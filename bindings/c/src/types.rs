@@ -21,9 +21,15 @@ use std::sync::Arc;
 use arrow_schema::Schema as ArrowSchema;
 use paimon::spec::{DataField, Predicate};
 use paimon::table::{
-    CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableCommit,
+    CommitMessage, IncrementalScanMode, PostponeBucketPlan, PostponeFixedBucketTableCommit,
     PostponeFixedBucketTableWrite, Table, TableCommit, TableWrite,
 };
+
+/// Values accepted by `paimon_read_builder_new_incremental_scan`.
+pub const PAIMON_INCREMENTAL_SCAN_MODE_DELTA: i32 = 0;
+pub const PAIMON_INCREMENTAL_SCAN_MODE_CHANGELOG: i32 = 1;
+pub const PAIMON_INCREMENTAL_SCAN_MODE_AUTO: i32 = 2;
+pub const PAIMON_INCREMENTAL_SCAN_MODE_DIFF: i32 = 3;
 
 /// C-compatible key-value pair for options.
 #[repr(C)]
@@ -102,6 +108,22 @@ pub struct paimon_table_scan {
     pub inner: *mut c_void,
 }
 
+/// Internal state for a fixed-range incremental scan.
+pub(crate) struct IncrementalScanState {
+    pub table: Table,
+    pub projected_columns: Option<Vec<String>>,
+    pub filter: Option<Predicate>,
+    pub case_sensitive: bool,
+    pub mode: IncrementalScanMode,
+    pub start_exclusive: i64,
+    pub end_inclusive: i64,
+}
+
+#[repr(C)]
+pub struct paimon_incremental_scan {
+    pub inner: *mut c_void,
+}
+
 #[repr(C)]
 pub struct paimon_table_read {
     pub inner: *mut c_void,
@@ -116,6 +138,11 @@ pub(crate) struct TableReadState {
 
 #[repr(C)]
 pub struct paimon_plan {
+    pub inner: *mut c_void,
+}
+
+#[repr(C)]
+pub struct paimon_incremental_plan {
     pub inner: *mut c_void,
 }
 

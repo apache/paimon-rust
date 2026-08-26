@@ -24,14 +24,16 @@ use futures::StreamExt;
 use paimon::catalog::{Identifier, DEFAULT_MAIN_BRANCH};
 use paimon::io::FileIO;
 use paimon::spec::{DataField, DataType, Datum, Predicate, PredicateBuilder, TableSchema};
-use paimon::table::{ArrowRecordBatchStream, DataSplit, Table};
+use paimon::table::{
+    ArrowRecordBatchStream, DataSplit, IncrementalPlan, IncrementalScanMode, ReadBuilder, Table,
+};
 use paimon::Plan;
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::{
-    paimon_result_get_table, paimon_result_new_read, paimon_result_next_batch, paimon_result_plan,
-    paimon_result_predicate, paimon_result_read_builder, paimon_result_record_batch_reader,
-    paimon_result_table_scan,
+    paimon_result_get_table, paimon_result_incremental_plan, paimon_result_incremental_scan,
+    paimon_result_new_read, paimon_result_next_batch, paimon_result_plan, paimon_result_predicate,
+    paimon_result_read_builder, paimon_result_record_batch_reader, paimon_result_table_scan,
 };
 use crate::runtime;
 use crate::types::*;
@@ -57,6 +59,37 @@ unsafe fn box_read_builder_state(state: ReadBuilderState) -> *mut paimon_read_bu
 unsafe fn box_table_read_state(state: TableReadState) -> *mut paimon_table_read {
     let inner = Box::into_raw(Box::new(state)) as *mut c_void;
     Box::into_raw(Box::new(paimon_table_read { inner }))
+}
+
+fn build_core_read_builder<'a>(
+    table: &'a Table,
+    projected_columns: Option<&[String]>,
+    filter: Option<&Predicate>,
+    case_sensitive: bool,
+) -> paimon::Result<ReadBuilder<'a>> {
+    let mut builder = table.new_read_builder();
+    builder.with_case_sensitive(case_sensitive);
+    if let Some(columns) = projected_columns {
+        let columns = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        builder.with_projection(&columns)?;
+    }
+    if let Some(filter) = filter {
+        builder.with_filter(filter.clone());
+    }
+    Ok(builder)
+}
+
+fn incremental_scan_mode_from_c(mode: i32) -> Result<IncrementalScanMode, *mut paimon_error> {
+    match mode {
+        PAIMON_INCREMENTAL_SCAN_MODE_DELTA => Ok(IncrementalScanMode::Delta),
+        PAIMON_INCREMENTAL_SCAN_MODE_CHANGELOG => Ok(IncrementalScanMode::Changelog),
+        PAIMON_INCREMENTAL_SCAN_MODE_AUTO => Ok(IncrementalScanMode::Auto),
+        PAIMON_INCREMENTAL_SCAN_MODE_DIFF => Ok(IncrementalScanMode::Diff),
+        _ => Err(paimon_error::new(
+            PaimonErrorCode::InvalidInput,
+            format!("unknown incremental scan mode {mode}"),
+        )),
+    }
 }
 
 // ======================= Table ===============================
@@ -540,24 +573,20 @@ pub unsafe extern "C" fn paimon_read_builder_new_read(
         };
     }
     let state = &*((*rb).inner as *const ReadBuilderState);
-    let mut rb_rust = state.table.new_read_builder();
-    rb_rust.with_case_sensitive(state.case_sensitive);
-
-    // Apply projection if set
-    if let Some(ref columns) = state.projected_columns {
-        let col_refs: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-        if let Err(e) = rb_rust.with_projection(&col_refs) {
+    let rb_rust = match build_core_read_builder(
+        &state.table,
+        state.projected_columns.as_deref(),
+        state.filter.as_ref(),
+        state.case_sensitive,
+    ) {
+        Ok(builder) => builder,
+        Err(e) => {
             return paimon_result_new_read {
                 read: std::ptr::null_mut(),
                 error: paimon_error::from_paimon(e),
-            };
+            }
         }
-    }
-
-    // Apply filter if set
-    if let Some(ref filter) = state.filter {
-        rb_rust.with_filter(filter.clone());
-    }
+    };
 
     match rb_rust.new_read() {
         Ok(table_read) => {
@@ -574,6 +603,117 @@ pub unsafe extern "C" fn paimon_read_builder_new_read(
         Err(e) => paimon_result_new_read {
             read: std::ptr::null_mut(),
             error: paimon_error::from_paimon(e),
+        },
+    }
+}
+
+// ======================= IncrementalScan ===============================
+
+/// Create a fixed-range incremental scan from a ReadBuilder.
+///
+/// The snapshot range is `(start_exclusive, end_inclusive]`. `mode` must be one
+/// of `PAIMON_INCREMENTAL_SCAN_MODE_DELTA`, `_CHANGELOG`, `_AUTO`, or `_DIFF`.
+/// Projection and filter settings already applied to the ReadBuilder are
+/// preserved by this scan for incremental planning. Build the TableRead from
+/// the same ReadBuilder to apply the same projection and filter while reading.
+///
+/// # Safety
+/// `rb` must be a valid pointer returned by `paimon_table_new_read_builder`, or
+/// null (returns error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_read_builder_new_incremental_scan(
+    rb: *const paimon_read_builder,
+    mode: i32,
+    start_exclusive: i64,
+    end_inclusive: i64,
+) -> paimon_result_incremental_scan {
+    if let Err(error) = check_non_null(rb, "rb") {
+        return paimon_result_incremental_scan {
+            scan: std::ptr::null_mut(),
+            error,
+        };
+    }
+    let mode = match incremental_scan_mode_from_c(mode) {
+        Ok(mode) => mode,
+        Err(error) => {
+            return paimon_result_incremental_scan {
+                scan: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    let state = &*((*rb).inner as *const ReadBuilderState);
+    let scan_state = IncrementalScanState {
+        table: state.table.clone(),
+        projected_columns: state.projected_columns.clone(),
+        filter: state.filter.clone(),
+        case_sensitive: state.case_sensitive,
+        mode,
+        start_exclusive,
+        end_inclusive,
+    };
+    let inner = Box::into_raw(Box::new(scan_state)) as *mut c_void;
+    paimon_result_incremental_scan {
+        scan: Box::into_raw(Box::new(paimon_incremental_scan { inner })),
+        error: std::ptr::null_mut(),
+    }
+}
+
+/// Free a fixed-range incremental scan.
+///
+/// # Safety
+/// Only call with a scan returned by `paimon_read_builder_new_incremental_scan`.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_incremental_scan_free(scan: *mut paimon_incremental_scan) {
+    if !scan.is_null() {
+        let wrapper = Box::from_raw(scan);
+        if !wrapper.inner.is_null() {
+            drop(Box::from_raw(wrapper.inner as *mut IncrementalScanState));
+        }
+    }
+}
+
+/// Plan a fixed snapshot range for incremental reading.
+///
+/// # Safety
+/// `scan` must be a valid pointer returned by
+/// `paimon_read_builder_new_incremental_scan`, or null (returns error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_incremental_scan_plan(
+    scan: *const paimon_incremental_scan,
+) -> paimon_result_incremental_plan {
+    if let Err(error) = check_non_null(scan, "scan") {
+        return paimon_result_incremental_plan {
+            plan: std::ptr::null_mut(),
+            error,
+        };
+    }
+    let state = &*((*scan).inner as *const IncrementalScanState);
+    let builder = match build_core_read_builder(
+        &state.table,
+        state.projected_columns.as_deref(),
+        state.filter.as_ref(),
+        state.case_sensitive,
+    ) {
+        Ok(builder) => builder,
+        Err(error) => {
+            return paimon_result_incremental_plan {
+                plan: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(error),
+            }
+        }
+    };
+    let scan = builder.new_incremental_scan(state.mode, state.start_exclusive, state.end_inclusive);
+    match runtime().block_on(scan.plan()) {
+        Ok(plan) => paimon_result_incremental_plan {
+            plan: Box::into_raw(Box::new(paimon_incremental_plan {
+                inner: Box::into_raw(Box::new(plan)) as *mut c_void,
+            })),
+            error: std::ptr::null_mut(),
+        },
+        Err(error) => paimon_result_incremental_plan {
+            plan: std::ptr::null_mut(),
+            error: paimon_error::from_paimon(error),
         },
     }
 }
@@ -706,6 +846,39 @@ pub unsafe extern "C" fn paimon_plan_num_splits(plan: *const paimon_plan) -> usi
     plan_ref.splits().len()
 }
 
+/// Free an incremental plan.
+///
+/// # Safety
+/// Only call with a plan returned by `paimon_incremental_scan_plan`.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_incremental_plan_free(plan: *mut paimon_incremental_plan) {
+    if !plan.is_null() {
+        let wrapper = Box::from_raw(plan);
+        if !wrapper.inner.is_null() {
+            drop(Box::from_raw(wrapper.inner as *mut IncrementalPlan));
+        }
+    }
+}
+
+/// Return the number of incremental work units in a plan.
+///
+/// Delta, Changelog, and Auto plans contain data splits. Diff plans contain
+/// before/after split pairs, each counted as one work unit.
+///
+/// # Safety
+/// `plan` must be a valid pointer returned by `paimon_incremental_scan_plan`,
+/// or null (returns 0).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_incremental_plan_num_splits(
+    plan: *const paimon_incremental_plan,
+) -> usize {
+    if plan.is_null() {
+        return 0;
+    }
+    let plan = &*((*plan).inner as *const IncrementalPlan);
+    plan.splits().len()
+}
+
 // ======================= TableRead ===============================
 
 /// Free a paimon_table_read.
@@ -781,6 +954,71 @@ pub unsafe extern "C" fn paimon_table_read_to_arrow(
         Err(e) => paimon_result_record_batch_reader {
             reader: std::ptr::null_mut(),
             error: paimon_error::from_paimon(e),
+        },
+    }
+}
+
+/// Read a sub-range of an incremental plan as Arrow record batches.
+///
+/// `offset` and `length` select a contiguous range of incremental work units.
+/// The range is clamped to the available units. The returned reader uses the
+/// same `paimon_record_batch_reader_next` and free functions as a batch read.
+///
+/// # Safety
+/// `read` and `plan` must be valid pointers returned by previous Paimon C API
+/// calls, or null (returns error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_read_to_incremental_arrow(
+    read: *const paimon_table_read,
+    plan: *const paimon_incremental_plan,
+    offset: usize,
+    length: usize,
+) -> paimon_result_record_batch_reader {
+    if let Err(error) = check_non_null(read, "read") {
+        return paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error,
+        };
+    }
+    if let Err(error) = check_non_null(plan, "plan") {
+        return paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error,
+        };
+    }
+
+    let state = &*((*read).inner as *const TableReadState);
+    let plan = &*((*plan).inner as *const IncrementalPlan);
+    let start = offset.min(plan.splits().len());
+    let end = offset.saturating_add(length).min(plan.splits().len());
+    let selected = match IncrementalPlan::try_new(plan.mode(), plan.splits()[start..end].to_vec()) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return paimon_result_record_batch_reader {
+                reader: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(error),
+            }
+        }
+    };
+    let table_read = paimon::table::TableRead::new(
+        &state.table,
+        state.read_type.clone(),
+        state.data_predicates.clone(),
+    );
+    match table_read.to_incremental_arrow(&selected) {
+        Ok(stream) => {
+            let reader = Box::new(stream);
+            let wrapper = Box::new(paimon_record_batch_reader {
+                inner: Box::into_raw(reader) as *mut c_void,
+            });
+            paimon_result_record_batch_reader {
+                reader: Box::into_raw(wrapper),
+                error: std::ptr::null_mut(),
+            }
+        }
+        Err(error) => paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error: paimon_error::from_paimon(error),
         },
     }
 }
@@ -865,7 +1103,8 @@ pub unsafe extern "C" fn paimon_record_batch_reader_next(
 /// Free a paimon_record_batch_reader.
 ///
 /// # Safety
-/// Only call with a reader returned from `paimon_table_read_to_arrow` or
+/// Only call with a reader returned from `paimon_table_read_to_arrow`,
+/// `paimon_table_read_to_incremental_arrow`, or
 /// `paimon_vector_search_builder_execute_read`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_record_batch_reader_free(reader: *mut paimon_record_batch_reader) {
@@ -1951,6 +2190,27 @@ const _: unsafe extern "C" fn(
     *const paimon_option,
     usize,
 ) -> paimon_result_read_builder = paimon_table_new_read_builder_with_options;
+
+// Incremental-read ABI signature guards. Incremental plans intentionally use
+// distinct opaque types from batch plans so callers cannot cross-cast them.
+const _: unsafe extern "C" fn(
+    *const paimon_read_builder,
+    i32,
+    i64,
+    i64,
+) -> paimon_result_incremental_scan = paimon_read_builder_new_incremental_scan;
+const _: unsafe extern "C" fn(*mut paimon_incremental_scan) = paimon_incremental_scan_free;
+const _: unsafe extern "C" fn(*const paimon_incremental_scan) -> paimon_result_incremental_plan =
+    paimon_incremental_scan_plan;
+const _: unsafe extern "C" fn(*mut paimon_incremental_plan) = paimon_incremental_plan_free;
+const _: unsafe extern "C" fn(*const paimon_incremental_plan) -> usize =
+    paimon_incremental_plan_num_splits;
+const _: unsafe extern "C" fn(
+    *const paimon_table_read,
+    *const paimon_incremental_plan,
+    usize,
+    usize,
+) -> paimon_result_record_batch_reader = paimon_table_read_to_incremental_arrow;
 
 // Plan constructor ABI signature guard. Pins the symbol that builds a plan from
 // serialized split bytes so an accidental signature change fails to compile

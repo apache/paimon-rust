@@ -92,3 +92,14 @@ records by comparing the before and after images. If table option
 
 The start snapshot must still exist because `Diff` reads both endpoint states.
 An equal start and end snapshot produces an empty result.
+
+## C API
+
+The C binding exposes the same fixed-range incremental planner through
+`paimon_read_builder_new_incremental_scan`, `paimon_incremental_scan_plan`, and
+`paimon_table_read_to_incremental_arrow`. It supports all four modes listed
+above and uses the same `(start_exclusive, end_inclusive]` range semantics.
+
+The returned reader is consumed with `paimon_record_batch_reader_next`, just
+like a regular C batch read. See [C Integration](c-binding.md#batch-incremental-reading)
+for a complete C example and resource-ownership rules.

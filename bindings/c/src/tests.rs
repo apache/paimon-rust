@@ -343,6 +343,178 @@ unsafe fn read_rows_ffi(table: *const paimon_table) -> Vec<(i32, String)> {
 }
 
 // =========================================================================
+//  Incremental read tests
+// =========================================================================
+
+#[test]
+fn test_incremental_delta_read_uses_left_open_snapshot_range() {
+    let path = "memory:/test_c_incremental_delta_range";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    write_data_rust(&table, &[make_batch(vec![1], vec!["first"])]);
+    write_data_rust(&table, &[make_batch(vec![2], vec!["second"])]);
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let rb_result = paimon_table_new_read_builder(handle);
+        assert!(rb_result.error.is_null());
+        let rb = rb_result.read_builder;
+
+        let scan_result =
+            paimon_read_builder_new_incremental_scan(rb, PAIMON_INCREMENTAL_SCAN_MODE_DELTA, 1, 2);
+        assert!(scan_result.error.is_null());
+        let scan = scan_result.scan;
+
+        let plan_result = paimon_incremental_scan_plan(scan);
+        assert!(plan_result.error.is_null());
+        let plan = plan_result.plan;
+        assert_eq!(paimon_incremental_plan_num_splits(plan), 1);
+
+        let read_result = paimon_read_builder_new_read(rb);
+        assert!(read_result.error.is_null());
+        let read = read_result.read;
+
+        let reader_result = paimon_table_read_to_incremental_arrow(read, plan, 0, usize::MAX);
+        assert!(reader_result.error.is_null());
+        let reader = reader_result.reader;
+        assert_eq!(collect_rows(reader), vec![(2, "second".to_string())]);
+
+        paimon_record_batch_reader_free(reader);
+        paimon_table_read_free(read);
+        paimon_incremental_plan_free(plan);
+        paimon_incremental_scan_free(scan);
+        paimon_read_builder_free(rb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_incremental_empty_snapshot_range_returns_empty_stream() {
+    let path = "memory:/test_c_incremental_empty_range";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    write_data_rust(&table, &[make_batch(vec![1], vec!["first"])]);
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let rb = paimon_table_new_read_builder(handle).read_builder;
+        let scan_result =
+            paimon_read_builder_new_incremental_scan(rb, PAIMON_INCREMENTAL_SCAN_MODE_DELTA, 1, 1);
+        assert!(scan_result.error.is_null());
+        let plan_result = paimon_incremental_scan_plan(scan_result.scan);
+        assert!(plan_result.error.is_null());
+        assert_eq!(paimon_incremental_plan_num_splits(plan_result.plan), 0);
+
+        let read_result = paimon_read_builder_new_read(rb);
+        assert!(read_result.error.is_null());
+        let reader_result = paimon_table_read_to_incremental_arrow(
+            read_result.read,
+            plan_result.plan,
+            0,
+            usize::MAX,
+        );
+        assert!(reader_result.error.is_null());
+        assert!(collect_rows(reader_result.reader).is_empty());
+
+        paimon_record_batch_reader_free(reader_result.reader);
+        paimon_table_read_free(read_result.read);
+        paimon_incremental_plan_free(plan_result.plan);
+        paimon_incremental_scan_free(scan_result.scan);
+        paimon_read_builder_free(rb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_incremental_scan_rejects_unknown_mode() {
+    let table = Table::new(
+        memory_file_io(),
+        Identifier::new("default", "test"),
+        "memory:/test_c_incremental_unknown_mode".to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let rb = paimon_table_new_read_builder(handle).read_builder;
+        let result = paimon_read_builder_new_incremental_scan(rb, 99, 0, 1);
+        assert!(result.scan.is_null());
+        assert!(!result.error.is_null());
+        assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
+        let message = std::str::from_utf8(std::slice::from_raw_parts(
+            (*result.error).message.data,
+            (*result.error).message.len,
+        ))
+        .unwrap();
+        assert!(message.contains("incremental scan mode"), "got: {message}");
+
+        paimon_error_free(result.error);
+        paimon_read_builder_free(rb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_incremental_read_preserves_builder_filter() {
+    let path = "memory:/test_c_incremental_filter";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    write_data_rust(&table, &[make_batch(vec![1], vec!["first"])]);
+    write_data_rust(&table, &[make_batch(vec![2, 3], vec!["second", "third"])]);
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let rb = paimon_table_new_read_builder(handle).read_builder;
+        let predicate = build_predicate_equal(handle, "id", 3);
+        assert!(paimon_read_builder_with_filter(rb, predicate).is_null());
+
+        let scan_result =
+            paimon_read_builder_new_incremental_scan(rb, PAIMON_INCREMENTAL_SCAN_MODE_DELTA, 1, 2);
+        assert!(scan_result.error.is_null());
+        let scan = scan_result.scan;
+        let plan_result = paimon_incremental_scan_plan(scan);
+        assert!(plan_result.error.is_null());
+        let plan = plan_result.plan;
+        let read_result = paimon_read_builder_new_read(rb);
+        assert!(read_result.error.is_null());
+        let read = read_result.read;
+        let reader_result = paimon_table_read_to_incremental_arrow(read, plan, 0, usize::MAX);
+        assert!(reader_result.error.is_null());
+        let reader = reader_result.reader;
+        assert_eq!(collect_rows(reader), vec![(3, "third".to_string())]);
+
+        paimon_record_batch_reader_free(reader);
+        paimon_table_read_free(read);
+        paimon_incremental_plan_free(plan);
+        paimon_incremental_scan_free(scan);
+        paimon_read_builder_free(rb);
+        unwrap_table(handle);
+    }
+}
+
+// =========================================================================
 //  Catalog-free table construction tests
 // =========================================================================
 
@@ -2058,6 +2230,31 @@ fn test_abort_commit() {
 #[test]
 fn test_null_pointer_handling() {
     unsafe {
+        let result = paimon_read_builder_new_incremental_scan(
+            ptr::null(),
+            PAIMON_INCREMENTAL_SCAN_MODE_DELTA,
+            0,
+            1,
+        );
+        assert!(result.scan.is_null());
+        assert!(!result.error.is_null());
+        paimon_error_free(result.error);
+
+        let result = paimon_incremental_scan_plan(ptr::null());
+        assert!(result.plan.is_null());
+        assert!(!result.error.is_null());
+        paimon_error_free(result.error);
+
+        let result =
+            paimon_table_read_to_incremental_arrow(ptr::null(), ptr::null(), 0, usize::MAX);
+        assert!(result.reader.is_null());
+        assert!(!result.error.is_null());
+        paimon_error_free(result.error);
+
+        assert_eq!(paimon_incremental_plan_num_splits(ptr::null()), 0);
+        paimon_incremental_scan_free(ptr::null_mut());
+        paimon_incremental_plan_free(ptr::null_mut());
+
         let result = paimon_table_new_write_builder(ptr::null());
         assert!(!result.error.is_null());
         assert!(result.write_builder.is_null());

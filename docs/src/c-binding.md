@@ -20,8 +20,9 @@ under the License.
 # C Integration
 
 The C integration exposes Apache Paimon Rust through a C ABI. It provides
-catalog and table access, scan planning, predicate push-down, streaming reads,
-writes and commits, and vector search. Record batches cross the ABI through the
+catalog and table access, batch and incremental scan planning, predicate
+push-down, streaming reads, writes and commits, and vector search. Record
+batches cross the ABI through the
 [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html).
 
 The C binding is currently built from source. The repository does not check in
@@ -220,6 +221,76 @@ range is clamped to the number of available splits.
     `ArrowSchema` container structs. When writing, the ownership direction is
     reversed: `paimon_table_write_write_arrow_batch` consumes the exported
     Arrow structures, so the caller must not release them again.
+
+## Batch Incremental Reading
+
+The C API can plan and read a fixed snapshot range with
+`(start_exclusive, end_inclusive]` semantics. For example, `(3, 5]` reads
+changes from snapshots 4 and 5. The generated header defines these scan modes:
+
+| C mode | Behavior |
+|--------|----------|
+| `PAIMON_INCREMENTAL_SCAN_MODE_DELTA` | Reads data files added by `APPEND` snapshots. |
+| `PAIMON_INCREMENTAL_SCAN_MODE_CHANGELOG` | Reads existing changelog files, skipping `OVERWRITE` snapshots and snapshots without changelog files. |
+| `PAIMON_INCREMENTAL_SCAN_MODE_AUTO` | Selects Delta when `changelog-producer=none`; otherwise selects Changelog. |
+| `PAIMON_INCREMENTAL_SCAN_MODE_DIFF` | Compares the complete table states at the start and end snapshots. |
+
+Create the incremental scan from the configured read builder, plan it, and
+consume the plan with an incremental Arrow reader:
+
+```c
+paimon_result_incremental_scan scan_result =
+    paimon_read_builder_new_incremental_scan(
+        read_builder,
+        PAIMON_INCREMENTAL_SCAN_MODE_DELTA,
+        3, /* start_exclusive */
+        5  /* end_inclusive */);
+CHECK_RESULT(scan_result);
+paimon_incremental_scan *incremental_scan = scan_result.scan;
+
+paimon_result_incremental_plan plan_result =
+    paimon_incremental_scan_plan(incremental_scan);
+CHECK_RESULT(plan_result);
+paimon_incremental_plan *incremental_plan = plan_result.plan;
+
+paimon_result_new_read read_result =
+    paimon_read_builder_new_read(read_builder);
+CHECK_RESULT(read_result);
+paimon_table_read *read = read_result.read;
+
+size_t work_count =
+    paimon_incremental_plan_num_splits(incremental_plan);
+paimon_result_record_batch_reader reader_result =
+    paimon_table_read_to_incremental_arrow(
+        read, incremental_plan, 0, work_count);
+CHECK_RESULT(reader_result);
+paimon_record_batch_reader *reader = reader_result.reader;
+
+/* Consume reader with paimon_record_batch_reader_next as shown above. */
+
+paimon_record_batch_reader_free(reader);
+paimon_table_read_free(read);
+paimon_incremental_plan_free(incremental_plan);
+paimon_incremental_scan_free(incremental_scan);
+```
+
+Projection and predicates configured before creating the incremental scan are
+used during planning. Create the `paimon_table_read` from the same read builder
+so the same projection and predicates are also applied while reading.
+
+`paimon_table_read_to_incremental_arrow` accepts an `offset` and `length` over
+incremental work units. Delta, Changelog, and resolved Auto plans contain data
+splits; Diff plans contain before/after split pairs, with each pair counted as
+one unit.
+
+!!! note "Fixed-range API"
+    This API performs batch incremental reading over a fixed snapshot range. It
+    does not wait for future snapshots. A continuous consumer must discover new
+    snapshot IDs, create subsequent ranges, and persist its last successfully
+    consumed `end_inclusive` checkpoint.
+
+For mode semantics and current Diff restrictions, see
+[Batch Incremental Reading](incremental-reading.md).
 
 ## Projection and Predicates
 

@@ -55,8 +55,20 @@ pub struct paimon_result_table_scan {
 }
 
 #[repr(C)]
+pub struct paimon_result_incremental_scan {
+    pub scan: *mut paimon_incremental_scan,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
 pub struct paimon_result_plan {
     pub plan: *mut paimon_plan,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_incremental_plan {
+    pub plan: *mut paimon_incremental_plan,
     pub error: *mut paimon_error,
 }
 
