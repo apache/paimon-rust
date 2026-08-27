@@ -28,6 +28,8 @@ use crate::file_index::file_index_result::FileIndexResult;
 use crate::spec::{DataType, Datum, PredicateOperator};
 use crate::{Error, Result};
 
+pub(crate) mod writer;
+
 const VERSION_1: u8 = 1;
 const VERSION_2: u8 = 2;
 const JAVA_CANONICAL_FLOAT_NAN_BITS: u32 = 0x7fc0_0000;
@@ -950,8 +952,9 @@ impl FileIndexReader for BitmapFileIndexReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::Options;
     use crate::spec::{
-        BigIntType, BooleanType, CharType, DateType, DoubleType, FloatType, IntType,
+        BigIntType, BinaryType, BooleanType, CharType, DateType, DoubleType, FloatType, IntType,
         LocalZonedTimestampType, SmallIntType, TimeType, TimestampType, TinyIntType, VarCharType,
     };
 
@@ -1100,6 +1103,20 @@ mod tests {
         "00010000000400000000000000143a300000010000000000010010000000000004",
         "00"
     );
+    const JAVA_INT_MULTIPLE_BODIES_MULTIBLOCK_V2: &str = concat!(
+        "020000000800000003010000000000000014000000020000000100000000000000",
+        "030000001c0000002c000000020000000100000014000000140000000200000028",
+        "0000001400000001000000030000003c000000143a300000010000000000010010",
+        "000000020005003a300000010000000000010010000000010006003a3000000100",
+        "00000000010010000000000004003a300000010000000000010010000000030007",
+        "00"
+    );
+    const JAVA_STRING_BLOCK_BOUNDARY_V2: &str = concat!(
+        "020000000400000003000000000200000001610000000000000002636300000021",
+        "0000003300000002000000016100000000000000140000000462626262ffffffff",
+        "ffffffff00000001000000026363fffffffdffffffff3a3000000100000000000100",
+        "1000000001000300"
+    );
     const JAVA_SINGLETON_NULL_V1: &str =
         "01000000030000000201fffffffd00000000ffffffff00000001fffffffe";
     const JAVA_SINGLETON_NULL_V2: &str = concat!(
@@ -1108,6 +1125,16 @@ mod tests {
     );
     const JAVA_EMPTY_V1: &str = "01000000000000000000";
     const JAVA_EMPTY_V2: &str = "020000000000000000000000000000000000";
+    const JAVA_FLOAT_SINGLETONS_V2: &str = concat!(
+        "02000000040000000301fffffffc00000012000000018000000000000000000000",
+        "280000000380000000fffffffdffffffff00000000fffffffeffffffff7fc00000",
+        "ffffffffffffffff"
+    );
+    const JAVA_DOUBLE_SINGLETONS_V2: &str = concat!(
+        "02000000040000000301fffffffc00000012000000018000000000000000000000",
+        "0000000034000000038000000000000000fffffffdffffffff0000000000000000",
+        "fffffffeffffffff7ff8000000000000ffffffffffffffff"
+    );
 
     struct Fixture {
         name: &'static str,
@@ -1266,6 +1293,322 @@ mod tests {
                 v2: JAVA_STRING_V2,
             },
         ]
+    }
+
+    #[test]
+    fn test_v2_writer_matches_java_golden_payloads() {
+        for fixture in fixtures() {
+            let mut writer =
+                writer::BitmapFileIndexWriter::try_new(fixture.data_type, &Options::new())
+                    .unwrap_or_else(|error| panic!("{} writer failed: {error}", fixture.name));
+            for datum in [
+                Some(&fixture.repeated),
+                Some(&fixture.singleton),
+                None,
+                Some(&fixture.repeated),
+                None,
+            ] {
+                writer
+                    .write(datum)
+                    .unwrap_or_else(|error| panic!("{} write failed: {error}", fixture.name));
+            }
+            assert_eq!(
+                writer.serialized_bytes().unwrap(),
+                bytes(fixture.v2),
+                "{} V2 writer",
+                fixture.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_v2_writer_matches_java_floating_value_encoding() {
+        let float_values = [
+            Datum::Float(f32::from_bits(0xffa1_2345)),
+            Datum::Float(0.0),
+            Datum::Float(-0.0),
+        ];
+        let mut float_writer = writer::BitmapFileIndexWriter::try_new(
+            DataType::Float(FloatType::new()),
+            &Options::new(),
+        )
+        .unwrap();
+        for value in &float_values {
+            float_writer.write(Some(value)).unwrap();
+        }
+        float_writer.write(None).unwrap();
+        assert_eq!(
+            float_writer.serialized_bytes().unwrap(),
+            bytes(JAVA_FLOAT_SINGLETONS_V2)
+        );
+
+        let double_values = [
+            Datum::Double(f64::from_bits(0xfff0_1234_5678_9abc)),
+            Datum::Double(0.0),
+            Datum::Double(-0.0),
+        ];
+        let mut double_writer = writer::BitmapFileIndexWriter::try_new(
+            DataType::Double(DoubleType::new()),
+            &Options::new(),
+        )
+        .unwrap();
+        for value in &double_values {
+            double_writer.write(Some(value)).unwrap();
+        }
+        double_writer.write(None).unwrap();
+        assert_eq!(
+            double_writer.serialized_bytes().unwrap(),
+            bytes(JAVA_DOUBLE_SINGLETONS_V2)
+        );
+    }
+
+    #[test]
+    fn test_v2_writer_round_trip_null_singleton_and_multiple_values() {
+        let data_type = DataType::Int(IntType::new());
+        let repeated = Datum::Int(-123_456_789);
+        let singleton = Datum::Int(42);
+        let mut writer =
+            writer::BitmapFileIndexWriter::try_new(data_type.clone(), &Options::new()).unwrap();
+        for datum in [
+            Some(&repeated),
+            Some(&singleton),
+            None,
+            Some(&repeated),
+            None,
+        ] {
+            writer.write(datum).unwrap();
+        }
+
+        let serialized = writer.serialized_bytes().unwrap();
+        assert_eq!(serialized, bytes(JAVA_INT_V2));
+        let reader = BitmapFileIndexReader::try_new(data_type.clone(), serialized).unwrap();
+        assert!(matches!(&reader.index, BitmapIndex::V2(_)));
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::Eq, &[repeated]),
+            selection([0, 3])
+        );
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::Eq, &[singleton]),
+            selection([1])
+        );
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::IsNull, &[]),
+            selection([2, 4])
+        );
+    }
+
+    #[test]
+    fn test_v2_writer_empty_and_singleton_null_payloads() {
+        let data_type = DataType::Int(IntType::new());
+        let mut empty =
+            writer::BitmapFileIndexWriter::try_new(data_type.clone(), &Options::new()).unwrap();
+        assert_eq!(empty.serialized_bytes().unwrap(), bytes(JAVA_EMPTY_V2));
+
+        let mut singleton =
+            writer::BitmapFileIndexWriter::try_new(data_type.clone(), &Options::new()).unwrap();
+        for datum in [Some(&Datum::Int(0)), Some(&Datum::Int(1)), None] {
+            singleton.write(datum).unwrap();
+        }
+        let serialized = singleton.serialized_bytes().unwrap();
+        assert_eq!(serialized, bytes(JAVA_SINGLETON_NULL_V2));
+        let reader = BitmapFileIndexReader::try_new(data_type.clone(), serialized).unwrap();
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::IsNull, &[]),
+            selection([2])
+        );
+
+        let mut all_null =
+            writer::BitmapFileIndexWriter::try_new(data_type.clone(), &Options::new()).unwrap();
+        for _ in 0..3 {
+            all_null.write(None).unwrap();
+        }
+        let reader =
+            BitmapFileIndexReader::try_new(data_type.clone(), all_null.serialized_bytes().unwrap())
+                .unwrap();
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::IsNull, &[]),
+            selection(0..3)
+        );
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::IsNotNull, &[]),
+            selection([])
+        );
+    }
+
+    #[test]
+    fn test_v2_writer_multiple_index_blocks() {
+        let data_type = DataType::Int(IntType::new());
+        let mut options = Options::new();
+        options.set("index-block-size", "16");
+        let mut writer =
+            writer::BitmapFileIndexWriter::try_new(data_type.clone(), &options).unwrap();
+        for value in [4, 1, 3, 2, 4] {
+            writer.write(Some(&Datum::Int(value))).unwrap();
+        }
+
+        let serialized = writer.serialized_bytes().unwrap();
+        assert_eq!(serialized, bytes(JAVA_INT_MULTIBLOCK_V2));
+        let reader = BitmapFileIndexReader::try_new(data_type.clone(), serialized).unwrap();
+        let blocks = match &reader.index {
+            BitmapIndex::V2(index) => &index.blocks,
+            BitmapIndex::V1(_) => panic!("expected V2 index"),
+        };
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::Eq, &[Datum::Int(4)]),
+            selection([0, 4])
+        );
+        assert_eq!(
+            evaluate(
+                &reader,
+                &data_type,
+                PredicateOperator::In,
+                &[Datum::Int(1), Datum::Int(2), Datum::Int(3)]
+            ),
+            selection([1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn test_v2_writer_multiple_bitmap_bodies_across_index_blocks() {
+        let data_type = DataType::Int(IntType::new());
+        let mut options = Options::new();
+        options.set("index-block-size", "28");
+        let mut writer =
+            writer::BitmapFileIndexWriter::try_new(data_type.clone(), &options).unwrap();
+        for value in [
+            Some(2),
+            Some(1),
+            None,
+            Some(3),
+            Some(2),
+            None,
+            Some(1),
+            Some(3),
+        ] {
+            let datum = value.map(Datum::Int);
+            writer.write(datum.as_ref()).unwrap();
+        }
+
+        let serialized = writer.serialized_bytes().unwrap();
+        assert_eq!(serialized, bytes(JAVA_INT_MULTIPLE_BODIES_MULTIBLOCK_V2));
+        let reader = BitmapFileIndexReader::try_new(data_type.clone(), serialized).unwrap();
+        let blocks = match &reader.index {
+            BitmapIndex::V2(index) => &index.blocks,
+            BitmapIndex::V1(_) => panic!("expected V2 index"),
+        };
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::Eq, &[Datum::Int(1)]),
+            selection([1, 6])
+        );
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::Eq, &[Datum::Int(2)]),
+            selection([0, 4])
+        );
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::Eq, &[Datum::Int(3)]),
+            selection([3, 7])
+        );
+        assert_eq!(
+            evaluate(&reader, &data_type, PredicateOperator::IsNull, &[]),
+            selection([2, 5])
+        );
+    }
+
+    #[test]
+    fn test_v2_writer_variable_string_index_block_boundary() {
+        let data_type = DataType::VarChar(VarCharType::new(20).unwrap());
+        let mut options = Options::new();
+        options.set("index-block-size", "33");
+        let mut writer =
+            writer::BitmapFileIndexWriter::try_new(data_type.clone(), &options).unwrap();
+        for value in ["bbbb", "a", "cc", "a"] {
+            writer
+                .write(Some(&Datum::String(value.to_string())))
+                .unwrap();
+        }
+
+        let serialized = writer.serialized_bytes().unwrap();
+        assert_eq!(serialized, bytes(JAVA_STRING_BLOCK_BOUNDARY_V2));
+        let reader = BitmapFileIndexReader::try_new(data_type.clone(), serialized).unwrap();
+        let blocks = match &reader.index {
+            BitmapIndex::V2(index) => &index.blocks,
+            BitmapIndex::V1(_) => panic!("expected V2 index"),
+        };
+        // 4-byte header + 13-byte "a" entry + 16-byte "bbbb" entry.
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            evaluate(
+                &reader,
+                &data_type,
+                PredicateOperator::Eq,
+                &[Datum::String("a".to_string())]
+            ),
+            selection([1, 3])
+        );
+        assert_eq!(
+            evaluate(
+                &reader,
+                &data_type,
+                PredicateOperator::In,
+                &[
+                    Datum::String("bbbb".to_string()),
+                    Datum::String("cc".to_string())
+                ]
+            ),
+            selection([0, 2])
+        );
+    }
+
+    #[test]
+    fn test_v2_writer_rejects_invalid_config_and_unsupported_type() {
+        let data_type = DataType::Int(IntType::new());
+
+        let mut options = Options::new();
+        options.set("version", "2");
+        options.set("index-block-size", "16 kb");
+        assert!(writer::BitmapFileIndexWriter::try_new(data_type.clone(), &options).is_ok());
+
+        for version in ["invalid", "256"] {
+            let mut options = Options::new();
+            options.set("version", version);
+            assert!(matches!(
+                writer::BitmapFileIndexWriter::try_new(data_type.clone(), &options),
+                Err(Error::ConfigInvalid { .. })
+            ));
+        }
+        for version in ["1", "3"] {
+            let mut options = Options::new();
+            options.set("version", version);
+            assert!(matches!(
+                writer::BitmapFileIndexWriter::try_new(data_type.clone(), &options),
+                Err(Error::Unsupported { .. })
+            ));
+        }
+        for block_size in ["invalid", "0", "15", "9223372036854775807 tb"] {
+            let mut options = Options::new();
+            options.set("index-block-size", block_size);
+            assert!(matches!(
+                writer::BitmapFileIndexWriter::try_new(data_type.clone(), &options),
+                Err(Error::ConfigInvalid { .. })
+            ));
+        }
+
+        let mut options = Options::new();
+        options.set("index-block-size", "16");
+        assert!(matches!(
+            writer::BitmapFileIndexWriter::try_new(DataType::BigInt(BigIntType::new()), &options),
+            Err(Error::ConfigInvalid { .. })
+        ));
+
+        assert!(matches!(
+            writer::BitmapFileIndexWriter::try_new(
+                DataType::Binary(BinaryType::new(4).unwrap()),
+                &Options::new()
+            ),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]
