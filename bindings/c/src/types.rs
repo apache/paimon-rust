@@ -68,6 +68,57 @@ pub struct paimon_catalog {
     pub inner: *mut c_void,
 }
 
+/// Opaque wrapper around a cloneable Paimon FileIO.
+#[repr(C)]
+pub struct paimon_file_io {
+    pub inner: *mut c_void,
+}
+
+/// Version 1 callbacks for an externally managed file-block cache.
+///
+/// Callbacks may run concurrently on arbitrary Rust runtime blocking threads.
+/// They must not unwind across the C ABI. `get` returns the number of bytes
+/// copied into `output`; return `-1` for a miss and any value other than the
+/// requested length for a fail-open miss. All callback buffers and paths are
+/// borrowed only for the duration of the call. Paths use pointer-plus-length
+/// because canonical storage keys may contain embedded NUL separators.
+#[repr(C)]
+pub struct paimon_file_cache_callbacks_v1 {
+    pub context: *mut c_void,
+    pub get: Option<
+        unsafe extern "C" fn(
+            context: *mut c_void,
+            path_data: *const u8,
+            path_length: usize,
+            offset: u64,
+            length: usize,
+            output: *mut u8,
+        ) -> i64,
+    >,
+    pub put: Option<
+        unsafe extern "C" fn(
+            context: *mut c_void,
+            path_data: *const u8,
+            path_length: usize,
+            offset: u64,
+            data: *const u8,
+            length: usize,
+        ) -> i32,
+    >,
+    pub invalidate_path: Option<
+        unsafe extern "C" fn(context: *mut c_void, path_data: *const u8, path_length: usize) -> i32,
+    >,
+    pub invalidate_prefix: Option<
+        unsafe extern "C" fn(
+            context: *mut c_void,
+            prefix_data: *const u8,
+            prefix_length: usize,
+        ) -> i32,
+    >,
+    /// Releases `context` after the last FileIO/table clone is dropped.
+    pub destroy: Option<unsafe extern "C" fn(context: *mut c_void)>,
+}
+
 #[repr(C)]
 pub struct paimon_identifier {
     pub inner: *mut c_void,

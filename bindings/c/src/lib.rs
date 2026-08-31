@@ -21,6 +21,7 @@
 
 mod catalog;
 mod error;
+mod file_io;
 mod identifier;
 mod result;
 mod table;

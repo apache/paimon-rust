@@ -37,6 +37,25 @@ use url::Url;
 use super::cache::{CachedFileReader, LocalCache};
 use super::Storage;
 
+/// An externally managed block cache used by [`FileIO`].
+///
+/// Implementations store immutable file ranges. Cache failures must be handled
+/// as misses/no-ops so the storage backend remains the source of truth.
+#[async_trait::async_trait]
+pub trait FileBlockCache: std::fmt::Debug + Send + Sync + 'static {
+    /// Return the exact requested range on a hit, or `None` on a miss.
+    async fn get(&self, path: &str, range: Range<u64>) -> Option<Bytes>;
+
+    /// Store a range. Implementations may silently decline the write.
+    async fn put(&self, path: &str, offset: u64, data: Bytes);
+
+    /// Remove all cached ranges for one file.
+    async fn invalidate_path(&self, path: &str);
+
+    /// Remove all cached ranges under a directory prefix.
+    async fn invalidate_prefix(&self, prefix: &str);
+}
+
 #[async_trait::async_trait]
 pub(crate) trait FileIOProvider: std::fmt::Debug + Send + Sync {
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)>;
@@ -60,6 +79,24 @@ impl std::fmt::Debug for FileIO {
 }
 
 impl FileIO {
+    /// Attach an externally managed block cache.
+    ///
+    /// `block_size` controls the aligned ranges presented to the cache.
+    /// `whitelist` uses the same comma-separated values as
+    /// `local-cache.whitelist`: `meta`, `global-index`, `bucket-index`, `data`,
+    /// and `file-index`.
+    pub fn with_file_block_cache(
+        mut self,
+        cache: Arc<dyn FileBlockCache>,
+        block_size: u64,
+        whitelist: &str,
+    ) -> crate::Result<Self> {
+        self.cache = Some(Arc::new(LocalCache::external(
+            cache, block_size, whitelist,
+        )?));
+        Ok(self)
+    }
+
     pub(crate) fn with_provider(mut self, provider: Arc<dyn FileIOProvider>) -> Self {
         self.provider = Some(provider);
         self

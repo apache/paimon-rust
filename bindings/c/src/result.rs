@@ -25,6 +25,12 @@ pub struct paimon_result_catalog_new {
 }
 
 #[repr(C)]
+pub struct paimon_result_file_io_new {
+    pub file_io: *mut paimon_file_io,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
 pub struct paimon_result_identifier_new {
     pub identifier: *mut paimon_identifier,
     pub error: *mut paimon_error,

@@ -28,6 +28,7 @@ use paimon::table::{ArrowRecordBatchStream, DataSplit, Table};
 use paimon::Plan;
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
+use crate::file_io::file_io_ref;
 use crate::result::{
     paimon_result_get_table, paimon_result_new_read, paimon_result_next_batch, paimon_result_plan,
     paimon_result_predicate, paimon_result_read_builder, paimon_result_record_batch_reader,
@@ -60,6 +61,38 @@ unsafe fn box_table_read_state(state: TableReadState) -> *mut paimon_table_read 
 }
 
 // ======================= Table ===============================
+
+fn resolved_table_result(
+    file_io: FileIO,
+    table_path: String,
+    schema: TableSchema,
+    database: String,
+    table_name: String,
+    branch: String,
+) -> paimon_result_get_table {
+    let table = match Table::from_resolved_schema(
+        file_io,
+        Identifier::new(database, table_name),
+        table_path,
+        schema,
+        branch,
+    ) {
+        Ok(table) => table,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::from_paimon(error),
+            }
+        }
+    };
+    let wrapper = Box::new(paimon_table {
+        inner: Box::into_raw(Box::new(table)) as *mut c_void,
+    });
+    paimon_result_get_table {
+        table: Box::into_raw(wrapper),
+        error: std::ptr::null_mut(),
+    }
+}
 
 /// Create a table directly from a resolved Paimon table schema JSON.
 ///
@@ -192,35 +225,112 @@ pub unsafe extern "C" fn paimon_table_from_schema_json(
             }
         }
     };
-    let table = match Table::from_resolved_schema(
-        file_io,
-        Identifier::new(database, table_name),
-        table_path,
-        schema,
-        branch,
-    ) {
-        Ok(table) => table,
+    resolved_table_result(file_io, table_path, schema, database, table_name, branch)
+}
+
+/// Create a table from a resolved schema and a caller-created FileIO.
+///
+/// The FileIO is cloned into the table, so its handle may be freed immediately
+/// after this call. This additive API allows native embedders to share storage
+/// and an externally managed cache across tables.
+///
+/// # Safety
+/// `file_io` must be returned by a Paimon FileIO constructor. All string
+/// pointers except `branch` must be valid null-terminated C strings. `branch`
+/// may be null to select `main`.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_from_schema_json_with_file_io(
+    file_io: *const paimon_file_io,
+    table_path: *const c_char,
+    table_schema_json: *const c_char,
+    database: *const c_char,
+    table_name: *const c_char,
+    branch: *const c_char,
+) -> paimon_result_get_table {
+    if let Err(error) = check_non_null(file_io, "file_io") {
+        return paimon_result_get_table {
+            table: std::ptr::null_mut(),
+            error,
+        };
+    }
+    let table_path = match validate_cstr(table_path, "table_path") {
+        Ok(value) => value,
         Err(error) => {
             return paimon_result_get_table {
                 table: std::ptr::null_mut(),
-                error: paimon_error::from_paimon(error),
+                error,
             }
         }
     };
-    let wrapper = Box::new(paimon_table {
-        inner: Box::into_raw(Box::new(table)) as *mut c_void,
-    });
-    paimon_result_get_table {
-        table: Box::into_raw(wrapper),
-        error: std::ptr::null_mut(),
-    }
+    let table_schema_json = match validate_cstr(table_schema_json, "table_schema_json") {
+        Ok(value) => value,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    let database = match validate_cstr(database, "database") {
+        Ok(value) => value,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    let table_name = match validate_cstr(table_name, "table_name") {
+        Ok(value) => value,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    let branch = if branch.is_null() {
+        DEFAULT_MAIN_BRANCH.to_string()
+    } else {
+        match validate_cstr(branch, "branch") {
+            Ok(value) => value,
+            Err(error) => {
+                return paimon_result_get_table {
+                    table: std::ptr::null_mut(),
+                    error,
+                }
+            }
+        }
+    };
+    let schema = match serde_json::from_str::<TableSchema>(&table_schema_json) {
+        Ok(schema) => schema,
+        Err(error) => {
+            return paimon_result_get_table {
+                table: std::ptr::null_mut(),
+                error: paimon_error::new(
+                    PaimonErrorCode::InvalidInput,
+                    format!("Failed to parse table schema JSON: {error}"),
+                ),
+            }
+        }
+    };
+
+    resolved_table_result(
+        file_io_ref(file_io).clone(),
+        table_path,
+        schema,
+        database,
+        table_name,
+        branch,
+    )
 }
 
 /// Free a paimon_table.
 ///
 /// # Safety
-/// Only call with a table returned from `paimon_catalog_get_table` or
-/// `paimon_table_from_schema_json`.
+/// Only call with a table returned from `paimon_catalog_get_table`,
+/// `paimon_table_from_schema_json`, or
+/// `paimon_table_from_schema_json_with_file_io`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_table_free(table: *mut paimon_table) {
     free_table_wrapper(table, |t| t.inner);
@@ -1944,6 +2054,14 @@ const _: unsafe extern "C" fn(
     *const paimon_option,
     usize,
 ) -> paimon_result_get_table = paimon_table_from_schema_json;
+const _: unsafe extern "C" fn(
+    *const paimon_file_io,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+) -> paimon_result_get_table = paimon_table_from_schema_json_with_file_io;
 const _: unsafe extern "C" fn(*const paimon_table) -> paimon_result_read_builder =
     paimon_table_new_read_builder;
 const _: unsafe extern "C" fn(

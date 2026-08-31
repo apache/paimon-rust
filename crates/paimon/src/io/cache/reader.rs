@@ -70,7 +70,11 @@ impl CachedFileReader {
             message: format!("Cache block is too large for '{}'", self.path),
             source: None,
         })?;
-        if let Some(payload) = self.cache.get_block(&key, &self.read_token).await {
+        if let Some(payload) = self
+            .cache
+            .get_block(&key, expected_len, &self.read_token)
+            .await
+        {
             if payload.len() == expected_len {
                 return Ok(payload);
             }
@@ -79,7 +83,11 @@ impl CachedFileReader {
 
         let load_lock = self.cache.block_load_lock(&key).await;
         let load_guard = load_lock.lock().await;
-        let result = if let Some(payload) = self.cache.get_block(&key, &self.read_token).await {
+        let result = if let Some(payload) = self
+            .cache
+            .get_block(&key, expected_len, &self.read_token)
+            .await
+        {
             if payload.len() == expected_len {
                 Ok(payload)
             } else {
@@ -182,9 +190,12 @@ impl CachedFileReader {
         let mut output = BytesMut::with_capacity(output_len);
         for block_index in 0..block_count {
             let key = self.cache.block_key(&self.path, block_index);
-            let payload = self.cache.get_block(&key, &self.read_token).await?;
             let start = block_index * block_size;
             let expected_len = (self.file_size - start).min(block_size) as usize;
+            let payload = self
+                .cache
+                .get_block(&key, expected_len, &self.read_token)
+                .await?;
             if payload.len() != expected_len {
                 self.cache.remove_block(&key).await;
                 return None;

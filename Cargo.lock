@@ -4726,6 +4726,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "bytes",
  "futures",
  "paimon",

@@ -38,9 +38,10 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 serde_json = "1.0.120"
+async-trait = "0.1.81"
+bytes = "1.7.1"
 
 [dev-dependencies]
 # Test-only: the vector-search integration tests build a real primary-key vindex
 # IVF-flat ANN segment fixture in-process. Versions match crates/paimon.
-bytes = "1.7.1"
 paimon-vindex-core = "0.4.0"

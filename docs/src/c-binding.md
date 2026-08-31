@@ -176,6 +176,60 @@ paimon_option options[] = {
 paimon_result_catalog_new result = paimon_catalog_create(options, 3);
 ```
 
+## Caller-managed File Cache
+
+Native engines can create a reusable `paimon_file_io` and connect Paimon reads
+to their own block-cache framework. The callback table is versioned so future
+extensions do not change an existing C ABI:
+
+```c
+paimon_file_cache_callbacks_v1 cache = {
+    .context = engine_cache,
+    .get = engine_cache_get,
+    .put = engine_cache_put,
+    .invalidate_path = engine_cache_invalidate_path,
+    .invalidate_prefix = engine_cache_invalidate_prefix,
+    .destroy = engine_cache_release,
+};
+
+paimon_result_file_io_new io_result =
+    paimon_file_io_create_with_cache_v1(
+        "s3://bucket/table",
+        storage_options,
+        storage_options_len,
+        &cache,
+        1024 * 1024,
+        "meta,global-index");
+CHECK_RESULT(io_result);
+
+paimon_result_get_table table_result =
+    paimon_table_from_schema_json_with_file_io(
+        io_result.file_io,
+        "s3://bucket/table",
+        table_schema_json,
+        "default",
+        "orders",
+        NULL);
+CHECK_RESULT(table_result);
+
+// The table retained a FileIO clone.
+paimon_file_io_free(io_result.file_io);
+```
+
+`get` receives an output buffer with exactly `length` writable bytes. It returns
+the number of bytes copied, `-1` for a miss, or any other negative value for a
+fail-open error. A nonnegative value different from `length` is also treated as
+a miss. `put` and invalidation failures are ignored so object storage remains
+the source of truth.
+
+Callbacks may execute concurrently on arbitrary blocking-worker threads and
+must not throw or unwind across the C ABI. Callback cache keys use
+`path_data + path_length` rather than null-terminated strings because canonical
+storage keys may contain embedded NUL separators. Paths and buffers are borrowed
+only for the duration of each call. After successful FileIO creation, Paimon
+owns `context`; `destroy` runs exactly once after the FileIO handle and all
+tables cloned from it have been freed.
+
 ## Reading Arrow Record Batches
 
 Paimon uses a **scan-then-read** flow. A scan creates a plan, and a table read

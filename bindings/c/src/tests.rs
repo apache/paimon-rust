@@ -26,11 +26,13 @@
 //! must NOT wrap C FFI calls inside another `block_on`. Use the global
 //! runtime only for Rust-API setup (write_data_rust, setup_table_dirs).
 
+use std::collections::HashMap;
 use std::ffi::{c_void, CString};
 use std::mem::ManuallyDrop;
 use std::process::Command;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use arrow::buffer::NullBuffer;
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -42,6 +44,7 @@ use paimon::spec::{CommitKind, DataType, IntType, Schema, TableSchema, VarCharTy
 use paimon::table::{SnapshotManager, Table};
 
 use crate::error::*;
+use crate::file_io::*;
 use crate::table::*;
 use crate::types::*;
 use crate::vector_search::*;
@@ -345,6 +348,304 @@ unsafe fn read_rows_ffi(table: *const paimon_table) -> Vec<(i32, String)> {
 // =========================================================================
 //  Catalog-free table construction tests
 // =========================================================================
+
+#[derive(Default)]
+struct TestFileCacheState {
+    blocks: Mutex<HashMap<(String, u64), Vec<u8>>>,
+    hits: AtomicUsize,
+    misses: AtomicUsize,
+    puts: AtomicUsize,
+    invalidations: AtomicUsize,
+    destroys: AtomicUsize,
+}
+
+struct TestFileCacheContext {
+    state: Arc<TestFileCacheState>,
+}
+
+unsafe extern "C" fn test_file_cache_get(
+    context: *mut c_void,
+    path_data: *const u8,
+    path_length: usize,
+    offset: u64,
+    length: usize,
+    output: *mut u8,
+) -> i64 {
+    let context = &*(context as *const TestFileCacheContext);
+    let path =
+        String::from_utf8_lossy(std::slice::from_raw_parts(path_data, path_length)).into_owned();
+    let blocks = context.state.blocks.lock().unwrap();
+    let Some(data) = blocks
+        .get(&(path, offset))
+        .filter(|data| data.len() == length)
+    else {
+        context.state.misses.fetch_add(1, Ordering::SeqCst);
+        return -1;
+    };
+    ptr::copy_nonoverlapping(data.as_ptr(), output, length);
+    context.state.hits.fetch_add(1, Ordering::SeqCst);
+    length as i64
+}
+
+unsafe extern "C" fn test_file_cache_short_get(
+    _context: *mut c_void,
+    _path_data: *const u8,
+    _path_length: usize,
+    _offset: u64,
+    length: usize,
+    output: *mut u8,
+) -> i64 {
+    if length > 0 {
+        output.write(0);
+    }
+    length.saturating_sub(1) as i64
+}
+
+unsafe extern "C" fn test_file_cache_put(
+    context: *mut c_void,
+    path_data: *const u8,
+    path_length: usize,
+    offset: u64,
+    data: *const u8,
+    length: usize,
+) -> i32 {
+    let context = &*(context as *const TestFileCacheContext);
+    let path =
+        String::from_utf8_lossy(std::slice::from_raw_parts(path_data, path_length)).into_owned();
+    let data = std::slice::from_raw_parts(data, length).to_vec();
+    context
+        .state
+        .blocks
+        .lock()
+        .unwrap()
+        .insert((path, offset), data);
+    context.state.puts.fetch_add(1, Ordering::SeqCst);
+    0
+}
+
+unsafe extern "C" fn test_file_cache_invalidate_path(
+    context: *mut c_void,
+    path_data: *const u8,
+    path_length: usize,
+) -> i32 {
+    let context = &*(context as *const TestFileCacheContext);
+    let path =
+        String::from_utf8_lossy(std::slice::from_raw_parts(path_data, path_length)).into_owned();
+    context
+        .state
+        .blocks
+        .lock()
+        .unwrap()
+        .retain(|(cached_path, _), _| cached_path != &path);
+    context.state.invalidations.fetch_add(1, Ordering::SeqCst);
+    0
+}
+
+unsafe extern "C" fn test_file_cache_invalidate_prefix(
+    context: *mut c_void,
+    prefix_data: *const u8,
+    prefix_length: usize,
+) -> i32 {
+    let context = &*(context as *const TestFileCacheContext);
+    let prefix = String::from_utf8_lossy(std::slice::from_raw_parts(prefix_data, prefix_length))
+        .into_owned();
+    context
+        .state
+        .blocks
+        .lock()
+        .unwrap()
+        .retain(|(cached_path, _), _| !cached_path.starts_with(&prefix));
+    context.state.invalidations.fetch_add(1, Ordering::SeqCst);
+    0
+}
+
+unsafe extern "C" fn test_file_cache_destroy(context: *mut c_void) {
+    let context = Box::from_raw(context as *mut TestFileCacheContext);
+    context.state.destroys.fetch_add(1, Ordering::SeqCst);
+}
+
+fn test_file_cache_callbacks(state: Arc<TestFileCacheState>) -> paimon_file_cache_callbacks_v1 {
+    paimon_file_cache_callbacks_v1 {
+        context: Box::into_raw(Box::new(TestFileCacheContext { state })) as *mut c_void,
+        get: Some(test_file_cache_get),
+        put: Some(test_file_cache_put),
+        invalidate_path: Some(test_file_cache_invalidate_path),
+        invalidate_prefix: Some(test_file_cache_invalidate_prefix),
+        destroy: Some(test_file_cache_destroy),
+    }
+}
+
+#[test]
+fn test_file_io_external_cache_miss_populates_and_hit_reuses_blocks() {
+    let state = Arc::new(TestFileCacheState::default());
+    let callbacks = test_file_cache_callbacks(state.clone());
+    let root = CString::new("memory:/ffi_external_cache").unwrap();
+    let whitelist = CString::new("meta").unwrap();
+
+    unsafe {
+        let result = paimon_file_io_create_with_cache_v1(
+            root.as_ptr(),
+            ptr::null(),
+            0,
+            &callbacks,
+            4,
+            whitelist.as_ptr(),
+        );
+        assert!(result.error.is_null());
+        let file_io = file_io_ref(result.file_io);
+        let path = "memory:/ffi_external_cache/snapshot/snapshot-1";
+        crate::runtime()
+            .block_on(
+                file_io
+                    .new_output(path)
+                    .unwrap()
+                    .write(bytes::Bytes::from_static(b"abcdefgh")),
+            )
+            .unwrap();
+
+        let first = crate::runtime()
+            .block_on(file_io.new_input(path).unwrap().read())
+            .unwrap();
+        let second = crate::runtime()
+            .block_on(file_io.new_input(path).unwrap().read())
+            .unwrap();
+        assert_eq!(first.as_ref(), b"abcdefgh");
+        assert_eq!(second.as_ref(), b"abcdefgh");
+        assert_eq!(state.puts.load(Ordering::SeqCst), 2);
+        assert!(state.misses.load(Ordering::SeqCst) >= 1);
+        assert_eq!(state.hits.load(Ordering::SeqCst), 2);
+        assert_eq!(state.invalidations.load(Ordering::SeqCst), 1);
+
+        paimon_file_io_free(result.file_io);
+        assert_eq!(state.destroys.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn test_table_with_file_io_retains_cache_context_until_table_is_freed() {
+    let state = Arc::new(TestFileCacheState::default());
+    let callbacks = test_file_cache_callbacks(state.clone());
+    let path = CString::new("memory:/ffi_file_io_table").unwrap();
+    let file_io = unsafe {
+        paimon_file_io_create_with_cache_v1(
+            path.as_ptr(),
+            ptr::null(),
+            0,
+            &callbacks,
+            4,
+            ptr::null(),
+        )
+    };
+    assert!(file_io.error.is_null());
+
+    let schema_json = CString::new(serde_json::to_string(&simple_table_schema()).unwrap()).unwrap();
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("test").unwrap();
+    unsafe {
+        let table = paimon_table_from_schema_json_with_file_io(
+            file_io.file_io,
+            path.as_ptr(),
+            schema_json.as_ptr(),
+            database.as_ptr(),
+            table_name.as_ptr(),
+            ptr::null(),
+        );
+        assert!(table.error.is_null());
+
+        paimon_file_io_free(file_io.file_io);
+        assert_eq!(state.destroys.load(Ordering::SeqCst), 0);
+        paimon_table_free(table.table);
+        assert_eq!(state.destroys.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn test_file_io_external_cache_rejects_invalid_callback_contract() {
+    let path = CString::new("memory:/ffi_invalid_cache").unwrap();
+    let callbacks = paimon_file_cache_callbacks_v1 {
+        context: ptr::null_mut(),
+        get: None,
+        put: None,
+        invalidate_path: None,
+        invalidate_prefix: None,
+        destroy: None,
+    };
+    unsafe {
+        let missing_get = paimon_file_io_create_with_cache_v1(
+            path.as_ptr(),
+            ptr::null(),
+            0,
+            &callbacks,
+            4,
+            ptr::null(),
+        );
+        assert!(missing_get.file_io.is_null());
+        assert_eq!(
+            (*missing_get.error).code,
+            PaimonErrorCode::InvalidInput as i32
+        );
+        paimon_error_free(missing_get.error);
+
+        let zero_block = paimon_file_io_create_with_cache_v1(
+            path.as_ptr(),
+            ptr::null(),
+            0,
+            &paimon_file_cache_callbacks_v1 {
+                get: Some(test_file_cache_get),
+                ..callbacks
+            },
+            0,
+            ptr::null(),
+        );
+        assert!(zero_block.file_io.is_null());
+        assert_eq!(
+            (*zero_block.error).code,
+            PaimonErrorCode::InvalidInput as i32
+        );
+        paimon_error_free(zero_block.error);
+    }
+}
+
+#[test]
+fn test_file_io_external_cache_short_hit_fails_open_to_storage() {
+    let callbacks = paimon_file_cache_callbacks_v1 {
+        context: ptr::null_mut(),
+        get: Some(test_file_cache_short_get),
+        put: None,
+        invalidate_path: None,
+        invalidate_prefix: None,
+        destroy: None,
+    };
+    let root = CString::new("memory:/ffi_short_cache_hit").unwrap();
+    let whitelist = CString::new("meta").unwrap();
+    unsafe {
+        let result = paimon_file_io_create_with_cache_v1(
+            root.as_ptr(),
+            ptr::null(),
+            0,
+            &callbacks,
+            4,
+            whitelist.as_ptr(),
+        );
+        assert!(result.error.is_null());
+        let file_io = file_io_ref(result.file_io);
+        let path = "memory:/ffi_short_cache_hit/snapshot/snapshot-1";
+        crate::runtime()
+            .block_on(
+                file_io
+                    .new_output(path)
+                    .unwrap()
+                    .write(bytes::Bytes::from_static(b"source")),
+            )
+            .unwrap();
+
+        let actual = crate::runtime()
+            .block_on(file_io.new_input(path).unwrap().read())
+            .unwrap();
+        assert_eq!(actual.as_ref(), b"source");
+        paimon_file_io_free(result.file_io);
+    }
+}
 
 #[test]
 fn test_table_from_schema_json_preserves_resolved_schema_and_branch() {
@@ -2222,8 +2523,6 @@ fn test_two_commits_same_builder() {
 //
 // The materialized stream carries the user table columns plus a unified
 // `__paimon_search_score` Float32 column; row order is best-first.
-
-use std::collections::HashMap;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
 use arrow_array::{ArrayRef, Float32Array};

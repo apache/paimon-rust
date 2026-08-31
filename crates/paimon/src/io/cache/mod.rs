@@ -25,6 +25,7 @@ use self::file_type::FileType;
 use self::memory::MemoryCache;
 use self::state::{BlockKey, CacheCoordinator, CacheReadToken};
 use crate::common::{CatalogOptions, Options};
+use crate::io::FileBlockCache;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -50,9 +51,30 @@ pub(crate) struct LocalCache {
 enum CacheBackend {
     Memory(MemoryCache),
     Disk(Arc<DiskCache>),
+    External(Arc<dyn FileBlockCache>),
 }
 
 impl LocalCache {
+    pub(in crate::io) fn external(
+        cache: Arc<dyn FileBlockCache>,
+        block_size: u64,
+        whitelist: &str,
+    ) -> crate::Result<Self> {
+        if block_size == 0 {
+            return Err(crate::Error::ConfigInvalid {
+                message: "External file cache block size must be greater than zero".to_string(),
+            });
+        }
+        Ok(Self {
+            backend: CacheBackend::External(cache),
+            coordinator: Arc::new(CacheCoordinator::default()),
+            namespace: String::new(),
+            block_size,
+            whitelist: FileType::parse_whitelist(whitelist),
+            file_size_capacity: DEFAULT_FILE_SIZE_CAPACITY,
+        })
+    }
+
     pub(super) fn new(config: LocalCacheConfig) -> crate::Result<Self> {
         let file_size_capacity = config
             .max_size
@@ -92,7 +114,12 @@ impl LocalCache {
         !FileType::is_mutable(path) && self.whitelist.contains(&FileType::classify(path))
     }
 
-    async fn get_block(&self, key: &BlockKey, token: &CacheReadToken) -> Option<bytes::Bytes> {
+    async fn get_block(
+        &self,
+        key: &BlockKey,
+        expected_len: usize,
+        token: &CacheReadToken,
+    ) -> Option<bytes::Bytes> {
         let _prefix_guard = self.coordinator.prefix_read_guard().await;
         let _publish_guard = token.publish_guard().await;
         if !token.is_current() {
@@ -101,6 +128,12 @@ impl LocalCache {
         let payload = match &self.backend {
             CacheBackend::Memory(memory) => memory.get_block(key),
             CacheBackend::Disk(disk) => disk.get_block(key).await,
+            CacheBackend::External(cache) => {
+                let start = key.block_index.checked_mul(key.block_size)?;
+                let length = u64::try_from(expected_len).ok()?;
+                let end = start.checked_add(length)?;
+                cache.get(&key.path, start..end).await
+            }
         };
         if token.is_current() {
             payload
@@ -118,6 +151,11 @@ impl LocalCache {
         match &self.backend {
             CacheBackend::Memory(memory) => memory.put_block(key, payload),
             CacheBackend::Disk(disk) => disk.put_block(key, payload).await,
+            CacheBackend::External(cache) => {
+                if let Some(offset) = key.block_index.checked_mul(key.block_size) {
+                    cache.put(&key.path, offset, payload).await;
+                }
+            }
         }
     }
 
@@ -125,6 +163,7 @@ impl LocalCache {
         match &self.backend {
             CacheBackend::Memory(memory) => memory.remove_block(key),
             CacheBackend::Disk(disk) => disk.remove_block(key).await,
+            CacheBackend::External(cache) => cache.invalidate_path(&key.path).await,
         }
     }
 
@@ -167,6 +206,7 @@ impl LocalCache {
         match &self.backend {
             CacheBackend::Memory(memory) => memory.invalidate_path(&self.namespace, path),
             CacheBackend::Disk(disk) => disk.invalidate_path(&self.namespace, path).await,
+            CacheBackend::External(cache) => cache.invalidate_path(path).await,
         }
     }
 
@@ -181,6 +221,7 @@ impl LocalCache {
         match &self.backend {
             CacheBackend::Memory(memory) => memory.invalidate_prefix(&self.namespace, prefix),
             CacheBackend::Disk(disk) => disk.invalidate_prefix(&self.namespace, prefix).await,
+            CacheBackend::External(cache) => cache.invalidate_prefix(prefix).await,
         }
     }
 }
