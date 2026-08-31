@@ -23,7 +23,7 @@
 use super::bucket_filter::compute_target_buckets;
 use super::format_table_scan::FormatTableScan;
 use super::global_index_scanner::RowRangeIndex;
-use super::global_index_types::normalize_sorted_global_index_type;
+use super::global_index_types::normalize_queryable_global_index_type;
 use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
 use super::stats_filter::{
@@ -413,7 +413,7 @@ fn retain_index_manifest_entry(
     entry.kind == FileKind::Add
         && ((deletion_vectors_needed && entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
             || (global_index_needed
-                && normalize_sorted_global_index_type(&entry.index_file.index_type).is_some()))
+                && normalize_queryable_global_index_type(&entry.index_file.index_type).is_some()))
 }
 
 fn retain_index_manifest_entry_for_scan(
@@ -431,7 +431,7 @@ fn retain_index_manifest_entry_for_scan(
             return Ok(false);
         }
     }
-    if normalize_sorted_global_index_type(&entry.index_file.index_type).is_none() {
+    if normalize_queryable_global_index_type(&entry.index_file.index_type).is_none() {
         return Ok(true);
     }
     let Some(global_index) = entry.index_file.global_index_meta.as_ref() else {
@@ -1322,6 +1322,14 @@ impl<'a> PaimonTableScan<'a> {
                 btree_fallback_scan_max_size: core_options.btree_index_fallback_scan_max_size()?,
                 bitmap_fallback_scan_max_size: core_options
                     .bitmap_index_fallback_scan_max_size()?,
+                fm_read_options: if index_entries
+                    .iter()
+                    .any(|entry| entry.index_file.index_type.eq_ignore_ascii_case("fm"))
+                {
+                    crate::fm_index::FMOptions::from_options(self.table.schema().options())?.read
+                } else {
+                    crate::fm_index::FMReadOptions::default()
+                },
                 next_row_id: snapshot.next_row_id(),
                 data_ranges,
             },

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Global index scanner: evaluates predicates against sorted global indexes
+//! Global index scanner: evaluates predicates against queryable global indexes
 //! to produce row ID ranges for data evolution tables.
 //!
 //! Reference: [org.apache.paimon.index.GlobalIndexScanner](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/index/GlobalIndexScanner.java)
@@ -25,12 +25,13 @@ use super::bitmap_global_index_format::{
 };
 use super::bitmap_global_index_reader::BitmapGlobalIndexReader;
 use super::global_index_types::{
-    normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
-    MULTIVALUE_GLOBAL_INDEX_TYPE,
+    normalize_queryable_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
+    FM_GLOBAL_INDEX_TYPE, MULTIVALUE_GLOBAL_INDEX_TYPE,
 };
 use crate::btree::query::{extract_between, BetweenInfo, IndexQuery};
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexMeta, BTreeIndexReader};
 use crate::deletion_vector::DeletionVectorFactory;
+use crate::fm_index::{manifest_row_range, FMGlobalIndexReader, FMReadContext, FMReadOptions};
 use crate::io::FileIO;
 use crate::spec::{
     DataField, DataType, Datum, FileKind, GlobalIndexSearchMode, IndexFileMeta, IndexManifestEntry,
@@ -116,13 +117,14 @@ impl Drop for QueryIoProbeGuard<'_> {
 struct GlobalIndexScanResult {
     row_ranges: Vec<RowRange>,
     evaluated_field_ids: HashSet<i32>,
+    indexed_coverage: Vec<RowRange>,
 }
 
 /// Evaluates global index predicates and returns matching row ranges.
 ///
 /// The scanner filters index manifest entries for global index files,
-/// uses BTreeIndexMeta for file-level pruning, then reads matching
-/// BTree or bitmap files to evaluate predicates and collect row IDs.
+/// uses type-specific metadata for file-level pruning, then reads matching
+/// BTree, bitmap, multivalue, or FM files to evaluate predicates and collect row IDs.
 /// Opened BTreeIndexReaders are cached for reuse across evaluations.
 pub(crate) struct GlobalIndexScanner {
     file_io: FileIO,
@@ -132,9 +134,12 @@ pub(crate) struct GlobalIndexScanner {
     query_semaphore: Arc<Semaphore>,
     btree_fallback_scan_max_size: i64,
     bitmap_fallback_scan_max_size: i64,
+    fm_read_options: FMReadOptions,
+    fm_read_context: Arc<FMReadContext>,
     /// Global index entries grouped by field_id.
     entries_by_field: Vec<(i32, Vec<GlobalIndexEntry>)>,
     /// Indexed row-id coverage grouped by field_id.
+    #[cfg(test)]
     coverage_by_field: HashMap<i32, Vec<RowRange>>,
     /// Schema fields for field_id lookup.
     schema_fields: Vec<DataField>,
@@ -150,7 +155,110 @@ struct GlobalIndexEntry {
     index_type: GlobalIndexFileKind,
     file_size: i64,
     row_range_start: i64,
-    meta: BTreeIndexMeta,
+    row_range_end: i64,
+    meta: GlobalIndexEntryMeta,
+}
+
+fn sorted_entry_meta(entry: &GlobalIndexEntry) -> &BTreeIndexMeta {
+    match &entry.meta {
+        GlobalIndexEntryMeta::Sorted(meta) => meta,
+        GlobalIndexEntryMeta::FM { .. } => unreachable!("FM entries do not have sorted metadata"),
+    }
+}
+
+enum GlobalIndexEntryMeta {
+    Sorted(BTreeIndexMeta),
+    FM {
+        bytes: Vec<u8>,
+        first_row_id: u64,
+        row_count: u64,
+    },
+}
+
+struct FMFileRowRange<'a> {
+    file_name: &'a str,
+    first_row_id: u64,
+    row_count: u64,
+}
+
+fn validate_fm_file_sets(entries_by_field: &HashMap<i32, Vec<GlobalIndexEntry>>) -> Result<()> {
+    for (field_id, entries) in entries_by_field {
+        let mut groups: HashMap<(i64, i64), Vec<FMFileRowRange<'_>>> = HashMap::new();
+        for entry in entries {
+            let GlobalIndexEntryMeta::FM {
+                first_row_id,
+                row_count,
+                ..
+            } = &entry.meta
+            else {
+                continue;
+            };
+            groups
+                .entry((entry.row_range_start, entry.row_range_end))
+                .or_default()
+                .push(FMFileRowRange {
+                    file_name: &entry.file_name,
+                    first_row_id: *first_row_id,
+                    row_count: *row_count,
+                });
+        }
+
+        for ((range_start, range_end), mut files) in groups {
+            let expected_row_count = range_end
+                .checked_sub(range_start)
+                .and_then(|count| count.checked_add(1))
+                .and_then(|count| u64::try_from(count).ok())
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "Invalid FM global index source row range [{range_start}, {range_end}] for field {field_id}"
+                    ),
+                    source: None,
+                })?;
+            files.sort_unstable_by_key(|file| file.first_row_id);
+            let mut expected_first_row_id = 0u64;
+            for file in files {
+                let FMFileRowRange {
+                    file_name,
+                    first_row_id,
+                    row_count,
+                } = file;
+                if row_count == 0 || first_row_id != expected_first_row_id {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "FM global index files do not exactly cover source row range [{range_start}, {range_end}] for field {field_id}: expected relative row {expected_first_row_id}, file '{file_name}' starts at {first_row_id}"
+                        ),
+                        source: None,
+                    });
+                }
+                expected_first_row_id =
+                    first_row_id
+                        .checked_add(row_count)
+                        .ok_or_else(|| Error::DataInvalid {
+                            message: format!(
+                                "FM global index row range overflows for file '{file_name}'"
+                            ),
+                            source: None,
+                        })?;
+                if expected_first_row_id > expected_row_count {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "FM global index file '{file_name}' extends beyond source row range [{range_start}, {range_end}]"
+                        ),
+                        source: None,
+                    });
+                }
+            }
+            if expected_first_row_id != expected_row_count {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "FM global index files cover {expected_first_row_id} rows, expected {expected_row_count} for source row range [{range_start}, {range_end}] and field {field_id}"
+                    ),
+                    source: None,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +266,7 @@ enum GlobalIndexFileKind {
     BTree,
     Bitmap,
     Multivalue,
+    FM,
 }
 
 fn is_floating_point(data_type: &DataType) -> bool {
@@ -220,6 +329,7 @@ impl GlobalIndexFileKind {
             Self::BTree => "BTree",
             Self::Bitmap => "bitmap",
             Self::Multivalue => "multivalue",
+            Self::FM => "FM",
         }
     }
 }
@@ -227,6 +337,7 @@ impl GlobalIndexFileKind {
 enum OpenedGlobalIndexReader {
     BTree(BTreeIndexReader<BoxedCmp>),
     Bitmap(BitmapGlobalIndexReader),
+    FM(FMGlobalIndexReader),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -244,11 +355,17 @@ struct EntryQueryPlan {
     matching_predicates: Vec<usize>,
 }
 
+struct EntryQueryResult {
+    bitmap: Option<RoaringTreemap>,
+    declined: bool,
+}
+
 impl FallbackScanPlan {
     fn allowed(self, kind: GlobalIndexFileKind) -> bool {
         match kind {
             GlobalIndexFileKind::BTree => self.allow_btree,
             GlobalIndexFileKind::Bitmap | GlobalIndexFileKind::Multivalue => self.allow_bitmap,
+            GlobalIndexFileKind::FM => true,
         }
     }
 }
@@ -259,10 +376,26 @@ impl OpenedGlobalIndexReader {
         op: PredicateOperator,
         literals: &[Datum],
         data_type: &DataType,
-    ) -> std::io::Result<RoaringTreemap> {
+    ) -> std::io::Result<Option<RoaringTreemap>> {
         match self {
-            Self::BTree(reader) => reader.query(op, literals, data_type).await,
-            Self::Bitmap(reader) => reader.query(op, literals, data_type).await,
+            Self::BTree(reader) => reader.query(op, literals, data_type).await.map(Some),
+            Self::Bitmap(reader) => reader.query(op, literals, data_type).await.map(Some),
+            Self::FM(reader) => match op {
+                PredicateOperator::Contains => {
+                    let literal = literals.first().ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "FM contains requires one literal",
+                        )
+                    })?;
+                    reader
+                        .contains(&serialize_bitmap_datum(literal, data_type))
+                        .await
+                }
+                PredicateOperator::IsNull => reader.is_null().await.map(Some),
+                PredicateOperator::IsNotNull => reader.is_not_null().await.map(Some),
+                _ => Ok(None),
+            },
         }
     }
 
@@ -285,6 +418,10 @@ impl OpenedGlobalIndexReader {
                     .range_query(from, to, data_type, from_inclusive, to_inclusive)
                     .await
             }
+            Self::FM(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "FM index does not support ordered range queries",
+            )),
         }
     }
 }
@@ -292,6 +429,7 @@ impl OpenedGlobalIndexReader {
 impl GlobalIndexScanner {
     /// Create a scanner from index manifest entries.
     /// Returns `Ok(None)` if there are no global index entries.
+    #[cfg(test)]
     pub(crate) fn create(
         file_io: &FileIO,
         table_path: &str,
@@ -300,6 +438,29 @@ impl GlobalIndexScanner {
         bitmap_fallback_scan_max_size: i64,
         index_entries: &[IndexManifestEntry],
         schema_fields: &[DataField],
+    ) -> Result<Option<Self>> {
+        Self::create_with_fm_options(
+            file_io,
+            table_path,
+            global_index_thread_num,
+            btree_fallback_scan_max_size,
+            bitmap_fallback_scan_max_size,
+            index_entries,
+            schema_fields,
+            FMReadOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_with_fm_options(
+        file_io: &FileIO,
+        table_path: &str,
+        global_index_thread_num: usize,
+        btree_fallback_scan_max_size: i64,
+        bitmap_fallback_scan_max_size: i64,
+        index_entries: &[IndexManifestEntry],
+        schema_fields: &[DataField],
+        fm_read_options: FMReadOptions,
     ) -> Result<Option<Self>> {
         if global_index_thread_num == 0 {
             return Err(Error::DataInvalid {
@@ -318,13 +479,15 @@ impl GlobalIndexScanner {
         }
         let mut entries_by_field: std::collections::HashMap<i32, Vec<GlobalIndexEntry>> =
             std::collections::HashMap::new();
+        #[cfg(test)]
         let mut coverage_by_field: HashMap<i32, Vec<RowRange>> = HashMap::new();
 
         for entry in index_entries {
             if entry.kind != FileKind::Add {
                 continue;
             }
-            let Some(index_type) = normalize_sorted_global_index_type(&entry.index_file.index_type)
+            let Some(index_type) =
+                normalize_queryable_global_index_type(&entry.index_file.index_type)
             else {
                 continue;
             };
@@ -335,7 +498,7 @@ impl GlobalIndexScanner {
                     .as_ref()
                     .ok_or_else(|| Error::DataInvalid {
                         message: format!(
-                            "Missing global index metadata for sorted index file '{}'",
+                            "Missing global index metadata for queryable index file '{}'",
                             entry.index_file.file_name
                         ),
                         source: None,
@@ -346,38 +509,78 @@ impl GlobalIndexScanner {
                 .as_ref()
                 .ok_or_else(|| Error::DataInvalid {
                     message: format!(
-                        "Missing sorted global index metadata for file '{}'",
+                        "Missing queryable global index metadata for file '{}'",
                         entry.index_file.file_name
                     ),
                     source: None,
                 })?;
-            let sorted_meta =
-                BTreeIndexMeta::deserialize(index_meta).map_err(|error| Error::DataInvalid {
-                    message: format!(
-                        "Invalid sorted global index metadata for file '{}'",
-                        entry.index_file.file_name
-                    ),
-                    source: Some(Box::new(error)),
-                })?;
+            let kind = match index_type {
+                BTREE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::BTree,
+                BITMAP_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Bitmap,
+                MULTIVALUE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Multivalue,
+                FM_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::FM,
+                _ => unreachable!("normalized queryable global index type"),
+            };
+            let parsed_meta = if kind == GlobalIndexFileKind::FM {
+                let (first_row_id, row_count) =
+                    manifest_row_range(index_meta).map_err(|error| Error::DataInvalid {
+                        message: format!(
+                            "Invalid FM global index metadata for file '{}'",
+                            entry.index_file.file_name
+                        ),
+                        source: Some(Box::new(error)),
+                    })?;
+                let manifest_row_count =
+                    i64::try_from(row_count).map_err(|_| Error::DataInvalid {
+                        message: format!(
+                            "FM global index row count does not fit i64 for file '{}'",
+                            entry.index_file.file_name
+                        ),
+                        source: None,
+                    })?;
+                if entry.index_file.row_count != manifest_row_count {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "FM global index row count mismatch for file '{}': manifest={}, file={}",
+                            entry.index_file.file_name, row_count, entry.index_file.row_count
+                        ),
+                        source: None,
+                    });
+                }
+                GlobalIndexEntryMeta::FM {
+                    bytes: index_meta.clone(),
+                    first_row_id,
+                    row_count,
+                }
+            } else {
+                GlobalIndexEntryMeta::Sorted(BTreeIndexMeta::deserialize(index_meta).map_err(
+                    |error| Error::DataInvalid {
+                        message: format!(
+                            "Invalid sorted global index metadata for file '{}'",
+                            entry.index_file.file_name
+                        ),
+                        source: Some(Box::new(error)),
+                    },
+                )?)
+            };
 
             let resolved = GlobalIndexEntry {
                 file_name: entry.index_file.file_name.clone(),
-                index_type: match index_type {
-                    BTREE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::BTree,
-                    BITMAP_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Bitmap,
-                    MULTIVALUE_GLOBAL_INDEX_TYPE => GlobalIndexFileKind::Multivalue,
-                    _ => unreachable!("normalized sorted global index type"),
-                },
+                index_type: kind,
                 file_size: entry.index_file.file_size,
                 row_range_start: global_meta.row_range_start,
-                meta: sorted_meta,
+                row_range_end: global_meta.row_range_end,
+                meta: parsed_meta,
             };
 
+            #[cfg(test)]
             let row_range = RowRange::new(global_meta.row_range_start, global_meta.row_range_end);
+            #[cfg(test)]
             coverage_by_field
                 .entry(global_meta.index_field_id)
                 .or_default()
                 .push(row_range.clone());
+            #[cfg(test)]
             if let Some(extra_field_ids) = global_meta.extra_field_ids.as_ref() {
                 for extra_field_id in extra_field_ids {
                     coverage_by_field
@@ -393,6 +596,8 @@ impl GlobalIndexScanner {
                 .push(resolved);
         }
 
+        validate_fm_file_sets(&entries_by_field)?;
+
         if entries_by_field.is_empty() {
             return Ok(None);
         }
@@ -404,7 +609,10 @@ impl GlobalIndexScanner {
             query_semaphore: Arc::new(Semaphore::new(global_index_thread_num)),
             btree_fallback_scan_max_size,
             bitmap_fallback_scan_max_size,
+            fm_read_options,
+            fm_read_context: Arc::new(FMReadContext::new(fm_read_options.cache_size)),
             entries_by_field: entries_by_field.into_iter().collect(),
+            #[cfg(test)]
             coverage_by_field,
             schema_fields: schema_fields.to_vec(),
             reader_cache: Mutex::new(HashMap::new()),
@@ -440,12 +648,15 @@ impl GlobalIndexScanner {
                     if !entries_support_predicate(entries, *op, literals) {
                         return Ok(None);
                     }
-                    self.evaluate_leaf(entries, &[(*op, literals.as_slice(), data_type)])
+                    let predicates = [(*op, literals.as_slice(), data_type)];
+                    let selected_entries = select_entries_for_predicates(entries, &predicates);
+                    self.evaluate_leaf(&selected_entries, &predicates)
                         .await
-                        .map(|ranges| {
-                            ranges.map(|row_ranges| GlobalIndexScanResult {
+                        .map(|result| {
+                            result.map(|(row_ranges, indexed_coverage)| GlobalIndexScanResult {
                                 row_ranges,
                                 evaluated_field_ids: HashSet::from([field_id]),
+                                indexed_coverage,
                             })
                         })
                 }
@@ -488,29 +699,57 @@ impl GlobalIndexScanner {
                     for (field_id, predicates) in &leaf_groups {
                         if let Some(entries) = self.entries_for_field(*field_id) {
                             let field_id = *field_id;
-                            let predicates = predicates.as_slice();
+                            let mut selected_predicates = predicates.clone();
+                            let mut selected_entries =
+                                select_entries_for_predicates(entries, &selected_predicates);
+                            if selected_entries.is_empty() {
+                                for predicate in predicates {
+                                    let candidate_predicates = vec![*predicate];
+                                    let candidate_entries = select_entries_for_predicates(
+                                        entries,
+                                        &candidate_predicates,
+                                    );
+                                    if !candidate_entries.is_empty() {
+                                        selected_predicates = candidate_predicates;
+                                        selected_entries = candidate_entries;
+                                        break;
+                                    }
+                                }
+                            }
                             leaf_futures.push(async move {
-                                let ranges = self.evaluate_leaf(entries, predicates).await?;
-                                Ok((field_id, ranges))
+                                let result = self
+                                    .evaluate_leaf(&selected_entries, &selected_predicates)
+                                    .await?;
+                                Ok((field_id, result))
                             });
                         }
                     }
                     let leaf_group_count = leaf_futures.len();
-                    let (mut row_ranges, mut evaluated_field_ids) = try_fold_bounded(
-                        leaf_futures,
-                        leaf_group_count.max(1),
-                        (None::<Vec<RowRange>>, HashSet::new()),
-                        |(row_ranges, evaluated_field_ids), (field_id, ranges)| {
-                            if let Some(ranges) = ranges {
-                                *row_ranges = Some(match row_ranges.take() {
-                                    None => ranges,
-                                    Some(existing) => intersect_sorted_ranges(&existing, &ranges),
-                                });
-                                evaluated_field_ids.insert(field_id);
-                            }
-                        },
-                    )
-                    .await?;
+                    let (mut row_ranges, mut indexed_coverage, mut evaluated_field_ids) =
+                        try_fold_bounded(
+                            leaf_futures,
+                            leaf_group_count.max(1),
+                            (None::<Vec<RowRange>>, None::<Vec<RowRange>>, HashSet::new()),
+                            |(row_ranges, indexed_coverage, evaluated_field_ids),
+                             (field_id, result)| {
+                                if let Some((ranges, coverage)) = result {
+                                    *row_ranges = Some(match row_ranges.take() {
+                                        None => ranges,
+                                        Some(existing) => {
+                                            intersect_sorted_ranges(&existing, &ranges)
+                                        }
+                                    });
+                                    *indexed_coverage = Some(match indexed_coverage.take() {
+                                        None => coverage,
+                                        Some(existing) => {
+                                            intersect_sorted_ranges(&existing, &coverage)
+                                        }
+                                    });
+                                    evaluated_field_ids.insert(field_id);
+                                }
+                            },
+                        )
+                        .await?;
 
                     // Evaluate non-leaf children recursively
                     for child in non_leaf_children {
@@ -522,22 +761,38 @@ impl GlobalIndexScanner {
                                 }
                             });
                             evaluated_field_ids.extend(child_result.evaluated_field_ids);
+                            indexed_coverage = Some(match indexed_coverage {
+                                None => child_result.indexed_coverage,
+                                Some(existing) => intersect_sorted_ranges(
+                                    &existing,
+                                    &child_result.indexed_coverage,
+                                ),
+                            });
                         }
                     }
 
                     Ok(row_ranges.map(|row_ranges| GlobalIndexScanResult {
                         row_ranges,
                         evaluated_field_ids,
+                        indexed_coverage: indexed_coverage.unwrap_or_default(),
                     }))
                 }
                 Predicate::Or(children) => {
                     let mut all_ranges: Vec<RowRange> = Vec::new();
                     let mut evaluated_field_ids = HashSet::new();
+                    let mut indexed_coverage: Option<Vec<RowRange>> = None;
                     for child in children {
                         match self.evaluate(child).await? {
                             Some(child_result) => {
                                 all_ranges.extend(child_result.row_ranges);
                                 evaluated_field_ids.extend(child_result.evaluated_field_ids);
+                                indexed_coverage = Some(match indexed_coverage {
+                                    None => child_result.indexed_coverage,
+                                    Some(existing) => intersect_sorted_ranges(
+                                        &existing,
+                                        &child_result.indexed_coverage,
+                                    ),
+                                });
                             }
                             None => return Ok(None),
                         }
@@ -550,6 +805,7 @@ impl GlobalIndexScanner {
                     Ok(Some(GlobalIndexScanResult {
                         row_ranges,
                         evaluated_field_ids,
+                        indexed_coverage: indexed_coverage.unwrap_or_default(),
                     }))
                 }
                 _ => Ok(None),
@@ -562,9 +818,9 @@ impl GlobalIndexScanner {
     /// Detects between patterns (GtEq/Gt + LtEq/Lt) and merges them into a single range query.
     async fn evaluate_leaf(
         &self,
-        entries: &[GlobalIndexEntry],
+        entries: &[&GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
-    ) -> Result<Option<Vec<RowRange>>> {
+    ) -> Result<Option<(Vec<RowRange>, Vec<RowRange>)>> {
         let normalized_predicates = predicates
             .iter()
             .map(|(op, literals, data_type)| {
@@ -628,21 +884,22 @@ impl GlobalIndexScanner {
                         .iter()
                         .map(|entry| match entry.index_type {
                             GlobalIndexFileKind::BTree => {
-                                entry.meta.may_match(*op, btree_serialized, btree_cmp)
+                                sorted_entry_meta(entry).may_match(*op, btree_serialized, btree_cmp)
                             }
                             GlobalIndexFileKind::Bitmap => bitmap_meta_may_match(
-                                &entry.meta,
+                                sorted_entry_meta(entry),
                                 *op,
                                 data_type,
                                 bitmap_serialized,
                                 bitmap_cmp.as_ref(),
                             ),
                             GlobalIndexFileKind::Multivalue => multivalue_meta_may_match(
-                                &entry.meta,
+                                sorted_entry_meta(entry),
                                 *op,
                                 bitmap_serialized,
                                 bitmap_cmp.as_ref(),
                             ),
+                            GlobalIndexFileKind::FM => true,
                         })
                         .collect()
                 },
@@ -657,35 +914,33 @@ impl GlobalIndexScanner {
             })
             .collect();
 
-        let between_matches_by_entry: Vec<bool> = match between.as_ref() {
-            Some(b) => {
-                let btree_cmp = make_key_comparator(b.data_type);
-                let btree_from = serialize_datum(b.from, b.data_type);
-                let btree_to = serialize_datum(b.to, b.data_type);
-                let bitmap_cmp = make_bitmap_key_comparator(b.data_type);
-                let bitmap_from = serialize_bitmap_datum(b.from, b.data_type);
-                let bitmap_to = serialize_bitmap_datum(b.to, b.data_type);
-                entries
-                    .iter()
-                    .map(|entry| match entry.index_type {
-                        GlobalIndexFileKind::BTree => {
-                            entry
-                                .meta
-                                .may_match_between(&btree_from, &btree_to, &btree_cmp)
-                        }
-                        GlobalIndexFileKind::Bitmap => bitmap_meta_may_match_between(
-                            &entry.meta,
-                            b.data_type,
-                            &bitmap_from,
-                            &bitmap_to,
-                            bitmap_cmp.as_ref(),
-                        ),
-                        GlobalIndexFileKind::Multivalue => false,
-                    })
-                    .collect()
-            }
-            None => Vec::new(),
-        };
+        let between_matches_by_entry: Vec<bool> =
+            match between.as_ref() {
+                Some(b) => {
+                    let btree_cmp = make_key_comparator(b.data_type);
+                    let btree_from = serialize_datum(b.from, b.data_type);
+                    let btree_to = serialize_datum(b.to, b.data_type);
+                    let bitmap_cmp = make_bitmap_key_comparator(b.data_type);
+                    let bitmap_from = serialize_bitmap_datum(b.from, b.data_type);
+                    let bitmap_to = serialize_bitmap_datum(b.to, b.data_type);
+                    entries
+                        .iter()
+                        .map(|entry| match entry.index_type {
+                            GlobalIndexFileKind::BTree => sorted_entry_meta(entry)
+                                .may_match_between(&btree_from, &btree_to, &btree_cmp),
+                            GlobalIndexFileKind::Bitmap => bitmap_meta_may_match_between(
+                                sorted_entry_meta(entry),
+                                b.data_type,
+                                &bitmap_from,
+                                &bitmap_to,
+                                bitmap_cmp.as_ref(),
+                            ),
+                            GlobalIndexFileKind::Multivalue | GlobalIndexFileKind::FM => false,
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
         let between_fallback_plan = between
             .as_ref()
             .map(|_| self.fallback_scan_plan(entries, &between_matches_by_entry));
@@ -784,12 +1039,16 @@ impl GlobalIndexScanner {
                     .await?;
                 Ok((entry.row_range_start, result))
             });
-        let all_row_ids = try_fold_bounded(
+        let (all_row_ids, declined) = try_fold_bounded(
             futures,
             self.global_index_thread_num,
-            RoaringTreemap::new(),
-            |all_row_ids, (row_range_start, file_result)| {
-                if let Some(bitmap) = file_result {
+            (RoaringTreemap::new(), false),
+            |(all_row_ids, declined), (row_range_start, file_result)| {
+                if file_result.declined {
+                    *declined = true;
+                    return;
+                }
+                if let Some(bitmap) = file_result.bitmap {
                     for row_id in bitmap.iter() {
                         all_row_ids.insert(row_id + row_range_start as u64);
                     }
@@ -798,7 +1057,17 @@ impl GlobalIndexScanner {
         )
         .await?;
 
-        Ok(Some(bitmap_to_ranges(&all_row_ids)))
+        if declined {
+            return Ok(None);
+        }
+
+        let coverage = super::merge_row_ranges(
+            entries
+                .iter()
+                .map(|entry| RowRange::new(entry.row_range_start, entry.row_range_end))
+                .collect(),
+        );
+        Ok(Some((bitmap_to_ranges(&all_row_ids), coverage)))
     }
 
     async fn query_entry(
@@ -808,14 +1077,11 @@ impl GlobalIndexScanner {
         between: Option<&BetweenInfo<'_>>,
         plan: &EntryQueryPlan,
         effective_predicates: &[(PredicateOperator, &[Datum], &DataType)],
-    ) -> Result<Option<RoaringTreemap>> {
+    ) -> Result<EntryQueryResult> {
         let mut reader = if (plan.between_matches && plan.between_evaluated)
             || !plan.matching_predicates.is_empty()
         {
-            Some(
-                self.open_reader_for_entry(entry, &entry.meta, data_type)
-                    .await?,
-            )
+            Some(self.open_reader_for_entry(entry, data_type).await?)
         } else {
             None
         };
@@ -828,6 +1094,7 @@ impl GlobalIndexScanner {
                 GlobalIndexFileKind::Bitmap | GlobalIndexFileKind::Multivalue => {
                     serialize_bitmap_datum
                 }
+                GlobalIndexFileKind::FM => unreachable!("FM range query was rejected in planning"),
             };
             let from_key = serialize_key(between.from, between.data_type);
             let to_key = serialize_key(between.to, between.data_type);
@@ -848,12 +1115,18 @@ impl GlobalIndexScanner {
 
         for &idx in &plan.matching_predicates {
             let (op, literals, data_type) = &effective_predicates[idx];
-            let bitmap = reader
+            let Some(bitmap) = reader
                 .as_ref()
                 .expect("reader is opened when predicates match")
                 .query(*op, literals, data_type)
                 .await
-                .map_err(|error| Self::query_error(entry, error))?;
+                .map_err(|error| Self::query_error(entry, error))?
+            else {
+                return Ok(EntryQueryResult {
+                    bitmap: None,
+                    declined: true,
+                });
+            };
             file_result = Some(match file_result {
                 None => bitmap,
                 Some(mut existing) => {
@@ -868,7 +1141,10 @@ impl GlobalIndexScanner {
         if let Some(OpenedGlobalIndexReader::BTree(reader)) = reader.take() {
             self.return_reader(entry.file_name.clone(), reader);
         }
-        Ok(file_result)
+        Ok(EntryQueryResult {
+            bitmap: file_result,
+            declined: false,
+        })
     }
 
     fn query_error(entry: &GlobalIndexEntry, error: std::io::Error) -> Error {
@@ -920,11 +1196,13 @@ impl GlobalIndexScanner {
     async fn open_reader_for_entry(
         &self,
         entry: &GlobalIndexEntry,
-        meta: &BTreeIndexMeta,
         data_type: &DataType,
     ) -> Result<OpenedGlobalIndexReader> {
         match entry.index_type {
-            GlobalIndexFileKind::BTree => self.get_or_open_reader(entry, meta, data_type).await,
+            GlobalIndexFileKind::BTree => {
+                self.get_or_open_reader(entry, sorted_entry_meta(entry), data_type)
+                    .await
+            }
             GlobalIndexFileKind::Bitmap => self
                 .open_bitmap_reader(entry)
                 .await
@@ -947,7 +1225,58 @@ impl GlobalIndexScanner {
                     ),
                     source: Some(Box::new(e)),
                 }),
+            GlobalIndexFileKind::FM => self
+                .open_fm_reader(entry)
+                .await
+                .map(OpenedGlobalIndexReader::FM)
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!("Failed to open FM global index file: {}", entry.file_name),
+                    source: Some(Box::new(e)),
+                }),
         }
+    }
+
+    async fn open_fm_reader(
+        &self,
+        entry: &GlobalIndexEntry,
+    ) -> std::io::Result<FMGlobalIndexReader> {
+        let GlobalIndexEntryMeta::FM {
+            bytes: manifest_meta,
+            ..
+        } = &entry.meta
+        else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "FM entry has non-FM manifest metadata",
+            ));
+        };
+        let path = format!("{}/{INDEX_DIR}/{}", self.table_path, entry.file_name);
+        let input = self
+            .file_io
+            .new_input(&path)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let file_size = if entry.file_size > 0 {
+            entry.file_size as u64
+        } else {
+            input
+                .metadata()
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .size
+        };
+        let file_reader = input
+            .reader()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        FMGlobalIndexReader::open_with_context(
+            Box::new(file_reader),
+            file_size,
+            manifest_meta,
+            self.fm_read_options,
+            Arc::clone(&self.fm_read_context),
+            entry.file_name.clone(),
+        )
+        .await
     }
 
     async fn open_bitmap_reader(
@@ -977,7 +1306,7 @@ impl GlobalIndexScanner {
 
     fn fallback_scan_plan(
         &self,
-        entries: &[GlobalIndexEntry],
+        entries: &[&GlobalIndexEntry],
         selected: &[bool],
     ) -> FallbackScanPlan {
         let mut plan = FallbackScanPlan::default();
@@ -1003,6 +1332,7 @@ impl GlobalIndexScanner {
                     plan.selected_bitmap += 1;
                     bitmap_valid &= add_file_size(&mut bitmap_total, entry.file_size);
                 }
+                GlobalIndexFileKind::FM => {}
             }
         }
 
@@ -1055,6 +1385,7 @@ impl GlobalIndexScanner {
         Ok(self.unindexed_ranges_for_field_ids(&field_ids, search_mode, next_row_id, data_ranges))
     }
 
+    #[cfg(test)]
     fn unindexed_ranges_for_field_ids(
         &self,
         field_ids: &HashSet<i32>,
@@ -1139,22 +1470,60 @@ fn is_multivalue_predicate(op: PredicateOperator) -> bool {
     )
 }
 
+fn entry_supports_predicate(
+    entry: &GlobalIndexEntry,
+    op: PredicateOperator,
+    literals: &[Datum],
+) -> bool {
+    match entry.index_type {
+        GlobalIndexFileKind::Multivalue => {
+            is_multivalue_predicate(op)
+                && !(matches!(op, PredicateOperator::ArrayContainsAll) && literals.is_empty())
+        }
+        GlobalIndexFileKind::FM => {
+            matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull)
+                || (op == PredicateOperator::Contains && literals.len() == 1)
+        }
+        GlobalIndexFileKind::BTree | GlobalIndexFileKind::Bitmap => !is_multivalue_predicate(op),
+    }
+}
+
 fn entries_support_predicate(
     entries: &[GlobalIndexEntry],
     op: PredicateOperator,
     literals: &[Datum],
 ) -> bool {
-    if is_multivalue_predicate(op) {
-        if matches!(op, PredicateOperator::ArrayContainsAll) && literals.is_empty() {
-            return false;
-        }
-        entries
+    entries
+        .iter()
+        .any(|entry| entry_supports_predicate(entry, op, literals))
+}
+
+fn select_entries_for_predicates<'a>(
+    entries: &'a [GlobalIndexEntry],
+    predicates: &[(PredicateOperator, &[Datum], &DataType)],
+) -> Vec<&'a GlobalIndexEntry> {
+    let compatible = entries
+        .iter()
+        .filter(|entry| {
+            predicates
+                .iter()
+                .all(|(op, literals, _)| entry_supports_predicate(entry, *op, literals))
+        })
+        .collect::<Vec<_>>();
+
+    if predicates
+        .iter()
+        .any(|(op, _, _)| *op == PredicateOperator::Contains)
+        && compatible
             .iter()
-            .all(|entry| entry.index_type == GlobalIndexFileKind::Multivalue)
+            .any(|entry| entry.index_type == GlobalIndexFileKind::FM)
+    {
+        compatible
+            .into_iter()
+            .filter(|entry| entry.index_type == GlobalIndexFileKind::FM)
+            .collect()
     } else {
-        entries
-            .iter()
-            .all(|entry| entry.index_type != GlobalIndexFileKind::Multivalue)
+        compatible
     }
 }
 
@@ -1284,6 +1653,22 @@ fn unindexed_ranges_for_coverage(
     };
     let indexed_ranges = indexed_ranges_from_coverage(coverage_by_field, field_ids);
     super::source::exclude_row_ranges(&data_ranges, &indexed_ranges)
+}
+
+fn unindexed_ranges_for_indexed_coverage(
+    indexed_ranges: &[RowRange],
+    search_mode: GlobalIndexSearchMode,
+    next_row_id: Option<i64>,
+    data_ranges: &[RowRange],
+) -> Vec<RowRange> {
+    let Some(data_ranges) = data_ranges_for_search_mode(search_mode, next_row_id, data_ranges)
+    else {
+        return Vec::new();
+    };
+    super::source::exclude_row_ranges(
+        &data_ranges,
+        &super::merge_row_ranges(indexed_ranges.to_vec()),
+    )
 }
 
 /// Compute row ranges not covered by a family of global index files.
@@ -1565,6 +1950,7 @@ pub(crate) struct GlobalIndexEvaluation<'a> {
     pub(crate) global_index_thread_num: usize,
     pub(crate) btree_fallback_scan_max_size: i64,
     pub(crate) bitmap_fallback_scan_max_size: i64,
+    pub(crate) fm_read_options: FMReadOptions,
     pub(crate) next_row_id: Option<i64>,
     pub(crate) data_ranges: &'a [RowRange],
 }
@@ -1572,7 +1958,7 @@ pub(crate) struct GlobalIndexEvaluation<'a> {
 pub(crate) async fn evaluate_global_index(
     evaluation: GlobalIndexEvaluation<'_>,
 ) -> Result<Option<Vec<RowRange>>> {
-    let scanner = match GlobalIndexScanner::create(
+    let scanner = match GlobalIndexScanner::create_with_fm_options(
         evaluation.file_io,
         evaluation.table_path,
         evaluation.global_index_thread_num,
@@ -1580,6 +1966,7 @@ pub(crate) async fn evaluate_global_index(
         evaluation.bitmap_fallback_scan_max_size,
         evaluation.index_entries,
         evaluation.schema_fields,
+        evaluation.fm_read_options,
     )? {
         Some(s) => s,
         None => return Ok(None),
@@ -1592,8 +1979,8 @@ pub(crate) async fn evaluate_global_index(
         None => return Ok(None),
     };
     let mut row_ranges = scan_result.row_ranges;
-    row_ranges.extend(scanner.unindexed_ranges_for_field_ids(
-        &scan_result.evaluated_field_ids,
+    row_ranges.extend(unindexed_ranges_for_indexed_coverage(
+        &scan_result.indexed_coverage,
         evaluation.search_mode,
         evaluation.next_row_id,
         evaluation.data_ranges,
@@ -1606,6 +1993,7 @@ mod tests {
     use super::*;
     use crate::btree::test_util::VecFileWrite;
     use crate::btree::{BTreeIndexWriter, BlockCompressionType};
+    use crate::fm_index::{FMGlobalIndexWriter, FMWriteOptions};
     use crate::table::bitmap_global_index_writer::BitmapGlobalIndexWriter;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
@@ -1987,6 +2375,121 @@ mod tests {
         }
     }
 
+    async fn make_fm_index_entry(
+        file_name: &str,
+        field_id: i32,
+        row_range_start: i64,
+        row_range_end: i64,
+        first_row_id: u64,
+        row_count: u64,
+    ) -> IndexManifestEntry {
+        let output = VecFileWrite::new();
+        let mut writer = FMGlobalIndexWriter::new(
+            Box::new(output.clone()),
+            FMWriteOptions {
+                compression: BlockCompressionType::None,
+                ..FMWriteOptions::default()
+            },
+        )
+        .unwrap();
+        for row_id in first_row_id..first_row_id + row_count {
+            writer.write(Some(b"value"), row_id).await.unwrap();
+        }
+        let result = writer.finish().await.unwrap();
+        IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: vec![],
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: FM_GLOBAL_INDEX_TYPE.to_string(),
+                file_name: file_name.to_string(),
+                file_size: output.to_vec().len() as i64,
+                row_count: result.row_count as i64,
+                deletion_vectors_ranges: None,
+                global_index_meta: Some(crate::spec::GlobalIndexMeta {
+                    row_range_start,
+                    row_range_end,
+                    index_field_id: field_id,
+                    extra_field_ids: None,
+                    source_meta: None,
+                    index_meta: Some(result.index_meta),
+                }),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fm_file_set_must_exactly_cover_source_range() {
+        let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let first = make_fm_index_entry("first.fm", 1, 10, 13, 0, 2).await;
+        let error = match GlobalIndexScanner::create(
+            &file_io,
+            "memory:/table",
+            1,
+            i64::MAX,
+            i64::MAX,
+            std::slice::from_ref(&first),
+            &string_schema_fields(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a partial Java FM file set must fail closed"),
+        };
+        assert!(
+            matches!(error, Error::DataInvalid { message, .. } if message.contains("cover 2 rows, expected 4"))
+        );
+
+        let second = make_fm_index_entry("second.fm", 1, 10, 13, 2, 2).await;
+        assert!(GlobalIndexScanner::create(
+            &file_io,
+            "memory:/table",
+            1,
+            i64::MAX,
+            i64::MAX,
+            &[first, second],
+            &string_schema_fields(),
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn test_mixed_fm_and_btree_select_compatible_index_family() {
+        let btree = GlobalIndexEntry {
+            file_name: "name.btree".to_string(),
+            index_type: GlobalIndexFileKind::BTree,
+            file_size: 1,
+            row_range_start: 0,
+            row_range_end: 9,
+            meta: GlobalIndexEntryMeta::Sorted(BTreeIndexMeta::new(None, None, false)),
+        };
+        let fm = GlobalIndexEntry {
+            file_name: "name.fm".to_string(),
+            index_type: GlobalIndexFileKind::FM,
+            file_size: 1,
+            row_range_start: 0,
+            row_range_end: 9,
+            meta: GlobalIndexEntryMeta::FM {
+                bytes: Vec::new(),
+                first_row_id: 0,
+                row_count: 10,
+            },
+        };
+        let entries = [btree, fm];
+        let data_type = DataType::VarChar(crate::spec::VarCharType::string_type());
+        let literal = [Datum::String("needle".to_string())];
+
+        let contains = [(PredicateOperator::Contains, literal.as_slice(), &data_type)];
+        let selected = select_entries_for_predicates(&entries, &contains);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].index_type, GlobalIndexFileKind::FM);
+
+        let equals = [(PredicateOperator::Eq, literal.as_slice(), &data_type)];
+        let selected = select_entries_for_predicates(&entries, &equals);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].index_type, GlobalIndexFileKind::BTree);
+    }
+
     fn int_schema_fields() -> Vec<DataField> {
         vec![DataField::new(
             1,
@@ -2041,6 +2544,7 @@ mod tests {
             global_index_thread_num: 32,
             btree_fallback_scan_max_size,
             bitmap_fallback_scan_max_size,
+            fm_read_options: FMReadOptions::default(),
             next_row_id: None,
             data_ranges: &[],
         })
@@ -3165,6 +3669,7 @@ mod tests {
             global_index_thread_num: 32,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
+            fm_read_options: FMReadOptions::default(),
             next_row_id: Some(150),
             data_ranges: &[],
         })
@@ -3218,6 +3723,7 @@ mod tests {
             global_index_thread_num: 32,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
+            fm_read_options: FMReadOptions::default(),
             next_row_id: Some(100),
             data_ranges: &[],
         })
@@ -3252,6 +3758,7 @@ mod tests {
             global_index_thread_num: 32,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
+            fm_read_options: FMReadOptions::default(),
             next_row_id: Some(150),
             data_ranges: &data_ranges,
         })

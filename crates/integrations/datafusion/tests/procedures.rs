@@ -217,7 +217,7 @@ async fn test_create_global_index_rejects_unsupported_index_types() {
                     index_type => '{index_type}'\
                 )"
             ),
-            "only supports index_type => 'btree', 'bitmap', 'multivalue', or vindex types",
+            "only supports index_type => 'btree', 'bitmap', 'multivalue', 'fm', or vindex types",
         )
         .await;
     }
@@ -468,6 +468,91 @@ async fn test_create_global_index_builds_bitmap_with_java_format() {
         contains_rows,
         vec![(1, "alice".to_string()), (3, "alice".to_string())]
     );
+}
+
+#[tokio::test]
+async fn test_create_and_drop_fm_global_index() {
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.fm_build (id INT, name VARCHAR(100)) WITH (\
+            'row-tracking.enabled' = 'true',\
+            'data-evolution.enabled' = 'true',\
+            'global-index.enabled' = 'true',\
+            'sorted-index.records-per-range' = '10',\
+            'fm-index.sa-sample-rate' = '1',\
+            'fm-index.locate-cost-ratio' = '1'\
+        )",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.fm_build (id, name) VALUES \
+         (1, 'banana'), (2, 'bandana'), (3, 'carol'), (4, NULL)",
+    )
+    .await;
+
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(\
+            table => 'test_db.fm_build', \
+            index_column => 'name', \
+            index_type => 'FM', \
+            options => 'fm-index.partition-row-count=2,fm-index.compression=none'\
+        )",
+    )
+    .await;
+    assert_eq!(
+        row_count(
+            &sql_context,
+            "SELECT * FROM paimon.test_db.`fm_build$table_indexes` \
+             WHERE index_type = 'fm' AND index_field_name = 'name'",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        collect_id_name(
+            &sql_context,
+            "SELECT id, name FROM paimon.test_db.fm_build WHERE name LIKE '%ana%'",
+        )
+        .await,
+        vec![(1, "banana".to_string()), (2, "bandana".to_string())]
+    );
+
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(\
+            table => 'test_db.fm_build', \
+            index_column => 'name', \
+            index_type => 'btree'\
+        )",
+    )
+    .await;
+    assert_eq!(
+        collect_id_name(
+            &sql_context,
+            "SELECT id, name FROM paimon.test_db.fm_build WHERE name = 'banana'",
+        )
+        .await,
+        vec![(1, "banana".to_string())],
+        "a coexisting FM index must not disable BTree equality lookup"
+    );
+
+    exec(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.fm_build', index_column => 'name', index_type => 'fm')",
+    )
+    .await;
+    assert_eq!(
+        row_count(
+            &sql_context,
+            "SELECT * FROM paimon.test_db.`fm_build$table_indexes` WHERE index_type = 'fm'",
+        )
+        .await,
+        0
+    );
+    drop(tmp);
 }
 
 #[tokio::test]

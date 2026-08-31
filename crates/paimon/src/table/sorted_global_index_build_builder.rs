@@ -18,12 +18,14 @@
 use super::bitmap_global_index_format::{make_bitmap_key_comparator, serialize_bitmap_datum};
 use super::bitmap_global_index_writer::{BitmapGlobalIndexWriter, BitmapWriteResult};
 use super::global_index_types::{
-    normalize_sorted_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
-    MULTIVALUE_GLOBAL_INDEX_TYPE,
+    normalize_queryable_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
+    FM_GLOBAL_INDEX_TYPE, MULTIVALUE_GLOBAL_INDEX_TYPE,
 };
 use super::sorted_global_index_options::SortedIndexWriteOptions;
 use crate::btree::key_serde::KeyComparator;
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexWriter};
+use crate::fm_index::{FMGlobalIndexWriter, FMOptions, FMWriteOptions};
+use crate::io::FileWrite;
 use crate::spec::{
     bucket_dir_name, extract_datum_from_array, extract_datum_from_arrow, BinaryRow, CoreOptions,
     DataField, DataFileMeta, DataType, Datum, FileKind, GlobalIndexMeta, IndexFileMeta,
@@ -45,6 +47,11 @@ const INDEX_DIR: &str = "index";
 
 type SortedIndexKeyRow = (Option<Vec<u8>>, i64);
 type SerializeKeyFn = fn(&Datum, &DataType) -> Vec<u8>;
+
+enum GlobalIndexWriteOptions {
+    Sorted(SortedIndexWriteOptions),
+    FM(FMWriteOptions),
+}
 
 fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparator, SerializeKeyFn) {
     match index_type {
@@ -99,10 +106,10 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
 
         self.table.ensure_not_branch_reference_for_write()?;
 
-        let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
+        let index_type = normalize_queryable_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
                 message: format!(
-                    "Sorted global index build only supports index_type => 'btree', 'bitmap', or 'multivalue', got '{}'",
+                    "Scalar global index build only supports index_type => 'btree', 'bitmap', 'multivalue', or 'fm', got '{}'",
                     self.index_type
                 ),
             }
@@ -120,7 +127,14 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let core_options = CoreOptions::new(&resolved_options);
         validate_table_options(self.table, &core_options)?;
         let records_per_range = core_options.sorted_index_records_per_range()?;
-        let write_options = SortedIndexWriteOptions::from_options(index_type, &resolved_options)?;
+        let write_options = if index_type == FM_GLOBAL_INDEX_TYPE {
+            GlobalIndexWriteOptions::FM(FMOptions::from_options(&resolved_options)?.write)
+        } else {
+            GlobalIndexWriteOptions::Sorted(SortedIndexWriteOptions::from_options(
+                index_type,
+                &resolved_options,
+            )?)
+        };
 
         let index_field = find_index_field(self.table, index_column)?;
         index_key_type(index_type, index_field)?;
@@ -180,28 +194,36 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         )
         .await?;
 
-        let shard_count = shards.len();
-        let mut messages = Vec::with_capacity(shard_count);
-        for shard in shards {
-            let index_file = self
-                .build_index_file(&shard, index_field, index_column, &write_options)
-                .await?;
-            let mut message =
-                CommitMessage::new(shard.partition_bytes.clone(), shard.source_bucket, vec![]);
-            message.new_index_files = vec![index_file];
-            messages.push(message);
-        }
-
-        TableCommit::new(
+        let commit = TableCommit::new(
             self.table.clone(),
             format!(
                 "global-index-{}-create-{}",
                 index_type,
                 uuid::Uuid::new_v4()
             ),
-        )
-        .commit_if_latest_snapshot(messages, snapshot.id())
-        .await?;
+        );
+        let shard_count = shards.len();
+        let mut messages = Vec::with_capacity(shard_count);
+        for shard in shards {
+            let index_file = match self
+                .build_index_file(&shard, index_field, index_column, &write_options)
+                .await
+            {
+                Ok(index_file) => index_file,
+                Err(error) => {
+                    let _ = commit.abort(&messages).await;
+                    return Err(error);
+                }
+            };
+            let mut message =
+                CommitMessage::new(shard.partition_bytes.clone(), shard.source_bucket, vec![]);
+            message.new_index_files = vec![index_file];
+            messages.push(message);
+        }
+
+        commit
+            .commit_if_latest_snapshot(messages, snapshot.id())
+            .await?;
 
         Ok(shard_count)
     }
@@ -211,36 +233,43 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         shard: &SortedGlobalIndexShard,
         index_field: &DataField,
         index_column: &str,
-        write_options: &SortedIndexWriteOptions,
+        write_options: &GlobalIndexWriteOptions,
     ) -> Result<IndexFileMeta> {
-        let index_type = normalize_sorted_global_index_type(&self.index_type).ok_or_else(|| {
+        let index_type = normalize_queryable_global_index_type(&self.index_type).ok_or_else(|| {
             Error::Unsupported {
                 message: format!(
-                    "Sorted global index build only supports index_type => 'btree', 'bitmap', or 'multivalue', got '{}'",
+                    "Scalar global index build only supports index_type => 'btree', 'bitmap', 'multivalue', or 'fm', got '{}'",
                     self.index_type
                 ),
             }
         })?;
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
         let key_type = index_key_type(index_type, index_field)?;
-        let (cmp, serialize_key) = make_index_key_codec(
-            if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
-                BITMAP_GLOBAL_INDEX_TYPE
-            } else {
-                index_type
-            },
-            key_type,
-        );
-        let mut rows = extract_index_rows(
-            self.table,
-            shard,
-            index_column,
-            index_field,
+        let codec_type = if matches!(
             index_type,
-            serialize_key,
-        )
-        .await?;
-        sort_index_rows(&mut rows, &cmp);
+            MULTIVALUE_GLOBAL_INDEX_TYPE | FM_GLOBAL_INDEX_TYPE
+        ) {
+            BITMAP_GLOBAL_INDEX_TYPE
+        } else {
+            index_type
+        };
+        let (cmp, serialize_key) = make_index_key_codec(codec_type, key_type);
+        let mut rows = if index_type == FM_GLOBAL_INDEX_TYPE {
+            Vec::new()
+        } else {
+            extract_index_rows(
+                self.table,
+                shard,
+                index_column,
+                index_field,
+                index_type,
+                serialize_key,
+            )
+            .await?
+        };
+        if !rows.is_empty() {
+            sort_index_rows(&mut rows, &cmp);
+        }
 
         self.table
             .file_io()
@@ -255,112 +284,151 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             self.table.location().trim_end_matches('/'),
             file_name
         );
-        let output = self.table.file_io().new_output(&index_path)?;
-        let writer = output.writer().await?;
-        let (written_row_count, index_meta) = match index_type {
-            BTREE_GLOBAL_INDEX_TYPE => {
-                let mut writer = BTreeIndexWriter::with_comparator_and_compression_level(
-                    writer,
-                    write_options.block_size,
-                    write_options.compression_type,
-                    write_options.compression_level,
-                    cmp,
-                );
-                for (key, local_row_id) in &rows {
-                    writer
-                        .write(key.as_deref(), *local_row_id)
+        let write_result: Result<(u64, Vec<u8>, i64)> = async {
+            let output = self.table.file_io().new_output(&index_path)?;
+            let writer = output.writer().await?;
+            let (written_row_count, index_meta) = match index_type {
+                BTREE_GLOBAL_INDEX_TYPE => {
+                    let GlobalIndexWriteOptions::Sorted(write_options) = write_options else {
+                        unreachable!("BTree uses sorted write options")
+                    };
+                    let mut writer = BTreeIndexWriter::with_comparator_and_compression_level(
+                        writer,
+                        write_options.block_size,
+                        write_options.compression_type,
+                        write_options.compression_level,
+                        cmp,
+                    );
+                    for (key, local_row_id) in &rows {
+                        writer
+                            .write(key.as_deref(), *local_row_id)
+                            .await
+                            .map_err(|e| Error::DataInvalid {
+                                message: format!(
+                                    "Failed to write BTree global index file '{file_name}'"
+                                ),
+                                source: Some(Box::new(e)),
+                            })?;
+                    }
+                    let write_result = writer.finish().await.map_err(|e| Error::DataInvalid {
+                        message: format!("Failed to finish BTree global index file '{file_name}'"),
+                        source: Some(Box::new(e)),
+                    })?;
+                    (write_result.row_count, write_result.meta.serialize())
+                }
+                BITMAP_GLOBAL_INDEX_TYPE => {
+                    let GlobalIndexWriteOptions::Sorted(write_options) = write_options else {
+                        unreachable!("bitmap uses sorted write options")
+                    };
+                    let mut writer = BitmapGlobalIndexWriter::with_compression_level(
+                        writer,
+                        write_options.block_size,
+                        write_options.compression_type,
+                        write_options.compression_level,
+                        cmp,
+                    );
+                    for (key, local_row_id) in &rows {
+                        writer.write(key.as_deref(), *local_row_id).map_err(|e| {
+                            Error::DataInvalid {
+                                message: format!(
+                                    "Failed to write bitmap global index file '{file_name}'"
+                                ),
+                                source: Some(Box::new(e)),
+                            }
+                        })?;
+                    }
+                    let BitmapWriteResult { row_count, meta } =
+                        writer.finish().await.map_err(|e| Error::DataInvalid {
+                            message: format!(
+                                "Failed to finish bitmap global index file '{file_name}'"
+                            ),
+                            source: Some(Box::new(e)),
+                        })?;
+                    (row_count, meta.serialize())
+                }
+                MULTIVALUE_GLOBAL_INDEX_TYPE => {
+                    let GlobalIndexWriteOptions::Sorted(write_options) = write_options else {
+                        unreachable!("multivalue uses sorted write options")
+                    };
+                    let mut writer = BitmapGlobalIndexWriter::with_compression_level(
+                        writer,
+                        write_options.block_size,
+                        write_options.compression_type,
+                        write_options.compression_level,
+                        cmp,
+                    );
+                    for (key, local_row_id) in &rows {
+                        let key = key
+                            .as_deref()
+                            .expect("multivalue extraction skips null keys");
+                        writer.write_posting(key, *local_row_id).map_err(|e| {
+                            Error::DataInvalid {
+                                message: format!(
+                                    "Failed to write multivalue global index file '{file_name}'"
+                                ),
+                                source: Some(Box::new(e)),
+                            }
+                        })?;
+                    }
+                    let BitmapWriteResult { row_count, meta } = writer
+                        .finish_with_source_row_count(u64::try_from(row_count).unwrap())
                         .await
                         .map_err(|e| Error::DataInvalid {
                             message: format!(
-                                "Failed to write BTree global index file '{file_name}'"
+                                "Failed to finish multivalue global index file '{file_name}'"
                             ),
                             source: Some(Box::new(e)),
                         })?;
+                    (row_count, meta.serialize())
                 }
-                let write_result = writer.finish().await.map_err(|e| Error::DataInvalid {
-                    message: format!("Failed to finish BTree global index file '{file_name}'"),
-                    source: Some(Box::new(e)),
-                })?;
-                (write_result.row_count, write_result.meta)
-            }
-            BITMAP_GLOBAL_INDEX_TYPE => {
-                let mut writer = BitmapGlobalIndexWriter::with_compression_level(
-                    writer,
-                    write_options.block_size,
-                    write_options.compression_type,
-                    write_options.compression_level,
-                    cmp,
-                );
-                for (key, local_row_id) in &rows {
-                    writer.write(key.as_deref(), *local_row_id).map_err(|e| {
-                        Error::DataInvalid {
-                            message: format!(
-                                "Failed to write bitmap global index file '{file_name}'"
-                            ),
-                            source: Some(Box::new(e)),
-                        }
-                    })?;
+                FM_GLOBAL_INDEX_TYPE => {
+                    let GlobalIndexWriteOptions::FM(write_options) = write_options else {
+                        unreachable!("FM uses FM write options")
+                    };
+                    write_fm_index_streaming(
+                        self.table,
+                        shard,
+                        index_column,
+                        index_field,
+                        serialize_key,
+                        writer,
+                        *write_options,
+                        &file_name,
+                    )
+                    .await?
                 }
-                let BitmapWriteResult { row_count, meta } =
-                    writer.finish().await.map_err(|e| Error::DataInvalid {
-                        message: format!("Failed to finish bitmap global index file '{file_name}'"),
-                        source: Some(Box::new(e)),
-                    })?;
-                (row_count, meta)
-            }
-            MULTIVALUE_GLOBAL_INDEX_TYPE => {
-                let mut writer = BitmapGlobalIndexWriter::with_compression_level(
-                    writer,
-                    write_options.block_size,
-                    write_options.compression_type,
-                    write_options.compression_level,
-                    cmp,
-                );
-                for (key, local_row_id) in &rows {
-                    let key = key
-                        .as_deref()
-                        .expect("multivalue extraction skips null keys");
-                    writer
-                        .write_posting(key, *local_row_id)
-                        .map_err(|e| Error::DataInvalid {
-                            message: format!(
-                                "Failed to write multivalue global index file '{file_name}'"
-                            ),
-                            source: Some(Box::new(e)),
-                        })?;
-                }
-                let BitmapWriteResult { row_count, meta } = writer
-                    .finish_with_source_row_count(u64::try_from(row_count).unwrap())
-                    .await
-                    .map_err(|e| Error::DataInvalid {
-                        message: format!(
-                            "Failed to finish multivalue global index file '{file_name}'"
-                        ),
-                        source: Some(Box::new(e)),
-                    })?;
-                (row_count, meta)
-            }
-            _ => unreachable!("normalized sorted global index type"),
-        };
+                _ => unreachable!("normalized queryable global index type"),
+            };
 
-        if written_row_count != u64::try_from(row_count).unwrap() {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "Sorted global index expected {} rows, wrote {}",
-                    row_count, written_row_count
-                ),
-                source: None,
-            });
+            if written_row_count != u64::try_from(row_count).unwrap() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Sorted global index expected {} rows, wrote {}",
+                        row_count, written_row_count
+                    ),
+                    source: None,
+                });
+            }
+
+            let status = self.table.file_io().get_status(&index_path).await?;
+            let file_size = checked_i64(
+                status.size,
+                "Index file is too large for Rust IndexFileMeta",
+            )?;
+            Ok((written_row_count, index_meta, file_size))
         }
-
-        let status = self.table.file_io().get_status(&index_path).await?;
+        .await;
+        let (_, index_meta, file_size) = match write_result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = self.table.file_io().delete_file(&index_path).await;
+                return Err(error);
+            }
+        };
         Ok(IndexFileMeta {
             index_type: index_type.to_string(),
             file_name,
-            file_size: checked_i64(
-                status.size,
-                "Index file is too large for Rust IndexFileMeta",
-            )?,
+            file_size,
             row_count,
             deletion_vectors_ranges: None,
             global_index_meta: Some(GlobalIndexMeta {
@@ -369,10 +437,118 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
                 index_field_id: index_field.id(),
                 extra_field_ids: None,
                 source_meta: None,
-                index_meta: Some(index_meta.serialize()),
+                index_meta: Some(index_meta),
             }),
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_fm_index_streaming(
+    table: &Table,
+    shard: &SortedGlobalIndexShard,
+    index_column: &str,
+    index_field: &DataField,
+    serialize_key: SerializeKeyFn,
+    output: Box<dyn FileWrite>,
+    write_options: FMWriteOptions,
+    file_name: &str,
+) -> Result<(u64, Vec<u8>)> {
+    let mut writer =
+        FMGlobalIndexWriter::new(output, write_options).map_err(|error| Error::DataInvalid {
+            message: format!("Failed to create FM global index file '{file_name}'"),
+            source: Some(Box::new(error)),
+        })?;
+    let splits = build_read_splits_for_shard(shard)?;
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
+    let read = read_builder.new_read()?;
+    let mut batches = read.to_arrow(&splits)?;
+    let expected_row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
+    let mut expected_row_id = shard.row_range_start;
+
+    while let Some(batch) = batches.try_next().await? {
+        let value_index =
+            batch
+                .schema()
+                .index_of(index_column)
+                .map_err(|error| Error::DataInvalid {
+                    message: format!(
+                        "Index column '{index_column}' not found in FM read batch: {error}"
+                    ),
+                    source: None,
+                })?;
+        let row_id_index = batch
+            .schema()
+            .index_of(ROW_ID_FIELD_NAME)
+            .map_err(|error| Error::DataInvalid {
+                message: format!("_ROW_ID column not found in FM read batch: {error}"),
+                source: None,
+            })?;
+        let row_ids = batch
+            .column(row_id_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| Error::DataInvalid {
+                message: "FM global index build requires non-null Int64 _ROW_ID".to_string(),
+                source: None,
+            })?;
+
+        for row in 0..batch.num_rows() {
+            if row_ids.is_null(row) {
+                return Err(Error::DataInvalid {
+                    message: "FM global index build found null _ROW_ID".to_string(),
+                    source: None,
+                });
+            }
+            let row_id = row_ids.value(row);
+            if row_id != expected_row_id {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "FM global index build expected _ROW_ID {expected_row_id}, got {row_id}"
+                    ),
+                    source: None,
+                });
+            }
+            expected_row_id = expected_row_id
+                .checked_add(1)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "FM global index row ID overflow".to_string(),
+                    source: None,
+                })?;
+            let local_row_id =
+                u64::try_from(row_id - shard.row_range_start).map_err(|_| Error::DataInvalid {
+                    message: format!(
+                        "FM global index file '{file_name}' has a negative local row ID"
+                    ),
+                    source: None,
+                })?;
+            let key = extract_datum_from_arrow(&batch, row, value_index, index_field.data_type())?
+                .map(|datum| serialize_key(&datum, index_field.data_type()));
+            writer
+                .write(key.as_deref(), local_row_id)
+                .await
+                .map_err(|error| Error::DataInvalid {
+                    message: format!("Failed to write FM global index file '{file_name}'"),
+                    source: Some(Box::new(error)),
+                })?;
+        }
+    }
+
+    let actual_row_count = expected_row_id - shard.row_range_start;
+    if actual_row_count != expected_row_count {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "FM global index build expected {expected_row_count} rows, got {actual_row_count}"
+            ),
+            source: None,
+        });
+    }
+    let result = writer.finish().await.map_err(|error| Error::DataInvalid {
+        message: format!("Failed to finish FM global index file '{file_name}'"),
+        source: Some(Box::new(error)),
+    })?;
+    Ok((result.row_count, result.index_meta))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +647,17 @@ fn index_key_type<'a>(index_type: &str, field: &'a DataField) -> Result<&'a Data
             });
         }
         Ok(array_type.element_type())
+    } else if index_type == FM_GLOBAL_INDEX_TYPE {
+        if !matches!(field.data_type(), DataType::Char(_) | DataType::VarChar(_)) {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "FM global index requires a character string column, got {:?} for column '{}'",
+                    field.data_type(),
+                    field.name()
+                ),
+            });
+        }
+        Ok(field.data_type())
     } else {
         validate_btree_field(field)?;
         Ok(field.data_type())
@@ -1605,6 +1792,21 @@ mod tests {
         .unwrap()
     }
 
+    fn nullable_name_batch(ids: Vec<i32>, names: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
     fn multivalue_batch() -> RecordBatch {
         let element = Arc::new(ArrowField::new("element", ArrowDataType::Int32, true));
         let mut items = ListBuilder::new(Int32Builder::new()).with_field(element.clone());
@@ -1754,6 +1956,7 @@ mod tests {
             global_index_thread_num: 32,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
+            fm_read_options: crate::fm_index::FMReadOptions::default(),
             next_row_id: snapshot.next_row_id(),
             data_ranges: &[],
         })
@@ -1787,6 +1990,164 @@ mod tests {
         assert_eq!(
             plan.splits()[0].row_ranges(),
             Some(&[RowRange::new(0, 0), RowRange::new(2, 2)][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_writes_and_queries_fm_index() {
+        let table_path = "memory:/test_fm_global_index_builder_e2e";
+        let mut options = table_options("10");
+        options.insert("fm-index.sa-sample-rate".to_string(), "1".to_string());
+        options.insert("fm-index.locate-cost-ratio".to_string(), "1".to_string());
+        options.insert("fm-index.compression".to_string(), "none".to_string());
+        let table = test_table_with_path(table_path, options);
+        setup_dirs(&table).await;
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&nullable_name_batch(
+                vec![1, 2, 3, 4],
+                vec![Some("banana"), Some("bandana"), None, Some("")],
+            ))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(table_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table
+                .new_sorted_global_index_build_builder()
+                .with_index_column("name")
+                .with_index_type(FM_GLOBAL_INDEX_TYPE)
+                .execute()
+                .await
+                .unwrap(),
+            1
+        );
+
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let index_entries = IndexManifest::read(
+            table.file_io(),
+            &format!(
+                "{table_path}/manifest/{}",
+                snapshot.index_manifest().expect("index manifest")
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(index_entries.len(), 1);
+        let index_file = &index_entries[0].index_file;
+        assert_eq!(index_file.index_type, FM_GLOBAL_INDEX_TYPE);
+        assert!(index_file.file_name.starts_with("fm-global-index-"));
+        assert_eq!(index_file.row_count, 4);
+        crate::fm_index::validate_manifest_meta(
+            index_file
+                .global_index_meta
+                .as_ref()
+                .unwrap()
+                .index_meta
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+
+        let predicates = PredicateBuilder::new(table.schema().fields());
+        assert_eq!(
+            scan_ids(
+                &table,
+                predicates
+                    .contains("name", Datum::String("ana".to_string()))
+                    .unwrap(),
+            )
+            .await,
+            vec![1, 2]
+        );
+        assert_eq!(
+            scan_ids(&table, predicates.is_null("name").unwrap()).await,
+            vec![3]
+        );
+        assert_eq!(
+            scan_ids(
+                &table,
+                predicates
+                    .contains("name", Datum::String(String::new()))
+                    .unwrap(),
+            )
+            .await,
+            vec![1, 2, 4]
+        );
+
+        // A dense match that exceeds the FM locate budget must decline the
+        // index and let the normal row filter scan the source, never produce
+        // a false empty result.
+        let mut fallback_options = table.schema().options().clone();
+        fallback_options.insert(
+            "fm-index.locate-cost-ratio".to_string(),
+            "0.000001".to_string(),
+        );
+        let fallback_table = Table::new(
+            table.file_io().clone(),
+            table.identifier().clone(),
+            table.location().to_string(),
+            table.schema().copy_with_replaced_options(fallback_options),
+            None,
+        );
+        let predicate = PredicateBuilder::new(fallback_table.schema().fields())
+            .contains("name", Datum::String("a".to_string()))
+            .unwrap();
+        assert_eq!(scan_ids(&fallback_table, predicate).await, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_failed_fm_build_removes_partial_index_file() {
+        let table_path = "memory:/test_failed_fm_build_cleanup";
+        let table = test_table_with_path(table_path, table_options("3"));
+        setup_dirs(&table).await;
+
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(
+                vec![1, 2, 3, 4, 5, 6],
+                vec!["one", "two", "six", "red", "blue", "value-too-long"],
+            ))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(table_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        let mut options = HashMap::new();
+        options.insert("fm-index.partition-size".to_string(), "8".to_string());
+        options.insert("fm-index.partition-row-count".to_string(), "1".to_string());
+        options.insert("fm-index.compression".to_string(), "none".to_string());
+        let error = table
+            .new_sorted_global_index_build_builder()
+            .with_index_column("name")
+            .with_index_type(FM_GLOBAL_INDEX_TYPE)
+            .with_options(options)
+            .execute()
+            .await
+            .expect_err("the oversized FM value must fail the build");
+        assert!(matches!(error, Error::DataInvalid { .. }));
+
+        let files = table
+            .file_io()
+            .list_status(&format!("{table_path}/index"))
+            .await
+            .unwrap();
+        assert!(
+            files
+                .iter()
+                .all(|file| !file.path.contains("fm-global-index-")),
+            "failed FM build left a partial index file: {files:?}"
         );
     }
 
@@ -2150,6 +2511,7 @@ mod tests {
             global_index_thread_num: 32,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
+            fm_read_options: crate::fm_index::FMReadOptions::default(),
             next_row_id: snapshot.next_row_id(),
             data_ranges: &[],
         })
@@ -2263,6 +2625,7 @@ mod tests {
             global_index_thread_num: 32,
             btree_fallback_scan_max_size: i64::MAX,
             bitmap_fallback_scan_max_size: i64::MAX,
+            fm_read_options: crate::fm_index::FMReadOptions::default(),
             next_row_id: snapshot.next_row_id(),
             data_ranges: &[],
         })

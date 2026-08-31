@@ -44,7 +44,7 @@ use std::cmp::Ordering;
 use std::io::{self, Cursor, Read, Write};
 
 /// Block compression type, compatible with Java's BlockCompressionType.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum BlockCompressionType {
     None = 0,
@@ -131,7 +131,29 @@ pub(crate) fn decompress_block(
     data: &[u8],
     compression_type: BlockCompressionType,
 ) -> io::Result<Vec<u8>> {
+    decompress_block_inner(data, compression_type, None)
+}
+
+pub(crate) fn decompress_block_with_expected_size(
+    data: &[u8],
+    compression_type: BlockCompressionType,
+    expected_size: usize,
+) -> io::Result<Vec<u8>> {
+    decompress_block_inner(data, compression_type, Some(expected_size))
+}
+
+fn decompress_block_inner(
+    data: &[u8],
+    compression_type: BlockCompressionType,
+    expected_size: Option<usize>,
+) -> io::Result<Vec<u8>> {
     if compression_type == BlockCompressionType::None {
+        if expected_size.is_some_and(|expected_size| expected_size != data.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Uncompressed block size does not match its metadata",
+            ));
+        }
         return Ok(data.to_vec());
     }
 
@@ -142,6 +164,12 @@ pub(crate) fn decompress_block(
             "Invalid negative uncompressed block size",
         )
     })?;
+    if expected_size.is_some_and(|expected_size| expected_size != uncompressed_size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Compressed block size does not match its metadata",
+        ));
+    }
     let compressed_start = cursor.position() as usize;
     let compressed = &data[compressed_start..];
     match compression_type {
@@ -648,6 +676,19 @@ impl<'a> BlockIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constrained_decompression_rejects_header_size_before_decoding() {
+        let source = vec![0u8; 4096];
+        let (compressed, compression) =
+            compress_block(&source, BlockCompressionType::Zstd, 1).unwrap();
+        assert_eq!(compression, BlockCompressionType::Zstd);
+
+        let error = decompress_block_with_expected_size(&compressed, compression, 64)
+            .expect_err("the validated outer size must constrain allocation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not match its metadata"));
+    }
 
     #[test]
     fn test_block_roundtrip_aligned() {

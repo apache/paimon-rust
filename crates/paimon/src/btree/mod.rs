@@ -47,7 +47,9 @@ pub(crate) mod var_len;
 mod writer;
 
 pub use block::BlockCompressionType;
-pub(crate) use block::{compress_block, compute_crc32, decompress_block};
+pub(crate) use block::{
+    compress_block, compute_crc32, decompress_block, decompress_block_with_expected_size,
+};
 pub use footer::BTreeFileFooter;
 pub use key_serde::{make_key_comparator, serialize_datum};
 pub use meta::BTreeIndexMeta;

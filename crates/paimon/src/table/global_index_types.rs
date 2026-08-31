@@ -24,6 +24,7 @@ use crate::vindex::{
 pub(crate) const BTREE_GLOBAL_INDEX_TYPE: &str = "btree";
 pub(crate) const BITMAP_GLOBAL_INDEX_TYPE: &str = "bitmap";
 pub(crate) const MULTIVALUE_GLOBAL_INDEX_TYPE: &str = "multivalue";
+pub(crate) const FM_GLOBAL_INDEX_TYPE: &str = "fm";
 
 pub(crate) fn normalize_sorted_global_index_type(index_type: &str) -> Option<&'static str> {
     if index_type.eq_ignore_ascii_case(BTREE_GLOBAL_INDEX_TYPE) {
@@ -37,11 +38,19 @@ pub(crate) fn normalize_sorted_global_index_type(index_type: &str) -> Option<&'s
     }
 }
 
+pub(crate) fn normalize_queryable_global_index_type(index_type: &str) -> Option<&'static str> {
+    normalize_sorted_global_index_type(index_type).or_else(|| {
+        index_type
+            .eq_ignore_ascii_case(FM_GLOBAL_INDEX_TYPE)
+            .then_some(FM_GLOBAL_INDEX_TYPE)
+    })
+}
+
 /// Human-readable list of the global index types the Rust drop path accepts.
 /// Used verbatim in the unsupported-type error of both the builder and the
 /// DataFusion procedure so the two messages stay in sync.
 pub const SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP: &str =
-    "btree, bitmap, multivalue, lumina, lumina-vector-ann, ivf-flat, ivf-pq, ivf-sq, ivf-rq, diskann";
+    "btree, bitmap, multivalue, fm, lumina, lumina-vector-ann, ivf-flat, ivf-pq, ivf-sq, ivf-rq, diskann";
 
 /// Canonicalize any supported global index type to a stable `&'static str`, or
 /// `None` if unsupported. Case-insensitive. Order: sorted -> lumina -> vindex.
@@ -51,8 +60,8 @@ pub const SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP: &str =
 /// type never matches another on the same column. Callers should compare the
 /// canonical form of BOTH the request and each stored entry's `index_type`.
 pub fn normalize_global_index_type_for_drop(index_type: &str) -> Option<&'static str> {
-    if let Some(sorted) = normalize_sorted_global_index_type(index_type) {
-        return Some(sorted);
+    if let Some(queryable) = normalize_queryable_global_index_type(index_type) {
+        return Some(queryable);
     }
     // is_lumina_index_type / is_vindex_index_type match case-sensitively, so
     // lowercase first (normalize_sorted_global_index_type is already case-insensitive).
@@ -94,6 +103,7 @@ mod tests {
             normalize_global_index_type_for_drop("MultiValue"),
             Some("multivalue")
         );
+        assert_eq!(normalize_global_index_type_for_drop("FM"), Some("fm"));
     }
 
     #[test]
