@@ -23,6 +23,7 @@ use roaring::RoaringBitmap;
 
 use crate::common::options::parse_memory_size;
 use crate::common::Options;
+use crate::file_index::file_index_writer::FileIndexWriter;
 use crate::spec::{DataType, Datum};
 use crate::{Error, Result};
 
@@ -56,8 +57,10 @@ impl BitmapFileIndexWriter {
             bitmaps: HashMap::new(),
         })
     }
+}
 
-    pub(crate) fn write(&mut self, datum: Option<&Datum>) -> Result<()> {
+impl FileIndexWriter for BitmapFileIndexWriter {
+    fn write(&mut self, datum: Option<&Datum>) -> Result<()> {
         if self.row_count == i32::MAX as u32 {
             return Err(Error::DataInvalid {
                 message: "Bitmap row count exceeds i32::MAX".to_string(),
@@ -81,7 +84,7 @@ impl BitmapFileIndexWriter {
         Ok(())
     }
 
-    pub(crate) fn serialized_bytes(&mut self) -> Result<Bytes> {
+    fn serialized_bytes(&mut self) -> Result<Bytes> {
         let null_bytes = serialize_bitmap(&mut self.null_bitmap)?;
         let mut body = Vec::new();
         let null_entry = if self.null_bitmap.is_empty() {
@@ -161,6 +164,10 @@ impl BitmapFileIndexWriter {
         }
         output.extend_from_slice(&body);
         Ok(output.freeze())
+    }
+
+    fn empty(&self) -> bool {
+        self.row_count == 0
     }
 }
 

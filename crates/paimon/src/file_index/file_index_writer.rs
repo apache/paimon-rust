@@ -15,22 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Concrete readers/writers and predicate plumbing stay crate-private until
-// data-writer and scan integration land in later changes.
-#[allow(dead_code)]
-pub(crate) mod bitmap;
-#[allow(dead_code)]
-pub(crate) mod bloom_filter;
-mod file_index_format;
-#[allow(dead_code)]
-pub(crate) mod file_index_predicate;
-#[allow(dead_code)]
-pub(crate) mod file_index_reader;
-#[allow(dead_code)]
-pub(crate) mod file_index_result;
-#[allow(dead_code)]
-pub(crate) mod file_index_writer;
-#[allow(dead_code)]
-pub(crate) mod file_indexer_factory;
+use bytes::Bytes;
 
-pub use file_index_format::*;
+use crate::spec::Datum;
+use crate::Result;
+
+/// Writes one concrete file index payload.
+pub(crate) trait FileIndexWriter {
+    /// Adds one row to the index. `None` represents a null value.
+    fn write(&mut self, datum: Option<&Datum>) -> Result<()>;
+
+    /// Serializes the index-specific payload consumed by a matching reader.
+    fn serialized_bytes(&mut self) -> Result<Bytes>;
+
+    /// Returns whether no rows have been added to this writer.
+    fn empty(&self) -> bool;
+}

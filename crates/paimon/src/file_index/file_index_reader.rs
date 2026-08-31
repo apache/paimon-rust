@@ -34,3 +34,78 @@ pub(crate) trait FileIndexReader {
         FileIndexResult::Remain
     }
 }
+
+/// Reader used by the outer format when a writer produced no rows.
+pub(crate) struct EmptyFileIndexReader;
+
+impl FileIndexReader for EmptyFileIndexReader {
+    fn evaluate(
+        &self,
+        _column: &str,
+        _index: usize,
+        _data_type: &DataType,
+        operator: PredicateOperator,
+        _literals: &[Datum],
+    ) -> FileIndexResult {
+        match operator {
+            PredicateOperator::Eq
+            | PredicateOperator::Lt
+            | PredicateOperator::LtEq
+            | PredicateOperator::Gt
+            | PredicateOperator::GtEq
+            | PredicateOperator::In
+            | PredicateOperator::IsNotNull
+            | PredicateOperator::StartsWith
+            | PredicateOperator::EndsWith
+            | PredicateOperator::Contains => FileIndexResult::Skip,
+            _ => FileIndexResult::Remain,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::IntType;
+
+    #[test]
+    fn test_empty_reader_matches_java_supported_predicates() {
+        let reader = EmptyFileIndexReader;
+        let data_type = DataType::Int(IntType::new());
+
+        for operator in [
+            PredicateOperator::Eq,
+            PredicateOperator::Lt,
+            PredicateOperator::LtEq,
+            PredicateOperator::Gt,
+            PredicateOperator::GtEq,
+            PredicateOperator::In,
+            PredicateOperator::IsNotNull,
+            PredicateOperator::StartsWith,
+            PredicateOperator::EndsWith,
+            PredicateOperator::Contains,
+        ] {
+            assert_eq!(
+                reader.evaluate("a", 0, &data_type, operator, &[Datum::Int(1)]),
+                FileIndexResult::Skip
+            );
+        }
+
+        for operator in [
+            PredicateOperator::IsNull,
+            PredicateOperator::NotEq,
+            PredicateOperator::NotIn,
+            PredicateOperator::ArrayContains,
+            PredicateOperator::ArraysOverlap,
+            PredicateOperator::ArrayContainsAll,
+            PredicateOperator::Like,
+            PredicateOperator::Between,
+            PredicateOperator::NotBetween,
+        ] {
+            assert_eq!(
+                reader.evaluate("a", 0, &data_type, operator, &[Datum::Int(1)]),
+                FileIndexResult::Remain
+            );
+        }
+    }
+}

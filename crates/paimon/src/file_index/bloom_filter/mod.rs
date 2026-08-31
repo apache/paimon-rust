@@ -23,6 +23,7 @@ use bytes::{Bytes, BytesMut};
 use crate::common::Options;
 use crate::file_index::file_index_reader::FileIndexReader;
 use crate::file_index::file_index_result::FileIndexResult;
+use crate::file_index::file_index_writer::FileIndexWriter;
 use crate::spec::{DataType, Datum, PredicateOperator};
 use crate::{Error, Result};
 
@@ -37,6 +38,7 @@ const FPP: &str = "fpp";
 pub(crate) struct BloomFilterWriter {
     hash_function: FastHash,
     filter: BloomFilter64,
+    empty: bool,
 }
 
 impl BloomFilterWriter {
@@ -48,21 +50,29 @@ impl BloomFilterWriter {
         Ok(Self {
             hash_function,
             filter,
+            empty: true,
         })
     }
+}
 
-    pub(crate) fn write(&mut self, datum: Option<&Datum>) -> Result<()> {
+impl FileIndexWriter for BloomFilterWriter {
+    fn write(&mut self, datum: Option<&Datum>) -> Result<()> {
         if let Some(datum) = datum {
             self.filter.add_hash(self.hash_function.hash(datum)?);
         }
+        self.empty = false;
         Ok(())
     }
 
-    pub(crate) fn serialized_bytes(&self) -> Bytes {
+    fn serialized_bytes(&mut self) -> Result<Bytes> {
         let mut serialized = BytesMut::with_capacity(4 + self.filter.bytes().len());
         serialized.extend_from_slice(&self.filter.num_hash_functions().to_be_bytes());
         serialized.extend_from_slice(self.filter.bytes());
-        serialized.freeze()
+        Ok(serialized.freeze())
+    }
+
+    fn empty(&self) -> bool {
+        self.empty
     }
 }
 
@@ -198,7 +208,7 @@ mod tests {
         }
         writer.write(None).unwrap();
 
-        let serialized = writer.serialized_bytes();
+        let serialized = writer.serialized_bytes().unwrap();
         assert_eq!(
             serialized.as_ref(),
             &hex::decode("00000003818281005001").unwrap()
@@ -253,7 +263,7 @@ mod tests {
                 .unwrap();
         writer.write(Some(&Datum::Long(42))).unwrap();
 
-        let serialized = writer.serialized_bytes();
+        let serialized = writer.serialized_bytes().unwrap();
         assert_eq!(&serialized[..4], &133_i32.to_be_bytes());
         assert_eq!(serialized.len(), 28);
 
@@ -279,7 +289,8 @@ mod tests {
             .write(Some(&Datum::Float(f32::from_bits(0x7fc0_0001))))
             .unwrap();
         let reader =
-            BloomFilterReader::try_new(float_type.clone(), writer.serialized_bytes()).unwrap();
+            BloomFilterReader::try_new(float_type.clone(), writer.serialized_bytes().unwrap())
+                .unwrap();
 
         assert_eq!(
             evaluate(
@@ -323,7 +334,8 @@ mod tests {
             BloomFilterWriter::try_new(double_type.clone(), &options("10", "0.1")).unwrap();
         writer.write(Some(&Datum::Double(-0.0))).unwrap();
         let reader =
-            BloomFilterReader::try_new(double_type.clone(), writer.serialized_bytes()).unwrap();
+            BloomFilterReader::try_new(double_type.clone(), writer.serialized_bytes().unwrap())
+                .unwrap();
         assert_eq!(
             evaluate(
                 &reader,
@@ -342,7 +354,8 @@ mod tests {
         let bigint = DataType::BigInt(BigIntType::new());
         let mut writer = BloomFilterWriter::try_new(bigint.clone(), &options).unwrap();
         writer.write(Some(&Datum::Long(42))).unwrap();
-        let reader = BloomFilterReader::try_new(bigint, writer.serialized_bytes()).unwrap();
+        let reader =
+            BloomFilterReader::try_new(bigint, writer.serialized_bytes().unwrap()).unwrap();
         assert_eq!(
             evaluate(
                 &reader,
@@ -358,7 +371,8 @@ mod tests {
         writer
             .write(Some(&Datum::String("abc".to_string())))
             .unwrap();
-        let reader = BloomFilterReader::try_new(char_type, writer.serialized_bytes()).unwrap();
+        let reader =
+            BloomFilterReader::try_new(char_type, writer.serialized_bytes().unwrap()).unwrap();
         assert_eq!(
             evaluate(
                 &reader,
@@ -377,7 +391,8 @@ mod tests {
                 nanos: 456_000,
             }))
             .unwrap();
-        let reader = BloomFilterReader::try_new(timestamp4, writer.serialized_bytes()).unwrap();
+        let reader =
+            BloomFilterReader::try_new(timestamp4, writer.serialized_bytes().unwrap()).unwrap();
         let missing = [Datum::Timestamp {
             millis: 1_700_000_000_124,
             nanos: 456_000,
@@ -479,7 +494,8 @@ mod tests {
                 BloomFilterWriter::try_new(data_type.clone(), &options("10", "0.1")).unwrap();
             writer.write(Some(&datum)).unwrap();
             let reader =
-                BloomFilterReader::try_new(data_type.clone(), writer.serialized_bytes()).unwrap();
+                BloomFilterReader::try_new(data_type.clone(), writer.serialized_bytes().unwrap())
+                    .unwrap();
 
             assert_eq!(
                 evaluate(&reader, &data_type, PredicateOperator::Eq, &[datum]),
@@ -509,7 +525,8 @@ mod tests {
             writer.write(Some(&Datum::Long(*value))).unwrap();
         }
         let reader =
-            BloomFilterReader::try_new(data_type.clone(), writer.serialized_bytes()).unwrap();
+            BloomFilterReader::try_new(data_type.clone(), writer.serialized_bytes().unwrap())
+                .unwrap();
 
         for value in inserted {
             assert_eq!(
@@ -547,7 +564,8 @@ mod tests {
             BloomFilterWriter::try_new(data_type.clone(), &options("10", "0.1")).unwrap();
         writer.write(Some(&Datum::Long(42))).unwrap();
         let reader =
-            BloomFilterReader::try_new(data_type.clone(), writer.serialized_bytes()).unwrap();
+            BloomFilterReader::try_new(data_type.clone(), writer.serialized_bytes().unwrap())
+                .unwrap();
 
         for operator in [
             PredicateOperator::IsNull,

@@ -953,6 +953,7 @@ impl FileIndexReader for BitmapFileIndexReader {
 mod tests {
     use super::*;
     use crate::common::Options;
+    use crate::file_index::file_index_writer::FileIndexWriter;
     use crate::spec::{
         BigIntType, BinaryType, BooleanType, CharType, DateType, DoubleType, FloatType, IntType,
         LocalZonedTimestampType, SmallIntType, TimeType, TimestampType, TinyIntType, VarCharType,
