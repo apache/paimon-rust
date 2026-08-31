@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -363,19 +363,23 @@ pub struct FileIndex {
 }
 
 impl FileIndex {
-    /// Constructs the concrete readers described by this outer-format file.
+    /// Constructs readers for the required columns described by this outer-format file.
     #[allow(dead_code)]
     pub(crate) async fn create_index_readers(
         &self,
         fields: &[DataField],
+        required_columns: &HashSet<String>,
     ) -> crate::Result<HashMap<String, Vec<Box<dyn FileIndexReader>>>> {
         let fields_by_name = fields
             .iter()
             .map(|field| (field.name(), field.data_type()))
             .collect::<HashMap<&str, &DataType>>();
-        let mut readers = HashMap::with_capacity(self.header.len());
+        let mut readers = HashMap::with_capacity(required_columns.len());
 
-        for (column_name, index_info) in &self.header {
+        for column_name in required_columns {
+            let Some(index_info) = self.header.get(column_name) else {
+                continue;
+            };
             let mut column_readers = Vec::with_capacity(index_info.len());
             for (identifier, info) in index_info {
                 if info.start_pos == EMPTY_INDEX_FLAG {
@@ -624,8 +628,10 @@ impl FileIndexFormatReader {
 mod file_index_format_tests {
 
     use super::*;
-    use bytes::Bytes;
-    use std::collections::HashMap;
+    use bytes::{Bytes, BytesMut};
+    use std::collections::{HashMap, HashSet};
+    use std::ops::Range;
+    use std::sync::{Arc, Mutex};
 
     use crate::common::Options;
     use crate::file_index::file_index_predicate::FileIndexPredicate;
@@ -657,6 +663,19 @@ mod file_index_format_tests {
         let output = file_io.new_output(path)?;
         output.write(Bytes::from(bytes)).await?;
         Ok(output.to_input_file())
+    }
+
+    struct TrackingFileRead {
+        data: Bytes,
+        ranges: Arc<Mutex<Vec<Range<u64>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for TrackingFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            self.ranges.lock().unwrap().push(range.clone());
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        }
     }
 
     #[test]
@@ -694,6 +713,61 @@ mod file_index_format_tests {
             resolve_index_data_type(&fields_by_name, "plain[k]"),
             Err(Error::FileIndexFormatInvalid { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn test_composition_reads_only_required_column_payloads() -> crate::Result<()> {
+        let data_type = DataType::Int(IntType::new());
+        let mut writer =
+            FileIndexerFactory::create_writer(BITMAP_INDEX, data_type.clone(), &Options::new())?;
+        writer.write(Some(&Datum::Int(1)))?;
+        let required_payload = writer.serialized_bytes()?;
+        let unrelated_payload = Bytes::from(vec![0; 1024]);
+        let required_end = required_payload.len() as u64;
+        let unrelated_end = required_end + unrelated_payload.len() as u64;
+        let mut data = BytesMut::with_capacity(unrelated_end as usize);
+        data.extend_from_slice(&required_payload);
+        data.extend_from_slice(&unrelated_payload);
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let file_index = FileIndex {
+            reader: Box::new(TrackingFileRead {
+                data: data.freeze(),
+                ranges: Arc::clone(&ranges),
+            }),
+            header: HashMap::from([
+                (
+                    "required".to_string(),
+                    HashMap::from([(
+                        BITMAP_INDEX.to_string(),
+                        IndexInfo {
+                            start_pos: 0,
+                            length: required_end as i32,
+                        },
+                    )]),
+                ),
+                (
+                    "unrelated".to_string(),
+                    HashMap::from([(
+                        "unknown".to_string(),
+                        IndexInfo {
+                            start_pos: required_end as i32,
+                            length: unrelated_payload.len() as i32,
+                        },
+                    )]),
+                ),
+            ]),
+        };
+        let fields = [DataField::new(0, "required".to_string(), data_type)];
+        let required_columns = HashSet::from(["required".to_string()]);
+
+        let readers = file_index
+            .create_index_readers(&fields, &required_columns)
+            .await?;
+
+        assert_eq!(readers.len(), 1);
+        assert_eq!(readers["required"].len(), 1);
+        assert_eq!(*ranges.lock().unwrap(), vec![0..required_end]);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1016,7 +1090,11 @@ mod file_index_format_tests {
 
         let output = write_column_indexes("memory:/tmp/composed_file_indexes", indexes).await?;
         let file_index = FileIndexFormatReader::get_file_index(output.to_input_file()).await?;
-        let readers = file_index.create_index_readers(&fields).await?;
+        let required_columns =
+            HashSet::from(["a".to_string(), "b".to_string(), "empty".to_string()]);
+        let readers = file_index
+            .create_index_readers(&fields, &required_columns)
+            .await?;
         assert_eq!(readers.len(), 3);
         assert_eq!(readers["a"].len(), 2);
         assert_eq!(readers["b"].len(), 1);
@@ -1078,7 +1156,10 @@ mod file_index_format_tests {
 
         let output = write_column_indexes("memory:/tmp/nested_map_file_indexes", indexes).await?;
         let file_index = FileIndexFormatReader::get_file_index(output.to_input_file()).await?;
-        let readers = file_index.create_index_readers(&fields).await?;
+        let required_columns = HashSet::from(["metrics[k]".to_string()]);
+        let readers = file_index
+            .create_index_readers(&fields, &required_columns)
+            .await?;
         assert_eq!(readers["metrics[k]"].len(), 2);
 
         let predicate = FileIndexPredicate::new(readers);
@@ -1109,7 +1190,11 @@ mod file_index_format_tests {
             DataType::Int(IntType::new()),
         )];
 
-        let error = match file_index.create_index_readers(&fields).await {
+        let required_columns = HashSet::from(["a".to_string()]);
+        let error = match file_index
+            .create_index_readers(&fields, &required_columns)
+            .await
+        {
             Ok(_) => panic!("unknown identifier must fail"),
             Err(error) => error,
         };
