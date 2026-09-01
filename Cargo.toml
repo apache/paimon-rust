@@ -39,7 +39,7 @@ rust-version = "1.91.0"
 arrow = "58.0"
 arrow-array = { version = "58.0", features = ["ffi"] }
 arrow-arith = "58.0"
-arrow-buffer = "58.0"
+arrow-buffer = "59.2"
 arrow-schema = "58.0"
 arrow-cast = "58.0"
 arrow-ord = "58.0"
