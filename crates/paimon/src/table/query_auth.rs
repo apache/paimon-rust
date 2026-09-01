@@ -227,51 +227,62 @@ mod tests {
         );
     }
 
+    fn data_file_for_stats(
+        schema_id: i64,
+        cols: Option<Vec<&str>>,
+        written: Option<Vec<&str>>,
+    ) -> crate::spec::DataFileMeta {
+        crate::spec::DataFileMeta {
+            file_name: "f.parquet".to_string(),
+            file_size: 1,
+            row_count: 1,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: crate::spec::stats::BinaryTableStats::empty(),
+            value_stats: crate::spec::stats::BinaryTableStats::empty(),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: Some(0),
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: cols.map(|c| c.iter().map(|s| s.to_string()).collect()),
+            external_path: None,
+            first_row_id: None,
+            write_cols: written.map(|c| c.iter().map(|s| s.to_string()).collect()),
+            column_max_sequence_numbers: None,
+        }
+    }
+
+    fn plan_of(meta: crate::spec::DataFileMeta) -> crate::table::Plan {
+        crate::table::Plan::new(vec![crate::table::DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRowBuilder::new(0).build())
+            .with_bucket(0)
+            .with_bucket_path("p".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![meta])
+            .with_raw_convertible(false)
+            .build()
+            .unwrap()])
+    }
+
     #[tokio::test]
     async fn test_stats_for_a_dropped_column_are_refused() {
         let table = query_auth_table();
-        let file =
-            |cols: Option<Vec<&str>>, written: Option<Vec<&str>>| crate::spec::DataFileMeta {
-                file_name: "f.parquet".to_string(),
-                file_size: 1,
-                row_count: 1,
-                min_key: Vec::new(),
-                max_key: Vec::new(),
-                key_stats: crate::spec::stats::BinaryTableStats::empty(),
-                value_stats: crate::spec::stats::BinaryTableStats::empty(),
-                min_sequence_number: 0,
-                max_sequence_number: 0,
-                schema_id: table.schema().id(),
-                level: 0,
-                extra_files: Vec::new(),
-                creation_time: None,
-                delete_row_count: Some(0),
-                embedded_index: None,
-                file_source: None,
-                value_stats_cols: cols.map(|c| c.iter().map(|s| s.to_string()).collect()),
-                external_path: None,
-                first_row_id: None,
-                write_cols: written.map(|c| c.iter().map(|s| s.to_string()).collect()),
-                column_max_sequence_numbers: None,
-            };
-        let plan_of = |meta| {
-            crate::table::Plan::new(vec![crate::table::DataSplitBuilder::new()
-                .with_snapshot(1)
-                .with_partition(crate::spec::BinaryRowBuilder::new(0).build())
-                .with_bucket(0)
-                .with_bucket_path("p".to_string())
-                .with_total_buckets(1)
-                .with_data_files(vec![meta])
-                .with_raw_convertible(false)
-                .build()
-                .unwrap()])
-        };
         let schemas = table.schema_manager();
 
         for meta in [
-            file(Some(vec!["id", "gone"]), None),
-            file(None, Some(vec!["id", "gone"])),
-            file(Some(vec!["id"]), Some(vec!["id", "gone"])),
+            data_file_for_stats(table.schema().id(), Some(vec!["id", "gone"]), None),
+            data_file_for_stats(table.schema().id(), None, Some(vec!["id", "gone"])),
+            data_file_for_stats(
+                table.schema().id(),
+                Some(vec!["id"]),
+                Some(vec!["id", "gone"]),
+            ),
         ] {
             let err = super::reject_unauthorized_stats(&plan_of(meta), table.schema(), schemas)
                 .await
@@ -284,12 +295,67 @@ mod tests {
         }
 
         assert!(super::reject_unauthorized_stats(
-            &plan_of(file(Some(vec!["id"]), Some(vec!["id"]))),
+            &plan_of(data_file_for_stats(
+                table.schema().id(),
+                Some(vec!["id"]),
+                Some(vec!["id"])
+            )),
             table.schema(),
             schemas
         )
         .await
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_an_old_schema_whose_column_changed_type_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let location = tmp.path().display().to_string();
+        let column = |ty| {
+            crate::spec::Schema::builder()
+                .column("id", ty)
+                .option("query-auth.enabled", "true")
+                .build()
+                .unwrap()
+        };
+        let table = crate::table::Table::new(
+            crate::io::FileIOBuilder::new("file").build().unwrap(),
+            crate::catalog::Identifier::new("default", "evolved"),
+            location,
+            crate::spec::TableSchema::new(
+                0,
+                &column(crate::spec::DataType::Int(crate::spec::IntType::new())),
+            ),
+            None,
+        );
+
+        // Same field id and name, a different type: the server ruled on the
+        // current one, so the older file's stats are not covered.
+        let older = crate::spec::TableSchema::new(
+            1,
+            &column(crate::spec::DataType::BigInt(crate::spec::BigIntType::new())),
+        );
+        let schemas = table.schema_manager();
+        table
+            .file_io()
+            .new_output(&schemas.schema_path(1))
+            .unwrap()
+            .write(serde_json::to_vec(&older).unwrap().into())
+            .await
+            .unwrap();
+
+        let err = super::reject_unauthorized_stats(
+            &plan_of(data_file_for_stats(1, None, None)),
+            table.schema(),
+            schemas,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("statistics for 'id'")),
+            "{err:?}"
+        );
     }
 
     #[test]
