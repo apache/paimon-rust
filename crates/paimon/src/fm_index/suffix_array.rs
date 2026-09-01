@@ -297,10 +297,10 @@ mod tests {
         for length in 1..=80 {
             for _ in 0..30 {
                 let alphabet = random.gen_range(1..=12);
-                let mut text = (0..length)
+                let text = (0..length)
                     .map(|_| random.gen_range(1..=alphabet) as u16)
+                    .chain(std::iter::once(0))
                     .collect::<Vec<_>>();
-                text.push(0);
                 assert_eq!(build(&text, alphabet).unwrap(), naive(&text));
             }
         }
