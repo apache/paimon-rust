@@ -89,7 +89,7 @@ jobs:
         run: python3 scripts/validate_asf_yaml.py
 
       - name: Check License Header
-        uses: apache/skywalking-eyes/header@v0.8.0
+        uses: apache/skywalking-eyes/header@v0.9.0
 
       - name: Test release artifact verifiers
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
