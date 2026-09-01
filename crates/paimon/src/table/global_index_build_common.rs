@@ -28,6 +28,8 @@ use crate::spec::{FileKind, IndexManifest};
 use crate::table::{merge_row_ranges, RowRange, Table};
 use crate::{Error, Result};
 
+pub(crate) mod vector;
+
 /// Java `sameExtraFieldIds`: null/empty are equal; otherwise exact ordered equality.
 pub(crate) fn same_extra_field_ids(a: Option<&[i32]>, b: Option<&[i32]>) -> bool {
     let a = a.unwrap_or(&[]);

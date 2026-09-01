@@ -1,0 +1,2332 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+use crate::btree::BTreeIndexMeta;
+use crate::catalog::Identifier;
+use crate::io::FileIOBuilder;
+use crate::spec::stats::BinaryTableStats;
+use crate::spec::{
+    ArrayType, BinaryRow, BinaryRowBuilder, BinaryType, DataField, DataFileMeta, DoubleType,
+    FileKind, FloatType, GlobalIndexMeta, GlobalIndexSearchMode, IndexFileMeta, IndexManifest,
+    IntType, ManifestEntry, Predicate, PredicateBuilder, PredicateOperator, Schema, TableSchema,
+    TimeType, VarBinaryType, VarCharType, ROW_ID_FIELD_NAME,
+};
+use crate::table::global_index_scanner::{evaluate_global_index, GlobalIndexEvaluation};
+use crate::table::global_index_types::MULTIVALUE_GLOBAL_INDEX_TYPE;
+use crate::table::{merge_row_ranges, SnapshotManager, TableCommit, TableWrite};
+use arrow_array::builder::{Int32Builder, ListBuilder, Time32MillisecondBuilder};
+use arrow_array::{
+    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use chrono::{DateTime, Utc};
+use futures::TryStreamExt;
+use std::sync::Arc;
+
+/// A row range wider than `i32::MAX` yields the full count instead of being
+/// rejected, and an inverted or overflowing range is still an error.
+#[test]
+fn checked_row_count_spans_beyond_i32() {
+    let start = 0;
+    let end = i64::from(i32::MAX) + 10;
+    assert_eq!(
+        super::checked_row_count(start, end).unwrap(),
+        i64::from(i32::MAX) + 11
+    );
+    assert!(super::checked_row_count(5, 4).is_err());
+    assert!(super::checked_row_count(i64::MIN, i64::MAX).is_err());
+}
+
+fn data_file(name: &str, first_row_id: Option<i64>, row_count: i64) -> DataFileMeta {
+    DataFileMeta {
+        file_name: name.to_string(),
+        file_size: 128,
+        row_count,
+        min_key: vec![],
+        max_key: vec![],
+        key_stats: BinaryTableStats::new(vec![], vec![], vec![]),
+        value_stats: BinaryTableStats::new(vec![], vec![], vec![]),
+        min_sequence_number: 0,
+        max_sequence_number: 0,
+        schema_id: 0,
+        level: 0,
+        extra_files: vec![],
+        creation_time: Some(
+            "2024-09-06T07:45:55.039+00:00"
+                .parse::<DateTime<Utc>>()
+                .unwrap(),
+        ),
+        delete_row_count: None,
+        embedded_index: None,
+        first_row_id,
+        write_cols: None,
+        external_path: None,
+        file_source: None,
+        value_stats_cols: None,
+        column_max_sequence_numbers: None,
+    }
+}
+
+fn partial_file(name: &str, first_row_id: Option<i64>, row_count: i64) -> DataFileMeta {
+    let mut file = data_file(name, first_row_id, row_count);
+    file.write_cols = Some(vec!["name".to_string()]);
+    file
+}
+
+fn manifest_entry(file: DataFileMeta) -> ManifestEntry {
+    manifest_entry_with_bucket(file, 0, 1)
+}
+
+fn manifest_entry_with_bucket(
+    file: DataFileMeta,
+    bucket: i32,
+    total_buckets: i32,
+) -> ManifestEntry {
+    ManifestEntry::new(FileKind::Add, vec![], bucket, total_buckets, file, 2)
+}
+
+fn table_options(records_per_range: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("row-tracking.enabled".to_string(), "true".to_string()),
+        ("data-evolution.enabled".to_string(), "true".to_string()),
+        ("global-index.enabled".to_string(), "true".to_string()),
+        (
+            "sorted-index.records-per-range".to_string(),
+            records_per_range.to_string(),
+        ),
+    ])
+}
+
+fn test_table(options: HashMap<String, String>) -> Table {
+    test_table_with_path("memory:/test_btree_global_index_builder", options)
+}
+
+fn test_table_with_path(table_path: &str, options: HashMap<String, String>) -> Table {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .options(options)
+        .build()
+        .unwrap();
+    Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "test_table"),
+        table_path.to_string(),
+        TableSchema::new(0, &schema),
+        None,
+    )
+}
+
+fn multivalue_table(table_path: &str) -> Table {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "items",
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+        )
+        .options(table_options("10"))
+        .build()
+        .unwrap();
+    Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "test_multivalue_table"),
+        table_path.to_string(),
+        TableSchema::new(0, &schema),
+        None,
+    )
+}
+
+fn plan(
+    entries: Vec<ManifestEntry>,
+    records_per_range: i64,
+) -> Result<Vec<SortedGlobalIndexShard>> {
+    let table = test_table(table_options(&records_per_range.to_string()));
+    let core = CoreOptions::new(table.schema().options());
+    plan_sorted_index_shards(
+        table.location(),
+        table.schema().partition_keys(),
+        table.schema().fields(),
+        &core,
+        1,
+        entries,
+        records_per_range,
+        &[],
+    )
+}
+
+#[test]
+fn test_planner_splits_single_file_across_ranges() {
+    let shards = plan(vec![manifest_entry(data_file("a", Some(0), 25))], 10).unwrap();
+
+    assert_eq!(
+        shards
+            .iter()
+            .map(|s| (s.row_range_start, s.row_range_end))
+            .collect::<Vec<_>>(),
+        vec![(0, 9), (10, 19), (20, 24)]
+    );
+}
+
+#[test]
+fn test_planner_merges_contiguous_normal_files() {
+    let shards = plan(
+        vec![
+            manifest_entry(data_file("a", Some(0), 5)),
+            manifest_entry(data_file("b", Some(5), 5)),
+        ],
+        20,
+    )
+    .unwrap();
+
+    assert_eq!(shards.len(), 1);
+    assert_eq!((shards[0].row_range_start, shards[0].row_range_end), (0, 9));
+}
+
+#[test]
+fn test_planner_splits_row_id_gap_into_separate_shards() {
+    let shards = plan(
+        vec![
+            manifest_entry(data_file("a", Some(0), 5)),
+            manifest_entry(data_file("b", Some(10), 5)),
+        ],
+        20,
+    )
+    .unwrap();
+
+    assert_eq!(
+        shards
+            .iter()
+            .map(|s| (s.row_range_start, s.row_range_end))
+            .collect::<Vec<_>>(),
+        vec![(0, 4), (10, 14)]
+    );
+}
+
+#[test]
+fn test_planner_rejects_missing_first_row_id() {
+    let err = plan(vec![manifest_entry(data_file("a", None, 5))], 10)
+        .expect_err("missing first_row_id should fail");
+    assert!(
+        matches!(err, Error::DataInvalid { message, .. } if message.contains("missing first_row_id"))
+    );
+}
+
+#[test]
+fn test_planner_keeps_buckets_separate() {
+    let shards = plan(
+        vec![
+            manifest_entry_with_bucket(data_file("a", Some(0), 5), 0, 2),
+            manifest_entry_with_bucket(data_file("b", Some(5), 5), 1, 2),
+        ],
+        20,
+    )
+    .unwrap();
+
+    assert_eq!(
+        shards
+            .iter()
+            .map(|s| (
+                s.source_bucket,
+                s.total_buckets,
+                s.row_range_start,
+                s.row_range_end
+            ))
+            .collect::<Vec<_>>(),
+        vec![(0, 2, 0, 4), (1, 2, 5, 9)]
+    );
+}
+
+#[test]
+fn test_planner_keeps_partial_file_in_read_group_without_expanding_coverage() {
+    let shards = plan(
+        vec![
+            manifest_entry(data_file("base", Some(0), 5)),
+            manifest_entry(partial_file("partial", Some(0), 5)),
+        ],
+        20,
+    )
+    .unwrap();
+
+    assert_eq!(shards.len(), 1);
+    assert_eq!((shards[0].row_range_start, shards[0].row_range_end), (0, 4));
+    assert_eq!(shards[0].files.len(), 2);
+}
+
+#[test]
+fn test_build_read_splits_groups_only_overlapping_partial_files() {
+    let shards = plan(
+        vec![
+            manifest_entry(data_file("a", Some(0), 5)),
+            manifest_entry(data_file("b", Some(5), 5)),
+            manifest_entry(partial_file("partial", Some(0), 5)),
+        ],
+        20,
+    )
+    .unwrap();
+    assert_eq!(shards.len(), 1);
+
+    let splits = build_read_splits_for_shard(&shards[0]).unwrap();
+
+    assert_eq!(splits.len(), 2);
+    assert_eq!(
+        splits[0]
+            .data_files()
+            .iter()
+            .map(|file| file.file_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "partial"]
+    );
+    assert_eq!(splits[0].row_ranges(), Some(&[RowRange::new(0, 4)][..]));
+    assert!(!splits[0].raw_convertible());
+
+    assert_eq!(
+        splits[1]
+            .data_files()
+            .iter()
+            .map(|file| file.file_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["b"]
+    );
+    assert_eq!(splits[1].row_ranges(), Some(&[RowRange::new(5, 9)][..]));
+    assert!(splits[1].raw_convertible());
+}
+
+#[test]
+fn test_validate_btree_field_rejects_complex_type() {
+    let field = DataField::new(
+        0,
+        "items".to_string(),
+        DataType::Array(crate::spec::ArrayType::new(DataType::Int(IntType::new()))),
+    );
+    let err = validate_btree_field(&field).expect_err("array should be rejected");
+    assert!(matches!(err, Error::Unsupported { message } if message.contains("scalar")));
+}
+
+#[test]
+fn test_validate_btree_field_rejects_binary_types() {
+    for data_type in [
+        DataType::Binary(BinaryType::new(4).unwrap()),
+        DataType::VarBinary(VarBinaryType::try_new(true, 4).unwrap()),
+    ] {
+        let field = DataField::new(0, "bytes".to_string(), data_type);
+        let err = validate_btree_field(&field).expect_err("binary should be rejected");
+        assert!(matches!(err, Error::Unsupported { message } if message.contains("scalar")));
+    }
+}
+
+fn index_batch(values: Vec<Option<i32>>, row_ids: Vec<Option<i64>>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, true),
+        ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(values)) as ArrayRef,
+            Arc::new(Int64Array::from(row_ids)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_extract_index_rows_serializes_keys_and_local_row_ids() {
+    let batch = index_batch(
+        vec![Some(10), None, Some(30)],
+        vec![Some(5), Some(6), Some(7)],
+    );
+    let rows = extract_index_rows_from_batches(
+        &[batch],
+        "id",
+        &DataType::Int(IntType::new()),
+        5,
+        3,
+        serialize_datum,
+    )
+    .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (Some(10i32.to_le_bytes().to_vec()), 0),
+            (None, 1),
+            (Some(30i32.to_le_bytes().to_vec()), 2),
+        ]
+    );
+}
+
+#[test]
+fn test_extract_multivalue_rows_skips_null_arrays_and_elements() {
+    let element = Arc::new(ArrowField::new("element", ArrowDataType::Int32, true));
+    let mut items = ListBuilder::new(Int32Builder::new()).with_field(element.clone());
+    items.values().append_value(10);
+    items.values().append_null();
+    items.values().append_value(10);
+    items.append(true);
+    items.append(true); // empty array
+    items.append(false); // null array
+    items.values().append_value(30);
+    items.append(true);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("items", ArrowDataType::List(element), true),
+        ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(items.finish()) as ArrayRef,
+            Arc::new(Int64Array::from_iter_values(5..9)) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let rows = extract_multivalue_index_rows_from_batches(
+        &[batch],
+        "items",
+        &DataType::Int(IntType::new()),
+        5,
+        4,
+        serialize_bitmap_datum,
+    )
+    .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (Some(10i32.to_le_bytes().to_vec()), 0),
+            (Some(10i32.to_le_bytes().to_vec()), 0),
+            (Some(30i32.to_le_bytes().to_vec()), 3),
+        ]
+    );
+}
+
+#[test]
+fn test_extract_multivalue_time_rows_matches_java_int_serializer() {
+    let element = Arc::new(ArrowField::new(
+        "element",
+        ArrowDataType::Time32(arrow_schema::TimeUnit::Millisecond),
+        true,
+    ));
+    let mut items = ListBuilder::new(Time32MillisecondBuilder::new()).with_field(element.clone());
+    items.values().append_value(12_345);
+    items.values().append_null();
+    items.append(true);
+    items.values().append_value(86_399_999);
+    items.append(true);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("items", ArrowDataType::List(element), true),
+        ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(items.finish()) as ArrayRef,
+            Arc::new(Int64Array::from_iter_values(7..9)) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let time_type = DataType::Time(TimeType::new(3).unwrap());
+
+    let rows = extract_multivalue_index_rows_from_batches(
+        &[batch],
+        "items",
+        &time_type,
+        7,
+        2,
+        serialize_bitmap_datum,
+    )
+    .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (Some(12_345i32.to_le_bytes().to_vec()), 0),
+            (Some(86_399_999i32.to_le_bytes().to_vec()), 1),
+        ]
+    );
+}
+
+#[test]
+fn test_index_key_codec_scopes_java_nan_semantics_to_bitmap() {
+    fn assert_codec(
+        data_type: DataType,
+        negative_nan: Datum,
+        raw_nan_key: Vec<u8>,
+        canonical_nan_key: Vec<u8>,
+        zero: Datum,
+    ) {
+        let (btree_cmp, btree_serialize) =
+            make_index_key_codec(BTREE_GLOBAL_INDEX_TYPE, &data_type);
+        let btree_nan_key = btree_serialize(&negative_nan, &data_type);
+        let zero_key = btree_serialize(&zero, &data_type);
+        assert_eq!(btree_nan_key, raw_nan_key);
+        assert!(btree_cmp(&btree_nan_key, &zero_key).is_lt());
+
+        let (bitmap_cmp, bitmap_serialize) =
+            make_index_key_codec(BITMAP_GLOBAL_INDEX_TYPE, &data_type);
+        let bitmap_nan_key = bitmap_serialize(&negative_nan, &data_type);
+        assert_eq!(bitmap_nan_key, canonical_nan_key);
+        assert!(bitmap_cmp(&bitmap_nan_key, &zero_key).is_gt());
+    }
+
+    assert_codec(
+        DataType::Float(FloatType::new()),
+        Datum::Float(f32::from_bits(0xffc0_0001)),
+        0xffc0_0001u32.to_le_bytes().to_vec(),
+        0x7fc0_0000u32.to_le_bytes().to_vec(),
+        Datum::Float(0.0),
+    );
+    assert_codec(
+        DataType::Double(DoubleType::new()),
+        Datum::Double(f64::from_bits(0xfff8_0000_0000_0001)),
+        0xfff8_0000_0000_0001u64.to_le_bytes().to_vec(),
+        0x7ff8_0000_0000_0000u64.to_le_bytes().to_vec(),
+        Datum::Double(0.0),
+    );
+}
+
+#[test]
+fn test_extract_index_rows_rejects_row_id_gap() {
+    let batch = index_batch(vec![Some(10), Some(30)], vec![Some(5), Some(7)]);
+    let err = extract_index_rows_from_batches(
+        &[batch],
+        "id",
+        &DataType::Int(IntType::new()),
+        5,
+        2,
+        serialize_datum,
+    )
+    .expect_err("row-id gap should fail");
+
+    assert!(
+        matches!(err, Error::DataInvalid { message, .. } if message.contains("expected _ROW_ID"))
+    );
+}
+
+#[test]
+fn test_sort_index_rows_orders_nulls_then_keys() {
+    let mut rows = vec![
+        (Some(3i32.to_le_bytes().to_vec()), 0),
+        (None, 1),
+        (Some(1i32.to_le_bytes().to_vec()), 2),
+        (Some(1i32.to_le_bytes().to_vec()), 3),
+    ];
+    let cmp = make_key_comparator(&DataType::Int(IntType::new()));
+
+    sort_index_rows(&mut rows, &cmp);
+
+    assert_eq!(
+        rows,
+        vec![
+            (None, 1),
+            (Some(1i32.to_le_bytes().to_vec()), 2),
+            (Some(1i32.to_le_bytes().to_vec()), 3),
+            (Some(3i32.to_le_bytes().to_vec()), 0),
+        ]
+    );
+}
+
+#[test]
+fn test_extract_index_rows_accepts_string_column() {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+        ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some("alice"), None])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(10), Some(11)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let rows = extract_index_rows_from_batches(
+        &[batch],
+        "name",
+        &DataType::VarChar(VarCharType::string_type()),
+        10,
+        2,
+        serialize_datum,
+    )
+    .unwrap();
+
+    assert_eq!(rows, vec![(Some(b"alice".to_vec()), 0), (None, 1)]);
+}
+
+fn data_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(names)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn nullable_name_batch(ids: Vec<i32>, names: Vec<Option<&str>>) -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("name", ArrowDataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(names)) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+fn multivalue_batch() -> RecordBatch {
+    let element = Arc::new(ArrowField::new("element", ArrowDataType::Int32, true));
+    let mut items = ListBuilder::new(Int32Builder::new()).with_field(element.clone());
+
+    items.values().append_value(10);
+    items.values().append_null();
+    items.values().append_value(10);
+    items.append(true);
+
+    items.append(true); // empty array
+    items.append(false); // null array
+
+    items.values().append_value(10);
+    items.values().append_value(30);
+    items.append(true);
+
+    items.values().append_value(30);
+    items.values().append_value(40);
+    items.append(true);
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("items", ArrowDataType::List(element), true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from_iter_values(1..=5)) as ArrayRef,
+            Arc::new(items.finish()) as ArrayRef,
+        ],
+    )
+    .unwrap()
+}
+
+async fn setup_dirs(table: &Table) {
+    table
+        .file_io()
+        .mkdirs(&format!("{}/snapshot/", table.location()))
+        .await
+        .unwrap();
+    table
+        .file_io()
+        .mkdirs(&format!("{}/manifest/", table.location()))
+        .await
+        .unwrap();
+}
+
+async fn scan_ids(table: &Table, predicate: Predicate) -> Vec<i32> {
+    let mut builder = table.new_read_builder();
+    builder.with_filter(predicate);
+    let plan = builder.new_scan().plan().await.unwrap();
+    let read = builder.new_read().unwrap();
+    let batches = read
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let mut ids = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test]
+async fn test_execute_writes_btree_index_manifest_and_file() {
+    let table_path = "memory:/test_btree_global_index_builder_e2e";
+    let table = test_table_with_path(table_path, table_options("10"));
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "alice"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let shard_count = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(shard_count, 1);
+
+    let snapshot_manager =
+        SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let snapshot = snapshot_manager
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let index_manifest = snapshot.index_manifest().expect("index manifest");
+    let index_entries = IndexManifest::read(
+        table.file_io(),
+        &format!("{table_path}/manifest/{index_manifest}"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(index_entries.len(), 1);
+
+    let index_file = &index_entries[0].index_file;
+    assert_eq!(index_file.index_type, BTREE_GLOBAL_INDEX_TYPE);
+    assert!(index_file.file_name.starts_with("btree-global-index-"));
+    assert_eq!(index_file.row_count, 3);
+    assert!(index_file.file_size > 0);
+
+    let global_meta = index_file
+        .global_index_meta
+        .as_ref()
+        .expect("global index meta");
+    assert_eq!(global_meta.row_range_start, 0);
+    assert_eq!(global_meta.row_range_end, 2);
+    assert_eq!(global_meta.index_field_id, 1);
+    let btree_meta =
+        crate::btree::BTreeIndexMeta::deserialize(global_meta.index_meta.as_ref().unwrap())
+            .unwrap();
+    assert_eq!(btree_meta.first_key, Some(b"alice".to_vec()));
+    assert_eq!(btree_meta.last_key, Some(b"bob".to_vec()));
+    assert!(!btree_meta.has_nulls);
+
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("name", crate::spec::Datum::String("alice".to_string()))
+        .unwrap();
+    let row_ranges = evaluate_global_index(GlobalIndexEvaluation {
+        file_io: table.file_io(),
+        table_path: table.location(),
+        index_entries: &index_entries,
+        predicates: &[predicate],
+        schema_fields: table.schema().fields(),
+        search_mode: GlobalIndexSearchMode::Fast,
+        global_index_thread_num: 32,
+        btree_fallback_scan_max_size: i64::MAX,
+        bitmap_fallback_scan_max_size: i64::MAX,
+        fm_read_options: crate::fm_index::FMReadOptions::default(),
+        next_row_id: snapshot.next_row_id(),
+        data_ranges: &[],
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(row_ranges, vec![RowRange::new(0, 0), RowRange::new(2, 2)]);
+
+    // Reopen the same table without an explicit global-index override and
+    // verify that the regular scan path still uses the committed index.
+    let mut options = table.schema().options().clone();
+    assert_eq!(
+        options.remove("global-index.enabled"),
+        Some("true".to_string())
+    );
+    let scan_table = Table::new(
+        table.file_io().clone(),
+        table.identifier().clone(),
+        table.location().to_string(),
+        table.schema().copy_with_replaced_options(options),
+        None,
+    );
+    let predicate = PredicateBuilder::new(scan_table.schema().fields())
+        .equal("name", crate::spec::Datum::String("alice".to_string()))
+        .unwrap();
+    let mut read_builder = scan_table.new_read_builder();
+    read_builder.with_filter(predicate);
+    let plan = read_builder.new_scan().plan().await.unwrap();
+
+    assert_eq!(plan.splits().len(), 1);
+    assert_eq!(
+        plan.splits()[0].row_ranges(),
+        Some(&[RowRange::new(0, 0), RowRange::new(2, 2)][..])
+    );
+}
+
+#[tokio::test]
+async fn test_execute_writes_and_queries_fm_index() {
+    let table_path = "memory:/test_fm_global_index_builder_e2e";
+    let mut options = table_options("10");
+    options.insert("fm-index.sa-sample-rate".to_string(), "1".to_string());
+    options.insert("fm-index.locate-cost-ratio".to_string(), "1".to_string());
+    options.insert("fm-index.compression".to_string(), "none".to_string());
+    let table = test_table_with_path(table_path, options);
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&nullable_name_batch(
+            vec![1, 2, 3, 4],
+            vec![Some("banana"), Some("bandana"), None, Some("")],
+        ))
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(table_write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        table
+            .new_sorted_global_index_build_builder()
+            .with_index_column("name")
+            .with_index_type(FM_GLOBAL_INDEX_TYPE)
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let index_entries = IndexManifest::read(
+        table.file_io(),
+        &format!(
+            "{table_path}/manifest/{}",
+            snapshot.index_manifest().expect("index manifest")
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(index_entries.len(), 1);
+    let index_file = &index_entries[0].index_file;
+    assert_eq!(index_file.index_type, FM_GLOBAL_INDEX_TYPE);
+    assert!(index_file.file_name.starts_with("fm-global-index-"));
+    assert_eq!(index_file.row_count, 4);
+    crate::fm_index::validate_manifest_meta(
+        index_file
+            .global_index_meta
+            .as_ref()
+            .unwrap()
+            .index_meta
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let predicates = PredicateBuilder::new(table.schema().fields());
+    assert_eq!(
+        scan_ids(
+            &table,
+            predicates
+                .contains("name", Datum::String("ana".to_string()))
+                .unwrap(),
+        )
+        .await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        scan_ids(&table, predicates.is_null("name").unwrap()).await,
+        vec![3]
+    );
+    assert_eq!(
+        scan_ids(
+            &table,
+            predicates
+                .contains("name", Datum::String(String::new()))
+                .unwrap(),
+        )
+        .await,
+        vec![1, 2, 4]
+    );
+
+    // A dense match that exceeds the FM locate budget must decline the
+    // index and let the normal row filter scan the source, never produce
+    // a false empty result.
+    let mut fallback_options = table.schema().options().clone();
+    fallback_options.insert(
+        "fm-index.locate-cost-ratio".to_string(),
+        "0.000001".to_string(),
+    );
+    let fallback_table = Table::new(
+        table.file_io().clone(),
+        table.identifier().clone(),
+        table.location().to_string(),
+        table.schema().copy_with_replaced_options(fallback_options),
+        None,
+    );
+    let predicate = PredicateBuilder::new(fallback_table.schema().fields())
+        .contains("name", Datum::String("a".to_string()))
+        .unwrap();
+    assert_eq!(scan_ids(&fallback_table, predicate).await, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn test_failed_fm_build_removes_partial_index_file() {
+    let table_path = "memory:/test_failed_fm_build_cleanup";
+    let table = test_table_with_path(table_path, table_options("3"));
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(
+            vec![1, 2, 3, 4, 5, 6],
+            vec!["one", "two", "six", "red", "blue", "value-too-long"],
+        ))
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(table_write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let mut options = HashMap::new();
+    options.insert("fm-index.partition-size".to_string(), "8".to_string());
+    options.insert("fm-index.partition-row-count".to_string(), "1".to_string());
+    options.insert("fm-index.compression".to_string(), "none".to_string());
+    let error = table
+        .new_sorted_global_index_build_builder()
+        .with_index_column("name")
+        .with_index_type(FM_GLOBAL_INDEX_TYPE)
+        .with_options(options)
+        .execute()
+        .await
+        .expect_err("the oversized FM value must fail the build");
+    assert!(matches!(error, Error::DataInvalid { .. }));
+
+    let files = table
+        .file_io()
+        .list_status(&format!("{table_path}/index"))
+        .await
+        .unwrap();
+    assert!(
+        files
+            .iter()
+            .all(|file| !file.path.contains("fm-global-index-")),
+        "failed FM build left a partial index file: {files:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_global_index_prunes_during_manifest_read() {
+    for (search_mode, expected_manifest_pruned, expected_entries_read) in
+        [("fast", 1, 1), ("full", 1, 1)]
+    {
+        let table_path = format!("memory:/test_global_index_manifest_pruning_{search_mode}");
+        let mut options = table_options("2");
+        options.insert(
+            "global-index.search-mode".to_string(),
+            search_mode.to_string(),
+        );
+        let table = test_table_with_path(&table_path, options);
+        setup_dirs(&table).await;
+
+        for (user, ids, names) in [
+            ("writer-1", vec![1, 2], vec!["alice", "bob"]),
+            ("writer-2", vec![3, 4], vec!["carol", "dave"]),
+        ] {
+            let mut table_write = TableWrite::new(&table, user.to_string()).unwrap();
+            table_write
+                .write_arrow_batch(&data_batch(ids, names))
+                .await
+                .unwrap();
+            TableCommit::new(table.clone(), user.to_string())
+                .commit(table_write.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+        }
+
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("name", crate::spec::Datum::String("alice".to_string()))
+            .unwrap();
+        let mut read_builder = table.new_read_builder();
+        read_builder.with_filter(predicate);
+        let (plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+
+        assert_eq!(
+            plan.splits()
+                .iter()
+                .flat_map(|split| split.data_files())
+                .count(),
+            1
+        );
+        assert_eq!(
+            trace.manifest_files_pruned_by_row_ranges,
+            expected_manifest_pruned
+        );
+        assert_eq!(trace.manifest_entries_read, expected_entries_read);
+        assert_eq!(trace.manifest_entries_pruned_by_row_ranges, 0);
+        assert_eq!(
+            trace.manifest_entries_after_manifest_filters,
+            expected_entries_read
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_scalar_full_search_includes_unindexed_rows() {
+    let mut options = table_options("2");
+    options.insert("scalar-index.search-mode".to_string(), "full".to_string());
+    let table = test_table_with_path(
+        "memory:/test_scalar_full_search_includes_unindexed_rows",
+        options,
+    );
+    setup_dirs(&table).await;
+
+    let mut first_write = TableWrite::new(&table, "writer-1".to_string()).unwrap();
+    first_write
+        .write_arrow_batch(&data_batch(vec![1, 2], vec!["alice", "bob"]))
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "writer-1".to_string())
+        .commit(first_write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+
+    let mut second_write = TableWrite::new(&table, "writer-2".to_string()).unwrap();
+    second_write
+        .write_arrow_batch(&data_batch(vec![3, 4], vec!["alice", "dave"]))
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "writer-2".to_string())
+        .commit(second_write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("name", crate::spec::Datum::String("alice".to_string()))
+        .unwrap();
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_filter(predicate);
+    let plan = read_builder.new_scan().plan().await.unwrap();
+    let planned_ranges = merge_row_ranges(
+        plan.splits()
+            .iter()
+            .flat_map(|split| split.row_ranges().unwrap_or_default())
+            .cloned()
+            .collect(),
+    );
+
+    assert_eq!(
+        planned_ranges,
+        vec![RowRange::new(0, 0), RowRange::new(2, 3)]
+    );
+    assert_eq!(
+        scan_ids(
+            &table,
+            PredicateBuilder::new(table.schema().fields())
+                .equal("name", crate::spec::Datum::String("alice".to_string()))
+                .unwrap(),
+        )
+        .await,
+        vec![1, 3]
+    );
+}
+
+#[tokio::test]
+async fn test_empty_global_index_ranges_skip_legacy_manifests() {
+    for search_mode in ["fast", "full"] {
+        let table_path = format!("memory:/test_empty_global_index_ranges_{search_mode}");
+        let mut options = table_options("10");
+        options.insert(
+            "global-index.search-mode".to_string(),
+            search_mode.to_string(),
+        );
+        let table = test_table_with_path(&table_path, options);
+        setup_dirs(&table).await;
+
+        let mut table_write = TableWrite::new(&table, "writer".to_string()).unwrap();
+        table_write
+            .write_arrow_batch(&data_batch(vec![1, 2], vec!["alice", "bob"]))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "writer".to_string())
+            .commit(table_write.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_column("name")
+            .execute()
+            .await
+            .unwrap();
+
+        let mut legacy_file = data_file("legacy.parquet", None, 2);
+        legacy_file.level = 1;
+        legacy_file.file_source = Some(1); // FileSource.COMPACT
+        TableCommit::new(table.clone(), "legacy-writer".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![legacy_file],
+            )])
+            .await
+            .unwrap();
+
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.next_row_id(), Some(2));
+
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal(
+                "name",
+                crate::spec::Datum::String("not-present".to_string()),
+            )
+            .unwrap();
+        let mut read_builder = table.new_read_builder();
+        read_builder.with_filter(predicate);
+
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        assert!(plan.splits().is_empty());
+
+        let (traced_plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+        let delta_plan = read_builder
+            .new_scan()
+            .plan_snapshot_delta(&snapshot)
+            .await
+            .unwrap();
+
+        assert!(traced_plan.splits().is_empty());
+        assert_eq!(trace.manifest_entries_read, 0);
+        assert_eq!(trace.final_splits, 0);
+        assert_eq!(trace.final_files, 0);
+        assert!(delta_plan.splits().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_detail_mode_defers_manifest_pruning_for_unindexed_ranges() {
+    let table_path = "memory:/test_detail_manifest_pruning";
+    let mut options = table_options("2");
+    options.insert("global-index.search-mode".to_string(), "detail".to_string());
+    let table = test_table_with_path(table_path, options);
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "writer-1".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![1, 2], vec!["alice", "bob"]))
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "writer-1".to_string())
+        .commit(table_write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+
+    let mut table_write = TableWrite::new(&table, "writer-2".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![3, 4], vec!["alice", "dave"]))
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "writer-2".to_string())
+        .commit(table_write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("name", crate::spec::Datum::String("alice".to_string()))
+        .unwrap();
+    let mut read_builder = table.new_read_builder();
+    read_builder.with_filter(predicate);
+    let (plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
+    let planned_ranges = merge_row_ranges(
+        plan.splits()
+            .iter()
+            .flat_map(|split| split.row_ranges().unwrap_or_default())
+            .cloned()
+            .collect(),
+    );
+
+    assert_eq!(
+        plan.splits()
+            .iter()
+            .flat_map(|split| split.data_files())
+            .count(),
+        2
+    );
+    assert_eq!(
+        planned_ranges,
+        vec![RowRange::new(0, 0), RowRange::new(2, 3)]
+    );
+    assert_eq!(trace.manifest_files_pruned_by_row_ranges, 0);
+    assert_eq!(trace.manifest_entries_read, 2);
+}
+
+#[tokio::test]
+async fn test_execute_writes_bitmap_index_manifest_and_java_file() {
+    let table_path = "memory:/test_bitmap_global_index_builder_e2e";
+    let table = test_table_with_path(table_path, table_options("10"));
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "alice"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let shard_count = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(shard_count, 1);
+
+    let snapshot_manager =
+        SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let snapshot = snapshot_manager
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let index_manifest = snapshot.index_manifest().expect("index manifest");
+    let index_entries = IndexManifest::read(
+        table.file_io(),
+        &format!("{table_path}/manifest/{index_manifest}"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(index_entries.len(), 1);
+
+    let index_file = &index_entries[0].index_file;
+    assert_eq!(index_file.index_type, BITMAP_GLOBAL_INDEX_TYPE);
+    assert!(index_file.file_name.starts_with("bitmap-global-index-"));
+    assert_eq!(index_file.row_count, 3);
+    assert!(index_file.file_size > 0);
+
+    let global_meta = index_file
+        .global_index_meta
+        .as_ref()
+        .expect("global index meta");
+    let bitmap_meta =
+        crate::btree::BTreeIndexMeta::deserialize(global_meta.index_meta.as_ref().unwrap())
+            .unwrap();
+    assert_eq!(bitmap_meta.first_key, Some(b"alice".to_vec()));
+    assert_eq!(bitmap_meta.last_key, Some(b"bob".to_vec()));
+    assert!(!bitmap_meta.has_nulls);
+
+    let index_path = format!("{table_path}/index/{}", index_file.file_name);
+    let input = table.file_io().new_input(&index_path).unwrap();
+    let file_size = input.metadata().await.unwrap().size;
+    let reader = input.reader().await.unwrap();
+    let bitmap_reader = crate::table::bitmap_global_index_reader::BitmapGlobalIndexReader::open(
+        Box::new(reader),
+        file_size,
+    )
+    .await
+    .unwrap();
+    let bitmap = bitmap_reader
+        .query(
+            crate::spec::PredicateOperator::Eq,
+            &[crate::spec::Datum::String("alice".to_string())],
+            table.schema().fields()[1].data_type(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bitmap.iter().collect::<Vec<_>>(), vec![0, 2]);
+
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("name", crate::spec::Datum::String("alice".to_string()))
+        .unwrap();
+    let row_ranges = evaluate_global_index(GlobalIndexEvaluation {
+        file_io: table.file_io(),
+        table_path: table.location(),
+        index_entries: &index_entries,
+        predicates: &[predicate],
+        schema_fields: table.schema().fields(),
+        search_mode: GlobalIndexSearchMode::Fast,
+        global_index_thread_num: 32,
+        btree_fallback_scan_max_size: i64::MAX,
+        bitmap_fallback_scan_max_size: i64::MAX,
+        fm_read_options: crate::fm_index::FMReadOptions::default(),
+        next_row_id: snapshot.next_row_id(),
+        data_ranges: &[],
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(row_ranges, vec![RowRange::new(0, 0), RowRange::new(2, 2)]);
+}
+
+#[tokio::test]
+async fn test_execute_multivalue_index_and_array_queries_end_to_end() {
+    let table_path = "memory:/test_multivalue_global_index_builder_e2e";
+    let table = multivalue_table(table_path);
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&multivalue_batch())
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(table_write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let shard_count = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("items")
+        .with_index_type(MULTIVALUE_GLOBAL_INDEX_TYPE)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(shard_count, 1);
+
+    let snapshot = SnapshotManager::new(table.file_io().clone(), table.location().to_string())
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let index_manifest = snapshot.index_manifest().expect("index manifest");
+    let index_entries = IndexManifest::read(
+        table.file_io(),
+        &format!("{table_path}/manifest/{index_manifest}"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(index_entries.len(), 1);
+
+    let index_file = &index_entries[0].index_file;
+    assert_eq!(index_file.index_type, MULTIVALUE_GLOBAL_INDEX_TYPE);
+    assert_eq!(index_file.row_count, 5, "source rows, not postings");
+    let global_meta = index_file.global_index_meta.as_ref().unwrap();
+    let serialized_meta = global_meta.index_meta.as_deref().unwrap();
+    let sorted_meta = BTreeIndexMeta::deserialize(serialized_meta).unwrap();
+    assert_eq!(serialized_meta, sorted_meta.serialize());
+    let element_type = DataType::Int(IntType::new());
+
+    let index_path = format!("{table_path}/index/{}", index_file.file_name);
+    let input = table.file_io().new_input(&index_path).unwrap();
+    let file_size = input.metadata().await.unwrap().size;
+    let reader = input.reader().await.unwrap();
+    let bitmap_reader = crate::table::bitmap_global_index_reader::BitmapGlobalIndexReader::open(
+        Box::new(reader),
+        file_size,
+    )
+    .await
+    .unwrap();
+    let contains = bitmap_reader
+        .query(
+            PredicateOperator::ArrayContains,
+            &[Datum::Int(10)],
+            &element_type,
+        )
+        .await
+        .unwrap();
+    assert_eq!(contains.iter().collect::<Vec<_>>(), vec![0, 3]);
+    let overlap = bitmap_reader
+        .query(
+            PredicateOperator::ArraysOverlap,
+            &[Datum::Int(40), Datum::Int(10), Datum::Int(10)],
+            &element_type,
+        )
+        .await
+        .unwrap();
+    assert_eq!(overlap.iter().collect::<Vec<_>>(), vec![0, 3, 4]);
+    let contains_all = bitmap_reader
+        .query(
+            PredicateOperator::ArrayContainsAll,
+            &[Datum::Int(10), Datum::Int(30), Datum::Int(10)],
+            &element_type,
+        )
+        .await
+        .unwrap();
+    assert_eq!(contains_all.iter().collect::<Vec<_>>(), vec![3]);
+
+    let fields = table.schema().fields();
+    let contains_all_predicate = PredicateBuilder::new(fields)
+        .array_contains_all(
+            "items",
+            vec![Datum::Int(10), Datum::Int(30), Datum::Int(10)],
+        )
+        .unwrap();
+    let ranges = evaluate_global_index(GlobalIndexEvaluation {
+        file_io: table.file_io(),
+        table_path: table.location(),
+        index_entries: &index_entries,
+        predicates: std::slice::from_ref(&contains_all_predicate),
+        schema_fields: fields,
+        search_mode: GlobalIndexSearchMode::Fast,
+        global_index_thread_num: 32,
+        btree_fallback_scan_max_size: i64::MAX,
+        bitmap_fallback_scan_max_size: i64::MAX,
+        fm_read_options: crate::fm_index::FMReadOptions::default(),
+        next_row_id: snapshot.next_row_id(),
+        data_ranges: &[],
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ranges, vec![RowRange::new(3, 3)]);
+
+    assert_eq!(scan_ids(&table, contains_all_predicate).await, vec![4]);
+    let empty_contains_all = PredicateBuilder::new(fields)
+        .array_contains_all("items", vec![])
+        .unwrap();
+    assert_eq!(
+        scan_ids(&table, empty_contains_all).await,
+        vec![1, 2, 4, 5],
+        "empty contains-all matches every non-null array and must fall back"
+    );
+}
+
+#[tokio::test]
+async fn test_bitmap_floating_candidates_preserve_residual_results() {
+    let table_path = "memory:/test_bitmap_floating_residual_candidates";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("f", DataType::Float(FloatType::new()))
+        .column("d", DataType::Double(DoubleType::new()))
+        .options(table_options("100"))
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "test_bitmap_floating_residual_candidates"),
+        table_path.to_string(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    setup_dirs(&table).await;
+
+    let float_negative_nan = f32::from_bits(0xffc0_0001);
+    let double_negative_nan = f64::from_bits(0xfff8_0000_0000_0001);
+    let arrow_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("f", ArrowDataType::Float32, true),
+        ArrowField::new("d", ArrowDataType::Float64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema,
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..9)) as ArrayRef,
+            Arc::new(Float32Array::from(vec![
+                Some(float_negative_nan),
+                Some(f32::from_bits(0xffff_1234)),
+                Some(f32::NAN),
+                Some(f32::from_bits(0x7fc0_0010)),
+                Some(-1.0),
+                Some(-0.0),
+                Some(0.0),
+                Some(1.0),
+                None,
+            ])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![
+                Some(double_negative_nan),
+                Some(f64::from_bits(0xffff_1234_5678_9abc)),
+                Some(f64::NAN),
+                Some(f64::from_bits(0x7ff8_0000_0000_0010)),
+                Some(-1.0),
+                Some(-0.0),
+                Some(0.0),
+                Some(1.0),
+                None,
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write.write_arrow_batch(&batch).await.unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    for column in ["f", "d"] {
+        let shard_count = table
+            .new_btree_global_index_build_builder()
+            .with_index_column(column)
+            .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(shard_count, 1);
+    }
+
+    let mut disabled_options = table.schema().options().clone();
+    disabled_options.insert("global-index.enabled".to_string(), "false".to_string());
+    let table_without_index = Table::new(
+        table.file_io().clone(),
+        table.identifier().clone(),
+        table.location().to_string(),
+        table.schema().copy_with_replaced_options(disabled_options),
+        None,
+    );
+
+    let predicates = PredicateBuilder::new(table.schema().fields());
+    let cases = [
+        (
+            "Float < 0",
+            predicates.less_than("f", Datum::Float(0.0)).unwrap(),
+            vec![0, 1, 4, 5],
+        ),
+        (
+            "Double < 0",
+            predicates.less_than("d", Datum::Double(0.0)).unwrap(),
+            vec![0, 1, 4, 5],
+        ),
+        (
+            "Float = canonical NaN",
+            predicates.equal("f", Datum::Float(f32::NAN)).unwrap(),
+            vec![2],
+        ),
+        (
+            "Double = canonical NaN",
+            predicates.equal("d", Datum::Double(f64::NAN)).unwrap(),
+            vec![2],
+        ),
+        (
+            "Float = negative NaN",
+            predicates
+                .equal("f", Datum::Float(float_negative_nan))
+                .unwrap(),
+            vec![0],
+        ),
+        (
+            "Double = negative NaN",
+            predicates
+                .equal("d", Datum::Double(double_negative_nan))
+                .unwrap(),
+            vec![0],
+        ),
+        (
+            "Float IN NaNs",
+            predicates
+                .is_in(
+                    "f",
+                    vec![Datum::Float(float_negative_nan), Datum::Float(f32::NAN)],
+                )
+                .unwrap(),
+            vec![0, 2],
+        ),
+        (
+            "Double IN NaNs",
+            predicates
+                .is_in(
+                    "d",
+                    vec![Datum::Double(double_negative_nan), Datum::Double(f64::NAN)],
+                )
+                .unwrap(),
+            vec![0, 2],
+        ),
+        (
+            "Float != canonical NaN",
+            predicates.not_equal("f", Datum::Float(f32::NAN)).unwrap(),
+            vec![0, 1, 3, 4, 5, 6, 7],
+        ),
+        (
+            "Double != canonical NaN",
+            predicates.not_equal("d", Datum::Double(f64::NAN)).unwrap(),
+            vec![0, 1, 3, 4, 5, 6, 7],
+        ),
+        (
+            "Float NOT IN",
+            predicates
+                .is_not_in("f", vec![Datum::Float(f32::NAN), Datum::Float(0.0)])
+                .unwrap(),
+            vec![0, 1, 3, 4, 5, 7],
+        ),
+        (
+            "Double NOT IN",
+            predicates
+                .is_not_in("d", vec![Datum::Double(f64::NAN), Datum::Double(0.0)])
+                .unwrap(),
+            vec![0, 1, 3, 4, 5, 7],
+        ),
+        (
+            "Float combined range",
+            Predicate::and(vec![
+                predicates
+                    .greater_or_equal("f", Datum::Float(float_negative_nan))
+                    .unwrap(),
+                predicates.less_or_equal("f", Datum::Float(0.0)).unwrap(),
+            ]),
+            vec![0, 4, 5, 6],
+        ),
+        (
+            "Double combined range",
+            Predicate::and(vec![
+                predicates
+                    .greater_or_equal("d", Datum::Double(double_negative_nan))
+                    .unwrap(),
+                predicates.less_or_equal("d", Datum::Double(0.0)).unwrap(),
+            ]),
+            vec![0, 4, 5, 6],
+        ),
+    ];
+
+    for (name, predicate, expected) in cases {
+        let without_index = scan_ids(&table_without_index, predicate.clone()).await;
+        assert_eq!(without_index, expected, "{name}: residual baseline");
+        let with_index = scan_ids(&table, predicate).await;
+        assert_eq!(
+            with_index, without_index,
+            "{name}: global index changed rows"
+        );
+    }
+}
+
+/// Bitmap is built through the same sorted builder; a second build with no
+/// new data must be a no-op keyed on the bitmap coverage — not error, and
+/// not be confused by any btree coverage of the same field.
+#[tokio::test]
+async fn bitmap_second_build_without_new_data_is_noop() {
+    let table_path = "memory:/test_bitmap_global_index_second_build_noop";
+    let table = test_table_with_path(table_path, table_options("10"));
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let first_built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+        .execute()
+        .await
+        .unwrap();
+    assert!(
+        first_built > 0,
+        "first bitmap build must index initial rows"
+    );
+
+    let files_after_first = latest_bitmap_index_files(&table).await;
+    assert!(!files_after_first.is_empty());
+
+    let built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        built, 0,
+        "fully-indexed bitmap table must build nothing on re-run"
+    );
+
+    let names_first = files_after_first
+        .iter()
+        .map(|f| f.file_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let names_second = latest_bitmap_index_files(&table)
+        .await
+        .iter()
+        .map(|f| f.file_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(names_first, names_second, "re-run must not change entries");
+}
+
+/// A btree index over the SAME field must NOT count as bitmap coverage: a
+/// bitmap build after a btree build over identical rows must still produce a
+/// bitmap index (regression guard for the index_type-keyed gap computation —
+/// the merge-residual bug hard-coded btree here, which would have skipped
+/// these rows for a bitmap build).
+#[tokio::test]
+async fn bitmap_build_after_btree_on_same_field_still_indexes() {
+    let table_path = "memory:/test_bitmap_after_btree_same_field";
+    let table = test_table_with_path(table_path, table_options("10"));
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let btree_built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert!(btree_built > 0);
+
+    let bitmap_built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+        .execute()
+        .await
+        .unwrap();
+    assert!(
+        bitmap_built > 0,
+        "bitmap build must index rows even when a btree index already covers the same field"
+    );
+
+    let bitmap_files = latest_bitmap_index_files(&table).await;
+    assert!(
+        !bitmap_files.is_empty(),
+        "a bitmap index file must be written"
+    );
+    let coverage = data_row_id_coverage(&table).await;
+    let bitmap_start = bitmap_files
+        .iter()
+        .filter_map(|f| f.global_index_meta.as_ref())
+        .map(|m| m.row_range_start)
+        .min()
+        .unwrap();
+    assert_eq!(
+        bitmap_start,
+        coverage[0].from(),
+        "bitmap coverage must span from the first data row, not skip btree-covered rows"
+    );
+}
+
+/// Bitmap incremental: build, append, build again → only the appended range
+/// gets a new bitmap file; the first bitmap file is retained (append-only).
+#[tokio::test]
+async fn bitmap_incremental_build_indexes_only_new_rows() {
+    let table_path = "memory:/test_bitmap_global_index_incremental";
+    let table = test_table_with_path(table_path, table_options("10"));
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let first_built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+        .execute()
+        .await
+        .unwrap();
+    assert!(first_built > 0);
+    let first_names = latest_bitmap_index_files(&table)
+        .await
+        .iter()
+        .map(|f| f.file_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let n: i64 = 3;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![4, 5, 6], vec!["dave", "erin", "frank"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let second_built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .with_index_type(BITMAP_GLOBAL_INDEX_TYPE)
+        .execute()
+        .await
+        .unwrap();
+    assert!(second_built > 0, "appended rows must be indexed");
+
+    let all_files = latest_bitmap_index_files(&table).await;
+    let all_names = all_files
+        .iter()
+        .map(|f| f.file_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        first_names.iter().all(|name| all_names.contains(name)),
+        "build #1 bitmap files must be retained untouched"
+    );
+    let new_files = all_files
+        .iter()
+        .filter(|f| !first_names.contains(&f.file_name))
+        .collect::<Vec<_>>();
+    assert!(!new_files.is_empty(), "build #2 must add new bitmap files");
+    for file in new_files {
+        let meta = file
+            .global_index_meta
+            .as_ref()
+            .expect("global index meta on new bitmap file");
+        assert!(
+            meta.row_range_start >= n,
+            "new bitmap file range must start at or after {}, got [{}, {}]",
+            n,
+            meta.row_range_start,
+            meta.row_range_end
+        );
+    }
+}
+
+async fn latest_bitmap_index_files(table: &Table) -> Vec<IndexFileMeta> {
+    let snapshot_manager =
+        SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let snapshot = snapshot_manager
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(index_manifest_name) = snapshot.index_manifest() else {
+        return Vec::new();
+    };
+    IndexManifest::read(
+        table.file_io(),
+        &snapshot_manager.manifest_path(index_manifest_name),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .filter(|entry| {
+        entry.kind == FileKind::Add && entry.index_file.index_type == BITMAP_GLOBAL_INDEX_TYPE
+    })
+    .map(|entry| entry.index_file)
+    .collect()
+}
+
+async fn latest_btree_index_files(table: &Table) -> Vec<IndexFileMeta> {
+    let snapshot_manager =
+        SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let snapshot = snapshot_manager
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let Some(index_manifest_name) = snapshot.index_manifest() else {
+        return Vec::new();
+    };
+    IndexManifest::read(
+        table.file_io(),
+        &snapshot_manager.manifest_path(index_manifest_name),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .filter(|entry| {
+        entry.kind == FileKind::Add && entry.index_file.index_type == BTREE_GLOBAL_INDEX_TYPE
+    })
+    .map(|entry| entry.index_file)
+    .collect()
+}
+
+/// Row-id coverage of the committed data files, read back from the data
+/// manifest (never hard-coded) and merged into contiguous ranges. Mirrors
+/// how `execute` gathers `manifest_entries` so tests observe the exact
+/// row-ids the writer assigned.
+async fn data_row_id_coverage(table: &Table) -> Vec<RowRange> {
+    let snapshot_manager =
+        SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+    let snapshot = snapshot_manager
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let entries = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan_manifest_entries(&snapshot)
+        .await
+        .unwrap();
+    let ranges = entries
+        .iter()
+        .filter(|entry| *entry.kind() == FileKind::Add)
+        .filter_map(|entry| {
+            entry
+                .file()
+                .row_id_range()
+                .map(|(start, end)| RowRange::new(start, end))
+        })
+        .collect::<Vec<_>>();
+    merge_row_ranges(ranges)
+}
+
+/// Second build with no new data must be a clean no-op (returns 0), not an
+/// overlap error. This is the core bug fix: today the second call errors.
+#[tokio::test]
+async fn second_build_without_new_data_is_noop() {
+    let table_path = "memory:/test_btree_global_index_second_build_noop";
+    let table = test_table_with_path(table_path, table_options("10"));
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let first_built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert!(first_built > 0, "first build must index the initial rows");
+
+    let files_after_first = latest_btree_index_files(&table).await;
+    assert!(!files_after_first.is_empty());
+
+    let built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(built, 0, "fully-indexed table must build nothing on re-run");
+
+    let files_after_second = latest_btree_index_files(&table).await;
+    let names_first = files_after_first
+        .iter()
+        .map(|f| f.file_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let names_second = files_after_second
+        .iter()
+        .map(|f| f.file_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names_first, names_second,
+        "re-run must not add or remove index manifest entries"
+    );
+}
+
+/// Build, append new rows, build again -> only the appended row range is
+/// indexed; the first build's index files are retained untouched (append-only).
+#[tokio::test]
+async fn incremental_build_indexes_only_new_rows() {
+    let table_path = "memory:/test_btree_global_index_incremental";
+    let table = test_table_with_path(table_path, table_options("10"));
+    setup_dirs(&table).await;
+
+    // Build #1 over rows [0..3).
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let first_built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert!(first_built > 0);
+
+    let first_files = latest_btree_index_files(&table).await;
+    let first_names = first_files
+        .iter()
+        .map(|f| f.file_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let n: i64 = 3;
+
+    // Append a second batch (new row-ids [3..6)).
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![4, 5, 6], vec!["dave", "erin", "frank"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let second_built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert!(second_built > 0, "appended rows must be indexed");
+
+    let all_files = latest_btree_index_files(&table).await;
+    let all_names = all_files
+        .iter()
+        .map(|f| f.file_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    // Every build-#1 file is still present (append-only, no rewrite/delete).
+    assert!(
+        first_names.iter().all(|name| all_names.contains(name)),
+        "build #1 index files must be retained untouched"
+    );
+
+    // Every build-#2 file covers only the appended range [N, ..].
+    let new_files = all_files
+        .iter()
+        .filter(|f| !first_names.contains(&f.file_name))
+        .collect::<Vec<_>>();
+    assert!(!new_files.is_empty(), "build #2 must add new index files");
+    for file in new_files {
+        let meta = file
+            .global_index_meta
+            .as_ref()
+            .expect("global index meta on new btree file");
+        assert!(
+            meta.row_range_start >= n,
+            "new index file range must start at or after {}, got [{}, {}]",
+            n,
+            meta.row_range_start,
+            meta.row_range_end
+        );
+    }
+}
+
+/// Regression: first build (no existing index) must equal the pre-change
+/// full build -- subtraction with empty `indexed` = full coverage.
+#[tokio::test]
+async fn first_build_indexes_full_coverage() {
+    let table_path = "memory:/test_btree_global_index_first_full_coverage";
+    let table = test_table_with_path(table_path, table_options("10"));
+    setup_dirs(&table).await;
+
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        built, 1,
+        "first build must index the full coverage in one shard"
+    );
+
+    let files = latest_btree_index_files(&table).await;
+    assert_eq!(files.len(), 1);
+    let meta = files[0]
+        .global_index_meta
+        .as_ref()
+        .expect("global index meta");
+    assert_eq!(meta.row_range_start, 0);
+    assert_eq!(meta.row_range_end, 2);
+}
+
+/// Grid boundary (spec edge 4): with `records-per-range = 4`, an appended
+/// gap that spans several grid cells must be split so each new index file's
+/// range stays inside one cell, the ranges are contiguous, and together
+/// they exactly cover the gap. Row-ids are read back from the manifests,
+/// never hard-coded.
+#[tokio::test]
+async fn incremental_build_splits_gap_across_records_per_range_grid() {
+    const RPR: i64 = 4;
+    let table_path = "memory:/test_btree_global_index_grid_boundary";
+    let table = test_table_with_path(table_path, table_options("4"));
+    setup_dirs(&table).await;
+
+    // Build #1 over an initial batch (row-ids the writer assigns).
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"]))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let first_built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert!(first_built > 0, "first build must index the initial rows");
+
+    // Row range already covered by build #1 (read back, not hard-coded).
+    let first_index_files = latest_btree_index_files(&table).await;
+    let indexed_before = merge_row_ranges(
+        first_index_files
+            .iter()
+            .filter_map(|f| f.global_index_meta.as_ref())
+            .map(|m| RowRange::new(m.row_range_start, m.row_range_end))
+            .collect(),
+    );
+    assert_eq!(
+        indexed_before.len(),
+        1,
+        "build #1 should cover one contiguous range"
+    );
+    let gap_start = indexed_before[0].to() + 1;
+    let before_names = first_index_files
+        .iter()
+        .map(|f| f.file_name.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    // Append rows so the new gap crosses records_per_range (=4) boundaries.
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(
+            vec![4, 5, 6, 7, 8, 9, 10],
+            vec!["d", "e", "f", "g", "h", "i", "j"],
+        ))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    // Total data coverage read back from the data manifest.
+    let coverage = data_row_id_coverage(&table).await;
+    assert_eq!(
+        coverage.len(),
+        1,
+        "appended data must be contiguous with build #1"
+    );
+    let gap_end = coverage[0].to();
+    assert!(
+        gap_end - gap_start + 1 > RPR,
+        "gap [{gap_start}, {gap_end}] must span more than one records_per_range cell"
+    );
+
+    let second_built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert!(second_built > 0, "appended rows must be indexed");
+
+    // Only the newly written index files (build #1 files are retained).
+    let mut new_metas = latest_btree_index_files(&table)
+        .await
+        .into_iter()
+        .filter(|f| !before_names.contains(&f.file_name))
+        .filter_map(|f| f.global_index_meta)
+        .map(|m| (m.row_range_start, m.row_range_end))
+        .collect::<Vec<_>>();
+    new_metas.sort();
+    assert!(!new_metas.is_empty(), "build #2 must add new index files");
+
+    // (a) Each range lies within a single grid cell: no multiple of RPR is
+    //     strictly interior, i.e. start and end share the same cell index.
+    for (start, end) in &new_metas {
+        assert!(end >= start, "range must be non-empty: [{start}, {end}]");
+        assert_eq!(
+            start / RPR,
+            end / RPR,
+            "range [{start}, {end}] straddles a records_per_range boundary"
+        );
+    }
+    // (b) Contiguous with no gaps or overlaps.
+    for pair in new_metas.windows(2) {
+        assert_eq!(
+            pair[1].0,
+            pair[0].1 + 1,
+            "ranges must be contiguous: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    // (c) Together they exactly cover the appended gap [gap_start, gap_end].
+    assert_eq!(
+        new_metas.first().unwrap().0,
+        gap_start,
+        "coverage must start at the gap start"
+    );
+    assert_eq!(
+        new_metas.last().unwrap().1,
+        gap_end,
+        "coverage must end at the gap end"
+    );
+}
+
+/// Hole splitting (spec edge 5) at build level: a mid-coverage indexed range
+/// (constructed directly, as the drop-builder tests build `GlobalIndexMeta`
+/// entries) must carve the data coverage into two build segments, one on
+/// each side, and the hole itself must not be re-indexed.
+#[tokio::test]
+async fn incremental_build_splits_gap_around_mid_coverage_indexed_hole() {
+    let table_path = "memory:/test_btree_global_index_mid_hole";
+    // records-per-range large so the grid never splits: the only split is
+    // the hole itself.
+    let table = test_table_with_path(table_path, table_options("100"));
+    setup_dirs(&table).await;
+
+    // Real data spanning row-ids [0, 9].
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    table_write
+        .write_arrow_batch(&data_batch(
+            (1..=10).collect(),
+            vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
+        ))
+        .await
+        .unwrap();
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let coverage = data_row_id_coverage(&table).await;
+    assert_eq!(coverage.len(), 1, "data must be one contiguous range");
+    assert_eq!(coverage[0].from(), 0);
+    let last_row = coverage[0].to();
+    assert!(last_row >= 9, "need at least 10 rows for a mid hole");
+
+    // Inject a mid-coverage indexed range [hole_start, hole_end] for the
+    // `name` field directly into the index manifest.
+    let name_field_id = find_index_field(&table, "name").unwrap().id();
+    let hole_start = 4;
+    let hole_end = 6;
+    let synthetic = IndexFileMeta {
+        index_type: BTREE_GLOBAL_INDEX_TYPE.to_string(),
+        file_name: "btree-synthetic-hole.index".to_string(),
+        file_size: 1,
+        row_count: (hole_end - hole_start + 1),
+        deletion_vectors_ranges: None,
+        global_index_meta: Some(GlobalIndexMeta {
+            row_range_start: hole_start,
+            row_range_end: hole_end,
+            index_field_id: name_field_id,
+            extra_field_ids: None,
+            source_meta: None,
+            index_meta: None,
+        }),
+    };
+    let mut message = CommitMessage::new(BinaryRow::new(0).to_serialized_bytes(), 0, vec![]);
+    message.new_index_files = vec![synthetic];
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(vec![message])
+        .await
+        .unwrap();
+
+    let before_names = latest_btree_index_files(&table)
+        .await
+        .into_iter()
+        .map(|f| f.file_name)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    // Build: gap = coverage minus the hole = [0, hole_start-1] and
+    // [hole_end+1, last_row]; two shards since the grid does not split here.
+    let built = table
+        .new_btree_global_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(
+        built, 2,
+        "mid-coverage hole must split the gap into two shards"
+    );
+
+    let mut new_metas = latest_btree_index_files(&table)
+        .await
+        .into_iter()
+        .filter(|f| !before_names.contains(&f.file_name))
+        .filter_map(|f| f.global_index_meta)
+        .map(|m| (m.row_range_start, m.row_range_end))
+        .collect::<Vec<_>>();
+    new_metas.sort();
+
+    assert_eq!(
+        new_metas,
+        vec![(0, hole_start - 1), (hole_end + 1, last_row)],
+        "new shards must fill the coverage on both sides of the indexed hole"
+    );
+    for (start, end) in &new_metas {
+        assert!(
+            *end < hole_start || *start > hole_end,
+            "new shard [{start}, {end}] must not overlap indexed hole [{hole_start}, {hole_end}]"
+        );
+    }
+}
