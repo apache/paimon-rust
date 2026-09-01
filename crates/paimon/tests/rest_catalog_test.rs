@@ -2652,6 +2652,55 @@ async fn test_query_auth_is_not_weakened_by_a_table_recreated_under_the_same_nam
 }
 
 #[tokio::test]
+async fn test_query_auth_refuses_a_read_type_with_an_extra_nested_field() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = format!("file://{}", tmp.path().display());
+    let nested = |extra: bool| {
+        let mut children = vec![paimon::spec::DataField::new(
+            1,
+            "a".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+        if extra {
+            children.push(paimon::spec::DataField::new(
+                2,
+                "hidden".to_string(),
+                DataType::Int(IntType::new()),
+            ));
+        }
+        DataType::Row(paimon::spec::RowType::new(children))
+    };
+    let served = Schema::builder()
+        .column("info", nested(false))
+        .option("query-auth.enabled", "true")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "nested", served, &path);
+
+    let table = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "nested"))
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+
+    // Same field id and name as the authorized column, one nested child more.
+    let forged = paimon::spec::DataField::new(
+        table.schema().fields()[0].id(),
+        "info".to_string(),
+        nested(true),
+    );
+    let mut builder = table.new_read_builder();
+    builder.with_read_type(vec![forged]);
+    let Err(err) = builder.new_read().unwrap().to_arrow(plan.splits()) else {
+        panic!("a nested child the server never ruled on must be refused")
+    };
+    assert_refused(err);
+}
+
+#[tokio::test]
 async fn test_query_auth_refuses_a_decorated_handle() {
     let ctx = setup_catalog(vec!["default"]).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -2691,12 +2740,42 @@ async fn test_query_auth_enabled_after_a_load_still_refuses_searches() {
     ctx.server
         .set_auth_response("default", "searched", restricted());
 
-    let err = table
-        .new_vector_search_builder()
-        .execute_scored()
-        .await
-        .expect_err("a search reads index files and cannot apply the server's rules");
-    assert_refused(err);
+    assert_refused(
+        table
+            .new_vector_search_builder()
+            .execute_scored()
+            .await
+            .expect_err("a vector search reads index files directly"),
+    );
+    #[cfg(feature = "fulltext")]
+    assert_refused(
+        table
+            .new_full_text_search_builder()
+            .execute_scored()
+            .await
+            .expect_err("a full-text search reads index files directly"),
+    );
+    assert_refused(
+        table
+            .new_hybrid_search_builder()
+            .execute_scored()
+            .await
+            .expect_err("a hybrid search reads index files directly"),
+    );
+    assert_refused(
+        table
+            .new_batch_vector_search_builder()
+            .execute()
+            .await
+            .expect_err("the batch path is reachable without the outer builder"),
+    );
+    assert_refused(
+        table
+            .new_lumina_index_build_builder()
+            .execute()
+            .await
+            .expect_err("building an index scans the table's rows"),
+    );
 }
 
 #[tokio::test]
