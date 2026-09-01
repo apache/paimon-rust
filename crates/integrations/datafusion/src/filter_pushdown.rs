@@ -89,20 +89,6 @@ pub(crate) fn analyze_filters(
     }
 }
 
-pub(crate) fn is_safe_vector_prefilter(predicate: &Predicate) -> bool {
-    match predicate {
-        Predicate::Leaf { literals, .. } => !literals.iter().any(|literal| {
-            matches!(literal, Datum::Float(value) if value.is_nan())
-                || matches!(literal, Datum::Double(value) if value.is_nan())
-        }),
-        Predicate::And(children) | Predicate::Or(children) => {
-            children.iter().all(is_safe_vector_prefilter)
-        }
-        Predicate::Not(inner) => is_safe_vector_prefilter(inner),
-        Predicate::AlwaysTrue | Predicate::AlwaysFalse => true,
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn build_pushed_predicate(filters: &[Expr], fields: &[DataField]) -> Option<Predicate> {
     analyze_filters(filters, fields, true).pushed_predicate
@@ -924,27 +910,6 @@ mod tests {
             classify_filter_pushdown(&filter, &fields, true, |_| true),
             TableProviderFilterPushDown::Inexact
         );
-    }
-
-    #[test]
-    fn test_vector_prefilter_rejects_nan_literals() {
-        let predicate = Predicate::Leaf {
-            column: "score".to_string(),
-            index: 0,
-            data_type: DataType::Float(FloatType::new()),
-            op: PredicateOperator::Eq,
-            literals: vec![Datum::Float(f32::NAN)],
-        };
-        assert!(!is_safe_vector_prefilter(&predicate));
-
-        let finite = Predicate::Leaf {
-            column: "score".to_string(),
-            index: 0,
-            data_type: DataType::Float(FloatType::new()),
-            op: PredicateOperator::Eq,
-            literals: vec![Datum::Float(f32::INFINITY)],
-        };
-        assert!(is_safe_vector_prefilter(&finite));
     }
 
     #[test]

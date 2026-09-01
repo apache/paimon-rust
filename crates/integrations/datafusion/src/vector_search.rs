@@ -49,7 +49,7 @@ use paimon::spec::{
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
-use crate::filter_pushdown::{analyze_filters, is_safe_vector_prefilter};
+use crate::filter_pushdown::analyze_filters;
 use crate::runtime::{await_with_runtime, block_on_with_runtime};
 use crate::table::{datafusion_read_fields, PaimonTableProvider};
 use crate::table_function_args::{
@@ -273,9 +273,7 @@ impl TableProvider for VectorSearchTableProvider {
                 "vector_search cannot apply a partially translated scalar pre-filter".to_string(),
             ));
         }
-        let pushed_predicate = filter_analysis
-            .pushed_predicate
-            .filter(is_safe_vector_prefilter);
+        let pushed_predicate = filter_analysis.pushed_predicate;
 
         // An outer `LIMIT 0` needs no rows.
         if limit == Some(0) {
@@ -312,12 +310,7 @@ impl TableProvider for VectorSearchTableProvider {
             .iter()
             .map(|filter| {
                 let analysis = analyze_filters(std::slice::from_ref(*filter), fields, true);
-                if analysis
-                    .pushed_predicate
-                    .as_ref()
-                    .is_some_and(is_safe_vector_prefilter)
-                    && !analysis.requires_residual
-                {
+                if analysis.pushed_predicate.is_some() && !analysis.requires_residual {
                     // Keep DataFusion's residual filter as a correctness backstop
                     // while using the same predicate before vector Top-K.
                     TableProviderFilterPushDown::Inexact

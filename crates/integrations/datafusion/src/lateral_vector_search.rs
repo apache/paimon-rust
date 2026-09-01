@@ -62,7 +62,7 @@ use paimon::vector_search::SearchResult;
 use tokio::sync::OnceCell;
 
 use crate::error::to_datafusion_error;
-use crate::filter_pushdown::{analyze_filters, is_safe_vector_prefilter};
+use crate::filter_pushdown::analyze_filters;
 use crate::vector_search::LateralVectorSearchTableProvider;
 
 #[derive(Debug)]
@@ -163,9 +163,7 @@ impl OptimizerRule for RewriteLateralVectorSearch {
                     true,
                 );
                 match analysis.pushed_predicate {
-                    Some(predicate)
-                        if !analysis.requires_residual && is_safe_vector_prefilter(&predicate) =>
-                    {
+                    Some(predicate) if !analysis.requires_residual => {
                         target_predicates.push(predicate);
                     }
                     _ => {

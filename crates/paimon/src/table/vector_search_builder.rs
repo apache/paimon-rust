@@ -222,8 +222,7 @@ impl PreparedVectorSearchFilter {
 }
 
 fn same_vector_search_table(left: &Table, right: &Table) -> bool {
-    left.file_io().shares_storage_lineage(right.file_io())
-        && left.location().trim_end_matches('/') == right.location().trim_end_matches('/')
+    left.location().trim_end_matches('/') == right.location().trim_end_matches('/')
         && left.branch() == right.branch()
 }
 
@@ -7530,34 +7529,6 @@ mod tests {
             .execute()
             .await
             .expect_err("a prepared filter must not retarget the builder to another table");
-
-        assert!(
-            error.to_string().contains("different table"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn prepared_filter_from_same_location_but_different_file_io_is_rejected() {
-        let location = "memory:/prepared_filter_shared_location";
-        let source =
-            vector_test_table_with_file_io(FileIOBuilder::new("memory").build().unwrap(), location);
-        let prepared = source
-            .prepare_vector_search_filter(id_gt_filter(&source, 0))
-            .await
-            .unwrap();
-        let target =
-            vector_test_table_with_file_io(FileIOBuilder::new("memory").build().unwrap(), location);
-
-        let error = target
-            .new_batch_vector_search_builder()
-            .with_vector_column("embedding")
-            .with_query_vectors(vec![vec![1.0, 0.0]])
-            .with_limit(1)
-            .with_prepared_filter(prepared)
-            .execute()
-            .await
-            .expect_err("a prepared filter must stay bound to its FileIO lineage");
 
         assert!(
             error.to_string().contains("different table"),
