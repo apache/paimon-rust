@@ -74,9 +74,9 @@ pub struct ObjectTable {
 impl ObjectTable {
     pub(crate) fn normalize_creation(schema: &Schema, default_location: &str) -> Result<Schema> {
         let mut options = schema.options().clone();
-        if !options
+        if options
             .get(PATH_OPTION)
-            .is_some_and(|path| !path.trim().is_empty())
+            .is_none_or(|path| path.trim().is_empty())
         {
             options.insert(PATH_OPTION.to_string(), default_location.to_string());
         }
