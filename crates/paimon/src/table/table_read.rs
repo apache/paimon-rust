@@ -382,6 +382,7 @@ impl<'a> PaimonTableRead<'a> {
         has_value_kind: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
         plan.validate()?;
+        let core_options = self.table.schema().core_options();
         let data_splits = plan.data_splits();
         let user_read_type = self.read_type.clone();
         let include_sequence = audit_sequence_number_enabled(self.table);
@@ -414,7 +415,8 @@ impl<'a> PaimonTableRead<'a> {
             read_type,
             self.data_predicates.clone(),
         )
-        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?))
+        .with_file_index_read_enabled(core_options.file_index_read_enabled())
+        .with_batch_size(Some(core_options.read_batch_size()?))
         .with_parquet_read_budget(Some(self.parquet_read_budget()?));
         let raw_stream = reader.read(&data_splits)?;
 
@@ -883,6 +885,7 @@ impl<'a> PaimonTableRead<'a> {
     }
 
     fn new_data_file_reader(&self) -> crate::Result<DataFileReader> {
+        let core_options = self.table.schema().core_options();
         let mut reader = DataFileReader::new(
             self.table.file_io.clone(),
             self.table.schema_manager().clone(),
@@ -891,7 +894,8 @@ impl<'a> PaimonTableRead<'a> {
             self.read_type().to_vec(),
             self.data_predicates.clone(),
         )
-        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?))
+        .with_file_index_read_enabled(core_options.file_index_read_enabled())
+        .with_batch_size(Some(core_options.read_batch_size()?))
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
         .with_read_timing(self.data_file_read_timing.clone());
         // The engine decoder filter is safe only on the plain append/raw path.
@@ -1481,11 +1485,17 @@ fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
 mod tests {
     use super::*;
     use crate::catalog::Identifier;
+    use crate::common::Options;
+    use crate::file_index::file_indexer_factory::{FileIndexerFactory, BITMAP_INDEX};
+    use crate::file_index::write_column_indexes;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{BinaryRow, DataFileMeta, DataType, IntType, Schema, TableSchema};
+    use crate::spec::{
+        BinaryRow, DataFileMeta, DataType, Datum, IntType, PredicateBuilder, Schema, TableSchema,
+    };
     use crate::table::query_auth_table;
     use crate::table::source::DataSplitBuilder;
+    use futures::TryStreamExt;
 
     fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
         DataFileMeta {
@@ -1540,6 +1550,101 @@ mod tests {
             TableSchema::new(0, &schema.build().unwrap()),
             None,
         )
+    }
+
+    async fn embedded_bitmap_index() -> Vec<u8> {
+        let mut writer = FileIndexerFactory::create_writer(
+            BITMAP_INDEX,
+            DataType::Int(IntType::new()),
+            &Options::new(),
+        )
+        .unwrap();
+        writer.write(Some(&Datum::Int(1))).unwrap();
+        let indexes = std::collections::HashMap::from([(
+            "id".to_string(),
+            std::collections::HashMap::from([(
+                BITMAP_INDEX.to_string(),
+                Some(writer.serialized_bytes().unwrap()),
+            )]),
+        )]);
+        write_column_indexes("memory:/table_read_file_index_source", indexes)
+            .await
+            .unwrap()
+            .to_input_file()
+            .read()
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    fn file_index_table(path: &str, enabled: Option<bool>) -> Table {
+        let mut builder = Schema::builder().column("id", DataType::Int(IntType::new()));
+        if let Some(enabled) = enabled {
+            builder = builder.option("file-index.read.enabled", enabled.to_string());
+        }
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "file_index_t"),
+            path.to_string(),
+            TableSchema::new(0, &builder.build().unwrap()),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_raw_table_read_paths_honor_file_index_read_option() {
+        let mut indexed_file = file("missing.mosaic", 5, Some(0));
+        indexed_file.row_count = 1;
+        indexed_file.embedded_index = Some(embedded_bitmap_index().await);
+        let split = split(vec![indexed_file], true);
+        let table = file_index_table("memory:/table_read_file_index", None);
+        let fields = table.schema().fields().to_vec();
+        let predicate = PredicateBuilder::new(&fields)
+            .equal("id", Datum::Int(99))
+            .unwrap();
+        let read = TableRead::new(&table, fields, vec![predicate]);
+
+        let normal = read
+            .to_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(normal.is_empty());
+
+        let plan = IncrementalPlan::new(
+            IncrementalScanMode::Delta,
+            vec![IncrementalSplit::Data(split.clone())],
+        );
+        let incremental = read
+            .to_incremental_arrow(&plan)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(incremental.is_empty());
+        let audit = read
+            .to_audit_log_arrow(&plan)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(audit.is_empty());
+
+        let disabled_table =
+            file_index_table("memory:/table_read_file_index_disabled", Some(false));
+        let disabled_fields = disabled_table.schema().fields().to_vec();
+        let disabled_predicate = PredicateBuilder::new(&disabled_fields)
+            .equal("id", Datum::Int(99))
+            .unwrap();
+        let disabled_read =
+            TableRead::new(&disabled_table, disabled_fields, vec![disabled_predicate]);
+        let disabled = disabled_read
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await;
+        assert!(disabled.is_err());
     }
 
     #[test]
