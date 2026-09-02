@@ -517,7 +517,7 @@ impl<'a> VectorSearchBuilder<'a> {
             return Ok(Box::pin(stream::empty()));
         };
         let pinned_table = self.table.copy_with_resolved_snapshot(&snapshot).await?;
-        let mut search_builder = pinned_table.new_vector_search_builder();
+        let mut search_builder = pinned_table.new_vector_search_builder().assume_authorized();
         search_builder
             .with_vector_column(vector_column)
             .with_query_vector(query_vector.to_vec())

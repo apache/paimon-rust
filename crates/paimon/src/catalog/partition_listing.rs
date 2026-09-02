@@ -33,7 +33,9 @@ use crate::Result;
 /// matching the shape catalogs would otherwise return from a metastore.
 pub async fn list_partitions_from_file_system(table: &Table) -> Result<Vec<Partition>> {
     // Manifests carry partition values and per-column stats.
-    crate::spec::CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
+    table
+        .ensure_read_authorized_live("listing partitions")
+        .await?;
     let file_io = table.file_io();
     let snapshot_sm = table.snapshot_manager();
     let manifest_sm = SnapshotManager::new(file_io.clone(), table.location().to_string());

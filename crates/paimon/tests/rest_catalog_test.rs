@@ -2724,6 +2724,38 @@ async fn test_query_auth_refuses_a_decorated_handle() {
 }
 
 #[tokio::test]
+async fn test_query_auth_enabled_after_a_load_still_refuses_metadata_and_writes() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = format!("file://{}", tmp.path().display());
+    ctx.server
+        .add_table_with_schema("default", "meta", schema_of(&["id"], &[]), &path);
+    let table = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "meta"))
+        .await
+        .unwrap();
+    ctx.server
+        .set_table_schema_id("default", "meta", schema_of(&["id"], GUARDED), 0);
+    ctx.server
+        .set_auth_response("default", "meta", restricted());
+
+    assert_refused(
+        table
+            .partition_stats()
+            .await
+            .expect_err("partition stats expose partition values, row counts and sizes"),
+    );
+    assert_refused(
+        table
+            .new_global_index_drop_builder()
+            .execute()
+            .await
+            .expect_err("dropping an index is not something a restricted user may do"),
+    );
+}
+
+#[tokio::test]
 async fn test_query_auth_enabled_after_a_load_still_refuses_searches() {
     let ctx = setup_catalog(vec!["default"]).await;
     let tmp = tempfile::tempdir().unwrap();

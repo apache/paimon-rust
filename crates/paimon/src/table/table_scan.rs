@@ -1138,8 +1138,8 @@ impl<'a> PaimonTableScan<'a> {
     }
 
     /// The grant predates the manifest read, so the table can have been re-created
-    /// at the same path in between. Also refuses a plan whose files carry
-    /// statistics the current schema no longer covers.
+    /// at the same path in between. Also refuses statistics the current schema
+    /// no longer covers.
     async fn check_planned_files(&self, plan: &Plan, query_auth: bool) -> crate::Result<()> {
         if !query_auth {
             return Ok(());

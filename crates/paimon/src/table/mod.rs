@@ -341,8 +341,7 @@ impl Table {
     }
 
     /// The live counterpart of [`CoreOptions::ensure_read_authorized`], which
-    /// reads the schema this handle was loaded with. Paths that can await but
-    /// cannot apply the server's rules must ask instead.
+    /// reads the schema this handle was loaded with.
     pub(crate) async fn ensure_read_authorized_live(&self, path: &str) -> Result<()> {
         let local = CoreOptions::new(self.schema.options());
         local.ensure_type_paimon_served(&self.identifier.full_name())?;
@@ -373,8 +372,8 @@ impl Table {
     }
 
     /// Whether this user may read this table; `None` when it is not
-    /// `query-auth.enabled`. `server_query_auth` is the caller's already-fetched
-    /// [`Self::server_query_auth_enabled`], so planning asks the server once.
+    /// `query-auth.enabled`. `server_query_auth` is the caller's, so planning
+    /// asks the server once.
     pub(crate) async fn authorize_read(
         &self,
         server_query_auth: bool,

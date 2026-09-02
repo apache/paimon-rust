@@ -205,7 +205,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -252,7 +252,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -337,7 +337,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -593,7 +593,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         if partitions.is_empty() {
@@ -674,7 +674,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         self.try_commit(

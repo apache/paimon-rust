@@ -50,7 +50,7 @@ impl QueryAuthGrant {
 }
 
 /// `value_stats` and `write_cols` are public on every split and an older file
-/// can name a dropped column. Refused rather than scrubbed: rewriting encoded
+/// can name a dropped column. Refused rather than scrubbed — rewriting encoded
 /// stats is how bounds get mismatched.
 pub(crate) async fn reject_unauthorized_stats(
     plan: &super::Plan,
@@ -85,7 +85,9 @@ pub(crate) async fn reject_unauthorized_stats(
             let older = schemas.schema(file.schema_id).await?;
             if let Some(gone) = older.fields().iter().find(|f| {
                 !current.fields().iter().any(|c| {
-                    c.id() == f.id() && c.name() == f.name() && c.data_type() == f.data_type()
+                    c.id() == f.id()
+                        && c.name() == f.name()
+                        && shape(c.data_type()) == shape(f.data_type())
                 })
             }) {
                 return refuse(gone.name());
@@ -93,6 +95,36 @@ pub(crate) async fn reject_unauthorized_stats(
         }
     }
     Ok(())
+}
+
+/// The physical shape, descriptions stripped: `DataField` equality includes them,
+/// so a comment-only edit would otherwise read as an unauthorized column.
+fn shape(ty: &crate::spec::DataType) -> crate::spec::DataType {
+    use crate::spec::{ArrayType, DataType, MapType, MultisetType, RowType};
+    match ty {
+        DataType::Row(row) => DataType::Row(RowType::new(
+            row.fields()
+                .iter()
+                .map(|f| {
+                    crate::spec::DataField::new(f.id(), f.name().to_string(), shape(f.data_type()))
+                })
+                .collect(),
+        )),
+        DataType::Array(a) => DataType::Array(ArrayType::with_nullable(
+            ty.is_nullable(),
+            shape(a.element_type()),
+        )),
+        DataType::Multiset(m) => DataType::Multiset(MultisetType::with_nullable(
+            ty.is_nullable(),
+            shape(m.element_type()),
+        )),
+        DataType::Map(m) => DataType::Map(MapType::with_nullable(
+            ty.is_nullable(),
+            shape(m.key_type()),
+            shape(m.value_type()),
+        )),
+        other => other.clone(),
+    }
 }
 
 /// A refusal naming the option, so callers never match on prose.
@@ -130,11 +162,12 @@ pub(crate) fn reject_noncanonical_fields(
         if crate::spec::is_reserved_system_field_name(field.name()) {
             continue;
         }
-        // The whole type: an older field can keep `(id, name)` and carry an extra
-        // nested child. Nested ids are unassigned, so a legitimate read type
-        // carries the schema field's shape whole.
+        // The whole shape: an older field can keep `(id, name)` and carry an
+        // extra nested child.
         let canonical = schema_fields.iter().any(|f| {
-            f.id() == field.id() && f.name() == field.name() && f.data_type() == field.data_type()
+            f.id() == field.id()
+                && f.name() == field.name()
+                && shape(f.data_type()) == shape(field.data_type())
         });
         if !canonical {
             return Err(unsupported(&format!(
@@ -355,6 +388,29 @@ mod tests {
             matches!(err, crate::Error::Unsupported { ref message }
                 if message.contains("statistics for 'id'")),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_comment_only_change_is_not_a_different_column() {
+        use crate::spec::{DataField, DataType, IntType, RowType};
+        let child = |desc: Option<&str>| {
+            let f = DataField::new(1, "a".to_string(), DataType::Int(IntType::new()));
+            match desc {
+                Some(d) => f.with_description(Some(d.to_string())),
+                None => f,
+            }
+        };
+        let row = |desc| DataType::Row(RowType::new(vec![child(desc)]));
+        assert_ne!(
+            row(None),
+            row(Some("why")),
+            "equality includes descriptions"
+        );
+        assert_eq!(
+            super::shape(&row(None)),
+            super::shape(&row(Some("why"))),
+            "but a comment is not a column the server did not authorize"
         );
     }
 
