@@ -390,11 +390,12 @@ jobs:
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Updating assets on existing GitHub release: $TAG"
+            gh release upload "$TAG" "${release_files[@]}" --clobber
             gh release edit "$TAG" \
               --title "Release Go binding $VERSION" \
+              --draft=false \
               --prerelease="$prerelease" \
               --latest=false
-            gh release upload "$TAG" "${release_files[@]}" --clobber
           else
             gh release create "$TAG" \
               --title "Release Go binding $VERSION" \
