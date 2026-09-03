@@ -89,7 +89,7 @@ cd paimon-rust-${RELEASE_VERSION}
 Build the workspace:
 
 ```bash
-cargo build --workspace --release
+cargo build --locked --workspace --release
 ```
 
 For Python binding, see `bindings/python/`. For Go binding, see `bindings/go/`.

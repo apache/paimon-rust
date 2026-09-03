@@ -44,19 +44,19 @@ In practice, the release relationship should look like this:
 3. build the Go embedded libraries from the same baseline,
 4. create a Go release commit that contains the generated `libpaimon_c.*.zst`
    files, and
-5. tag that commit as `bindings/go/vX.Y.Z` or `bindings/go/vX.Y.Z-rc.N`.
+5. tag that commit as `bindings/go/vX.Y.Z` or `bindings/go/vX.Y.Z-rcN`.
 
 This keeps a clear link to the Rust release baseline while allowing the Go
 submodule tag to contain the embedded artifacts required by Go module consumers.
 
 ## Recommended Sequence
 
-- For an ASF-style release process, first complete the source release steps for
-  the Rust project.
-- After the corresponding release candidate has been approved, run the Go
-  binding release workflow to publish the convenience Go module tag.
-- If you publish release candidates for the Go binding, base them on the same
-  reviewed Rust release-candidate commit.
+- For an ASF-style release process, first prepare the Rust source release.
+- Pushing a root Rust RC tag automatically publishes the Go RC convenience tag
+  from the same source commit. After the RC is approved, pushing the final root
+  tag does the same for the final Go version.
+- For a manual recovery or standalone Go release, use the same reviewed Rust
+  release commit or immutable tag as `source_ref`.
 
 ## Before Release
 
@@ -64,9 +64,11 @@ submodule tag to contain the embedded artifacts required by Go module consumers.
 - Confirm the target version is decided, for example `v0.1.0`.
 - Confirm the Rust release baseline commit for this Go release is recorded.
 - Decide the exact `source_ref` to pass into the release workflow.
+- Confirm the base version in `version` matches the Paimon workspace version at
+  `source_ref`; after `main` is bumped, it cannot be used to publish the previous version.
 - Confirm whether this Go release is based on a Rust GA tag or an approved Rust
   release-candidate commit.
-- Use `vX.Y.Z-rc.N` for release candidates, for example `v0.1.0-rc.1`.
+- Use `vX.Y.Z-rcN` for release candidates, for example `v0.1.0-rc1`.
 - Use `vX.Y.Z` for the final general-availability release.
 - Confirm the version has not already been used as a Go submodule tag:
   `bindings/go/v0.1.0`.
@@ -82,10 +84,12 @@ submodule tag to contain the embedded artifacts required by Go module consumers.
 
 ## Publish
 
-- Open GitHub Actions and run `Release Go Binding`.
-- Provide the release version, for example `v0.1.0`.
-- Provide `source_ref`, for example `main`, `v0.1.0-rc.1`, or a specific commit SHA.
-- For release candidates, publish `bindings/go/vX.Y.Z-rc.N` first and verify it before the final tag.
+- For a coordinated Rust release, pushing the root `vX.Y.Z-rcN` or `vX.Y.Z`
+  tag starts `Release Go Binding` automatically with that exact source commit.
+- For a manual recovery or standalone Go release, open GitHub Actions and run
+  `Release Go Binding`. Provide the release version, for example `v0.1.0`, and
+  `source_ref`, for example `main`, `v0.1.0-rc1`, or a specific commit SHA.
+- For release candidates, publish `bindings/go/vX.Y.Z-rcN` first and verify it before the final tag.
 - Make sure the workflow is started from the intended Rust release baseline
   branch or commit lineage.
 - Wait for all matrix builds to finish successfully:
@@ -95,7 +99,8 @@ submodule tag to contain the embedded artifacts required by Go module consumers.
   - `darwin/arm64`
 - Confirm each build job generates and verifies the target-specific legal report.
 - Confirm the workflow creates the annotated tag `bindings/go/v0.1.0`.
-- Confirm the workflow publishes a GitHub release for that tag.
+- Confirm the workflow publishes a GitHub release for that tag, marks an RC
+  release as a pre-release, and does not replace the root project's latest release.
 
 ## After Release
 
@@ -130,7 +135,11 @@ import paimon "github.com/apache/paimon-rust/bindings/go"
 ## Rollback Notes
 
 - Do not reuse a broken Go module version once it has been observed externally.
-- Do not delete and recreate an existing `bindings/go/vX.Y.Z-rc.N` or `bindings/go/vX.Y.Z` tag.
+- Do not delete and recreate an existing `bindings/go/vX.Y.Z-rcN` or `bindings/go/vX.Y.Z` tag.
 - Publish a new patch version instead, for example move from `v0.1.0` to `v0.1.1`.
-- If an RC is bad, publish the next RC, for example move from `v0.1.0-rc.1` to `v0.1.0-rc.2`.
+- If an RC is bad, publish the next RC, for example move from `v0.1.0-rc1` to `v0.1.0-rc2`.
 - If the workflow fails before pushing the tag, fix the issue and rerun with the same intended version.
+- If the workflow fails after pushing the tag, rerun it with the same version and
+  original source commit SHA or immutable tag. It verifies that the existing tag
+  contains only the expected release artifacts on top of that source, restores
+  the tagged artifacts, and resumes GitHub Release creation.
