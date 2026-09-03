@@ -113,7 +113,7 @@ jobs:
             expected_file: libpaimon_c.darwin.amd64.dylib.zst
             rust_target: x86_64-apple-darwin
             license_file: THIRD-PARTY-LICENSES.darwin.amd64.html
-          - runner: macos-14
+          - runner: macos-15
             expected_file: libpaimon_c.darwin.arm64.dylib.zst
             rust_target: aarch64-apple-darwin
             license_file: THIRD-PARTY-LICENSES.darwin.arm64.html
