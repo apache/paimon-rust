@@ -782,6 +782,93 @@ async fn test_snapshots_system_table() {
 }
 
 #[tokio::test]
+async fn test_consumers_system_table() {
+    let (ctx, _catalog, tmp) = create_context().await;
+    let table = format!("paimon.default.{FIXTURE_TABLE}$consumers");
+
+    let batches = run_sql(&ctx, &format!("SELECT * FROM {table}")).await;
+    assert!(!batches.is_empty(), "$consumers should return a batch");
+    let schema = batches[0].schema();
+    assert_eq!(schema.field(0).name(), "consumer_id");
+    assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+    assert_eq!(schema.field(1).name(), "next_snapshot_id");
+    assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        0
+    );
+
+    let consumer_dir = tmp
+        .path()
+        .join("default.db")
+        .join(FIXTURE_TABLE)
+        .join("consumer");
+    std::fs::create_dir_all(&consumer_dir).unwrap();
+    std::fs::write(consumer_dir.join("consumer-id2"), r#"{"nextSnapshot":6}"#).unwrap();
+    std::fs::write(
+        consumer_dir.join("consumer-id1"),
+        r#"{"nextSnapshot":5,"ignored":"value"}"#,
+    )
+    .unwrap();
+    std::fs::write(consumer_dir.join("not-a-consumer"), "not json").unwrap();
+
+    let batches = run_sql(&ctx, &format!("SELECT * FROM {table} ORDER BY consumer_id")).await;
+    let batch = &batches[0];
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("consumer_id is Utf8");
+    let snapshots = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("next_snapshot_id is Int64");
+    assert_eq!(ids.iter().flatten().collect::<Vec<_>>(), vec!["id1", "id2"]);
+    assert_eq!(snapshots.values(), &[5, 6]);
+
+    // A filtered point lookup must not read unrelated consumer files.
+    std::fs::write(consumer_dir.join("consumer-bad"), "{").unwrap();
+    let cases: [(&str, &[(&str, i64)]); 5] = [
+        ("consumer_id = 'id1'", &[("id1", 5)]),
+        ("consumer_id IN ('id2', 'missing')", &[("id2", 6)]),
+        ("consumer_id = 'missing'", &[]),
+        ("consumer_id = 'id1 '", &[]),
+        ("consumer_id IN ('id1', 'id1 ')", &[("id1", 5)]),
+    ];
+    for (predicate, expected) in cases {
+        let batches = run_sql(
+            &ctx,
+            &format!("SELECT consumer_id, next_snapshot_id FROM {table} WHERE {predicate}"),
+        )
+        .await;
+        let mut actual = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let snapshots = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                actual.push((ids.value(row).to_string(), snapshots.value(row)));
+            }
+        }
+        assert_eq!(
+            actual,
+            expected
+                .iter()
+                .map(|(id, snapshot)| (id.to_string(), *snapshot))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_branches_system_table_empty_when_no_branch_dir() {
     let (ctx, _catalog, _tmp) = create_context().await;
     let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$branches");

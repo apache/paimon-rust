@@ -33,6 +33,7 @@ mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
 mod commit_message;
+mod consumer_manager;
 pub(crate) mod cow_writer;
 mod data_evolution_reader;
 pub mod data_evolution_writer;
@@ -113,6 +114,7 @@ pub use audit_log_table::AuditLogTable;
 pub use blob_resolver::{BlobReader, BlobStream};
 pub use branch_manager::BranchManager;
 pub use commit_message::CommitMessage;
+pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 #[cfg(feature = "fulltext")]
@@ -315,6 +317,15 @@ impl Table {
 
     pub fn tag_manager(&self) -> TagManager {
         let manager = TagManager::new(self.file_io.clone(), self.location.clone());
+        if self.is_main_branch() {
+            manager
+        } else {
+            manager.with_branch(&self.branch)
+        }
+    }
+
+    pub fn consumer_manager(&self) -> ConsumerManager {
+        let manager = ConsumerManager::new(self.file_io.clone(), self.location.clone());
         if self.is_main_branch() {
             manager
         } else {
