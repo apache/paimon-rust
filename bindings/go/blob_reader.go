@@ -23,9 +23,12 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"unsafe"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/jupiterrider/ffi"
 )
 
@@ -81,6 +84,40 @@ func (r *BlobReader) ReadBlobs(descriptors [][]byte) ([][]byte, error) {
 		return nil, ErrClosed
 	}
 	return ffiBlobReaderReadBlobs.symbol(r.ctx)(r.inner, descriptors)
+}
+
+// StringBlobMapDescriptors returns one MAP<STRING, BLOB> row.
+func StringBlobMapDescriptors(column arrow.Array, row int) (map[string][]byte, error) {
+	m, ok := column.(*array.Map)
+	if !ok {
+		return nil, fmt.Errorf("paimon: BLOB map column is %T, want *array.Map", column)
+	}
+	if row < 0 || row >= m.Len() {
+		return nil, fmt.Errorf("paimon: BLOB map row %d is out of range", row)
+	}
+	if m.IsNull(row) {
+		return nil, nil
+	}
+	keys, ok := m.Keys().(*array.String)
+	if !ok {
+		return nil, fmt.Errorf("paimon: BLOB map keys are %T, want *array.String", m.Keys())
+	}
+	descriptors, ok := m.Items().(*array.Binary)
+	if !ok {
+		return nil, fmt.Errorf("paimon: BLOB map values are %T, want *array.Binary", m.Items())
+	}
+	start, end := m.ValueOffsets(row)
+	result := make(map[string][]byte, end-start)
+	for index := start; index < end; index++ {
+		i := int(index)
+		key := strings.Clone(keys.Value(i))
+		if descriptors.IsNull(i) {
+			result[key] = nil
+			continue
+		}
+		result[key] = append([]byte(nil), descriptors.Value(i)...)
+	}
+	return result, nil
 }
 
 // Close releases the reader and is idempotent.

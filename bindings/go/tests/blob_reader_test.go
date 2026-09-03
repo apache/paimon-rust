@@ -30,6 +30,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/apache/arrow-go/v18/arrow/array"
 	paimon "github.com/apache/paimon-rust/bindings/go"
 )
 
@@ -98,6 +99,95 @@ func TestBlobReaderReadBlobAndBatch(t *testing.T) {
 	}
 	if empty == nil || len(empty) != 0 {
 		t.Fatalf("empty batch returned %#v", empty)
+	}
+}
+
+func TestStringBlobMapDescriptors(t *testing.T) {
+	source := filepath.Join("testdata", "map_blob_table")
+	warehouse := t.TempDir()
+	if err := copyDirectory(source, filepath.Join(warehouse, "default.db", "map_blob_table")); err != nil {
+		t.Fatal(err)
+	}
+	table := openTableAt(t, warehouse, "map_blob_table")
+	builder, err := table.NewReadBuilderWithOptions(map[string]string{
+		"blob-as-descriptor": "true",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer builder.Close()
+	if err := builder.WithProjection([]string{"id", "assets"}); err != nil {
+		t.Fatal(err)
+	}
+	scan, err := builder.NewScan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	plan, err := scan.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	read, err := builder.NewRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	batches, err := read.NewRecordBatchReader(plan.Splits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer batches.Close()
+
+	rows := make(map[int32]map[string][]byte)
+	for {
+		record, err := batches.NextRecord()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := record.Column(0).(*array.Int32)
+		for row := 0; row < int(record.NumRows()); row++ {
+			rows[ids.Value(row)], err = paimon.StringBlobMapDescriptors(record.Column(1), row)
+			if err != nil {
+				record.Release()
+				t.Fatal(err)
+			}
+		}
+		record.Release()
+	}
+
+	descriptors := rows[1]
+	if len(rows) != 3 {
+		t.Fatalf("read %d rows, want 3", len(rows))
+	}
+	if len(descriptors["first"]) == 0 || len(descriptors["tail"]) == 0 {
+		t.Fatalf("descriptor map is invalid after Arrow release: %#v", descriptors)
+	}
+	if rows[2] != nil || len(rows[3]) != 0 {
+		t.Fatalf("unexpected null or empty maps: %#v", rows)
+	}
+	reader, err := table.NewBlobReader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	resolved, err := reader.ReadBlobs([][]byte{
+		descriptors["tail"],
+		descriptors["first"],
+		descriptors["empty"],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resolved[0]) != "ghij" || string(resolved[1]) != "abc" || len(resolved[2]) != 0 {
+		t.Fatalf("unexpected values: %q", resolved)
+	}
+	if descriptors["null"] != nil {
+		t.Fatalf("null BLOB returned %#v", descriptors["null"])
 	}
 }
 

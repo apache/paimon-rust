@@ -22,7 +22,13 @@ use crate::spec::{BlobDescriptor, DataField, DataType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::builder::{BinaryBuilder, ListBuilder};
-use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int16Array,
+    Int32Array, Int64Array, Int8Array, MapArray, RecordBatch, RecordBatchOptions, StringArray,
+    StructArray, Time32MillisecondArray,
+};
+use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_schema::DataType as ArrowDataType;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -96,12 +102,29 @@ impl IndexedBlobReader {
         )
         .await
     }
+
+    pub(crate) async fn read_map_positions(
+        &self,
+        positions: &[usize],
+        key_type: &DataType,
+    ) -> crate::Result<Vec<BlobReadValue>> {
+        let planned_reads = plan_blob_array_reads(&self.index, positions)?;
+        fetch_blob_map_values(
+            self.reader.as_ref(),
+            planned_reads,
+            &self.file_path,
+            self.descriptor_mode,
+            key_type,
+        )
+        .await
+    }
 }
 
 #[derive(Debug)]
 pub(crate) enum BlobReadValue {
     Value(Bytes),
     Array(Vec<Option<Bytes>>),
+    Map(Vec<(Bytes, Option<Bytes>)>),
     Null,
     Placeholder,
 }
@@ -121,11 +144,18 @@ const BLOB_ARRAY_HEADER_SIZE: u64 = 9;
 const BLOB_ARRAY_INDEX_LENGTH_SIZE: u64 = 4;
 const BLOB_ARRAY_MIN_PAYLOAD_SIZE: u64 = BLOB_ARRAY_HEADER_SIZE + BLOB_ARRAY_INDEX_LENGTH_SIZE;
 const BLOB_ARRAY_NULL_ELEMENT_LENGTH: i64 = -1;
+const BLOB_MAP_MAGIC_NUMBER: i32 = 0x4D424342;
+const BLOB_MAP_VERSION: u8 = 1;
+const BLOB_MAP_HEADER_SIZE: u64 = 9;
+const BLOB_MAP_INDEX_LENGTHS_SIZE: u64 = 8;
+const BLOB_MAP_MIN_PAYLOAD_SIZE: u64 = BLOB_MAP_HEADER_SIZE + BLOB_MAP_INDEX_LENGTHS_SIZE;
+const BLOB_MAP_NULL_LENGTH: i64 = -1;
 
-#[derive(Debug, Clone, Copy)]
-enum BlobFieldKind {
+#[derive(Debug, Clone)]
+pub(crate) enum BlobFieldKind {
     Scalar,
     Array,
+    Map(DataType),
 }
 
 #[async_trait]
@@ -159,7 +189,7 @@ impl FormatFileReader for BlobFormatReader {
 
         Ok(try_stream! {
             while let Some(positions) = selection.next_batch(batch_size) {
-                let batch = match field_kind {
+                let batch = match &field_kind {
                     Some(BlobFieldKind::Scalar) => {
                         let values = blob_reader.read_positions(&positions).await?;
                         build_blob_batch(&target_schema, values)?
@@ -167,6 +197,10 @@ impl FormatFileReader for BlobFormatReader {
                     Some(BlobFieldKind::Array) => {
                         let values = blob_reader.read_array_positions(&positions).await?;
                         build_blob_array_batch(&target_schema, values)?
+                    }
+                    Some(BlobFieldKind::Map(key_type)) => {
+                        let values = blob_reader.read_map_positions(&positions, key_type).await?;
+                        build_blob_map_batch(&target_schema, values, key_type)?
                     }
                     None => RecordBatch::try_new_with_options(
                         target_schema.clone(),
@@ -203,9 +237,12 @@ fn validate_read_fields(read_fields: &[DataField]) -> crate::Result<Option<BlobF
             DataType::Array(array) if matches!(array.element_type(), DataType::Blob(_)) => {
                 Ok(BlobFieldKind::Array)
             }
+            DataType::Map(map) if matches!(map.value_type(), DataType::Blob(_)) => {
+                Ok(BlobFieldKind::Map(map.key_type().clone()))
+            }
             other => Err(Error::DataInvalid {
                 message: format!(
-                    ".blob format requires a Blob or Array<Blob> field, got {:?} for column '{}'",
+                    ".blob format requires a Blob, Array<Blob>, or Map<X, Blob> field, got {:?} for column '{}'",
                     other,
                     field.name()
                 ),
@@ -258,7 +295,7 @@ pub(crate) fn build_blob_batch(
         match value {
             BlobReadValue::Value(bytes) => builder.append_value(bytes.as_ref()),
             BlobReadValue::Null | BlobReadValue::Placeholder => builder.append_null(),
-            BlobReadValue::Array(_) => {
+            BlobReadValue::Array(_) | BlobReadValue::Map(_) => {
                 return Err(Error::UnexpectedError {
                     message: "Scalar BLOB reader produced an ARRAY<BLOB> value".to_string(),
                     source: None,
@@ -302,7 +339,7 @@ pub(crate) fn build_blob_array_batch(
                 builder.append(true);
             }
             BlobReadValue::Null | BlobReadValue::Placeholder => builder.append(false),
-            BlobReadValue::Value(_) => {
+            BlobReadValue::Value(_) | BlobReadValue::Map(_) => {
                 return Err(Error::UnexpectedError {
                     message: "ARRAY<BLOB> reader produced a scalar BLOB value".to_string(),
                     source: None,
@@ -316,6 +353,275 @@ pub(crate) fn build_blob_array_batch(
         message: format!("Failed to build ARRAY<BLOB> RecordBatch: {e}"),
         source: Some(Box::new(e)),
     })
+}
+
+pub(crate) fn build_blob_map_batch(
+    target_schema: &Arc<arrow_schema::Schema>,
+    values: Vec<BlobReadValue>,
+    key_type: &DataType,
+) -> crate::Result<RecordBatch> {
+    let ArrowDataType::Map(entries_field, ordered) = target_schema.field(0).data_type() else {
+        return Err(Error::UnexpectedError {
+            message: "Expected MAP<X, BLOB> to map to Arrow Map".to_string(),
+            source: None,
+        });
+    };
+    let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
+        return Err(Error::UnexpectedError {
+            message: "Expected MAP<X, BLOB> entries to be an Arrow Struct".to_string(),
+            source: None,
+        });
+    };
+
+    let mut keys = Vec::new();
+    let mut blobs = Vec::new();
+    let mut blob_data_length = 0u64;
+    let mut offsets = vec![0i32];
+    let mut validity = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            BlobReadValue::Map(entries) => {
+                validity.push(true);
+                let next = offsets
+                    .last()
+                    .copied()
+                    .unwrap()
+                    .checked_add(
+                        i32::try_from(entries.len()).map_err(|e| Error::DataInvalid {
+                            message: "MAP<X, BLOB> entry count exceeds Arrow i32 offsets"
+                                .to_string(),
+                            source: Some(Box::new(e)),
+                        })?,
+                    )
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: "MAP<X, BLOB> batch exceeds Arrow i32 offsets".to_string(),
+                        source: None,
+                    })?;
+                for (key, blob) in entries {
+                    if let Some(blob) = &blob {
+                        blob_data_length = checked_arrow_binary_data_length(
+                            blob_data_length,
+                            blob.len() as u64,
+                            "MAP<X, BLOB> batch value data",
+                        )?;
+                    }
+                    keys.push(key);
+                    blobs.push(blob);
+                }
+                offsets.push(next);
+            }
+            BlobReadValue::Null | BlobReadValue::Placeholder => {
+                validity.push(false);
+                offsets.push(*offsets.last().unwrap());
+            }
+            BlobReadValue::Value(_) | BlobReadValue::Array(_) => {
+                return Err(Error::UnexpectedError {
+                    message: "MAP<X, BLOB> reader produced a non-map value".to_string(),
+                    source: None,
+                });
+            }
+        }
+    }
+
+    let key_array = decode_blob_map_keys(&keys, key_type)?;
+    let value_array = Arc::new(BinaryArray::from_iter(
+        blobs.iter().map(|value| value.as_deref()),
+    )) as ArrayRef;
+    let entries = StructArray::try_new(entry_fields.clone(), vec![key_array, value_array], None)
+        .map_err(|e| Error::UnexpectedError {
+            message: format!("Failed to build MAP<X, BLOB> entries: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+    let map = MapArray::try_new(
+        entries_field.clone(),
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        entries,
+        Some(NullBuffer::new(BooleanBuffer::from(validity))),
+        *ordered,
+    )
+    .map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to build MAP<X, BLOB> array: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+    RecordBatch::try_new(target_schema.clone(), vec![Arc::new(map)]).map_err(|e| {
+        Error::UnexpectedError {
+            message: format!("Failed to build MAP<X, BLOB> RecordBatch: {e}"),
+            source: Some(Box::new(e)),
+        }
+    })
+}
+
+fn decode_blob_map_keys(keys: &[Bytes], key_type: &DataType) -> crate::Result<ArrayRef> {
+    macro_rules! fixed_keys {
+        ($array:ty, $type:ty, $size:expr) => {{
+            let values = keys
+                .iter()
+                .map(|key| {
+                    let bytes: [u8; $size] =
+                        key.as_ref().try_into().map_err(|_| Error::DataInvalid {
+                            message: format!(
+                                "Invalid MAP<X, BLOB> fixed-width key length: {}",
+                                key.len()
+                            ),
+                            source: None,
+                        })?;
+                    Ok(<$type>::from_le_bytes(bytes))
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(Arc::new(<$array>::from(values)) as ArrayRef)
+        }};
+    }
+
+    for key in keys {
+        validate_blob_map_key_length(key_type, key.len() as u64)?;
+    }
+    if blob_map_key_uses_binary_offsets(key_type) {
+        keys.iter().try_fold(0u64, |total, key| {
+            checked_arrow_binary_data_length(total, key.len() as u64, "MAP<X, BLOB> batch key data")
+        })?;
+    }
+
+    match key_type {
+        DataType::TinyInt(_) => fixed_keys!(Int8Array, i8, 1),
+        DataType::SmallInt(_) => fixed_keys!(Int16Array, i16, 2),
+        DataType::Int(_) => fixed_keys!(Int32Array, i32, 4),
+        DataType::BigInt(_) => fixed_keys!(Int64Array, i64, 8),
+        DataType::Date(_) => fixed_keys!(Date32Array, i32, 4),
+        DataType::Time(_) => fixed_keys!(Time32MillisecondArray, i32, 4),
+        DataType::Boolean(_) => {
+            let values = keys
+                .iter()
+                .map(|key| match key.as_ref() {
+                    [0] => Ok(false),
+                    [1] => Ok(true),
+                    _ => Err(Error::DataInvalid {
+                        message: "Invalid MAP<X, BLOB> boolean key".to_string(),
+                        source: None,
+                    }),
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(Arc::new(BooleanArray::from(values)))
+        }
+        DataType::Char(_) | DataType::VarChar(_) => {
+            let values = keys
+                .iter()
+                .map(|key| {
+                    std::str::from_utf8(key).map_err(|e| Error::DataInvalid {
+                        message: "Invalid MAP<X, BLOB> string key".to_string(),
+                        source: Some(Box::new(e)),
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(Arc::new(StringArray::from(values)))
+        }
+        DataType::Binary(_) | DataType::VarBinary(_) => Ok(Arc::new(
+            BinaryArray::from_iter_values(keys.iter().map(|key| key.as_ref())),
+        )),
+        DataType::Decimal(decimal) => {
+            let values = keys
+                .iter()
+                .map(|key| decode_blob_map_decimal(key, decimal.precision()))
+                .collect::<crate::Result<Vec<_>>>()?;
+            let array = Decimal128Array::from(values)
+                .with_precision_and_scale(decimal.precision() as u8, decimal.scale() as i8)
+                .map_err(|e| Error::DataInvalid {
+                    message: format!("Invalid MAP<X, BLOB> decimal key: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+            Ok(Arc::new(array))
+        }
+        other => Err(Error::Unsupported {
+            message: format!("Unsupported key type for MAP<X, BLOB>: {other:?}"),
+        }),
+    }
+}
+
+fn blob_map_key_uses_binary_offsets(key_type: &DataType) -> bool {
+    matches!(
+        key_type,
+        DataType::Char(_) | DataType::VarChar(_) | DataType::Binary(_) | DataType::VarBinary(_)
+    )
+}
+
+fn validate_blob_map_key_length(key_type: &DataType, length: u64) -> crate::Result<()> {
+    let fixed_length = match key_type {
+        DataType::TinyInt(_) | DataType::Boolean(_) => Some(1),
+        DataType::SmallInt(_) => Some(2),
+        DataType::Int(_) | DataType::Date(_) | DataType::Time(_) => Some(4),
+        DataType::BigInt(_) => Some(8),
+        DataType::Decimal(decimal) if decimal.precision() <= 18 => Some(8),
+        DataType::Decimal(_) => {
+            if !(1..=16).contains(&length) {
+                return Err(Error::DataInvalid {
+                    message: "Invalid MAP<X, BLOB> decimal key".to_string(),
+                    source: None,
+                });
+            }
+            return Ok(());
+        }
+        DataType::Char(_) | DataType::VarChar(_) | DataType::Binary(_) | DataType::VarBinary(_) => {
+            return Ok(())
+        }
+        other => {
+            return Err(Error::Unsupported {
+                message: format!("Unsupported key type for MAP<X, BLOB>: {other:?}"),
+            });
+        }
+    };
+    if fixed_length != Some(length) {
+        return Err(Error::DataInvalid {
+            message: format!("Invalid MAP<X, BLOB> fixed-width key length: {length}"),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+fn checked_arrow_binary_data_length(
+    current: u64,
+    additional: u64,
+    context: &str,
+) -> crate::Result<u64> {
+    let total = current
+        .checked_add(additional)
+        .filter(|total| *total <= i32::MAX as u64)
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!("{context} is too large for Arrow Binary"),
+            source: None,
+        })?;
+    Ok(total)
+}
+
+fn decode_blob_map_decimal(bytes: &[u8], precision: u32) -> crate::Result<i128> {
+    let value = if precision <= 18 {
+        let bytes: [u8; 8] = bytes.try_into().map_err(|_| Error::DataInvalid {
+            message: format!(
+                "Invalid MAP<X, BLOB> fixed-width key length: {}",
+                bytes.len()
+            ),
+            source: None,
+        })?;
+        i64::from_le_bytes(bytes) as i128
+    } else {
+        if bytes.is_empty() || bytes.len() > 16 {
+            return Err(Error::DataInvalid {
+                message: "Invalid MAP<X, BLOB> decimal key".to_string(),
+                source: None,
+            });
+        }
+        let fill = if bytes[0] & 0x80 == 0 { 0 } else { 0xff };
+        let mut extended = [fill; 16];
+        extended[16 - bytes.len()..].copy_from_slice(bytes);
+        i128::from_be_bytes(extended)
+    };
+    let digits = value.unsigned_abs().to_string().len() as u32;
+    if digits > precision {
+        return Err(Error::DataInvalid {
+            message: "MAP<X, BLOB> decimal key exceeds declared precision".to_string(),
+            source: None,
+        });
+    }
+    Ok(value)
 }
 
 fn plan_blob_reads(
@@ -762,6 +1068,287 @@ fn build_blob_array_descriptors(
         }
     }
     Ok(BlobReadValue::Array(elements))
+}
+
+async fn fetch_blob_map_values(
+    reader: &dyn FileRead,
+    planned_reads: Vec<PlannedBlobArrayRead>,
+    file_path: &str,
+    descriptor_mode: bool,
+    key_type: &DataType,
+) -> crate::Result<Vec<BlobReadValue>> {
+    futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
+        match planned_read {
+            PlannedBlobArrayRead::Null => Ok(BlobReadValue::Null),
+            PlannedBlobArrayRead::Placeholder => Ok(BlobReadValue::Placeholder),
+            PlannedBlobArrayRead::Read(payload_range) => {
+                read_blob_map_entry(reader, payload_range, file_path, descriptor_mode, key_type)
+                    .await
+            }
+        }
+    }))
+    .buffered(BLOB_READ_CONCURRENCY)
+    .try_collect()
+    .await
+}
+
+async fn read_blob_map_entry(
+    reader: &dyn FileRead,
+    payload_range: Range<u64>,
+    file_path: &str,
+    descriptor_mode: bool,
+    key_type: &DataType,
+) -> crate::Result<BlobReadValue> {
+    let payload_length = payload_range
+        .end
+        .checked_sub(payload_range.start)
+        .ok_or_else(|| Error::DataInvalid {
+            message: format!("Invalid MAP<X, BLOB> payload range: {payload_range:?}"),
+            source: None,
+        })?;
+    if payload_length < BLOB_MAP_MIN_PAYLOAD_SIZE {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "MAP<X, BLOB> payload is too small: expected at least {BLOB_MAP_MIN_PAYLOAD_SIZE} bytes, got {payload_length}"
+            ),
+            source: None,
+        });
+    }
+
+    let header = read_blob_map_range(
+        reader,
+        payload_range.start..payload_range.start + BLOB_MAP_HEADER_SIZE,
+        "header",
+    )
+    .await?;
+    let magic = i32::from_le_bytes(header[..4].try_into().unwrap());
+    if magic != BLOB_MAP_MAGIC_NUMBER {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Invalid MAP<X, BLOB> payload magic number: expected {BLOB_MAP_MAGIC_NUMBER}, got {magic}"
+            ),
+            source: None,
+        });
+    }
+    if header[4] != BLOB_MAP_VERSION {
+        return Err(Error::Unsupported {
+            message: format!(
+                "Unsupported MAP<X, BLOB> payload version: expected {BLOB_MAP_VERSION}, got {}",
+                header[4]
+            ),
+        });
+    }
+    let entry_count = i32::from_le_bytes(header[5..9].try_into().unwrap());
+    if entry_count < 0 {
+        return Err(Error::DataInvalid {
+            message: format!("Invalid MAP<X, BLOB> entry count: {entry_count}"),
+            source: None,
+        });
+    }
+    let entry_count = entry_count as usize;
+
+    let index_lengths_start = payload_range.end - BLOB_MAP_INDEX_LENGTHS_SIZE;
+    let index_lengths = read_blob_map_range(
+        reader,
+        index_lengths_start..payload_range.end,
+        "index lengths",
+    )
+    .await?;
+    let key_index_length = i32::from_le_bytes(index_lengths[..4].try_into().unwrap());
+    let value_index_length = i32::from_le_bytes(index_lengths[4..8].try_into().unwrap());
+    let max_indexes = payload_length - BLOB_MAP_MIN_PAYLOAD_SIZE;
+    if key_index_length < 0 || key_index_length as u64 > max_indexes {
+        return Err(Error::DataInvalid {
+            message: format!("Invalid MAP<X, BLOB> key index length: {key_index_length}"),
+            source: None,
+        });
+    }
+    if value_index_length < 0 || value_index_length as u64 > max_indexes {
+        return Err(Error::DataInvalid {
+            message: format!("Invalid MAP<X, BLOB> value index length: {value_index_length}"),
+            source: None,
+        });
+    }
+    let key_index_length = key_index_length as u64;
+    let value_index_length = value_index_length as u64;
+    if key_index_length + value_index_length > max_indexes
+        || entry_count as u64 > key_index_length
+        || entry_count as u64 > value_index_length
+    {
+        return Err(Error::DataInvalid {
+            message: "MAP<X, BLOB> indexes do not match the payload".to_string(),
+            source: None,
+        });
+    }
+
+    let value_index_start = index_lengths_start - value_index_length;
+    let key_index_start = value_index_start - key_index_length;
+    let key_index =
+        read_blob_map_range(reader, key_index_start..value_index_start, "key index").await?;
+    let value_index = read_blob_map_range(
+        reader,
+        value_index_start..index_lengths_start,
+        "value index",
+    )
+    .await?;
+    let key_lengths = decode_delta_varints(&key_index).map_err(|e| Error::DataInvalid {
+        message: format!("Invalid MAP<X, BLOB> key index: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+    let value_lengths = decode_delta_varints(&value_index).map_err(|e| Error::DataInvalid {
+        message: format!("Invalid MAP<X, BLOB> value index: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+    if key_lengths.len() != entry_count || value_lengths.len() != entry_count {
+        return Err(Error::DataInvalid {
+            message: "MAP<X, BLOB> entry count does not match index lengths".to_string(),
+            source: None,
+        });
+    }
+
+    let data_start = payload_range.start + BLOB_MAP_HEADER_SIZE;
+    let data_length = key_index_start - data_start;
+    let mut key_data_length = 0u64;
+    for &length in &key_lengths {
+        if length == BLOB_MAP_NULL_LENGTH {
+            return Err(Error::DataInvalid {
+                message: "MAP<X, BLOB> null keys cannot be represented by Arrow".to_string(),
+                source: None,
+            });
+        }
+        let length = u64::try_from(length).map_err(|e| Error::DataInvalid {
+            message: format!("Invalid MAP<X, BLOB> key length: {length}"),
+            source: Some(Box::new(e)),
+        })?;
+        validate_blob_map_key_length(key_type, length)?;
+        key_data_length = key_data_length
+            .checked_add(length)
+            .filter(|total| *total <= data_length)
+            .ok_or_else(|| Error::DataInvalid {
+                message: "MAP<X, BLOB> key lengths exceed the payload data length".to_string(),
+                source: None,
+            })?;
+    }
+    let value_data_length = data_length - key_data_length;
+    let mut total_value_length = 0u64;
+    for &length in &value_lengths {
+        if length == BLOB_MAP_NULL_LENGTH {
+            continue;
+        }
+        let length = u64::try_from(length).map_err(|e| Error::DataInvalid {
+            message: format!("Invalid MAP<X, BLOB> value length: {length}"),
+            source: Some(Box::new(e)),
+        })?;
+        total_value_length = total_value_length
+            .checked_add(length)
+            .filter(|total| *total <= value_data_length)
+            .ok_or_else(|| Error::DataInvalid {
+                message: "MAP<X, BLOB> value lengths exceed the payload data length".to_string(),
+                source: None,
+            })?;
+    }
+    if total_value_length != value_data_length {
+        return Err(Error::DataInvalid {
+            message: "MAP<X, BLOB> key/value lengths do not match the payload data length"
+                .to_string(),
+            source: None,
+        });
+    }
+    if !descriptor_mode {
+        checked_arrow_binary_data_length(0, total_value_length, "MAP<X, BLOB> inline value data")?;
+    }
+    if blob_map_key_uses_binary_offsets(key_type) {
+        checked_arrow_binary_data_length(0, key_data_length, "MAP<X, BLOB> key data")?;
+    }
+
+    let key_data =
+        read_blob_map_range(reader, data_start..data_start + key_data_length, "key data").await?;
+    let mut keys = Vec::with_capacity(entry_count);
+    let mut cursor = 0usize;
+    let mut unique = std::collections::HashSet::with_capacity(entry_count);
+    for length in key_lengths {
+        let length = length as usize;
+        let end = cursor + length;
+        let key = key_data.slice(cursor..end);
+        if !unique.insert(key.clone()) {
+            return Err(Error::DataInvalid {
+                message: "Invalid MAP<X, BLOB> payload: duplicate key".to_string(),
+                source: None,
+            });
+        }
+        keys.push(key);
+        cursor = end;
+    }
+
+    let mut value_offset = data_start + key_data_length;
+    let mut reads = Vec::with_capacity(entry_count);
+    for length in value_lengths {
+        if length == BLOB_MAP_NULL_LENGTH {
+            reads.push(None);
+        } else {
+            let length = length as u64;
+            reads.push(Some(value_offset..value_offset + length));
+            value_offset += length;
+        }
+    }
+    let values = if descriptor_mode {
+        reads
+            .into_iter()
+            .map(|range| {
+                range
+                    .map(|range| {
+                        let offset =
+                            i64::try_from(range.start).map_err(|e| Error::DataInvalid {
+                                message: "MAP<X, BLOB> descriptor offset exceeds i64".to_string(),
+                                source: Some(Box::new(e)),
+                            })?;
+                        let length = i64::try_from(range.end - range.start).map_err(|e| {
+                            Error::DataInvalid {
+                                message: "MAP<X, BLOB> descriptor length exceeds i64".to_string(),
+                                source: Some(Box::new(e)),
+                            }
+                        })?;
+                        Ok(Bytes::from(
+                            BlobDescriptor::new(file_path.to_string(), offset, length).serialize(),
+                        ))
+                    })
+                    .transpose()
+            })
+            .collect::<crate::Result<Vec<_>>>()?
+    } else {
+        let payload = read_blob_entry(reader, blob_entry_range(&payload_range)).await?;
+        reads
+            .into_iter()
+            .map(|range| {
+                range.map(|range| {
+                    payload.slice(
+                        (range.start - payload_range.start) as usize
+                            ..(range.end - payload_range.start) as usize,
+                    )
+                })
+            })
+            .collect()
+    };
+    Ok(BlobReadValue::Map(keys.into_iter().zip(values).collect()))
+}
+
+async fn read_blob_map_range(
+    reader: &dyn FileRead,
+    range: Range<u64>,
+    part: &str,
+) -> crate::Result<Bytes> {
+    let expected = range.end - range.start;
+    let bytes = reader.read(range.clone()).await?;
+    if bytes.len() as u64 != expected {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Short read for MAP<X, BLOB> {part} range {range:?}: expected {expected} bytes, got {}",
+                bytes.len()
+            ),
+            source: None,
+        });
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -1368,7 +1955,7 @@ fn encode_varint(value: i64, out: &mut Vec<u8>) {
 mod tests {
     use super::*;
     use crate::btree::test_util::BytesFileRead;
-    use crate::spec::{ArrayType, BlobType};
+    use crate::spec::{ArrayType, BlobType, MapType, VarCharType};
     use arrow_array::Array;
     use bytes::Bytes;
     use futures::TryStreamExt;
@@ -1505,6 +2092,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_map_reader_returns_inline_values_and_descriptors() {
+        let payload = build_blob_map_payload(&[
+            ("video", Some(b"alpha")),
+            ("thumbnail", None),
+            ("empty", Some(b"")),
+        ]);
+        let file_bytes = blob_test_utils::build_blob_file_bytes(&[Some(payload.as_slice()), None]);
+        let fields = blob_map_read_fields();
+
+        let inline = BlobFormatReader::new("file:///tmp/map.blob".to_string(), false)
+            .read_batch_stream(
+                Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
+                file_bytes.len() as u64,
+                &fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_blob_map_values(&inline[0]),
+            vec![
+                Some(vec![
+                    ("video".to_string(), Some(b"alpha".to_vec())),
+                    ("thumbnail".to_string(), None),
+                    ("empty".to_string(), Some(Vec::new())),
+                ]),
+                None,
+            ]
+        );
+
+        let descriptors = BlobFormatReader::new("file:///tmp/map.blob".to_string(), true)
+            .read_batch_stream(
+                Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
+                file_bytes.len() as u64,
+                &fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let rows = collect_blob_map_values(&descriptors[0]);
+        let entries = rows[0].as_ref().unwrap();
+        let video = BlobDescriptor::deserialize(entries[0].1.as_ref().unwrap()).unwrap();
+        assert_eq!(video.uri(), "file:///tmp/map.blob");
+        assert_eq!(video.length(), 5);
+        assert!(entries[1].1.is_none());
+        let empty = BlobDescriptor::deserialize(entries[2].1.as_ref().unwrap()).unwrap();
+        assert_eq!(empty.length(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_blob_map_descriptor_read_skips_values() {
+        let file_path = "file:///tmp/map.blob";
+        let payload =
+            build_blob_map_payload(&[("first", Some(b"alpha")), ("second", Some(b"beta"))]);
+        let file_bytes = blob_test_utils::build_blob_file_bytes(&[Some(payload.as_slice())]);
+        let reader = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
+        let batches = BlobFormatReader::new(file_path.to_string(), true)
+            .read_batch_stream(
+                Box::new(reader.clone()),
+                file_bytes.len() as u64,
+                &blob_map_read_fields(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        for (_, descriptor) in collect_blob_map_values(&batches[0])[0].as_ref().unwrap() {
+            let descriptor = BlobDescriptor::deserialize(descriptor.as_ref().unwrap()).unwrap();
+            let value_range =
+                descriptor.offset() as u64..(descriptor.offset() + descriptor.length()) as u64;
+            assert!(reader
+                .ranges()
+                .iter()
+                .all(|range| range.end <= value_range.start || range.start >= value_range.end));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inline_blob_map_reader_rejects_crc_mismatch() {
+        let payload = build_blob_map_payload(&[("key", Some(b"value"))]);
+        let mut file_bytes = blob_test_utils::build_blob_file_bytes(&[Some(payload.as_slice())]);
+        let value_offset =
+            (BLOB_INLINE_HEADER_SIZE + BLOB_MAP_HEADER_SIZE + "key".len() as u64) as usize;
+        file_bytes[value_offset] ^= 0xff;
+
+        let stream = BlobFormatReader::new(String::new(), false)
+            .read_batch_stream(
+                Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
+                file_bytes.len() as u64,
+                &blob_map_read_fields(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let error = stream.try_collect::<Vec<_>>().await.unwrap_err();
+        assert_data_invalid(error, "CRC32 mismatch");
+    }
+
+    #[tokio::test]
+    async fn test_inline_blob_map_reader_rejects_oversized_data_before_entry_read() {
+        let value_length = i32::MAX as u64 + 1;
+        let (reader, payload_range) = sparse_blob_map_entry(&[1], &[value_length as i64]);
+        let key_type = DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap());
+
+        let error = read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type)
+            .await
+            .unwrap_err();
+
+        assert!(
+            !reader.ranges().contains(&blob_entry_range(&payload_range)),
+            "oversized inline MAP<X, BLOB> must be rejected before reading the complete entry"
+        );
+        assert_data_invalid(error, "too large");
+    }
+
+    #[tokio::test]
+    async fn test_blob_map_reader_rejects_oversized_key_before_data_read() {
+        let key_length = i32::MAX as u64 + 1;
+        let (reader, payload_range) = sparse_blob_map_entry(&[key_length as i64], &[0]);
+        let key_type = DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap());
+
+        let error = read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type)
+            .await
+            .unwrap_err();
+
+        assert_eq!(reader.ranges().len(), 4);
+        assert!(!reader.ranges().contains(&blob_entry_range(&payload_range)));
+        assert_data_invalid(error, "too large");
+    }
+
+    #[tokio::test]
+    async fn test_blob_map_reader_rejects_invalid_fixed_key_before_data_read() {
+        let key_length = i32::MAX as u64 + 1;
+        let (reader, payload_range) = sparse_blob_map_entry(&[key_length as i64], &[0]);
+        let key_type = DataType::Int(crate::spec::IntType::new());
+
+        let error = read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type)
+            .await
+            .unwrap_err();
+
+        assert_eq!(reader.ranges().len(), 4);
+        assert!(!reader.ranges().contains(&blob_entry_range(&payload_range)));
+        assert_data_invalid(error, "fixed-width key length");
+    }
+
+    #[tokio::test]
+    async fn test_blob_map_reader_rejects_null_key_for_arrow() {
+        let (reader, payload_range) = sparse_blob_map_entry(&[-1], &[0]);
+        let key_type = DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap());
+
+        let error = read_blob_map_entry(&reader, payload_range, "", false, &key_type)
+            .await
+            .unwrap_err();
+
+        assert_data_invalid(error, "null keys cannot be represented by Arrow");
+    }
+
+    #[test]
+    fn test_blob_map_batch_rejects_oversized_binary_data() {
+        let error =
+            checked_arrow_binary_data_length(i32::MAX as u64, 1, "MAP<X, BLOB> batch value data")
+                .unwrap_err();
+
+        assert_data_invalid(error, "too large");
+    }
+
+    #[tokio::test]
     async fn test_inline_blob_array_reader_rejects_payload_crc_mismatch() {
         let payload = build_blob_array_payload(b"helloworld", &[5, -1, 5]);
         let mut file_bytes = blob_test_utils::build_blob_file_bytes(&[Some(payload.as_slice())]);
@@ -1534,8 +2305,20 @@ mod tests {
         let payload_length =
             BLOB_ARRAY_MIN_PAYLOAD_SIZE + element_data_length + element_index.len() as u64;
         let payload_range = BLOB_INLINE_HEADER_SIZE..BLOB_INLINE_HEADER_SIZE + payload_length;
-        let reader =
-            BlobArrayPreflightFileRead::new(payload_range.clone(), 1, element_index.len() as i32);
+        let mut header = Vec::with_capacity(BLOB_ARRAY_HEADER_SIZE as usize);
+        header.extend_from_slice(&BLOB_ARRAY_MAGIC_NUMBER.to_le_bytes());
+        header.push(BLOB_ARRAY_VERSION);
+        header.extend_from_slice(&1i32.to_le_bytes());
+        let reader = SparseFileRead::new(vec![
+            (
+                payload_range.start..payload_range.start + BLOB_ARRAY_HEADER_SIZE,
+                Bytes::from(header),
+            ),
+            (
+                payload_range.end - BLOB_ARRAY_INDEX_LENGTH_SIZE..payload_range.end,
+                Bytes::copy_from_slice(&(element_index.len() as i32).to_le_bytes()),
+            ),
+        ]);
 
         let error = read_inline_blob_array_entry(&reader, payload_range.clone())
             .await
@@ -1848,7 +2631,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(Error::DataInvalid { message, .. }) if message.contains("Blob or Array<Blob> field"))
+            matches!(result, Err(Error::DataInvalid { message, .. }) if message.contains("Blob, Array<Blob>, or Map<X, Blob> field"))
         );
     }
 
@@ -1875,7 +2658,7 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(Error::DataInvalid { message, .. }) if message.contains("Blob or Array<Blob>"))
+            matches!(result, Err(Error::DataInvalid { message, .. }) if message.contains("Blob, Array<Blob>, or Map<X, Blob>"))
         );
     }
 
@@ -2150,6 +2933,17 @@ mod tests {
         )]
     }
 
+    fn blob_map_read_fields() -> Vec<DataField> {
+        vec![DataField::new(
+            0,
+            "payloads".to_string(),
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap()),
+                DataType::Blob(BlobType::new()),
+            )),
+        )]
+    }
+
     fn build_blob_array_payload(element_data: &[u8], element_lengths: &[i64]) -> Vec<u8> {
         let index = encode_delta_varints_write(element_lengths);
         let mut payload = Vec::with_capacity(
@@ -2161,6 +2955,36 @@ mod tests {
         payload.extend_from_slice(element_data);
         payload.extend_from_slice(&index);
         payload.extend_from_slice(&(index.len() as i32).to_le_bytes());
+        payload
+    }
+
+    fn build_blob_map_payload(entries: &[(&str, Option<&[u8]>)]) -> Vec<u8> {
+        let key_lengths = entries
+            .iter()
+            .map(|(key, _)| key.len() as i64)
+            .collect::<Vec<_>>();
+        let value_lengths = entries
+            .iter()
+            .map(|(_, value)| value.map_or(-1, |value| value.len() as i64))
+            .collect::<Vec<_>>();
+        let key_index = encode_delta_varints_write(&key_lengths);
+        let value_index = encode_delta_varints_write(&value_lengths);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&BLOB_MAP_MAGIC_NUMBER.to_le_bytes());
+        payload.push(BLOB_MAP_VERSION);
+        payload.extend_from_slice(&(entries.len() as i32).to_le_bytes());
+        for (key, _) in entries {
+            payload.extend_from_slice(key.as_bytes());
+        }
+        for (_, value) in entries {
+            if let Some(value) = value {
+                payload.extend_from_slice(value);
+            }
+        }
+        payload.extend_from_slice(&key_index);
+        payload.extend_from_slice(&value_index);
+        payload.extend_from_slice(&(key_index.len() as i32).to_le_bytes());
+        payload.extend_from_slice(&(value_index.len() as i32).to_le_bytes());
         payload
     }
 
@@ -2259,6 +3083,38 @@ mod tests {
             .collect()
     }
 
+    type BlobMapRows = Vec<Option<Vec<(String, Option<Vec<u8>>)>>>;
+
+    fn collect_blob_map_values(batch: &RecordBatch) -> BlobMapRows {
+        let array = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        let keys = array.keys().as_any().downcast_ref::<StringArray>().unwrap();
+        let values = array
+            .values()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        (0..array.len())
+            .map(|row| {
+                if array.is_null(row) {
+                    return None;
+                }
+                let start = array.value_offsets()[row];
+                let end = array.value_offsets()[row + 1];
+                Some(
+                    (start..end)
+                        .map(|index| {
+                            let index = index as usize;
+                            (
+                                keys.value(index).to_string(),
+                                (!values.is_null(index)).then(|| values.value(index).to_vec()),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     fn load_blob_fixture(name: &str) -> Vec<u8> {
         let path = format!("{}/testdata/blob/{name}", env!("CARGO_MANIFEST_DIR"));
         std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {path}: {e}"))
@@ -2303,19 +3159,15 @@ mod tests {
         }
     }
 
-    struct BlobArrayPreflightFileRead {
-        payload_range: Range<u64>,
-        element_count: i32,
-        index_length: i32,
+    struct SparseFileRead {
+        responses: Vec<(Range<u64>, Bytes)>,
         ranges: Mutex<Vec<Range<u64>>>,
     }
 
-    impl BlobArrayPreflightFileRead {
-        fn new(payload_range: Range<u64>, element_count: i32, index_length: i32) -> Self {
+    impl SparseFileRead {
+        fn new(responses: Vec<(Range<u64>, Bytes)>) -> Self {
             Self {
-                payload_range,
-                element_count,
-                index_length,
+                responses,
                 ranges: Mutex::new(Vec::new()),
             }
         }
@@ -2325,25 +3177,55 @@ mod tests {
         }
     }
 
+    fn sparse_blob_map_entry(
+        key_lengths: &[i64],
+        value_lengths: &[i64],
+    ) -> (SparseFileRead, Range<u64>) {
+        let key_index = encode_delta_varints_write(key_lengths);
+        let value_index = encode_delta_varints_write(value_lengths);
+        let data_length = key_lengths
+            .iter()
+            .chain(value_lengths)
+            .filter(|length| **length >= 0)
+            .map(|length| *length as u64)
+            .sum::<u64>();
+        let payload_length = BLOB_MAP_MIN_PAYLOAD_SIZE
+            + data_length
+            + key_index.len() as u64
+            + value_index.len() as u64;
+        let payload_range = BLOB_INLINE_HEADER_SIZE..BLOB_INLINE_HEADER_SIZE + payload_length;
+        let mut header = Vec::with_capacity(BLOB_MAP_HEADER_SIZE as usize);
+        header.extend_from_slice(&BLOB_MAP_MAGIC_NUMBER.to_le_bytes());
+        header.push(BLOB_MAP_VERSION);
+        header.extend_from_slice(&(key_lengths.len() as i32).to_le_bytes());
+        let lengths_start = payload_range.end - BLOB_MAP_INDEX_LENGTHS_SIZE;
+        let value_index_start = lengths_start - value_index.len() as u64;
+        let key_index_start = value_index_start - key_index.len() as u64;
+        let mut index_lengths = Vec::with_capacity(BLOB_MAP_INDEX_LENGTHS_SIZE as usize);
+        index_lengths.extend_from_slice(&(key_index.len() as i32).to_le_bytes());
+        index_lengths.extend_from_slice(&(value_index.len() as i32).to_le_bytes());
+        let reader = SparseFileRead::new(vec![
+            (
+                payload_range.start..payload_range.start + BLOB_MAP_HEADER_SIZE,
+                Bytes::from(header),
+            ),
+            (lengths_start..payload_range.end, Bytes::from(index_lengths)),
+            (key_index_start..value_index_start, Bytes::from(key_index)),
+            (value_index_start..lengths_start, Bytes::from(value_index)),
+        ]);
+        (reader, payload_range)
+    }
+
     #[async_trait::async_trait]
-    impl FileRead for BlobArrayPreflightFileRead {
+    impl FileRead for SparseFileRead {
         async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
             self.ranges.lock().unwrap().push(range.clone());
-
-            let header_range =
-                self.payload_range.start..self.payload_range.start + BLOB_ARRAY_HEADER_SIZE;
-            if range == header_range {
-                let mut header = Vec::with_capacity(BLOB_ARRAY_HEADER_SIZE as usize);
-                header.extend_from_slice(&BLOB_ARRAY_MAGIC_NUMBER.to_le_bytes());
-                header.push(BLOB_ARRAY_VERSION);
-                header.extend_from_slice(&self.element_count.to_le_bytes());
-                return Ok(Bytes::from(header));
-            }
-
-            let index_length_range =
-                self.payload_range.end - BLOB_ARRAY_INDEX_LENGTH_SIZE..self.payload_range.end;
-            if range == index_length_range {
-                return Ok(Bytes::copy_from_slice(&self.index_length.to_le_bytes()));
+            if let Some((_, bytes)) = self
+                .responses
+                .iter()
+                .find(|(expected, _)| expected == &range)
+            {
+                return Ok(bytes.clone());
             }
 
             Err(Error::UnexpectedError {

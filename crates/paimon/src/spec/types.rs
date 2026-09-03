@@ -133,6 +133,7 @@ impl DataType {
         match self {
             DataType::Blob(_) => true,
             DataType::Array(array) => array.element_type().is_blob_type(),
+            DataType::Map(map) => map.value_type().is_blob_type(),
             _ => false,
         }
     }
@@ -1976,10 +1977,12 @@ mod tests {
     fn test_blob_file_field_classification() {
         let blob = DataType::Blob(BlobType::new());
         let array_blob = DataType::Array(ArrayType::new(blob.clone()));
+        let map_blob = DataType::Map(MapType::new(DataType::Int(IntType::new()), blob.clone()));
         let nested_array_blob = DataType::Array(ArrayType::new(array_blob.clone()));
 
         assert!(blob.is_blob_file_field());
         assert!(array_blob.is_blob_file_field());
+        assert!(map_blob.is_blob_file_field());
         assert!(!nested_array_blob.is_blob_file_field());
         assert!(!DataType::Int(IntType::new()).is_blob_file_field());
     }
