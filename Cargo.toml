@@ -33,7 +33,7 @@ edition = "2021"
 homepage = "https://paimon.apache.org/docs/rust/"
 repository = "https://github.com/apache/paimon-rust"
 license = "Apache-2.0"
-rust-version = "1.91.0"
+rust-version = "1.94.0"
 
 [workspace.dependencies]
 arrow = "58.0"
