@@ -15,11 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/target
-/bindings/cpp/target/
-.idea
-.vscode
-**/.DS_Store
-**/dist/
-docs/site/
-.qoder
+cmake_minimum_required(VERSION 3.15)
+project(PaimonCppInstallTreeConsumer LANGUAGES CXX)
+
+find_package(PaimonCpp CONFIG REQUIRED)
+# Package discovery may happen through more than one dependency. A repeated
+# lookup must retain the same bundled Paimon::c target instead of treating it
+# as an external override.
+find_package(PaimonCpp CONFIG REQUIRED)
+add_executable(paimon_install_tree_consumer main.cpp)
+target_link_libraries(paimon_install_tree_consumer PRIVATE Paimon::cpp)

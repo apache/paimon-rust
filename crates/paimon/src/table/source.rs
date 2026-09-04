@@ -23,6 +23,71 @@ use crate::spec::{BinaryRow, DataFileMeta, DataFileMetaRowLayout};
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use url::Url;
+
+const MAX_RESTORED_FILE_NAME_BYTES: usize = 4 * 1024;
+
+fn safe_restored_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_RESTORED_FILE_NAME_BYTES
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+fn url_authority_matches(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.username() == right.username()
+        && left.password() == right.password()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn path_has_root(root: &str, candidate: &str) -> bool {
+    match (Url::parse(root), Url::parse(candidate)) {
+        (Ok(root), Ok(candidate)) => {
+            if !url_authority_matches(&root, &candidate)
+                || root.query().is_some()
+                || root.fragment().is_some()
+                || candidate.query().is_some()
+                || candidate.fragment().is_some()
+            {
+                return false;
+            }
+            path_text_has_root(root.path(), candidate.path())
+        }
+        (Err(_), Err(_)) => path_text_has_root(root, candidate),
+        _ => false,
+    }
+}
+
+fn path_text_has_root(root: &str, candidate: &str) -> bool {
+    fn components(path: &str) -> Option<Vec<&str>> {
+        let mut result = Vec::new();
+        for component in path.split(['/', '\\']) {
+            match component {
+                "" | "." => {}
+                ".." => return None,
+                value => result.push(value),
+            }
+        }
+        Some(result)
+    }
+
+    if root.is_empty()
+        || candidate.is_empty()
+        || root.starts_with('/') != candidate.starts_with('/')
+        || root.starts_with('\\') != candidate.starts_with('\\')
+    {
+        return false;
+    }
+    let (Some(root), Some(candidate)) = (components(root), components(candidate)) else {
+        return false;
+    };
+    candidate.len() >= root.len() && candidate[..root.len()] == root
+}
 
 fn is_vector_store_file_name(file_name: &str) -> bool {
     file_name.to_ascii_lowercase().contains(".vector.")
@@ -572,6 +637,65 @@ impl DataSplit {
     /// Full path for a single data file in this split, respecting `_EXTERNAL_PATH`.
     pub fn data_file_path(&self, file: &DataFileMeta) -> String {
         file.data_file_path(&self.bucket_path)
+    }
+
+    /// Validate that a deserialized split cannot escape its table root.
+    ///
+    /// Planned splits are trusted Rust objects, but persisted split bytes can
+    /// cross an FFI/process boundary. Version 1 recovery therefore rejects
+    /// external data paths and requires every referenced path to remain under
+    /// the table location.
+    pub fn validate_restored_containment(&self, table_location: &str) -> crate::Result<()> {
+        if !path_has_root(table_location, self.bucket_path()) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Restored split bucket path '{}' is outside table root '{table_location}'",
+                    self.bucket_path()
+                ),
+                source: None,
+            });
+        }
+        for file in self.data_files() {
+            if file.external_path.is_some() {
+                return Err(crate::Error::Unsupported {
+                    message:
+                        "Restored stream plans with external data-file paths are not supported"
+                            .to_string(),
+                });
+            }
+            if !safe_restored_file_name(&file.file_name)
+                || file
+                    .extra_files
+                    .iter()
+                    .any(|name| !safe_restored_file_name(name))
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: "Restored stream plan contains an unsafe data-file name".to_string(),
+                    source: None,
+                });
+            }
+        }
+        if let Some(deletion_files) = self.data_deletion_files() {
+            for deletion_file in deletion_files.iter().flatten() {
+                if deletion_file.offset() < 0
+                    || deletion_file.length() < 0
+                    || deletion_file
+                        .offset()
+                        .checked_add(deletion_file.length())
+                        .is_none()
+                    || !path_has_root(table_location, deletion_file.path())
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Restored deletion file '{}' is invalid or outside table root '{table_location}'",
+                            deletion_file.path()
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Sum of the physical row counts this split knows about.
@@ -1374,6 +1498,61 @@ mod tests {
             .with_raw_convertible(raw_convertible)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn restored_split_paths_are_confined_to_table() {
+        let safe = split(vec![file("data.orc", 1, None)], true);
+        assert!(safe.validate_restored_containment("file:/tmp").is_ok());
+        assert!(safe
+            .validate_restored_containment("file:/tmp-other")
+            .is_err());
+
+        let outside_bucket = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("s3://warehouse/table-evil/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![file("data.orc", 1, None)])
+            .build()
+            .unwrap();
+        assert!(outside_bucket
+            .validate_restored_containment("s3://warehouse/table")
+            .is_err());
+    }
+
+    #[test]
+    fn restored_split_rejects_external_and_unsafe_files() {
+        let mut external = file("data.orc", 1, None);
+        external.external_path = Some("file:/etc/passwd".to_string());
+        assert!(split(vec![external], true)
+            .validate_restored_containment("file:/tmp")
+            .is_err());
+
+        let unsafe_name = file("../data.orc", 1, None);
+        assert!(split(vec![unsafe_name], true)
+            .validate_restored_containment("file:/tmp")
+            .is_err());
+
+        let with_outside_deletion = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("file:/tmp/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![file("data.orc", 1, None)])
+            .with_data_deletion_files(vec![Some(DeletionFile::new(
+                "file:/elsewhere/dv.idx".to_string(),
+                0,
+                8,
+                Some(1),
+            ))])
+            .build()
+            .unwrap();
+        assert!(with_outside_deletion
+            .validate_restored_containment("file:/tmp")
+            .is_err());
     }
 
     #[test]

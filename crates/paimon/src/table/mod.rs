@@ -97,6 +97,7 @@ mod sorted_global_index_build_builder;
 mod sorted_global_index_options;
 mod source;
 mod stats_filter;
+mod stream_scan;
 pub(crate) mod table_commit;
 mod table_read;
 mod table_scan;
@@ -150,6 +151,9 @@ pub use sorted_global_index_build_builder::{
 };
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
+};
+pub use stream_scan::{
+    StreamPlan, StreamScan, StreamScanFollowUpMode, StreamScanPoll, StreamScanStartupMode,
 };
 pub use table_commit::TableCommit;
 pub use table_read::TableRead;

@@ -95,6 +95,9 @@ pub(crate) const DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION: &str =
     "alter-column-null-to-not-null.disabled";
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
 pub(crate) const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
+const NUM_LEVELS_OPTION: &str = "num-levels";
+const NUM_SORTED_RUN_COMPACTION_TRIGGER_OPTION: &str = "num-sorted-run.compaction-trigger";
+const DEFAULT_NUM_SORTED_RUN_COMPACTION_TRIGGER: i32 = 5;
 const ROWKIND_FIELD_OPTION: &str = "rowkind.field";
 const IGNORE_DELETE_OPTION: &str = "ignore-delete";
 const IGNORE_UPDATE_BEFORE_OPTION: &str = "ignore-update-before";
@@ -612,6 +615,44 @@ impl<'a> CoreOptions<'a> {
                 }),
             },
         }
+    }
+
+    /// Total number of merge-tree levels.
+    ///
+    /// Java defaults this to `num-sorted-run.compaction-trigger + 1` so a
+    /// compaction always has at least one non-zero target level.
+    pub fn num_levels(&self) -> crate::Result<i32> {
+        fn positive_i32(raw: &str, option: &str) -> crate::Result<i32> {
+            let value = raw
+                .parse::<i32>()
+                .map_err(|error| crate::Error::DataInvalid {
+                    message: format!("Option '{option}' must be a positive integer, got: {raw}"),
+                    source: Some(Box::new(error)),
+                })?;
+            if value <= 0 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Option '{option}' must be greater than 0, got: {value}"),
+                    source: None,
+                });
+            }
+            Ok(value)
+        }
+
+        if let Some(raw) = self.options.get(NUM_LEVELS_OPTION) {
+            return positive_i32(raw, NUM_LEVELS_OPTION);
+        }
+        let trigger = match self.options.get(NUM_SORTED_RUN_COMPACTION_TRIGGER_OPTION) {
+            Some(raw) => positive_i32(raw, NUM_SORTED_RUN_COMPACTION_TRIGGER_OPTION)?,
+            None => DEFAULT_NUM_SORTED_RUN_COMPACTION_TRIGGER,
+        };
+        trigger
+            .checked_add(1)
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{NUM_SORTED_RUN_COMPACTION_TRIGGER_OPTION}' cannot be incremented: {trigger}"
+                ),
+                source: None,
+            })
     }
 
     /// The `rowkind.field` option: a user column whose value encodes the row kind.

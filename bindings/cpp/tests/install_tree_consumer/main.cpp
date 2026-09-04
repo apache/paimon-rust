@@ -15,29 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// This crate is the C binding for the Paimon project.
-// So it's type node can't meet camel case.
-#![allow(non_camel_case_types)]
+#include <paimon/paimon.hpp>
 
-mod blob_reader;
-mod catalog;
-mod error;
-mod file_io;
-mod identifier;
-mod result;
-mod stream;
-mod table;
-#[cfg(test)]
-mod tests;
-mod types;
-mod vector_search;
-mod write;
-
-use std::sync::OnceLock;
-use tokio::runtime::Runtime;
-
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-fn runtime() -> &'static Runtime {
-    RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create tokio runtime"))
+int main() {
+  auto options = paimon::StreamScanOptions::defaults();
+  return options ? 0 : 1;
 }

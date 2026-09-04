@@ -174,6 +174,34 @@ jobs:
       - name: Build
         run: cargo build --locked --features fulltext,vortex
 
+  cpp:
+    name: cpp (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cbindgen
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2.85.4
+        with:
+          tool: cbindgen@0.29.4
+
+      - name: Configure C++ facade
+        run: >
+          cmake -S bindings/cpp -B target/cpp-ci
+          -DPAIMON_CPP_BUILD_EXAMPLES=ON
+          -DPAIMON_CPP_BUILD_TESTS=ON
+
+      - name: Build C++ facade
+        run: cmake --build target/cpp-ci --parallel 4
+
+      - name: Test C++ facade
+        run: ctest --test-dir target/cpp-ci --output-on-failure
+
   unit:
     runs-on: ${{ matrix.os }}
     strategy:

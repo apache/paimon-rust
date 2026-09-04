@@ -17,9 +17,12 @@
 
 mod common;
 
-use arrow_array::{Array, Int32Array, RecordBatch};
+use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
+use paimon::spec::{BlobType, DataType, IntType, Schema, TableSchema};
 use paimon::table::IncrementalScanMode;
+use std::sync::Arc;
 
 use common::incremental_helpers::{
     make_batch, make_batch_with_kinds, make_partitioned_batch, memory_table, partitioned_pk_schema,
@@ -80,6 +83,88 @@ async fn read_current_pairs(table: &paimon::table::Table) -> Vec<(i32, i32)> {
         .await
         .unwrap();
     collect_pairs(&batches)
+}
+
+#[tokio::test]
+async fn delta_data_evolution_reads_blob_column_files() {
+    let table_path = "memory:/incremental_batch/data_evolution_blob";
+    let schema = TableSchema::new(
+        0,
+        &Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Blob(BlobType::new()))
+            .option("bucket", "-1")
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap(),
+    );
+    let (file_io, table) = memory_table(table_path, schema);
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("payload", ArrowDataType::Binary, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(BinaryArray::from(vec![Some(b"blob-data".as_slice())])),
+        ],
+    )
+    .unwrap();
+    write_batch(&table, &batch).await;
+
+    let builder = table.new_read_builder();
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 0, 1)
+        .plan()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let payloads = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(payloads.value(0), b"blob-data");
+
+    let audit_batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_audit_log_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
+    let rowkinds = audit_batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(rowkinds.value(0), "+I");
+    let payloads = audit_batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+    assert_eq!(payloads.value(0), b"blob-data");
 }
 
 async fn plan_incremental(

@@ -147,6 +147,18 @@ pub struct paimon_result_prepare_commit {
 }
 
 #[repr(C)]
+pub struct paimon_result_prepared_commit {
+    pub prepared: *mut paimon_prepared_commit,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_bytes {
+    pub bytes: paimon_bytes,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
 pub struct paimon_result_postpone_fixed_bucket_write_builder {
     pub write_builder: *mut paimon_postpone_fixed_bucket_write_builder,
     pub error: *mut paimon_error,

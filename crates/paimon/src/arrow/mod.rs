@@ -104,7 +104,9 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
                     "entries",
                     ArrowDataType::Struct(
                         vec![
-                            ArrowField::new("key", element_type, m.element_type().is_nullable()),
+                            // Arrow map keys are always non-null, including the
+                            // element carrier used for a Paimon MULTISET.
+                            ArrowField::new("key", element_type, false),
                             ArrowField::new("value", ArrowDataType::Int32, false),
                         ]
                         .into(),
@@ -488,6 +490,22 @@ mod tests {
             fields[1].metadata().get(PARQUET_FIELD_ID_META_KEY),
             Some(&"1".to_string())
         );
+    }
+
+    #[test]
+    fn test_multiset_arrow_key_is_non_nullable() {
+        let multiset = PaimonDataType::Multiset(MultisetType::new(PaimonDataType::VarChar(
+            VarCharType::new(VarCharType::MAX_LENGTH).unwrap(),
+        )));
+        let ArrowDataType::Map(entries, false) = paimon_type_to_arrow(&multiset).unwrap() else {
+            panic!("expected multiset Arrow Map");
+        };
+        let ArrowDataType::Struct(fields) = entries.data_type() else {
+            panic!("expected multiset entries Struct");
+        };
+        assert!(!fields[0].is_nullable());
+        assert_eq!(fields[1].data_type(), &ArrowDataType::Int32);
+        assert!(!fields[1].is_nullable());
     }
 
     #[test]

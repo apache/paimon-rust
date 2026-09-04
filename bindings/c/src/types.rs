@@ -24,6 +24,7 @@ use paimon::table::{
     CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableCommit,
     PostponeFixedBucketTableWrite, Table, TableCommit, TableWrite,
 };
+use sha2::{Digest, Sha256};
 
 /// C-compatible key-value pair for options.
 #[repr(C)]
@@ -201,6 +202,68 @@ pub(crate) struct ReadBuilderState {
     pub case_sensitive: bool,
 }
 
+fn digest_read_builder_canonical(canonical: &str) -> String {
+    let digest = Sha256::digest(canonical.as_bytes());
+    format!("paimon-c-read-builder-sha256-v1:{digest:x}")
+}
+
+/// Build the stable identity component shared by a stream plan and the
+/// `TableRead` which consumes it.
+///
+/// The canonical input uses length-prefixed components and the persisted value
+/// is a SHA-256 digest, so predicate literals are not exposed in a checkpoint.
+/// Predicate `Debug` formatting is versioned by the fingerprint prefix and
+/// must be bumped if it changes incompatibly.
+pub(crate) fn read_builder_fingerprint(state: &ReadBuilderState) -> String {
+    fn push_component(target: &mut String, value: &str) {
+        target.push_str(&value.len().to_string());
+        target.push(':');
+        target.push_str(value);
+        target.push(';');
+    }
+
+    let mut canonical = String::from("paimon-c-read-builder-canonical-v1;");
+    canonical.push_str(if state.case_sensitive {
+        "case=1;"
+    } else {
+        "case=0;"
+    });
+    match &state.projected_columns {
+        None => canonical.push_str("projection=none;"),
+        Some(columns) => {
+            canonical.push_str("projection=some;");
+            canonical.push_str(&columns.len().to_string());
+            canonical.push(';');
+            for column in columns {
+                push_component(&mut canonical, column);
+            }
+        }
+    }
+    match &state.filter {
+        None => canonical.push_str("filter=none;"),
+        Some(filter) => {
+            canonical.push_str("filter=some;");
+            push_component(&mut canonical, &format!("{filter:?}"));
+        }
+    }
+    digest_read_builder_canonical(&canonical)
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::digest_read_builder_canonical;
+
+    #[test]
+    fn digest_does_not_expose_predicate_literals() {
+        let canonical = "filter=some;24:secret-customer-id=42;";
+        let digest = digest_read_builder_canonical(canonical);
+        assert!(digest.starts_with("paimon-c-read-builder-sha256-v1:"));
+        assert!(!digest.contains("secret-customer-id"));
+        assert_eq!(digest.len(), "paimon-c-read-builder-sha256-v1:".len() + 64);
+        assert_eq!(digest, digest_read_builder_canonical(canonical));
+    }
+}
+
 /// Internal state for TableScan that stores table and filter.
 pub(crate) struct TableScanState {
     pub table: Table,
@@ -222,6 +285,10 @@ pub(crate) struct TableReadState {
     pub table: Table,
     pub read_type: Vec<DataField>,
     pub data_predicates: Vec<Predicate>,
+    pub table_location: String,
+    pub table_branch: String,
+    pub schema_id: i64,
+    pub read_fingerprint: String,
 }
 
 #[repr(C)]
@@ -368,6 +435,15 @@ pub(crate) struct CommitMessagesState {
     pub commit_user: String,
 }
 
+/// Durable, versioned representation of one standard streaming checkpoint.
+///
+/// Unlike `paimon_commit_messages`, this state also carries the monotonically
+/// increasing commit identifier and can be serialized across process restarts.
+pub(crate) struct PreparedCommitState {
+    pub commit_identifier: i64,
+    pub messages: CommitMessagesState,
+}
+
 pub(crate) struct PostponeFixedBucketCommitMessagesState {
     pub messages: Vec<CommitMessage>,
     pub overwrite: bool,
@@ -393,6 +469,12 @@ pub struct paimon_table_commit {
 /// Opaque container for commit messages and their originating write context.
 #[repr(C)]
 pub struct paimon_commit_messages {
+    pub inner: *mut c_void,
+}
+
+/// Opaque durable prepared-commit handle for a standard table write.
+#[repr(C)]
+pub struct paimon_prepared_commit {
     pub inner: *mut c_void,
 }
 

@@ -319,8 +319,15 @@ impl<'a> PaimonTableRead<'a> {
             }
         }
         // Delta / Changelog rows are read as-is from planned files (no full-table
-        // merge against historical base versions).
-        self.new_data_file_reader()?.read(&data_splits)
+        // merge against historical base versions). Data-evolution tables still
+        // need their column files merged with the main data file; reading only
+        // the latter would silently return NULL for BLOB/vector columns.
+        let core_options = self.table.schema.core_options();
+        if core_options.data_evolution_enabled() {
+            self.read_with_evolution(&data_splits, &core_options)
+        } else {
+            self.new_data_file_reader()?.read(&data_splits)
+        }
     }
 
     fn to_incremental_diff_arrow(
@@ -406,17 +413,28 @@ impl<'a> PaimonTableRead<'a> {
             ));
         }
 
-        let reader = DataFileReader::new(
-            self.table.file_io.clone(),
-            self.table.schema_manager().clone(),
-            self.table.schema().id(),
-            self.table.schema.fields().to_vec(),
-            read_type,
-            self.data_predicates.clone(),
-        )
-        .with_batch_size(Some(self.table.schema().core_options().read_batch_size()?))
-        .with_parquet_read_budget(Some(self.parquet_read_budget()?));
-        let raw_stream = reader.read(&data_splits)?;
+        let core_options = self.table.schema().core_options();
+        let raw_stream = if core_options.data_evolution_enabled() {
+            if has_value_kind || include_sequence {
+                return Err(crate::Error::Unsupported {
+                    message: "Data-evolution audit reads with changelog or sequence-number fields are not supported"
+                        .to_string(),
+                });
+            }
+            self.read_with_evolution(&data_splits, &core_options)?
+        } else {
+            DataFileReader::new(
+                self.table.file_io.clone(),
+                self.table.schema_manager().clone(),
+                self.table.schema().id(),
+                self.table.schema.fields().to_vec(),
+                read_type,
+                self.data_predicates.clone(),
+            )
+            .with_batch_size(Some(core_options.read_batch_size()?))
+            .with_parquet_read_budget(Some(self.parquet_read_budget()?))
+            .read(&data_splits)?
+        };
 
         Ok(Box::pin(async_stream::try_stream! {
             futures::pin_mut!(raw_stream);

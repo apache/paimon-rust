@@ -40,7 +40,7 @@ use crate::Result;
 use apache_avro::{to_value, Schema};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Batch commit identifier (i64::MAX), same as Python's BATCH_COMMIT_IDENTIFIER.
 const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
@@ -48,9 +48,49 @@ const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 
+fn checked_next_snapshot_id(snapshot_id: i64) -> Result<i64> {
+    snapshot_id
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: format!("Snapshot id {snapshot_id} cannot be incremented"),
+            source: None,
+        })
+}
+
+fn validate_commit_identifier(commit_identifier: i64) -> Result<()> {
+    if commit_identifier < 0 {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Streaming commit identifier must be non-negative, got {commit_identifier}"
+            ),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+fn validate_streaming_commit_identifier(commit_identifier: i64) -> Result<()> {
+    validate_commit_identifier(commit_identifier)?;
+    if commit_identifier == BATCH_COMMIT_IDENTIFIER {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Streaming commit identifier {BATCH_COMMIT_IDENTIFIER} is reserved for batch commits"
+            ),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
 type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
 type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentifierCommitStatus {
+    Known(bool),
+    HistoryTruncated { earliest_snapshot_id: i64 },
+}
 
 fn validate_bucket_ownership(messages: &[CommitMessage]) -> Result<()> {
     let mut owners = HashSet::new();
@@ -164,13 +204,14 @@ impl TableCommit {
 
     /// Commit new files in APPEND mode.
     pub async fn commit(&self, commit_messages: Vec<CommitMessage>) -> Result<()> {
-        self.commit_with_identifier(commit_messages, BATCH_COMMIT_IDENTIFIER)
+        self.commit_with_identifier_impl(commit_messages, BATCH_COMMIT_IDENTIFIER, false)
             .await
     }
 
     /// Commit new files with a caller-provided commit identifier.
     ///
     /// Identifiers must increase monotonically for a given `commit_user`.
+    /// `i64::MAX` is reserved for unidentified batch commits.
     /// All messages for one identifier must be submitted in a single call.
     /// This method does not filter previously committed identifiers. Use
     /// [`Self::filter_and_commit_with_identifier`] when retrying an uncertain
@@ -180,20 +221,23 @@ impl TableCommit {
         commit_messages: Vec<CommitMessage>,
         commit_identifier: i64,
     ) -> Result<()> {
+        validate_streaming_commit_identifier(commit_identifier)?;
         self.commit_with_identifier_impl(commit_messages, commit_identifier, false)
             .await
     }
 
     /// Filter a previously committed identifier, then commit if it is new.
     ///
-    /// Identifiers must increase monotonically for a given `commit_user`. This
-    /// method is intended for retrying the same uncertain result; regular
+    /// Identifiers must increase monotonically for a given `commit_user`.
+    /// `i64::MAX` is reserved for unidentified batch commits.
+    /// This method is intended for retrying the same uncertain result; regular
     /// commits should use [`Self::commit_with_identifier`].
     pub async fn filter_and_commit_with_identifier(
         &self,
         commit_messages: Vec<CommitMessage>,
         commit_identifier: i64,
     ) -> Result<()> {
+        validate_streaming_commit_identifier(commit_identifier)?;
         self.commit_with_identifier_impl(commit_messages, commit_identifier, true)
             .await
     }
@@ -204,6 +248,7 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        validate_commit_identifier(commit_identifier)?;
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
@@ -325,6 +370,7 @@ impl TableCommit {
         static_partitions: Option<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
     ) -> Result<()> {
+        validate_streaming_commit_identifier(commit_identifier)?;
         self.overwrite_impl(commit_messages, static_partitions, commit_identifier, true)
             .await
     }
@@ -336,6 +382,7 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        validate_commit_identifier(commit_identifier)?;
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
@@ -582,6 +629,7 @@ impl TableCommit {
         partitions: Vec<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
     ) -> Result<()> {
+        validate_streaming_commit_identifier(commit_identifier)?;
         self.truncate_partitions_impl(partitions, commit_identifier, true)
             .await
     }
@@ -592,6 +640,7 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        validate_commit_identifier(commit_identifier)?;
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
@@ -665,6 +714,7 @@ impl TableCommit {
     /// A previously committed identifier is filtered so retrying an uncertain
     /// result cannot delete data committed in between.
     pub async fn truncate_table_with_identifier(&self, commit_identifier: i64) -> Result<()> {
+        validate_streaming_commit_identifier(commit_identifier)?;
         self.truncate_table_impl(commit_identifier, true).await
     }
 
@@ -673,6 +723,7 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        validate_commit_identifier(commit_identifier)?;
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
@@ -693,6 +744,50 @@ impl TableCommit {
             filter_committed,
         )
         .await
+    }
+
+    /// Return whether this commit user has already published `commit_identifier`
+    /// or a later identifier.
+    ///
+    /// Streaming identifiers are monotonically increasing, so a later snapshot
+    /// also proves that an older checkpoint must not be committed or aborted.
+    pub async fn is_identifier_committed(&self, commit_identifier: i64) -> Result<bool> {
+        validate_streaming_commit_identifier(commit_identifier)?;
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_not_branch_reference_for_write()?;
+        let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
+        match self
+            .commit_identifier_status(&latest_snapshot, commit_identifier)
+            .await?
+        {
+            IdentifierCommitStatus::Known(committed) => Ok(committed),
+            IdentifierCommitStatus::HistoryTruncated {
+                earliest_snapshot_id,
+            } => Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Commit identifier {commit_identifier} is indeterminate because retained snapshot history starts at {earliest_snapshot_id}; the required snapshot history is out of range"
+                ),
+                source: None,
+            }),
+        }
+    }
+
+    /// Abort prepared files only if their streaming identifier has not already
+    /// been published.
+    ///
+    /// This makes recovery after a lost commit acknowledgement safe: retrying
+    /// or accidentally aborting a committed prepared checkpoint is a no-op.
+    /// The caller must still serialize commit and abort operations for one
+    /// `commit_user` so a new commit cannot race this check.
+    pub async fn abort_if_uncommitted(
+        &self,
+        commit_messages: &[CommitMessage],
+        commit_identifier: i64,
+    ) -> Result<()> {
+        if self.is_identifier_committed(commit_identifier).await? {
+            return Ok(());
+        }
+        self.abort(commit_messages).await
     }
 
     /// Abort a prepared commit by deleting newly written data, changelog and index files.
@@ -778,12 +873,14 @@ impl TableCommit {
         let mut retry_count = 0u32;
         let mut duplicate_check_start_snapshot_id: Option<i64> = None;
         let mut retry_state: Option<Box<RetryState>> = None;
-        let start_time_ms = current_time_millis();
+        let start_time = Instant::now();
         // An identified destructive no-op must still record its identifier.
         // Otherwise a retry after an intervening write can execute the operation
         // for the first time and delete data which was not present originally.
         let commit_empty_overwrite =
             filter_committed && plan.commit_kind_hint() == CommitKind::OVERWRITE;
+        let enforce_monotonic_identifier =
+            !filter_committed && commit_identifier != BATCH_COMMIT_IDENTIFIER;
         let mut filter_committed = filter_committed;
 
         loop {
@@ -810,6 +907,19 @@ impl TableCommit {
                     break;
                 }
             }
+            if enforce_monotonic_identifier
+                && self
+                    .is_committed_identifier(&latest_snapshot, commit_identifier)
+                    .await?
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Commit identifier {commit_identifier} is not greater than the latest identifier retained for commit_user '{}'",
+                        self.commit_user
+                    ),
+                    source: None,
+                });
+            }
             validate_expected_latest_snapshot(expected_snapshot_id, &latest_snapshot)?;
             let resolved = self
                 .resolve_commit(&mut plan, &latest_snapshot, retry_state.as_deref())
@@ -830,14 +940,17 @@ impl TableCommit {
             match result {
                 CommitAttemptResult::Success => break,
                 CommitAttemptResult::Retry(state) => {
-                    duplicate_check_start_snapshot_id.get_or_insert_with(|| {
-                        latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1)
-                    });
+                    if duplicate_check_start_snapshot_id.is_none() {
+                        duplicate_check_start_snapshot_id = Some(match &latest_snapshot {
+                            Some(snapshot) => checked_next_snapshot_id(snapshot.id())?,
+                            None => 1,
+                        });
+                    }
                     retry_state = Some(state);
                 }
             }
 
-            let elapsed_ms = current_time_millis() - start_time_ms;
+            let elapsed_ms = u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
             if elapsed_ms > self.commit_timeout_ms || retry_count >= self.commit_max_retries {
                 let snap_id = duplicate_check_start_snapshot_id.unwrap_or(1);
                 return Err(crate::Error::DataInvalid {
@@ -864,7 +977,10 @@ impl TableCommit {
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
     ) -> Result<CommitAttemptResult> {
-        let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
+        let new_snapshot_id = match latest_snapshot {
+            Some(snapshot) => checked_next_snapshot_id(snapshot.id())?,
+            None => 1,
+        };
 
         // Row tracking
         let mut next_row_id: Option<i64> = None;
@@ -1274,8 +1390,26 @@ impl TableCommit {
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
     ) -> Result<bool> {
+        match self
+            .commit_identifier_status(latest_snapshot, commit_identifier)
+            .await?
+        {
+            IdentifierCommitStatus::Known(committed) => Ok(committed),
+            // A fresh, globally unique commit_user must be able to begin on a
+            // table whose early snapshots have expired. Retry safety across
+            // that retention boundary cannot be proven; abort uses the public
+            // fail-closed path above instead.
+            IdentifierCommitStatus::HistoryTruncated { .. } => Ok(false),
+        }
+    }
+
+    async fn commit_identifier_status(
+        &self,
+        latest_snapshot: &Option<Snapshot>,
+        commit_identifier: i64,
+    ) -> Result<IdentifierCommitStatus> {
         let Some(latest) = latest_snapshot else {
-            return Ok(false);
+            return Ok(IdentifierCommitStatus::Known(false));
         };
         let earliest_snapshot_id = self
             .snapshot_manager
@@ -1288,11 +1422,19 @@ impl TableCommit {
             } else {
                 self.snapshot_manager.get_snapshot(snapshot_id).await?
             };
-            if snapshot.commit_user() == self.commit_user {
-                return Ok(commit_identifier <= snapshot.commit_identifier());
+            if snapshot.commit_user() == self.commit_user
+                && snapshot.commit_identifier() != BATCH_COMMIT_IDENTIFIER
+                && commit_identifier <= snapshot.commit_identifier()
+            {
+                return Ok(IdentifierCommitStatus::Known(true));
             }
         }
-        Ok(false)
+        if earliest_snapshot_id > 1 {
+            return Ok(IdentifierCommitStatus::HistoryTruncated {
+                earliest_snapshot_id,
+            });
+        }
+        Ok(IdentifierCommitStatus::Known(false))
     }
 
     /// Check if this commit was already completed during an in-process retry.
@@ -1792,7 +1934,13 @@ impl TableCommit {
             return Ok(false);
         };
 
-        for snapshot_id in cached_snapshot.id() + 1..=latest_snapshot.id() {
+        if cached_snapshot.id() > latest_snapshot.id() {
+            return Ok(false);
+        }
+        if cached_snapshot.id() == latest_snapshot.id() {
+            return Ok(true);
+        }
+        for snapshot_id in checked_next_snapshot_id(cached_snapshot.id())?..=latest_snapshot.id() {
             *delta_probe_count += 1;
             let snapshot = match self.snapshot_manager.get_snapshot(snapshot_id).await {
                 Ok(snapshot) => snapshot,
@@ -1897,7 +2045,10 @@ impl TableCommit {
         let entry_refs = commit_entries.iter().collect::<Vec<_>>();
         let partition_filter = self.build_entries_partition_filter(&entry_refs)?;
         let mut entries = Vec::new();
-        for snapshot_id in from_snapshot.id() + 1..=to_snapshot.id() {
+        if from_snapshot.id() >= to_snapshot.id() {
+            return Ok(Some(entries));
+        }
+        for snapshot_id in checked_next_snapshot_id(from_snapshot.id())?..=to_snapshot.id() {
             let snapshot = match self.snapshot_manager.get_snapshot(snapshot_id).await {
                 Ok(snapshot) => snapshot,
                 Err(_) => return Ok(None),
@@ -2037,7 +2188,11 @@ impl TableCommit {
             .collect::<HashSet<_>>();
         let partition_filter = self.build_entries_partition_filter(&fixed_entries)?;
 
-        for snapshot_id in check_from_snapshot.max(0) + 1..=latest_snapshot.id() {
+        let check_from_snapshot = check_from_snapshot.max(0);
+        if check_from_snapshot >= latest_snapshot.id() {
+            return Ok(());
+        }
+        for snapshot_id in checked_next_snapshot_id(check_from_snapshot)?..=latest_snapshot.id() {
             let snapshot = self.snapshot_manager.get_snapshot(snapshot_id).await?;
             let concurrent_entries = self
                 .read_delta_entries(partition_filter.as_ref(), &snapshot)
@@ -2351,7 +2506,10 @@ impl TableCommit {
 
         let delta_entry_refs = delta_entries.iter().collect::<Vec<_>>();
         let partition_filter = self.build_entries_partition_filter(&delta_entry_refs)?;
-        for snapshot_id in check_from_snapshot + 1..=latest_snapshot.id() {
+        if check_from_snapshot >= latest_snapshot.id() {
+            return Ok(());
+        }
+        for snapshot_id in checked_next_snapshot_id(check_from_snapshot)?..=latest_snapshot.id() {
             let snapshot = self.snapshot_manager.get_snapshot(snapshot_id).await?;
             if snapshot.commit_kind() == &CommitKind::COMPACT {
                 continue;
@@ -3159,6 +3317,44 @@ fn rand_f64() -> f64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_snapshot_successor_rejects_overflow() {
+        assert_eq!(checked_next_snapshot_id(1).unwrap(), 2);
+        assert!(checked_next_snapshot_id(i64::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_streaming_identifiers_are_rejected_even_for_noops() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_negative_commit_identifier";
+        setup_dirs(&file_io, table_path).await;
+        let commit = setup_commit(&file_io, table_path);
+
+        for invalid in [-1, BATCH_COMMIT_IDENTIFIER] {
+            assert!(commit
+                .commit_with_identifier(Vec::new(), invalid)
+                .await
+                .is_err());
+            assert!(commit
+                .filter_and_commit_with_identifier(Vec::new(), invalid)
+                .await
+                .is_err());
+            assert!(commit
+                .overwrite_with_identifier(Vec::new(), None, invalid)
+                .await
+                .is_err());
+            assert!(commit
+                .truncate_partitions_with_identifier(Vec::new(), invalid)
+                .await
+                .is_err());
+            assert!(commit
+                .truncate_table_with_identifier(invalid)
+                .await
+                .is_err());
+        }
+        assert!(latest_snapshot(&file_io, table_path).await.is_none());
+    }
+
     #[tokio::test]
     async fn abort_still_cleans_up_for_a_query_auth_table() {
         let table = crate::table::query_auth_table();
@@ -3618,6 +3814,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_non_filtering_identifiers_must_increase() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_monotonic_commit_identifier";
+        setup_dirs(&file_io, table_path).await;
+        let commit = setup_commit(&file_io, table_path);
+
+        commit
+            .commit_with_identifier(
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("data-7.parquet", 100)],
+                )],
+                7,
+            )
+            .await
+            .unwrap();
+        for identifier in [7, 6] {
+            let error = commit
+                .commit_with_identifier(
+                    vec![CommitMessage::new(
+                        vec![],
+                        0,
+                        vec![test_data_file(
+                            &format!("invalid-{identifier}.parquet"),
+                            100,
+                        )],
+                    )],
+                    identifier,
+                )
+                .await
+                .expect_err("non-filtering identifiers must increase");
+            assert!(error.to_string().contains("not greater"));
+        }
+        commit
+            .commit_with_identifier(
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("data-8.parquet", 100)],
+                )],
+                8,
+            )
+            .await
+            .unwrap();
+
+        let latest = latest_snapshot(&file_io, table_path).await.unwrap();
+        assert_eq!(latest.id(), 2);
+        assert_eq!(latest.commit_identifier(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_identifier_lookup_checks_all_retained_snapshots() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_legacy_out_of_order_identifiers";
+        setup_dirs(&file_io, table_path).await;
+        let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        for (snapshot_id, commit_identifier) in [(1, 10), (2, 5)] {
+            let snapshot = Snapshot::builder()
+                .version(3)
+                .id(snapshot_id)
+                .schema_id(0)
+                .base_manifest_list("base-list".to_string())
+                .delta_manifest_list("delta-list".to_string())
+                .commit_user("test-user".to_string())
+                .commit_identifier(commit_identifier)
+                .commit_kind(CommitKind::APPEND)
+                .time_millis(snapshot_id as u64)
+                .build();
+            assert!(snapshot_manager.commit_snapshot(&snapshot).await.unwrap());
+        }
+
+        let commit = setup_commit(&file_io, table_path);
+        assert!(commit.is_identifier_committed(7).await.unwrap());
+        assert!(!commit.is_identifier_committed(11).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn test_filter_and_commit_rejects_expired_older_identifier() {
         let file_io = test_file_io();
         let table_path = "memory:/test_filter_expired_identifier";
@@ -3648,6 +3922,61 @@ mod tests {
             2,
             "an expired older identifier is still a retry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_abort_fails_closed_when_commit_history_is_truncated() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_abort_truncated_identifier_history";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        let first = CommitMessage::new(
+            vec![],
+            0,
+            vec![test_data_file("possibly-live.parquet", 100)],
+        );
+        commit
+            .commit_with_identifier(vec![first.clone()], 1)
+            .await
+            .unwrap();
+        let other_commit = TableCommit::new(test_table(&file_io, table_path), "other-user".into());
+        other_commit
+            .commit_with_identifier(
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("other.parquet", 100)],
+                )],
+                1,
+            )
+            .await
+            .unwrap();
+
+        let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        snapshot_manager.delete_snapshot(1).await.unwrap();
+        let error = commit
+            .abort_if_uncommitted(&[first], 1)
+            .await
+            .expect_err("truncated history cannot prove that abort is safe");
+        assert!(error.to_string().contains("indeterminate"));
+        assert!(error.to_string().contains("out of range"));
+
+        let new_job = TableCommit::new(test_table(&file_io, table_path), "brand-new-user".into());
+        new_job
+            .filter_and_commit_with_identifier(
+                vec![CommitMessage::new(
+                    vec![],
+                    0,
+                    vec![test_data_file("new-job.parquet", 100)],
+                )],
+                1,
+            )
+            .await
+            .expect("a new commit_user must be able to start after history truncation");
+        let latest = latest_snapshot(&file_io, table_path).await.unwrap();
+        assert_eq!(latest.id(), 3);
+        assert_eq!(latest.commit_user(), "brand-new-user");
     }
 
     #[tokio::test]

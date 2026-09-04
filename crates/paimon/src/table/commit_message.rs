@@ -17,11 +17,12 @@
 
 use crate::spec::DataFileMeta;
 use crate::spec::IndexFileMeta;
+use serde::{Deserialize, Serialize};
 
 /// A commit message representing new files to be committed for a specific partition and bucket.
 ///
 /// Reference: [org.apache.paimon.table.sink.CommitMessage](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/sink/CommitMessageImpl.java)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommitMessage {
     /// Binary row bytes for the partition.
     pub partition: Vec<u8>,

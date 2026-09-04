@@ -24,6 +24,7 @@ use super::bucket_filter::{extract_predicate_for_keys, split_partition_and_data_
 use super::format_read_builder::FormatReadBuilder;
 use super::incremental_scan::{IncrementalScan, IncrementalScanMode};
 use super::partition_filter::PartitionFilter;
+use super::stream_scan::{StreamScan, StreamScanFollowUpMode, StreamScanStartupMode};
 use super::table_read::{configured_parquet_read_budget, TableRead};
 use super::{Table, TableScan};
 use crate::spec::{CoreOptions, DataField, Predicate};
@@ -288,6 +289,33 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
+    /// Create an owned, stateful continuous snapshot scanner.
+    ///
+    /// The returned scanner clones the table and scan configuration. It remains
+    /// valid after this builder and its originating table handle are dropped.
+    /// Filters, projection-driven data-evolution pruning, and row ranges are
+    /// preserved. Limit pushdown is rejected because advancing a stream cursor
+    /// past a partially planned snapshot would lose data.
+    pub async fn new_stream_scan(
+        &self,
+        startup_mode: StreamScanStartupMode,
+        follow_up_mode: StreamScanFollowUpMode,
+    ) -> Result<StreamScan> {
+        let mut scan = match &self.0 {
+            ReadBuilderKind::Paimon(builder) => {
+                builder.new_stream_scan(startup_mode, follow_up_mode)
+            }
+            ReadBuilderKind::Format(_) => Err(Error::Unsupported {
+                message: "Continuous stream scan is not supported for format tables".to_string(),
+            }),
+        }?;
+        // Freeze the `Latest` boundary before returning. If initialization is
+        // deferred until the first poll, a concurrently committed snapshot can
+        // be mistaken for pre-existing data and skipped.
+        scan.initialize().await?;
+        Ok(scan)
+    }
+
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
         match &self.0 {
@@ -330,6 +358,37 @@ impl<'a> PaimonReadBuilder<'a> {
             case_sensitive: true,
             parquet_read_budget: None,
         }
+    }
+
+    fn new_stream_scan(
+        &self,
+        startup_mode: StreamScanStartupMode,
+        follow_up_mode: StreamScanFollowUpMode,
+    ) -> Result<StreamScan> {
+        if self.limit.is_some() {
+            return Err(Error::Unsupported {
+                message: "Continuous stream scan does not support limit pushdown".to_string(),
+            });
+        }
+        let partition_filter = self.filter.partition_predicate.clone().map(|pred| {
+            PartitionFilter::from_predicate(pred, &self.table.schema().partition_fields())
+        });
+        let read_type = self.resolve_read_type()?;
+        let projected_read_field_ids = projected_read_field_ids_with_predicates(
+            &read_type,
+            &self.filter.data_predicates,
+            self.table.schema().fields(),
+        );
+        StreamScan::try_new(
+            self.table.clone(),
+            partition_filter,
+            self.filter.data_predicates.clone(),
+            self.filter.bucket_predicate.clone(),
+            self.effective_row_ranges(),
+            projected_read_field_ids,
+            startup_mode,
+            follow_up_mode,
+        )
     }
 
     /// Set column projection by name. Output order follows the caller-specified order.

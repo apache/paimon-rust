@@ -61,6 +61,22 @@ const MANIFEST_DIR: &str = "manifest";
 /// Path segment for index directory under table.
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 
+/// Additional file-level restriction used by streaming full-start scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotLevelFilter {
+    GreaterThan(i32),
+    Equal(i32),
+}
+
+impl SnapshotLevelFilter {
+    fn matches(self, level: i32) -> bool {
+        match self {
+            Self::GreaterThan(bound) => level > bound,
+            Self::Equal(expected) => level == expected,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ManifestReadCounters {
     entries_read: usize,
@@ -118,6 +134,7 @@ async fn read_all_manifest_entries(
     table_path: &str,
     snapshot: &Snapshot,
     skip_level_zero: bool,
+    level_filter: Option<SnapshotLevelFilter>,
     scan_all_files: bool,
     has_primary_keys: bool,
     partition_filter: Option<&PartitionFilter>,
@@ -237,7 +254,9 @@ async fn read_all_manifest_entries(
                 // Post-filter: level-0 and data predicates (need DataFileMeta)
                 let mut filtered = Vec::with_capacity(entries.len());
                 for entry in entries {
-                    if skip_level_zero && has_primary_keys && entry.file().level == 0 {
+                    if (skip_level_zero && has_primary_keys && entry.file().level == 0)
+                        || level_filter.is_some_and(|filter| !filter.matches(entry.file().level))
+                    {
                         counters.pruned_by_level += 1;
                         continue;
                     }
@@ -535,6 +554,14 @@ fn merge_manifest_entries(mut entries: Vec<ManifestEntry>) -> Vec<ManifestEntry>
         .map(|e| e.identifier())
         .collect();
     entries.retain(|e| *e.kind() == FileKind::Add && !deleted.contains(&e.identifier()));
+    entries
+}
+
+/// Keep change files without netting DELETE against ADD. A stream/batch
+/// incremental manifest describes events, so a rewrite's ADD must survive even
+/// when the same identity also appears as DELETE in that manifest.
+fn retain_incremental_add_entries(mut entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
+    entries.retain(|entry| *entry.kind() == FileKind::Add);
     entries
 }
 
@@ -968,12 +995,52 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Plan stream changes without attaching post-commit index/DV state.
+    pub(crate) async fn plan_snapshot_delta_streaming(
+        &self,
+        snapshot: &Snapshot,
+    ) -> crate::Result<Plan> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_delta_streaming(snapshot).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support incremental delta scan".to_string(),
+            }),
+        }
+    }
+
     /// Plan data splits from a snapshot's changelog manifest list only.
     pub(crate) async fn plan_snapshot_changelog(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
         match &self.0 {
             TableScanKind::Paimon(scan) => scan.plan_snapshot_changelog(snapshot).await,
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support incremental changelog scan".to_string(),
+            }),
+        }
+    }
+
+    /// Plan stream changelog work without current-state index/DV pruning.
+    pub(crate) async fn plan_snapshot_changelog_streaming(
+        &self,
+        snapshot: &Snapshot,
+    ) -> crate::Result<Plan> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_changelog_streaming(snapshot).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support incremental changelog scan".to_string(),
+            }),
+        }
+    }
+
+    /// Plan the complete table state at an already resolved snapshot.
+    pub(crate) async fn plan_snapshot_full(
+        &self,
+        snapshot: &Snapshot,
+        level_filter: Option<SnapshotLevelFilter>,
+    ) -> crate::Result<Plan> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_full(snapshot, level_filter).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support Paimon snapshot stream scan".to_string(),
             }),
         }
     }
@@ -1103,7 +1170,7 @@ impl<'a> PaimonTableScan<'a> {
             Some(snapshot) => snapshot,
             None => return Ok(Plan::new(Vec::new())),
         };
-        self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
+        self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None, None)
             .await
     }
 
@@ -1124,6 +1191,7 @@ impl<'a> PaimonTableScan<'a> {
             .plan_snapshot(
                 snapshot,
                 data_evolution_read_field_ids.as_ref(),
+                None,
                 Some(&mut trace),
             )
             .await?;
@@ -1177,7 +1245,7 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         snapshot: &Snapshot,
     ) -> crate::Result<Vec<ManifestEntry>> {
-        self.plan_manifest_entries_with_trace(snapshot, None, None)
+        self.plan_manifest_entries_with_trace(snapshot, None, None, None)
             .await
     }
 
@@ -1185,6 +1253,7 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         snapshot: &Snapshot,
         row_range_index: Option<&RowRangeIndex>,
+        level_filter: Option<SnapshotLevelFilter>,
         trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Vec<ManifestEntry>> {
         let file_io = self.table.file_io();
@@ -1251,6 +1320,7 @@ impl<'a> PaimonTableScan<'a> {
             table_path,
             snapshot,
             skip_level_zero,
+            level_filter,
             self.scan_all_files,
             has_primary_keys,
             self.partition_filter.as_ref(),
@@ -1474,6 +1544,22 @@ impl<'a> PaimonTableScan<'a> {
             snapshot,
             snapshot.delta_manifest_list(),
             data_evolution_read_field_ids.as_ref(),
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn plan_snapshot_delta_streaming(
+        &self,
+        snapshot: &Snapshot,
+    ) -> crate::Result<Plan> {
+        self.ensure_query_auth_allowed()?;
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        self.plan_snapshot_manifest_list(
+            snapshot,
+            snapshot.delta_manifest_list(),
+            data_evolution_read_field_ids.as_ref(),
+            true,
         )
         .await
     }
@@ -1493,6 +1579,42 @@ impl<'a> PaimonTableScan<'a> {
             snapshot,
             list_name,
             data_evolution_read_field_ids.as_ref(),
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn plan_snapshot_changelog_streaming(
+        &self,
+        snapshot: &Snapshot,
+    ) -> crate::Result<Plan> {
+        self.ensure_query_auth_allowed()?;
+        let Some(list_name) = snapshot.changelog_manifest_list() else {
+            return Ok(Plan::new(Vec::new()));
+        };
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        self.plan_snapshot_manifest_list(
+            snapshot,
+            list_name,
+            data_evolution_read_field_ids.as_ref(),
+            true,
+        )
+        .await
+    }
+
+    /// Plan the complete table state at an already resolved snapshot.
+    pub(crate) async fn plan_snapshot_full(
+        &self,
+        snapshot: &Snapshot,
+        level_filter: Option<SnapshotLevelFilter>,
+    ) -> crate::Result<Plan> {
+        self.ensure_query_auth_allowed()?;
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        self.plan_snapshot(
+            snapshot.clone(),
+            data_evolution_read_field_ids.as_ref(),
+            level_filter,
+            None,
         )
         .await
     }
@@ -1502,24 +1624,34 @@ impl<'a> PaimonTableScan<'a> {
         snapshot: &Snapshot,
         manifest_list_name: &str,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
+        streaming_changes: bool,
     ) -> crate::Result<Plan> {
         if matches!(self.limit, Some(0)) {
             return Ok(Plan::new(Vec::new()));
         }
         let core_options = CoreOptions::new(self.table.schema().options());
         let data_evolution_enabled = core_options.data_evolution_enabled();
-        let global_index_settings =
-            self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
-        let index_entries = self
-            .read_index_manifest_entries(
-                snapshot,
-                global_index_settings.is_some(),
-                core_options.deletion_vectors_enabled(),
-            )
-            .await?;
-        let manifest_row_ranges = self
-            .manifest_row_ranges(snapshot, index_entries.as_deref(), global_index_settings)
-            .await?;
+        let (index_entries, global_index_settings, manifest_row_ranges) = if streaming_changes {
+            // Stream plans represent changes, not the post-commit table state.
+            // A current-state global index can prune a required retract or
+            // UPDATE_BEFORE event, and a current deletion vector can mask the
+            // very row the stream must emit. Keep only explicit row ranges.
+            (None, None, self.row_ranges.clone())
+        } else {
+            let settings =
+                self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
+            let entries = self
+                .read_index_manifest_entries(
+                    snapshot,
+                    settings.is_some(),
+                    core_options.deletion_vectors_enabled(),
+                )
+                .await?;
+            let ranges = self
+                .manifest_row_ranges(snapshot, entries.as_deref(), settings)
+                .await?;
+            (entries, settings, ranges)
+        };
         if manifest_row_ranges.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Plan::new(Vec::new()));
         }
@@ -1703,7 +1835,13 @@ impl<'a> PaimonTableScan<'a> {
             let manifest_entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
                 &bytes,
                 &shared_cache,
-                &mut |_kind, partition_bytes, bucket, total_buckets| {
+                &mut |kind, partition_bytes, bucket, total_buckets| {
+                    // Java's incremental reader uses readAndNoMergeFileEntries
+                    // and then selects ADD. Merging a DELETE+ADD rewrite here
+                    // would cancel the new change before it can be emitted.
+                    if kind != FileKind::Add {
+                        return false;
+                    }
                     if has_primary_keys && !scan_all_files && bucket < 0 {
                         return false;
                     }
@@ -1734,7 +1872,7 @@ impl<'a> PaimonTableScan<'a> {
             )?;
             entries.extend(manifest_entries);
         }
-        let entries = merge_manifest_entries(entries);
+        let entries = retain_incremental_add_entries(entries);
         let entries = if let Some(index) = row_range_index {
             retain_manifest_entry_row_ranges(entries, index)
         } else {
@@ -1747,6 +1885,7 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         snapshot: Snapshot,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
+        level_filter: Option<SnapshotLevelFilter>,
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         if matches!(self.limit, Some(0)) {
@@ -1784,6 +1923,7 @@ impl<'a> PaimonTableScan<'a> {
             .plan_manifest_entries_with_trace(
                 &snapshot,
                 row_range_index.as_ref(),
+                level_filter,
                 trace.as_deref_mut(),
             )
             .await?;
@@ -2164,11 +2304,11 @@ mod tests {
     use super::{
         data_evolution_row_range_groups, data_file_overlaps_row_range_index,
         group_data_files_by_partition_bucket, manifest_file_overlaps_row_range_index,
-        prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
-        retain_index_manifest_entry_for_scan, retain_manifest_entry_row_ranges,
-        retain_manifest_row_ranges, scan_predicate_field_ids, should_skip_level_zero_for_scan,
-        split_row_ranges_for_files, LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex,
-        TableScan,
+        prune_data_evolution_group_by_read_fields, retain_incremental_add_entries,
+        retain_index_manifest_entry, retain_index_manifest_entry_for_scan,
+        retain_manifest_entry_row_ranges, retain_manifest_row_ranges, scan_predicate_field_ids,
+        should_skip_level_zero_for_scan, split_row_ranges_for_files, LimitPushdownAccumulator,
+        PaimonTableScan, RowRangeIndex, TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
@@ -2528,6 +2668,25 @@ mod tests {
             vec![("f.parquet".to_string(), 5), ("g.parquet".to_string(), 0)],
             "upgraded file (f@L5) must survive; only f@L0 is cancelled by the DELETE"
         );
+    }
+
+    #[test]
+    fn test_incremental_entries_do_not_net_delete_against_add() {
+        let entry = |kind: FileKind| {
+            ManifestEntry::new(
+                kind,
+                Vec::new(),
+                0,
+                1,
+                make_evo_file("same.parquet", 1, 1, 1, None),
+                2,
+            )
+        };
+        let changes =
+            retain_incremental_add_entries(vec![entry(FileKind::Delete), entry(FileKind::Add)]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(*changes[0].kind(), FileKind::Add);
+        assert_eq!(changes[0].file().file_name, "same.parquet");
     }
 
     fn file_names(groups: &[Vec<DataFileMeta>]) -> Vec<Vec<&str>> {

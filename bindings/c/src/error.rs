@@ -19,15 +19,25 @@ use std::ffi::{c_char, CStr};
 
 use crate::types::paimon_bytes;
 
+pub const PAIMON_ERROR_UNEXPECTED: i32 = 0;
+pub const PAIMON_ERROR_UNSUPPORTED: i32 = 1;
+pub const PAIMON_ERROR_NOT_FOUND: i32 = 2;
+pub const PAIMON_ERROR_ALREADY_EXISTS: i32 = 3;
+pub const PAIMON_ERROR_INVALID_INPUT: i32 = 4;
+pub const PAIMON_ERROR_IO: i32 = 5;
+pub const PAIMON_ERROR_OUT_OF_RANGE: i32 = 6;
+
 /// Error codes for paimon C API.
 #[repr(i32)]
 pub enum PaimonErrorCode {
-    Unexpected = 0,
-    Unsupported = 1,
-    NotFound = 2,
-    AlreadyExists = 3,
-    InvalidInput = 4,
-    IoError = 5,
+    Unexpected = PAIMON_ERROR_UNEXPECTED,
+    Unsupported = PAIMON_ERROR_UNSUPPORTED,
+    NotFound = PAIMON_ERROR_NOT_FOUND,
+    AlreadyExists = PAIMON_ERROR_ALREADY_EXISTS,
+    InvalidInput = PAIMON_ERROR_INVALID_INPUT,
+    IoError = PAIMON_ERROR_IO,
+    /// A requested streaming checkpoint or snapshot is no longer readable.
+    OutOfRange = PAIMON_ERROR_OUT_OF_RANGE,
 }
 
 /// C-compatible error type.
@@ -53,9 +63,18 @@ impl paimon_error {
             paimon::Error::TableNotExist { .. }
             | paimon::Error::DatabaseNotExist { .. }
             | paimon::Error::ColumnNotExist { .. } => PaimonErrorCode::NotFound,
+            paimon::Error::SnapshotNotExist { .. } => PaimonErrorCode::OutOfRange,
             paimon::Error::TableAlreadyExist { .. }
             | paimon::Error::DatabaseAlreadyExist { .. }
             | paimon::Error::ColumnAlreadyExist { .. } => PaimonErrorCode::AlreadyExists,
+            paimon::Error::DataInvalid { message, .. }
+                if message.contains("snapshot")
+                    && (message.contains("expired")
+                        || message.contains("out of range")
+                        || message.contains("too large")) =>
+            {
+                PaimonErrorCode::OutOfRange
+            }
             paimon::Error::ConfigInvalid { .. }
             | paimon::Error::DataTypeInvalid { .. }
             | paimon::Error::DataInvalid { .. }

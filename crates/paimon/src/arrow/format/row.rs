@@ -1266,12 +1266,7 @@ impl ColumnBuilder {
             DataType::Multiset(m) => {
                 let count_type = DataType::Int(IntType::new());
                 Self::Map {
-                    entries_field: map_entries_field(
-                        m.element_type(),
-                        &count_type,
-                        m.element_type().is_nullable(),
-                        false,
-                    )?,
+                    entries_field: map_entries_field(m.element_type(), &count_type, false, false)?,
                     offsets: vec![0],
                     validities: Vec::with_capacity(capacity),
                     keys: Box::new(ColumnBuilder::new(m.element_type(), capacity)?),
@@ -2992,7 +2987,7 @@ mod tests {
         let bag = test_map_array(
             vec![0, 2, 2, 3],
             vec![true, false, true],
-            true,
+            false,
             false,
             vec![Some("x"), Some("y"), Some("z")],
             vec![Some(2), Some(1), Some(4)],

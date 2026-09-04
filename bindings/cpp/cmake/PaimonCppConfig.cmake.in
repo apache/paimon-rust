@@ -1,0 +1,70 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+@PACKAGE_INIT@
+
+# CMake may discover /usr/lib64 packages through the /lib64 -> /usr/lib64
+# symlink. Resolve the config directory before deriving the install prefix so
+# imported include and library paths still point at /usr.
+get_filename_component(
+  _paimon_cpp_config_dir "${CMAKE_CURRENT_LIST_DIR}" REALPATH)
+get_filename_component(
+  PACKAGE_PREFIX_DIR "${_paimon_cpp_config_dir}/../../.." ABSOLUTE)
+unset(_paimon_cpp_config_dir)
+
+if(TARGET Paimon::cpp)
+  if(NOT TARGET Paimon::c)
+    set(PaimonCpp_FOUND FALSE)
+    set(PaimonCpp_NOT_FOUND_MESSAGE
+        "Paimon::cpp exists without its bundled Paimon::c target")
+    return()
+  endif()
+  check_required_components(PaimonCpp)
+  return()
+endif()
+
+if(TARGET Paimon::c)
+  set(PaimonCpp_FOUND FALSE)
+  set(PaimonCpp_NOT_FOUND_MESSAGE
+      "Paimon::c already exists; PaimonCpp requires its bundled paimon-c library")
+  return()
+endif()
+
+set(_paimon_c_library
+    "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/@PAIMON_C_INSTALL_FILENAME@")
+if(NOT EXISTS "${_paimon_c_library}")
+  set(PaimonCpp_FOUND FALSE)
+  set(PaimonCpp_NOT_FOUND_MESSAGE
+      "the bundled paimon-c library is missing: ${_paimon_c_library}")
+  return()
+endif()
+
+add_library(Paimon::c SHARED IMPORTED)
+set_target_properties(
+  Paimon::c
+  PROPERTIES
+    IMPORTED_LOCATION "${_paimon_c_library}"
+    IMPORTED_NO_SONAME TRUE
+    INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+
+include("${CMAKE_CURRENT_LIST_DIR}/PaimonCppTargets.cmake")
+set_target_properties(
+  Paimon::cpp
+  PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES
+      "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+check_required_components(PaimonCpp)

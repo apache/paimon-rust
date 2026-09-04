@@ -46,12 +46,108 @@ use paimon::spec::{
 use paimon::table::{SnapshotManager, Table};
 
 use crate::blob_reader::*;
+use crate::catalog::*;
 use crate::error::*;
 use crate::file_io::*;
+use crate::identifier::*;
+use crate::stream::*;
 use crate::table::*;
 use crate::types::*;
 use crate::vector_search::*;
 use crate::write::*;
+
+#[test]
+fn test_catalog_create_and_drop_table_from_schema_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let warehouse = CString::new(directory.path().to_string_lossy().as_bytes()).unwrap();
+    let warehouse_key = CString::new("warehouse").unwrap();
+    let options = [paimon_option {
+        key: warehouse_key.as_ptr(),
+        value: warehouse.as_ptr(),
+    }];
+    let catalog_result = unsafe { paimon_catalog_create(options.as_ptr(), options.len()) };
+    assert!(catalog_result.error.is_null());
+    assert!(!catalog_result.catalog.is_null());
+
+    let catalog = unsafe { &*((*catalog_result.catalog).inner as *const Arc<dyn paimon::Catalog>) };
+    crate::runtime()
+        .block_on(catalog.create_database("default", true, HashMap::new()))
+        .unwrap();
+
+    let database = CString::new("default").unwrap();
+    let table_name = CString::new("ffi_ddl").unwrap();
+    let identifier_result =
+        unsafe { paimon_identifier_new(database.as_ptr(), table_name.as_ptr()) };
+    assert!(identifier_result.error.is_null());
+    assert!(!identifier_result.identifier.is_null());
+
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::with_nullable(false)))
+        .option("bucket", "1")
+        .option("bucket-key", "id")
+        .build()
+        .unwrap();
+    let schema_json = CString::new(serde_json::to_string(&schema).unwrap()).unwrap();
+
+    let create_error = unsafe {
+        paimon_catalog_create_table_from_schema_json(
+            catalog_result.catalog,
+            identifier_result.identifier,
+            schema_json.as_ptr(),
+            false,
+        )
+    };
+    assert!(create_error.is_null());
+
+    let table_result =
+        unsafe { paimon_catalog_get_table(catalog_result.catalog, identifier_result.identifier) };
+    assert!(table_result.error.is_null());
+    assert!(!table_result.table.is_null());
+    unsafe { paimon_table_free(table_result.table) };
+
+    let duplicate_error = unsafe {
+        paimon_catalog_create_table_from_schema_json(
+            catalog_result.catalog,
+            identifier_result.identifier,
+            schema_json.as_ptr(),
+            false,
+        )
+    };
+    assert!(!duplicate_error.is_null());
+    assert_eq!(
+        unsafe { (*duplicate_error).code },
+        PAIMON_ERROR_ALREADY_EXISTS
+    );
+    unsafe { paimon_error_free(duplicate_error) };
+    assert!(unsafe {
+        paimon_catalog_create_table_from_schema_json(
+            catalog_result.catalog,
+            identifier_result.identifier,
+            schema_json.as_ptr(),
+            true,
+        )
+    }
+    .is_null());
+
+    assert!(unsafe {
+        paimon_catalog_drop_table(catalog_result.catalog, identifier_result.identifier, false)
+    }
+    .is_null());
+    let missing =
+        unsafe { paimon_catalog_get_table(catalog_result.catalog, identifier_result.identifier) };
+    assert!(missing.table.is_null());
+    assert!(!missing.error.is_null());
+    unsafe { paimon_error_free(missing.error) };
+    assert!(unsafe {
+        paimon_catalog_drop_table(catalog_result.catalog, identifier_result.identifier, true)
+    }
+    .is_null());
+
+    unsafe {
+        paimon_identifier_free(identifier_result.identifier);
+        paimon_catalog_free(catalog_result.catalog);
+    }
+}
 
 // =========================================================================
 //  Helpers
@@ -314,6 +410,42 @@ unsafe fn collect_rows(reader: *mut paimon_record_batch_reader) -> Vec<(i32, Str
     rows
 }
 
+/// Collect the audit-log row-kind strings while exercising Arrow ownership.
+unsafe fn collect_rowkinds(reader: *mut paimon_record_batch_reader) -> Vec<String> {
+    let mut kinds = Vec::new();
+    loop {
+        let result = paimon_record_batch_reader_next(reader);
+        assert!(result.error.is_null(), "reader_next should not error");
+        if result.batch.array.is_null() {
+            break;
+        }
+        let ffi_array = ptr::read(result.batch.array as *const FFI_ArrowArray);
+        let ffi_schema = ptr::read(result.batch.schema as *const FFI_ArrowSchema);
+        let data = arrow_array::ffi::from_ffi(ffi_array, &ffi_schema).unwrap();
+        ptr::write(
+            result.batch.array as *mut FFI_ArrowArray,
+            FFI_ArrowArray::empty(),
+        );
+        ptr::write(
+            result.batch.schema as *mut FFI_ArrowSchema,
+            FFI_ArrowSchema::empty(),
+        );
+        paimon_arrow_batch_free(result.batch);
+
+        let batch = RecordBatch::from(StructArray::from(data));
+        let rowkind = batch
+            .column_by_name("rowkind")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for index in 0..batch.num_rows() {
+            kinds.push(rowkind.value(index).to_string());
+        }
+    }
+    kinds
+}
+
 /// Full read via C FFI: read_builder -> scan -> plan -> read -> stream -> rows.
 /// Called OUTSIDE of any block_on — the C FFI functions use block_on internally.
 unsafe fn read_rows_ffi(table: *const paimon_table) -> Vec<(i32, String)> {
@@ -346,6 +478,234 @@ unsafe fn read_rows_ffi(table: *const paimon_table) -> Vec<(i32, String)> {
     paimon_read_builder_free(rb);
 
     rows
+}
+
+#[test]
+fn test_stream_scan_tails_snapshots_and_restores_cursor() {
+    let path = "memory:/test_stream_scan_tails_snapshots";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table.clone()) };
+
+    unsafe {
+        let rb_result = paimon_table_new_read_builder(handle);
+        assert!(rb_result.error.is_null());
+        let rb = rb_result.read_builder;
+        let read_result = paimon_read_builder_new_read(rb);
+        assert!(read_result.error.is_null());
+        let read = read_result.read;
+
+        let mut options = std::mem::MaybeUninit::<paimon_stream_scan_options>::uninit();
+        assert!(paimon_stream_scan_options_init(options.as_mut_ptr()).is_null());
+        let mut options = options.assume_init();
+        options.startup_mode = PAIMON_STREAM_STARTUP_LATEST;
+        options.follow_up_mode = PAIMON_STREAM_FOLLOW_UP_DELTA;
+
+        let scan_result = paimon_read_builder_new_stream_scan(rb, &options);
+        assert!(scan_result.error.is_null());
+        let scan = scan_result.scan;
+        assert_eq!(paimon_stream_scan_checkpoint(scan), 1);
+
+        // Commit before the first poll. Eager initialization at scan creation
+        // must retain snapshot 1 instead of treating it as pre-existing data.
+        write_data_rust(&table, &[make_batch(vec![1], vec!["first"])]);
+        let first = paimon_stream_scan_poll(scan);
+        assert!(first.error.is_null());
+        assert_eq!(first.status, PAIMON_STREAM_POLL_DATA);
+        assert_eq!(first.snapshot_id, 1);
+        assert_eq!(first.next_snapshot_id, 2);
+        assert_eq!(paimon_stream_scan_checkpoint(scan), 2);
+        assert_eq!(paimon_stream_plan_is_full(first.plan), 0);
+
+        let serialized = paimon_stream_plan_serialize(first.plan);
+        assert!(serialized.error.is_null());
+        let checkpoint_bytes =
+            std::slice::from_raw_parts(serialized.bytes.data, serialized.bytes.len).to_vec();
+        paimon_bytes_free(serialized.bytes);
+        let restored_plan =
+            paimon_stream_plan_deserialize(checkpoint_bytes.as_ptr(), checkpoint_bytes.len());
+        assert!(restored_plan.error.is_null());
+        assert_eq!(restored_plan.status, PAIMON_STREAM_POLL_DATA);
+        assert_eq!(restored_plan.snapshot_id, 1);
+        assert_eq!(restored_plan.next_snapshot_id, 2);
+        let restored_reader = paimon_stream_plan_read_to_arrow(
+            read,
+            restored_plan.plan,
+            0,
+            usize::MAX,
+            PAIMON_STREAM_READ_DATA,
+        );
+        assert!(restored_reader.error.is_null());
+        assert_eq!(
+            collect_rows(restored_reader.reader),
+            vec![(1, "first".into())]
+        );
+        paimon_record_batch_reader_free(restored_reader.reader);
+
+        let mismatched_builder = paimon_table_new_read_builder(handle);
+        assert!(mismatched_builder.error.is_null());
+        assert!(
+            paimon_read_builder_with_case_sensitive(mismatched_builder.read_builder, false,)
+                .is_null()
+        );
+        let mismatched_read = paimon_read_builder_new_read(mismatched_builder.read_builder);
+        assert!(mismatched_read.error.is_null());
+        let mismatched_result = paimon_stream_plan_read_to_arrow(
+            mismatched_read.read,
+            restored_plan.plan,
+            0,
+            usize::MAX,
+            PAIMON_STREAM_READ_DATA,
+        );
+        assert!(mismatched_result.reader.is_null());
+        assert!(!mismatched_result.error.is_null());
+        assert_eq!(
+            (*mismatched_result.error).code,
+            PaimonErrorCode::InvalidInput as i32
+        );
+        paimon_error_free(mismatched_result.error);
+        paimon_table_read_free(mismatched_read.read);
+        paimon_read_builder_free(mismatched_builder.read_builder);
+
+        let branch_table = Table::from_resolved_schema(
+            table.file_io().clone(),
+            Identifier::new("default", "test"),
+            path.to_string(),
+            table.schema().clone(),
+            "branch-review",
+        )
+        .unwrap();
+        let branch_handle = wrap_table(branch_table);
+        let branch_builder = paimon_table_new_read_builder(branch_handle);
+        assert!(branch_builder.error.is_null());
+        let branch_read = paimon_read_builder_new_read(branch_builder.read_builder);
+        assert!(branch_read.error.is_null());
+        let branch_result = paimon_stream_plan_read_to_arrow(
+            branch_read.read,
+            restored_plan.plan,
+            0,
+            usize::MAX,
+            PAIMON_STREAM_READ_DATA,
+        );
+        assert!(branch_result.reader.is_null());
+        assert!(!branch_result.error.is_null());
+        assert_eq!(
+            (*branch_result.error).code,
+            PaimonErrorCode::InvalidInput as i32
+        );
+        paimon_error_free(branch_result.error);
+        paimon_table_read_free(branch_read.read);
+        paimon_read_builder_free(branch_builder.read_builder);
+        unwrap_table(branch_handle);
+
+        paimon_stream_plan_free(restored_plan.plan);
+
+        let first_reader = paimon_stream_plan_read_to_arrow(
+            read,
+            first.plan,
+            0,
+            usize::MAX,
+            PAIMON_STREAM_READ_DATA,
+        );
+        assert!(first_reader.error.is_null());
+        assert_eq!(collect_rows(first_reader.reader), vec![(1, "first".into())]);
+        paimon_record_batch_reader_free(first_reader.reader);
+
+        let audit_reader = paimon_stream_plan_read_to_arrow(
+            read,
+            first.plan,
+            0,
+            usize::MAX,
+            PAIMON_STREAM_READ_AUDIT_LOG,
+        );
+        assert!(audit_reader.error.is_null());
+        assert_eq!(collect_rowkinds(audit_reader.reader), vec!["+I"]);
+        paimon_record_batch_reader_free(audit_reader.reader);
+        paimon_stream_plan_free(first.plan);
+
+        write_data_rust(&table, &[make_batch(vec![2], vec!["second"])]);
+        let second = paimon_stream_scan_poll(scan);
+        assert!(second.error.is_null());
+        assert_eq!(second.status, PAIMON_STREAM_POLL_DATA);
+        assert_eq!(second.snapshot_id, 2);
+        assert_eq!(second.next_snapshot_id, 3);
+        let second_reader = paimon_stream_plan_read_to_arrow(
+            read,
+            second.plan,
+            0,
+            usize::MAX,
+            PAIMON_STREAM_READ_DATA,
+        );
+        assert!(second_reader.error.is_null());
+        assert_eq!(
+            collect_rows(second_reader.reader),
+            vec![(2, "second".into())]
+        );
+        paimon_record_batch_reader_free(second_reader.reader);
+        paimon_stream_plan_free(second.plan);
+
+        // Restoring nextSnapshotId=2 replays snapshot 2 rather than losing it.
+        assert!(paimon_stream_scan_restore(scan, 2).is_null());
+        let replay = paimon_stream_scan_poll(scan);
+        assert!(replay.error.is_null());
+        assert_eq!(replay.status, PAIMON_STREAM_POLL_DATA);
+        assert_eq!(replay.snapshot_id, 2);
+        paimon_stream_plan_free(replay.plan);
+
+        paimon_stream_scan_free(scan);
+        paimon_table_read_free(read);
+        paimon_read_builder_free(rb);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_stream_scan_latest_full_then_waits_for_follow_up() {
+    let path = "memory:/test_stream_scan_latest_full";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    write_data_rust(&table, &[make_batch(vec![7], vec!["existing"])]);
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let rb_result = paimon_table_new_read_builder(handle);
+        assert!(rb_result.error.is_null());
+        let mut options = std::mem::MaybeUninit::<paimon_stream_scan_options>::uninit();
+        assert!(paimon_stream_scan_options_init(options.as_mut_ptr()).is_null());
+        let options = options.assume_init();
+        let scan_result = paimon_read_builder_new_stream_scan(rb_result.read_builder, &options);
+        assert!(scan_result.error.is_null());
+
+        let full = paimon_stream_scan_poll(scan_result.scan);
+        assert!(full.error.is_null());
+        assert_eq!(full.status, PAIMON_STREAM_POLL_DATA);
+        assert_eq!(full.snapshot_id, 1);
+        assert_eq!(paimon_stream_plan_is_full(full.plan), 1);
+        assert_eq!(paimon_stream_scan_checkpoint(scan_result.scan), 2);
+        paimon_stream_plan_free(full.plan);
+
+        let waiting = paimon_stream_scan_poll(scan_result.scan);
+        assert!(waiting.error.is_null());
+        assert_eq!(waiting.status, PAIMON_STREAM_POLL_WAITING);
+
+        paimon_stream_scan_free(scan_result.scan);
+        paimon_read_builder_free(rb_result.read_builder);
+        unwrap_table(handle);
+    }
 }
 
 // =========================================================================
@@ -1804,6 +2164,298 @@ fn test_caller_supplied_commit_identity_is_shared_and_persisted() {
 }
 
 #[test]
+fn test_stream_write_v1_reuses_writer_across_monotonic_checkpoints() {
+    let path = "memory:/test_stream_write_v1_reuses_writer";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("stream-write-job-9").unwrap();
+
+    unsafe {
+        let wb_result =
+            paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr());
+        assert!(wb_result.error.is_null());
+        let wb = wb_result.write_builder;
+
+        let tw_result = paimon_write_builder_new_write(wb);
+        assert!(tw_result.error.is_null());
+        let tw = tw_result.write;
+
+        let commit_result = paimon_write_builder_new_commit(wb);
+        assert!(commit_result.error.is_null());
+        let commit = commit_result.commit;
+
+        // Checkpoint 100: retain the prepared messages until a successful
+        // filter-and-commit confirms an intentionally lost commit ACK.
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![1], vec!["first"]));
+        let error = paimon_table_write_write_arrow_batch(
+            tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(error.is_null());
+
+        let prepared_100 = paimon_table_write_prepare_commit(tw);
+        assert!(prepared_100.error.is_null());
+        let error = paimon_table_commit_commit_with_identifier(commit, prepared_100.messages, 100);
+        assert!(error.is_null());
+
+        let error = paimon_table_commit_filter_and_commit_with_identifier(
+            commit,
+            prepared_100.messages,
+            100,
+        );
+        assert!(
+            error.is_null(),
+            "a retry after a lost commit ACK must be idempotent"
+        );
+        paimon_commit_messages_free(prepared_100.messages);
+
+        // Checkpoint 101 deliberately reuses both the writer and committer.
+        // prepare_commit must drain only the data written since checkpoint 100.
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![2], vec!["second"]));
+        let error = paimon_table_write_write_arrow_batch(
+            tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(error.is_null());
+
+        let prepared_101 = paimon_table_write_prepare_commit(tw);
+        assert!(prepared_101.error.is_null());
+        let error = paimon_table_commit_commit_with_identifier(commit, prepared_101.messages, 101);
+        assert!(error.is_null());
+        paimon_commit_messages_free(prepared_101.messages);
+
+        assert_eq!(
+            read_rows_ffi(handle),
+            vec![(1, "first".into()), (2, "second".into())]
+        );
+
+        // A later prepared checkpoint can be abandoned without publishing a
+        // snapshot or making its rows visible.
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![3], vec!["aborted"]));
+        let error = paimon_table_write_write_arrow_batch(
+            tw,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(error.is_null());
+
+        let abandoned = paimon_table_write_prepare_commit(tw);
+        assert!(abandoned.error.is_null());
+        let abandoned_prepared = paimon_commit_messages_prepare(abandoned.messages, 102);
+        assert!(abandoned_prepared.error.is_null());
+        paimon_commit_messages_free(abandoned.messages);
+        let error = paimon_table_commit_abort_prepared(commit, abandoned_prepared.prepared);
+        assert!(error.is_null());
+        paimon_prepared_commit_free(abandoned_prepared.prepared);
+
+        assert_eq!(
+            read_rows_ffi(handle),
+            vec![(1, "first".into()), (2, "second".into())]
+        );
+
+        paimon_table_commit_free(commit);
+        paimon_table_write_free(tw);
+        paimon_write_builder_free(wb);
+        unwrap_table(handle);
+    }
+
+    let snapshots = crate::runtime().block_on(async {
+        let manager = SnapshotManager::new(file_io, path.to_string());
+        (
+            manager.get_snapshot(1).await.unwrap(),
+            manager.get_snapshot(2).await.unwrap(),
+            manager.get_latest_snapshot_id().await.unwrap(),
+        )
+    });
+    assert_eq!(snapshots.0.commit_user(), "stream-write-job-9");
+    assert_eq!(snapshots.0.commit_identifier(), 100);
+    assert_eq!(snapshots.1.commit_user(), "stream-write-job-9");
+    assert_eq!(snapshots.1.commit_identifier(), 101);
+    assert_eq!(
+        snapshots.2,
+        Some(2),
+        "the retry and abort must not publish snapshots"
+    );
+}
+
+#[test]
+fn test_prepared_commit_roundtrip_and_lost_ack_retry() {
+    let path = "memory:/test_prepared_commit_roundtrip";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("durable-stream-job-5").unwrap();
+
+    unsafe {
+        let writer_builder =
+            paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr());
+        assert!(writer_builder.error.is_null());
+        let writer_builder = writer_builder.write_builder;
+
+        let writer = paimon_write_builder_new_write(writer_builder);
+        assert!(writer.error.is_null());
+        let writer = writer.write;
+
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![5], vec!["durable"]));
+        let error = paimon_table_write_write_arrow_batch(
+            writer,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(error.is_null());
+
+        let messages = paimon_table_write_prepare_commit(writer);
+        assert!(messages.error.is_null());
+        let reserved = paimon_commit_messages_prepare(messages.messages, i64::MAX);
+        assert!(reserved.prepared.is_null());
+        assert!(!reserved.error.is_null());
+        assert_eq!((*reserved.error).code, PaimonErrorCode::InvalidInput as i32);
+        paimon_error_free(reserved.error);
+        let prepared = paimon_commit_messages_prepare(messages.messages, 500);
+        assert!(prepared.error.is_null());
+        assert_eq!(paimon_prepared_commit_identifier(prepared.prepared), 500);
+
+        let serialized = paimon_prepared_commit_serialize(prepared.prepared);
+        assert!(serialized.error.is_null());
+        assert!(!serialized.bytes.data.is_null());
+        assert!(serialized.bytes.len > 0);
+
+        let mut unsafe_checkpoint: serde_json::Value = serde_json::from_slice(
+            std::slice::from_raw_parts(serialized.bytes.data, serialized.bytes.len),
+        )
+        .unwrap();
+        unsafe_checkpoint["messages"][0]["new_files"][0]["_EXTERNAL_PATH"] =
+            serde_json::json!("file:/tmp/not-owned-by-the-prepared-commit");
+        let unsafe_checkpoint = serde_json::to_vec(&unsafe_checkpoint).unwrap();
+        let rejected =
+            paimon_prepared_commit_deserialize(unsafe_checkpoint.as_ptr(), unsafe_checkpoint.len());
+        assert!(rejected.prepared.is_null());
+        assert!(!rejected.error.is_null());
+        assert_eq!((*rejected.error).code, PaimonErrorCode::InvalidInput as i32);
+        paimon_error_free(rejected.error);
+
+        let mut duplicated_checkpoint: serde_json::Value = serde_json::from_slice(
+            std::slice::from_raw_parts(serialized.bytes.data, serialized.bytes.len),
+        )
+        .unwrap();
+        let duplicate_message = duplicated_checkpoint["messages"][0].clone();
+        duplicated_checkpoint["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate_message);
+        let duplicated_checkpoint = serde_json::to_vec(&duplicated_checkpoint).unwrap();
+
+        let mut conflicting_checkpoint: serde_json::Value = serde_json::from_slice(
+            std::slice::from_raw_parts(serialized.bytes.data, serialized.bytes.len),
+        )
+        .unwrap();
+        let mut conflicting_message = conflicting_checkpoint["messages"][0].clone();
+        conflicting_message["new_files"][0]["_FILE_SIZE"] = serde_json::json!(123456789);
+        conflicting_checkpoint["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(conflicting_message);
+        let conflicting_checkpoint = serde_json::to_vec(&conflicting_checkpoint).unwrap();
+        let rejected = paimon_prepared_commit_deserialize(
+            conflicting_checkpoint.as_ptr(),
+            conflicting_checkpoint.len(),
+        );
+        assert!(rejected.prepared.is_null());
+        assert!(!rejected.error.is_null());
+        assert!(error_message(rejected.error).contains("same file identity"));
+        paimon_error_free(rejected.error);
+
+        // The serialized bytes, rather than either in-process source handle,
+        // are the durable checkpoint boundary.
+        paimon_commit_messages_free(messages.messages);
+        paimon_prepared_commit_free(prepared.prepared);
+
+        let restored = paimon_prepared_commit_deserialize(
+            duplicated_checkpoint.as_ptr(),
+            duplicated_checkpoint.len(),
+        );
+        assert!(restored.error.is_null());
+        assert_eq!(paimon_prepared_commit_identifier(restored.prepared), 500);
+
+        let first_committer_builder =
+            paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr());
+        assert!(first_committer_builder.error.is_null());
+        let first_committer_builder = first_committer_builder.write_builder;
+        let first_committer = paimon_write_builder_new_commit(first_committer_builder);
+        assert!(first_committer.error.is_null());
+        let error = paimon_table_commit_commit_prepared(first_committer.commit, restored.prepared);
+        assert!(error.is_null());
+
+        // A stale abort request after a successful commit (including a lost
+        // acknowledgement recovered by identifier) must not delete files now
+        // referenced by the committed snapshot.
+        let error = paimon_table_commit_abort_prepared(first_committer.commit, restored.prepared);
+        assert!(error.is_null());
+        assert_eq!(read_rows_ffi(handle), vec![(5, "durable".into())]);
+
+        // Treat the successful return above as a lost ACK. Discard all
+        // in-memory commit state, recover from the same durable bytes, and
+        // retry through the identifier-filtering commit path.
+        paimon_prepared_commit_free(restored.prepared);
+        paimon_table_commit_free(first_committer.commit);
+        paimon_write_builder_free(first_committer_builder);
+
+        let retry = paimon_prepared_commit_deserialize(
+            serialized.bytes.data.cast_const(),
+            serialized.bytes.len,
+        );
+        assert!(retry.error.is_null());
+        let retry_committer_builder =
+            paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr());
+        assert!(retry_committer_builder.error.is_null());
+        let retry_committer_builder = retry_committer_builder.write_builder;
+        let retry_committer = paimon_write_builder_new_commit(retry_committer_builder);
+        assert!(retry_committer.error.is_null());
+        let error = paimon_table_commit_commit_prepared(retry_committer.commit, retry.prepared);
+        assert!(
+            error.is_null(),
+            "recovered commit_prepared must filter a previously committed identifier"
+        );
+
+        paimon_prepared_commit_free(retry.prepared);
+        paimon_bytes_free(serialized.bytes);
+        paimon_table_commit_free(retry_committer.commit);
+        paimon_write_builder_free(retry_committer_builder);
+
+        assert_eq!(read_rows_ffi(handle), vec![(5, "durable".into())]);
+
+        paimon_table_write_free(writer);
+        paimon_write_builder_free(writer_builder);
+        unwrap_table(handle);
+    }
+
+    let snapshot = crate::runtime()
+        .block_on(SnapshotManager::new(file_io, path.to_string()).get_latest_snapshot())
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.id(), 1, "the lost-ACK retry must be a no-op");
+    assert_eq!(snapshot.commit_user(), "durable-stream-job-5");
+    assert_eq!(snapshot.commit_identifier(), 500);
+}
+
+#[test]
 fn test_commit_messages_merge_preserves_all_writer_files() {
     let path = "memory:/test_commit_messages_merge";
     let file_io = memory_file_io();
@@ -1840,6 +2492,11 @@ fn test_commit_messages_merge_preserves_all_writer_files() {
         let messages2 = paimon_table_write_prepare_commit(tw2).messages;
         let err = paimon_commit_messages_merge(messages1, messages2);
         assert!(err.is_null());
+        let err = paimon_commit_messages_merge(messages1, messages2);
+        assert!(
+            err.is_null(),
+            "re-merging the same fragment must be a no-op"
+        );
 
         let commit = paimon_write_builder_new_commit(wb1).commit;
         let err = paimon_table_commit_commit_with_identifier(commit, messages1, 7);
@@ -1852,6 +2509,81 @@ fn test_commit_messages_merge_preserves_all_writer_files() {
         paimon_commit_messages_free(messages2);
         paimon_commit_messages_free(messages1);
         paimon_table_commit_free(commit);
+        paimon_table_write_free(tw2);
+        paimon_table_write_free(tw1);
+        paimon_write_builder_free(wb2);
+        paimon_write_builder_free(wb1);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_prepared_commit_merge_preserves_parallel_writer_files() {
+    let path = "memory:/test_prepared_commit_merge";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let commit_user = CString::new("durable-distributed-job-700").unwrap();
+
+    unsafe {
+        let wb1 = paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr())
+            .write_builder;
+        let wb2 = paimon_table_new_write_builder_with_commit_user(handle, commit_user.as_ptr())
+            .write_builder;
+        let tw1 = paimon_write_builder_new_write(wb1).write;
+        let tw2 = paimon_write_builder_new_write(wb2).write;
+
+        for (writer, ids, names) in [
+            (tw1, vec![10], vec!["left"]),
+            (tw2, vec![20], vec!["right"]),
+        ] {
+            let (array, schema) = export_batch_to_ffi(make_batch(ids, names));
+            let error = paimon_table_write_write_arrow_batch(
+                writer,
+                (&**array) as *const FFI_ArrowArray as *mut c_void,
+                (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+            );
+            assert!(error.is_null());
+        }
+
+        let messages1 = paimon_table_write_prepare_commit(tw1);
+        assert!(messages1.error.is_null());
+        let messages2 = paimon_table_write_prepare_commit(tw2);
+        assert!(messages2.error.is_null());
+        let prepared1 = paimon_commit_messages_prepare(messages1.messages, 700);
+        assert!(prepared1.error.is_null());
+        let prepared2 = paimon_commit_messages_prepare(messages2.messages, 700);
+        assert!(prepared2.error.is_null());
+        paimon_commit_messages_free(messages2.messages);
+        paimon_commit_messages_free(messages1.messages);
+
+        let error = paimon_prepared_commit_merge(prepared1.prepared, prepared2.prepared);
+        assert!(error.is_null());
+        let error = paimon_prepared_commit_merge(prepared1.prepared, prepared2.prepared);
+        assert!(
+            error.is_null(),
+            "re-merging the same durable fragment must be a no-op"
+        );
+        let commit = paimon_write_builder_new_commit(wb1);
+        assert!(commit.error.is_null());
+        let error = paimon_table_commit_commit_prepared(commit.commit, prepared1.prepared);
+        assert!(error.is_null());
+
+        assert_eq!(
+            read_rows_ffi(handle),
+            vec![(10, "left".into()), (20, "right".into())]
+        );
+
+        paimon_table_commit_free(commit.commit);
+        paimon_prepared_commit_free(prepared2.prepared);
+        paimon_prepared_commit_free(prepared1.prepared);
         paimon_table_write_free(tw2);
         paimon_table_write_free(tw1);
         paimon_write_builder_free(wb2);
@@ -2125,6 +2857,17 @@ fn test_write_multiple_batches() {
 
         let tc_result = paimon_write_builder_new_commit(wb);
         let tc = tc_result.commit;
+        for invalid in [-1, i64::MAX] {
+            let err = paimon_table_commit_commit_with_identifier(tc, pc_result.messages, invalid);
+            assert!(!err.is_null());
+            assert_eq!((*err).code, PaimonErrorCode::InvalidInput as i32);
+            paimon_error_free(err);
+            let err = paimon_table_commit_truncate_table_with_identifier(tc, invalid);
+            assert!(!err.is_null());
+            assert_eq!((*err).code, PaimonErrorCode::InvalidInput as i32);
+            paimon_error_free(err);
+        }
+
         let err = paimon_table_commit_commit(tc, pc_result.messages);
         assert!(err.is_null());
         paimon_commit_messages_free(pc_result.messages);

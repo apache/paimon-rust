@@ -15,22 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void};
+use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
 use arrow_array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
-use paimon::table::{PostponeBucketPlan, Table};
+use paimon::table::{CommitMessage, PostponeBucketPlan, Table};
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::result::{
-    paimon_result_postpone_fixed_bucket_prepare_commit,
+    paimon_result_bytes, paimon_result_postpone_fixed_bucket_prepare_commit,
     paimon_result_postpone_fixed_bucket_table_commit,
     paimon_result_postpone_fixed_bucket_table_write,
     paimon_result_postpone_fixed_bucket_write_builder, paimon_result_prepare_commit,
-    paimon_result_table_commit, paimon_result_table_write, paimon_result_write_builder,
+    paimon_result_prepared_commit, paimon_result_table_commit, paimon_result_table_write,
+    paimon_result_write_builder,
 };
 use crate::runtime;
 use crate::types::*;
@@ -817,6 +823,490 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_commit_messages_free(
     }
 }
 
+const PREPARED_COMMIT_FORMAT: &str = "paimon-rust-prepared-commit";
+// Version 2 adds strict resource and path validation. Version 1 is rejected:
+// accepting its unconstrained internal CommitMessage representation would
+// reintroduce unsafe file references after recovery.
+const PREPARED_COMMIT_VERSION: u32 = 2;
+const MAX_PREPARED_COMMIT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PREPARED_MESSAGES: usize = 100_000;
+const MAX_PREPARED_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FILES_PER_MESSAGE: usize = 100_000;
+const MAX_TOTAL_FILE_REFERENCES: usize = 1_000_000;
+const MAX_EXTRA_FILES_PER_DATA_FILE: usize = 10_000;
+const MAX_PARTITION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_IDENTITY_BYTES: usize = 1024 * 1024;
+const MAX_FILE_NAME_BYTES: usize = 4 * 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedCommitEnvelope {
+    format: String,
+    version: u32,
+    commit_identifier: i64,
+    table_location: String,
+    commit_user: String,
+    overwrite: bool,
+    messages: Vec<paimon::table::CommitMessage>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPreparedCommitEnvelope<'a> {
+    format: String,
+    version: u32,
+    commit_identifier: i64,
+    table_location: String,
+    commit_user: String,
+    overwrite: bool,
+    #[serde(borrow, deserialize_with = "deserialize_bounded_raw_messages")]
+    messages: Vec<&'a RawValue>,
+}
+
+fn deserialize_bounded_raw_messages<'de, D>(deserializer: D) -> Result<Vec<&'de RawValue>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{Error, IgnoredAny, SeqAccess, Visitor};
+
+    struct RawMessagesVisitor;
+
+    impl<'de> Visitor<'de> for RawMessagesVisitor {
+        type Value = Vec<&'de RawValue>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded list of prepared commit messages")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut messages = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_PREPARED_MESSAGES),
+            );
+            while messages.len() < MAX_PREPARED_MESSAGES {
+                let Some(message) = sequence.next_element::<&'de RawValue>()? else {
+                    return Ok(messages);
+                };
+                messages.push(message);
+            }
+            if sequence.next_element::<IgnoredAny>()?.is_some() {
+                return Err(A::Error::custom(format!(
+                    "prepared commit contains more than {MAX_PREPARED_MESSAGES} messages"
+                )));
+            }
+            Ok(messages)
+        }
+    }
+
+    deserializer.deserialize_seq(RawMessagesVisitor)
+}
+
+fn prepared_panic_error(operation: &str) -> *mut paimon_error {
+    paimon_error::new(
+        PaimonErrorCode::Unexpected,
+        format!("Rust panic while executing {operation}"),
+    )
+}
+
+fn validate_file_component(kind: &str, name: &str) -> Result<(), *mut paimon_error> {
+    if name.is_empty()
+        || name.len() > MAX_FILE_NAME_BYTES
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(invalid_input(format!(
+            "prepared commit contains unsafe {kind} '{name}'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_data_file(file: &paimon::spec::DataFileMeta) -> Result<usize, *mut paimon_error> {
+    if file.external_path.is_some() {
+        return Err(invalid_input(
+            "prepared commits with external data-file paths are not supported",
+        ));
+    }
+    validate_file_component("data file name", &file.file_name)?;
+    if file.extra_files.len() > MAX_EXTRA_FILES_PER_DATA_FILE {
+        return Err(invalid_input(format!(
+            "data file contains {} extra files; maximum is {}",
+            file.extra_files.len(),
+            MAX_EXTRA_FILES_PER_DATA_FILE
+        )));
+    }
+    for extra in &file.extra_files {
+        validate_file_component("extra file name", extra)?;
+    }
+    Ok(1 + file.extra_files.len())
+}
+
+fn validate_index_file(file: &paimon::spec::IndexFileMeta) -> Result<usize, *mut paimon_error> {
+    validate_file_component("index file name", &file.file_name)?;
+    if let Some(ranges) = &file.deletion_vectors_ranges {
+        for data_file_name in ranges.keys() {
+            validate_file_component("deletion-vector data file name", data_file_name)?;
+        }
+    }
+    Ok(1)
+}
+
+fn validate_prepared_commit_envelope(
+    envelope: &PreparedCommitEnvelope,
+) -> Result<(), *mut paimon_error> {
+    if envelope.commit_identifier < 0
+        || envelope.commit_identifier == i64::MAX
+        || envelope.table_location.is_empty()
+        || envelope.table_location.len() > MAX_IDENTITY_BYTES
+        || envelope.commit_user.is_empty()
+        || envelope.commit_user.len() > MAX_IDENTITY_BYTES
+    {
+        return Err(invalid_input(
+            "prepared commit contains an invalid identity",
+        ));
+    }
+    if envelope.messages.len() > MAX_PREPARED_MESSAGES {
+        return Err(invalid_input(format!(
+            "prepared commit contains {} messages; maximum is {}",
+            envelope.messages.len(),
+            MAX_PREPARED_MESSAGES
+        )));
+    }
+
+    let mut total_file_references = 0usize;
+    for message in &envelope.messages {
+        if message.partition.len() > MAX_PARTITION_BYTES {
+            return Err(invalid_input(format!(
+                "prepared commit partition exceeds {MAX_PARTITION_BYTES} bytes"
+            )));
+        }
+        let message_file_count = message
+            .new_files
+            .len()
+            .checked_add(message.new_changelog_files.len())
+            .and_then(|count| count.checked_add(message.deleted_files.len()))
+            .and_then(|count| count.checked_add(message.new_index_files.len()))
+            .and_then(|count| count.checked_add(message.deleted_index_files.len()))
+            .ok_or_else(|| invalid_input("prepared commit file count overflows"))?;
+        if message_file_count > MAX_FILES_PER_MESSAGE {
+            return Err(invalid_input(format!(
+                "prepared commit message contains {message_file_count} files; maximum is {MAX_FILES_PER_MESSAGE}"
+            )));
+        }
+        for file in message
+            .new_files
+            .iter()
+            .chain(message.new_changelog_files.iter())
+            .chain(message.deleted_files.iter())
+        {
+            total_file_references = total_file_references
+                .checked_add(validate_data_file(file)?)
+                .ok_or_else(|| invalid_input("prepared commit file count overflows"))?;
+        }
+        for file in message
+            .new_index_files
+            .iter()
+            .chain(message.deleted_index_files.iter())
+        {
+            total_file_references = total_file_references
+                .checked_add(validate_index_file(file)?)
+                .ok_or_else(|| invalid_input("prepared commit file count overflows"))?;
+        }
+        if total_file_references > MAX_TOTAL_FILE_REFERENCES {
+            return Err(invalid_input(format!(
+                "prepared commit contains more than {MAX_TOTAL_FILE_REFERENCES} file references"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn empty_bytes() -> paimon_bytes {
+    paimon_bytes {
+        data: ptr::null_mut(),
+        len: 0,
+    }
+}
+
+/// Bind standard commit messages to a monotonically increasing streaming
+/// commit identifier. The returned prepared commit owns a clone of the
+/// messages, so the source handle remains valid. Valid identifiers are in
+/// `[0, INT64_MAX)`; `INT64_MAX` is reserved for unidentified batch commits.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_commit_messages_prepare(
+    msgs: *const paimon_commit_messages,
+    commit_identifier: i64,
+) -> paimon_result_prepared_commit {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if let Err(error) = check_non_null(msgs, "msgs") {
+            return paimon_result_prepared_commit {
+                prepared: ptr::null_mut(),
+                error,
+            };
+        }
+        if commit_identifier < 0 || commit_identifier == i64::MAX {
+            return paimon_result_prepared_commit {
+                prepared: ptr::null_mut(),
+                error: invalid_input(
+                    "streaming commit_identifier must be non-negative and less than i64::MAX",
+                ),
+            };
+        }
+        let source = &*((*msgs).inner as *const CommitMessagesState);
+        let mut messages = Vec::new();
+        if let Err(error) = merge_messages_idempotently(&mut messages, &source.messages) {
+            return paimon_result_prepared_commit {
+                prepared: ptr::null_mut(),
+                error,
+            };
+        }
+        let state = PreparedCommitState {
+            commit_identifier,
+            messages: CommitMessagesState {
+                messages,
+                overwrite: source.overwrite,
+                table_location: source.table_location.clone(),
+                commit_user: source.commit_user.clone(),
+            },
+        };
+        let inner = Box::into_raw(Box::new(state)) as *mut c_void;
+        paimon_result_prepared_commit {
+            prepared: Box::into_raw(Box::new(paimon_prepared_commit { inner })),
+            error: ptr::null_mut(),
+        }
+    }));
+    outcome.unwrap_or_else(|_| paimon_result_prepared_commit {
+        prepared: ptr::null_mut(),
+        error: prepared_panic_error("paimon_commit_messages_prepare"),
+    })
+}
+
+/// Serialize a prepared commit into a process-independent, versioned buffer.
+/// The bytes must be released with `paimon_bytes_free`.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_prepared_commit_serialize(
+    prepared: *const paimon_prepared_commit,
+) -> paimon_result_bytes {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if let Err(error) = check_non_null(prepared, "prepared") {
+            return paimon_result_bytes {
+                bytes: empty_bytes(),
+                error,
+            };
+        }
+        let state = &*((*prepared).inner as *const PreparedCommitState);
+        let envelope = PreparedCommitEnvelope {
+            format: PREPARED_COMMIT_FORMAT.to_string(),
+            version: PREPARED_COMMIT_VERSION,
+            commit_identifier: state.commit_identifier,
+            table_location: state.messages.table_location.clone(),
+            commit_user: state.messages.commit_user.clone(),
+            overwrite: state.messages.overwrite,
+            messages: state.messages.messages.clone(),
+        };
+        if let Err(error) = validate_prepared_commit_envelope(&envelope) {
+            return paimon_result_bytes {
+                bytes: empty_bytes(),
+                error,
+            };
+        }
+        match serde_json::to_vec(&envelope) {
+            Ok(bytes) if bytes.len() <= MAX_PREPARED_COMMIT_BYTES => paimon_result_bytes {
+                bytes: paimon_bytes::new(bytes),
+                error: ptr::null_mut(),
+            },
+            Ok(bytes) => paimon_result_bytes {
+                bytes: empty_bytes(),
+                error: invalid_input(format!(
+                    "serialized prepared commit is {} bytes; maximum is {}",
+                    bytes.len(),
+                    MAX_PREPARED_COMMIT_BYTES
+                )),
+            },
+            Err(error) => paimon_result_bytes {
+                bytes: empty_bytes(),
+                error: paimon_error::new(
+                    PaimonErrorCode::Unexpected,
+                    format!("failed to serialize prepared commit: {error}"),
+                ),
+            },
+        }
+    }));
+    outcome.unwrap_or_else(|_| paimon_result_bytes {
+        bytes: empty_bytes(),
+        error: prepared_panic_error("paimon_prepared_commit_serialize"),
+    })
+}
+
+/// Restore a prepared commit serialized by `paimon_prepared_commit_serialize`.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_prepared_commit_deserialize(
+    data: *const u8,
+    len: usize,
+) -> paimon_result_prepared_commit {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if data.is_null() || len == 0 {
+            return paimon_result_prepared_commit {
+                prepared: ptr::null_mut(),
+                error: invalid_input("prepared commit buffer must not be null or empty"),
+            };
+        }
+        if len > MAX_PREPARED_COMMIT_BYTES {
+            return paimon_result_prepared_commit {
+                prepared: ptr::null_mut(),
+                error: invalid_input(format!(
+                    "prepared commit buffer exceeds {MAX_PREPARED_COMMIT_BYTES} bytes"
+                )),
+            };
+        }
+        let bytes = std::slice::from_raw_parts(data, len);
+        let raw: RawPreparedCommitEnvelope<'_> = match serde_json::from_slice(bytes) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return paimon_result_prepared_commit {
+                    prepared: ptr::null_mut(),
+                    error: invalid_input(format!("invalid prepared commit buffer: {error}")),
+                };
+            }
+        };
+        if raw.format != PREPARED_COMMIT_FORMAT || raw.version != PREPARED_COMMIT_VERSION {
+            return paimon_result_prepared_commit {
+                prepared: ptr::null_mut(),
+                error: paimon_error::new(
+                    PaimonErrorCode::Unsupported,
+                    format!(
+                        "unsupported prepared commit format '{}' version {}",
+                        raw.format, raw.version
+                    ),
+                ),
+            };
+        }
+        if raw.commit_identifier < 0
+            || raw.commit_identifier == i64::MAX
+            || raw.table_location.is_empty()
+            || raw.table_location.len() > MAX_IDENTITY_BYTES
+            || raw.commit_user.is_empty()
+            || raw.commit_user.len() > MAX_IDENTITY_BYTES
+        {
+            return paimon_result_prepared_commit {
+                prepared: ptr::null_mut(),
+                error: invalid_input("prepared commit contains an invalid identity"),
+            };
+        }
+        if raw.messages.len() > MAX_PREPARED_MESSAGES {
+            return paimon_result_prepared_commit {
+                prepared: ptr::null_mut(),
+                error: invalid_input(format!(
+                    "prepared commit contains {} messages; maximum is {}",
+                    raw.messages.len(),
+                    MAX_PREPARED_MESSAGES
+                )),
+            };
+        }
+        let mut messages = Vec::with_capacity(raw.messages.len());
+        for (index, raw_message) in raw.messages.into_iter().enumerate() {
+            if raw_message.get().len() > MAX_PREPARED_MESSAGE_BYTES {
+                return paimon_result_prepared_commit {
+                    prepared: ptr::null_mut(),
+                    error: invalid_input(format!(
+                        "prepared commit message {index} exceeds {MAX_PREPARED_MESSAGE_BYTES} bytes"
+                    )),
+                };
+            }
+            match serde_json::from_str::<CommitMessage>(raw_message.get()) {
+                Ok(message) => messages.push(message),
+                Err(error) => {
+                    return paimon_result_prepared_commit {
+                        prepared: ptr::null_mut(),
+                        error: invalid_input(format!(
+                            "invalid prepared commit message {index}: {error}"
+                        )),
+                    };
+                }
+            }
+        }
+        let mut envelope = PreparedCommitEnvelope {
+            format: raw.format,
+            version: raw.version,
+            commit_identifier: raw.commit_identifier,
+            table_location: raw.table_location,
+            commit_user: raw.commit_user,
+            overwrite: raw.overwrite,
+            messages,
+        };
+        if let Err(error) = validate_prepared_commit_envelope(&envelope) {
+            return paimon_result_prepared_commit {
+                prepared: ptr::null_mut(),
+                error,
+            };
+        }
+        let mut normalized_messages = Vec::new();
+        if let Err(error) =
+            merge_messages_idempotently(&mut normalized_messages, &envelope.messages)
+        {
+            return paimon_result_prepared_commit {
+                prepared: ptr::null_mut(),
+                error,
+            };
+        }
+        envelope.messages = normalized_messages;
+        let state = PreparedCommitState {
+            commit_identifier: envelope.commit_identifier,
+            messages: CommitMessagesState {
+                messages: envelope.messages,
+                overwrite: envelope.overwrite,
+                table_location: envelope.table_location,
+                commit_user: envelope.commit_user,
+            },
+        };
+        let inner = Box::into_raw(Box::new(state)) as *mut c_void;
+        paimon_result_prepared_commit {
+            prepared: Box::into_raw(Box::new(paimon_prepared_commit { inner })),
+            error: ptr::null_mut(),
+        }
+    }));
+    outcome.unwrap_or_else(|_| paimon_result_prepared_commit {
+        prepared: ptr::null_mut(),
+        error: prepared_panic_error("paimon_prepared_commit_deserialize"),
+    })
+}
+
+/// Return the commit identifier carried by a prepared commit, or -1 for null.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_prepared_commit_identifier(
+    prepared: *const paimon_prepared_commit,
+) -> i64 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if prepared.is_null() || (*prepared).inner.is_null() {
+            return -1;
+        }
+        let state = &*((*prepared).inner as *const PreparedCommitState);
+        state.commit_identifier
+    }))
+    .unwrap_or(-1)
+}
+
+/// Free a prepared commit.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_prepared_commit_free(prepared: *mut paimon_prepared_commit) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if !prepared.is_null() {
+            let wrapper = Box::from_raw(prepared);
+            if !wrapper.inner.is_null() {
+                drop(Box::from_raw(wrapper.inner as *mut PreparedCommitState));
+            }
+        }
+    }));
+}
+
 fn validate_message_context(
     target_table: &str,
     target_user: &str,
@@ -835,6 +1325,90 @@ fn validate_message_context(
             "commit messages can only be merged when overwrite modes match",
         ));
     }
+    Ok(())
+}
+
+type CommitMessageGroupKey = (Vec<u8>, i32);
+type CommitFileKey = (u8, String);
+
+fn commit_message_file_keys(message: &CommitMessage) -> Vec<CommitFileKey> {
+    let mut keys = Vec::new();
+    let mut add_data_files = |category: u8, files: &[paimon::spec::DataFileMeta]| {
+        for file in files {
+            keys.push((category, file.file_name.clone()));
+            for extra in &file.extra_files {
+                keys.push((category + 1, extra.clone()));
+            }
+        }
+    };
+    add_data_files(0, &message.new_files);
+    add_data_files(2, &message.new_changelog_files);
+    add_data_files(4, &message.deleted_files);
+    for (category, files) in [
+        (6u8, &message.new_index_files),
+        (7u8, &message.deleted_index_files),
+    ] {
+        for file in files {
+            keys.push((category, file.file_name.clone()));
+        }
+    }
+    keys
+}
+
+fn merge_messages_idempotently(
+    target: &mut Vec<CommitMessage>,
+    source: &[CommitMessage],
+) -> Result<(), *mut paimon_error> {
+    let capacity = target
+        .len()
+        .checked_add(source.len())
+        .unwrap_or(MAX_PREPARED_MESSAGES)
+        .min(MAX_PREPARED_MESSAGES);
+    let mut merged = Vec::with_capacity(capacity);
+    let mut key_owners: HashMap<CommitMessageGroupKey, HashMap<CommitFileKey, usize>> =
+        HashMap::new();
+
+    for message in target.iter().chain(source) {
+        let message_keys = commit_message_file_keys(message);
+        // Empty writer fragments do not publish any metadata and can be
+        // removed without changing commit semantics.
+        if message_keys.is_empty() {
+            continue;
+        }
+        let unique_keys = message_keys.iter().cloned().collect::<HashSet<_>>();
+        if unique_keys.len() != message_keys.len() {
+            return Err(invalid_input(
+                "commit message contains a duplicate file identity",
+            ));
+        }
+
+        // Hash/copy a partition only once per message. Putting it in every
+        // file key makes merge CPU and memory proportional to
+        // partition_bytes * file_count.
+        let group = (message.partition.clone(), message.bucket);
+        let group_owners = key_owners.entry(group).or_default();
+        let owners = unique_keys
+            .iter()
+            .filter_map(|key| group_owners.get(key).copied())
+            .collect::<HashSet<_>>();
+        if !owners.is_empty() {
+            if owners.iter().any(|index| merged[*index] == *message) {
+                continue;
+            }
+            return Err(invalid_input(
+                "commit message merge found the same file identity with different fragment metadata",
+            ));
+        }
+        if merged.len() >= MAX_PREPARED_MESSAGES {
+            return Err(invalid_input(format!(
+                "merged commit contains more than {MAX_PREPARED_MESSAGES} messages"
+            )));
+        }
+        let owner = merged.len();
+        group_owners.extend(unique_keys.into_iter().map(|key| (key, owner)));
+        merged.push(message.clone());
+    }
+    *target = merged;
     Ok(())
 }
 
@@ -865,8 +1439,51 @@ pub unsafe extern "C" fn paimon_commit_messages_merge(
     ) {
         return error;
     }
-    target.messages.extend(source.messages.clone());
-    ptr::null_mut()
+    match merge_messages_idempotently(&mut target.messages, &source.messages) {
+        Ok(()) => ptr::null_mut(),
+        Err(error) => error,
+    }
+}
+
+/// Merge two durable prepared commits produced by parallel writers for the
+/// same table, commit user, mode and identifier.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_prepared_commit_merge(
+    target: *mut paimon_prepared_commit,
+    source: *const paimon_prepared_commit,
+) -> *mut paimon_error {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if let Err(error) = check_non_null(target, "target") {
+            return error;
+        }
+        if let Err(error) = check_non_null(source, "source") {
+            return error;
+        }
+        if ptr::eq(target, source.cast_mut()) {
+            return invalid_input("target and source prepared commits must be distinct handles");
+        }
+        let target = &mut *((*target).inner as *mut PreparedCommitState);
+        let source = &*((*source).inner as *const PreparedCommitState);
+        if target.commit_identifier != source.commit_identifier {
+            return invalid_input("prepared commits must have the same commit_identifier");
+        }
+        if let Err(error) = validate_message_context(
+            &target.messages.table_location,
+            &target.messages.commit_user,
+            target.messages.overwrite,
+            &source.messages.table_location,
+            &source.messages.commit_user,
+            source.messages.overwrite,
+        ) {
+            return error;
+        }
+        match merge_messages_idempotently(&mut target.messages.messages, &source.messages.messages)
+        {
+            Ok(()) => ptr::null_mut(),
+            Err(error) => error,
+        }
+    }));
+    outcome.unwrap_or_else(|_| prepared_panic_error("paimon_prepared_commit_merge"))
 }
 
 /// Merge postpone fixed-bucket messages for one logical commit.
@@ -896,8 +1513,10 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_commit_messages_merge(
     ) {
         return error;
     }
-    target.messages.extend(source.messages.clone());
-    ptr::null_mut()
+    match merge_messages_idempotently(&mut target.messages, &source.messages) {
+        Ok(()) => ptr::null_mut(),
+        Err(error) => error,
+    }
 }
 
 // ======================= Commit operations ===============================
@@ -929,17 +1548,118 @@ fn validate_commit_context(
     Ok(())
 }
 
+/// Commit a durable prepared commit using the retry-safe identifier path.
+///
+/// This is the correct operation after restoring a prepared commit or after a
+/// previous commit returned an indeterminate transport/IO error. A successful
+/// earlier commit with the same `(commit_user, commit_identifier)` is filtered.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_commit_commit_prepared(
+    tc: *const paimon_table_commit,
+    prepared: *const paimon_prepared_commit,
+) -> *mut paimon_error {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if let Err(error) = check_non_null(tc, "tc") {
+            return error;
+        }
+        if let Err(error) = check_non_null(prepared, "prepared") {
+            return error;
+        }
+        let table_commit = &*((*tc).inner as *const TableCommitState);
+        let prepared = &*((*prepared).inner as *const PreparedCommitState);
+        let messages = &prepared.messages;
+        if let Err(error) = validate_commit_context(
+            &table_commit.table_location,
+            &table_commit.commit_user,
+            table_commit.overwrite,
+            &messages.table_location,
+            &messages.commit_user,
+            messages.overwrite,
+        ) {
+            return error;
+        }
+        let result = if messages.overwrite {
+            runtime().block_on(table_commit.commit.overwrite_with_identifier(
+                messages.messages.clone(),
+                None,
+                prepared.commit_identifier,
+            ))
+        } else {
+            runtime().block_on(table_commit.commit.filter_and_commit_with_identifier(
+                messages.messages.clone(),
+                prepared.commit_identifier,
+            ))
+        };
+        match result {
+            Ok(()) => ptr::null_mut(),
+            Err(error) => paimon_error::from_paimon(error),
+        }
+    }));
+    outcome.unwrap_or_else(|_| prepared_panic_error("paimon_table_commit_commit_prepared"))
+}
+
+/// Abort files referenced by a durable prepared commit.
+///
+/// Do not call this after an indeterminate commit response: retry
+/// `paimon_table_commit_commit_prepared` first so a successful commit is not
+/// followed by deletion of its files. The caller must also fence/serialize all
+/// commit and abort operations for the same `(table, commit_user)` across
+/// processes. If retained snapshot history cannot prove that abort is safe,
+/// this function fails closed and deletes nothing.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_commit_abort_prepared(
+    tc: *const paimon_table_commit,
+    prepared: *const paimon_prepared_commit,
+) -> *mut paimon_error {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if let Err(error) = check_non_null(tc, "tc") {
+            return error;
+        }
+        if let Err(error) = check_non_null(prepared, "prepared") {
+            return error;
+        }
+        let table_commit = &*((*tc).inner as *const TableCommitState);
+        let prepared = &*((*prepared).inner as *const PreparedCommitState);
+        let messages = &prepared.messages;
+        if let Err(error) = validate_commit_context(
+            &table_commit.table_location,
+            &table_commit.commit_user,
+            table_commit.overwrite,
+            &messages.table_location,
+            &messages.commit_user,
+            messages.overwrite,
+        ) {
+            return error;
+        }
+        match runtime().block_on(
+            table_commit
+                .commit
+                .abort_if_uncommitted(&messages.messages, prepared.commit_identifier),
+        ) {
+            Ok(()) => ptr::null_mut(),
+            Err(error) => paimon_error::from_paimon(error),
+        }
+    }));
+    outcome.unwrap_or_else(|_| prepared_panic_error("paimon_table_commit_abort_prepared"))
+}
+
 unsafe fn standard_commit_with_identifier_impl(
     tc: *const paimon_table_commit,
     msgs: *mut paimon_commit_messages,
     commit_identifier: i64,
     filter_committed: bool,
+    batch_commit: bool,
 ) -> *mut paimon_error {
     if let Err(error) = check_non_null(tc, "tc") {
         return error;
     }
     if let Err(error) = check_non_null(msgs, "msgs") {
         return error;
+    }
+    if commit_identifier < 0 || (!batch_commit && commit_identifier == i64::MAX) {
+        return invalid_input(
+            "streaming commit_identifier must be non-negative and less than i64::MAX",
+        );
     }
     let table_commit = &*((*tc).inner as *const TableCommitState);
     let messages = &*((*msgs).inner as *const CommitMessagesState);
@@ -959,7 +1679,9 @@ unsafe fn standard_commit_with_identifier_impl(
         );
     }
     let messages = messages.messages.clone();
-    let result = if filter_committed {
+    let result = if batch_commit {
+        runtime().block_on(table_commit.commit.commit(messages))
+    } else if filter_committed {
         runtime().block_on(
             table_commit
                 .commit
@@ -984,7 +1706,7 @@ pub unsafe extern "C" fn paimon_table_commit_commit(
     tc: *const paimon_table_commit,
     msgs: *mut paimon_commit_messages,
 ) -> *mut paimon_error {
-    paimon_table_commit_commit_with_identifier(tc, msgs, i64::MAX)
+    standard_commit_with_identifier_impl(tc, msgs, i64::MAX, false, true)
 }
 
 /// Commit standard append messages with an identifier.
@@ -994,7 +1716,7 @@ pub unsafe extern "C" fn paimon_table_commit_commit_with_identifier(
     msgs: *mut paimon_commit_messages,
     commit_identifier: i64,
 ) -> *mut paimon_error {
-    standard_commit_with_identifier_impl(tc, msgs, commit_identifier, false)
+    standard_commit_with_identifier_impl(tc, msgs, commit_identifier, false, false)
 }
 
 /// Filter a committed identifier before committing standard append messages.
@@ -1004,7 +1726,7 @@ pub unsafe extern "C" fn paimon_table_commit_filter_and_commit_with_identifier(
     msgs: *mut paimon_commit_messages,
     commit_identifier: i64,
 ) -> *mut paimon_error {
-    standard_commit_with_identifier_impl(tc, msgs, commit_identifier, true)
+    standard_commit_with_identifier_impl(tc, msgs, commit_identifier, true, false)
 }
 
 /// Commit standard overwrite messages.
@@ -1036,6 +1758,11 @@ unsafe fn standard_overwrite_impl(
     }
     if let Err(error) = check_non_null(msgs, "msgs") {
         return error;
+    }
+    if commit_identifier.is_some_and(|identifier| identifier < 0 || identifier == i64::MAX) {
+        return invalid_input(
+            "streaming commit_identifier must be non-negative and less than i64::MAX",
+        );
     }
     let table_commit = &*((*tc).inner as *const TableCommitState);
     let messages = &*((*msgs).inner as *const CommitMessagesState);
@@ -1093,6 +1820,11 @@ unsafe fn paimon_table_commit_truncate_table_impl(
     if let Err(error) = check_non_null(tc, "tc") {
         return error;
     }
+    if commit_identifier.is_some_and(|identifier| identifier < 0 || identifier == i64::MAX) {
+        return invalid_input(
+            "streaming commit_identifier must be non-negative and less than i64::MAX",
+        );
+    }
     let table_commit = &*((*tc).inner as *const TableCommitState);
     let result = match commit_identifier {
         Some(commit_identifier) => runtime().block_on(
@@ -1143,12 +1875,18 @@ unsafe fn fixed_commit_with_identifier_impl(
     msgs: *mut paimon_postpone_fixed_bucket_commit_messages,
     commit_identifier: i64,
     filter_committed: bool,
+    batch_commit: bool,
 ) -> *mut paimon_error {
     if let Err(error) = check_non_null(tc, "tc") {
         return error;
     }
     if let Err(error) = check_non_null(msgs, "msgs") {
         return error;
+    }
+    if commit_identifier < 0 || (!batch_commit && commit_identifier == i64::MAX) {
+        return invalid_input(
+            "streaming commit_identifier must be non-negative and less than i64::MAX",
+        );
     }
     let table_commit = &*((*tc).inner as *const PostponeFixedBucketTableCommitState);
     let messages = &*((*msgs).inner as *const PostponeFixedBucketCommitMessagesState);
@@ -1163,7 +1901,9 @@ unsafe fn fixed_commit_with_identifier_impl(
         return error;
     }
     let messages = messages.messages.clone();
-    let result = if filter_committed {
+    let result = if batch_commit {
+        runtime().block_on(table_commit.commit.commit(messages))
+    } else if filter_committed {
         runtime().block_on(
             table_commit
                 .commit
@@ -1188,7 +1928,7 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_table_commit_commit(
     tc: *const paimon_postpone_fixed_bucket_table_commit,
     msgs: *mut paimon_postpone_fixed_bucket_commit_messages,
 ) -> *mut paimon_error {
-    paimon_postpone_fixed_bucket_table_commit_commit_with_identifier(tc, msgs, i64::MAX)
+    fixed_commit_with_identifier_impl(tc, msgs, i64::MAX, false, true)
 }
 
 /// Commit postpone fixed-bucket messages with an identifier.
@@ -1198,7 +1938,7 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_table_commit_commit_with_i
     msgs: *mut paimon_postpone_fixed_bucket_commit_messages,
     commit_identifier: i64,
 ) -> *mut paimon_error {
-    fixed_commit_with_identifier_impl(tc, msgs, commit_identifier, false)
+    fixed_commit_with_identifier_impl(tc, msgs, commit_identifier, false, false)
 }
 
 /// Filter a committed identifier before committing fixed-bucket messages.
@@ -1208,7 +1948,7 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_table_commit_filter_and_co
     msgs: *mut paimon_postpone_fixed_bucket_commit_messages,
     commit_identifier: i64,
 ) -> *mut paimon_error {
-    fixed_commit_with_identifier_impl(tc, msgs, commit_identifier, true)
+    fixed_commit_with_identifier_impl(tc, msgs, commit_identifier, true, false)
 }
 
 /// Truncate a table with a postpone fixed-bucket TableCommit.
@@ -1234,6 +1974,11 @@ unsafe fn fixed_truncate_table_impl(
 ) -> *mut paimon_error {
     if let Err(error) = check_non_null(tc, "tc") {
         return error;
+    }
+    if commit_identifier.is_some_and(|identifier| identifier < 0 || identifier == i64::MAX) {
+        return invalid_input(
+            "streaming commit_identifier must be non-negative and less than i64::MAX",
+        );
     }
     let table_commit = &*((*tc).inner as *const PostponeFixedBucketTableCommitState);
     let result = match commit_identifier {
@@ -1322,6 +2067,16 @@ const _: unsafe extern "C" fn(
     *mut paimon_commit_messages,
     *const paimon_commit_messages,
 ) -> *mut paimon_error = paimon_commit_messages_merge;
+const _: unsafe extern "C" fn(*const paimon_commit_messages, i64) -> paimon_result_prepared_commit =
+    paimon_commit_messages_prepare;
+const _: unsafe extern "C" fn(*const paimon_prepared_commit) -> paimon_result_bytes =
+    paimon_prepared_commit_serialize;
+const _: unsafe extern "C" fn(*const u8, usize) -> paimon_result_prepared_commit =
+    paimon_prepared_commit_deserialize;
+const _: unsafe extern "C" fn(
+    *mut paimon_prepared_commit,
+    *const paimon_prepared_commit,
+) -> *mut paimon_error = paimon_prepared_commit_merge;
 const _: unsafe extern "C" fn(
     *mut paimon_postpone_fixed_bucket_commit_messages,
     *const paimon_postpone_fixed_bucket_commit_messages,
@@ -1383,6 +2138,38 @@ const _: unsafe extern "C" fn(
     *mut paimon_commit_messages,
 ) -> *mut paimon_error = paimon_table_commit_abort;
 const _: unsafe extern "C" fn(
+    *const paimon_table_commit,
+    *const paimon_prepared_commit,
+) -> *mut paimon_error = paimon_table_commit_commit_prepared;
+const _: unsafe extern "C" fn(
+    *const paimon_table_commit,
+    *const paimon_prepared_commit,
+) -> *mut paimon_error = paimon_table_commit_abort_prepared;
+const _: unsafe extern "C" fn(
     *const paimon_postpone_fixed_bucket_table_commit,
     *mut paimon_postpone_fixed_bucket_commit_messages,
 ) -> *mut paimon_error = paimon_postpone_fixed_bucket_table_commit_abort;
+
+#[cfg(test)]
+mod raw_message_limit_tests {
+    use super::{RawPreparedCommitEnvelope, MAX_PREPARED_MESSAGES};
+
+    #[test]
+    fn raw_message_count_is_rejected_during_deserialization() {
+        let messages = (0..=MAX_PREPARED_MESSAGES)
+            .map(|_| "{}")
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"format":"paimon-rust-prepared-commit","version":2,"commit_identifier":1,"table_location":"memory:/table","commit_user":"job","overwrite":false,"messages":[{messages}]}}"#
+        );
+        let error = match serde_json::from_str::<RawPreparedCommitEnvelope<'_>>(&json) {
+            Ok(_) => panic!("oversized raw message list must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("more than"));
+        assert!(error
+            .to_string()
+            .contains(&MAX_PREPARED_MESSAGES.to_string()));
+    }
+}

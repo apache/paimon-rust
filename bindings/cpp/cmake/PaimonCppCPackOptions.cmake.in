@@ -1,0 +1,71 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# CPack loads this file once per generator. The RPM generator derives ELF
+# requirements itself; for a DEB built on a non-Debian host, derive the Ubuntu
+# OpenSSL package from the actual SONAME linked by libpaimon_c.
+if(CPACK_GENERATOR STREQUAL "DEB")
+  execute_process(
+    COMMAND "@CMAKE_READELF@" --dynamic "@paimon_c_library@"
+    RESULT_VARIABLE paimon_readelf_result
+    OUTPUT_VARIABLE paimon_dynamic_section
+    ERROR_VARIABLE paimon_readelf_error)
+  if(NOT paimon_readelf_result EQUAL 0)
+    message(
+      FATAL_ERROR
+        "Cannot inspect libpaimon_c dependencies: ${paimon_readelf_error}")
+  endif()
+
+  execute_process(
+    COMMAND "@CMAKE_READELF@" --version-info "@paimon_c_library@"
+    RESULT_VARIABLE paimon_version_info_result
+    OUTPUT_VARIABLE paimon_version_info
+    ERROR_VARIABLE paimon_version_info_error)
+  if(NOT paimon_version_info_result EQUAL 0)
+    message(
+      FATAL_ERROR
+        "Cannot inspect libpaimon_c symbol versions: ${paimon_version_info_error}")
+  endif()
+  string(
+    REGEX MATCHALL "GLIBC_[0-9]+\\.[0-9]+(\\.[0-9]+)?"
+          paimon_glibc_symbols "${paimon_version_info}")
+  set(paimon_minimum_glibc 0)
+  foreach(paimon_glibc_symbol IN LISTS paimon_glibc_symbols)
+    string(REPLACE "GLIBC_" "" paimon_glibc_version "${paimon_glibc_symbol}")
+    if(paimon_glibc_version VERSION_GREATER paimon_minimum_glibc)
+      set(paimon_minimum_glibc "${paimon_glibc_version}")
+    endif()
+  endforeach()
+  if(paimon_minimum_glibc STREQUAL 0)
+    message(FATAL_ERROR "No GLIBC symbol versions found in libpaimon_c")
+  endif()
+
+  set(paimon_debian_dependencies "libc6 (>= ${paimon_minimum_glibc})")
+  if(paimon_dynamic_section MATCHES "libssl\\.so\\.3")
+    list(APPEND paimon_debian_dependencies libssl3)
+  elseif(paimon_dynamic_section MATCHES "libssl\\.so\\.1\\.1")
+    list(APPEND paimon_debian_dependencies libssl1.1)
+  elseif(paimon_dynamic_section MATCHES "libssl\\.so")
+    message(
+      FATAL_ERROR
+        "Unsupported OpenSSL SONAME in libpaimon_c; set an explicit DEB mapping")
+  endif()
+  if(paimon_dynamic_section MATCHES "libgcc_s\\.so")
+    list(APPEND paimon_debian_dependencies "libgcc-s1 | libgcc1")
+  endif()
+  list(JOIN paimon_debian_dependencies ", " CPACK_DEBIAN_PACKAGE_DEPENDS)
+endif()

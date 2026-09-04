@@ -145,9 +145,13 @@ impl SnapshotManager {
         let hint_path = self.latest_hint_path();
         if let Some(hint_id) = self.read_hint(&hint_path).await {
             if hint_id > 0 {
-                let next_path = self.snapshot_path(hint_id + 1);
-                let next_input = self.file_io.new_input(&next_path)?;
-                if !next_input.exists().await? {
+                if let Some(next_id) = hint_id.checked_add(1) {
+                    let next_path = self.snapshot_path(next_id);
+                    let next_input = self.file_io.new_input(&next_path)?;
+                    if !next_input.exists().await? {
+                        return Ok(Some(hint_id));
+                    }
+                } else {
                     return Ok(Some(hint_id));
                 }
             }
@@ -654,6 +658,13 @@ mod tests {
         sm.write_latest_hint(42).await.unwrap();
         let hint = sm.read_hint(&sm.latest_hint_path()).await;
         assert_eq!(hint, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_latest_hint_at_max_id_does_not_overflow() {
+        let (_, sm) = setup("memory:/test_latest_hint_max").await;
+        sm.write_latest_hint(i64::MAX).await.unwrap();
+        assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), Some(i64::MAX));
     }
 
     #[tokio::test]

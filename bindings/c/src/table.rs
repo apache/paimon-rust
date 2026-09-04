@@ -675,6 +675,10 @@ pub unsafe extern "C" fn paimon_read_builder_new_read(
                 table: state.table.clone(),
                 read_type: table_read.read_type().to_vec(),
                 data_predicates: table_read.data_predicates().to_vec(),
+                table_location: state.table.location().to_string(),
+                table_branch: state.table.branch().to_string(),
+                schema_id: state.table.schema().id(),
+                read_fingerprint: read_builder_fingerprint(state),
             };
             paimon_result_new_read {
                 read: box_table_read_state(read_state),
