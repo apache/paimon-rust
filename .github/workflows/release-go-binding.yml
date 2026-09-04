@@ -38,6 +38,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -46,6 +50,7 @@ jobs:
       source_ref: ${{ steps.meta.outputs.source_ref }}
       tag: ${{ steps.meta.outputs.tag }}
       source_sha: ${{ steps.meta.outputs.source_sha }}
+      tag_object: ${{ steps.meta.outputs.tag_object }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -55,44 +60,91 @@ jobs:
       - name: Validate release version and tag
         id: meta
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
         run: |
-          event_name='${{ github.event_name }}'
+          set -euo pipefail
+          event_name="${GITHUB_EVENT_NAME}"
           version=''
           source_ref=''
 
           if [[ "$event_name" == "workflow_dispatch" ]]; then
-            version='${{ inputs.version }}'
-            source_ref='${{ inputs.source_ref }}'
+            version="$INPUT_VERSION"
+            source_ref="$INPUT_SOURCE_REF"
           else
-            tag_name='${{ github.ref_name }}'
-            source_ref='${{ github.sha }}'
+            tag_name="$GITHUB_REF_NAME"
+            source_ref="$GITHUB_SHA"
             version="$tag_name"
           fi
 
-          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
-            echo "invalid version: $version; expected vX.Y.Z or vX.Y.Z-rc.N" >&2
+          if [[ ! "$version" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-rc[1-9][0-9]*)?$ ]]; then
+            echo "invalid version: $version; expected vX.Y.Z or vX.Y.Z-rcN" >&2
             exit 1
           fi
+          tag_version="${BASH_REMATCH[1]}"
           if [[ -z "$source_ref" ]]; then
             echo "source_ref must not be empty" >&2
             exit 1
           fi
 
-          git rev-parse --verify "$source_ref^{commit}" >/dev/null 2>&1 || {
+          source_sha=$(git rev-parse --verify "$source_ref^{commit}") || {
             echo "source_ref does not resolve to a commit: $source_ref" >&2
             exit 1
           }
 
-          tag="bindings/go/$version"
-          if git rev-parse "$tag" >/dev/null 2>&1; then
-            echo "tag already exists: $tag" >&2
+          workspace_version=$(
+            cargo metadata --locked --format-version 1 --no-deps |
+              jq -er '.packages[] | select(.name == "paimon") | .version'
+          )
+          if [[ "$tag_version" != "$workspace_version" ]]; then
+            echo "version $tag_version does not match workspace $workspace_version" >&2
             exit 1
+          fi
+
+          tag="bindings/go/$version"
+          tag_ref="refs/tags/$tag"
+          tag_object=''
+          if git show-ref --verify --quiet "$tag_ref"; then
+            tag_object=$(git rev-parse "$tag_ref")
+            if [[ "$(git cat-file -t "$tag_ref")" != "tag" ]]; then
+              echo "existing release tag is not annotated: $tag" >&2
+              exit 1
+            fi
+            tag_commit=$(git rev-parse "$tag_ref^{commit}")
+            tag_line=$(git rev-list --parents -n 1 "$tag_commit")
+            if [[ "$tag_commit" != "$source_sha" && "$tag_line" != "$tag_commit $source_sha" ]]; then
+              echo "existing tag $tag is not based on $source_sha" >&2
+              exit 1
+            fi
+            if [[ "$tag_commit" != "$source_sha" ]]; then
+              while IFS= read -r path; do
+                case "$path" in
+                  bindings/go/LICENSE | \
+                    bindings/go/NOTICE | \
+                    bindings/go/libpaimon_c.linux.amd64.so.zst | \
+                    bindings/go/libpaimon_c.linux.arm64.so.zst | \
+                    bindings/go/libpaimon_c.darwin.amd64.dylib.zst | \
+                    bindings/go/libpaimon_c.darwin.arm64.dylib.zst | \
+                    bindings/go/THIRD-PARTY-LICENSES.linux.amd64.html | \
+                    bindings/go/THIRD-PARTY-LICENSES.linux.arm64.html | \
+                    bindings/go/THIRD-PARTY-LICENSES.darwin.amd64.html | \
+                    bindings/go/THIRD-PARTY-LICENSES.darwin.arm64.html) ;;
+                  *)
+                    echo "existing tag $tag changes unexpected path: $path" >&2
+                    exit 1
+                    ;;
+                esac
+              done < <(git diff-tree --no-commit-id --name-only -r "$source_sha" "$tag_commit")
+            fi
+            echo "existing tag $tag is based on the requested source; the release can resume"
           fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "source_ref=$source_ref" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$(git rev-parse "$source_ref^{commit}")" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "tag_object=$tag_object" >> "$GITHUB_OUTPUT"
 
   build:
     needs: validate
@@ -194,10 +246,12 @@ jobs:
             release/go/${{ matrix.license_file }}
           if-no-files-found: error
 
-  publish:
+  tag:
     needs:
       - validate
       - build
+    outputs:
+      tag_object: ${{ steps.tag_state.outputs.tag_object }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -236,15 +290,49 @@ jobs:
           python3 scripts/verify_go_release_artifacts.py --artifacts-dir release/go
 
       - name: Create release tag commit
+        id: tag_state
         env:
           TAG: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
           SOURCE_REF: ${{ needs.validate.outputs.source_ref }}
           SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
         shell: bash
         run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          release_files=(
+            LICENSE
+            NOTICE
+            libpaimon_c.linux.amd64.so.zst
+            libpaimon_c.linux.arm64.so.zst
+            libpaimon_c.darwin.amd64.dylib.zst
+            libpaimon_c.darwin.arm64.dylib.zst
+            THIRD-PARTY-LICENSES.linux.amd64.html
+            THIRD-PARTY-LICENSES.linux.arm64.html
+            THIRD-PARTY-LICENSES.darwin.amd64.html
+            THIRD-PARTY-LICENSES.darwin.arm64.html
+          )
+          tag_ref="refs/tags/$TAG"
+          current_tag_object=''
+          if git show-ref --verify --quiet "$tag_ref"; then
+            current_tag_object=$(git rev-parse "$tag_ref")
+          fi
+          if [[ "$current_tag_object" != "$EXPECTED_TAG_OBJECT" ]]; then
+            echo "tag $TAG changed after validation" >&2
+            exit 1
+          fi
+          if [[ -n "$EXPECTED_TAG_OBJECT" ]]; then
+            echo "Reusing artifacts from existing tag: $TAG"
+            for file in "${release_files[@]}"; do
+              git show "${EXPECTED_TAG_OBJECT}^{commit}:bindings/go/${file}" > "release/go/${file}"
+            done
+            python3 scripts/verify_go_release_artifacts.py --artifacts-dir release/go
+            echo "tag_object=$EXPECTED_TAG_OBJECT" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           cp release/go/libpaimon_c.*.zst bindings/go/
           cp \
@@ -264,24 +352,100 @@ jobs:
 
           git tag -a "$TAG" -m "Release Go binding ${VERSION} from ${SOURCE_REF}@${SOURCE_SHA}"
           git push origin "refs/tags/$TAG"
+          tag_object=$(git rev-parse "refs/tags/$TAG")
+          echo "tag_object=$tag_object" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs:
+      - validate
+      - tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate.outputs.source_sha }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install artifact verification tools
+        run: sudo apt-get update && sudo apt-get install -y file zstd
+
+      - name: Restore and verify tagged release artifacts
+        env:
+          TAG_OBJECT: ${{ needs.tag.outputs.tag_object }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/go
+          release_files=(
+            LICENSE
+            NOTICE
+            libpaimon_c.linux.amd64.so.zst
+            libpaimon_c.linux.arm64.so.zst
+            libpaimon_c.darwin.amd64.dylib.zst
+            libpaimon_c.darwin.arm64.dylib.zst
+            THIRD-PARTY-LICENSES.linux.amd64.html
+            THIRD-PARTY-LICENSES.linux.arm64.html
+            THIRD-PARTY-LICENSES.darwin.amd64.html
+            THIRD-PARTY-LICENSES.darwin.arm64.html
+          )
+          for file in "${release_files[@]}"; do
+            git show "${TAG_OBJECT}^{commit}:bindings/go/${file}" > "release/go/${file}"
+          done
+          python3 scripts/verify_go_release_artifacts.py --artifacts-dir release/go
 
       - name: Create GitHub release
         env:
           TAG: ${{ needs.validate.outputs.tag }}
           VERSION: ${{ needs.validate.outputs.version }}
+          TAG_OBJECT: ${{ needs.tag.outputs.tag_object }}
           GH_TOKEN: ${{ github.token }}
         working-directory: release/go
         run: |
-          gh release create "$TAG" \
-            --title "Release Go binding $VERSION" \
-            --generate-notes \
-            LICENSE \
-            NOTICE \
-            libpaimon_c.linux.amd64.so.zst \
-            libpaimon_c.linux.arm64.so.zst \
-            libpaimon_c.darwin.amd64.dylib.zst \
-            libpaimon_c.darwin.arm64.dylib.zst \
-            THIRD-PARTY-LICENSES.linux.amd64.html \
-            THIRD-PARTY-LICENSES.linux.arm64.html \
-            THIRD-PARTY-LICENSES.darwin.amd64.html \
+          set -euo pipefail
+          remote_tag_object=$(
+            git ls-remote --refs origin "refs/tags/$TAG" |
+              awk 'NR == 1 { print $1 }'
+          )
+          if [[ "$remote_tag_object" != "$TAG_OBJECT" ]]; then
+            echo "remote tag $TAG changed before GitHub Release creation" >&2
+            exit 1
+          fi
+          release_files=(
+            LICENSE
+            NOTICE
+            libpaimon_c.linux.amd64.so.zst
+            libpaimon_c.linux.arm64.so.zst
+            libpaimon_c.darwin.amd64.dylib.zst
+            libpaimon_c.darwin.arm64.dylib.zst
+            THIRD-PARTY-LICENSES.linux.amd64.html
+            THIRD-PARTY-LICENSES.linux.arm64.html
+            THIRD-PARTY-LICENSES.darwin.amd64.html
             THIRD-PARTY-LICENSES.darwin.arm64.html
+          )
+          prerelease=false
+          release_flags=(--verify-tag --latest=false)
+          if [[ "$VERSION" == *-rc* ]]; then
+            prerelease=true
+            release_flags+=(--prerelease)
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Updating assets on existing GitHub release: $TAG"
+            gh release upload "$TAG" "${release_files[@]}" --clobber
+            gh release edit "$TAG" \
+              --title "Release Go binding $VERSION" \
+              --draft=false \
+              --prerelease="$prerelease" \
+              --latest=false
+          else
+            gh release create "$TAG" \
+              --title "Release Go binding $VERSION" \
+              --generate-notes \
+              "${release_flags[@]}" \
+              "${release_files[@]}"
+          fi

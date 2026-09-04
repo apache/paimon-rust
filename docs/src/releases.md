@@ -25,11 +25,35 @@ Apache Paimon Rust follows [Semantic Versioning](https://semver.org/). All relea
 
 ## Upcoming
 
-### 0.3.0 (In Development)
+### 0.4.0 (In Development)
 
 See [GitHub Issues](https://github.com/apache/paimon-rust/issues) for the current roadmap.
 
+The minimum supported Rust version for 0.4.0 is 1.94.
+
+Key features:
+
+- Expanded primary-key vector and hybrid search with vector/full-text fusion, streamed index builds, DiskANN and quantized IVF backends, scalar pre-filtering, and externally planned bucket splits
+- Java-compatible file and global indexes, including Bloom, Bitmap V1/V2 reads and V2 writes, multi-value array indexes, and exact FM substring search
+- Native read-only object tables and `TableType`-based routing to pluggable external table engines
+- Batch incremental-diff reads, watermark-based time travel, and deletion-vector merge-on-read for uncompacted primary-key snapshots
+- Expanded DataFusion SQL with `ALTER COLUMN`, database lifecycle statements, configurable runtime resources, and the Java-compatible `$consumers` system table
+- Expanded Go table-write support plus postpone-table fixed-bucket write primitives for Rust, C, and Go, with Python commit rollback
+- Standalone `BlobDescriptor` batch reads and seekable streams, with Go batch and stream APIs and `MAP<STRING, BLOB>` descriptor reads
+- Extensible and cached I/O through caller-provided OpenDAL operators, an in-memory local block cache, and C cache callbacks
+
 ## Past Releases
+
+### [0.3.0](https://github.com/apache/paimon-rust/releases/tag/v0.3.0)
+
+Key features:
+
+- Primary-key changelog writes plus aggregation and partial-update merge improvements
+- Java-compatible Mosaic, Vortex, schema-evolution, and data-evolution read paths
+- Lumina and vindex vector search, hybrid search, and BTree, bitmap, and full-text global indexes
+- Dedicated vector storage plus BLOB and VARIANT type support
+- DataFusion 54 integration, REST catalog views and functions, and a filesystem-backed REST server
+- Expanded Python DataFrame-style read/write APIs and C and Go binding coverage
 
 ### [0.2.0](https://github.com/apache/paimon-rust/releases/tag/v0.2.0)
 

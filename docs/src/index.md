@@ -43,7 +43,7 @@ ZSTD data files use 23.25% less physical storage than the SNAPPY source files.
 
 ## Status
 
-The project is under active development (0.3.0 in development).
+The project is under active development (0.4.0 in development).
 
 ## License
 
