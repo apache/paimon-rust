@@ -24,7 +24,7 @@ use crate::{
         file_index_reader::{EmptyFileIndexReader, FileIndexReader},
         file_indexer_factory::FileIndexerFactory,
     },
-    io::{FileIO, FileRead, FileStatus, InputFile, OutputFile},
+    io::{FileIO, FileRead, InputFile, OutputFile},
     spec::{DataField, DataType},
     Error,
 };
@@ -364,7 +364,6 @@ pub struct FileIndex {
 
 impl FileIndex {
     /// Constructs readers for the required columns described by this outer-format file.
-    #[allow(dead_code)]
     pub(crate) async fn create_index_readers(
         &self,
         fields: &[DataField],
@@ -382,6 +381,9 @@ impl FileIndex {
             };
             let mut column_readers = Vec::with_capacity(index_info.len());
             for (identifier, info) in index_info {
+                if !FileIndexerFactory::is_supported(identifier) {
+                    continue;
+                }
                 if info.start_pos == EMPTY_INDEX_FLAG {
                     column_readers.push(Box::new(EmptyFileIndexReader) as Box<dyn FileIndexReader>);
                     continue;
@@ -468,16 +470,27 @@ impl FileIndex {
 
 pub struct FileIndexFormatReader {
     reader: Box<dyn FileRead>,
-    stat: FileStatus,
+    file_size: u64,
 }
 
 impl FileIndexFormatReader {
     pub async fn get_file_index(input_file: InputFile) -> crate::Result<FileIndex> {
         let reader = input_file.reader().await?;
-        let mut file_reader = Self {
-            reader: Box::new(reader),
-            stat: input_file.metadata().await?,
-        };
+        let file_size = input_file.metadata().await?.size;
+        Self::get_file_index_from_reader(Box::new(reader), file_size).await
+    }
+
+    pub(crate) async fn get_file_index_from_bytes(bytes: Bytes) -> crate::Result<FileIndex> {
+        let file_size = u64::try_from(bytes.len())
+            .map_err(|_| format_invalid("embedded file index is too large"))?;
+        Self::get_file_index_from_reader(Box::new(BytesFileRead(bytes)), file_size).await
+    }
+
+    async fn get_file_index_from_reader(
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+    ) -> crate::Result<FileIndex> {
+        let mut file_reader = Self { reader, file_size };
         let header = file_reader.read_header().await?;
         Ok(FileIndex {
             header,
@@ -486,10 +499,10 @@ impl FileIndexFormatReader {
     }
 
     async fn read_header(&mut self) -> crate::Result<HashMap<String, HashMap<String, IndexInfo>>> {
-        if self.stat.size < FIXED_HEADER_LENGTH as u64 {
+        if self.file_size < FIXED_HEADER_LENGTH as u64 {
             return Err(format_invalid(format!(
                 "truncated fixed header: need {FIXED_HEADER_LENGTH} bytes, but file has {}",
-                self.stat.size
+                self.file_size
             )));
         }
 
@@ -521,10 +534,10 @@ impl FileIndexFormatReader {
                 "header length {head_length} is smaller than the minimum {MIN_HEADER_LENGTH}"
             )));
         }
-        if head_length as u64 > self.stat.size {
+        if head_length as u64 > self.file_size {
             return Err(format_invalid(format!(
                 "header length {head_length} exceeds file size {}",
-                self.stat.size
+                self.file_size
             )));
         }
 
@@ -548,7 +561,7 @@ impl FileIndexFormatReader {
                 let index_name = read_java_utf(&mut buffer, "index name")?;
                 let start_pos = read_i32(&mut buffer, "index start position")?;
                 let length = read_i32(&mut buffer, "index length")?;
-                Self::validate_index_range(start_pos, length, head_length as u64, self.stat.size)?;
+                Self::validate_index_range(start_pos, length, head_length as u64, self.file_size)?;
                 index_info_map.insert(index_name, IndexInfo { start_pos, length });
             }
 
@@ -621,6 +634,27 @@ impl FileIndexFormatReader {
             )));
         }
         Ok(())
+    }
+}
+
+struct BytesFileRead(Bytes);
+
+#[async_trait::async_trait]
+impl FileRead for BytesFileRead {
+    async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+        let start = usize::try_from(range.start)
+            .map_err(|_| format_invalid("embedded file index range start is too large"))?;
+        let end = usize::try_from(range.end)
+            .map_err(|_| format_invalid("embedded file index range end is too large"))?;
+        if start > end || end > self.0.len() {
+            return Err(format_invalid(format!(
+                "embedded file index range {}..{} exceeds byte length {}",
+                range.start,
+                range.end,
+                self.0.len()
+            )));
+        }
+        Ok(self.0.slice(start..end))
     }
 }
 
@@ -781,6 +815,53 @@ mod file_index_format_tests {
         let actual = output.to_input_file().read().await?;
 
         assert_eq!(actual.as_ref(), hex::decode(JAVA_V1_SIMPLE).unwrap());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embedded_bytes_reader_matches_sidecar_reader() -> crate::Result<()> {
+        let fields = [DataField::new(
+            0,
+            "a".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+        let mut writer = FileIndexerFactory::create_writer(
+            BITMAP_INDEX,
+            fields[0].data_type().clone(),
+            &Options::new(),
+        )?;
+        for value in [Datum::Int(1), Datum::Int(2), Datum::Int(1)] {
+            writer.write(Some(&value))?;
+        }
+        let indexes = HashMap::from([(
+            "a".to_string(),
+            HashMap::from([(BITMAP_INDEX.to_string(), Some(writer.serialized_bytes()?))]),
+        )]);
+        let output = write_column_indexes("memory:/tmp/embedded_file_index", indexes).await?;
+        let bytes = output.clone().to_input_file().read().await?;
+        let sidecar = FileIndexFormatReader::get_file_index(output.to_input_file()).await?;
+        let embedded = FileIndexFormatReader::get_file_index_from_bytes(bytes).await?;
+        let required_columns = HashSet::from(["a".to_string()]);
+        let predicate = PredicateBuilder::new(&fields).equal("a", Datum::Int(1))?;
+
+        let sidecar_result = FileIndexPredicate::new(
+            sidecar
+                .create_index_readers(&fields, &required_columns)
+                .await?,
+        )
+        .evaluate(&predicate);
+        let embedded_result = FileIndexPredicate::new(
+            embedded
+                .create_index_readers(&fields, &required_columns)
+                .await?,
+        )
+        .evaluate(&predicate);
+
+        assert_eq!(embedded_result, sidecar_result);
+        assert_eq!(
+            embedded_result,
+            FileIndexResult::Selection([0_u32, 2].into_iter().collect())
+        );
         Ok(())
     }
 
@@ -1098,7 +1179,7 @@ mod file_index_format_tests {
         assert_eq!(readers.len(), 3);
         assert_eq!(readers["a"].len(), 2);
         assert_eq!(readers["b"].len(), 1);
-        assert_eq!(readers["empty"].len(), 1);
+        assert!(readers["empty"].is_empty());
 
         let predicate = FileIndexPredicate::new(readers);
         let builder = PredicateBuilder::new(&fields);
@@ -1112,7 +1193,7 @@ mod file_index_format_tests {
         );
         assert_eq!(
             predicate.evaluate(&builder.equal("empty", Datum::Int(1))?),
-            FileIndexResult::Skip
+            FileIndexResult::Remain
         );
 
         Ok(())
@@ -1177,28 +1258,52 @@ mod file_index_format_tests {
     }
 
     #[tokio::test]
-    async fn test_composition_rejects_unknown_non_empty_identifier() -> crate::Result<()> {
-        let indexes = HashMap::from([(
-            "a".to_string(),
-            HashMap::from([("unknown".to_string(), Some(Bytes::from_static(b"payload")))]),
-        )]);
-        let output = write_column_indexes("memory:/tmp/unknown_file_index", indexes).await?;
-        let file_index = FileIndexFormatReader::get_file_index(output.to_input_file()).await?;
-        let fields = [DataField::new(
-            0,
-            "a".to_string(),
-            DataType::Int(IntType::new()),
-        )];
-
-        let required_columns = HashSet::from(["a".to_string()]);
-        let error = match file_index
-            .create_index_readers(&fields, &required_columns)
-            .await
-        {
-            Ok(_) => panic!("unknown identifier must fail"),
-            Err(error) => error,
+    async fn test_composition_skips_unknown_payload_and_keeps_supported_reader() -> crate::Result<()>
+    {
+        let data_type = DataType::Int(IntType::new());
+        let mut writer =
+            FileIndexerFactory::create_writer(BITMAP_INDEX, data_type.clone(), &Options::new())?;
+        writer.write(Some(&Datum::Int(1)))?;
+        let supported_payload = writer.serialized_bytes()?;
+        let unknown_payload = Bytes::from_static(b"must not be read");
+        let supported_end = supported_payload.len() as u64;
+        let mut data = BytesMut::with_capacity(supported_payload.len() + unknown_payload.len());
+        data.extend_from_slice(&supported_payload);
+        data.extend_from_slice(&unknown_payload);
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let file_index = FileIndex {
+            reader: Box::new(TrackingFileRead {
+                data: data.freeze(),
+                ranges: Arc::clone(&ranges),
+            }),
+            header: HashMap::from([(
+                "a".to_string(),
+                HashMap::from([
+                    (
+                        BITMAP_INDEX.to_string(),
+                        IndexInfo {
+                            start_pos: 0,
+                            length: supported_end as i32,
+                        },
+                    ),
+                    (
+                        "unknown".to_string(),
+                        IndexInfo {
+                            start_pos: supported_end as i32,
+                            length: unknown_payload.len() as i32,
+                        },
+                    ),
+                ]),
+            )]),
         };
-        assert!(matches!(error, Error::Unsupported { .. }));
+        let fields = [DataField::new(0, "a".to_string(), data_type)];
+
+        let readers = file_index
+            .create_index_readers(&fields, &HashSet::from(["a".to_string()]))
+            .await?;
+
+        assert_eq!(readers["a"].len(), 1);
+        assert_eq!(*ranges.lock().unwrap(), vec![0..supported_end]);
         Ok(())
     }
 

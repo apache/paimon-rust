@@ -16,11 +16,12 @@
 // under the License.
 
 // Concrete readers/writers and predicate plumbing stay crate-private until
-// data-writer and scan integration land in later changes.
+// writer integration and the API surface are ready to stabilize.
 #[allow(dead_code)]
 pub(crate) mod bitmap;
 #[allow(dead_code)]
 pub(crate) mod bloom_filter;
+pub(crate) mod evaluator;
 mod file_index_format;
 #[allow(dead_code)]
 pub(crate) mod file_index_predicate;

@@ -23,6 +23,7 @@ const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
 pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
+const FILE_INDEX_READ_ENABLED_OPTION: &str = "file-index.read.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
 const SCALAR_INDEX_SEARCH_MODE_OPTION: &str = "scalar-index.search-mode";
@@ -654,6 +655,14 @@ impl<'a> CoreOptions<'a> {
             .get(DATA_EVOLUTION_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    /// Whether raw data-file reads use FileIndex pruning. Default is true.
+    pub fn file_index_read_enabled(&self) -> bool {
+        self.options
+            .get(FILE_INDEX_READ_ENABLED_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
     }
 
     /// The declared [`TableType`], defaulting to [`TableType::Table`].
@@ -1575,6 +1584,18 @@ mod tests {
             let options = HashMap::from([("read.batch-size".to_string(), value.to_string())]);
             assert!(CoreOptions::new(&options).read_batch_size().is_err());
         }
+    }
+
+    #[test]
+    fn test_file_index_read_enabled() {
+        let options = HashMap::new();
+        assert!(CoreOptions::new(&options).file_index_read_enabled());
+
+        let options = HashMap::from([(
+            FILE_INDEX_READ_ENABLED_OPTION.to_string(),
+            "false".to_string(),
+        )]);
+        assert!(!CoreOptions::new(&options).file_index_read_enabled());
     }
 
     #[test]

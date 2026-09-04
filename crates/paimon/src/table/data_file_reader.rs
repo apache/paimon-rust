@@ -20,6 +20,8 @@ use crate::arrow::format::create_format_reader_with_budget;
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::arrow::ParquetReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
+use crate::file_index::evaluator::evaluate_file_index;
+use crate::file_index::file_index_result::FileIndexResult;
 use crate::io::{FileIO, FileRead};
 use crate::spec::{
     is_variant_extraction_row_type, DataField, DataFileMeta, DataType, Predicate, ROW_ID_FIELD_NAME,
@@ -33,6 +35,7 @@ use arrow_cast::cast;
 
 use async_stream::try_stream;
 use futures::StreamExt;
+use roaring::RoaringBitmap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -112,6 +115,7 @@ pub(crate) struct DataFileReader {
     table_fields: Vec<DataField>,
     read_type: Vec<DataField>,
     predicates: Vec<Predicate>,
+    file_index_read_enabled: bool,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     blob_as_descriptor: bool,
     batch_size: Option<usize>,
@@ -135,6 +139,7 @@ impl DataFileReader {
             table_fields,
             read_type,
             predicates,
+            file_index_read_enabled: false,
             row_filter_factory: None,
             blob_as_descriptor: false,
             batch_size: None,
@@ -145,6 +150,11 @@ impl DataFileReader {
 
     pub(crate) fn with_blob_as_descriptor(mut self, blob_as_descriptor: bool) -> Self {
         self.blob_as_descriptor = blob_as_descriptor;
+        self
+    }
+
+    pub(crate) fn with_file_index_read_enabled(mut self, enabled: bool) -> Self {
+        self.file_index_read_enabled = enabled;
         self
     }
 
@@ -257,12 +267,59 @@ impl DataFileReader {
                         timing.add_file_schema_open(start.elapsed());
                     }
 
-                    let mut stream = reader.read_single_file_stream(
+                    let file_fields = data_fields
+                        .as_deref()
+                        .unwrap_or(reader.table_fields.as_slice());
+                    let file_index_result = if reader.file_index_read_enabled {
+                        evaluate_file_index(
+                            &reader.file_io,
+                            split.bucket_path(),
+                            &file_meta,
+                            &reader.table_fields,
+                            file_fields,
+                            &reader.predicates,
+                        )
+                        .await?
+                    } else {
+                        FileIndexResult::Remain
+                    };
+
+                    let split_ranges = split.row_ranges().map(|ranges| {
+                        to_local_row_ranges(
+                            ranges,
+                            file_meta.first_row_id.unwrap_or(0),
+                            file_meta.row_count,
+                        )
+                    });
+                    let selected_ranges = match file_index_result {
+                        FileIndexResult::Remain => split_ranges,
+                        FileIndexResult::Skip => Some(Vec::new()),
+                        FileIndexResult::Selection(selection) => {
+                            match file_index_selection_to_local_ranges(
+                                &selection,
+                                file_meta.row_count,
+                            )? {
+                                Some(index_ranges) => Some(match split_ranges {
+                                    Some(split_ranges) => {
+                                        intersect_sorted_ranges(&index_ranges, &split_ranges)
+                                    }
+                                    None => index_ranges,
+                                }),
+                                None => split_ranges,
+                            }
+                        }
+                    };
+                    let row_selection = merge_row_selection(
+                        file_meta.row_count,
+                        dv.as_deref(),
+                        selected_ranges.as_deref(),
+                    );
+
+                    let mut stream = reader.read_single_file_stream_with_selection(
                         &split,
                         file_meta,
                         data_fields,
-                        dv,
-                        split.row_ranges().map(|ranges| ranges.to_vec()),
+                        row_selection,
                     )?;
                     while let Some(batch) = stream.next().await {
                         yield batch?;
@@ -340,6 +397,25 @@ impl DataFileReader {
         dv: Option<Arc<DeletionVector>>,
         row_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        let local_ranges = row_ranges.as_ref().map(|ranges| {
+            to_local_row_ranges(
+                ranges,
+                file_meta.first_row_id.unwrap_or(0),
+                file_meta.row_count,
+            )
+        });
+        let row_selection =
+            merge_row_selection(file_meta.row_count, dv.as_deref(), local_ranges.as_deref());
+        self.read_single_file_stream_with_selection(split, file_meta, data_fields, row_selection)
+    }
+
+    fn read_single_file_stream_with_selection(
+        &self,
+        split: &DataSplit,
+        file_meta: DataFileMeta,
+        data_fields: Option<Vec<DataField>>,
+        row_selection: Option<Vec<RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         // Guard at the true risk site: `_ROW_ID` is materialized positionally from
         // each batch's row count (see `row_id_column_for_batch`), assuming the
         // reader emits rows in original file order and count. Format readers may
@@ -351,6 +427,9 @@ impl DataFileReader {
         // data-evolution readers; both strip/omit `_ROW_ID` from the read_type
         // they pass, so this guard does not affect them.
         Self::reject_row_id_with_predicates(&self.read_type, &self.predicates)?;
+        if row_selection.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(futures::stream::empty().boxed());
+        }
 
         let read_type = self.read_type.clone();
         let table_fields = self.table_fields.clone();
@@ -440,21 +519,11 @@ impl DataFileReader {
                 None => Box::new(file_reader),
             };
             let is_parquet = path_to_read.to_ascii_lowercase().ends_with(".parquet");
-            let local_ranges = row_ranges.as_ref().map(|ranges| {
-                to_local_row_ranges(ranges, file_meta.first_row_id.unwrap_or(0), file_meta.row_count)
-            });
-
-            let row_selection = merge_row_selection(
-                file_meta.row_count,
-                dv.as_deref(),
-                local_ranges.as_deref(),
+            let selected_row_ids = selected_row_ids_for_read(
+                projects_row_id,
+                file_meta.first_row_id,
+                row_selection.as_deref(),
             );
-            let selected_row_ids = match (file_meta.first_row_id, row_selection.as_ref()) {
-                (Some(first_row_id), Some(ranges)) => {
-                    Some(expand_local_selected_row_ids(first_row_id, ranges))
-                }
-                _ => None,
-            };
             let mut row_id_cursor = file_meta.first_row_id.unwrap_or(0);
             let mut row_id_offset = 0usize;
 
@@ -891,24 +960,26 @@ fn is_row_file(file_meta: &DataFileMeta) -> bool {
             .is_some_and(|path| path.to_ascii_lowercase().ends_with(".row"))
 }
 
-/// Convert absolute RowRanges to file-local 0-based ranges.
+/// Convert absolute RowRanges to normalized file-local 0-based ranges.
 fn to_local_row_ranges(
     row_ranges: &[RowRange],
     first_row_id: i64,
     row_count: i64,
 ) -> Vec<RowRange> {
     let file_end = first_row_id + row_count - 1;
-    row_ranges
-        .iter()
-        .filter_map(|r| {
-            if r.to() < first_row_id || r.from() > file_end {
-                return None;
-            }
-            let local_from = (r.from() - first_row_id).max(0);
-            let local_to = (r.to() - first_row_id).min(row_count - 1);
-            Some(RowRange::new(local_from, local_to))
-        })
-        .collect()
+    crate::table::merge_row_ranges(
+        row_ranges
+            .iter()
+            .filter_map(|r| {
+                if r.to() < first_row_id || r.from() > file_end {
+                    return None;
+                }
+                let local_from = (r.from() - first_row_id).max(0);
+                let local_to = (r.to() - first_row_id).min(row_count - 1);
+                Some(RowRange::new(local_from, local_to))
+            })
+            .collect(),
+    )
 }
 
 /// Coalesce sorted, de-duplicated 0-based physical positions into contiguous
@@ -933,6 +1004,39 @@ fn coalesce_positions_to_local_ranges(sorted_positions: &[i64]) -> Vec<RowRange>
     }
     ranges.push(RowRange::new(start, end));
     ranges
+}
+
+const MAX_FILE_INDEX_ROW_RANGES: usize = 65_536;
+
+/// Convert a bitmap into contiguous ranges without visiting every selected row.
+/// `None` means the bitmap is too fragmented to materialize safely and callers
+/// must preserve other restrictions and rely on the residual predicate.
+fn file_index_selection_to_local_ranges(
+    selection: &RoaringBitmap,
+    row_count: i64,
+) -> crate::Result<Option<Vec<RowRange>>> {
+    if let Some(position) = selection.max() {
+        if i64::from(position) >= row_count {
+            return Err(Error::FileIndexFormatInvalid {
+                message: format!(
+                    "FileIndex selected row position {position} outside data file row count {row_count}"
+                ),
+            });
+        }
+    }
+
+    let mut ranges = Vec::new();
+    let mut positions = selection.iter();
+    while let Some(range) = positions.next_range() {
+        if ranges.len() == MAX_FILE_INDEX_ROW_RANGES {
+            return Ok(None);
+        }
+        ranges.push(RowRange::new(
+            i64::from(*range.start()),
+            i64::from(*range.end()),
+        ));
+    }
+    Ok(Some(ranges))
 }
 
 /// Merge DV and row_ranges into a unified list of 0-based inclusive RowRanges.
@@ -1051,6 +1155,22 @@ fn expand_local_selected_row_ids(first_row_id: i64, local_ranges: &[RowRange]) -
         }
     }
     ids
+}
+
+fn selected_row_ids_for_read(
+    projects_row_id: bool,
+    first_row_id: Option<i64>,
+    row_selection: Option<&[RowRange]>,
+) -> Option<Vec<i64>> {
+    if !projects_row_id {
+        return None;
+    }
+    match (first_row_id, row_selection) {
+        (Some(first_row_id), Some(ranges)) => {
+            Some(expand_local_selected_row_ids(first_row_id, ranges))
+        }
+        _ => None,
+    }
 }
 
 fn row_id_column_for_batch(
@@ -1486,10 +1606,17 @@ mod row_tests {
 mod tests {
     use super::*;
     use crate::arrow::build_target_arrow_schema;
+    use crate::common::Options;
+    use crate::file_index::file_index_result::FileIndexResult;
+    use crate::file_index::file_indexer_factory::{
+        FileIndexerFactory, BITMAP_INDEX, BLOOM_FILTER_INDEX,
+    };
+    use crate::file_index::write_column_indexes;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        ArrayType, DataFileMeta, DataType, Datum, IntType, Predicate, PredicateBuilder, VarCharType,
+        ArrayType, BigIntType, DataFileMeta, DataType, Datum, IntType, Predicate, PredicateBuilder,
+        PredicateOperator, Schema, SchemaChange, TableSchema, VarCharType,
     };
     use crate::table::source::{DataSplitBuilder, DeletionFile};
     use arrow_array::{Int32Array, StringArray};
@@ -1541,6 +1668,56 @@ mod tests {
         assert_eq!(
             merge_row_selection(10, Some(&dv), Some(&full)),
             Some(vec![RowRange::new(0, 2), RowRange::new(4, 9)])
+        );
+    }
+
+    #[test]
+    fn file_index_selection_coalesces_positions_and_rejects_out_of_range_values() {
+        let selection = [0_u32, 1, 3].into_iter().collect();
+        assert_eq!(
+            file_index_selection_to_local_ranges(&selection, 4).unwrap(),
+            Some(vec![RowRange::new(0, 1), RowRange::new(3, 3)])
+        );
+
+        let out_of_range = [4_u32].into_iter().collect();
+        assert!(matches!(
+            file_index_selection_to_local_ranges(&out_of_range, 4),
+            Err(Error::FileIndexFormatInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn dense_file_index_selection_stays_compact_and_fragmented_selection_falls_back() {
+        let mut dense = RoaringBitmap::new();
+        dense.insert_range(0..=10_000_000);
+        assert_eq!(
+            file_index_selection_to_local_ranges(&dense, 10_000_001).unwrap(),
+            Some(vec![RowRange::new(0, 10_000_000)])
+        );
+
+        let fragmented = (0..=MAX_FILE_INDEX_ROW_RANGES as u32)
+            .map(|position| position * 2)
+            .collect();
+        assert_eq!(
+            file_index_selection_to_local_ranges(&fragmented, 200_000).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_row_ids_are_built_only_when_projected() {
+        let huge_selection = [RowRange::new(0, i64::from(i32::MAX))];
+        assert_eq!(
+            selected_row_ids_for_read(false, Some(10), Some(&huge_selection)),
+            None
+        );
+        assert_eq!(
+            selected_row_ids_for_read(
+                true,
+                Some(10),
+                Some(&[RowRange::new(1, 2), RowRange::new(4, 4)]),
+            ),
+            Some(vec![11, 12, 14])
         );
     }
 
@@ -1694,6 +1871,34 @@ mod tests {
         writer.write_batch(batch).unwrap();
         writer.close().unwrap();
         Bytes::from(writer.output().data.to_vec())
+    }
+
+    async fn file_index_bytes(
+        path: &str,
+        column: &str,
+        identifier: &str,
+        data_type: DataType,
+        options: &Options,
+        values: &[Datum],
+    ) -> Bytes {
+        let mut writer = FileIndexerFactory::create_writer(identifier, data_type, options).unwrap();
+        for value in values {
+            writer.write(Some(value)).unwrap();
+        }
+        let indexes = std::collections::HashMap::from([(
+            column.to_string(),
+            std::collections::HashMap::from([(
+                identifier.to_string(),
+                Some(writer.serialized_bytes().unwrap()),
+            )]),
+        )]);
+        write_column_indexes(path, indexes)
+            .await
+            .unwrap()
+            .to_input_file()
+            .read()
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1893,6 +2098,406 @@ mod tests {
                     .to_vec()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn test_file_index_bitmap_skip_avoids_opening_data_file_and_disabled_falls_back() {
+        let fields = pk_fields();
+        let index = file_index_bytes(
+            "memory:/file_index_skip_source",
+            "id",
+            BITMAP_INDEX,
+            fields[0].data_type().clone(),
+            &Options::new(),
+            &[Datum::Int(1), Datum::Int(2)],
+        )
+        .await;
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/file_index_skip";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let mut file = data_file("missing.mosaic", 1, 2, 0);
+        file.embedded_index = Some(index.to_vec());
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .build()
+            .unwrap();
+        let predicate = PredicateBuilder::new(&fields)
+            .equal("id", Datum::Int(99))
+            .unwrap();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+
+        let enabled = DataFileReader::new(
+            file_io.clone(),
+            schema_manager.clone(),
+            0,
+            fields.clone(),
+            fields.clone(),
+            vec![predicate.clone()],
+        )
+        .with_file_index_read_enabled(true)
+        .read(std::slice::from_ref(&split))
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        assert!(enabled.is_empty());
+
+        let disabled = DataFileReader::new(
+            file_io,
+            schema_manager,
+            0,
+            fields.clone(),
+            fields,
+            vec![predicate],
+        )
+        .with_file_index_read_enabled(false)
+        .read(&[split])
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await;
+        assert!(
+            disabled.is_err(),
+            "disabled reads must preserve the data path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_index_bitmap_selection_intersects_unordered_split_ranges_and_deletion_vector(
+    ) {
+        let fields = pk_fields();
+        let data = write_mosaic(&pk_batch(
+            vec![1, 2, 3, 4, 5, 6],
+            vec!["a", "b", "c", "d", "e", "f"],
+        ));
+        let index = file_index_bytes(
+            "memory:/file_index_selection_source",
+            "id",
+            BITMAP_INDEX,
+            fields[0].data_type().clone(),
+            &Options::new(),
+            &[
+                Datum::Int(1),
+                Datum::Int(2),
+                Datum::Int(3),
+                Datum::Int(4),
+                Datum::Int(5),
+                Datum::Int(6),
+            ],
+        )
+        .await;
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/file_index_selection";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.mosaic";
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+        let sidecar_name = format!("{file_name}.index");
+        file_io
+            .new_output(&format!("{bucket_path}/{sidecar_name}"))
+            .unwrap()
+            .write(index)
+            .await
+            .unwrap();
+        let dv = write_deletion_file(&file_io, &format!("{table_path}/index/dv-0"), &[3]).await;
+        let mut file = data_file(file_name, data.len() as i64, 6, 0);
+        file.extra_files = vec![sidecar_name];
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .with_data_deletion_files(vec![Some(dv)])
+            .with_row_ranges(vec![
+                RowRange::new(4, 5),
+                RowRange::new(1, 3),
+                RowRange::new(2, 4),
+            ])
+            .build()
+            .unwrap();
+        let predicate = PredicateBuilder::new(&fields)
+            .is_in(
+                "id",
+                vec![Datum::Int(2), Datum::Int(3), Datum::Int(4), Datum::Int(5)],
+            )
+            .unwrap();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+
+        for enabled in [true, false] {
+            let batches = DataFileReader::new(
+                file_io.clone(),
+                schema_manager.clone(),
+                0,
+                fields.clone(),
+                fields.clone(),
+                vec![predicate.clone()],
+            )
+            .with_file_index_read_enabled(enabled)
+            .read(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+            assert_eq!(collect_ids(&batches), vec![2, 3, 5], "enabled={enabled}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_index_bloom_false_positive_is_removed_by_residual_filter() {
+        let fields = pk_fields();
+        let data_type = fields[0].data_type().clone();
+        let mut bloom_options = Options::new();
+        bloom_options.set("items", "1");
+        bloom_options.set("fpp", "0.99");
+        let mut writer = FileIndexerFactory::create_writer(
+            BLOOM_FILTER_INDEX,
+            data_type.clone(),
+            &bloom_options,
+        )
+        .unwrap();
+        writer.write(Some(&Datum::Int(1))).unwrap();
+        let payload = writer.serialized_bytes().unwrap();
+        let bloom_reader = FileIndexerFactory::create_reader(
+            BLOOM_FILTER_INDEX,
+            data_type.clone(),
+            payload.clone(),
+        )
+        .unwrap();
+        let false_positive = (2..10_000)
+            .find(|candidate| {
+                bloom_reader.evaluate(
+                    "id",
+                    0,
+                    &data_type,
+                    PredicateOperator::Eq,
+                    &[Datum::Int(*candidate)],
+                ) == FileIndexResult::Remain
+            })
+            .expect("high-FPP Bloom filter should have a false positive");
+        let indexes = std::collections::HashMap::from([(
+            "id".to_string(),
+            std::collections::HashMap::from([(BLOOM_FILTER_INDEX.to_string(), Some(payload))]),
+        )]);
+        let index = write_column_indexes("memory:/file_index_bloom_source", indexes)
+            .await
+            .unwrap()
+            .to_input_file()
+            .read()
+            .await
+            .unwrap();
+
+        let data = write_mosaic(&pk_batch(vec![1], vec!["a"]));
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/file_index_bloom";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.mosaic";
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+        let mut file = data_file(file_name, data.len() as i64, 1, 0);
+        file.embedded_index = Some(index.to_vec());
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .build()
+            .unwrap();
+        let predicate = PredicateBuilder::new(&fields)
+            .equal("id", Datum::Int(false_positive))
+            .unwrap();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+        let batches = DataFileReader::new(
+            file_io,
+            schema_manager,
+            0,
+            fields.clone(),
+            fields,
+            vec![predicate],
+        )
+        .with_file_index_read_enabled(true)
+        .read(&[split])
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert!(collect_ids(&batches).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_file_index_uses_schema_evolved_file_fields_and_remapped_predicate() {
+        let old_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("old_id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let current_schema = old_schema
+            .apply_changes(vec![
+                SchemaChange::rename_column("old_id".to_string(), "new_id".to_string()),
+                SchemaChange::update_column_type(
+                    "new_id".to_string(),
+                    DataType::BigInt(BigIntType::new()),
+                ),
+            ])
+            .unwrap();
+        let index = file_index_bytes(
+            "memory:/file_index_schema_evolution_source",
+            "old_id",
+            BITMAP_INDEX,
+            old_schema.fields()[0].data_type().clone(),
+            &Options::new(),
+            &[Datum::Int(1), Datum::Int(2)],
+        )
+        .await;
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/file_index_schema_evolution";
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+        let schema_path = schema_manager.schema_path(old_schema.id());
+        let schema_dir = schema_path.rsplit_once('/').unwrap().0;
+        file_io.mkdirs(schema_dir).await.unwrap();
+        file_io
+            .new_output(&schema_path)
+            .unwrap()
+            .write(Bytes::from(serde_json::to_vec(&old_schema).unwrap()))
+            .await
+            .unwrap();
+        let mut file = data_file("missing.mosaic", 1, 2, old_schema.id());
+        file.embedded_index = Some(index.to_vec());
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(format!("{table_path}/bucket-0"))
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .build()
+            .unwrap();
+        let predicate = PredicateBuilder::new(current_schema.fields())
+            .equal("new_id", Datum::Long(99))
+            .unwrap();
+
+        let batches = DataFileReader::new(
+            file_io,
+            schema_manager,
+            current_schema.id(),
+            current_schema.fields().to_vec(),
+            current_schema.fields().to_vec(),
+            vec![predicate],
+        )
+        .with_file_index_read_enabled(true)
+        .read(&[split])
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert!(batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_file_index_nested_not_with_added_column_falls_back() {
+        let old_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let current_schema = old_schema
+            .apply_changes(vec![SchemaChange::add_column(
+                "added".to_string(),
+                DataType::Int(IntType::new()),
+            )])
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            build_target_arrow_schema(old_schema.fields()).unwrap(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let data = write_mosaic(&batch);
+        let index = file_index_bytes(
+            "memory:/file_index_nested_not_source",
+            "id",
+            BITMAP_INDEX,
+            old_schema.fields()[0].data_type().clone(),
+            &Options::new(),
+            &[Datum::Int(1), Datum::Int(2)],
+        )
+        .await;
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/file_index_nested_not";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.mosaic";
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.to_string());
+        let schema_path = schema_manager.schema_path(old_schema.id());
+        let schema_dir = schema_path.rsplit_once('/').unwrap().0;
+        file_io.mkdirs(schema_dir).await.unwrap();
+        file_io
+            .new_output(&schema_path)
+            .unwrap()
+            .write(Bytes::from(serde_json::to_vec(&old_schema).unwrap()))
+            .await
+            .unwrap();
+
+        let mut file = data_file(file_name, data.len() as i64, 2, old_schema.id());
+        file.embedded_index = Some(index.to_vec());
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .build()
+            .unwrap();
+        let builder = PredicateBuilder::new(current_schema.fields());
+        let predicate = Predicate::negate(Predicate::and(vec![
+            Predicate::negate(builder.equal("id", Datum::Int(1)).unwrap()),
+            builder.equal("added", Datum::Int(2)).unwrap(),
+        ]));
+
+        for enabled in [true, false] {
+            let batches = DataFileReader::new(
+                file_io.clone(),
+                schema_manager.clone(),
+                current_schema.id(),
+                current_schema.fields().to_vec(),
+                vec![current_schema.fields()[0].clone()],
+                vec![predicate.clone()],
+            )
+            .with_file_index_read_enabled(enabled)
+            .read(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+            assert_eq!(collect_ids(&batches), vec![1, 2], "enabled={enabled}");
+        }
     }
 
     /// Deletion vectors are applied format-agnostically by `DataFileReader`; verify a
