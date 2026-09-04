@@ -1910,8 +1910,17 @@ fn decimal_to_plain_string(unscaled: i128, scale: i8, strip_trailing_zeros: bool
     result
 }
 
+/// Order two variant object keys the way Java does.
+///
+/// Java sorts them with `BinaryString.compareTo` (via
+/// `GenericVariantBuilder.FieldEntry.compareTo`), which compares the UTF-8 bytes
+/// as unsigned. That is *not* `String.compareTo`'s UTF-16 code-unit order: the
+/// two disagree whenever a non-BMP key, whose surrogates are `0xD800..=0xDBFF`,
+/// meets a key in `U+E000..=U+FFFF`, because UTF-16 sorts the surrogate first
+/// while UTF-8 sorts the 4-byte sequence last. Rust `str` is already UTF-8, so
+/// comparing the bytes is the same comparison Java makes.
 fn java_string_cmp(left: &str, right: &str) -> std::cmp::Ordering {
-    left.encode_utf16().cmp(right.encode_utf16())
+    left.as_bytes().cmp(right.as_bytes())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3348,6 +3357,60 @@ mod tests {
             .is_null()
             .unwrap());
         assert!(variant.get_path("$.array[9]").unwrap().is_none());
+    }
+
+    /// Java sorts variant object keys with `BinaryString.compareTo`, i.e. by
+    /// unsigned UTF-8 bytes. UTF-16 code-unit order disagrees whenever a non-BMP
+    /// key (a surrogate pair, code units `0xD800..=0xDBFF`) meets a key in
+    /// `U+E000..=U+FFFF`: UTF-16 puts the surrogate first, UTF-8 puts the 4-byte
+    /// sequence last.
+    #[test]
+    fn object_keys_are_ordered_by_utf8_bytes_like_java() {
+        // U+FF21 is EF BC A1 in UTF-8 and FF21 in UTF-16.
+        let fullwidth_a = "\u{FF21}";
+        // U+1F600 is F0 9F 98 80 in UTF-8 and D83D DE00 in UTF-16.
+        let emoji = "\u{1F600}";
+        assert!(fullwidth_a.as_bytes() < emoji.as_bytes());
+        assert!(
+            emoji.encode_utf16().cmp(fullwidth_a.encode_utf16()) == std::cmp::Ordering::Less,
+            "the two orders must actually disagree for this fixture to prove anything"
+        );
+
+        assert_eq!(
+            java_string_cmp(fullwidth_a, emoji),
+            std::cmp::Ordering::Less,
+            "the comparator must follow UTF-8 bytes, not UTF-16 code units"
+        );
+
+        // The writer stores keys in that order, and `to_json` walks the object in
+        // stored order, so the emitted key sequence pins the on-disk layout.
+        let json = format!(r#"{{"{emoji}":2,"{fullwidth_a}":1}}"#);
+        let variant = GenericVariant::parse_json(&json).unwrap();
+        assert_eq!(
+            variant.to_json().unwrap(),
+            format!(r#"{{"{fullwidth_a}":1,"{emoji}":2}}"#)
+        );
+
+        // Both keys must still be reachable through the binary search, which uses
+        // the same comparator.
+        assert_eq!(
+            variant
+                .get_path(&format!("$.{fullwidth_a}"))
+                .unwrap()
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            variant
+                .get_path(&format!("$.{emoji}"))
+                .unwrap()
+                .unwrap()
+                .to_json()
+                .unwrap(),
+            "2"
+        );
     }
 
     #[test]
