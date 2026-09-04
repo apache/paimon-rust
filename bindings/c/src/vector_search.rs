@@ -185,7 +185,10 @@ pub unsafe extern "C" fn paimon_vector_search_builder_with_options(
     std::ptr::null_mut()
 }
 
-/// Set an optional scalar residual filter for a vector-search builder.
+/// Set an optional scalar predicate applied before vector Top-K.
+///
+/// The Rust core resolves the predicate to an allow-list for the selected
+/// primary-key or data-evolution/global-index search path.
 ///
 /// The predicate is consumed (ownership transferred to the builder). Pass null
 /// to clear any previously set filter.

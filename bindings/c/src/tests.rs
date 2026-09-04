@@ -3263,32 +3263,48 @@ fn vector_search_pk_filter_excludes_neighbor() {
 }
 
 #[test]
-fn vector_search_append_filter_returns_invalid_input() {
-    let path = "memory:/vsearch_append_filter_err";
+fn vector_search_append_filter_matches_rust() {
+    let path = "memory:/vsearch_append_filter_read";
     let table = build_append_vector_table(path);
+    let query = [1.0f32, 0.0];
+    let limit = 3;
+
+    let unfiltered = rust_execute_read_pairs(&table, "embedding", query.to_vec(), limit, None);
+    assert!(
+        unfiltered.iter().any(|(id, _)| *id == 0),
+        "fixture must include the filtered nearest neighbor in the unfiltered Top-K"
+    );
+
+    let rust_filter = PredicateBuilder::new(table.schema().fields())
+        .greater_or_equal("id", Datum::Int(1))
+        .unwrap();
+    let rust_pairs = rust_execute_read_pairs(
+        &table,
+        "embedding",
+        query.to_vec(),
+        limit,
+        Some(rust_filter),
+    );
+    assert_eq!(
+        rust_pairs.len(),
+        limit,
+        "filter-before-Top-K must refill the result after excluding id 0"
+    );
+    assert!(
+        rust_pairs.iter().all(|(id, _)| *id >= 1),
+        "Rust core returned a row excluded by the filter"
+    );
+
     let handle = unsafe { wrap_table(table) };
     unsafe {
         let predicate = build_predicate_ge(handle, "id", 1);
-        let builder = c_vector_builder(handle, "embedding", &[1.0f32, 0.0], 3, predicate);
-        let result = paimon_vector_search_builder_execute_read(builder);
-        paimon_vector_search_builder_free(builder);
+        let builder = c_vector_builder(handle, "embedding", &query, limit, predicate);
+        let c_pairs = c_execute_read_pairs(builder);
 
-        assert!(
-            result.reader.is_null(),
-            "errored read must not yield a reader"
-        );
-        assert!(!result.error.is_null(), "DE filter must fail loud");
         assert_eq!(
-            (*result.error).code,
-            PaimonErrorCode::InvalidInput as i32,
-            "DE filter error must map to InvalidInput"
+            c_pairs, rust_pairs,
+            "filtered C pairs must match the Rust core reference"
         );
-        let message = error_message(result.error);
-        assert!(
-            message.contains("primary-key vector path"),
-            "unexpected error message: {message}"
-        );
-        paimon_error_free(result.error);
         unwrap_table(handle);
     }
 }
