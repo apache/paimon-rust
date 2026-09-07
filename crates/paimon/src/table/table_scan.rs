@@ -3953,7 +3953,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_file_matches_not_in_fails_open() {
+    fn test_data_file_matches_not_in_keeps_when_bounds_differ() {
         let fields = int_field();
         let file = test_data_file_meta(
             int_stats_row(Some(10)),

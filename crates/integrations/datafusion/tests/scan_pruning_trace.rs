@@ -112,6 +112,67 @@ fn trace_manifest_counts(plan_text: &str) -> (usize, usize) {
     (after, before)
 }
 
+/// `NOT IN` must prune a data file whose min and max are both a forbidden
+/// literal, and must not change what the query returns. Each INSERT here writes
+/// one file holding a single distinct value, so `value NOT IN (20)` leaves the
+/// 20-only file with min == max == 20.
+#[tokio::test]
+async fn test_scan_trace_records_not_in_data_stats_pruning() {
+    let (tmp, catalog) = common::create_test_env();
+    let sql_context = common::create_sql_context(catalog.clone()).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("CREATE TABLE paimon.test_db.trace_not_in (id INT, value INT)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for (id, value) in [(1, 10), (2, 20), (3, 30)] {
+        common::exec(
+            &sql_context,
+            &format!("INSERT INTO paimon.test_db.trace_not_in VALUES ({id}, {value})"),
+        )
+        .await;
+    }
+
+    let table = load_table(&catalog, "trace_not_in").await;
+    let fields = table.schema().fields();
+    let pb = PredicateBuilder::new(fields);
+
+    let (_plan, all_trace) = table
+        .new_read_builder()
+        .new_scan()
+        .plan_with_trace()
+        .await
+        .unwrap();
+    assert_eq!(all_trace.final_files, 3);
+
+    let mut reader = table.new_read_builder();
+    reader.with_filter(pb.is_not_in("value", vec![Datum::Int(20)]).unwrap());
+    let (_not_in_plan, not_in_trace) = reader.new_scan().plan_with_trace().await.unwrap();
+
+    assert_eq!(
+        not_in_trace.manifest_entries_pruned_by_data_stats, 1,
+        "the file holding only 20 should be pruned: {not_in_trace:?}"
+    );
+    assert_eq!(not_in_trace.final_files, 2);
+
+    let rows = common::collect_id_value(
+        &sql_context,
+        "SELECT id, value FROM paimon.test_db.trace_not_in WHERE value NOT IN (20) ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, vec![(1, 10), (3, 30)]);
+    drop(tmp);
+}
+
 #[tokio::test]
 async fn test_scan_trace_records_partition_pruning() {
     let (_tmp, catalog) = setup_trace_table().await;
