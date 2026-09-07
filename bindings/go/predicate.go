@@ -253,8 +253,14 @@ var errConsumedPredicate = fmt.Errorf("paimon: predicate already consumed or nil
 // PredicateBuilder creates filter predicates for a table.
 // It holds a Go-level reference to the Table and does not own any C resources,
 // so there is no Close() method.
+//
+// caseSensitive is baked into every predicate this builder produces: the core
+// resolves a column when the predicate is constructed, so it cannot be changed
+// afterwards. Use Table.PredicateBuilder for exact matching or
+// Table.PredicateBuilderWithCaseSensitive to opt out.
 type PredicateBuilder struct {
-	table *Table
+	table         *Table
+	caseSensitive bool
 }
 
 // Eq creates an equality predicate: column = value.
@@ -333,16 +339,21 @@ func (pb *PredicateBuilder) NotIn(column string, values ...any) (*Predicate, err
 
 // buildLeafPredicate is a helper for comparison predicates that take (table, column, datum).
 func (pb *PredicateBuilder) buildLeafPredicate(
-	ffiVar *FFI[func(*paimonTable, *byte, paimonDatumC) (*paimonPredicate, error)],
+	ffiVar *leafPredicateFFI,
 	column string, datum Datum,
 ) (*Predicate, error) {
 	t := pb.table
 	if t.inner == nil {
 		return nil, ErrClosed
 	}
-	createFn := ffiVar.symbol(t.ctx)
 	cCol := append([]byte(column), 0)
-	inner, err := createFn(t.inner, &cCol[0], datum.inner)
+	var inner *paimonPredicate
+	var err error
+	if pb.caseSensitive {
+		inner, err = ffiVar.exact.symbol(t.ctx)(t.inner, &cCol[0], datum.inner)
+	} else {
+		inner, err = ffiVar.folded.symbol(t.ctx)(t.inner, &cCol[0], datum.inner, false)
+	}
 	runtime.KeepAlive(cCol)
 	runtime.KeepAlive(datum)
 	if err != nil {
@@ -354,16 +365,21 @@ func (pb *PredicateBuilder) buildLeafPredicate(
 
 // buildNullPredicate is a helper for IS NULL / IS NOT NULL predicates.
 func (pb *PredicateBuilder) buildNullPredicate(
-	ffiVar *FFI[func(*paimonTable, *byte) (*paimonPredicate, error)],
+	ffiVar *nullPredicateFFI,
 	column string,
 ) (*Predicate, error) {
 	t := pb.table
 	if t.inner == nil {
 		return nil, ErrClosed
 	}
-	createFn := ffiVar.symbol(t.ctx)
 	cCol := append([]byte(column), 0)
-	inner, err := createFn(t.inner, &cCol[0])
+	var inner *paimonPredicate
+	var err error
+	if pb.caseSensitive {
+		inner, err = ffiVar.exact.symbol(t.ctx)(t.inner, &cCol[0])
+	} else {
+		inner, err = ffiVar.folded.symbol(t.ctx)(t.inner, &cCol[0], false)
+	}
 	runtime.KeepAlive(cCol)
 	if err != nil {
 		return nil, err
@@ -374,7 +390,7 @@ func (pb *PredicateBuilder) buildNullPredicate(
 
 // buildInPredicate is a helper for IS IN / IS NOT IN predicates.
 func (pb *PredicateBuilder) buildInPredicate(
-	ffiVar *FFI[func(*paimonTable, *byte, unsafe.Pointer, uintptr) (*paimonPredicate, error)],
+	ffiVar *inPredicateFFI,
 	column string, values []any,
 ) (*Predicate, error) {
 	t := pb.table
@@ -389,13 +405,20 @@ func (pb *PredicateBuilder) buildInPredicate(
 		}
 		datums[i] = d.inner
 	}
-	createFn := ffiVar.symbol(t.ctx)
 	cCol := append([]byte(column), 0)
 	var datumsPtr unsafe.Pointer
 	if len(datums) > 0 {
 		datumsPtr = unsafe.Pointer(&datums[0])
 	}
-	inner, err := createFn(t.inner, &cCol[0], datumsPtr, uintptr(len(datums)))
+	var inner *paimonPredicate
+	var err error
+	if pb.caseSensitive {
+		inner, err = ffiVar.exact.symbol(t.ctx)(t.inner, &cCol[0], datumsPtr, uintptr(len(datums)))
+	} else {
+		inner, err = ffiVar.folded.symbol(t.ctx)(
+			t.inner, &cCol[0], datumsPtr, uintptr(len(datums)), false,
+		)
+	}
 	runtime.KeepAlive(cCol)
 	runtime.KeepAlive(datums)
 	runtime.KeepAlive(values)
@@ -462,12 +485,72 @@ var ffiPredicateFree = newFFI(ffiOpts{
 	}
 })
 
-var ffiPredicateEqual = newPredicateLeafFFI("paimon_predicate_equal")
-var ffiPredicateNotEqual = newPredicateLeafFFI("paimon_predicate_not_equal")
-var ffiPredicateLessThan = newPredicateLeafFFI("paimon_predicate_less_than")
-var ffiPredicateLessOrEqual = newPredicateLeafFFI("paimon_predicate_less_or_equal")
-var ffiPredicateGreaterThan = newPredicateLeafFFI("paimon_predicate_greater_than")
-var ffiPredicateGreaterOrEqual = newPredicateLeafFFI("paimon_predicate_greater_or_equal")
+var ffiPredicateEqual = newPredicateLeafFFIPair("paimon_predicate_equal")
+var ffiPredicateNotEqual = newPredicateLeafFFIPair("paimon_predicate_not_equal")
+var ffiPredicateLessThan = newPredicateLeafFFIPair("paimon_predicate_less_than")
+var ffiPredicateLessOrEqual = newPredicateLeafFFIPair("paimon_predicate_less_or_equal")
+var ffiPredicateGreaterThan = newPredicateLeafFFIPair("paimon_predicate_greater_than")
+var ffiPredicateGreaterOrEqual = newPredicateLeafFFIPair("paimon_predicate_greater_or_equal")
+
+// Every predicate constructor in the C ABI comes in two flavours: the plain
+// symbol, which always matches column names exactly, and an additive
+// `_with_case_sensitive` variant taking a trailing `bool`. The two share one
+// implementation, the plain one passing `true`, so pairing them buys nothing at
+// runtime; it keeps the default path off the new symbols, so existing callers run
+// exactly the code they ran before, and lets the default follow the C side if it
+// ever redefines what the plain symbol means. The flag is written as an explicit
+// 0/1 byte for the same reason as in read_builder.go: Rust `bool` occupies one
+// byte and admits no value but 0 or 1.
+type leafPredicateFFI struct {
+	exact  *FFI[func(*paimonTable, *byte, paimonDatumC) (*paimonPredicate, error)]
+	folded *FFI[func(*paimonTable, *byte, paimonDatumC, bool) (*paimonPredicate, error)]
+}
+
+func newPredicateLeafFFIPair(sym string) *leafPredicateFFI {
+	return &leafPredicateFFI{
+		exact:  newPredicateLeafFFI(sym),
+		folded: newPredicateLeafCaseFFI(sym + "_with_case_sensitive"),
+	}
+}
+
+// newPredicateLeafCaseFFI wraps the (table, column, datum, case_sensitive) form.
+func newPredicateLeafCaseFFI(
+	sym string,
+) *FFI[func(*paimonTable, *byte, paimonDatumC, bool) (*paimonPredicate, error)] {
+	return newFFI(ffiOpts{
+		sym:   contextKey(sym),
+		rType: &typeResultPredicate,
+		aTypes: []*ffi.Type{
+			&ffi.TypePointer, &ffi.TypePointer, &typePaimonDatum, &ffi.TypeUint8,
+		},
+	}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTable, *byte, paimonDatumC, bool) (*paimonPredicate, error) {
+		return func(
+			table *paimonTable, column *byte, datum paimonDatumC, caseSensitive bool,
+		) (*paimonPredicate, error) {
+			flag := boolByte(caseSensitive)
+			var result resultPredicate
+			ffiCall(
+				unsafe.Pointer(&result),
+				unsafe.Pointer(&table),
+				unsafe.Pointer(&column),
+				unsafe.Pointer(&datum),
+				unsafe.Pointer(&flag),
+			)
+			if result.error != nil {
+				return nil, parseError(ctx, result.error)
+			}
+			return result.predicate, nil
+		}
+	})
+}
+
+// boolByte renders a Go bool as the single byte a Rust `bool` argument expects.
+func boolByte(value bool) uint8 {
+	if value {
+		return 1
+	}
+	return 0
+}
 
 // newPredicateLeafFFI creates an FFI wrapper for comparison predicate functions
 // with signature: (table, column, datum) -> result_predicate.
@@ -493,8 +576,46 @@ func newPredicateLeafFFI(sym string) *FFI[func(*paimonTable, *byte, paimonDatumC
 	})
 }
 
-var ffiPredicateIsNull = newPredicateNullFFI("paimon_predicate_is_null")
-var ffiPredicateIsNotNull = newPredicateNullFFI("paimon_predicate_is_not_null")
+var ffiPredicateIsNull = newPredicateNullFFIPair("paimon_predicate_is_null")
+var ffiPredicateIsNotNull = newPredicateNullFFIPair("paimon_predicate_is_not_null")
+
+type nullPredicateFFI struct {
+	exact  *FFI[func(*paimonTable, *byte) (*paimonPredicate, error)]
+	folded *FFI[func(*paimonTable, *byte, bool) (*paimonPredicate, error)]
+}
+
+func newPredicateNullFFIPair(sym string) *nullPredicateFFI {
+	return &nullPredicateFFI{
+		exact:  newPredicateNullFFI(sym),
+		folded: newPredicateNullCaseFFI(sym + "_with_case_sensitive"),
+	}
+}
+
+// newPredicateNullCaseFFI wraps the (table, column, case_sensitive) form.
+func newPredicateNullCaseFFI(
+	sym string,
+) *FFI[func(*paimonTable, *byte, bool) (*paimonPredicate, error)] {
+	return newFFI(ffiOpts{
+		sym:    contextKey(sym),
+		rType:  &typeResultPredicate,
+		aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer, &ffi.TypeUint8},
+	}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTable, *byte, bool) (*paimonPredicate, error) {
+		return func(table *paimonTable, column *byte, caseSensitive bool) (*paimonPredicate, error) {
+			flag := boolByte(caseSensitive)
+			var result resultPredicate
+			ffiCall(
+				unsafe.Pointer(&result),
+				unsafe.Pointer(&table),
+				unsafe.Pointer(&column),
+				unsafe.Pointer(&flag),
+			)
+			if result.error != nil {
+				return nil, parseError(ctx, result.error)
+			}
+			return result.predicate, nil
+		}
+	})
+}
 
 // newPredicateNullFFI creates an FFI wrapper for null-check predicate functions
 // with signature: (table, column) -> result_predicate.
@@ -519,8 +640,53 @@ func newPredicateNullFFI(sym string) *FFI[func(*paimonTable, *byte) (*paimonPred
 	})
 }
 
-var ffiPredicateIsIn = newPredicateInFFI("paimon_predicate_is_in")
-var ffiPredicateIsNotIn = newPredicateInFFI("paimon_predicate_is_not_in")
+var ffiPredicateIsIn = newPredicateInFFIPair("paimon_predicate_is_in")
+var ffiPredicateIsNotIn = newPredicateInFFIPair("paimon_predicate_is_not_in")
+
+type inPredicateFFI struct {
+	exact  *FFI[func(*paimonTable, *byte, unsafe.Pointer, uintptr) (*paimonPredicate, error)]
+	folded *FFI[func(*paimonTable, *byte, unsafe.Pointer, uintptr, bool) (*paimonPredicate, error)]
+}
+
+func newPredicateInFFIPair(sym string) *inPredicateFFI {
+	return &inPredicateFFI{
+		exact:  newPredicateInFFI(sym),
+		folded: newPredicateInCaseFFI(sym + "_with_case_sensitive"),
+	}
+}
+
+// newPredicateInCaseFFI wraps the (table, column, datums, len, case_sensitive) form.
+func newPredicateInCaseFFI(
+	sym string,
+) *FFI[func(*paimonTable, *byte, unsafe.Pointer, uintptr, bool) (*paimonPredicate, error)] {
+	return newFFI(ffiOpts{
+		sym:   contextKey(sym),
+		rType: &typeResultPredicate,
+		aTypes: []*ffi.Type{
+			&ffi.TypePointer, &ffi.TypePointer, &ffi.TypePointer, &ffi.TypePointer, &ffi.TypeUint8,
+		},
+	}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTable, *byte, unsafe.Pointer, uintptr, bool) (*paimonPredicate, error) {
+		return func(
+			table *paimonTable, column *byte, datums unsafe.Pointer, datumsLen uintptr,
+			caseSensitive bool,
+		) (*paimonPredicate, error) {
+			flag := boolByte(caseSensitive)
+			var result resultPredicate
+			ffiCall(
+				unsafe.Pointer(&result),
+				unsafe.Pointer(&table),
+				unsafe.Pointer(&column),
+				unsafe.Pointer(&datums),
+				unsafe.Pointer(&datumsLen),
+				unsafe.Pointer(&flag),
+			)
+			if result.error != nil {
+				return nil, parseError(ctx, result.error)
+			}
+			return result.predicate, nil
+		}
+	})
+}
 
 // newPredicateInFFI creates an FFI wrapper for IN/NOT IN predicate functions
 // with signature: (table, column, datums, datums_len) -> result_predicate.

@@ -45,9 +45,21 @@ func (t *Table) Close() {
 	})
 }
 
-// PredicateBuilder returns a builder for creating filter predicates on this table.
+// PredicateBuilder returns a builder for creating filter predicates on this
+// table, matching column names exactly.
 func (t *Table) PredicateBuilder() *PredicateBuilder {
-	return &PredicateBuilder{table: t}
+	return &PredicateBuilder{table: t, caseSensitive: true}
+}
+
+// PredicateBuilderWithCaseSensitive returns a predicate builder that resolves
+// column names by ASCII case folding when caseSensitive is false. A name that
+// folds onto two different schema columns is rejected as ambiguous.
+//
+// Case sensitivity is fixed when the predicate is built, which is why it belongs
+// to the builder rather than to ReadBuilder.WithCaseSensitive — that setting
+// covers projection only.
+func (t *Table) PredicateBuilderWithCaseSensitive(caseSensitive bool) *PredicateBuilder {
+	return &PredicateBuilder{table: t, caseSensitive: caseSensitive}
 }
 
 // NewReadBuilder creates a ReadBuilder for this table.

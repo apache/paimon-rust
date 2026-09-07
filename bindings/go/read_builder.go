@@ -56,6 +56,24 @@ func (rb *ReadBuilder) WithProjection(columns []string) error {
 	return projFn(rb.inner, columns)
 }
 
+// WithCaseSensitive sets whether the names given to WithProjection must match
+// the schema exactly. The default is true. With false, names are matched by
+// ASCII case folding, and a name that folds onto two different schema columns is
+// rejected as ambiguous. Either way the returned records carry the schema's own
+// spelling, not the requested one.
+//
+// This does not affect predicates. A predicate resolves its column when it is
+// built, so its case sensitivity comes from which builder produced it —
+// Table.PredicateBuilder or Table.PredicateBuilderWithCaseSensitive — and is
+// unaffected by this setting. Call order relative to WithProjection does not
+// matter: projection names are resolved in NewRead.
+func (rb *ReadBuilder) WithCaseSensitive(caseSensitive bool) error {
+	if rb.inner == nil {
+		return ErrClosed
+	}
+	return ffiReadBuilderWithCaseSensitive.symbol(rb.ctx)(rb.inner, caseSensitive)
+}
+
 // WithFilter sets a filter predicate for scan planning and read-side pruning.
 //
 // The predicate is used in two phases:
@@ -170,6 +188,31 @@ var ffiReadBuilderWithProjection = newFFI(ffiOpts{
 		// Ensure Go-managed buffers stay alive for the full native call.
 		runtime.KeepAlive(cStrings)
 		runtime.KeepAlive(colPtrs)
+		if errPtr != nil {
+			return parseError(ctx, errPtr)
+		}
+		return nil
+	}
+})
+
+// Rust `bool` is a single byte whose only valid values are 0 and 1, so the
+// argument is declared as a 1-byte integer (the ffi package documents TypeUint8
+// as the way to pass a bool) and an explicit 0/1 is written into it via
+// boolByte. This is the binding's first non-pointer scalar smaller than 4 bytes,
+// so do not copy a wider type here.
+var ffiReadBuilderWithCaseSensitive = newFFI(ffiOpts{
+	sym:    "paimon_read_builder_with_case_sensitive",
+	rType:  &ffi.TypePointer,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypeUint8},
+}, func(ctx context.Context, ffiCall ffiCall) func(rb *paimonReadBuilder, caseSensitive bool) error {
+	return func(rb *paimonReadBuilder, caseSensitive bool) error {
+		flag := boolByte(caseSensitive)
+		var errPtr *paimonError
+		ffiCall(
+			unsafe.Pointer(&errPtr),
+			unsafe.Pointer(&rb),
+			unsafe.Pointer(&flag),
+		)
 		if errPtr != nil {
 			return parseError(ctx, errPtr)
 		}
