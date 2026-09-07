@@ -96,7 +96,16 @@ pub(crate) fn new_aggregator(
     data_type: &DataType,
     table_options: &HashMap<String, String>,
 ) -> crate::Result<Box<dyn FieldAggregator>> {
-    match name {
+    // `canonical_aggregator_name` folds Java's undocumented SPI alias
+    // `first_not_null_value` onto `first_non_null_value`; the error arm still
+    // echoes the caller's spelling. The aggregator itself reports the canonical
+    // name from `FieldAggregator::name`, which costs no parity: the one Java
+    // message that repeats the configured identifier is the retract rejection in
+    // `FieldAggregator`, and retract is rejected here before an aggregator is
+    // ever built. Java's non-nullable diagnostic
+    // (`AggregateMergeFunction`: "Field <i> can not be null") names no function
+    // at all, so the Rust equivalent in `sort_merge` is strictly more specific.
+    match crate::spec::canonical_aggregator_name(name) {
         "sum" => Ok(Box::new(SumAgg::new(field_name, data_type)?)),
         "product" => Ok(Box::new(ProductAgg::new(field_name, data_type)?)),
         "min" => Ok(Box::new(MinAgg::new(field_name, data_type)?)),
@@ -112,9 +121,9 @@ pub(crate) fn new_aggregator(
             data_type,
             table_options,
         )?)),
-        other => Err(crate::Error::ConfigInvalid {
+        _ => Err(crate::Error::ConfigInvalid {
             message: format!(
-                "Unknown aggregate function '{other}' for field '{field_name}'; \
+                "Unknown aggregate function '{name}' for field '{field_name}'; \
                  supported: sum, product, min, max, last_value, first_value, \
                  last_non_null_value, first_non_null_value, bool_and, bool_or, listagg"
             ),
@@ -134,5 +143,59 @@ pub(crate) fn unsupported_type_error(
             "Aggregate function '{agg_name}' does not support data type {data_type:?} \
              for field '{field_name}'"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::Int32Array;
+
+    use super::*;
+    use crate::spec::IntType;
+
+    /// Java's legacy alias must build the very same aggregator, not merely pass
+    /// validation: `FieldFirstNonNullValueAggLegacyFactory` returns a
+    /// `FieldFirstNonNullValueAgg`, so both names have to lock the first
+    /// non-null value.
+    #[test]
+    fn test_legacy_first_not_null_value_aggregates_like_the_canonical_name() {
+        let data_type = DataType::Int(IntType::new());
+        let options = HashMap::new();
+        let input = Int32Array::from(vec![None, Some(5), Some(7)]);
+
+        let mut results = Vec::new();
+        for name in ["first_non_null_value", "first_not_null_value"] {
+            let mut agg = new_aggregator(name, "v", &data_type, &options)
+                .unwrap_or_else(|err| panic!("'{name}' should construct: {err:?}"));
+            for row in 0..input.len() {
+                agg.agg(&input, row).unwrap();
+            }
+            let out = agg.result().unwrap();
+            let out = out
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 result");
+            results.push(out.is_valid(0).then(|| out.value(0)));
+        }
+        assert_eq!(results[0], Some(5));
+        assert_eq!(results[0], results[1], "alias diverged from canonical name");
+    }
+
+    /// An unknown name is echoed back exactly as written, so resolving the alias
+    /// never renames what the user configured.
+    #[test]
+    fn test_unknown_aggregate_function_is_echoed_verbatim() {
+        let err = new_aggregator(
+            "first_not_null_valu",
+            "v",
+            &DataType::Int(IntType::new()),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("'first_not_null_valu'")),
+            "expected the caller's spelling, got {err:?}"
+        );
     }
 }
