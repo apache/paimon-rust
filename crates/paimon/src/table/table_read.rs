@@ -652,8 +652,8 @@ impl<'a> PaimonTableRead<'a> {
                 pair_read.read_pk_sorted_for_diff_with_type(&before, &core_options, &diff_read_type)?;
             let after_stream =
                 pair_read.read_pk_sorted_for_diff_with_type(&after, &core_options, &diff_read_type)?;
-            let mut bc = ArrowCursor::new(before_stream).await?;
-            let mut ac = ArrowCursor::new(after_stream).await?;
+            let mut bc = ArrowCursor::new(before_stream, 0).await?;
+            let mut ac = ArrowCursor::new(after_stream, 1).await?;
             let mut data_col_indices: Option<Vec<usize>> = None;
             let mut builder = AuditBatchBuilder::new(audit_schema.clone());
 
@@ -672,11 +672,11 @@ impl<'a> PaimonTableRead<'a> {
                 }
                 match cursor_cmp(&bc, &ac, &key_indices, &value_indices)? {
                     CursorOrd::BeforeOnly => {
-                        builder.push("-D", bc.batch(), bc.row());
+                        builder.push("-D", bc.batch_id(), bc.batch(), bc.row());
                         bc.advance().await?;
                     }
                     CursorOrd::AfterOnly => {
-                        builder.push("+I", ac.batch(), ac.row());
+                        builder.push("+I", ac.batch_id(), ac.batch(), ac.row());
                         ac.advance().await?;
                     }
                     CursorOrd::EqualSame => {
@@ -684,8 +684,8 @@ impl<'a> PaimonTableRead<'a> {
                         ac.advance().await?;
                     }
                     CursorOrd::EqualDiff => {
-                        builder.push("-U", bc.batch(), bc.row());
-                        builder.push("+U", ac.batch(), ac.row());
+                        builder.push("-U", bc.batch_id(), bc.batch(), bc.row());
+                        builder.push("+U", ac.batch_id(), ac.batch(), ac.row());
                         bc.advance().await?;
                         ac.advance().await?;
                     }
@@ -744,8 +744,8 @@ impl<'a> PaimonTableRead<'a> {
                 &core_options,
                 &diff_read_type,
             )?;
-            let mut bc = ArrowCursor::new(before_stream).await?;
-            let mut ac = ArrowCursor::new(after_stream).await?;
+            let mut bc = ArrowCursor::new(before_stream, 0).await?;
+            let mut ac = ArrowCursor::new(after_stream, 1).await?;
             let mut builder =
                 DiffAfterImageBatchBuilder::new(output_schema.clone(), output_col_indices.clone());
 
@@ -755,7 +755,7 @@ impl<'a> PaimonTableRead<'a> {
                         bc.advance().await?;
                     }
                     CursorOrd::AfterOnly => {
-                        builder.push(ac.batch(), ac.row());
+                        builder.push(ac.batch_id(), ac.batch(), ac.row());
                         ac.advance().await?;
                     }
                     CursorOrd::EqualSame => {
@@ -763,7 +763,7 @@ impl<'a> PaimonTableRead<'a> {
                         ac.advance().await?;
                     }
                     CursorOrd::EqualDiff => {
-                        builder.push(ac.batch(), ac.row());
+                        builder.push(ac.batch_id(), ac.batch(), ac.row());
                         bc.advance().await?;
                         ac.advance().await?;
                     }
@@ -1240,14 +1240,18 @@ enum CursorOrd {
 struct ArrowCursor {
     stream: ArrowRecordBatchStream,
     batch: Option<RecordBatch>,
+    source_id: usize,
+    batch_id: usize,
     row: usize,
 }
 
 impl ArrowCursor {
-    async fn new(stream: ArrowRecordBatchStream) -> crate::Result<Self> {
+    async fn new(stream: ArrowRecordBatchStream, source_id: usize) -> crate::Result<Self> {
         let mut cursor = Self {
             stream,
             batch: None,
+            source_id,
+            batch_id: 0,
             row: 0,
         };
         cursor.advance().await?;
@@ -1266,6 +1270,10 @@ impl ArrowCursor {
         self.row
     }
 
+    fn batch_id(&self) -> (usize, usize) {
+        (self.source_id, self.batch_id)
+    }
+
     async fn advance(&mut self) -> crate::Result<()> {
         loop {
             if let Some(ref batch) = self.batch {
@@ -1276,6 +1284,7 @@ impl ArrowCursor {
             }
             match self.stream.next().await {
                 Some(Ok(batch)) if batch.num_rows() > 0 => {
+                    self.batch_id += 1;
                     self.batch = Some(batch);
                     self.row = 0;
                     return Ok(());
@@ -1296,6 +1305,7 @@ struct AuditBatchBuilder {
     rowkind: StringBuilder,
     row_indices: Vec<(usize, usize)>,
     pinned_batches: Vec<RecordBatch>,
+    pinned_batch_ids: HashMap<(usize, usize), usize>,
     data_col_indices: Vec<usize>,
     len: usize,
 }
@@ -1307,6 +1317,7 @@ impl AuditBatchBuilder {
             rowkind: StringBuilder::new(),
             row_indices: Vec::new(),
             pinned_batches: Vec::new(),
+            pinned_batch_ids: HashMap::new(),
             data_col_indices: Vec::new(),
             len: 0,
         }
@@ -1324,9 +1335,14 @@ impl AuditBatchBuilder {
         self.len
     }
 
-    fn push(&mut self, kind: &str, batch: &RecordBatch, row: usize) {
+    fn push(&mut self, kind: &str, batch_id: (usize, usize), batch: &RecordBatch, row: usize) {
         self.rowkind.append_value(kind);
-        let batch_id = pin_batch(&mut self.pinned_batches, batch);
+        let batch_id = pin_batch(
+            &mut self.pinned_batches,
+            &mut self.pinned_batch_ids,
+            batch_id,
+            batch,
+        );
         self.row_indices.push((batch_id, row));
         self.len += 1;
     }
@@ -1341,6 +1357,7 @@ impl AuditBatchBuilder {
         )?);
         self.row_indices.clear();
         self.pinned_batches.clear();
+        self.pinned_batch_ids.clear();
         self.len = 0;
         RecordBatch::try_new(self.schema.clone(), columns).map_err(|e| {
             crate::Error::UnexpectedError {
@@ -1355,6 +1372,7 @@ struct DiffAfterImageBatchBuilder {
     schema: Arc<ArrowSchema>,
     row_indices: Vec<(usize, usize)>,
     pinned_batches: Vec<RecordBatch>,
+    pinned_batch_ids: HashMap<(usize, usize), usize>,
     col_indices: Vec<usize>,
     len: usize,
 }
@@ -1365,6 +1383,7 @@ impl DiffAfterImageBatchBuilder {
             schema,
             row_indices: Vec::new(),
             pinned_batches: Vec::new(),
+            pinned_batch_ids: HashMap::new(),
             col_indices,
             len: 0,
         }
@@ -1374,8 +1393,13 @@ impl DiffAfterImageBatchBuilder {
         self.len
     }
 
-    fn push(&mut self, batch: &RecordBatch, row: usize) {
-        let batch_id = pin_batch(&mut self.pinned_batches, batch);
+    fn push(&mut self, batch_id: (usize, usize), batch: &RecordBatch, row: usize) {
+        let batch_id = pin_batch(
+            &mut self.pinned_batches,
+            &mut self.pinned_batch_ids,
+            batch_id,
+            batch,
+        );
         self.row_indices.push((batch_id, row));
         self.len += 1;
     }
@@ -1386,6 +1410,7 @@ impl DiffAfterImageBatchBuilder {
             interleave_columns(&self.pinned_batches, &self.col_indices, &self.row_indices)?;
         self.row_indices.clear();
         self.pinned_batches.clear();
+        self.pinned_batch_ids.clear();
         self.len = 0;
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         RecordBatch::try_new_with_options(self.schema.clone(), columns, &options).map_err(|e| {
@@ -1397,21 +1422,19 @@ impl DiffAfterImageBatchBuilder {
     }
 }
 
-fn pin_batch(pinned_batches: &mut Vec<RecordBatch>, batch: &RecordBatch) -> usize {
-    if pinned_batches.last().is_some_and(|last| {
-        last.num_rows() == batch.num_rows()
-            && last.num_columns() == batch.num_columns()
-            && last
-                .columns()
-                .iter()
-                .zip(batch.columns())
-                .all(|(left, right)| Arc::ptr_eq(left, right))
-    }) {
-        return pinned_batches.len() - 1;
+fn pin_batch(
+    pinned_batches: &mut Vec<RecordBatch>,
+    pinned_batch_ids: &mut HashMap<(usize, usize), usize>,
+    batch_id: (usize, usize),
+    batch: &RecordBatch,
+) -> usize {
+    if let Some(&pinned_id) = pinned_batch_ids.get(&batch_id) {
+        return pinned_id;
     }
-    let batch_id = pinned_batches.len();
+    let pinned_id = pinned_batches.len();
     pinned_batches.push(batch.clone());
-    batch_id
+    pinned_batch_ids.insert(batch_id, pinned_id);
+    pinned_id
 }
 
 fn interleave_columns(
@@ -1721,31 +1744,39 @@ mod tests {
 
     #[test]
     fn test_diff_batch_builders_pin_each_input_batch_once() {
-        let input = RecordBatch::try_new(
-            Arc::new(ArrowSchema::new(vec![Field::new(
-                "id",
-                ArrowDataType::Int32,
-                false,
-            )])),
-            vec![Arc::new(Int32Array::from(vec![1, 2]))],
-        )
-        .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let input_a =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
+                .unwrap();
+        let input_b =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![3, 4]))])
+                .unwrap();
 
         let mut audit = AuditBatchBuilder::new(Arc::new(ArrowSchema::new(vec![
             Field::new(ROW_KIND_FIELD_NAME, ArrowDataType::Utf8, false),
             Field::new("id", ArrowDataType::Int32, false),
         ])));
         audit.set_data_col_indices(vec![0]);
-        audit.push("+I", &input, 1);
-        audit.push("+I", &input, 0);
-        assert_eq!(audit.pinned_batches.len(), 1);
+        audit.push("+I", (0, 1), &input_a, 1);
+        audit.push("+I", (1, 1), &input_b, 0);
+        audit.push("+I", (0, 1), &input_a, 0);
+        audit.push("+I", (1, 1), &input_b, 1);
+        assert_eq!(audit.pinned_batches.len(), 2);
         let audit_batch = audit.flush().unwrap();
         let audit_ids = audit_batch
             .column(1)
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!((audit_ids.value(0), audit_ids.value(1)), (2, 1));
+        assert_eq!(
+            audit_ids.values(),
+            &[2, 3, 1, 4],
+            "interleaved batches must preserve row order"
+        );
 
         let mut after = DiffAfterImageBatchBuilder::new(
             Arc::new(ArrowSchema::new(vec![Field::new(
@@ -1755,16 +1786,22 @@ mod tests {
             )])),
             vec![0],
         );
-        after.push(&input, 1);
-        after.push(&input, 0);
-        assert_eq!(after.pinned_batches.len(), 1);
+        after.push((0, 1), &input_a, 1);
+        after.push((1, 1), &input_b, 0);
+        after.push((0, 1), &input_a, 0);
+        after.push((1, 1), &input_b, 1);
+        assert_eq!(after.pinned_batches.len(), 2);
         let after_batch = after.flush().unwrap();
         let after_ids = after_batch
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!((after_ids.value(0), after_ids.value(1)), (2, 1));
+        assert_eq!(
+            after_ids.values(),
+            &[2, 3, 1, 4],
+            "interleaved batches must preserve row order"
+        );
     }
 
     fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
