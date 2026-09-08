@@ -139,6 +139,7 @@ pub(crate) fn provider_for_table(
     if !is_registered(system_name) {
         return Ok(None);
     }
+    crate::table_loader::ensure_paimon_served(&table, &identifier)?;
     ensure_system_table_read_supported(table.schema().options(), system_name)?;
     if system_name.eq_ignore_ascii_case("partitions") {
         return partitions::build(catalog, identifier, table).map(Some);
@@ -176,6 +177,7 @@ pub(crate) async fn load(
     let identifier = Identifier::new(database, object.table().to_string());
     match catalog.get_table(&identifier).await {
         Ok(mut table) => {
+            crate::table_loader::ensure_paimon_served(&table, &identifier)?;
             ensure_system_table_read_supported(table.schema().options(), &system_name)?;
             if let Some(branch) = object.branch() {
                 if !system_name.eq_ignore_ascii_case("branches") {
