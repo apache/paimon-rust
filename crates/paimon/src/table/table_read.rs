@@ -32,11 +32,9 @@ use crate::spec::{
 use crate::DataSplit;
 use arrow_array::{
     builder::StringBuilder, Array, ArrayRef, RecordBatch, RecordBatchOptions, StringArray,
-    UInt32Array,
 };
 use arrow_schema::Schema as ArrowSchema;
-use arrow_select::concat::concat as arrow_concat;
-use arrow_select::take::take;
+use arrow_select::interleave::interleave;
 use futures::{stream, StreamExt};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -1328,49 +1326,19 @@ impl AuditBatchBuilder {
 
     fn push(&mut self, kind: &str, batch: &RecordBatch, row: usize) {
         self.rowkind.append_value(kind);
-        let batch_id = self.pin_batch(batch);
+        let batch_id = pin_batch(&mut self.pinned_batches, batch);
         self.row_indices.push((batch_id, row));
         self.len += 1;
-    }
-
-    fn pin_batch(&mut self, batch: &RecordBatch) -> usize {
-        if let Some(last) = self.pinned_batches.last() {
-            if std::ptr::eq(batch, last) {
-                return self.pinned_batches.len() - 1;
-            }
-        }
-        let batch_id = self.pinned_batches.len();
-        self.pinned_batches.push(batch.clone());
-        batch_id
     }
 
     fn flush(&mut self) -> crate::Result<RecordBatch> {
         let mut columns: Vec<ArrayRef> = vec![Arc::new(self.rowkind.finish())];
         self.rowkind = StringBuilder::new();
-        for &col_idx in &self.data_col_indices {
-            let taken: Vec<ArrayRef> = self
-                .row_indices
-                .iter()
-                .map(|(batch_id, row)| {
-                    take(
-                        self.pinned_batches[*batch_id].column(col_idx).as_ref(),
-                        &UInt32Array::from(vec![*row as u32]),
-                        None,
-                    )
-                    .map_err(|e| crate::Error::UnexpectedError {
-                        message: format!("Failed to take audit diff column: {e}"),
-                        source: Some(Box::new(e)),
-                    })
-                })
-                .collect::<crate::Result<Vec<_>>>()?;
-            let refs: Vec<&dyn Array> = taken.iter().map(|array| array.as_ref()).collect();
-            columns.push(
-                arrow_concat(&refs).map_err(|e| crate::Error::UnexpectedError {
-                    message: format!("Failed to concat audit diff column: {e}"),
-                    source: Some(Box::new(e)),
-                })?,
-            );
-        }
+        columns.extend(interleave_columns(
+            &self.pinned_batches,
+            &self.data_col_indices,
+            &self.row_indices,
+        )?);
         self.row_indices.clear();
         self.pinned_batches.clear();
         self.len = 0;
@@ -1407,49 +1375,15 @@ impl DiffAfterImageBatchBuilder {
     }
 
     fn push(&mut self, batch: &RecordBatch, row: usize) {
-        let batch_id = self.pin_batch(batch);
+        let batch_id = pin_batch(&mut self.pinned_batches, batch);
         self.row_indices.push((batch_id, row));
         self.len += 1;
     }
 
-    fn pin_batch(&mut self, batch: &RecordBatch) -> usize {
-        if let Some(last) = self.pinned_batches.last() {
-            if std::ptr::eq(batch, last) {
-                return self.pinned_batches.len() - 1;
-            }
-        }
-        let batch_id = self.pinned_batches.len();
-        self.pinned_batches.push(batch.clone());
-        batch_id
-    }
-
     fn flush(&mut self) -> crate::Result<RecordBatch> {
         let row_count = self.len;
-        let mut columns = Vec::with_capacity(self.col_indices.len());
-        for &col_idx in &self.col_indices {
-            let taken: Vec<ArrayRef> = self
-                .row_indices
-                .iter()
-                .map(|(batch_id, row)| {
-                    take(
-                        self.pinned_batches[*batch_id].column(col_idx).as_ref(),
-                        &UInt32Array::from(vec![*row as u32]),
-                        None,
-                    )
-                    .map_err(|e| crate::Error::UnexpectedError {
-                        message: format!("Failed to take diff after-image column: {e}"),
-                        source: Some(Box::new(e)),
-                    })
-                })
-                .collect::<crate::Result<Vec<_>>>()?;
-            let refs: Vec<&dyn Array> = taken.iter().map(|array| array.as_ref()).collect();
-            columns.push(
-                arrow_concat(&refs).map_err(|e| crate::Error::UnexpectedError {
-                    message: format!("Failed to concat diff after-image column: {e}"),
-                    source: Some(Box::new(e)),
-                })?,
-            );
-        }
+        let columns =
+            interleave_columns(&self.pinned_batches, &self.col_indices, &self.row_indices)?;
         self.row_indices.clear();
         self.pinned_batches.clear();
         self.len = 0;
@@ -1461,6 +1395,43 @@ impl DiffAfterImageBatchBuilder {
             }
         })
     }
+}
+
+fn pin_batch(pinned_batches: &mut Vec<RecordBatch>, batch: &RecordBatch) -> usize {
+    if pinned_batches.last().is_some_and(|last| {
+        last.num_rows() == batch.num_rows()
+            && last.num_columns() == batch.num_columns()
+            && last
+                .columns()
+                .iter()
+                .zip(batch.columns())
+                .all(|(left, right)| Arc::ptr_eq(left, right))
+    }) {
+        return pinned_batches.len() - 1;
+    }
+    let batch_id = pinned_batches.len();
+    pinned_batches.push(batch.clone());
+    batch_id
+}
+
+fn interleave_columns(
+    batches: &[RecordBatch],
+    column_indices: &[usize],
+    row_indices: &[(usize, usize)],
+) -> crate::Result<Vec<ArrayRef>> {
+    column_indices
+        .iter()
+        .map(|&column_idx| {
+            let arrays: Vec<&dyn Array> = batches
+                .iter()
+                .map(|batch| batch.column(column_idx).as_ref())
+                .collect();
+            interleave(&arrays, row_indices).map_err(|e| crate::Error::UnexpectedError {
+                message: format!("Failed to interleave diff column: {e}"),
+                source: Some(Box::new(e)),
+            })
+        })
+        .collect()
 }
 
 fn diff_pairs(plan: &IncrementalPlan) -> crate::Result<Vec<(Vec<DataSplit>, Vec<DataSplit>)>> {
@@ -1745,6 +1716,56 @@ mod tests {
     use crate::spec::{BinaryRow, DataFileMeta, DataType, IntType, Schema, TableSchema};
     use crate::table::query_auth_table;
     use crate::table::source::DataSplitBuilder;
+    use arrow_array::Int32Array;
+    use arrow_schema::{DataType as ArrowDataType, Field};
+
+    #[test]
+    fn test_diff_batch_builders_pin_each_input_batch_once() {
+        let input = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                ArrowDataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+
+        let mut audit = AuditBatchBuilder::new(Arc::new(ArrowSchema::new(vec![
+            Field::new(ROW_KIND_FIELD_NAME, ArrowDataType::Utf8, false),
+            Field::new("id", ArrowDataType::Int32, false),
+        ])));
+        audit.set_data_col_indices(vec![0]);
+        audit.push("+I", &input, 1);
+        audit.push("+I", &input, 0);
+        assert_eq!(audit.pinned_batches.len(), 1);
+        let audit_batch = audit.flush().unwrap();
+        let audit_ids = audit_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!((audit_ids.value(0), audit_ids.value(1)), (2, 1));
+
+        let mut after = DiffAfterImageBatchBuilder::new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                ArrowDataType::Int32,
+                false,
+            )])),
+            vec![0],
+        );
+        after.push(&input, 1);
+        after.push(&input, 0);
+        assert_eq!(after.pinned_batches.len(), 1);
+        let after_batch = after.flush().unwrap();
+        let after_ids = after_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!((after_ids.value(0), after_ids.value(1)), (2, 1));
+    }
 
     fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
         DataFileMeta {
