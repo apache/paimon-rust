@@ -81,12 +81,32 @@ pub(crate) fn avro_codec(compression: &str) -> crate::Result<Codec> {
 mod tests {
     use super::*;
     use crate::spec::avro::from_avro_bytes_fast;
+    use crate::spec::index_manifest::INDEX_MANIFEST_ENTRY_SCHEMA;
     use crate::spec::manifest_common::FileKind;
     use crate::spec::manifest_entry::{ManifestEntry, MANIFEST_ENTRY_SCHEMA};
     use crate::spec::manifest_file_meta::MANIFEST_FILE_META_SCHEMA;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{DataFileMeta, ManifestFileMeta};
+    use crate::spec::{DataFileMeta, IndexManifestEntry, ManifestFileMeta};
+    use apache_avro::types::Value;
     use chrono::{DateTime, Utc};
+
+    // Check the record decoded from the OCF writer schema, including fields whose
+    // values were omitted by serde and filled from Avro defaults.
+    fn assert_record_field_order<'a>(value: &'a Value, expected: &[&str]) -> &'a [(String, Value)] {
+        let fields = match value {
+            Value::Union(_, value) => return assert_record_field_order(value, expected),
+            Value::Record(fields) => fields,
+            other => panic!("Expected an Avro record, got {other:?}"),
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        fields
+    }
 
     fn manifest_entry() -> ManifestEntry {
         manifest_entry_with_sequences(None)
@@ -157,6 +177,34 @@ mod tests {
             0,
         )];
         let bytes = to_avro_bytes(MANIFEST_FILE_META_SCHEMA, &original).unwrap();
+        let value = Reader::new(bytes.as_slice())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        // ManifestFileMetaSerializer.toRow, including optional pruning statistics.
+        let fields = assert_record_field_order(
+            &value,
+            &[
+                "_VERSION",
+                "_FILE_NAME",
+                "_FILE_SIZE",
+                "_NUM_ADDED_FILES",
+                "_NUM_DELETED_FILES",
+                "_PARTITION_STATS",
+                "_SCHEMA_ID",
+                "_MIN_BUCKET",
+                "_MAX_BUCKET",
+                "_MIN_LEVEL",
+                "_MAX_LEVEL",
+                "_MIN_ROW_ID",
+                "_MAX_ROW_ID",
+            ],
+        );
+        assert_record_field_order(
+            &fields[5].1,
+            &["_MIN_VALUES", "_MAX_VALUES", "_NULL_COUNTS"],
+        );
         let decoded = from_avro_bytes::<ManifestFileMeta>(&bytes).unwrap();
         assert_eq!(original, decoded);
     }
@@ -192,8 +240,132 @@ mod tests {
     fn test_roundtrip_manifest_entry() {
         let original = vec![manifest_entry()];
         let bytes = to_avro_bytes(MANIFEST_ENTRY_SCHEMA, &original).unwrap();
+        let value = Reader::new(bytes.as_slice())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        // ManifestEntrySerializer.toRow and DataFileMetaSerializer.toRow.
+        let fields = assert_record_field_order(
+            &value,
+            &[
+                "_VERSION",
+                "_KIND",
+                "_PARTITION",
+                "_BUCKET",
+                "_TOTAL_BUCKETS",
+                "_FILE",
+            ],
+        );
+        let file = assert_record_field_order(
+            &fields[5].1,
+            &[
+                "_FILE_NAME",
+                "_FILE_SIZE",
+                "_ROW_COUNT",
+                "_MIN_KEY",
+                "_MAX_KEY",
+                "_KEY_STATS",
+                "_VALUE_STATS",
+                "_MIN_SEQUENCE_NUMBER",
+                "_MAX_SEQUENCE_NUMBER",
+                "_SCHEMA_ID",
+                "_LEVEL",
+                "_EXTRA_FILES",
+                "_CREATION_TIME",
+                "_DELETE_ROW_COUNT",
+                "_EMBEDDED_FILE_INDEX",
+                "_FILE_SOURCE",
+                "_VALUE_STATS_COLS",
+                "_EXTERNAL_PATH",
+                "_FIRST_ROW_ID",
+                "_WRITE_COLS",
+                "_WRITE_COLS_SEQUENCES",
+            ],
+        );
+        for stats in [&file[5].1, &file[6].1] {
+            assert_record_field_order(stats, &["_MIN_VALUES", "_MAX_VALUES", "_NULL_COUNTS"]);
+        }
         let decoded = from_avro_bytes::<ManifestEntry>(&bytes).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_index_manifest_field_order() {
+        let entry: IndexManifestEntry = serde_json::from_value(serde_json::json!({
+            "_VERSION": 1,
+            "_KIND": 0,
+            "_PARTITION": [0, 0, 0, 0],
+            "_BUCKET": 2,
+            "_INDEX_TYPE": "DELETION_VECTORS",
+            "_FILE_NAME": "index-0",
+            "_FILE_SIZE": 42,
+            "_ROW_COUNT": 7,
+            "_DELETIONS_VECTORS_RANGES": [{"f0": "data-0", "f1": 1, "f2": 24, "_CARDINALITY": 3}],
+            "_EXTERNAL_PATH": "s3://bucket/index-0"
+        }))
+        .unwrap();
+        let global_entry: IndexManifestEntry = serde_json::from_value(serde_json::json!({
+            "_INDEX_TYPE": "GLOBAL_INDEX",
+            "_FILE_NAME": "index-1",
+            "_GLOBAL_INDEX": {
+                "_ROW_RANGE_START": 10, "_ROW_RANGE_END": 20, "_INDEX_FIELD_ID": 3,
+                "_EXTRA_FIELD_IDS": [4], "_INDEX_META": [5, 6], "_SOURCE_META": [7, 8]
+            },
+            "_VERSION": 1, "_KIND": 0, "_PARTITION": [0, 0, 0, 0], "_BUCKET": -1,
+            "_FILE_SIZE": 64, "_ROW_COUNT": 11
+        }))
+        .unwrap();
+        let original = vec![entry, global_entry];
+        let bytes = to_avro_bytes(INDEX_MANIFEST_ENTRY_SCHEMA, &original).unwrap();
+        for value in Reader::new(bytes.as_slice()).unwrap() {
+            let value = value.unwrap();
+            // IndexManifestEntrySerializer.toRow flattens IndexFileMeta after _BUCKET.
+            let fields = assert_record_field_order(
+                &value,
+                &[
+                    "_VERSION",
+                    "_KIND",
+                    "_PARTITION",
+                    "_BUCKET",
+                    "_INDEX_TYPE",
+                    "_FILE_NAME",
+                    "_FILE_SIZE",
+                    "_ROW_COUNT",
+                    "_DELETIONS_VECTORS_RANGES",
+                    "_EXTERNAL_PATH",
+                    "_GLOBAL_INDEX",
+                ],
+            );
+            if let Value::Union(_, ranges) = &fields[8].1 {
+                if let Value::Array(ranges) = ranges.as_ref() {
+                    assert_record_field_order(&ranges[0], &["f0", "f1", "f2", "_CARDINALITY"]);
+                }
+            }
+            if let Value::Union(_, global) = &fields[10].1 {
+                if !matches!(global.as_ref(), Value::Null) {
+                    assert_record_field_order(
+                        global,
+                        &[
+                            "_ROW_RANGE_START",
+                            "_ROW_RANGE_END",
+                            "_INDEX_FIELD_ID",
+                            "_EXTRA_FIELD_IDS",
+                            "_INDEX_META",
+                            "_SOURCE_META",
+                        ],
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            from_avro_bytes::<IndexManifestEntry>(&bytes).unwrap(),
+            original
+        );
+        assert_eq!(
+            from_avro_bytes_fast::<IndexManifestEntry>(&bytes).unwrap(),
+            original
+        );
     }
 
     /// The Avro manifest record carries `_WRITE_COLS_SEQUENCES`, so a populated value must

@@ -83,6 +83,10 @@ pub const INDEX_MANIFEST_ENTRY_SCHEMA: &str = r#"{
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-core/src/main/java/org/apache/paimon/manifest/IndexManifestEntry.java>
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexManifestEntry {
+    // Keep serde field order aligned with Java's IndexManifestEntrySerializer.
+    #[serde(rename = "_VERSION")]
+    pub version: i32,
+
     #[serde(rename = "_KIND")]
     pub kind: FileKind,
 
@@ -94,9 +98,6 @@ pub struct IndexManifestEntry {
 
     #[serde(flatten)]
     pub index_file: IndexFileMeta,
-
-    #[serde(rename = "_VERSION")]
-    pub version: i32,
 }
 
 impl Display for IndexManifestEntry {
@@ -302,6 +303,13 @@ mod tests {
                 }),
             },
         }
+    }
+
+    #[test]
+    fn test_index_manifest_serializes_version_first() {
+        let entry = global_index_entry(None);
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.starts_with(r#"{"_VERSION":1,"_KIND":0,"#), "{json}");
     }
 
     #[test]
