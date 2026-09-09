@@ -21,6 +21,7 @@ package paimon
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"unsafe"
 
@@ -54,8 +55,20 @@ func (t *Table) NewReadBuilder() (*ReadBuilder, error) {
 	if t.inner == nil {
 		return nil, ErrClosed
 	}
-	createFn := ffiTableNewReadBuilder.symbol(t.ctx)
-	inner, err := createFn(t.inner)
+	inner, err := ffiTableNewReadBuilder.symbol(t.ctx)(t.inner)
+	if err != nil {
+		return nil, err
+	}
+	t.lib.acquire()
+	return &ReadBuilder{ctx: t.ctx, lib: t.lib, inner: inner}, nil
+}
+
+// NewReadBuilderWithOptions creates a ReadBuilder with per-read options.
+func (t *Table) NewReadBuilderWithOptions(options map[string]string) (*ReadBuilder, error) {
+	if t.inner == nil {
+		return nil, ErrClosed
+	}
+	inner, err := ffiTableNewReadBuilderWithOptions.symbol(t.ctx)(t.inner, options)
 	if err != nil {
 		return nil, err
 	}
@@ -87,6 +100,52 @@ var ffiTableNewReadBuilder = newFFI(ffiOpts{
 			unsafe.Pointer(&result),
 			unsafe.Pointer(&table),
 		)
+		if result.error != nil {
+			return nil, parseError(ctx, result.error)
+		}
+		return result.readBuilder, nil
+	}
+})
+
+var ffiTableNewReadBuilderWithOptions = newFFI(ffiOpts{
+	sym:   "paimon_table_new_read_builder_with_options",
+	rType: &typeResultReadBuilder,
+	aTypes: []*ffi.Type{
+		&ffi.TypePointer,
+		&ffi.TypePointer,
+		&ffi.TypePointer,
+	},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTable, map[string]string) (*paimonReadBuilder, error) {
+	return func(table *paimonTable, options map[string]string) (*paimonReadBuilder, error) {
+		type paimonOption struct {
+			key   *byte
+			value *byte
+		}
+		opts := make([]paimonOption, 0, len(options))
+		for key, value := range options {
+			keyPtr, err := bytePtrFromString(key)
+			if err != nil {
+				return nil, err
+			}
+			valuePtr, err := bytePtrFromString(value)
+			if err != nil {
+				return nil, err
+			}
+			opts = append(opts, paimonOption{key: keyPtr, value: valuePtr})
+		}
+		var optsPtr unsafe.Pointer
+		if len(opts) > 0 {
+			optsPtr = unsafe.Pointer(&opts[0])
+		}
+		optsLen := uintptr(len(opts))
+		var result resultReadBuilder
+		ffiCall(
+			unsafe.Pointer(&result),
+			unsafe.Pointer(&table),
+			unsafe.Pointer(&optsPtr),
+			unsafe.Pointer(&optsLen),
+		)
+		runtime.KeepAlive(opts)
 		if result.error != nil {
 			return nil, parseError(ctx, result.error)
 		}

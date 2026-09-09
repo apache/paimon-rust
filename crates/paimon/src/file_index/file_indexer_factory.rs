@@ -51,6 +51,10 @@ impl BuiltinFileIndexer {
 pub(crate) struct FileIndexerFactory;
 
 impl FileIndexerFactory {
+    pub(crate) fn is_supported(identifier: &str) -> bool {
+        matches!(identifier, BITMAP_INDEX | BLOOM_FILTER_INDEX)
+    }
+
     pub(crate) fn create_writer(
         identifier: &str,
         data_type: DataType,

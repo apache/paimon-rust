@@ -938,7 +938,7 @@ fn append_csv_field(existing: Option<&str>, field_name: &str) -> String {
 fn normalize_blob_field_type(field_name: &str, data_type: DataType) -> crate::Result<DataType> {
     let nullable = data_type.is_nullable();
     match data_type {
-        DataType::Blob(_) => Ok(data_type),
+        ref value if value.is_blob_file_field() => Ok(data_type),
         DataType::Binary(_) | DataType::VarBinary(_) => {
             Ok(DataType::Blob(BlobType::with_nullable(nullable)))
         }

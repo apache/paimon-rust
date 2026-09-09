@@ -172,6 +172,83 @@ before expiry. Set `dlf.oss-endpoint` when the server-provided endpoint is not
 reachable from the application. Static options passed to
 `paimon.NewBlobReader` are not refreshed.
 
+Read a `MAP<STRING, BLOB>` column as descriptors, then stream one value:
+
+Rows with null map keys cannot be represented as Arrow maps and return an error.
+
+```go
+readBuilder, err := table.NewReadBuilderWithOptions(map[string]string{
+    "blob-as-descriptor": "true",
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer readBuilder.Close()
+if err := readBuilder.WithProjection([]string{"assets"}); err != nil {
+    log.Fatal(err)
+}
+
+scan, err := readBuilder.NewScan()
+if err != nil {
+    log.Fatal(err)
+}
+defer scan.Close()
+plan, err := scan.Plan()
+if err != nil {
+    log.Fatal(err)
+}
+defer plan.Close()
+read, err := readBuilder.NewRead()
+if err != nil {
+    log.Fatal(err)
+}
+defer read.Close()
+batches, err := read.NewRecordBatchReader(plan.Splits())
+if err != nil {
+    log.Fatal(err)
+}
+defer batches.Close()
+
+record, err := batches.NextRecord()
+if err != nil {
+    log.Fatal(err)
+}
+descriptors, err := paimon.StringBlobMapDescriptors(record.Column(0), 0)
+if err != nil {
+    log.Fatal(err)
+}
+record.Release() // the map owns its keys and descriptors
+for key, descriptor := range descriptors {
+	if descriptor == nil { // null BLOB
+		continue
+	}
+    stream, err := reader.OpenBlob(descriptor)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if _, err := io.Copy(destinationFor(key), stream); err != nil {
+        stream.Close()
+        log.Fatal(err)
+    }
+    stream.Close()
+}
+```
+
+`StringBlobMapDescriptors` returns an ordinary Go map and remains valid after
+releasing the Arrow record. To materialize small values in one merged batch:
+
+```go
+batch := make([][]byte, 0, len(descriptors))
+for _, descriptor := range descriptors {
+    if descriptor != nil {
+        batch = append(batch, descriptor)
+    }
+}
+values, err := reader.ReadBlobs(batch)
+```
+
+Use `OpenBlob` for large values.
+
 Reads are grouped by URI and nearby ranges are merged. The fixed limits are a
 64 KiB merge gap, 8 MiB merged span, 8 concurrent requests, and a 64 MiB
 per-reader admission budget. One larger range runs alone but may exceed that

@@ -556,8 +556,18 @@ impl BinaryRowBuilder {
         self.write_long(pos, unscaled);
     }
 
-    /// Write a non-compact Decimal (precision > 18) as big-endian two's complement bytes (8-byte aligned).
+    /// Write a non-compact Decimal (precision > 18) as big-endian two's complement bytes.
+    ///
+    /// Always reserves 16 bytes in the variable-length part, zero-filling whatever
+    /// the minimal form does not use, and stores the minimal length in the fixed
+    /// part. This is Java `AbstractBinaryWriter#writeDecimal`, which does
+    /// `ensureCapacity(16)`, zeroes both 8-byte halves and advances the cursor by
+    /// 16 unconditionally. Reserving only a multiple of 8 would diverge from that
+    /// byte image whenever the minimal form fits in 8 bytes, and `hash_code`
+    /// hashes the whole buffer, so the row would hash -- and bucket -- differently
+    /// than in Java.
     pub fn write_decimal_var_len(&mut self, pos: usize, unscaled: i128) {
+        const RESERVED_BYTES: usize = 16;
         let be_bytes = unscaled.to_be_bytes();
         let mut start = 0;
         while start < 15 {
@@ -573,9 +583,9 @@ impl BinaryRowBuilder {
 
         let var_offset = self.data.len();
         self.data.extend_from_slice(minimal);
-        let padding = (8 - (minimal.len() % 8)) % 8;
-        self.data.extend(std::iter::repeat_n(0u8, padding));
         let len = minimal.len();
+        self.data
+            .extend(std::iter::repeat_n(0u8, RESERVED_BYTES - len));
         let encoded = ((var_offset as u64) << 32) | (len as u64);
         let offset = self.field_offset(pos);
         self.data[offset..offset + 8].copy_from_slice(&encoded.to_le_bytes());
@@ -2145,6 +2155,54 @@ mod tests {
 
         assert_eq!(row.get_decimal_unscaled(0, 20).unwrap(), large_pos);
         assert_eq!(row.get_decimal_unscaled(1, 20).unwrap(), large_neg);
+    }
+
+    /// Java reserves 16 bytes for every non-compact Decimal regardless of how few
+    /// bytes the unscaled value needs (`AbstractBinaryWriter#writeDecimal`:
+    /// `ensureCapacity(16)`, zero both halves, `cursor += 16`). Reserving only a
+    /// multiple of 8 makes the byte image diverge whenever the minimal form fits
+    /// in 8 bytes, and since `hash_code` hashes the whole buffer -- and feeds
+    /// `default_bucket` -- the same logical row would land in a different bucket
+    /// than Java puts it in.
+    #[test]
+    fn test_decimal_var_len_always_reserves_16_bytes() {
+        // A compact write stays in the fixed-length part, so this is the row size
+        // with an empty variable-length region.
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_decimal_compact(0, 5);
+        let fixed_len = builder.build().data().len();
+
+        // |unscaled| < 2^63, so the minimal two's complement form is 8 bytes.
+        // DECIMAL(38, 18) holding 1.5 is exactly this shape.
+        let small: i128 = 1_500_000_000_000_000_000;
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_decimal_var_len(0, small);
+        let small_row = builder.build();
+
+        // 9 bytes minimal, which already rounded up to 16.
+        let large: i128 = 10_000_000_000_000_000_000;
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_decimal_var_len(0, large);
+        let large_row = builder.build();
+
+        assert_eq!(
+            small_row.data().len(),
+            fixed_len + 16,
+            "an 8-byte unscaled value must still reserve 16 bytes"
+        );
+        assert_eq!(large_row.data().len(), fixed_len + 16);
+        assert_eq!(
+            small_row.data().len(),
+            large_row.data().len(),
+            "reserved size must not depend on the value's magnitude"
+        );
+
+        // The unused half is zero-filled, as Java writes it.
+        assert_eq!(&small_row.data()[fixed_len + 8..], &[0u8; 8]);
+
+        // Still decodable, and the stored size stays the minimal length.
+        assert_eq!(small_row.get_decimal_unscaled(0, 20).unwrap(), small);
+        assert_eq!(large_row.get_decimal_unscaled(0, 20).unwrap(), large);
     }
 
     #[test]

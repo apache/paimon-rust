@@ -21,7 +21,8 @@ use super::{
 };
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::{
-    build_blob_array_batch, build_blob_batch, BlobReadValue, IndexedBlobReader,
+    build_blob_array_batch, build_blob_batch, build_blob_map_batch, BlobFieldKind, BlobReadValue,
+    IndexedBlobReader,
 };
 use crate::io::FileIO;
 use crate::spec::{DataField, DataType};
@@ -50,7 +51,7 @@ impl LazyBlobFile {
         positions: &[usize],
         file_io: &FileIO,
         blob_as_descriptor: bool,
-        array_field: bool,
+        field_kind: &BlobFieldKind,
     ) -> crate::Result<Vec<BlobReadValue>> {
         if self.reader.is_none() {
             let file_size = u64::try_from(self.file_size).map_err(|e| Error::DataInvalid {
@@ -94,10 +95,10 @@ impl LazyBlobFile {
             .reader
             .as_ref()
             .expect("blob reader is initialized above");
-        if array_field {
-            reader.read_array_positions(positions).await
-        } else {
-            reader.read_positions(positions).await
+        match field_kind {
+            BlobFieldKind::Scalar => reader.read_positions(positions).await,
+            BlobFieldKind::Array => reader.read_array_positions(positions).await,
+            BlobFieldKind::Map(key_type) => reader.read_map_positions(positions, key_type).await,
         }
     }
 
@@ -119,13 +120,20 @@ pub(super) fn read(
 ) -> crate::Result<ArrowRecordBatchStream> {
     if read_fields.len() != 1 || !read_fields[0].data_type().is_blob_file_field() {
         return Err(Error::DataInvalid {
-            message: "Blob bunch should provide exactly one BLOB or ARRAY<BLOB> field".to_string(),
+            message:
+                "Blob bunch should provide exactly one BLOB, ARRAY<BLOB>, or MAP<X, BLOB> field"
+                    .to_string(),
             source: None,
         });
     }
 
     let target_schema = build_target_arrow_schema(&read_fields)?;
-    let array_field = matches!(read_fields[0].data_type(), DataType::Array(_));
+    let field_kind = match read_fields[0].data_type() {
+        DataType::Blob(_) => BlobFieldKind::Scalar,
+        DataType::Array(_) => BlobFieldKind::Array,
+        DataType::Map(map) => BlobFieldKind::Map(map.key_type().clone()),
+        _ => unreachable!("validated as a blob file field"),
+    };
     let batch_size = batch_size.unwrap_or(BATCH_SIZE).max(1);
     let split = split.clone();
 
@@ -172,7 +180,7 @@ pub(super) fn read(
                 target_schema.clone(),
                 &file_io,
                 blob_as_descriptor,
-                array_field,
+                &field_kind,
             ).await?;
         }
     }
@@ -185,7 +193,7 @@ async fn resolve_batch(
     target_schema: Arc<arrow_schema::Schema>,
     file_io: &FileIO,
     blob_as_descriptor: bool,
-    array_field: bool,
+    field_kind: &BlobFieldKind,
 ) -> crate::Result<RecordBatch> {
     let mut resolved = (0..row_ids.len())
         .map(|_| BlobReadValue::Placeholder)
@@ -233,7 +241,7 @@ async fn resolve_batch(
 
             if !file_positions.is_empty() {
                 let values = file
-                    .read_positions(&file_positions, file_io, blob_as_descriptor, array_field)
+                    .read_positions(&file_positions, file_io, blob_as_descriptor, field_kind)
                     .await?;
                 for (output_position, value) in output_positions.into_iter().zip(values) {
                     if !matches!(&value, BlobReadValue::Placeholder) {
@@ -262,10 +270,10 @@ async fn resolve_batch(
         }
     }
 
-    if array_field {
-        build_blob_array_batch(&target_schema, resolved)
-    } else {
-        build_blob_batch(&target_schema, resolved)
+    match field_kind {
+        BlobFieldKind::Scalar => build_blob_batch(&target_schema, resolved),
+        BlobFieldKind::Array => build_blob_array_batch(&target_schema, resolved),
+        BlobFieldKind::Map(key_type) => build_blob_map_batch(&target_schema, resolved, key_type),
     }
 }
 
@@ -424,9 +432,16 @@ mod tests {
             VecDeque::from([oldest]),
         ];
         let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
-        let batch = resolve_batch(&mut groups, &[0, 1, 2, 3], schema, &file_io, false, false)
-            .await
-            .unwrap();
+        let batch = resolve_batch(
+            &mut groups,
+            &[0, 1, 2, 3],
+            schema,
+            &file_io,
+            false,
+            &BlobFieldKind::Scalar,
+        )
+        .await
+        .unwrap();
         let values = batch
             .column(0)
             .as_any()

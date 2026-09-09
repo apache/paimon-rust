@@ -28,6 +28,7 @@ header:
     - ".github/PULL_REQUEST_TEMPLATE.md"
     - "crates/paimon/tests/**/*.json"
     - "crates/paimon/testdata/**"
+    - "bindings/go/tests/testdata/**"
     - "third-party-licenses/jieba-rs-0.10.3.LICENSE"
     - "third-party-licenses/openssl-1.1.1.LICENSE"
     - "**/go.sum"

@@ -314,7 +314,7 @@ impl Storage {
     fn fs_relative_path(path: &str) -> crate::Result<Cow<'_, str>> {
         // A `file://` / `file:/` URL is already in scheme-relative form.
         if let Some(stripped) = path.strip_prefix("file:/") {
-            return Ok(if stripped.contains('\\') {
+            return Ok(if cfg!(windows) && stripped.contains('\\') {
                 Cow::Owned(stripped.replace('\\', "/"))
             } else {
                 Cow::Borrowed(stripped)
@@ -559,6 +559,15 @@ mod fs_relative_path_tests {
         assert_eq!(rel("file:/tmp/wh"), "tmp/wh");
         // `file://` keeps the leading authority slash, matching prior behavior.
         assert_eq!(rel("file:///tmp/wh"), "//tmp/wh");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn file_scheme_preserves_posix_backslashes() {
+        assert_eq!(
+            rel(r"file:///tmp/consumer/consumer-id\part"),
+            r"//tmp/consumer/consumer-id\part"
+        );
     }
 
     #[test]

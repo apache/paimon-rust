@@ -39,11 +39,11 @@ The release process consists of:
 
 When a version tag is pushed, GitHub Actions automatically publishes the language-specific artifacts:
 
-| Component        | Tag Pattern              | Published To      | Pre-release (`-rc`) Behavior          |
-|------------------|--------------------------|-------------------|---------------------------------------|
-| Rust crates      | `v0.1.0`                 | crates.io         | Dry-run only                          |
-| Python binding   | `v0.1.0`                 | PyPI              | Publishes to TestPyPI                 |
-| Go binding       | `v0.1.0`                 | Go module proxy   | Publishes as `bindings/go/vX.Y.Z-rcN` |
+| Component        | Root Tag Pattern     | Published To                    | Release-candidate Behavior                                 |
+|------------------|----------------------|---------------------------------|------------------------------------------------------------|
+| Rust crates      | `vX.Y.Z[-rcN]`       | crates.io                       | Validates packages and performs a dry run only             |
+| Python binding   | `vX.Y.Z[-rcN]`       | PyPI / TestPyPI                 | Publishes the corresponding PEP 440 RC version to TestPyPI |
+| Go binding       | `vX.Y.Z[-rcN]`       | Go module tag and GitHub Release | Creates `bindings/go/vX.Y.Z-rcN` as a GitHub pre-release   |
 
 The Release Manager's primary responsibility is managing the **source release** (tarball + signature) and coordinating the community vote. Language artifact publishing is handled by CI once the final tag is pushed.
 
@@ -244,9 +244,12 @@ After pushing, verify in [GitHub Actions](https://github.com/apache/paimon-rust/
 
 ### Create source release artifacts
 
-From the repository root (on the release branch, at the commit you tagged):
+From the repository root, check out and verify the exact RC tag before building:
 
 ```bash
+git switch --detach ${RC_TAG}
+git tag -v ${RC_TAG}
+test "$(git rev-parse HEAD)" = "$(git rev-parse "${RC_TAG}^{commit}")"
 ./scripts/release.sh ${RELEASE_VERSION}
 ```
 
@@ -256,7 +259,7 @@ This creates the following under `dist/`:
 - `paimon-rust-${RELEASE_VERSION}.tar.gz.asc` — GPG signature
 - `paimon-rust-${RELEASE_VERSION}.tar.gz.sha512` — SHA-512 checksum
 
-The script automatically generates the archive from `HEAD` via `git archive`, signs it with your GPG key, and verifies the signature.
+The script verifies that the version matches `Cargo.toml` at `HEAD` and that `HEAD` has an exact signed release tag. It then generates the archive via `git archive`, signs it with the Git-configured signing key when available, and verifies the signature.
 
 ### Stage artifacts to SVN
 
@@ -266,7 +269,7 @@ Upload the source release to the ASF dev area:
 svn checkout https://dist.apache.org/repos/dist/dev/paimon/ paimon-dist-dev --depth=immediates
 cd paimon-dist-dev
 mkdir paimon-rust-${RELEASE_VERSION}-rc${RC_NUM}
-cp ../paimon-rust-${RELEASE_VERSION}.tar.gz* paimon-rust-${RELEASE_VERSION}-rc${RC_NUM}/
+cp ../dist/paimon-rust-${RELEASE_VERSION}.tar.gz* paimon-rust-${RELEASE_VERSION}-rc${RC_NUM}/
 svn add paimon-rust-${RELEASE_VERSION}-rc${RC_NUM}
 svn commit -m "Add paimon-rust ${RELEASE_VERSION} RC${RC_NUM}"
 ```
@@ -297,7 +300,7 @@ The release candidate is available at:
 https://dist.apache.org/repos/dist/dev/paimon/paimon-rust-${RELEASE_VERSION}-rc${RC_NUM}/
 
 Git tag:
-https://github.com/apache/paimon-rust/releases/tag/${RC_TAG}
+https://github.com/apache/paimon-rust/tree/${RC_TAG}
 
 KEYS for signature verification:
 https://downloads.apache.org/paimon/KEYS

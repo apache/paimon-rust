@@ -19,7 +19,7 @@ use crate::file_index::file_index_result::FileIndexResult;
 use crate::spec::{DataType, Datum, PredicateOperator};
 
 /// Evaluates leaf predicates against one concrete file index.
-pub(crate) trait FileIndexReader {
+pub(crate) trait FileIndexReader: Send + Sync {
     /// Evaluates the fields carried by [`crate::spec::Predicate::Leaf`].
     ///
     /// Readers must return [`FileIndexResult::Remain`] for unsupported operators.

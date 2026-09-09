@@ -1,0 +1,30 @@
+{
+  "version": 3,
+  "id": 0,
+  "fields": [
+    {
+      "id": 0,
+      "name": "id",
+      "type": "INT"
+    },
+    {
+      "id": 1,
+      "name": "assets",
+      "type": {
+        "type": "MAP",
+        "key": "STRING NOT NULL",
+        "value": "BLOB",
+        "nullable": true
+      }
+    }
+  ],
+  "highestFieldId": 1,
+  "partitionKeys": [],
+  "primaryKeys": [],
+  "options": {
+    "row-tracking.enabled": "true",
+    "data-evolution.enabled": "true"
+  },
+  "comment": null,
+  "timeMillis": 1788359448372
+}

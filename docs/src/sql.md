@@ -1937,6 +1937,21 @@ Columns:
 | `watermark` | BIGINT | Watermark |
 | `next_row_id` | BIGINT | Next row id |
 
+### $consumers
+
+View the stored progress of streaming consumers:
+
+```sql
+SELECT * FROM paimon.default.my_table$consumers;
+```
+
+Columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `consumer_id` | STRING | Consumer identifier |
+| `next_snapshot_id` | BIGINT | Next snapshot the consumer will read |
+
 ### $tags
 
 View all named tags of a table:
