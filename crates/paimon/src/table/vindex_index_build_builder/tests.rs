@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::extraction::validate_vector_batch;
-use super::planning::{plan_vindex_shards, VindexIndexShard};
+use super::extraction::{validate_vector_batch, validate_vector_batch_ranges};
+use super::planning::{plan_ivf_training_ranges, plan_vindex_shards, VindexIndexShard};
 use super::validation::{
     checked_training_sample_index, checked_training_vector_count, checked_vector_bytes,
     find_index_field, validate_vector_field,
@@ -144,6 +144,25 @@ fn test_planner_splits_single_file_across_shards() {
 }
 
 #[test]
+fn test_ivf_training_ranges_are_bounded_and_exact() {
+    let shard = plan(
+        vec![manifest_entry(data_file("a", Some(100), 1_000))],
+        1_000,
+    )
+    .unwrap()
+    .remove(0);
+
+    let ranges = plan_ivf_training_ranges(&shard, 200).unwrap();
+
+    assert_eq!(ranges.len(), 64);
+    assert_eq!(ranges.iter().map(RowRange::count).sum::<i64>(), 200);
+    assert!(ranges.windows(2).all(|pair| pair[0].to() < pair[1].from()));
+    assert!(ranges.first().unwrap().from() >= 100);
+    assert!(ranges.last().unwrap().to() <= 1_099);
+    assert_eq!(ranges, plan_ivf_training_ranges(&shard, 200).unwrap());
+}
+
+#[test]
 fn test_planner_rejects_missing_first_row_id() {
     let err = plan(vec![manifest_entry(data_file("a", None, 5))], 10)
         .expect_err("missing first_row_id should fail");
@@ -250,6 +269,44 @@ fn test_extract_vectors_accepts_list_float32_and_row_ids() {
     let vectors = extract_vectors_from_batches(&[batch], "embedding", 2, 10, 2).unwrap();
 
     assert_eq!(vectors, vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn test_sparse_vector_validation_accepts_gaps_across_batches() {
+    let ranges = vec![RowRange::new(10, 11), RowRange::new(15, 16)];
+    let batches = [
+        vector_batch(
+            vec![
+                Some(vec![Some(1.0), Some(2.0)]),
+                Some(vec![Some(3.0), Some(4.0)]),
+            ],
+            vec![Some(10), Some(11)],
+        ),
+        vector_batch(
+            vec![
+                Some(vec![Some(5.0), Some(6.0)]),
+                Some(vec![Some(7.0), Some(8.0)]),
+            ],
+            vec![Some(15), Some(16)],
+        ),
+    ];
+    let mut range_index = 0;
+    let mut expected_row_id = ranges[0].from();
+
+    for batch in &batches {
+        validate_vector_batch_ranges(
+            batch,
+            "embedding",
+            2,
+            &ranges,
+            &mut range_index,
+            &mut expected_row_id,
+        )
+        .unwrap();
+    }
+
+    assert_eq!(range_index, ranges.len());
+    assert_eq!(expected_row_id, 17);
 }
 
 #[test]

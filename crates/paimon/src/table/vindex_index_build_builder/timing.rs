@@ -41,9 +41,14 @@ pub(super) struct VectorIndexBuildTiming {
     pub(super) parquet_projected_bytes_total: u64,
     pub(super) parquet_peak_inflight_row_groups: usize,
     pub(super) raw_temp_write: Duration,
+    pub(super) sample_read: Duration,
     pub(super) train_finish: Duration,
     pub(super) raw_temp_reread: Duration,
     pub(super) index_add: Duration,
+    pub(super) full_scan_add: Duration,
+    pub(super) pipeline_blocked: Duration,
+    pub(super) producer_blocked: Duration,
+    pub(super) consumer_add: Duration,
     pub(super) serialize_upload: Duration,
     pub(super) rows: usize,
     pub(super) training_rows_seen: usize,
@@ -58,17 +63,23 @@ pub(super) struct VectorIndexBuildTiming {
 impl VectorIndexBuildTiming {
     pub(super) fn log(self, index_type: &str, commit: Duration) {
         let total = self.total_without_commit.saturating_add(commit);
-        let accounted = self
-            .source_batch_wait
-            .saturating_add(self.raw_temp_write)
-            .saturating_add(self.train_finish)
-            .saturating_add(self.raw_temp_reread)
-            .saturating_add(self.index_add)
+        let build = if self.raw_temp_bytes != 0 {
+            self.source_batch_wait
+                .saturating_add(self.raw_temp_write)
+                .saturating_add(self.train_finish)
+                .saturating_add(self.raw_temp_reread)
+                .saturating_add(self.index_add)
+        } else {
+            self.sample_read
+                .saturating_add(self.train_finish)
+                .saturating_add(self.full_scan_add)
+        };
+        let accounted = build
             .saturating_add(self.serialize_upload)
             .saturating_add(commit);
         let unattributed = total.saturating_sub(accounted);
         eprintln!(
-            "event=paimon_vector_index_build index_type={} file={} rows={} training_rows_seen={} training_rows_retained={} batch_count={} raw_temp_bytes={} index_bytes={} source_batch_wait_ms={:.3} oss_read_ms={:.3} parquet_decode_ms={:.3} file_schema_open_ms={:.3} first_batch_wait_ms={:.3} remaining_batch_wait_ms={:.3} parquet_row_group_count={} parquet_projected_bytes_min={} parquet_projected_bytes_max={} parquet_projected_bytes_total={} parquet_peak_inflight_row_groups={} raw_temp_write_ms={:.3} train_finish_ms={:.3} raw_temp_reread_ms={:.3} index_add_ms={:.3} serialize_upload_ms={:.3} commit_ms={:.3} sample_read_ms=0.000 full_scan_add_ms=0.000 pipeline_blocked_ms=0.000 producer_blocked_ms=0.000 consumer_add_ms=0.000 data_file_count={} data_file_read_concurrency=1 peak_ready_batches=0 total_ms={:.3} unattributed_ms={:.3}",
+            "event=paimon_vector_index_build index_type={} file={} rows={} training_rows_seen={} training_rows_retained={} batch_count={} raw_temp_bytes={} index_bytes={} source_batch_wait_ms={:.3} oss_read_ms={:.3} parquet_decode_ms={:.3} file_schema_open_ms={:.3} first_batch_wait_ms={:.3} remaining_batch_wait_ms={:.3} parquet_row_group_count={} parquet_projected_bytes_min={} parquet_projected_bytes_max={} parquet_projected_bytes_total={} parquet_peak_inflight_row_groups={} raw_temp_write_ms={:.3} train_finish_ms={:.3} raw_temp_reread_ms={:.3} index_add_ms={:.3} serialize_upload_ms={:.3} commit_ms={:.3} sample_read_ms={:.3} full_scan_add_ms={:.3} pipeline_blocked_ms={:.3} producer_blocked_ms={:.3} consumer_add_ms={:.3} data_file_count={} data_file_read_concurrency=1 peak_ready_batches=0 total_ms={:.3} unattributed_ms={:.3}",
             index_type,
             self.file_name,
             self.rows,
@@ -94,6 +105,11 @@ impl VectorIndexBuildTiming {
             self.index_add.as_secs_f64() * 1000.0,
             self.serialize_upload.as_secs_f64() * 1000.0,
             commit.as_secs_f64() * 1000.0,
+            self.sample_read.as_secs_f64() * 1000.0,
+            self.full_scan_add.as_secs_f64() * 1000.0,
+            self.pipeline_blocked.as_secs_f64() * 1000.0,
+            self.producer_blocked.as_secs_f64() * 1000.0,
+            self.consumer_add.as_secs_f64() * 1000.0,
             self.data_file_count,
             total.as_secs_f64() * 1000.0,
             unattributed.as_secs_f64() * 1000.0,
