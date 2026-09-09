@@ -67,6 +67,47 @@ impl ParquetFormatReader {
     }
 }
 
+pub(crate) async fn has_usable_offset_index(
+    reader: Box<dyn FileRead>,
+    file_size: u64,
+    column_name: &str,
+) -> crate::Result<bool> {
+    let options = ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional);
+    let mut reader = ArrowFileReader::new(file_size, reader.into());
+    let metadata = reader.get_metadata(Some(&options)).await?;
+    Ok(metadata_has_usable_offset_index(&metadata, column_name))
+}
+
+fn metadata_has_usable_offset_index(metadata: &ParquetMetaData, column_name: &str) -> bool {
+    let columns = metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            column
+                .path()
+                .parts()
+                .first()
+                .is_some_and(|part| part == column_name)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some(offset_index) = metadata.offset_index() else {
+        return false;
+    };
+    !columns.is_empty()
+        && offset_index.len() == metadata.row_groups().len()
+        && offset_index.iter().all(|row_group| {
+            columns.iter().all(|index| {
+                row_group
+                    .get(*index)
+                    .is_some_and(|index| !index.page_locations().is_empty())
+            })
+        })
+}
+
 enum ParquetRowGroupMessage {
     Batch(RecordBatch),
     Error(Error),
@@ -2231,8 +2272,8 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 mod tests {
     use super::build_parquet_row_filter;
     use super::{
-        forward_row_group_batches, FilePredicates, ParquetFormatReader, ParquetFormatWriter,
-        ParquetRowGroupMessage,
+        forward_row_group_batches, metadata_has_usable_offset_index, FilePredicates,
+        ParquetFormatReader, ParquetFormatWriter, ParquetRowGroupMessage,
     };
     use super::{
         AsyncArrowWriter, Bytes, PageIndexPolicy, ParquetMetaDataReader, Predicate,
@@ -2904,7 +2945,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parquet_diagnostics_include_reads_with_row_selection() {
-        let data = write_multi_row_group_parquet(32, 64, EnabledStatistics::Chunk).await;
+        let data = write_multi_row_group_parquet(32, 64, EnabledStatistics::Chunk, false).await;
         let budget = Arc::new(ParquetReadBudget::new(8, 256 * 1024 * 1024).unwrap());
         budget.enable_diagnostics();
         let file_size = data.len() as u64;
@@ -3367,11 +3408,13 @@ mod tests {
         row_group_rows: usize,
         total_rows: i32,
         statistics: EnabledStatistics,
+        offset_index_disabled: bool,
     ) -> Vec<u8> {
         let schema = writer_arrow_schema();
         let props = parquet::file::properties::WriterProperties::builder()
             .set_max_row_group_row_count(Some(row_group_rows))
             .set_statistics_enabled(statistics)
+            .set_offset_index_disabled(offset_index_disabled)
             .build();
         let mut buf = Vec::new();
         let mut writer = AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
@@ -3387,7 +3430,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_row_group_selection_in_uses_min_max_without_page_index() {
-        let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk).await;
+        let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, false).await;
         let metadata = load_metadata_with_page_index(&bytes, false);
         assert_eq!(metadata.row_groups().len(), 2);
         assert!(metadata.column_index().is_none());
@@ -3416,18 +3459,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sparse_row_selection_requires_offset_index_for_projected_column() {
+        let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, false).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+
+        assert!(metadata_has_usable_offset_index(&metadata, "value"));
+        assert!(!metadata_has_usable_offset_index(&metadata, "missing"));
+        let bytes_without_index =
+            write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, true).await;
+        let metadata_without_index = load_metadata_with_page_index(&bytes_without_index, true);
+        assert!(!metadata_has_usable_offset_index(
+            &metadata_without_index,
+            "value"
+        ));
+    }
+
+    #[tokio::test]
     async fn test_row_group_selection_in_fails_open_on_unusable_stats() {
         let fields = vec![int_field("id"), int_field("value")];
         let predicates = vec![id_leaf(PredicateOperator::In, vec![Datum::Int(100)])];
 
-        let bytes = write_multi_row_group_parquet(10, 10, EnabledStatistics::None).await;
+        let bytes = write_multi_row_group_parquet(10, 10, EnabledStatistics::None, false).await;
         let metadata = load_metadata_with_page_index(&bytes, false);
         let selection =
             super::build_predicate_row_selection(metadata.row_groups(), &predicates, &fields)
                 .unwrap();
         assert!(selection.is_none(), "missing stats must fail open");
 
-        let bytes = write_multi_row_group_parquet(10, 10, EnabledStatistics::Chunk).await;
+        let bytes = write_multi_row_group_parquet(10, 10, EnabledStatistics::Chunk, false).await;
         let metadata = load_metadata_with_page_index(&bytes, false);
         let mut damaged_row_group = metadata.row_groups()[0].clone();
         let damaged_id_column = damaged_row_group
