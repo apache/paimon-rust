@@ -644,6 +644,105 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
 }
 
 #[tokio::test]
+async fn vindex_upload_failure_preserves_committed_index() {
+    use crate::io::multipart_test::{Fault, MultipartProvider};
+
+    for fault in [Fault::Part, Fault::Close] {
+        // A small backend part limit makes the tiny test index use multipart.
+        let provider = MultipartProvider::new(128);
+        let table_path = "memory:/test_vindex_upload_failure";
+        let table = test_table_with_io(
+            provider.file_io(),
+            table_path,
+            vindex_schema_builder(vindex_e2e_options("3"))
+                .build()
+                .unwrap(),
+        );
+        setup_dirs(table.file_io(), table_path).await;
+        write_vectors(
+            &table,
+            vec![1, 2, 3],
+            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
+        )
+        .await;
+        table
+            .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap();
+        let existing = latest_vindex_index_files(&table).await;
+        let old_path = format!("{table_path}/{INDEX_DIR}/{}", existing[0].file_name);
+        let old_bytes = table
+            .file_io()
+            .new_input(&old_path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let mut search = table.new_vector_search_builder();
+        search
+            .with_vector_column("embedding")
+            .with_query_vector(vec![1.0, 0.0])
+            .with_limit(1);
+        let old_result = search.execute().await.unwrap();
+        assert!(!old_result.is_empty());
+
+        write_vectors(&table, vec![4, 5, 6, 7, 8, 9], vec![vec![-1.0, 0.0]; 6]).await;
+        let snapshots = SnapshotManager::new(table.file_io().clone(), table_path.to_string());
+        let before = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+        {
+            let mut state = provider.state.lock().unwrap();
+            state.fault = fault;
+            state.fail_on_index = state.index_writes + 2;
+            state.concurrency.clear();
+        }
+        let error = table
+            .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .expect_err("injected upload must fail");
+        assert!(
+            error.to_string().contains("injected multipart failure"),
+            "{error}"
+        );
+        let after = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(before.id(), after.id());
+        assert_eq!(before.index_manifest(), after.index_manifest());
+        assert_eq!(latest_vindex_index_files(&table).await, existing);
+        assert_eq!(
+            table
+                .file_io()
+                .new_input(&old_path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            old_bytes
+        );
+        assert_eq!(search.execute().await.unwrap(), old_result);
+        let files = table
+            .file_io()
+            .list_status(&format!("{table_path}/{INDEX_DIR}/"))
+            .await
+            .unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "failed and previously written new shards must be removed"
+        );
+        assert!(table.file_io().exists(&old_path).await.unwrap());
+        let state = provider.state.lock().unwrap();
+        assert_eq!(state.concurrency, [8, 8]);
+        // The AsyncWrite adapter cannot abort: object deletion leaves the upload
+        // for storage lifecycle cleanup. Keep this distinct from committed files.
+        assert_eq!(state.uploads.len(), 1);
+        assert_eq!(state.aborts, 0);
+    }
+}
+
+#[tokio::test]
 async fn vindex_build_cleans_written_shards_when_later_shard_fails() {
     let table_path = "memory:/test_vindex_abort_written_shard";
     let table = vindex_e2e_table(table_path, "2");
