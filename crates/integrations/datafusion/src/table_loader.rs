@@ -66,10 +66,33 @@ pub(crate) async fn load_table_for_read(
         identifier.database().to_string(),
         parsed.table().to_string(),
     );
-    let mut table = catalog
-        .get_table(&base_identifier)
-        .await
-        .map_err(to_datafusion_error)?;
+    let mut table = match catalog.load_table(&base_identifier).await {
+        Ok(paimon::catalog::LoadedTable::Paimon(table)) => *table,
+        Ok(paimon::catalog::LoadedTable::Object(_)) => {
+            // The search UDTFs land here too, so the message names the table
+            // rather than what the caller asked of it.
+            return Err(DataFusionError::Plan(format!(
+                "table '{}' is declared 'object-table' and cannot be read as a Paimon table",
+                base_identifier.full_name()
+            )));
+        }
+        Ok(paimon::catalog::LoadedTable::External(external)) => {
+            return Err(DataFusionError::Plan(format!(
+                "table '{}' is declared '{}' and cannot be read as a Paimon table",
+                base_identifier.full_name(),
+                external.declared()
+            )));
+        }
+        // `LoadedTable` is non_exhaustive: a variant added upstream is not a
+        // Paimon table until this path says how to read one.
+        Ok(_) => {
+            return Err(DataFusionError::Plan(format!(
+                "table '{}' cannot be read as a Paimon table",
+                base_identifier.full_name()
+            )));
+        }
+        Err(err) => return Err(to_datafusion_error(err)),
+    };
     let system_table = parsed.system_table().map(str::to_string);
     if let Some(branch) = parsed.branch() {
         let is_branches_table = system_table

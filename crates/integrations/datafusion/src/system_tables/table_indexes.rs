@@ -83,7 +83,7 @@ fn dv_meta_fields() -> Fields {
 }
 
 #[derive(Debug)]
-struct TableIndexesTable {
+pub(super) struct TableIndexesTable {
     table: Table,
 }
 

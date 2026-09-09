@@ -88,7 +88,7 @@ fn partitions_schema() -> SchemaRef {
         .clone()
 }
 
-struct PartitionsTable {
+pub(super) struct PartitionsTable {
     catalog: Arc<dyn Catalog>,
     identifier: Identifier,
     table: Table,

@@ -33,7 +33,7 @@ use datafusion::sql::sqlparser::ast::{self, TableFactor, TableVersion};
 use paimon::spec::{SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION};
 
 use crate::catalog::ReadOnlyTableProvider;
-use crate::table::PaimonTableProvider;
+use crate::table::{ObjectTableProvider, PaimonTableProvider};
 
 /// A [`RelationPlanner`] that intercepts `VERSION AS OF` and `TIMESTAMP AS OF`
 /// clauses on Paimon tables and resolves them to time travel options.
@@ -93,15 +93,34 @@ impl RelationPlanner for PaimonRelationPlanner {
             ));
         }
 
-        let extra_options = match version {
-            TableVersion::VersionAsOf(expr) => resolve_version_as_of(expr)?,
-            TableVersion::TimestampAsOf(expr) => resolve_timestamp_as_of(expr)?,
-            _ => return Ok(RelationPlanning::Original(Box::new(relation))),
+        let Some(paimon_provider) = provider.downcast_ref::<PaimonTableProvider>() else {
+            // Ours, but with no snapshot to rewrite onto: refuse, because
+            // handing them on reaches the default planner, which drops the
+            // clause. Any other provider is another engine's, clause and all.
+            if provider.is::<ObjectTableProvider>()
+                || crate::system_tables::is_system_table_provider(provider.as_ref())
+            {
+                return Err(plan_datafusion_err!(
+                    "time travel is not supported for '{table_ref}'"
+                ));
+            }
+            return Ok(RelationPlanning::Original(Box::new(relation)));
         };
 
-        // Check if this is a Paimon table.
-        let Some(paimon_provider) = provider.downcast_ref::<PaimonTableProvider>() else {
-            return Ok(RelationPlanning::Original(Box::new(relation)));
+        let extra_options = match version {
+            TableVersion::VersionAsOf(expr) => resolve_version_as_of(expr)?,
+            // Same timestamp expression as `TIMESTAMP AS OF`.
+            TableVersion::TimestampAsOf(expr) | TableVersion::ForSystemTimeAsOf(expr) => {
+                resolve_timestamp_as_of(expr)?
+            }
+            // `AT(...)` and `CHANGES(...)` name neither a snapshot nor a
+            // timestamp; dropping the clause would answer with current rows.
+            _ => {
+                return Err(plan_datafusion_err!(
+                    "this time-travel syntax is not supported for Paimon tables; \
+                     use VERSION AS OF, TIMESTAMP AS OF or FOR SYSTEM_TIME AS OF"
+                ))
+            }
         };
 
         // Resolving time travel may switch the table to the snapshot's schema,
