@@ -88,20 +88,28 @@ async fn query_error(ctx: &SQLContext, sql: &str) -> String {
 }
 
 #[tokio::test]
-async fn test_query_auth_system_table_policy_matches_java() {
+async fn test_query_auth_system_tables_fail_closed() {
     let (ctx, _catalog, _tmp) = create_context().await;
     run_sql(
         &ctx,
-        "CREATE TABLE paimon.default.qa (id INT) WITH ('query-auth.enabled' = 'true')",
+        "CREATE TABLE paimon.default.qa (id INT) WITH (
+            'query-auth.enabled' = 'true',
+            's3.secret-key' = 'persisted-secret'
+        )",
     )
     .await;
 
-    // Rust cannot yet apply row filters or masks to table data, and raw file
-    // statistics cannot be masked. Both paths must fail closed.
+    // Rust cannot yet apply query-auth filters or masks to table and system-table
+    // data. Metadata paths, including persisted options, must fail closed.
     for sql in [
         "SELECT * FROM paimon.default.qa",
         "SELECT * FROM paimon.default.qa$audit_log",
         "SELECT * FROM paimon.default.qa$files",
+        "SELECT value FROM paimon.default.qa$options WHERE key = 's3.secret-key'",
+        "SELECT * FROM paimon.default.qa$schemas",
+        "SELECT * FROM paimon.default.qa$partitions",
+        "SELECT * FROM paimon.default.qa$manifests",
+        "SELECT * FROM paimon.default.qa$table_indexes",
     ] {
         let err = query_error(&ctx, sql).await;
         assert!(
@@ -110,26 +118,17 @@ async fn test_query_auth_system_table_policy_matches_java() {
         );
     }
 
-    // Match Java SystemTableLoader: schema and non-physical metadata remain readable.
-    let batches = run_sql(
-        &ctx,
-        "SELECT value FROM paimon.default.qa$options WHERE key = 'query-auth.enabled'",
-    )
-    .await;
-    assert_eq!(string_value(batches[0].column(0).as_ref(), 0), "true");
-    for sql in [
-        "SELECT * FROM paimon.default.qa$manifests",
-        "SELECT * FROM paimon.default.qa$table_indexes",
-    ] {
-        run_sql(&ctx, sql).await;
-    }
-
     run_sql(&ctx, "CREATE TABLE paimon.default.qa_dynamic (id INT)").await;
     run_sql(&ctx, "SET 'paimon.query-auth.enabled' = 'true'").await;
     for sql in [
         "SELECT * FROM paimon.default.qa_dynamic",
         "SELECT * FROM paimon.default.qa_dynamic$audit_log",
         "SELECT * FROM paimon.default.qa_dynamic$files",
+        "SELECT * FROM paimon.default.qa_dynamic$options",
+        "SELECT * FROM paimon.default.qa_dynamic$schemas",
+        "SELECT * FROM paimon.default.qa_dynamic$partitions",
+        "SELECT * FROM paimon.default.qa_dynamic$manifests",
+        "SELECT * FROM paimon.default.qa_dynamic$table_indexes",
     ] {
         let err = query_error(&ctx, sql).await;
         assert!(
@@ -137,7 +136,6 @@ async fn test_query_auth_system_table_policy_matches_java() {
             "dynamic auth should make `{sql}` fail closed, got: {err}"
         );
     }
-    run_sql(&ctx, "SELECT * FROM paimon.default.qa_dynamic$options").await;
     run_sql(&ctx, "RESET 'paimon.query-auth.enabled'").await;
 
     run_sql(&ctx, "SET 'paimon.s3.secret-key' = 'session-secret'").await;

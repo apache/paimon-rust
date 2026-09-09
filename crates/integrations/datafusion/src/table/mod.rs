@@ -32,7 +32,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use paimon::spec::{
-    BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    BigIntType, CoreOptions, DataField, DataType, MergeEngine, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
 use paimon::table::Table;
 
@@ -393,9 +393,21 @@ impl PaimonScanBuilder<'_> {
             });
         }
 
+        let first_row_audit = audit_log
+            && self
+                .table
+                .schema()
+                .core_options()
+                .merge_engine()
+                .map_err(to_datafusion_error)?
+                == MergeEngine::FirstRow;
         let splits = self.plan.into_splits();
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
             vec![Arc::from(Vec::new())]
+        } else if first_row_audit {
+            // ponytail: keep merge groups intact; add group-aware balancing if
+            // first-row audit parallelism becomes necessary.
+            vec![Arc::from(splits)]
         } else {
             let num_partitions = splits.len().min(self.target_partitions.max(1));
             bucket_round_robin(splits, num_partitions)
@@ -572,7 +584,9 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, MapType, RowType, VarCharType};
-    use paimon::{Catalog, CatalogOptions, DataSplit, FileSystemCatalog, Options};
+    use paimon::{
+        Catalog, CatalogOptions, DataSplit, DataSplitBuilder, FileSystemCatalog, Options,
+    };
 
     use crate::physical_plan::PaimonTableScan;
 
@@ -592,6 +606,61 @@ mod tests {
     fn test_bucket_round_robin_single_bucket() {
         let result = bucket_round_robin(vec![1, 2, 3], 1);
         assert_eq!(result, vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn test_first_row_audit_keeps_split_group_in_one_partition() {
+        let file_io = paimon::io::FileIOBuilder::new("memory").build().unwrap();
+        let schema = paimon::spec::Schema::builder()
+            .column(
+                "id",
+                paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+            )
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "first-row")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "first_row_audit"),
+            "memory:/first-row-audit".to_string(),
+            paimon::spec::TableSchema::new(0, &schema),
+            None,
+        );
+        let split = |snapshot| {
+            DataSplitBuilder::new()
+                .with_snapshot(snapshot)
+                .with_partition(paimon::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path("memory:/first-row-audit/bucket-0".to_string())
+                .with_total_buckets(1)
+                .with_data_files(vec![])
+                .build()
+                .unwrap()
+        };
+        let read_fields = datafusion_read_fields(&table);
+        let arrow_schema = datafusion_arrow_schema(&read_fields, true).unwrap();
+        let plan = PaimonScanBuilder {
+            table: &table,
+            schema: &arrow_schema,
+            plan: paimon::table::Plan::new(vec![split(1), split(2)]),
+            scan_trace: None,
+            projection: None,
+            pushed_predicate: None,
+            limit: None,
+            target_partitions: 8,
+            filter_exact: false,
+            case_sensitive: true,
+        }
+        .build_audit_log(read_fields)
+        .unwrap();
+        let scan = plan
+            .downcast_ref::<PaimonTableScan>()
+            .expect("Expected PaimonTableScan");
+
+        assert_eq!(scan.planned_partitions().len(), 1);
+        assert_eq!(scan.planned_partitions()[0].len(), 2);
     }
 
     fn get_test_warehouse() -> String {

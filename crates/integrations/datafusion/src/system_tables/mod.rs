@@ -81,14 +81,19 @@ const SYSTEM_TABLE_NAMES: &[&str] = &[
     "tags",
 ];
 
-// Matches Java SystemTableLoader's physical-metadata restriction. Audit log is
-// also rejected until Rust can apply the base table's row filters and masks.
+// Reject system tables whose contents can expose protected table data or
+// persisted credentials until Rust can apply row filters and column masks.
 const QUERY_AUTH_UNSUPPORTED_TABLES: &[&str] = &[
     "audit_log",
     "files",
     "file_key_ranges",
     "binlog",
     "statistics",
+    "options",
+    "schemas",
+    "partitions",
+    "manifests",
+    "table_indexes",
 ];
 
 /// Parse a Paimon object name into table, branch, and optional system table.
