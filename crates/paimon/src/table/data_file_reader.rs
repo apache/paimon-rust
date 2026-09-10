@@ -44,6 +44,8 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Default)]
 pub(crate) struct DataFileReadTiming {
     file_read_nanos: AtomicU64,
+    file_read_bytes: AtomicU64,
+    file_read_requests: AtomicU64,
     parquet_decode_nanos: AtomicU64,
     file_schema_open_nanos: AtomicU64,
     first_batch_wait_nanos: AtomicU64,
@@ -54,6 +56,12 @@ impl DataFileReadTiming {
     fn add_file_read(&self, duration: Duration) {
         self.file_read_nanos
             .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn add_file_io(&self, bytes: usize) {
+        self.file_read_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.file_read_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     fn add_parquet_decode(&self, duration: Duration) {
@@ -79,6 +87,13 @@ impl DataFileReadTiming {
         Duration::from_nanos(self.file_read_nanos.load(Ordering::Relaxed))
     }
 
+    pub(crate) fn file_io(&self) -> (u64, u64) {
+        (
+            self.file_read_bytes.load(Ordering::Relaxed),
+            self.file_read_requests.load(Ordering::Relaxed),
+        )
+    }
+
     pub(crate) fn parquet_decode(&self) -> Duration {
         Duration::from_nanos(self.parquet_decode_nanos.load(Ordering::Relaxed))
     }
@@ -102,6 +117,8 @@ impl FileRead for TimedFileRead {
         let start = Instant::now();
         let result = self.inner.read(range).await;
         self.timing.add_file_read(start.elapsed());
+        self.timing
+            .add_file_io(result.as_ref().map_or(0, bytes::Bytes::len));
         result
     }
 }

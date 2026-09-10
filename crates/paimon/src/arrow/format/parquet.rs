@@ -71,14 +71,23 @@ pub(crate) async fn has_usable_offset_index(
     reader: Box<dyn FileRead>,
     file_size: u64,
     column_name: &str,
+    row_ranges: &[RowRange],
 ) -> crate::Result<bool> {
     let options = ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional);
     let mut reader = ArrowFileReader::new(file_size, reader.into());
     let metadata = reader.get_metadata(Some(&options)).await?;
-    Ok(metadata_has_usable_offset_index(&metadata, column_name))
+    Ok(metadata_has_usable_offset_index(
+        &metadata,
+        column_name,
+        row_ranges,
+    ))
 }
 
-fn metadata_has_usable_offset_index(metadata: &ParquetMetaData, column_name: &str) -> bool {
+fn metadata_has_usable_offset_index(
+    metadata: &ParquetMetaData,
+    column_name: &str,
+    row_ranges: &[RowRange],
+) -> bool {
     let columns = metadata
         .file_metadata()
         .schema_descr()
@@ -97,15 +106,31 @@ fn metadata_has_usable_offset_index(metadata: &ParquetMetaData, column_name: &st
     let Some(offset_index) = metadata.offset_index() else {
         return false;
     };
-    !columns.is_empty()
-        && offset_index.len() == metadata.row_groups().len()
-        && offset_index.iter().all(|row_group| {
-            columns.iter().all(|index| {
-                row_group
+    if columns.is_empty() || offset_index.len() != metadata.row_groups().len() {
+        return false;
+    }
+    let mut row_start = 0i64;
+    let mut checked = false;
+    for (row_group, indexes) in metadata.row_groups().iter().zip(offset_index) {
+        let Some(row_end) = row_start.checked_add(row_group.num_rows()) else {
+            return false;
+        };
+        if row_ranges
+            .iter()
+            .any(|range| range.from() < row_end && range.to() >= row_start)
+        {
+            checked = true;
+            if !columns.iter().all(|index| {
+                indexes
                     .get(*index)
                     .is_some_and(|index| !index.page_locations().is_empty())
-            })
-        })
+            }) {
+                return false;
+            }
+        }
+        row_start = row_end;
+    }
+    checked
 }
 
 enum ParquetRowGroupMessage {
@@ -3463,14 +3488,20 @@ mod tests {
         let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, false).await;
         let metadata = load_metadata_with_page_index(&bytes, true);
 
-        assert!(metadata_has_usable_offset_index(&metadata, "value"));
-        assert!(!metadata_has_usable_offset_index(&metadata, "missing"));
+        let ranges = [RowRange::new(0, 19)];
+        assert!(metadata_has_usable_offset_index(
+            &metadata, "value", &ranges
+        ));
+        assert!(!metadata_has_usable_offset_index(
+            &metadata, "missing", &ranges
+        ));
         let bytes_without_index =
             write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, true).await;
         let metadata_without_index = load_metadata_with_page_index(&bytes_without_index, true);
         assert!(!metadata_has_usable_offset_index(
             &metadata_without_index,
-            "value"
+            "value",
+            &ranges
         ));
     }
 
