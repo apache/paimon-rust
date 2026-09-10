@@ -226,6 +226,33 @@ fn same_vector_search_table(left: &Table, right: &Table) -> bool {
         && left.branch() == right.branch()
 }
 
+/// Unwrap a single-query result from a batch entry point that must return exactly
+/// one element per input query.
+///
+/// The batch terminals below are handed one query, so their result vector holds
+/// exactly one entry. A `debug_assert_eq!(len, 1)` followed by `remove(0)` checked
+/// that only in debug builds, where a release build would instead panic on an index
+/// out of bounds for an empty vector -- or SILENTLY return the first of several,
+/// pairing the caller's single query with another query's result. A length that is
+/// wrong means the batch ran the wrong number of searches, which is a programming
+/// error in this crate rather than bad input, so it is reported as one.
+fn take_only_result<T>(results: Vec<T>, operation: &str) -> crate::Result<T> {
+    let mut results = results.into_iter();
+    let result = results
+        .next()
+        .ok_or_else(|| crate::Error::UnexpectedError {
+            message: format!("{operation} returned no result for one query"),
+            source: None,
+        })?;
+    if results.next().is_some() {
+        return Err(crate::Error::UnexpectedError {
+            message: format!("{operation} returned more than one result for one query"),
+            source: None,
+        });
+    }
+    Ok(result)
+}
+
 /// The primary-key vector route's search output plus the source context a later
 /// materialization (or a hybrid fusion across routes) needs. `candidates` are the
 /// best-first hits; `splits` are the per-bucket source splits their `split_index`
@@ -360,10 +387,9 @@ impl<'a> VectorSearchBuilder<'a> {
         if let Some(filter) = &self.filter {
             batch_builder.with_filter(filter.clone());
         }
-        let mut results = batch_builder.execute().await?;
+        let results = batch_builder.execute().await?;
 
-        debug_assert_eq!(results.len(), 1);
-        Ok(results.remove(0))
+        take_only_result(results, "vector search")
     }
 
     /// Run the vector search and materialize the matching rows as Arrow batches,
@@ -528,7 +554,7 @@ impl<'a> VectorSearchBuilder<'a> {
         query_vector: &[f32],
         limit: usize,
     ) -> crate::Result<(Vec<PkVectorCandidate>, PkVectorScanPlan, VectorSearchMetric)> {
-        let (mut candidates, plan, metric) = plan_and_search_pk_candidates_batch(
+        let (candidates, plan, metric) = plan_and_search_pk_candidates_batch(
             self.table,
             &self.options,
             self.filter.as_ref(),
@@ -538,8 +564,11 @@ impl<'a> VectorSearchBuilder<'a> {
             limit,
         )
         .await?;
-        debug_assert_eq!(candidates.len(), 1);
-        Ok((candidates.remove(0), plan, metric))
+        Ok((
+            take_only_result(candidates, "planned vector search")?,
+            plan,
+            metric,
+        ))
     }
 
     /// Plan + search the primary-key vector route and return the best-first
@@ -1957,14 +1986,13 @@ async fn evaluate_vector_search(
     index_entries: &[IndexManifestEntry],
     vector_search: &VectorSearch,
 ) -> crate::Result<Vec<RowRange>> {
-    let mut results = evaluate_batch_vector_search(
+    let results = evaluate_batch_vector_search(
         evaluation,
         index_entries,
         std::slice::from_ref(vector_search),
     )
     .await?;
-    debug_assert_eq!(results.len(), 1);
-    results.remove(0).to_row_ranges()
+    take_only_result(results, "vector search")?.to_row_ranges()
 }
 
 async fn evaluate_batch_vector_search(
@@ -8328,6 +8356,18 @@ mod residual_positions_tests {
             .expect("both sides restrict");
         assert_eq!(listed(&combined[0], "d0"), vec![2, 3]);
         assert!(!combined[0].contains_key("d1"));
+    }
+
+    /// The batch terminals here are handed exactly one query, so a result vector of any
+    /// other length means the batch ran the wrong number of searches. The
+    /// `debug_assert_eq!` this replaced was compiled out of release builds, where an
+    /// empty vector panicked on `remove(0)` and a longer one silently returned another
+    /// query's result.
+    #[test]
+    fn take_only_result_rejects_bad_batch_arity() {
+        assert_eq!(take_only_result(vec![7], "test").unwrap(), 7);
+        assert!(take_only_result::<i32>(Vec::new(), "test").is_err());
+        assert!(take_only_result(vec![1, 2], "test").is_err());
     }
 
     #[test]
