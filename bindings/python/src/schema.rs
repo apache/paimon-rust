@@ -77,9 +77,9 @@ impl PyDataField {
     }
 
     fn field_type(&self) -> String {
-        // TODO(#284 follow-up): mirror Java DataType.asSQLString() once
-        // a Display impl is added to paimon::spec::DataType.
-        format!("{:?}", self.inner.data_type())
+        // Java `DataField.type().asSQLString()`, which is what
+        // `Display for DataType` renders.
+        self.inner.data_type().to_string()
     }
 
     fn is_nullable(&self) -> bool {

@@ -243,6 +243,18 @@ pub struct ArrayType {
     element_type: Box<DataType>,
 }
 
+impl Display for ArrayType {
+    /// Java `ArrayType.FORMAT` is `ARRAY<%s>`, filled with the element's own SQL
+    /// string so the element's `NOT NULL` lands inside the angle brackets.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ARRAY<{}>", self.element_type)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
 impl ArrayType {
     pub fn new(element_type: DataType) -> Self {
         Self::with_nullable(true, element_type)
@@ -342,33 +354,13 @@ impl VectorType {
     pub fn length(&self) -> u32 {
         self.length
     }
-
-    /// SQL name of a valid vector element type.
-    fn element_sql_name(&self) -> &'static str {
-        match self.element_type.as_ref() {
-            DataType::Boolean(_) => "BOOLEAN",
-            DataType::TinyInt(_) => "TINYINT",
-            DataType::SmallInt(_) => "SMALLINT",
-            DataType::Int(_) => "INT",
-            DataType::BigInt(_) => "BIGINT",
-            DataType::Float(_) => "FLOAT",
-            DataType::Double(_) => "DOUBLE",
-            other => {
-                unreachable!("vector element type validated at construction: {other:?}")
-            }
-        }
-    }
 }
 
 impl Display for VectorType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         // Match Java VectorType.asSQLString: the element is rendered with its own
         // SQL string, which includes the element's nullability suffix.
-        write!(f, "VECTOR<{}", self.element_sql_name())?;
-        if !self.element_type.is_nullable() {
-            write!(f, " NOT NULL")?;
-        }
-        write!(f, ", {}>", self.length)?;
+        write!(f, "VECTOR<{}, {}>", self.element_type, self.length)?;
         if !self.nullable {
             write!(f, " NOT NULL")?;
         }
@@ -471,6 +463,16 @@ impl<'de> Deserialize<'de> for VectorType {
 pub struct BigIntType {
     #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::BIGINT>>")]
     nullable: bool,
+}
+
+impl Display for BigIntType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BIGINT")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for BigIntType {
@@ -593,6 +595,16 @@ pub struct BooleanType {
     nullable: bool,
 }
 
+impl Display for BooleanType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BOOLEAN")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
 impl Default for BooleanType {
     fn default() -> Self {
         Self::new()
@@ -624,6 +636,16 @@ impl BooleanType {
 pub struct BlobType {
     #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::BLOB>>")]
     nullable: bool,
+}
+
+impl Display for BlobType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BLOB")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for BlobType {
@@ -658,6 +680,16 @@ impl BlobType {
 pub struct VariantType {
     #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::VARIANT>>")]
     nullable: bool,
+}
+
+impl Display for VariantType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "VARIANT")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for VariantType {
@@ -779,6 +811,16 @@ impl CharType {
 pub struct DateType {
     #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::DATE>>")]
     nullable: bool,
+}
+
+impl Display for DateType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DATE")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for DateType {
@@ -1002,6 +1044,16 @@ pub struct FloatType {
     nullable: bool,
 }
 
+impl Display for FloatType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FLOAT")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
 impl Default for FloatType {
     fn default() -> Self {
         Self::new()
@@ -1033,6 +1085,16 @@ impl FloatType {
 pub struct IntType {
     #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::INT>>")]
     nullable: bool,
+}
+
+impl Display for IntType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "INT")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for IntType {
@@ -1172,6 +1234,16 @@ impl LocalZonedTimestampType {
 pub struct SmallIntType {
     #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::SMALLINT>>")]
     nullable: bool,
+}
+
+impl Display for SmallIntType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SMALLINT")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for SmallIntType {
@@ -1403,6 +1475,16 @@ impl TimestampType {
 pub struct TinyIntType {
     #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::TINYINT>>")]
     nullable: bool,
+}
+
+impl Display for TinyIntType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TINYINT")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for TinyIntType {
@@ -1655,6 +1737,17 @@ pub struct MapType {
     value_type: Box<DataType>,
 }
 
+impl Display for MapType {
+    /// Java `MapType.FORMAT` is `MAP<%s, %s>`.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MAP<{}, {}>", self.key_type, self.value_type)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
 impl MapType {
     pub fn new(key_type: DataType, value_type: DataType) -> Self {
         Self::with_nullable(true, key_type, value_type)
@@ -1697,6 +1790,17 @@ pub struct MultisetType {
     element_type: Box<DataType>,
 }
 
+impl Display for MultisetType {
+    /// Java `MultisetType.FORMAT` is `MULTISET<%s>`.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MULTISET<{}>", self.element_type)?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
 impl MultisetType {
     pub fn new(element_type: DataType) -> Self {
         Self::with_nullable(true, element_type)
@@ -1733,6 +1837,79 @@ pub struct RowType {
     #[serde_as(as = "FromInto<serde_utils::NullableType<serde_utils::ROW>>")]
     nullable: bool,
     fields: Vec<DataField>,
+}
+
+/// Render one row field the way Java `DataField.asSQLString` does: the escaped
+/// name, a space, the field type's SQL string, then `COMMENT '...'` when the
+/// field carries a description. Java also appends `DEFAULT <value>`, which has no
+/// counterpart on this struct.
+fn write_row_field(f: &mut Formatter<'_>, field: &DataField) -> std::fmt::Result {
+    write!(
+        f,
+        "{} {}",
+        crate::spec::escape_identifier(field.name()),
+        field.data_type()
+    )?;
+    if let Some(description) = field.description().filter(|text| !text.is_empty()) {
+        write!(
+            f,
+            " COMMENT '{}'",
+            crate::spec::escape_single_quotes(description)
+        )?;
+    }
+    Ok(())
+}
+
+impl Display for RowType {
+    /// Java `RowType.FORMAT` is `ROW<%s>`, filled with the fields' own SQL strings
+    /// joined by `", "`.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ROW<")?;
+        for (index, field) in self.fields.iter().enumerate() {
+            if index > 0 {
+                write!(f, ", ")?;
+            }
+            write_row_field(f, field)?;
+        }
+        write!(f, ">")?;
+        if !self.nullable {
+            write!(f, " NOT NULL")?;
+        }
+        Ok(())
+    }
+}
+
+impl Display for DataType {
+    /// Dispatch to the variant's own SQL string, mirroring Java's abstract
+    /// `DataType.asSQLString`. Every arm is spelled out so a new variant fails to
+    /// compile rather than falling into a catch-all that renders the wrong text.
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataType::Boolean(t) => Display::fmt(t, f),
+            DataType::TinyInt(t) => Display::fmt(t, f),
+            DataType::SmallInt(t) => Display::fmt(t, f),
+            DataType::Int(t) => Display::fmt(t, f),
+            DataType::BigInt(t) => Display::fmt(t, f),
+            DataType::Decimal(t) => Display::fmt(t, f),
+            DataType::Double(t) => Display::fmt(t, f),
+            DataType::Float(t) => Display::fmt(t, f),
+            DataType::Binary(t) => Display::fmt(t, f),
+            DataType::VarBinary(t) => Display::fmt(t, f),
+            DataType::Variant(t) => Display::fmt(t, f),
+            DataType::Blob(t) => Display::fmt(t, f),
+            DataType::Char(t) => Display::fmt(t, f),
+            DataType::VarChar(t) => Display::fmt(t, f),
+            DataType::Date(t) => Display::fmt(t, f),
+            DataType::LocalZonedTimestamp(t) => Display::fmt(t, f),
+            DataType::Time(t) => Display::fmt(t, f),
+            DataType::Timestamp(t) => Display::fmt(t, f),
+            DataType::Array(t) => Display::fmt(t, f),
+            DataType::Map(t) => Display::fmt(t, f),
+            DataType::Multiset(t) => Display::fmt(t, f),
+            DataType::Row(t) => Display::fmt(t, f),
+            DataType::Vector(t) => Display::fmt(t, f),
+        }
+    }
 }
 
 impl RowType {
@@ -2621,6 +2798,134 @@ mod tests {
             VectorType::try_new(true, too_big, DataType::Float(FloatType::new())),
             Err(Error::DataTypeInvalid { .. })
         ));
+    }
+
+    /// Every variant must render its Java `asSQLString`. Spelled out one by one so
+    /// a wrong keyword cannot hide behind another arm.
+    #[test]
+    fn test_data_type_display_matches_java_sql_string() {
+        let cases: Vec<(DataType, &str)> = vec![
+            (DataType::Boolean(BooleanType::new()), "BOOLEAN"),
+            (DataType::TinyInt(TinyIntType::new()), "TINYINT"),
+            (DataType::SmallInt(SmallIntType::new()), "SMALLINT"),
+            (DataType::Int(IntType::new()), "INT"),
+            (DataType::BigInt(BigIntType::new()), "BIGINT"),
+            (DataType::Float(FloatType::new()), "FLOAT"),
+            (DataType::Double(DoubleType::new()), "DOUBLE"),
+            (DataType::Date(DateType::new()), "DATE"),
+            (DataType::Variant(VariantType::new()), "VARIANT"),
+            (DataType::Blob(BlobType::new()), "BLOB"),
+            (DataType::Binary(BinaryType::new(1).unwrap()), "BINARY(1)"),
+            (
+                DataType::Decimal(DecimalType::new(10, 2).unwrap()),
+                "DECIMAL(10, 2)",
+            ),
+            (
+                DataType::VarChar(VarCharType::new(10).unwrap()),
+                "VARCHAR(10)",
+            ),
+        ];
+        for (data_type, expected) in cases {
+            assert_eq!(data_type.to_string(), expected);
+            assert_eq!(
+                data_type.copy_with_nullable(false).unwrap().to_string(),
+                format!("{expected} NOT NULL"),
+                "NOT NULL suffix for {expected}"
+            );
+        }
+    }
+
+    /// Java renders a constructed type by filling its `FORMAT` with the children's
+    /// own SQL strings, so a child's `NOT NULL` sits inside the brackets while the
+    /// outer type's sits after them.
+    #[test]
+    fn test_constructed_data_type_display_nests_children() {
+        let int = DataType::Int(IntType::new());
+        let not_null_int = int.copy_with_nullable(false).unwrap();
+
+        assert_eq!(
+            DataType::Array(ArrayType::new(int.clone())).to_string(),
+            "ARRAY<INT>"
+        );
+        assert_eq!(
+            DataType::Array(ArrayType::with_nullable(false, not_null_int.clone())).to_string(),
+            "ARRAY<INT NOT NULL> NOT NULL"
+        );
+        assert_eq!(
+            DataType::Multiset(MultisetType::new(int.clone())).to_string(),
+            "MULTISET<INT>"
+        );
+        assert_eq!(
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::new(8).unwrap()),
+                int.clone()
+            ))
+            .to_string(),
+            "MAP<VARCHAR(8), INT>"
+        );
+        assert_eq!(
+            DataType::Array(ArrayType::new(DataType::Map(MapType::new(
+                int.clone(),
+                DataType::Array(ArrayType::new(int.clone()))
+            ))))
+            .to_string(),
+            "ARRAY<MAP<INT, ARRAY<INT>>>"
+        );
+    }
+
+    /// Java `RowType.FORMAT` is `ROW<%s>` over `DataField.asSQLString`, which is the
+    /// escaped name, the type, then `COMMENT '...'` when a description is present.
+    #[test]
+    fn test_row_type_display_renders_fields_like_java() {
+        let row = RowType::new(vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "name".to_string(),
+                DataType::VarChar(VarCharType::new(10).unwrap()),
+            ),
+        ]);
+        assert_eq!(
+            DataType::Row(row).to_string(),
+            "ROW<`id` INT, `name` VARCHAR(10)>"
+        );
+
+        let described = RowType::with_nullable(
+            false,
+            vec![
+                DataField::new(0, "id".to_string(), DataType::Int(IntType::new()))
+                    .with_description(Some("the 'key'".to_string())),
+            ],
+        );
+        assert_eq!(
+            DataType::Row(described).to_string(),
+            "ROW<`id` INT COMMENT 'the ''key'''> NOT NULL"
+        );
+
+        // A double quote is not special to backtick quoting; a backtick is doubled;
+        // a name with a space or a reserved word stays unambiguous.
+        let quoted = RowType::new(vec![DataField::new(
+            0,
+            "we\"ird".to_string(),
+            DataType::Int(IntType::new()),
+        )]);
+        assert_eq!(DataType::Row(quoted).to_string(), "ROW<`we\"ird` INT>");
+
+        let backticked = RowType::new(vec![DataField::new(
+            0,
+            "a`b".to_string(),
+            DataType::Int(IntType::new()),
+        )]);
+        assert_eq!(DataType::Row(backticked).to_string(), "ROW<`a``b` INT>");
+
+        let spaced = RowType::new(vec![
+            DataField::new(0, "two words".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "select".to_string(), DataType::Int(IntType::new())),
+        ]);
+        assert_eq!(
+            DataType::Row(spaced).to_string(),
+            "ROW<`two words` INT, `select` INT>"
+        );
     }
 
     #[test]

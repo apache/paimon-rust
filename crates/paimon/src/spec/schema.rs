@@ -1119,8 +1119,10 @@ impl DataField {
     }
 }
 
+/// Quote an identifier the way Java `EncodingUtils.escapeIdentifier` does: wrap it
+/// in backticks and double any backtick it contains.
 pub fn escape_identifier(identifier: &str) -> String {
-    identifier.replace('"', "\"\"")
+    format!("`{}`", identifier.replace('`', "``"))
 }
 
 pub fn escape_single_quotes(text: &str) -> String {
@@ -2386,8 +2388,13 @@ mod tests {
 
     #[test]
     fn test_escape_identifier() {
-        let escaped_identifier = escape_identifier("\"identifier\"");
-        assert_eq!(escaped_identifier, "\"\"identifier\"\"");
+        // Java doubles backticks and wraps in backticks; a double quote is not
+        // special (`EncodingUtils.escapeIdentifier`).
+        assert_eq!(escape_identifier("id"), "`id`");
+        assert_eq!(escape_identifier("a`b"), "`a``b`");
+        assert_eq!(escape_identifier("\"identifier\""), "`\"identifier\"`");
+        assert_eq!(escape_identifier("two words"), "`two words`");
+        assert_eq!(escape_identifier(""), "``");
     }
 
     #[test]
