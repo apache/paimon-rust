@@ -42,6 +42,30 @@ use std::sync::Arc;
 
 const MAX_MERGE_INPUT_STREAMS: usize = 256;
 
+#[derive(Debug, Clone, Copy)]
+pub enum AuditLogInput<'a> {
+    Current(&'a [DataSplit]),
+    Incremental(&'a IncrementalPlan),
+}
+
+impl<'a> From<&'a [DataSplit]> for AuditLogInput<'a> {
+    fn from(splits: &'a [DataSplit]) -> Self {
+        Self::Current(splits)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [DataSplit; N]> for AuditLogInput<'a> {
+    fn from(splits: &'a [DataSplit; N]) -> Self {
+        Self::Current(splits)
+    }
+}
+
+impl<'a> From<&'a IncrementalPlan> for AuditLogInput<'a> {
+    fn from(plan: &'a IncrementalPlan) -> Self {
+        Self::Incremental(plan)
+    }
+}
+
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
 ///
 /// Reference: [pypaimon.read.table_read.TableRead](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_read.py)
@@ -80,6 +104,18 @@ impl<'a> TableRead<'a> {
                 data_predicates,
             )))
         }
+    }
+
+    pub(super) fn new_with_audit_projection(
+        table: &'a Table,
+        read_type: Vec<DataField>,
+        data_predicates: Vec<Predicate>,
+        audit_projection: Option<Vec<DataField>>,
+    ) -> Self {
+        Self(TableReadKind::Paimon(
+            PaimonTableRead::new(table, read_type, data_predicates)
+                .with_audit_projection(audit_projection),
+        ))
     }
 
     pub(crate) fn new_format(
@@ -192,54 +228,20 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Returns an audit-log [`ArrowRecordBatchStream`] for an incremental plan.
-    ///
-    /// Output schema is `rowkind` (+ optional `_SEQUENCE_NUMBER`) followed by
-    /// the projected user columns. Primary-key Delta and Changelog rows take
-    /// kinds from `_VALUE_KIND`; append-only Delta rows are `+I`. Diff emits
-    /// `+I`/`-U`/`+U`/`-D` from before/after image comparison.
-    pub fn to_audit_log_arrow(
+    /// Returns audit-log rows for current splits or an incremental plan.
+    pub fn to_audit_log_arrow<'input>(
         &self,
-        plan: &IncrementalPlan,
-    ) -> crate::Result<ArrowRecordBatchStream> {
-        self.ensure_query_auth_allowed()?;
-        plan.validate()?;
-        match &self.0 {
-            TableReadKind::Paimon(read) => read.to_audit_log_arrow(plan),
-            TableReadKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Format tables do not support audit log batch read".to_string(),
-            }),
-        }
-    }
-
-    /// Returns the current table state as audit-log rows for planned data splits.
-    pub fn to_audit_log_arrow_for_splits(
-        &self,
-        data_splits: &[DataSplit],
+        input: impl Into<AuditLogInput<'input>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
         self.ensure_query_auth_allowed()?;
         match &self.0 {
-            TableReadKind::Paimon(read) => read.to_audit_log_arrow_for_splits(data_splits),
-            TableReadKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "Format tables do not support audit log batch read".to_string(),
-            }),
-        }
-    }
-
-    /// As [`Self::to_audit_log_arrow_for_splits`], omitting unrequested system columns.
-    pub fn to_projected_audit_log_arrow_for_splits(
-        &self,
-        data_splits: &[DataSplit],
-        include_rowkind: bool,
-        include_sequence: bool,
-    ) -> crate::Result<ArrowRecordBatchStream> {
-        self.ensure_query_auth_allowed()?;
-        match &self.0 {
-            TableReadKind::Paimon(read) => read.to_projected_audit_log_arrow_for_splits(
-                data_splits,
-                include_rowkind,
-                include_sequence,
-            ),
+            TableReadKind::Paimon(read) => match input.into() {
+                AuditLogInput::Current(splits) => read.audit_current_stream(splits),
+                AuditLogInput::Incremental(plan) => {
+                    plan.validate()?;
+                    read.audit_incremental_stream(plan)
+                }
+            },
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support audit log batch read".to_string(),
             }),
@@ -255,6 +257,7 @@ impl<'a> TableRead<'a> {
 struct PaimonTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
+    audit_projection: Option<Vec<DataField>>,
     data_predicates: Vec<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
@@ -271,11 +274,17 @@ impl<'a> PaimonTableRead<'a> {
         Self {
             table,
             read_type,
+            audit_projection: None,
             data_predicates,
             row_filter_factory: None,
             parquet_read_budget: None,
             data_file_read_timing: None,
         }
+    }
+
+    fn with_audit_projection(mut self, projection: Option<Vec<DataField>>) -> Self {
+        self.audit_projection = projection;
+        self
     }
 
     /// Schema (fields) that this read will produce.
@@ -390,31 +399,13 @@ impl<'a> PaimonTableRead<'a> {
         }))
     }
 
-    /// Returns the current table state as audit-log rows.
-    pub fn to_audit_log_arrow_for_splits(
+    fn audit_current_stream(
         &self,
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
-        self.to_projected_audit_log_arrow_for_splits(
-            data_splits,
-            true,
-            audit_sequence_number_enabled(self.table),
-        )
-    }
-
-    /// Returns projected current-state audit rows without materializing omitted system columns.
-    pub fn to_projected_audit_log_arrow_for_splits(
-        &self,
-        data_splits: &[DataSplit],
-        include_rowkind: bool,
-        include_sequence: bool,
-    ) -> crate::Result<ArrowRecordBatchStream> {
-        if include_sequence && !audit_sequence_number_enabled(self.table) {
-            return Err(crate::Error::DataInvalid {
-                message: "Audit read requested _SEQUENCE_NUMBER but table-read.sequence-number.enabled is false".to_string(),
-                source: None,
-            });
-        }
+        let output_read_type = self.audit_read_type()?;
+        let include_rowkind = audit_field_requested(&output_read_type, ROW_KIND_FIELD_ID);
+        let include_sequence = audit_field_requested(&output_read_type, SEQUENCE_NUMBER_FIELD_ID);
         let user_read_type = self.read_type.clone();
         let audit_schema =
             audit_schema_for_read_type(&user_read_type, include_rowkind, include_sequence)?;
@@ -450,6 +441,7 @@ impl<'a> PaimonTableRead<'a> {
                 read_type.clone(),
                 self.data_predicates.clone(),
             )
+            .with_file_index_read_enabled(core_options.file_index_read_enabled())
             .with_batch_size(Some(core_options.read_batch_size()?))
             .with_parquet_read_budget(Some(Arc::clone(&parquet_read_budget)))
             .read(&raw_splits)?;
@@ -501,18 +493,18 @@ impl<'a> PaimonTableRead<'a> {
             self.to_arrow(data_splits)?
         };
 
-        Ok(audit_stream_from_physical(
+        let stream = audit_stream_from_physical(
             physical_stream,
             audit_schema,
             user_read_type,
             include_rowkind,
             include_sequence,
             has_primary_keys && include_rowkind,
-        ))
+        );
+        project_audit_stream(stream, &output_read_type)
     }
 
-    /// Returns an audit-log stream for a planned incremental scan.
-    pub fn to_audit_log_arrow(
+    fn audit_incremental_stream(
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
@@ -530,6 +522,25 @@ impl<'a> PaimonTableRead<'a> {
         }
     }
 
+    fn audit_read_type(&self) -> crate::Result<Vec<DataField>> {
+        let fields = self.audit_projection.clone().unwrap_or_else(|| {
+            audit_fields_for_read_type(
+                &self.read_type,
+                true,
+                audit_sequence_number_enabled(self.table),
+            )
+        });
+        if audit_field_requested(&fields, SEQUENCE_NUMBER_FIELD_ID)
+            && !audit_sequence_number_enabled(self.table)
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Audit read requested _SEQUENCE_NUMBER but table-read.sequence-number.enabled is false".to_string(),
+                source: None,
+            });
+        }
+        Ok(fields)
+    }
+
     fn audit_raw_stream(
         &self,
         plan: &IncrementalPlan,
@@ -538,9 +549,12 @@ impl<'a> PaimonTableRead<'a> {
         plan.validate()?;
         let core_options = self.table.schema().core_options();
         let data_splits = plan.data_splits();
+        let output_read_type = self.audit_read_type()?;
         let user_read_type = self.read_type.clone();
-        let include_sequence = audit_sequence_number_enabled(self.table);
-        let audit_schema = audit_schema_for_read_type(&user_read_type, true, include_sequence)?;
+        let include_rowkind = audit_field_requested(&output_read_type, ROW_KIND_FIELD_ID);
+        let include_sequence = audit_field_requested(&output_read_type, SEQUENCE_NUMBER_FIELD_ID);
+        let audit_schema =
+            audit_schema_for_read_type(&user_read_type, include_rowkind, include_sequence)?;
 
         let mut read_type = user_read_type.clone();
         if include_sequence {
@@ -553,7 +567,7 @@ impl<'a> PaimonTableRead<'a> {
                 ),
             );
         }
-        if has_value_kind {
+        if has_value_kind && include_rowkind {
             read_type.push(DataField::new(
                 VALUE_KIND_FIELD_ID,
                 VALUE_KIND_FIELD_NAME.to_string(),
@@ -573,25 +587,28 @@ impl<'a> PaimonTableRead<'a> {
         .with_batch_size(Some(core_options.read_batch_size()?))
         .with_parquet_read_budget(Some(self.parquet_read_budget()?));
         let raw_stream = reader.read(&data_splits)?;
-        Ok(audit_stream_from_physical(
+        let stream = audit_stream_from_physical(
             raw_stream,
             audit_schema,
             user_read_type,
-            true,
+            include_rowkind,
             include_sequence,
-            has_value_kind,
-        ))
+            has_value_kind && include_rowkind,
+        );
+        project_audit_stream(stream, &output_read_type)
     }
 
     fn audit_diff_stream(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
         let pairs = diff_pairs(plan)?;
         let parallel = CoreOptions::new(self.table.schema().options()).diff_parallelism();
+        let output_read_type = self.audit_read_type()?;
+        let include_sequence = audit_field_requested(&output_read_type, SEQUENCE_NUMBER_FIELD_ID);
         let table = self.table.clone();
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
 
-        Ok(Box::pin(async_stream::try_stream! {
+        let stream: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
             let mut workers = stream::iter(pairs.into_iter().map(|(before, after)| {
                 let table = table.clone();
                 let read_type = read_type.clone();
@@ -601,7 +618,11 @@ impl<'a> PaimonTableRead<'a> {
                     let pair_read = PaimonTableRead::new(&table, read_type, data_predicates)
                         .with_parquet_read_budget(parquet_read_budget);
                     let mut pair_stream =
-                        pair_read.to_audit_log_arrow_for_diff(&before, &after)?;
+                        pair_read.to_audit_log_arrow_for_diff(
+                            &before,
+                            &after,
+                            include_sequence,
+                        )?;
                     while let Some(batch) = pair_stream.next().await {
                         yield batch?;
                     }
@@ -612,15 +633,16 @@ impl<'a> PaimonTableRead<'a> {
             while let Some(batch) = workers.next().await {
                 yield batch?;
             }
-        }))
+        });
+        project_audit_stream(stream, &output_read_type)
     }
 
     fn to_audit_log_arrow_for_diff(
         &self,
         before: &[DataSplit],
         after: &[DataSplit],
+        include_sequence: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let include_sequence = audit_sequence_number_enabled(self.table);
         let audit_schema = audit_schema_for_read_type(&self.read_type, true, include_sequence)?;
 
         let mut diff_read_type = self.table.schema().fields().to_vec();
@@ -1165,11 +1187,53 @@ fn audit_stream_from_physical(
     })
 }
 
-fn audit_schema_for_read_type(
+fn project_audit_stream(
+    stream: ArrowRecordBatchStream,
+    read_type: &[DataField],
+) -> crate::Result<ArrowRecordBatchStream> {
+    let schema = build_target_arrow_schema(read_type)?;
+    let names = read_type
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect::<Vec<_>>();
+    Ok(Box::pin(async_stream::try_stream! {
+        futures::pin_mut!(stream);
+        let mut indices = None;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let indices = indices.get_or_insert_with(|| {
+                names
+                    .iter()
+                    .map(|name| batch.schema().index_of(name))
+                    .collect::<Result<Vec<_>, _>>()
+            });
+            let indices = indices.as_ref().map_err(|error| crate::Error::DataInvalid {
+                message: format!("Audit read projection failed: {error}"),
+                source: None,
+            })?;
+            let columns = indices
+                .iter()
+                .map(|&index| batch.column(index).clone())
+                .collect();
+            let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+            yield RecordBatch::try_new_with_options(schema.clone(), columns, &options)
+                .map_err(|error| crate::Error::UnexpectedError {
+                    message: format!("Failed to project audit log batch: {error}"),
+                    source: Some(Box::new(error)),
+                })?;
+        }
+    }))
+}
+
+fn audit_field_requested(read_type: &[DataField], field_id: i32) -> bool {
+    read_type.iter().any(|field| field.id() == field_id)
+}
+
+fn audit_fields_for_read_type(
     read_type: &[DataField],
     include_rowkind: bool,
     include_sequence: bool,
-) -> crate::Result<Arc<ArrowSchema>> {
+) -> Vec<DataField> {
     let mut fields = Vec::with_capacity(read_type.len() + 2);
     if include_rowkind {
         fields.push(DataField::new(
@@ -1186,7 +1250,19 @@ fn audit_schema_for_read_type(
         ));
     }
     fields.extend(read_type.iter().cloned());
-    build_target_arrow_schema(&fields)
+    fields
+}
+
+fn audit_schema_for_read_type(
+    read_type: &[DataField],
+    include_rowkind: bool,
+    include_sequence: bool,
+) -> crate::Result<Arc<ArrowSchema>> {
+    build_target_arrow_schema(&audit_fields_for_read_type(
+        read_type,
+        include_rowkind,
+        include_sequence,
+    ))
 }
 
 fn audit_sequence_number_enabled(table: &Table) -> bool {
@@ -1894,10 +1970,13 @@ mod tests {
             .to_vec()
     }
 
-    fn file_index_table(path: &str, enabled: Option<bool>) -> Table {
+    fn file_index_table(path: &str, enabled: Option<bool>, primary_key: bool) -> Table {
         let mut builder = Schema::builder().column("id", DataType::Int(IntType::new()));
         if let Some(enabled) = enabled {
             builder = builder.option("file-index.read.enabled", enabled.to_string());
+        }
+        if primary_key {
+            builder = builder.primary_key(["id"]).option("bucket", "1");
         }
         Table::new(
             FileIOBuilder::new("memory").build().unwrap(),
@@ -1914,7 +1993,7 @@ mod tests {
         indexed_file.row_count = 1;
         indexed_file.embedded_index = Some(embedded_bitmap_index().await);
         let split = split(vec![indexed_file], true);
-        let table = file_index_table("memory:/table_read_file_index", None);
+        let table = file_index_table("memory:/table_read_file_index", None, false);
         let fields = table.schema().fields().to_vec();
         let predicate = PredicateBuilder::new(&fields)
             .equal("id", Datum::Int(99))
@@ -1948,8 +2027,22 @@ mod tests {
             .unwrap();
         assert!(audit.is_empty());
 
+        let pk_table = file_index_table("memory:/table_read_audit_file_index", None, true);
+        let pk_fields = pk_table.schema().fields().to_vec();
+        let pk_predicate = PredicateBuilder::new(&pk_fields)
+            .equal("id", Datum::Int(99))
+            .unwrap();
+        let pk_read = TableRead::new(&pk_table, pk_fields, vec![pk_predicate]);
+        let current_audit = pk_read
+            .to_audit_log_arrow(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(current_audit.is_empty());
+
         let disabled_table =
-            file_index_table("memory:/table_read_file_index_disabled", Some(false));
+            file_index_table("memory:/table_read_file_index_disabled", Some(false), false);
         let disabled_fields = disabled_table.schema().fields().to_vec();
         let disabled_predicate = PredicateBuilder::new(&disabled_fields)
             .equal("id", Datum::Int(99))

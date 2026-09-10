@@ -91,6 +91,6 @@ impl AuditLogTable {
         self.wrapped
             .new_read_builder()
             .new_read()?
-            .to_audit_log_arrow_for_splits(splits)
+            .to_audit_log_arrow(splits)
     }
 }

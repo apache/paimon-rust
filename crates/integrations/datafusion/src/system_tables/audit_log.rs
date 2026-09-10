@@ -94,9 +94,14 @@ impl TableProvider for AuditLogTable {
         if let Some(limit) = pushed_limit {
             read_builder.with_limit(limit);
         }
-        let (plan, trace) = await_with_runtime(read_builder.new_scan().plan_with_trace())
-            .await
-            .map_err(to_datafusion_error)?;
+        let (plan, trace) = await_with_runtime(
+            read_builder
+                .new_scan()
+                .with_scan_all_files()
+                .plan_with_trace(),
+        )
+        .await
+        .map_err(to_datafusion_error)?;
 
         PaimonScanBuilder {
             table: &self.table,

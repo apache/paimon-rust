@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::BooleanArray;
 use datafusion::arrow::compute::{cast, filter_record_batch};
 use datafusion::arrow::datatypes::{
-    DataType as ArrowDataType, Schema, SchemaRef as ArrowSchemaRef, TimeUnit,
+    DataType as ArrowDataType, SchemaRef as ArrowSchemaRef, TimeUnit,
 };
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::stats::Precision;
@@ -51,62 +50,12 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use paimon::arrow::ParquetReadBudget;
-use paimon::spec::{
-    DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator,
-    ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_NAME,
-};
+use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::scalar_to_datum;
-
-struct AuditProjection {
-    indices: Vec<usize>,
-    schema: ArrowSchemaRef,
-}
-
-fn audit_projection(batch: &RecordBatch, schema: &ArrowSchemaRef) -> DFResult<AuditProjection> {
-    let batch_schema = batch.schema();
-    let by_name: HashMap<&str, usize> = batch_schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(index, field)| (field.name().as_str(), index))
-        .collect();
-    let indices = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            by_name.get(field.name().as_str()).copied().ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
-                    "Audit log reader did not return projected column '{}'",
-                    field.name()
-                ))
-            })
-        })
-        .collect::<DFResult<Vec<_>>>()?;
-    let fields = indices
-        .iter()
-        .map(|&index| batch.schema().field(index).clone())
-        .collect::<Vec<_>>();
-    Ok(AuditProjection {
-        indices,
-        schema: Arc::new(Schema::new(fields)),
-    })
-}
-
-fn project_audit_batch(batch: RecordBatch, projection: &AuditProjection) -> DFResult<RecordBatch> {
-    let row_count = batch.num_rows();
-    let columns = projection
-        .indices
-        .iter()
-        .map(|&index| batch.column(index).clone())
-        .collect();
-    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
-    RecordBatch::try_new_with_options(projection.schema.clone(), columns, &options)
-        .map_err(Into::into)
-}
 
 fn to_datafusion_batch(batch: RecordBatch, schema: &ArrowSchemaRef) -> DFResult<RecordBatch> {
     if batch.num_columns() != schema.fields().len() {
@@ -1195,33 +1144,14 @@ impl ExecutionPlan for PaimonTableScan {
                 )));
             }
             let stream = if audit_log {
-                read.to_projected_audit_log_arrow_for_splits(
-                    &splits,
-                    schema
-                        .fields()
-                        .iter()
-                        .any(|field| field.name() == ROW_KIND_FIELD_NAME),
-                    schema
-                        .fields()
-                        .iter()
-                        .any(|field| field.name() == SEQUENCE_NUMBER_FIELD_NAME),
-                )
+                read.to_audit_log_arrow(splits.as_ref())
             } else {
                 read.to_arrow(&splits)
             }
             .map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
-            let mut cached_audit_projection = None;
             let stream = stream.map(move |result| {
                 let batch = result.map_err(to_datafusion_error)?;
-                let batch = if audit_log {
-                    if cached_audit_projection.is_none() {
-                        cached_audit_projection = Some(audit_projection(&batch, &batch_schema)?);
-                    }
-                    project_audit_batch(batch, cached_audit_projection.as_ref().unwrap())?
-                } else {
-                    batch
-                };
                 let mut batch = to_datafusion_batch(batch, &batch_schema)?;
                 // The decoder hook is an optimization and may be unavailable
                 // for a file/path. Retain every original live expression as

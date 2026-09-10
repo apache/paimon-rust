@@ -337,6 +337,55 @@ async fn test_audit_log_system_table_keeps_row_kinds_and_sequence_numbers() {
 }
 
 #[tokio::test]
+async fn test_first_row_audit_log_merges_level_zero_before_filtering() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    run_sql(
+        &ctx,
+        "CREATE TABLE paimon.default.first_row_audit (
+            id INT NOT NULL,
+            value INT,
+            PRIMARY KEY (id)
+        ) WITH (
+            'bucket' = '1',
+            'merge-engine' = 'first-row'
+        )",
+    )
+    .await;
+    run_sql(
+        &ctx,
+        "INSERT INTO paimon.default.first_row_audit VALUES (1, 10)",
+    )
+    .await;
+    run_sql(
+        &ctx,
+        "INSERT INTO paimon.default.first_row_audit VALUES (1, 20)",
+    )
+    .await;
+
+    let batches = run_sql(
+        &ctx,
+        "SELECT value FROM paimon.default.first_row_audit$audit_log",
+    )
+    .await;
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[10]
+    );
+
+    let batches = run_sql(
+        &ctx,
+        "SELECT value FROM paimon.default.first_row_audit$audit_log WHERE value = 20",
+    )
+    .await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+}
+
+#[tokio::test]
 async fn test_audit_log_system_table_matches_deletion_vector_visibility() {
     let (ctx, _catalog, _tmp) = create_context().await;
     run_sql(

@@ -1423,11 +1423,9 @@ impl<'a> PaimonTableScan<'a> {
     ///   per-row masks, stats are a superset of live rows, full pruning stays
     ///   safe. With merge-on-read enabled, visible L0 versions require the
     ///   same key-only pruning rule as an ordinary PK merge read.
-    /// - `merge-engine=first-row`: planned with `skip_level_zero` and read
-    ///   via `DataFileReader` (see `TableRead::to_arrow`), no merge on the
-    ///   read path — pruning a file drops exactly the rows the raw path's
-    ///   exact residual filter would drop anyway. If first-row ever gains a
-    ///   merge read path, this exemption must be revisited.
+    /// - Ordinary `merge-engine=first-row` reads: planned with
+    ///   `skip_level_zero` and read via `DataFileReader`. Audit reads use
+    ///   `scan_all_files` and merge visible versions, so they are not exempt.
     fn stats_pruning_predicates(&self) -> Vec<Predicate> {
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema().options());
@@ -1441,7 +1439,7 @@ impl<'a> PaimonTableScan<'a> {
         );
         if has_primary_keys
             && (!deletion_vectors_enabled || deletion_vectors_merge_on_read)
-            && !first_row
+            && (!first_row || self.scan_all_files)
         {
             retain_primary_key_conjuncts(
                 &self.data_predicates,
@@ -3719,12 +3717,9 @@ mod tests {
         );
     }
 
-    /// `merge-engine=first-row` PK tables read raw (no merge on the read
-    /// path: planned with `skip_level_zero`, read via `DataFileReader`), so
-    /// pruning a file by a non-key conjunct cannot resurrect anything — it
-    /// drops exactly the rows the raw path's exact residual filter would
-    /// drop. The key-only gate must exempt first-row and keep full-predicate
-    /// stats pruning, matching the split-generation path.
+    /// Ordinary `merge-engine=first-row` reads skip level-0 files and read raw,
+    /// so full-predicate stats pruning stays safe. A scan of all files retains
+    /// level-0 versions for audit merging and must use key-only pruning.
     #[tokio::test]
     async fn test_first_row_table_stats_pruning_keeps_non_key_conjuncts() {
         let table_path = "memory:/test_first_row_stats_gate";
@@ -3781,6 +3776,23 @@ mod tests {
         assert_eq!(
             planned_files, 1,
             "only the value-matching file should be planned on first-row"
+        );
+
+        let (audit_plan, audit_trace) = reader
+            .new_scan()
+            .with_scan_all_files()
+            .plan_with_trace()
+            .await
+            .unwrap();
+        assert_eq!(audit_trace.manifest_entries_pruned_by_data_stats, 0);
+        assert_eq!(
+            audit_plan
+                .splits()
+                .iter()
+                .map(|split| split.data_files().len())
+                .sum::<usize>(),
+            2,
+            "all versions must reach the first-row audit merge"
         );
     }
 

@@ -371,7 +371,7 @@ impl PaimonScanBuilder<'_> {
         read_fields: Vec<DataField>,
         audit_log: bool,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let (projected_schema, mut read_type) = if let Some(indices) = self.projection {
+        let (projected_schema, read_type) = if let Some(indices) = self.projection {
             let fields: Vec<Field> = indices
                 .iter()
                 .map(|&index| self.schema.field(index).clone())
@@ -384,15 +384,6 @@ impl PaimonScanBuilder<'_> {
         } else {
             (self.schema.clone(), read_fields)
         };
-        if audit_log {
-            read_type.retain(|field| {
-                !matches!(
-                    field.id(),
-                    paimon::spec::ROW_KIND_FIELD_ID | paimon::spec::SEQUENCE_NUMBER_FIELD_ID
-                )
-            });
-        }
-
         let first_row_audit = audit_log
             && self
                 .table
