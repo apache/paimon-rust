@@ -733,8 +733,13 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     // Build #1 over the initial batch via a real end-to-end build.
     write_vectors(
         &table,
-        vec![1, 2, 3],
-        vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
+        vec![0, 1, 2, 3],
+        vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+            vec![2.0, 1.0],
+        ],
     )
     .await;
     let first_built = table
@@ -742,7 +747,7 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
         .with_index_column("embedding")
         .with_options(HashMap::from([(
             "ivf-flat.train.sample-ratio".to_string(),
-            "0.9".to_string(),
+            "0.5".to_string(),
         )]))
         .execute()
         .await

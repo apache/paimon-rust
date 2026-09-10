@@ -175,6 +175,12 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 }
             }
             if !usable || !found_vector_file {
+                log::warn!(
+                    "vindex sparse training read is unavailable for column '{}' in shard [{}, {}]; falling back to a full scan (usable_offset_indexes={usable}, found_vector_file={found_vector_file})",
+                    index_column,
+                    shard.row_range_start,
+                    shard.row_range_end,
+                );
                 sparse_ranges = None;
             }
         }
@@ -347,16 +353,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     rows_added = batch_end;
                     batches_added += 1;
                 }
-                if rows_added != row_count_usize || expected_row_id != expected_end {
-                    return Err(Error::DataInvalid {
-                        message: format!(
-                            "vindex streamed data mismatch: rows={rows_added}/{row_count_usize}, next_row_id={expected_row_id}/{expected_end}"
-                        ),
-                        source: None,
-                    });
-                }
                 Ok((
                     writer,
+                    rows_added,
+                    expected_row_id,
                     batches_added,
                     blocked,
                     validate_add,
@@ -398,14 +398,31 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             }
             drop(sender);
             let consumer_result = consumer.await;
+            let (
+                writer,
+                rows_added,
+                next_row_id,
+                batches_added,
+                blocked,
+                validate_add,
+                min_bytes,
+                max_bytes,
+                total_bytes,
+            ) = consumer_result.map_err(|e| Error::UnexpectedError {
+                message: format!("vindex add task failed: {e}"),
+                source: None,
+            })??;
             if let Some(error) = producer_error {
                 return Err(error);
             }
-            let (writer, batches_added, blocked, validate_add, min_bytes, max_bytes, total_bytes) =
-                consumer_result.map_err(|e| Error::UnexpectedError {
-                    message: format!("vindex add task failed: {e}"),
+            if rows_added != row_count_usize || next_row_id != expected_end {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "vindex streamed data mismatch: rows={rows_added}/{row_count_usize}, next_row_id={next_row_id}/{expected_end}"
+                    ),
                     source: None,
-                })??;
+                });
+            }
             batch_count = batches_added;
             pipeline_blocked = blocked;
             consumer_validate_add = validate_add;
