@@ -22,7 +22,9 @@ use crate::{Error, Result};
 
 use super::validation::checked_row_count;
 
-const MAX_IVF_TRAINING_RANGES: usize = 64;
+// Keep samples short enough to avoid storage-order bias; fall back before range I/O explodes.
+const MAX_IVF_TRAINING_RANGE_ROWS: usize = 128;
+const MAX_IVF_TRAINING_RANGES: usize = 4_096;
 
 pub(crate) type VindexIndexShard = VectorIndexShard;
 
@@ -53,7 +55,7 @@ pub(super) fn plan_vindex_shards(
 pub(super) fn plan_ivf_training_ranges(
     shard: &VindexIndexShard,
     training_rows: usize,
-) -> Result<Vec<RowRange>> {
+) -> Result<Option<Vec<RowRange>>> {
     let shard_rows = usize::try_from(checked_row_count(
         shard.row_range_start,
         shard.row_range_end,
@@ -70,11 +72,10 @@ pub(super) fn plan_ivf_training_ranges(
             source: None,
         });
     }
-    if training_rows == shard_rows {
-        return Ok(Vec::new());
+    let range_count = training_rows.div_ceil(MAX_IVF_TRAINING_RANGE_ROWS);
+    if range_count > MAX_IVF_TRAINING_RANGES {
+        return Ok(None);
     }
-
-    let range_count = training_rows.min(MAX_IVF_TRAINING_RANGES);
     let mut seed = mix_seed(
         (shard.snapshot_id as u64)
             ^ (shard.row_range_start as u64).rotate_left(21)
@@ -101,7 +102,7 @@ pub(super) fn plan_ivf_training_ranges(
         cursor = checked_add_offset(cursor, stratum_length, "training stratum")?;
     }
 
-    Ok(merge_row_ranges(ranges))
+    Ok(Some(merge_row_ranges(ranges)))
 }
 
 fn checked_add_offset(value: i64, offset: usize, name: &str) -> Result<i64> {

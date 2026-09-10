@@ -96,16 +96,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let training_rows_retained = if self.index_type == DISKANN_IDENTIFIER {
             0
         } else {
-            default_training_vector_count(training_vector_count, options.config.nlist()).map_err(
-                |e| Error::DataInvalid {
-                    message: format!("Failed to calculate IVF training vector count: {e}"),
-                    source: Some(Box::new(e)),
-                },
-            )?
+            // This only gates sparse reads; errors must preserve the full-scan fallback.
+            default_training_vector_count(training_vector_count, options.config.nlist())
+                .unwrap_or(0)
         };
         let mut sparse_ranges =
             if training_rows_retained > 0 && training_rows_retained < row_count_usize {
-                Some(plan_ivf_training_ranges(shard, training_rows_retained)?)
+                plan_ivf_training_ranges(shard, training_rows_retained)?
             } else {
                 None
             };
@@ -114,10 +111,12 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             let mut checks = Vec::new();
             let mut usable = true;
             for file in &shard.files {
-                let path = file.data_file_path(&shard.bucket_path);
-                if !path.to_ascii_lowercase().ends_with(".parquet") {
-                    usable = false;
-                    break;
+                if file
+                    .write_cols
+                    .as_ref()
+                    .is_some_and(|columns| !columns.iter().any(|column| column == index_column))
+                {
+                    continue;
                 }
                 let Some((file_start, file_end)) = file.row_id_range() else {
                     usable = false;
@@ -131,13 +130,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                         (from <= to).then(|| RowRange::new(from - file_start, to - file_start))
                     })
                     .collect::<Vec<_>>();
-                if local_ranges.is_empty()
-                    || file
-                        .write_cols
-                        .as_ref()
-                        .is_some_and(|columns| !columns.iter().any(|column| column == index_column))
-                {
+                if local_ranges.is_empty() {
                     continue;
+                }
+                let path = file.data_file_path(&shard.bucket_path);
+                if !path.to_ascii_lowercase().ends_with(".parquet") {
+                    usable = false;
+                    break;
                 }
                 let file_size = u64::try_from(file.file_size).map_err(|e| Error::DataInvalid {
                     message: format!(
