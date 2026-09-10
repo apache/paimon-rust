@@ -315,6 +315,12 @@ struct PaimonReadBuilder<'a> {
     derived_row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     parquet_read_budget: Option<Arc<crate::arrow::ParquetReadBudget>>,
+    /// Whether the caller ever set a filter, recorded BEFORE normalization splits it
+    /// into partition and data halves and before `_ROW_ID` conjuncts are extracted
+    /// into ranges. A read that bypasses scan planning cannot apply any of those
+    /// channels and must refuse rather than ignore them, and only this bit survives
+    /// every one of them.
+    filter_set: bool,
 }
 
 impl<'a> PaimonReadBuilder<'a> {
@@ -329,6 +335,7 @@ impl<'a> PaimonReadBuilder<'a> {
             derived_row_ranges: None,
             case_sensitive: true,
             parquet_read_budget: None,
+            filter_set: false,
         }
     }
 
@@ -388,6 +395,7 @@ impl<'a> PaimonReadBuilder<'a> {
     /// primary-key merge reads push key conjuncts below the merge and enforce
     /// the full predicate with an exact post-merge residual filter.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
+        self.filter_set = true;
         self.filter = normalize_filter(self.table, filter);
         self.derived_row_ranges = None;
         self.try_extract_row_id_ranges();
@@ -519,6 +527,14 @@ impl<'a> PaimonReadBuilder<'a> {
         };
         Ok(
             TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
+                .with_filter_set(self.filter_set)
+                // Both are scan-only, and both are already recorded as `Option`s here,
+                // so no extra bookkeeping is needed -- a scan-bypassing read only has to
+                // know they were SET, to refuse rather than ignore them.
+                .with_scan_only_restrictions(
+                    self.limit.is_some(),
+                    self.explicit_row_ranges.is_some(),
+                )
                 .with_parquet_read_budget(parquet_read_budget),
         )
     }
@@ -801,6 +817,89 @@ mod tests {
             TableSchema::new(0, &builder.build().unwrap()),
             None,
         )
+    }
+
+    /// A vector search read bypasses the scan, so it never sees the partition half of
+    /// the caller's filter -- `new_read` keeps only the data half. Without the
+    /// `filter_set` bit a pure partition filter would be dropped silently: the guard
+    /// would see empty data predicates and let every partition's hits through
+    /// unfiltered. This is the case that makes the bit load-bearing, so it is pinned
+    /// here on the builder rather than only on the read.
+    #[tokio::test]
+    async fn new_read_records_a_partition_only_filter_for_the_vector_search_read() {
+        let table = simple_table();
+        let partition_only = PredicateBuilder::new(table.schema().fields())
+            .equal("dt", crate::spec::Datum::String("2024-01-01".to_string()))
+            .unwrap();
+
+        let mut builder = table.new_read_builder();
+        builder.with_filter(partition_only);
+        let read = builder.new_read().unwrap();
+        // The data half really is empty -- which is why the flag has to exist.
+        assert!(
+            read.data_predicates().is_empty(),
+            "a partition-only filter leaves no data predicate behind"
+        );
+
+        // The guard runs before anything touches the splits, so none are needed.
+        let error = read
+            .to_arrow_indexed(&[])
+            .map(|_| ())
+            .expect_err("a partition filter must not be silently ignored");
+        assert!(
+            error.to_string().contains("cannot honour a filter"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A limit and explicit row ranges never reach a `TableRead` -- the read builder
+    /// keeps both for `TableScan`. A read that runs no scan therefore cannot honour
+    /// them, and must say so: silently ignoring a limit returns MORE rows than asked
+    /// for, and `with_row_ranges(vec![])` documents "selects no rows", which returning
+    /// every hit contradicts outright. Java silently ignores a limit here, so this
+    /// is a divergence to refuse, not a property to inherit.
+    #[tokio::test]
+    async fn to_arrow_indexed_refuses_scan_only_restrictions() {
+        let table = simple_table();
+
+        for (label, apply) in [
+            (
+                "a limit",
+                Box::new(|b: &mut ReadBuilder| {
+                    b.with_limit(0);
+                }) as Box<dyn Fn(&mut ReadBuilder)>,
+            ),
+            (
+                "row ranges",
+                Box::new(|b: &mut ReadBuilder| {
+                    // The empty vector on purpose: it is the case whose documented
+                    // meaning ("selects no rows") is the exact opposite of what
+                    // ignoring it would do.
+                    b.with_row_ranges(Vec::new());
+                }),
+            ),
+        ] {
+            let mut builder = table.new_read_builder();
+            apply(&mut builder);
+            let error = builder
+                .new_read()
+                .unwrap()
+                .to_arrow_indexed(&[])
+                .map(|_| ())
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(label),
+                "the error must name {label}: {error}"
+            );
+        }
+
+        // Neither set: the guard stays out of the way.
+        assert!(table
+            .new_read_builder()
+            .new_read()
+            .unwrap()
+            .to_arrow_indexed(&[])
+            .is_ok());
     }
 
     fn simple_table() -> Table {

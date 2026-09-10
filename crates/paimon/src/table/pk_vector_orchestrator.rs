@@ -265,6 +265,12 @@ pub(crate) fn build_indexed_splits(
 
         // Coalesce ascending positions into inclusive ranges; scores aligned to
         // ascending-position order.
+        //
+        // No score validation here: this helper also runs BEFORE reranking, purely to
+        // get the position ranges, and the scores it computes there are discarded
+        // (`rerank_indexed_positional` passes `None`). Rejecting a NaN here would fail
+        // a query the rerank would have dropped the NaN candidate from. Validation
+        // belongs where the scores leave the library -- see `validate_finite_scores`.
         let mut row_ranges: Vec<RowRange> = Vec::new();
         let mut scores: Vec<f32> = Vec::with_capacity(hits.len());
         let mut start = hits[0].0;
@@ -288,7 +294,16 @@ pub(crate) fn build_indexed_splits(
             .with_bucket(source.bucket())
             .with_bucket_path(source.bucket_path().to_string())
             .with_total_buckets(source.total_buckets())
-            .with_data_files(vec![file_meta]);
+            .with_data_files(vec![file_meta])
+            // Java's `PrimaryKeyScoredResult` marks the derived split non-raw-convertible,
+            // so mirror it. On a table without deletion vectors this also has teeth: a
+            // caller that clones `data_split()` into an ordinary read would otherwise take
+            // the raw path, which skips the merge and returns every physical row of the
+            // file -- including versions of a key that a later row in the same file
+            // supersedes. It is not a complete guard, and is not relied on as one:
+            // `pk_split_needs_merge` ignores this flag entirely once deletion vectors are
+            // enabled, dispatching on file level alone.
+            .with_raw_convertible(false);
         if let Some(df) = deletion_file {
             builder = builder.with_data_deletion_files(vec![Some(df)]);
         }
@@ -301,6 +316,51 @@ pub(crate) fn build_indexed_splits(
         });
     }
     Ok(out)
+}
+
+/// Reject a non-finite score before the splits leave the library.
+///
+/// The search deliberately lets a NaN distance rank last rather than fail, so one can
+/// survive Top-K. That is fine while the score stays internal -- the materialized read
+/// orders rows itself -- but a split handed to a caller carries its scores as the only
+/// ranking signal, and a NaN poisons whatever comparator receives it.
+///
+/// Called only by [`VectorRead::read`], the one route that hands scores out as split
+/// METADATA a caller ranks on. (`execute_read` also emits a
+/// `__paimon_search_score` column, unvalidated; that is pre-existing behaviour this
+/// change leaves alone.) It is deliberately NOT inside [`build_indexed_splits`], which
+/// also runs before reranking to obtain position ranges and throws its scores away
+/// there -- validating inside would fail a query the rerank would have fixed.
+///
+/// Java is stricter and earlier: every `PrimaryKeySearchPosition` construction
+/// rejects a non-finite score, including the ones `PrimaryKeyVectorRead.rerank`
+/// builds. This is a known divergence, not a mirror.
+///
+/// [`VectorRead::read`]: crate::table::VectorRead::read
+pub(crate) fn validate_finite_scores(splits: &[PkVectorIndexedSplit]) -> crate::Result<()> {
+    for split in splits {
+        let Some(scores) = split.scores() else {
+            continue;
+        };
+        for score in scores {
+            if !score.is_finite() {
+                // `.first()` rather than `[0]`: this is `pub(crate)` and may run before
+                // anything has checked the split holds exactly one file, and a panic
+                // here would cross the C ABI as an abort. Naming the file is a nicety;
+                // reporting the bad score is the point.
+                let file = split
+                    .data_split()
+                    .data_files()
+                    .first()
+                    .map(|f| f.file_name.as_str())
+                    .unwrap_or("<split with no data file>");
+                return Err(data_invalid(format!(
+                    "vector search produced a non-finite score {score} for {file}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build one bucket's DV map: keys are the union of active-file names and all
@@ -861,6 +921,55 @@ mod tests {
             .map(|_| ())
             .expect_err("duplicate (file,pos) must error");
         assert!(format!("{err:?}").contains("duplicate"), "got: {err:?}");
+    }
+
+    #[test]
+    fn validate_finite_scores_rejects_nan_and_infinity_anywhere_in_a_split() {
+        let splits = vec![search_split(0, vec![data_file("f", 10)])];
+
+        // The bad score is the SECOND hit, so a check that only looked at the first
+        // would miss it. Two metrics, because they fail differently: L2's
+        // `1/(1+d)` turns a NaN distance into a NaN score but an infinite one into 0,
+        // while cosine's `1 - d` turns an infinite distance into an infinite score. So
+        // `is_nan` alone would let the cosine case through.
+        for (metric, bad_distance) in [
+            (VectorSearchMetric::L2, f32::NAN),
+            (VectorSearchMetric::Cosine, f32::INFINITY),
+        ] {
+            let survivors = vec![cand(0, 0, "f", 0, 0.5), cand(0, 0, "f", 1, bad_distance)];
+            let built = build_indexed_splits(survivors, &splits, metric)
+                .expect("building the split itself does not validate scores");
+            let err = validate_finite_scores(&built)
+                .map(|_| ())
+                .expect_err("a non-finite score must not reach the caller");
+            assert!(format!("{err:?}").contains("non-finite"), "got: {err:?}");
+        }
+
+        // A split with NO data file: the message used to be built by indexing
+        // `data_files()[0]`, which panics here -- and a panic crossing the C ABI aborts
+        // the host rather than returning an error.
+        let orphan = PkVectorIndexedSplit {
+            split: DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(crate::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path("memory:/pkvo/bucket-0".to_string())
+                .with_total_buckets(1)
+                .with_data_files(Vec::new())
+                .build()
+                .unwrap(),
+            row_ranges: vec![RowRange::new(0, 0)],
+            scores: Some(vec![f32::NAN]),
+        };
+        let err = validate_finite_scores(&[orphan])
+            .map(|_| ())
+            .expect_err("a non-finite score must still be reported");
+        assert!(format!("{err:?}").contains("non-finite"), "got: {err:?}");
+
+        // Finite scores pass.
+        let survivors = vec![cand(0, 0, "f", 0, 1.0), cand(0, 0, "f", 1, 4.0)];
+        let built = build_indexed_splits(survivors, &splits, VectorSearchMetric::L2).unwrap();
+        assert!(validate_finite_scores(&built).is_ok());
     }
 
     #[test]

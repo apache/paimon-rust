@@ -37,10 +37,12 @@ use crate::table::pk_vector_bucket_split::BucketVectorSearchSplit;
 use crate::table::pk_vector_data_file_reader::{
     append_batch_vectors, DataFilePkVectorReaderFactory,
 };
-use crate::table::pk_vector_indexed_split_read::{expand_ranges, PkVectorIndexedSplitRead};
+use crate::table::pk_vector_indexed_split_read::{
+    expand_ranges, PkVectorIndexedSplit, PkVectorIndexedSplitRead,
+};
 use crate::table::pk_vector_orchestrator::{
-    as_split_exact_file_search, build_indexed_splits, merge_candidates, OrchestratorSearchResult,
-    PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
+    as_split_exact_file_search, build_indexed_splits, merge_candidates, validate_finite_scores,
+    OrchestratorSearchResult, PkVectorCandidate, PkVectorOrchestrator, PkVectorSearchSplit,
 };
 use crate::table::pk_vector_position_read::{
     PkVectorPositionRead, PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN,
@@ -191,6 +193,22 @@ pub struct VectorSearchBuilder<'a> {
     filter: Option<Predicate>,
 }
 
+/// Executes a configured vector query against an already planned set of
+/// primary-key vector bucket splits.
+///
+/// This mirrors Java's `VectorRead`: the search builder owns query construction,
+/// this read owns index execution, and
+/// [`TableRead`](crate::table::TableRead) materializes the returned
+/// [`PkVectorIndexedSplit`] values.
+pub struct VectorRead<'a> {
+    table: &'a Table,
+    query_vector: Vec<f32>,
+    limit: usize,
+    options: HashMap<String, String>,
+    filter: Option<Predicate>,
+    primary_key_vector_column: String,
+}
+
 pub struct BatchVectorSearchBuilder<'a> {
     table: &'a Table,
     vector_column: Option<String>,
@@ -253,6 +271,89 @@ fn take_only_result<T>(results: Vec<T>, operation: &str) -> crate::Result<T> {
         });
     }
     Ok(result)
+}
+
+impl<'a> VectorRead<'a> {
+    /// Execute primary-key bucket splits planned by an external engine and return
+    /// indexed row selections, without materializing user columns.
+    ///
+    /// This is step one of a two-step vector read. It returns one
+    /// [`PkVectorIndexedSplit`] per selected data file, carrying the selected
+    /// physical row positions and their scores. Step two belongs to the caller:
+    /// pass those indexed splits to
+    /// [`TableRead::to_arrow_indexed`](crate::table::TableRead::to_arrow_indexed)
+    /// with the caller's projection.
+    ///
+    /// The supplied [`BucketVectorSearchSplit`] values are authoritative: their
+    /// pinned snapshot, payload files and per-file row ranges are used as given.
+    /// This method validates that plan but does not read the table's index manifest
+    /// or replace it with a newly planned scan.
+    ///
+    /// Search, optional refinement and Top-K selection are local to the supplied
+    /// splits. A caller distributing separate reads across workers or buckets must
+    /// merge their candidates globally. The returned splits are not in best-first
+    /// order; their positions, and the rows later materialized from them, remain in
+    /// physical order with scores attached for caller-side ranking.
+    ///
+    /// A filter configured through [`VectorSearchBuilder::with_filter`] is applied
+    /// before Top-K selection. Projection does not apply here: it belongs to the
+    /// [`TableRead`](crate::table::TableRead) that materializes the indexed splits,
+    /// so [`VectorSearchBuilder::new_vector_read`] rejects a search projection.
+    ///
+    /// This route supports only primary-key vector indexes. Data-evolution vector
+    /// search uses the global-index route and is rejected rather than silently
+    /// executing a different plan.
+    ///
+    /// This Rust API accepts decoded splits. Callers receiving serialized split
+    /// bytes must deserialize them at their interop boundary before calling `read`;
+    /// the C binding does this before entering `VectorRead`.
+    pub async fn read(
+        &self,
+        splits: Vec<BucketVectorSearchSplit>,
+    ) -> crate::Result<Vec<PkVectorIndexedSplit>> {
+        if splits.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "vector read requires at least one bucket split".to_string(),
+                source: None,
+            });
+        }
+
+        let core = CoreOptions::new(self.table.schema().options());
+        let params = resolve_pk_vector_search_params(
+            self.table,
+            &self.options,
+            self.filter.as_ref(),
+            &core,
+            &self.primary_key_vector_column,
+            &[self.query_vector.as_slice()],
+            self.limit,
+        )?;
+        let plan = PkVectorScan::new(
+            self.table,
+            params.field_id,
+            params.index_type.clone(),
+            self.filter.clone(),
+        )
+        .plan_for_bucket_vector_splits(splits)?;
+
+        let candidates = search_pk_candidates_batch_with_plan(
+            self.table,
+            &self.options,
+            self.filter.as_ref(),
+            &core,
+            &self.primary_key_vector_column,
+            &[self.query_vector.as_slice()],
+            self.limit,
+            &plan,
+            &params,
+        )
+        .await?;
+        let candidates = take_only_result(candidates, "bucket-split vector search")?;
+
+        let splits = build_indexed_splits(candidates, &plan.splits, params.metric)?;
+        validate_finite_scores(&splits)?;
+        Ok(splits)
+    }
 }
 
 /// The primary-key vector route's search output plus the source context a later
@@ -328,6 +429,10 @@ impl<'a> VectorSearchBuilder<'a> {
     /// to `cols` (plus the always-appended `__paimon_search_score`). Without this
     /// call `execute_read` materializes every user table column. Only affects
     /// `execute_read`; the search-only paths ignore it.
+    /// Applies to [`execute_read`](Self::execute_read) only.
+    /// [`new_vector_read`](Self::new_vector_read) REJECTS a projection set here rather
+    /// than dropping it: a vector read returns which rows matched, and the table read
+    /// that follows owns the columns.
     pub fn with_projection(&mut self, cols: &[&str]) -> &mut Self {
         self.projection = Some(cols.iter().map(|c| c.to_string()).collect());
         self
@@ -570,6 +675,66 @@ impl<'a> VectorSearchBuilder<'a> {
 
         Self::materialize_candidates(candidates, &plan.splits, params.metric, &materialize_reader)
             .await
+    }
+
+    /// Create the index-reading half of a two-step vector search.
+    ///
+    /// The returned [`VectorRead`] executes externally planned bucket splits and
+    /// returns indexed splits. An ordinary [`TableRead`](crate::table::TableRead)
+    /// then materializes them.
+    pub fn new_vector_read(&self) -> crate::Result<VectorRead<'a>> {
+        let core = CoreOptions::new(self.table.schema().options());
+        core.ensure_read_authorized()?;
+
+        if self.projection.is_some() {
+            return Err(crate::Error::DataInvalid {
+                message: "with_projection does not apply to VectorRead: it returns which \
+                          rows matched, not their columns. Set the projection on the read \
+                          builder whose TableRead::to_arrow_indexed consumes these splits"
+                    .to_string(),
+                source: None,
+            });
+        }
+        let vector_column = self
+            .vector_column
+            .as_deref()
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: "Vector column must be set via with_vector_column()".to_string(),
+            })?
+            .to_string();
+        let query_vector = self
+            .query_vector
+            .as_ref()
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: "Query vector must be set via with_query_vector()".to_string(),
+            })?
+            .clone();
+        let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
+            message: "Limit must be set via with_limit()".to_string(),
+        })?;
+
+        let pk_col = if core.primary_key_vector_index_enabled() {
+            let targets_pk_column = core
+                .primary_key_vector_index_columns()
+                .ok()
+                .is_some_and(|cols| cols.iter().any(|c| c == &vector_column));
+            if targets_pk_column {
+                core.primary_key_vector_index_column()?
+            } else {
+                return Err(bucket_split_route_error(&vector_column));
+            }
+        } else {
+            return Err(bucket_split_route_error(&vector_column));
+        };
+
+        Ok(VectorRead {
+            table: self.table,
+            query_vector,
+            limit,
+            options: self.options.clone(),
+            filter: self.filter.clone(),
+            primary_key_vector_column: pk_col,
+        })
     }
 
     /// Materialize the best-first data-evolution vector search hits into Arrow

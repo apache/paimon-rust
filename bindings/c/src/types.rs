@@ -222,6 +222,12 @@ pub(crate) struct TableReadState {
     pub table: Table,
     pub read_type: Vec<DataField>,
     pub data_predicates: Vec<Predicate>,
+    /// The caller's filter as they set it, before the read builder normalized it into
+    /// partition and data halves. `data_predicates` above is only the data half, so it
+    /// is not enough to rebuild a read that must know about the partition half --
+    /// which a scan-bypassing read does, or it would silently ignore `pt = 'A'`. See
+    /// `paimon_table_read_to_arrow_indexed`.
+    pub filter: Option<Predicate>,
 }
 
 #[repr(C)]
@@ -243,6 +249,19 @@ pub struct paimon_predicate {
 /// Opaque wrapper around a vector-search builder.
 #[repr(C)]
 pub struct paimon_vector_search_builder {
+    pub inner: *mut c_void,
+}
+
+/// Opaque handle to the splits a primary-key vector search selected: one per data
+/// file, each carrying that file's chosen physical rows and their scores.
+///
+/// An IN-PROCESS handle, deliberately not bytes -- the search and the read both run
+/// inside this library, in one address space, so serializing would be a pure round
+/// trip. Pass it to `paimon_table_read_to_arrow_indexed`, which BORROWS it, so one
+/// search can be read again under a different projection. Free it with
+/// `paimon_vector_search_splits_free`.
+#[repr(C)]
+pub struct paimon_vector_search_splits {
     pub inner: *mut c_void,
 }
 
