@@ -43,7 +43,7 @@ pub(crate) use partial_update::PartialUpdateConfig;
 
 mod aggregation;
 pub(crate) use aggregation::{
-    remove_field_scoped_options, rename_field_scoped_options,
+    canonical_aggregator_name, remove_field_scoped_options, rename_field_scoped_options,
     validate_no_aggregation_on_sequence_field, AggregationConfig,
 };
 

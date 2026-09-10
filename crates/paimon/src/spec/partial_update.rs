@@ -350,6 +350,10 @@ impl<'a> PartialUpdateConfig<'a> {
                 continue;
             };
             validate_aggregator_for_type(function, field_name, field.data_type())?;
+            // Compared raw on purpose: Java `PartialUpdateMergeFunction` tests
+            // `aggFuncName.equals(FieldLastNonNullValueAggFactory.NAME)`, and that
+            // factory has no legacy alias — only `first_non_null_value` does — so
+            // there is nothing here to canonicalize.
             if function != "last_non_null_value" && !protected_fields.contains(field_name) {
                 return Err(crate::Error::ConfigInvalid {
                     message: format!(
@@ -804,6 +808,33 @@ mod tests {
             matches!(err, crate::Error::ConfigInvalid { ref message }
                 if message.contains("sume") && message.contains("price")),
             "expected unknown function error, got {err:?}"
+        );
+    }
+
+    /// The aggregate-function name helpers are shared with the aggregation merge
+    /// engine, so Java's `first_not_null_value` alias has to be accepted here
+    /// too. It is not `last_non_null_value`, so it still needs a sequence group.
+    #[test]
+    fn test_validate_aggregate_functions_accepts_legacy_first_not_null_value() {
+        let options = partial_update_options(&[
+            ("fields.version.sequence-group", "price"),
+            ("fields.price.aggregate-function", "first_not_null_value"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+
+        let functions = config
+            .validated_aggregate_functions(&fields, &["id".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            functions.get("price").map(String::as_str),
+            Some("first_not_null_value"),
+            "the configured spelling must be preserved, got {functions:?}"
         );
     }
 

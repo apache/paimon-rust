@@ -2674,6 +2674,57 @@ async fn test_pk_aggregation_mixed_aggregators() {
     assert_eq!(string_value(first_seen.as_ref(), 0), "a"); // first non-null wins
 }
 
+/// Java registers `first_not_null_value` as an SPI alias of
+/// `first_non_null_value`, so a schema written by Java/Flink can carry it. Both
+/// CREATE TABLE and the read-side merge function must resolve it. Planning does
+/// not build the merge function, so before the fix a table carrying the alias
+/// planned fine and only failed once rows were pulled.
+///
+/// The read side also has unit coverage in `paimon`; if this ever goes red, the
+/// alias belongs in both places, not out of CREATE.
+#[tokio::test]
+async fn test_pk_aggregation_accepts_legacy_first_not_null_value() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+
+    sql_context
+        .sql(
+            "CREATE TABLE paimon.test_db.t_agg_legacy_name (
+                id INT NOT NULL, first_seen STRING,
+                PRIMARY KEY (id)
+            ) WITH (
+                'bucket' = '1',
+                'merge-engine' = 'aggregation',
+                'fields.first_seen.aggregate-function' = 'first_not_null_value'
+            )",
+        )
+        .await
+        .unwrap();
+
+    for values in ["(1, NULL)", "(1, 'b')", "(1, 'c')"] {
+        sql_context
+            .sql(&format!(
+                "INSERT INTO paimon.test_db.t_agg_legacy_name VALUES {values}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+
+    let batches = sql_context
+        .sql("SELECT id, first_seen FROM paimon.test_db.t_agg_legacy_name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    let first_seen = batches[0].column_by_name("first_seen").unwrap();
+    assert_eq!(string_value(first_seen.as_ref(), 0), "b");
+}
+
 /// `sequence.field` forces the named column to `last_value`, even when a
 /// table-level default aggregator would otherwise apply.
 #[tokio::test]

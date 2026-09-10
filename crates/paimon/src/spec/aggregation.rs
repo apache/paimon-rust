@@ -358,13 +358,33 @@ pub(crate) fn remove_field_scoped_options(options: &mut HashMap<String, String>,
 const SUPPORTED_AGGREGATOR_NAMES_HINT: &str = "supported: sum, product, min, max, last_value, \
     first_value, last_non_null_value, first_non_null_value, bool_and, bool_or, listagg";
 
+/// Java keeps `first_not_null_value` registered as an SPI alias of
+/// `first_non_null_value`: `FieldFirstNonNullValueAggLegacyFactory` is listed in
+/// `paimon-core/src/main/resources/META-INF/services/org.apache.paimon.factories.Factory`
+/// next to the canonical factory, and both build the same
+/// `FieldFirstNonNullValueAgg`. The alias survives from the switch-case to SPI
+/// refactor and is deliberately undocumented, so a Java-written schema can carry
+/// it even though nothing suggests it — which is why it is resolved here but
+/// stays out of [`SUPPORTED_AGGREGATOR_NAMES_HINT`].
+///
+/// Matching is exact: Java's `FactoryUtil#discoverFactory` selects a factory
+/// with `identifier().equals(identifier)`, so neither case nor `-`/`_` is
+/// normalised.
+pub(crate) fn canonical_aggregator_name(name: &str) -> &str {
+    match name {
+        "first_not_null_value" => "first_non_null_value",
+        other => other,
+    }
+}
+
 /// Whether `name` matches one of the basic-mode aggregator identifiers.  Must
 /// stay in sync with the `match` arms in
-/// `crate::table::aggregator::new_aggregator` — guarded by
-/// `tests::validation_table_matches_constructors`.
+/// `crate::table::aggregator::new_aggregator`.  Both resolve the name through
+/// [`canonical_aggregator_name`] first; `tests::validation_table_matches_constructors`
+/// guards the type table below rather than this predicate.
 pub(crate) fn is_known_aggregator_name(name: &str) -> bool {
     matches!(
-        name,
+        canonical_aggregator_name(name),
         "sum"
             | "product"
             | "min"
@@ -388,7 +408,9 @@ pub(crate) fn validate_aggregator_for_type(
     field_name: &str,
     dt: &DataType,
 ) -> crate::Result<()> {
-    let ok = match name {
+    // Errors below echo the caller's `name`, not the canonical one, so a user
+    // never reads back a function name they did not write.
+    let ok = match canonical_aggregator_name(name) {
         "sum" => matches!(
             dt,
             DataType::TinyInt(_)
@@ -677,6 +699,48 @@ mod tests {
         );
     }
 
+    /// Java registers `first_not_null_value` as an SPI alias of
+    /// `first_non_null_value`, so a Java-written schema can carry it on all three
+    /// name-keyed paths: a non-primary-key column (type-checked), a primary-key
+    /// column (name-only), and `fields.default-aggregate-function`.
+    #[test]
+    fn test_legacy_first_not_null_value_alias_is_accepted() {
+        for (key, value) in [
+            ("fields.amount.aggregate-function", "first_not_null_value"),
+            ("fields.id.aggregate-function", "first_not_null_value"),
+            (FIELDS_DEFAULT_AGG_FUNCTION_OPTION, "first_not_null_value"),
+        ] {
+            let options = aggregation_options(&[(key, value)]);
+            AggregationConfig::new(&options)
+                .validate_create_mode(&pk(), &sample_fields())
+                .unwrap_or_else(|err| panic!("'{key}' = '{value}' should be accepted: {err:?}"));
+        }
+    }
+
+    /// The alias resolves by exact match, mirroring Java's
+    /// `FactoryUtil#discoverFactory`, which compares identifiers with `equals`.
+    /// Neither case nor `-`/`_` is normalised, and the reported name is the one
+    /// the user wrote.
+    #[test]
+    fn test_legacy_alias_near_misses_are_still_rejected() {
+        for name in [
+            "first_not_null_valu",
+            "first-not-null-value",
+            "FIRST_NOT_NULL_VALUE",
+            "not_null_value",
+        ] {
+            let options = aggregation_options(&[("fields.amount.aggregate-function", name)]);
+            let err = AggregationConfig::new(&options)
+                .validate_create_mode(&pk(), &sample_fields())
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::ConfigInvalid { ref message }
+                    if message.contains(name) && message.contains("amount")),
+                "'{name}' should be rejected and echoed back verbatim, got {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_rejects_aggregation_on_sequence_field_for_every_merge_engine() {
         // Java rejects aggregation definitions on sequence fields inside
@@ -791,6 +855,9 @@ mod tests {
             "first_value",
             "last_non_null_value",
             "first_non_null_value",
+            // Java's SPI alias of the entry above; both sides must resolve it
+            // identically, which is exactly what this test locks.
+            "first_not_null_value",
             "bool_and",
             "bool_or",
             "listagg",
