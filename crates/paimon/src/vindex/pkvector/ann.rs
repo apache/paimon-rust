@@ -121,6 +121,18 @@ pub(crate) fn build_live_row_ids(
         if active {
             if let Some(dv) = deletion_vectors.get(source_file.file_name()) {
                 for position in dv.iter() {
+                    // Bound the position against ITS OWN source file, as the residual
+                    // path above already does. Source files share one ordinal space
+                    // (`global = file_offset + position`), so a position past this
+                    // file's rows does not fall out of the mask -- it lands inside the
+                    // NEXT source file's range and deletes one of that file's rows.
+                    if position >= row_count {
+                        return Err(data_invalid(format!(
+                            "deleted position {position} is out of range for source file {} ({} rows)",
+                            source_file.file_name(),
+                            row_count
+                        )));
+                    }
                     let global = file_offset.checked_add(position).ok_or_else(|| {
                         data_invalid("vector source deleted position overflows u64")
                     })?;
@@ -889,6 +901,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 2]);
+    }
+
+    #[test]
+    fn a_deletion_vector_position_past_its_own_file_is_refused() {
+        // f0 holds 3 rows (global 0,1,2) and f1 holds 2 (global 3,4). A deletion
+        // vector on f0 naming position 3 has no row of f0 to delete; without the
+        // bound it becomes global 0 + 3 = 3, which is f1's FIRST row. The mask would
+        // come back well-formed, having silently dropped a row of a different file.
+        let files = vec![
+            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+        ];
+        let mut dvs = HashMap::new();
+        dvs.insert("f0".to_string(), dv(&[3]));
+        let error = build_live_row_ids(&files, &active_set(&["f0", "f1"]), &dvs, None)
+            .map(|_| ())
+            .expect_err("a position past f0's rows names no row of f0");
+        assert!(
+            error
+                .to_string()
+                .contains("out of range for source file f0"),
+            "{error}"
+        );
+
+        // The last VALID position of f0 still deletes f0's own row, and f1 is
+        // untouched -- the bound is `>= row_count`, not one row tighter.
+        let mut dvs = HashMap::new();
+        dvs.insert("f0".to_string(), dv(&[2]));
+        let live = build_live_row_ids(&files, &active_set(&["f0", "f1"]), &dvs, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 1, 3, 4]);
     }
 
     #[test]
