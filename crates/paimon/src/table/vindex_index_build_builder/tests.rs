@@ -152,14 +152,30 @@ fn test_ivf_training_ranges_are_bounded_and_exact() {
     .unwrap()
     .remove(0);
 
-    let ranges = plan_ivf_training_ranges(&shard, 200).unwrap();
+    for training_rows in [1, 63, 64, 65, 200, 899] {
+        let ranges = plan_ivf_training_ranges(&shard, training_rows).unwrap();
 
-    assert_eq!(ranges.len(), 64);
-    assert_eq!(ranges.iter().map(RowRange::count).sum::<i64>(), 200);
-    assert!(ranges.windows(2).all(|pair| pair[0].to() < pair[1].from()));
-    assert!(ranges.first().unwrap().from() >= 100);
-    assert!(ranges.last().unwrap().to() <= 1_099);
-    assert_eq!(ranges, plan_ivf_training_ranges(&shard, 200).unwrap());
+        assert!(ranges.len() <= 64);
+        assert_eq!(
+            ranges.iter().map(RowRange::count).sum::<i64>(),
+            training_rows as i64
+        );
+        assert!(ranges.windows(2).all(|pair| pair[0].to() < pair[1].from()));
+        assert!(ranges.first().unwrap().from() >= shard.row_range_start);
+        assert!(ranges.last().unwrap().to() <= shard.row_range_end);
+        assert_eq!(
+            ranges,
+            plan_ivf_training_ranges(&shard, training_rows).unwrap()
+        );
+    }
+
+    let ranges = plan_ivf_training_ranges(&shard, 200).unwrap();
+    let mut other_snapshot = shard.clone();
+    other_snapshot.snapshot_id += 1;
+    assert_ne!(
+        ranges,
+        plan_ivf_training_ranges(&other_snapshot, 200).unwrap()
+    );
 }
 
 #[test]
