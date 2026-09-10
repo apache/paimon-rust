@@ -20,12 +20,17 @@ use super::data_file_reader::{DataFileReadTiming, DataFileReader};
 use super::format_table_read::FormatTableRead;
 use super::incremental_scan::{IncrementalPlan, IncrementalScanMode, IncrementalSplit};
 use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
+use super::pk_vector_indexed_split_read::{
+    prepare_indexed_split, PkVectorIndexedSplit, PkVectorIndexedSplitRead,
+};
+use super::pk_vector_position_read::{PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN};
 use super::read_builder::split_scan_predicates;
+use super::vector_search_builder::ensure_no_reserved_read_columns;
 use super::{ArrowRecordBatchStream, Table};
-use crate::arrow::build_target_arrow_schema;
 use crate::arrow::ParquetReadBudget;
+use crate::arrow::{build_target_arrow_schema, PARQUET_FIELD_ID_META_KEY};
 use crate::spec::{
-    BigIntType, CoreOptions, DataField, DataType, MergeEngine, Predicate, TinyIntType,
+    BigIntType, CoreOptions, DataField, DataType, FloatType, MergeEngine, Predicate, TinyIntType,
     ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
     VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
@@ -37,7 +42,7 @@ use arrow_array::{
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat as arrow_concat;
 use arrow_select::take::take;
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -53,6 +58,88 @@ pub struct TableRead<'a>(TableReadKind<'a>);
 enum TableReadKind<'a> {
     Paimon(PaimonTableRead<'a>),
     Format(FormatTableRead<'a>),
+}
+
+/// Drop `_PKEY_VECTOR_POSITION` from a materialized batch. The positional read
+/// appends it so a caller can map rows back to the positions it asked for; this read
+/// emits rows in that same physical order, so nothing downstream needs it.
+fn strip_position_column(batch: &RecordBatch) -> crate::Result<RecordBatch> {
+    let schema = batch.schema();
+    let Some(drop_at) = schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == PKEY_VECTOR_POSITION_COLUMN)
+    else {
+        // The positional read appends this column unconditionally, so its absence
+        // means the producer changed under us. The reordering path this replaced
+        // failed loudly here too; passing the batch through would silently hand the
+        // caller a schema it did not ask for.
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "vector search read expected a {PKEY_VECTOR_POSITION_COLUMN} column to strip"
+            ),
+            source: None,
+        });
+    };
+    // The positional read appends the score column as a bare Arrow field, while every
+    // user column carries its Paimon field id as `PARQUET:field_id` metadata. Re-emit it
+    // with that metadata so this route's output schema is exactly
+    // `build_target_arrow_schema(indexed_read_type())` -- otherwise the schema a caller
+    // is told to expect and the one it receives differ in metadata alone, which is the
+    // worst kind of difference to debug. Confined to this route on purpose:
+    // `execute_read` shares the producer but not this function, and widening its wire
+    // schema is not this change's business.
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != drop_at)
+        .map(|(_, f)| {
+            if f.name() == SEARCH_SCORE_COLUMN
+                && !f.metadata().contains_key(PARQUET_FIELD_ID_META_KEY)
+            {
+                let mut metadata = f.metadata().clone();
+                metadata.insert(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    search_score_field().id().to_string(),
+                );
+                Arc::new(f.as_ref().clone().with_metadata(metadata))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != drop_at)
+        .map(|(_, c)| Arc::clone(c))
+        .collect();
+    RecordBatch::try_new_with_options(
+        Arc::new(ArrowSchema::new(fields)),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|e| crate::Error::DataInvalid {
+        message: format!("failed to drop the vector-search position column: {e}"),
+        source: None,
+    })
+}
+
+/// The `__paimon_search_score` field an indexed read appends.
+///
+/// Id and name mirror Java's `VectorSearchProcedure.SEARCH_SCORE_FIELD`
+/// (`new DataField(Integer.MAX_VALUE, SEARCH_SCORE, DataTypes.FLOAT())`), so the same
+/// column has the same identity on both sides. Non-null, because the column
+/// `PkVectorPositionRead` actually appends is non-null -- this describes what is
+/// produced, not what Java's nullable default would be.
+fn search_score_field() -> DataField {
+    DataField::new(
+        i32::MAX,
+        SEARCH_SCORE_COLUMN.to_string(),
+        DataType::Float(FloatType::with_nullable(false)),
+    )
 }
 
 pub(super) fn configured_parquet_read_budget(
@@ -134,6 +221,10 @@ impl<'a> TableRead<'a> {
     /// The hook is used only by schema-identical raw reads. Callers must still
     /// enforce the expression after the scan because an individual file may not
     /// be able to build a decoder filter.
+    /// Note: on a PRIMARY-KEY table an ordinary [`to_arrow`](Self::to_arrow) silently
+    /// ignores the factory -- `new_data_file_reader` attaches one only when the table has
+    /// no primary keys. [`to_arrow_indexed`](Self::to_arrow_indexed) rejects it instead of
+    /// ignoring it, so the two terminals differ on purpose.
     pub fn with_row_filter_factory(self, factory: Arc<dyn crate::arrow::RowFilterFactory>) -> Self {
         match self.0 {
             TableReadKind::Paimon(read) => {
@@ -158,6 +249,38 @@ impl<'a> TableRead<'a> {
         }
     }
 
+    /// Record that the read builder normalized a partition predicate out of the
+    /// caller's filter. Only the scan-bypassing vector search read consults it; see
+    /// [`Self::to_arrow_indexed`].
+    pub(crate) fn with_filter_set(self, was_set: bool) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(mut read) => {
+                read.filter_set = was_set;
+                Self(TableReadKind::Paimon(read))
+            }
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
+        }
+    }
+
+    /// Record the scan-only restrictions the caller set on the read builder: a limit,
+    /// and explicit row ranges. An ordinary read never consults them -- the scan
+    /// applies both -- but a read that bypasses the scan must refuse them rather than
+    /// return more rows than were asked for. See [`Self::to_arrow_indexed`].
+    pub(crate) fn with_scan_only_restrictions(
+        self,
+        limit_set: bool,
+        explicit_row_ranges_set: bool,
+    ) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(mut read) => {
+                read.limit_set = limit_set;
+                read.explicit_row_ranges_set = explicit_row_ranges_set;
+                Self(TableReadKind::Paimon(read))
+            }
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
+        }
+    }
+
     pub(crate) fn with_data_file_read_timing(self, timing: Arc<DataFileReadTiming>) -> Self {
         match self.0 {
             TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
@@ -173,6 +296,86 @@ impl<'a> TableRead<'a> {
             TableReadKind::Paimon(read) => read.to_arrow(data_splits),
             TableReadKind::Format(read) => read.to_arrow(data_splits),
         }
+    }
+
+    /// Read the rows a primary-key vector search selected.
+    ///
+    /// Step two of the two-step primary-key vector read: the search decided WHICH
+    /// rows -- one [`PkVectorIndexedSplit`] per data file, carrying that file's
+    /// selected physical positions and their scores -- and this decides WHICH
+    /// COLUMNS. Mirrors Java handing a `PrimaryKeyVectorResult`'s `IndexedSplit`s to
+    /// an ordinary read.
+    ///
+    /// Output columns are this read's own read type -- from
+    /// [`ReadBuilder::with_projection`](crate::table::ReadBuilder::with_projection)
+    /// or `with_read_type` -- plus `__paimon_search_score`, which is exactly what
+    /// [`indexed_read_type`](Self::indexed_read_type) reports. The internal
+    /// `_PKEY_VECTOR_POSITION` column is stripped before the rows leave; a read type
+    /// naming `_ROW_ID` (or either metadata column) is REJECTED, not hidden.
+    ///
+    /// Rows come back in the order the splits are given, and within a split in
+    /// ascending physical position -- not ranked. `VectorRead::read` returns its
+    /// splits in ascending `(partition, bucket, file)` order, so its output reads
+    /// in that order; a caller passing its own slice gets its own order:
+    /// a caller wanting them best-first sorts on the score column. Java behaves the
+    /// same way, its procedure sorting after the read. Not reordering here is also
+    /// what lets this stream a split at a time instead of collecting every batch.
+    ///
+    /// A scalar filter, a row filter factory, a `with_limit` and explicit
+    /// `with_row_ranges` on this read are all REJECTED. None can be honoured: this
+    /// read runs no scan, and the limit and ranges never reach a `TableRead` at all,
+    /// so accepting them would return more rows than the caller asked for --
+    /// `with_row_ranges(vec![])` even documents "selects no rows". Put the predicate and
+    /// the limit on the vector search builder, where they apply before Top-K.
+    ///
+    /// Java IGNORES a limit here rather than refusing it: `ReadBuilderImpl.newRead`
+    /// forwards it, but `PrimaryKeyIndexedSplitRead` does not override `withLimit`
+    /// and inherits `SplitRead`'s no-op, so `withLimit(1)` over a split selecting
+    /// three rows still returns three. Refusing is a deliberate divergence -- a
+    /// silently dropped limit is the failure this read refuses everywhere else.
+    ///
+    /// PRECONDITION, unchecked: the splits must come from a search over THIS table.
+    /// They name data files by path, so reading another table's splits here would open
+    /// those files under this table's schema -- which may fail, or may return the other
+    /// table's rows. `DataSplit` carries no table identity to check against, the same
+    /// as for `to_arrow`.
+    pub fn to_arrow_indexed(
+        &self,
+        splits: &[PkVectorIndexedSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.ensure_query_auth_allowed()?;
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.to_arrow_indexed(splits),
+            TableReadKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support vector search read".to_string(),
+            }),
+        }
+    }
+
+    /// The schema [`Self::to_arrow_indexed`] produces: this read's read type plus
+    /// `__paimon_search_score`.
+    ///
+    /// [`read_type`](Self::read_type) describes [`to_arrow`](Self::to_arrow) and does
+    /// not carry the score column, so it is the wrong answer for an indexed read. A
+    /// caller that must know the output schema BEFORE reading has no other way to get
+    /// it: a search that matched nothing yields no batch to learn it from.
+    ///
+    /// Fallible for the same reason `to_arrow_indexed` is -- a read type naming a
+    /// reserved column is rejected rather than answered with a schema that carries
+    /// that column twice. The score field takes id `i32::MAX` and non-null `FLOAT`,
+    /// the identity Java's `VectorSearchProcedure.SEARCH_SCORE_FIELD` uses.
+    pub fn indexed_read_type(&self) -> crate::Result<Vec<DataField>> {
+        // Refuse on the same tables `to_arrow_indexed` refuses: describing the output of
+        // a read that can never run would be a plausible-looking wrong answer.
+        if matches!(self.0, TableReadKind::Format(_)) {
+            return Err(crate::Error::Unsupported {
+                message: "Format tables do not support vector search read".to_string(),
+            });
+        }
+        ensure_no_reserved_read_columns(self.read_type())?;
+        let mut fields = self.read_type().to_vec();
+        fields.push(search_score_field());
+        Ok(fields)
     }
 
     /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
@@ -223,6 +426,18 @@ struct PaimonTableRead<'a> {
     table: &'a Table,
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
+    /// Whether the read builder also normalized a PARTITION predicate out of the
+    /// caller's filter. An ordinary read never needs it -- partition pruning happens
+    /// in the scan -- but a read that bypasses the scan does, or it would silently
+    /// ignore a filter the caller set. See
+    /// [`TableRead::to_arrow_indexed`](TableRead::to_arrow_indexed).
+    filter_set: bool,
+    /// Whether the read builder held a `with_limit`, and whether it held EXPLICIT
+    /// `with_row_ranges` (ranges derived from a filter are covered by `filter_set`).
+    /// Neither reaches an ordinary read -- both feed `TableScan` -- so only a
+    /// scan-bypassing read needs them, and only to refuse.
+    limit_set: bool,
+    explicit_row_ranges_set: bool,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     data_file_read_timing: Option<Arc<DataFileReadTiming>>,
@@ -239,6 +454,9 @@ impl<'a> PaimonTableRead<'a> {
             table,
             read_type,
             data_predicates,
+            filter_set: false,
+            limit_set: false,
+            explicit_row_ranges_set: false,
             row_filter_factory: None,
             parquet_read_budget: None,
             data_file_read_timing: None,
@@ -266,12 +484,19 @@ impl<'a> PaimonTableRead<'a> {
     /// [`ReadBuilder::with_filter`](crate::table::ReadBuilder::with_filter)
     /// for per-format exceptions).
     pub fn with_filter(mut self, filter: Predicate) -> Self {
-        let (_, data_predicates) = split_scan_predicates(self.table, filter);
+        let (_partition_predicate, data_predicates) = split_scan_predicates(self.table, filter);
         // Keep the FULL data predicate (including `And`/`Or`/`Not`). Native
         // pushdown / stats pruning skip compound nodes they cannot use, and the
         // residual pass applies the full predicate exactly. Pruning here would
         // drop compound predicates before the residual could enforce them.
         self.data_predicates = data_predicates;
+        // The partition half is dropped here as it is on the builder -- an ordinary
+        // read never applies it, the scan does. Record only that a filter was SET, not
+        // which halves survived: normalization drops a partition conjunct and
+        // `_ROW_ID` extraction drops an exact row-id one, so a scan-bypassing read
+        // that inspected the surviving predicates could see an empty list and
+        // silently ignore a filter the caller set.
+        self.filter_set = true;
         self
     }
 
@@ -882,6 +1107,132 @@ impl<'a> PaimonTableRead<'a> {
     /// Read raw data files without dedup or evolution.
     fn read_raw(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         self.new_data_file_reader()?.read(data_splits)
+    }
+
+    /// See [`TableRead::to_arrow_indexed`].
+    ///
+    /// Eager errors: a projection naming a reserved column, a read carrying a filter /
+    /// limit / row ranges / row filter factory, a bad fan-in, and every split's own
+    /// structural validation -- single data file, range bounds and ordering, score
+    /// alignment, scores present. Only the work that touches storage stays lazy: schema
+    /// resolution, deletion-vector load, opening the files.
+    fn to_arrow_indexed(
+        &self,
+        splits: &[PkVectorIndexedSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        // `ReadBuilder::with_projection` permits `_ROW_ID`, but the positional read
+        // recovers physical positions through it and rejects it deep inside a lazy
+        // stream. Catch it here instead.
+        ensure_no_reserved_read_columns(self.read_type())?;
+        crate::table::pk_vector_indexed_split_read::validate_fan_in(splits)?;
+
+        // Every input that would make this read return something other than exactly
+        // the rows the search selected, because it can honour none of them.
+        //
+        // `filter_set` covers a filter however little of it survived normalization --
+        // the read builder drops a `pt = 'A'` conjunct into a partition predicate and an
+        // exact `_ROW_ID` conjunct into row ranges, so inspecting the surviving
+        // `data_predicates` alone would let either through unapplied.
+        //
+        // A limit and explicit row ranges never reach ANY `TableRead`: the read builder
+        // keeps both for `TableScan`, and this read runs no scan. Accepting them would
+        // return MORE rows than asked for, and `with_row_ranges(vec![])` documents
+        // "selects no rows", which returning every hit flatly contradicts. Java IGNORES
+        // a limit here (`PrimaryKeyIndexedSplitRead` inherits `SplitRead`'s no-op
+        // `withLimit`), so refusing one is a deliberate divergence rather than a
+        // shared property.
+        //
+        // A `row_filter_factory` is the last one, and the only one that could not drop a
+        // row even if it were honoured: `new_data_file_reader` attaches a factory only
+        // when the table has no primary keys, and `new_vector_search_file_reader` never
+        // attaches one. It is refused because it would be IGNORED, not because it is
+        // dangerous -- note `to_arrow` on a primary-key table ignores it silently.
+        let mut refused: Vec<&str> = Vec::new();
+        if !self.data_predicates.is_empty() || self.filter_set {
+            refused.push("a filter");
+        }
+        if self.limit_set {
+            refused.push("a limit");
+        }
+        if self.explicit_row_ranges_set {
+            refused.push("row ranges");
+        }
+        if self.row_filter_factory.is_some() {
+            refused.push("a row filter factory");
+        }
+        if !refused.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "vector search read cannot honour {}: it bypasses scan planning and \
+                     returns exactly the rows the search selected. Put the predicate and \
+                     the limit on the vector search builder (with_filter / with_limit), \
+                     where they apply BEFORE Top-K. Applied here, a filter or a limit \
+                     would silently return fewer rows than the search was asked for, a \
+                     partition filter would not be applied at all because this read has \
+                     no scan, and a row filter factory is never attached by this read",
+                    refused.join(", ")
+                ),
+                source: None,
+            });
+        }
+
+        // Validate and expand EVERY split before the stream exists. This is pure
+        // metadata work, so a malformed split is reported before any row is handed out
+        // -- not after the splits before it have already been read.
+        let prepared = splits
+            .iter()
+            .map(prepare_indexed_split)
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        // `indexed_read_type` promises the score column, so every split must carry
+        // scores: one that does not would emit a narrower schema mid-stream and make
+        // that promise false. `VectorRead::read` always attaches them; the only
+        // score-less producer is the internal rerank path, which never gets here.
+        if let Some(without) = prepared.iter().find(|p| !p.has_scores()) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "indexed split for {} carries no scores, but a vector search read \
+                     emits a {SEARCH_SCORE_COLUMN} column for every split",
+                    without.file_name()
+                ),
+                source: None,
+            });
+        }
+
+        let split_read = PkVectorIndexedSplitRead::new(self.new_vector_search_file_reader()?);
+        let stream = async_stream::try_stream! {
+            for one in prepared {
+                let mut batches = split_read.read_prepared(one)?;
+                while let Some(batch) = batches.try_next().await? {
+                    yield strip_position_column(&batch)?;
+                }
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+
+    /// As [`Self::new_data_file_reader`], but predicate-free and with no engine
+    /// row-filter factory, which the positional read requires (see
+    /// [`Self::to_arrow_indexed`]).
+    ///
+    /// The parquet read budget IS newly honoured, which the terminal this replaced was
+    /// not: that one built a bare `DataFileReader`, so a vector read ignored the
+    /// table's row-group inflight bound. The budget is per-read, so a single-file
+    /// positional read cannot starve another.
+    ///
+    /// Batch size and read timing are left unset: `read_single_file_stream_local`
+    /// passes `None` as the format reader's batch size and never consults the timing,
+    /// so setting them would be inert.
+    fn new_vector_search_file_reader(&self) -> crate::Result<DataFileReader> {
+        Ok(DataFileReader::new(
+            self.table.file_io.clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema.fields().to_vec(),
+            self.read_type().to_vec(),
+            Vec::new(),
+        )
+        .with_parquet_read_budget(Some(self.parquet_read_budget()?)))
     }
 
     fn new_data_file_reader(&self) -> crate::Result<DataFileReader> {
@@ -1536,6 +1887,22 @@ mod tests {
             .unwrap()
     }
 
+    /// A format table with no other quirks -- the budget helper below deliberately
+    /// carries an invalid option, which would fail `new_read` before the read kind
+    /// mattered.
+    fn plain_format_table() -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("type", "format-table");
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "fmt_t"),
+            "memory:/fmt_t".to_string(),
+            TableSchema::new(0, &schema.build().unwrap()),
+            None,
+        )
+    }
+
     fn table_with_invalid_parquet_budget(format_table: bool) -> Table {
         let mut schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -1718,6 +2085,204 @@ mod tests {
                 .with_parquet_read_budget(Arc::new(ParquetReadBudget::default()));
             assert!(read.to_arrow(&[]).is_ok());
         }
+    }
+
+    /// A row filter factory cannot be honoured here at all: this read never attaches
+    /// one, and on a primary-key table `to_arrow` does not either. It is refused because
+    /// it would otherwise be silently IGNORED -- not because it could drop rows.
+    /// DataFusion attaches one whenever it has runtime filters, so this is a live path.
+    #[test]
+    fn indexed_read_rejects_a_row_filter_factory() {
+        use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplit;
+        use crate::table::RowRange;
+
+        #[derive(Debug)]
+        struct NoopFactory;
+        impl crate::arrow::RowFilterFactory for NoopFactory {
+            fn create(
+                &self,
+                _context: crate::arrow::RowFilterContext<'_>,
+            ) -> crate::Result<Vec<Box<dyn crate::arrow::RowFilter>>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let table = table_with_invalid_parquet_budget(false);
+        let split = PkVectorIndexedSplit {
+            split: split(vec![file("a", 5, Some(0))], false),
+            row_ranges: vec![RowRange::new(0, 0)],
+            scores: Some(vec![1.0]),
+        };
+        let base = || {
+            TableRead::new(&table, table.schema.fields().to_vec(), Vec::new())
+                .with_parquet_read_budget(Arc::new(ParquetReadBudget::default()))
+        };
+
+        assert!(base()
+            .to_arrow_indexed(std::slice::from_ref(&split))
+            .is_ok());
+        assert!(matches!(
+            base()
+                .with_row_filter_factory(Arc::new(NoopFactory))
+                .to_arrow_indexed(&[split]),
+            Err(crate::Error::DataInvalid { ref message, .. })
+                if message.contains("row filter factory")
+        ));
+    }
+
+    /// The fan-in guard is wired into `to_arrow_indexed`, not merely defined: it
+    /// rejects before the read touches storage, so a memory table with no files on disk
+    /// is enough to reach it.
+    #[test]
+    fn indexed_read_rejects_bad_fan_in() {
+        use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplit;
+        use crate::table::RowRange;
+
+        let table = table_with_invalid_parquet_budget(false);
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new())
+            .with_parquet_read_budget(Arc::new(ParquetReadBudget::default()));
+        let at = |snapshot: i64, name: &str| PkVectorIndexedSplit {
+            split: DataSplitBuilder::new()
+                .with_snapshot(snapshot)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path("memory:/budget_t/bucket-0".to_string())
+                .with_total_buckets(1)
+                .with_data_files(vec![file(name, 5, Some(0))])
+                .build()
+                .unwrap(),
+            row_ranges: vec![RowRange::new(0, 0)],
+            scores: Some(vec![1.0]),
+        };
+
+        assert!(read.to_arrow_indexed(&[at(1, "a"), at(1, "b")]).is_ok());
+        assert!(matches!(
+            read.to_arrow_indexed(&[at(1, "a"), at(2, "b")]),
+            Err(crate::Error::DataInvalid { ref message, .. })
+                if message.contains("one snapshot")
+        ));
+        assert!(matches!(
+            read.to_arrow_indexed(&[at(1, "a"), at(1, "a")]),
+            Err(crate::Error::DataInvalid { ref message, .. })
+                if message.contains("twice")
+        ));
+    }
+
+    /// A malformed split must be reported BEFORE any row is emitted, not after the
+    /// splits ahead of it have already been handed to the caller. The second split's
+    /// range is past its file, which only `validate_and_expand` catches -- so this
+    /// fails only if that check runs eagerly for every split.
+    #[test]
+    fn indexed_read_validates_every_split_before_streaming() {
+        use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplit;
+        use crate::table::RowRange;
+
+        let table = table_with_invalid_parquet_budget(false);
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new())
+            .with_parquet_read_budget(Arc::new(ParquetReadBudget::default()));
+        let one = |name: &str, range: RowRange| PkVectorIndexedSplit {
+            split: DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path("memory:/budget_t/bucket-0".to_string())
+                .with_total_buckets(1)
+                .with_data_files(vec![file(name, 5, Some(0))])
+                .build()
+                .unwrap(),
+            row_ranges: vec![range],
+            scores: Some(vec![1.0]),
+        };
+
+        // `file(..)` builds a 10-row file, so [50, 50] is outside it.
+        let error = read
+            .to_arrow_indexed(&[
+                one("a", RowRange::new(0, 0)),
+                one("b", RowRange::new(50, 50)),
+            ])
+            .map(|_| ())
+            .expect_err("a range past the file must be rejected");
+        assert!(
+            format!("{error:?}").contains("outside [0, 10)"),
+            "got: {error:?}"
+        );
+    }
+
+    /// `indexed_read_type` promises a score column for the whole stream, so a split
+    /// without scores -- which would emit a narrower schema partway through -- has to be
+    /// refused rather than silently change the output shape.
+    #[test]
+    fn indexed_read_requires_every_split_to_carry_scores() {
+        use crate::table::pk_vector_indexed_split_read::PkVectorIndexedSplit;
+        use crate::table::RowRange;
+
+        let table = table_with_invalid_parquet_budget(false);
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new())
+            .with_parquet_read_budget(Arc::new(ParquetReadBudget::default()));
+        let split = PkVectorIndexedSplit {
+            split: split(vec![file("a", 5, Some(0))], false),
+            row_ranges: vec![RowRange::new(0, 0)],
+            scores: None,
+        };
+        assert!(matches!(
+            read.to_arrow_indexed(&[split]),
+            Err(crate::Error::DataInvalid { ref message, .. })
+                if message.contains("carries no scores")
+        ));
+    }
+
+    /// The indexed read appends a column `read_type()` does not mention, and a search
+    /// that matched nothing yields no batch to learn the schema from -- so the schema
+    /// has to be askable up front.
+    #[test]
+    fn indexed_read_type_is_the_read_type_plus_the_score_column() {
+        let table = table_with_invalid_parquet_budget(false);
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+
+        let indexed = read.indexed_read_type().unwrap();
+        let (score, user) = indexed.split_last().unwrap();
+        assert_eq!(
+            user,
+            read.read_type(),
+            "the user columns come first, unchanged"
+        );
+        assert_eq!(score.name(), SEARCH_SCORE_COLUMN);
+        assert_eq!(
+            score.id(),
+            i32::MAX,
+            "same field id as Java's VectorSearchProcedure.SEARCH_SCORE_FIELD"
+        );
+        assert!(
+            !score.data_type().is_nullable(),
+            "the column the positional read appends is non-null"
+        );
+
+        // A read type that already names the score column would otherwise be answered
+        // with a schema carrying it twice, which is why this is fallible.
+        let colliding = vec![DataField::new(
+            0,
+            SEARCH_SCORE_COLUMN.to_string(),
+            DataType::Int(crate::spec::IntType::new()),
+        )];
+        assert!(TableRead::new(&table, colliding, Vec::new())
+            .indexed_read_type()
+            .is_err());
+    }
+
+    /// A format table can never run an indexed read, so it must not be handed a schema
+    /// describing one -- `to_arrow_indexed` refuses it, and these two have to agree.
+    #[test]
+    fn indexed_read_type_refuses_a_format_table() {
+        let table = plain_format_table();
+        let read = table.new_read_builder().new_read().unwrap();
+        assert!(matches!(
+            read.to_arrow_indexed(&[]),
+            Err(crate::Error::Unsupported { .. })
+        ));
+        assert!(matches!(
+            read.indexed_read_type(),
+            Err(crate::Error::Unsupported { .. })
+        ));
     }
 
     #[test]

@@ -239,8 +239,20 @@ impl BucketVectorSearchSplit {
         // leave no way to say which of them a range belongs to; a bucket cannot
         // hold such a pair and the planner rejects it, but these bytes are
         // untrusted.
+        //
+        // The row count is checked here for EVERY file, not only for the ones the
+        // message goes on to list ranges for -- the range reader below only sees the
+        // files it lists. `bucket_search` re-checks the ACTIVE files it is about to
+        // read, so this is the fail-fast copy plus the only check a file that never
+        // becomes active gets.
         let mut row_counts: HashMap<&str, i64> = HashMap::new();
         for file in data_split.data_files() {
+            if file.row_count < 0 {
+                return Err(data_invalid(format!(
+                    "data file {} has a negative row count: {}",
+                    file.file_name, file.row_count
+                )));
+            }
             if row_counts
                 .insert(file.file_name.as_str(), file.row_count)
                 .is_some()
@@ -301,8 +313,11 @@ fn nested_error(error: crate::Error) -> crate::Error {
 /// file. Java writes ranges its planner produced and re-checks nothing, so the
 /// checks here are what a reader of untrusted bytes needs rather than a mirror
 /// of the writer: `RowRange` cannot represent a descending pair at all, and a
-/// range outside its file would read rows that are not there. The file's own row
-/// count is checked first, so a forged one cannot lift that bound.
+/// range outside its file would read rows that are not there. The bound is only as
+/// good as the count it is taken against: every file's count was checked
+/// non-negative when the bucket was indexed above, but a forged LARGER positive
+/// count does lift this bound, so nothing downstream may size an allocation from
+/// what it admits.
 fn read_row_ranges(
     cur: &mut &[u8],
     file_name: &str,
@@ -313,15 +328,6 @@ fn read_row_ranges(
             "row ranges reference data file not present in the bucket split: {file_name}"
         ))
     })?;
-    // A negative row count is forged by construction. Rejecting it, rather than
-    // skipping the bound check for it, is what keeps the bound below meaningful:
-    // otherwise a forged count would lift it entirely.
-    if row_count < 0 {
-        return Err(data_invalid(format!(
-            "data file {file_name} has a negative row count: {row_count}"
-        )));
-    }
-
     let count = read_count(cur, "row range")?;
     let mut ranges: Vec<RowRange> = Vec::new();
     for _ in 0..count {
@@ -996,6 +1002,35 @@ mod tests {
         bytes[DATA_FILE_ROW_COUNT_OFFSET..DATA_FILE_ROW_COUNT_OFFSET + 8]
             .copy_from_slice(&(-1i64).to_le_bytes());
         assert_error_contains(&bytes, "data file data-1.orc has a negative row count: -1");
+    }
+
+    /// The same forged count, on a message that lists NO ranges at all. The range
+    /// reader only ever sees the files the message lists, and `bucket_search`
+    /// re-checks only the files that become ACTIVE, so for anything else this is the
+    /// only check there is.
+    #[test]
+    fn rejects_a_negative_row_count_on_a_file_with_no_listed_ranges() {
+        let mut bytes = golden_without_row_ranges();
+        bytes[DATA_FILE_ROW_COUNT_OFFSET..DATA_FILE_ROW_COUNT_OFFSET + 8]
+            .copy_from_slice(&crate::spec::DataFileMeta::ROW_COUNT_UNKNOWN.to_le_bytes());
+        assert_error_contains(&bytes, "data file data-1.orc has a negative row count: -1");
+    }
+
+    /// The golden with its row-range section removed: the no-pre-filter shape Java
+    /// emits when its planner narrowed nothing.
+    fn golden_without_row_ranges() -> Vec<u8> {
+        let mut bytes = golden();
+        let count_offset = bytes.len() - RANGE_SECTION_BYTES - 4;
+        bytes.truncate(count_offset + 4);
+        bytes[count_offset..count_offset + 4].copy_from_slice(&0i32.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_message_that_lists_no_ranges_decodes_to_no_entries() {
+        let split = BucketVectorSearchSplit::deserialize(&golden_without_row_ranges()).unwrap();
+        assert!(split.row_ranges_by_file().is_empty());
+        assert_eq!(split.data_split().data_files().len(), 1);
     }
 
     #[test]

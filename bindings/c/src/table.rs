@@ -675,6 +675,7 @@ pub unsafe extern "C" fn paimon_read_builder_new_read(
                 table: state.table.clone(),
                 read_type: table_read.read_type().to_vec(),
                 data_predicates: table_read.data_predicates().to_vec(),
+                filter: state.filter.clone(),
             };
             paimon_result_new_read {
                 read: box_table_read_state(read_state),
@@ -906,7 +907,9 @@ pub unsafe extern "C" fn paimon_table_read_to_arrow(
 /// ArrowArray and ArrowSchema container structs.
 ///
 /// # Safety
-/// `reader` must be a valid pointer from `paimon_table_read_to_arrow`, or null (returns error).
+/// `reader` must be a valid pointer from `paimon_table_read_to_arrow`,
+/// `paimon_table_read_to_arrow_indexed`, or
+/// `paimon_vector_search_builder_execute_read`, or null (returns error).
 #[no_mangle]
 pub unsafe extern "C" fn paimon_record_batch_reader_next(
     reader: *mut paimon_record_batch_reader,
@@ -975,7 +978,8 @@ pub unsafe extern "C" fn paimon_record_batch_reader_next(
 /// Free a paimon_record_batch_reader.
 ///
 /// # Safety
-/// Only call with a reader returned from `paimon_table_read_to_arrow` or
+/// Only call with a reader returned from `paimon_table_read_to_arrow`,
+/// `paimon_table_read_to_arrow_indexed`, or
 /// `paimon_vector_search_builder_execute_read`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_record_batch_reader_free(reader: *mut paimon_record_batch_reader) {
