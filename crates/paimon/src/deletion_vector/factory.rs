@@ -68,10 +68,93 @@ impl DeletionVectorFactory {
         let reader = input.reader().await?;
         let offset = df.offset() as u64;
         let len = df.length() as u64;
-        let bytes = reader
-            // 4 bytes for bitmap length, 4 bytes for magic number
-            .read(offset..offset.saturating_add(len).saturating_add(8))
-            .await?;
+        // A v1 entry occupies `len + 8` bytes on disk while a v2 entry occupies
+        // exactly `len` -- v2 counts the length prefix and the CRC in
+        // `DeletionFile.length()`, v1 counts neither (Java `DeletionVector.read`).
+        // Neither format needs its CRC, so `len + 4` is the most either can
+        // require. Reading that much overruns a v2 entry that ends the index
+        // file, and a range past EOF is rejected outright rather than truncated,
+        // so retry with the v2 size. v1 always satisfies the first range, so it
+        // still costs a single read.
+        let wanted = offset..offset.saturating_add(len).saturating_add(4);
+        let bytes = match reader.read(wanted).await {
+            Ok(bytes) => bytes,
+            // The two ranges differ by 4 bytes, so an unrelated I/O failure
+            // fails this one too and its error is what surfaces.
+            Err(_) => reader.read(offset..offset.saturating_add(len)).await?,
+        };
         DeletionVector::read_from_bytes(&bytes, Some(len))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIO;
+    use bytes::Bytes;
+    use roaring::RoaringBitmap;
+
+    fn local_file_path(path: &std::path::Path) -> String {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        if normalized.starts_with('/') {
+            format!("file:{normalized}")
+        } else {
+            format!("file:/{normalized}")
+        }
+    }
+
+    /// One `Bitmap64DeletionVector` run as Java writes it:
+    /// `i32 BE bitmapLength | i32 LE magic | portable 64-bit roaring | i32 BE crc`.
+    fn java_bitmap64_entry(values: &[u32]) -> Vec<u8> {
+        let mut bitmap = RoaringBitmap::new();
+        for value in values {
+            bitmap.insert(*value);
+        }
+        let mut payload = 1u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        bitmap.serialize_into(&mut payload).unwrap();
+
+        let mut bytes = ((4 + payload.len()) as i32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&1681511377u32.to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&bytes[4..]);
+        bytes.extend_from_slice(&(crc.finalize() as i32).to_be_bytes());
+        bytes
+    }
+
+    /// A v2 vector that ends the index file must still be readable. Its
+    /// `DeletionFile.length()` covers the whole run, so reading `length + 8`
+    /// runs past EOF and the storage layer rejects the range outright.
+    #[test]
+    fn test_read_bitmap64_at_end_of_index_file() {
+        let entry = java_bitmap64_entry(&[3u32, 11u32]);
+        let dir = tempfile::tempdir().unwrap();
+        let file_io = FileIO::from_path(dir.path().to_string_lossy())
+            .unwrap()
+            .build()
+            .unwrap();
+        let path = local_file_path(&dir.path().join("index-bitmap64-last"));
+
+        // Index files start with a one-byte version, then the vectors back to back.
+        let mut file = vec![1u8];
+        file.extend_from_slice(&entry);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            file_io
+                .new_output(&path)
+                .unwrap()
+                .write(Bytes::from(file))
+                .await
+                .unwrap();
+            let df = crate::DeletionFile::new(path.clone(), 1, entry.len() as i64, Some(2));
+            let dv = DeletionVectorFactory::read(&file_io, &df)
+                .await
+                .expect("v2 vector at end of file must be readable");
+            assert!(dv.is_deleted(3) && dv.is_deleted(11));
+            assert!(!dv.is_deleted(4));
+            assert_eq!(dv.cardinality(), 2);
+        });
     }
 }
