@@ -120,6 +120,12 @@ pub struct paimon_result_vector_search_builder {
     pub error: *mut paimon_error,
 }
 
+#[repr(C)]
+pub struct paimon_result_vector_search_splits {
+    pub splits: *mut paimon_vector_search_splits,
+    pub error: *mut paimon_error,
+}
+
 // === Write/Commit result types ===
 
 #[repr(C)]

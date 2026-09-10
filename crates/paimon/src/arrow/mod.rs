@@ -37,7 +37,7 @@ use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
+pub(crate) const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
 
 /// Converts a Paimon [`DataType`](PaimonDataType) to an Arrow [`DataType`](ArrowDataType).
 pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType> {
