@@ -1532,6 +1532,7 @@ Lumina index behavior is configured via table options prefixed with `lumina.`:
 | `lumina.distance.metric` | Distance metric (`inner_product`, `cosine`, `l2`) |
 | `lumina.index.type` | Index type (default: `diskann`) |
 | `lumina.encoding.type` | Encoding type (default: `pq`) |
+| `lumina.search.max-filter-bytes` | Maximum memory used by each active Lumina reader to expand a filtered row-id set (default: `64 MiB`, or 8,388,608 row ids). Queries exceeding it fail with an error; increase it explicitly as a table or vector-search option for unusually large index segments. This Rust-side safety option is not passed to the native Lumina library. |
 
 ### Lumina Environment
 

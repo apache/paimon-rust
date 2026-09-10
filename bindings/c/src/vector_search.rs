@@ -344,6 +344,133 @@ pub unsafe extern "C" fn paimon_vector_search_builder_execute_read(
     }
 }
 
+/// Run the vector search over bucket splits a Java planner produced, and stream
+/// the materialized rows.
+///
+/// This is the entry point for an engine that plans in Paimon Java and executes
+/// here: the planner emits one `BucketVectorSearchSplit` per bucket and ships its
+/// bytes to a worker, which calls this. `splits` points at `count` buffers and
+/// `split_lens` at their lengths; both arrays must hold `count` entries. The
+/// buffers are only read for the duration of the call.
+///
+/// The splits are the plan -- their payload files, per-file row ranges and pinned
+/// snapshot are used as given, and the table's index manifest is not read. Search,
+/// optional refine, Top-K and materialization are the same as
+/// `paimon_vector_search_builder_execute_read`, so the output is the projected
+/// user columns plus `__paimon_search_score`, best-first. The Top-K is local to
+/// the splits passed in; a caller distributing one call per bucket merges the
+/// per-bucket results itself.
+///
+/// Only a primary-key vector column can be read this way; a data-evolution table
+/// returns an error rather than an answer from a different plan. Consume via
+/// `paimon_record_batch_reader_next` and free with
+/// `paimon_record_batch_reader_free`.
+///
+/// # Safety
+/// `b` must be a valid pointer from `paimon_table_new_vector_search_builder`, or
+/// null (returns an error result). `splits` and `split_lens` must each point at
+/// `count` valid entries, and each `splits[i]` at `split_lens[i]` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vector_search_builder_execute_read_for_bucket_splits(
+    b: *mut paimon_vector_search_builder,
+    splits: *const *const u8,
+    split_lens: *const usize,
+    count: usize,
+) -> paimon_result_record_batch_reader {
+    if let Err(e) = check_non_null(b, "b") {
+        return paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error: e,
+        };
+    }
+    // A `#[repr(C)]` wrapper can arrive zero-initialized, which passes the null-POINTER
+    // check above while carrying a null `inner`. The state is dereferenced below, so
+    // that has to be caught here rather than as a null dereference inside the library.
+    if (*b).inner.is_null() {
+        return paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error: paimon_error::new(
+                PaimonErrorCode::InvalidInput,
+                concat!(
+                    "paimon_vector_search_builder_execute_read_for_bucket_splits: ",
+                    "builder is not initialized"
+                )
+                .to_string(),
+            ),
+        };
+    }
+    if splits.is_null() || split_lens.is_null() || count == 0 {
+        return paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error: paimon_error::new(
+                PaimonErrorCode::InvalidInput,
+                "paimon_vector_search_builder_execute_read_for_bucket_splits: null or empty splits"
+                    .to_string(),
+            ),
+        };
+    }
+
+    let ptrs = std::slice::from_raw_parts(splits, count);
+    let lens = std::slice::from_raw_parts(split_lens, count);
+    let mut buffers: Vec<&[u8]> = Vec::with_capacity(count);
+    for (i, (&ptr, &len)) in ptrs.iter().zip(lens).enumerate() {
+        // A null or empty buffer cannot be a split, and reaching the decoder with
+        // one would report it as corrupt data rather than as the caller's error.
+        if ptr.is_null() || len == 0 {
+            return paimon_result_record_batch_reader {
+                reader: std::ptr::null_mut(),
+                error: paimon_error::new(
+                    PaimonErrorCode::InvalidInput,
+                    format!(
+                        "paimon_vector_search_builder_execute_read_for_bucket_splits: \
+                         split {i} is null or empty"
+                    ),
+                ),
+            };
+        }
+        buffers.push(std::slice::from_raw_parts(ptr, len));
+    }
+
+    let state = &*((*b).inner as *const VectorSearchState);
+    let mut builder = state.table.new_vector_search_builder();
+    if let Some(col) = &state.vector_column {
+        builder.with_vector_column(col);
+    }
+    if let Some(v) = &state.query_vector {
+        builder.with_query_vector(v.clone());
+    }
+    if let Some(limit) = state.limit {
+        builder.with_limit(limit);
+    }
+    if !state.options.is_empty() {
+        builder.with_options(state.options.clone());
+    }
+    if let Some(f) = &state.filter {
+        builder.with_filter(f.clone());
+    }
+    if let Some(cols) = &state.projection {
+        let col_refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+        builder.with_projection(&col_refs);
+    }
+
+    match runtime().block_on(builder.execute_read_for_bucket_splits(&buffers)) {
+        Ok(stream) => {
+            let reader = Box::new(stream);
+            let wrapper = Box::new(paimon_record_batch_reader {
+                inner: Box::into_raw(reader) as *mut c_void,
+            });
+            paimon_result_record_batch_reader {
+                reader: Box::into_raw(wrapper),
+                error: std::ptr::null_mut(),
+            }
+        }
+        Err(e) => paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error: paimon_error::from_paimon(e),
+        },
+    }
+}
+
 // --- C ABI signature guards -------------------------------------------------
 //
 // These symbols are called across the FFI boundary with fixed argument counts:
@@ -387,3 +514,10 @@ const _: unsafe extern "C" fn(*mut paimon_vector_search_builder) =
 const _: unsafe extern "C" fn(
     *mut paimon_vector_search_builder,
 ) -> paimon_result_record_batch_reader = paimon_vector_search_builder_execute_read;
+const _: unsafe extern "C" fn(
+    *mut paimon_vector_search_builder,
+    *const *const u8,
+    *const usize,
+    usize,
+) -> paimon_result_record_batch_reader =
+    paimon_vector_search_builder_execute_read_for_bucket_splits;
