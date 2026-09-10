@@ -363,12 +363,16 @@ fn search_lumina<S: LuminaSearch + ?Sized>(
     }
 
     let limit = vector_search.limit;
-    let index_metric = index_meta.metric()?;
+    // Java's order: `index.size()` decides first, and the metric is parsed only once
+    // there is something to search. An empty index has no hits to rank, so reading
+    // the metric ahead of the size would report a malformed metric for a query whose
+    // answer is empty whatever the metric says.
     let count = searcher.get_count()? as usize;
     let effective_k = std::cmp::min(limit, count);
     if effective_k == 0 {
         return Ok(None);
     }
+    let index_metric = index_meta.metric()?;
 
     let include_row_ids = vector_search.effective_include_row_ids();
 
@@ -460,14 +464,27 @@ fn search_lumina_batch<S: LuminaSearch + ?Sized>(
         }
     }
 
-    let filter_id_list =
-        shared_filter.map(|include_row_ids| include_row_ids.iter().collect::<Vec<_>>());
-    if filter_id_list.as_ref().is_some_and(Vec::is_empty) {
+    // An include-set that permits nothing can match nothing, whatever the index
+    // holds. Answered from the set itself, so no native call is made at all.
+    if shared_filter
+        .as_ref()
+        .is_some_and(|filter| filter.is_empty())
+    {
         return Ok(vec![None; vector_searches.len()]);
     }
 
-    let index_metric = index_meta.metric()?;
+    // Java's order, and it decides what an empty index reports: `index.size()` first,
+    // then the dense filter is built, and the metric is parsed last. An empty index
+    // has nothing to return whatever the filter says, so converting the filter first
+    // would report an oversized one instead, and reading the metric first would
+    // report a malformed one. Neither is what happened.
     let count = searcher.get_count()? as usize;
+    if count == 0 {
+        return Ok(vec![None; vector_searches.len()]);
+    }
+    let filter_id_list =
+        shared_filter.map(|include_row_ids| include_row_ids.iter().collect::<Vec<_>>());
+    let index_metric = index_meta.metric()?;
     let effective_k = filter_id_list.as_ref().map_or_else(
         || std::cmp::min(limit, count),
         |ids| std::cmp::min(std::cmp::min(limit, count), ids.len()),
@@ -819,6 +836,76 @@ mod tests {
             searcher.count_calls.load(Ordering::Relaxed),
             0,
             "an empty shared filter should avoid all native searcher calls"
+        );
+        assert!(searcher
+            .unfiltered_calls
+            .lock()
+            .expect("unfiltered call lock")
+            .is_empty());
+        assert!(searcher
+            .filtered_calls
+            .lock()
+            .expect("filtered call lock")
+            .is_empty());
+    }
+
+    /// An index whose metadata names a metric Lumina does not define, so parsing it
+    /// fails. Everything else about the index is well formed -- only the ORDER the
+    /// steps run in decides whether the caller sees that failure or an empty answer.
+    fn test_index_meta_with_unknown_metric(dim: usize) -> LuminaIndexMeta {
+        LuminaIndexMeta::new(HashMap::from([
+            (KEY_DIMENSION.to_string(), dim.to_string()),
+            (KEY_DISTANCE_METRIC.to_string(), "not-a-metric".to_string()),
+        ]))
+    }
+
+    #[test]
+    fn an_empty_index_reports_empty_before_the_metric_is_parsed() {
+        // Java's order, scalar path: `index.size()` decides first. A query against an
+        // index holding nothing has an empty answer whatever the metric says, so
+        // reporting a malformed metric here would be an error about something that
+        // could not have changed the result.
+        let searcher = RecordingSearcher::new(0);
+        let search = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+        let result = search_lumina(
+            &searcher,
+            &test_index_meta_with_unknown_metric(2),
+            &HashMap::new(),
+            &search,
+        )
+        .expect("an empty index reports no hits, not a malformed metric");
+        assert_eq!(result, None);
+        assert!(searcher
+            .unfiltered_calls
+            .lock()
+            .expect("unfiltered call lock")
+            .is_empty());
+    }
+
+    #[test]
+    fn an_empty_index_reports_empty_before_the_filter_is_densified() {
+        // Same order on the batch path, where it also keeps the dense filter from
+        // being built: `index.size()` first, then the filter, then the metric.
+        let searcher = RecordingSearcher::new(0);
+        let shared_filter = Arc::new(roaring::RoaringTreemap::from_iter([2, 4, 6]));
+        let mut first = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+        first.set_shared_include_row_ids(Arc::clone(&shared_filter));
+        let mut second = VectorSearch::new(vec![0.0, 1.0], 2, "embedding".to_string()).unwrap();
+        second.set_shared_include_row_ids(Arc::clone(&shared_filter));
+
+        let results = search_lumina_batch(
+            &searcher,
+            &test_index_meta_with_unknown_metric(2),
+            &HashMap::new(),
+            &[first, second],
+        )
+        .expect("an empty index reports no hits, not a malformed metric");
+
+        assert_eq!(results, vec![None, None]);
+        assert_eq!(
+            searcher.count_calls.load(Ordering::Relaxed),
+            1,
+            "the index size is what the answer came from"
         );
         assert!(searcher
             .unfiltered_calls
