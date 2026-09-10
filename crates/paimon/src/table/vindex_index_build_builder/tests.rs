@@ -153,7 +153,9 @@ fn test_ivf_training_ranges_are_bounded_and_exact() {
     .remove(0);
 
     for training_rows in [1, 63, 64, 65, 200, 899] {
-        let ranges = plan_ivf_training_ranges(&shard, training_rows).unwrap();
+        let ranges = plan_ivf_training_ranges(&shard, training_rows)
+            .unwrap()
+            .expect("sparse ranges expected");
 
         assert!(ranges.len() <= 64);
         assert_eq!(
@@ -165,17 +167,84 @@ fn test_ivf_training_ranges_are_bounded_and_exact() {
         assert!(ranges.last().unwrap().to() <= shard.row_range_end);
         assert_eq!(
             ranges,
-            plan_ivf_training_ranges(&shard, training_rows).unwrap()
+            plan_ivf_training_ranges(&shard, training_rows)
+                .unwrap()
+                .expect("sparse ranges expected")
         );
     }
 
-    let ranges = plan_ivf_training_ranges(&shard, 200).unwrap();
+    let ranges = plan_ivf_training_ranges(&shard, 200)
+        .unwrap()
+        .expect("sparse ranges expected");
     let mut other_snapshot = shard.clone();
     other_snapshot.snapshot_id += 1;
     assert_ne!(
         ranges,
-        plan_ivf_training_ranges(&other_snapshot, 200).unwrap()
+        plan_ivf_training_ranges(&other_snapshot, 200)
+            .unwrap()
+            .expect("sparse ranges expected")
     );
+}
+
+#[test]
+fn test_ivf_training_ranges_keep_segments_short() {
+    let shard = plan(
+        vec![manifest_entry(data_file("a", Some(0), 1_000_000))],
+        1_000_000,
+    )
+    .unwrap()
+    .remove(0);
+
+    let ranges = plan_ivf_training_ranges(&shard, 65_536)
+        .unwrap()
+        .expect("sparse ranges expected");
+
+    assert_eq!(ranges.len(), 512);
+    assert!(ranges.iter().all(|range| range.count() <= 128));
+    assert_eq!(ranges.iter().map(RowRange::count).sum::<i64>(), 65_536);
+}
+
+#[test]
+fn test_ivf_training_ranges_scale_to_keep_segments_short() {
+    let shard = plan(
+        vec![manifest_entry(data_file("a", Some(0), 2_000_000))],
+        2_000_000,
+    )
+    .unwrap()
+    .remove(0);
+
+    let ranges = plan_ivf_training_ranges(&shard, 262_144)
+        .unwrap()
+        .expect("sparse ranges expected");
+
+    assert_eq!(ranges.len(), 2_048);
+    assert!(ranges.iter().all(|range| range.count() <= 128));
+    assert_eq!(ranges.iter().map(RowRange::count).sum::<i64>(), 262_144);
+}
+
+#[test]
+fn test_ivf_training_ranges_fall_back_above_range_limit() {
+    let shard = plan(
+        vec![manifest_entry(data_file("a", Some(0), 2_000_000))],
+        2_000_000,
+    )
+    .unwrap()
+    .remove(0);
+
+    assert!(plan_ivf_training_ranges(&shard, 524_289).unwrap().is_none());
+}
+
+#[test]
+fn test_ivf_training_ranges_cover_full_shard_without_empty_sentinel() {
+    let shard = plan(vec![manifest_entry(data_file("a", Some(0), 1_000))], 1_000)
+        .unwrap()
+        .remove(0);
+
+    let ranges = plan_ivf_training_ranges(&shard, 1_000)
+        .unwrap()
+        .expect("full range expected");
+
+    assert_eq!(ranges, vec![RowRange::new(0, 999)]);
 }
 
 #[test]
