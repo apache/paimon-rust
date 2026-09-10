@@ -17,7 +17,7 @@
 
 use crate::spec::{CoreOptions, DataField, ManifestEntry};
 use crate::table::global_index_build_common::vector::{plan_vector_index_shards, VectorIndexShard};
-use crate::table::RowRange;
+use crate::table::{merge_row_ranges, RowRange};
 use crate::{Error, Result};
 
 use super::validation::checked_row_count;
@@ -75,38 +75,33 @@ pub(super) fn plan_ivf_training_ranges(
     }
 
     let range_count = training_rows.min(MAX_IVF_TRAINING_RANGES);
-    let gap_count = range_count + 1;
-    let skipped_rows = shard_rows - training_rows;
-    let seed = mix_seed(
+    let mut seed = mix_seed(
         (shard.snapshot_id as u64)
             ^ (shard.row_range_start as u64).rotate_left(21)
-            ^ (shard.row_range_end as u64).rotate_left(42),
+            ^ (shard.row_range_end as u64).rotate_left(42)
+            ^ (shard.source_bucket as u64).rotate_left(11),
     );
-    let range_extra_offset = seed as usize % range_count;
-    let gap_extra_offset = seed.rotate_left(17) as usize % gap_count;
+    for byte in &shard.partition_bytes {
+        seed = mix_seed(seed ^ u64::from(*byte));
+    }
     let mut cursor = shard.row_range_start;
     let mut ranges = Vec::with_capacity(range_count);
 
-    for gap_index in 0..range_count {
-        let gap = skipped_rows / gap_count
-            + usize::from(
-                (gap_index + gap_count - gap_extra_offset) % gap_count < skipped_rows % gap_count,
-            );
-        cursor = checked_add_offset(cursor, gap, "training gap")?;
-        let length = training_rows / range_count
-            + usize::from(
-                (gap_index + range_count - range_extra_offset) % range_count
-                    < training_rows % range_count,
-            );
-        let end = checked_add_offset(cursor, length - 1, "training range")?;
-        ranges.push(RowRange::new(cursor, end));
-        cursor = end.checked_add(1).ok_or_else(|| Error::DataInvalid {
-            message: "vindex training range end overflows i64".to_string(),
-            source: None,
-        })?;
+    for range_index in 0..range_count {
+        let stratum_length =
+            shard_rows / range_count + usize::from(range_index < shard_rows % range_count);
+        let length =
+            training_rows / range_count + usize::from(range_index < training_rows % range_count);
+        debug_assert!(length <= stratum_length);
+        let available_offsets = stratum_length - length + 1;
+        let offset = mix_seed(seed ^ range_index as u64) as usize % available_offsets;
+        let start = checked_add_offset(cursor, offset, "training range")?;
+        let end = checked_add_offset(start, length - 1, "training range")?;
+        ranges.push(RowRange::new(start, end));
+        cursor = checked_add_offset(cursor, stratum_length, "training stratum")?;
     }
 
-    Ok(ranges)
+    Ok(merge_row_ranges(ranges))
 }
 
 fn checked_add_offset(value: i64, offset: usize, name: &str) -> Result<i64> {
