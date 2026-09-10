@@ -66,9 +66,6 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         PredicateOperator::In => {
             return true;
         }
-        PredicateOperator::NotIn => {
-            return true;
-        }
         PredicateOperator::ArrayContains => {
             return all_null != Some(true);
         }
@@ -96,6 +93,7 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         }
         PredicateOperator::Eq
         | PredicateOperator::NotEq
+        | PredicateOperator::NotIn
         | PredicateOperator::Lt
         | PredicateOperator::LtEq
         | PredicateOperator::Gt
@@ -145,7 +143,29 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
             !matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
                 && !matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
         }
-        PredicateOperator::NotEq => !(min_value == *literal && max_value == *literal),
+        // Skipping a file because every non-null value in it is forbidden needs
+        // two things that do not hold for FLOAT and DOUBLE, so both operators
+        // below fail open there (see `equality_exclusion_is_sound`).
+        PredicateOperator::NotEq => {
+            !(equality_exclusion_is_sound(&min_value)
+                && min_value == *literal
+                && max_value == *literal)
+        }
+        // The n-ary form of `NotEq` above: a file can only be skipped when some
+        // literal equals both bounds. Java `NotIn#test` does the same
+        // (`compareLiteral(lit, min) == 0 && compareLiteral(lit, max) == 0`). Its
+        // extra `literal == null` arm has no counterpart because `Datum` has no
+        // null variant at all: the REST parser folds `NOT IN (.., null)` into
+        // `AlwaysFalse`, and DataFusion declines to push the predicate down. Files
+        // that are entirely null were already skipped by the shared `all_null`
+        // check, and files that are partly null are still pruned -- a null row
+        // satisfies neither `NotIn` nor the equality that prunes it.
+        PredicateOperator::NotIn => {
+            !(equality_exclusion_is_sound(&min_value)
+                && literals
+                    .iter()
+                    .any(|literal| min_value == *literal && max_value == *literal))
+        }
         PredicateOperator::Lt => !matches!(
             min_value.partial_cmp(literal),
             Some(Ordering::Greater | Ordering::Equal)
@@ -208,7 +228,6 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         }
         PredicateOperator::IsNull
         | PredicateOperator::IsNotNull
-        | PredicateOperator::NotIn
         | PredicateOperator::EndsWith
         | PredicateOperator::Contains
         | PredicateOperator::Between
@@ -217,6 +236,26 @@ pub(crate) fn data_leaf_may_match<T: StatsAccessor>(
         | PredicateOperator::ArraysOverlap
         | PredicateOperator::ArrayContainsAll => true,
     }
+}
+
+/// Whether `min == max == literal` is enough to conclude that no row in a file
+/// can satisfy `!= literal`.
+///
+/// The conclusion needs two properties, and FLOAT and DOUBLE have neither:
+///
+/// * `Datum` equality must agree with the row-level filter. `datum_cmp` compares
+///   floats with IEEE `partial_cmp`, so it reports `-0.0 == +0.0`, while the
+///   residual filter tells them apart. Java is unaffected here because
+///   `CompareUtils#compareLiteral` goes through `Double.compareTo`, which orders
+///   `-0.0` below `+0.0`.
+/// * min and max must cover every non-null row. The writer leaves NaN out of
+///   min/max without counting it as null, so a file holding `[1.0, NaN]` reports
+///   `min == max == 1.0` over two rows.
+///
+/// Either one alone drops rows: on those two files `<> 0.0` and `<> 1.0` skipped
+/// the file even though the filter would have returned the row.
+fn equality_exclusion_is_sound(bound: &Datum) -> bool {
+    !matches!(bound, Datum::Float(_) | Datum::Double(_))
 }
 
 pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
@@ -545,7 +584,7 @@ fn coerce_stats_datum_for_predicate(datum: Datum, predicate_data_type: &DataType
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{BinaryType, IntType, VarCharType};
+    use crate::spec::{BinaryType, DoubleType, IntType, VarCharType};
 
     struct MockStats {
         row_count: i64,
@@ -725,11 +764,19 @@ mod tests {
     }
 
     fn int_stats(min: i32, max: i32) -> MockStats {
+        nullable_int_stats(Some(min), Some(max), Some(0))
+    }
+
+    fn nullable_int_stats(
+        min: Option<i32>,
+        max: Option<i32>,
+        null_count: Option<i64>,
+    ) -> MockStats {
         MockStats {
             row_count: 10,
-            null_count: Some(0),
-            min: Some(Datum::Int(min)),
-            max: Some(Datum::Int(max)),
+            null_count,
+            min: min.map(Datum::Int),
+            max: max.map(Datum::Int),
         }
     }
 
@@ -959,5 +1006,173 @@ mod tests {
             &[Datum::Int(0), Datum::Int(100)],
             &stats,
         ));
+    }
+
+    #[test]
+    fn not_in_prunes_a_file_holding_only_a_forbidden_value() {
+        let stats = nullable_int_stats(Some(7), Some(7), Some(0));
+        assert!(!run_int(PredicateOperator::NotIn, &[Datum::Int(7)], &stats));
+        // One matching literal is enough, wherever it sits in the list.
+        assert!(!run_int(
+            PredicateOperator::NotIn,
+            &[Datum::Int(1), Datum::Int(7), Datum::Int(9)],
+            &stats
+        ));
+    }
+
+    #[test]
+    fn not_in_keeps_a_file_whose_bounds_differ() {
+        let stats = nullable_int_stats(Some(10), Some(20), Some(0));
+        assert!(run_int(
+            PredicateOperator::NotIn,
+            &[Datum::Int(10), Datum::Int(20)],
+            &stats
+        ));
+        assert!(run_int(PredicateOperator::NotIn, &[Datum::Int(15)], &stats));
+    }
+
+    #[test]
+    fn not_in_prunes_an_all_null_file() {
+        // Every row is null, and a null row never satisfies NOT IN.
+        let stats = MockStats {
+            row_count: 10,
+            null_count: Some(10),
+            min: None,
+            max: None,
+        };
+        assert!(!run_int(PredicateOperator::NotIn, &[Datum::Int(7)], &stats));
+    }
+
+    #[test]
+    fn not_in_prunes_a_partially_null_constant_file() {
+        // Nulls do not rescue the file: the non-null rows all hold 7, and the
+        // null rows do not satisfy NOT IN either.
+        let stats = nullable_int_stats(Some(7), Some(7), Some(4));
+        assert!(!run_int(PredicateOperator::NotIn, &[Datum::Int(7)], &stats));
+        // Same when the null count is unknown: min/max already describe every
+        // non-null row, so an unknown number of nulls cannot rescue the file.
+        let unknown_nulls = nullable_int_stats(Some(7), Some(7), None);
+        assert!(!run_int(
+            PredicateOperator::NotIn,
+            &[Datum::Int(7)],
+            &unknown_nulls
+        ));
+    }
+
+    #[test]
+    fn not_in_falls_open_without_usable_stats() {
+        assert!(run_int(
+            PredicateOperator::NotIn,
+            &[Datum::Int(7)],
+            &nullable_int_stats(None, None, Some(0))
+        ));
+        assert!(run_int(
+            PredicateOperator::NotIn,
+            &[Datum::Int(7)],
+            &nullable_int_stats(Some(7), None, Some(0))
+        ));
+        // Inverted bounds: no literal can equal two different bounds, so the
+        // rule structurally cannot fire -- unlike `In`, which needs an explicit
+        // guard here.
+        assert!(run_int(
+            PredicateOperator::NotIn,
+            &[Datum::Int(7)],
+            &nullable_int_stats(Some(20), Some(10), Some(0))
+        ));
+        // No literals at all — Java's NotIn returns true here as well.
+        assert!(run_int(
+            PredicateOperator::NotIn,
+            &[],
+            &nullable_int_stats(Some(7), Some(7), Some(0))
+        ));
+    }
+
+    /// `x NOT IN (l)` is `x <> l`, so the two must always return the same
+    /// verdict. Changing one rule without the other would let the same file be
+    /// pruned by one spelling and kept by the other.
+    #[test]
+    fn not_in_with_one_literal_agrees_with_not_eq() {
+        for (min, max, null_count) in [
+            (Some(7), Some(7), Some(0)),
+            (Some(10), Some(20), Some(0)),
+            (Some(7), Some(7), Some(4)),
+            (None, None, Some(0)),
+            (Some(20), Some(10), Some(0)),
+            (Some(7), Some(7), None),
+            // All-null is the one shape where Rust deliberately parts from Java:
+            // `NotEqual` there takes no null count, while the shared check here
+            // prunes. Both operators must still agree with each other.
+            (None, None, Some(10)),
+        ] {
+            let stats = nullable_int_stats(min, max, null_count);
+            for literal in [7, 10, 20, 15] {
+                assert_eq!(
+                    run_int(PredicateOperator::NotIn, &[Datum::Int(literal)], &stats),
+                    run_int(PredicateOperator::NotEq, &[Datum::Int(literal)], &stats),
+                    "NotIn and NotEq disagree on ({min:?}, {max:?}, \
+                     null_count={null_count:?}, literal={literal})"
+                );
+            }
+        }
+    }
+
+    fn double_stats(min: f64, max: f64) -> MockStats {
+        MockStats {
+            row_count: 2,
+            null_count: Some(0),
+            min: Some(Datum::Double(min)),
+            max: Some(Datum::Double(max)),
+        }
+    }
+
+    fn run_double(op: PredicateOperator, literals: &[f64], stats: &MockStats) -> bool {
+        let dt = DataType::Double(DoubleType::new());
+        let literals: Vec<Datum> = literals.iter().copied().map(Datum::Double).collect();
+        data_leaf_may_match(0, &dt, &dt, op, &literals, stats)
+    }
+
+    /// FLOAT and DOUBLE fail open, because neither property the rule rests on
+    /// holds for them. Both shapes below are what the writer really produces: a
+    /// file holding `[1.0, NaN]` reports `min == max == 1.0` over two rows, and a
+    /// file holding only `-0.0` reports `min = -0.0, max = 0.0`.
+    #[test]
+    fn equality_exclusion_falls_open_for_floats() {
+        let nan_file = double_stats(1.0, 1.0);
+        assert!(run_double(PredicateOperator::NotEq, &[1.0], &nan_file));
+        assert!(run_double(PredicateOperator::NotIn, &[1.0, 2.0], &nan_file));
+
+        let signed_zero_file = double_stats(-0.0, 0.0);
+        assert!(run_double(
+            PredicateOperator::NotEq,
+            &[0.0],
+            &signed_zero_file
+        ));
+        assert!(run_double(
+            PredicateOperator::NotIn,
+            &[0.0],
+            &signed_zero_file
+        ));
+
+        // Ordering-based rules are unaffected and must keep pruning.
+        assert!(!run_double(PredicateOperator::Gt, &[5.0], &nan_file));
+        assert!(!run_double(PredicateOperator::Lt, &[0.5], &nan_file));
+        // So is `Eq`, whose direction of error is to keep files.
+        assert!(run_double(PredicateOperator::Eq, &[1.0], &nan_file));
+    }
+
+    /// The equivalence between `NOT IN (l)` and `<> l` has to survive the float
+    /// carve-out: both fail open together, rather than one of them pruning.
+    #[test]
+    fn not_in_agrees_with_not_eq_on_floats_too() {
+        for (min, max) in [(1.0, 1.0), (-0.0, 0.0), (0.0, 0.0), (1.0, 5.0)] {
+            let stats = double_stats(min, max);
+            for literal in [1.0, 0.0, -0.0, 5.0] {
+                assert_eq!(
+                    run_double(PredicateOperator::NotIn, &[literal], &stats),
+                    run_double(PredicateOperator::NotEq, &[literal], &stats),
+                    "NotIn and NotEq disagree on ({min}, {max}, literal={literal})"
+                );
+            }
+        }
     }
 }
