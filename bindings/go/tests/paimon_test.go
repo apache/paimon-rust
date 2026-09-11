@@ -879,3 +879,204 @@ func TestReadWithProjection(t *testing.T) {
 		}
 	}
 }
+
+// TestReadWithCaseInsensitiveProjection covers ReadBuilder.WithCaseSensitive.
+// The fixture columns are lowercase, so an uppercase projection is the reverse
+// of the Hive/Spark case it exists for, and exercises the same code path.
+func TestReadWithCaseInsensitiveProjection(t *testing.T) {
+	table := openTestTable(t)
+
+	// A name that matches no column under any casing is rejected by
+	// WithProjection itself, which is what makes the deferral below case-specific
+	// rather than a blanket "resolution happens later".
+	rbTypo, err := table.NewReadBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create read builder: %v", err)
+	}
+	defer rbTypo.Close()
+	if err := rbTypo.WithProjection([]string{"nosuchcolumn"}); err == nil {
+		t.Fatal("expected WithProjection to reject a name no casing can match")
+	}
+
+	// Default: exact matching, so the uppercase names do not resolve. The
+	// failure surfaces in NewRead, not in WithProjection.
+	rbDefault, err := table.NewReadBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create read builder: %v", err)
+	}
+	defer rbDefault.Close()
+	if err := rbDefault.WithProjection([]string{"ID", "NAME"}); err != nil {
+		t.Fatalf("WithProjection should defer resolution: %v", err)
+	}
+	if _, err := rbDefault.NewRead(); err == nil {
+		t.Fatal("expected NewRead to reject an uppercase projection by default")
+	}
+
+	// Explicitly asking for case sensitivity must behave like the default. This
+	// pins the `true` value of the flag, not just the `false` one.
+	rbExact, err := table.NewReadBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create read builder: %v", err)
+	}
+	defer rbExact.Close()
+	if err := rbExact.WithCaseSensitive(true); err != nil {
+		t.Fatalf("WithCaseSensitive(true) failed: %v", err)
+	}
+	if err := rbExact.WithProjection([]string{"ID", "NAME"}); err != nil {
+		t.Fatalf("WithProjection failed: %v", err)
+	}
+	if _, err := rbExact.NewRead(); err == nil {
+		t.Fatal("expected WithCaseSensitive(true) to keep rejecting uppercase names")
+	}
+
+	// Opting out resolves the names, and readRows asserts the records carry the
+	// schema's own lowercase spelling. Both call orders must agree, because the
+	// projection is resolved in NewRead rather than when it is set.
+	for _, order := range []string{"flag-first", "projection-first"} {
+		rb, err := table.NewReadBuilder()
+		if err != nil {
+			t.Fatalf("%s: failed to create read builder: %v", order, err)
+		}
+		if order == "flag-first" {
+			if err := rb.WithCaseSensitive(false); err != nil {
+				rb.Close()
+				t.Fatalf("%s: WithCaseSensitive(false) failed: %v", order, err)
+			}
+			if err := rb.WithProjection([]string{"ID", "NAME"}); err != nil {
+				rb.Close()
+				t.Fatalf("%s: WithProjection failed: %v", order, err)
+			}
+		} else {
+			if err := rb.WithProjection([]string{"ID", "NAME"}); err != nil {
+				rb.Close()
+				t.Fatalf("%s: WithProjection failed: %v", order, err)
+			}
+			if err := rb.WithCaseSensitive(false); err != nil {
+				rb.Close()
+				t.Fatalf("%s: WithCaseSensitive(false) failed: %v", order, err)
+			}
+		}
+		rows := readRows(t, rb)
+		rb.Close()
+		if len(rows) != 3 {
+			t.Fatalf("%s: expected 3 rows, got %d: %v", order, len(rows), rows)
+		}
+	}
+}
+
+// TestCaseSensitivitySwitchesAreIndependent pins the asymmetry the two doc
+// comments promise: the read builder's flag governs projection only, and a
+// predicate keeps the mode of the builder that produced it whatever the read
+// builder is set to. Both halves were only ever documented, so without this the
+// contract rests on prose.
+func TestCaseSensitivitySwitchesAreIndependent(t *testing.T) {
+	table := openTestTable(t)
+
+	rb, err := table.NewReadBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create read builder: %v", err)
+	}
+	defer rb.Close()
+	if err := rb.WithCaseSensitive(false); err != nil {
+		t.Fatalf("WithCaseSensitive(false) failed: %v", err)
+	}
+	// The read builder folds case, but this predicate does not: its column was
+	// resolved when it was built, before the read builder was ever consulted.
+	if pred, err := table.PredicateBuilder().Eq("ID", int32(1)); err == nil {
+		pred.Close()
+		t.Fatal("expected the read-builder flag not to reach a default-builder predicate")
+	}
+
+	// The mirror image: a case-folding predicate stays case-folding on a read
+	// builder left at the default.
+	rbExact, err := table.NewReadBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create read builder: %v", err)
+	}
+	defer rbExact.Close()
+	pred, err := table.PredicateBuilder().WithCaseSensitive(false).Eq("ID", int32(1))
+	if err != nil {
+		t.Fatalf("case-folding predicate failed to build: %v", err)
+	}
+	if err := rbExact.WithFilter(pred); err != nil {
+		t.Fatalf("WithFilter failed: %v", err)
+	}
+	rows := readRows(t, rbExact)
+	if len(rows) != 1 || rows[0].id != 1 {
+		t.Fatalf("expected exactly the id=1 row, got %v", rows)
+	}
+}
+
+// TestPredicateBuilderCaseSensitivity covers the predicate half. A predicate
+// resolves its column when it is built, so the choice belongs to the builder and
+// ReadBuilder.WithCaseSensitive has no bearing on it.
+func TestPredicateBuilderCaseSensitivity(t *testing.T) {
+	table := openTestTable(t)
+
+	for _, mode := range []struct {
+		name          string
+		pb            *paimon.PredicateBuilder
+		caseSensitive bool
+	}{
+		{"default", table.PredicateBuilder(), true},
+		{"case-sensitive", table.PredicateBuilder().WithCaseSensitive(true), true},
+		{"case-insensitive", table.PredicateBuilder().WithCaseSensitive(false), false},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			// Exercise every bound symbol, including all three argument shapes.
+			for _, tc := range []struct {
+				name   string
+				column string
+				build  func(string) (*paimon.Predicate, error)
+				want   []int32
+			}{
+				{"Eq", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.Eq(c, int32(2)) }, []int32{2}},
+				{"NotEq", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.NotEq(c, int32(2)) }, []int32{1, 3}},
+				{"Lt", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.Lt(c, int32(2)) }, []int32{1}},
+				{"Le", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.Le(c, int32(2)) }, []int32{1, 2}},
+				{"Gt", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.Gt(c, int32(2)) }, []int32{3}},
+				{"Ge", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.Ge(c, int32(2)) }, []int32{2, 3}},
+				{"IsNull", "name", mode.pb.IsNull, nil},
+				{"IsNotNull", "name", mode.pb.IsNotNull, []int32{1, 2, 3}},
+				{"In", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.In(c, int32(1), int32(3)) }, []int32{1, 3}},
+				{"NotIn", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.NotIn(c, int32(1), int32(3)) }, []int32{2}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					for _, column := range []string{tc.column, strings.ToUpper(tc.column)} {
+						t.Run(column, func(t *testing.T) {
+							pred, err := tc.build(column)
+							if mode.caseSensitive && column != tc.column {
+								if err == nil {
+									pred.Close()
+									t.Fatal("expected an uppercase column to fail")
+								}
+								return
+							}
+							if err != nil {
+								t.Fatalf("Failed to create predicate: %v", err)
+							}
+							defer pred.Close()
+
+							rb, err := table.NewReadBuilder()
+							if err != nil {
+								t.Fatalf("Failed to create read builder: %v", err)
+							}
+							defer rb.Close()
+							if err := rb.WithFilter(pred); err != nil {
+								t.Fatalf("WithFilter failed: %v", err)
+							}
+							var ids []int32
+							for _, r := range readRows(t, rb) {
+								ids = append(ids, r.id)
+							}
+							sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+							if !reflect.DeepEqual(ids, tc.want) {
+								t.Fatalf("Expected IDs %v, got %v", tc.want, ids)
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
