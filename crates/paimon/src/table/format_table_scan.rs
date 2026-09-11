@@ -26,6 +26,7 @@ use crate::spec::{
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::source::{DataSplitBuilder, RowRange};
 use chrono::NaiveDate;
+use futures::{StreamExt, TryStreamExt};
 
 #[derive(Debug, Clone)]
 pub(crate) struct FormatTableScan<'a> {
@@ -88,27 +89,50 @@ impl<'a> FormatTableScan<'a> {
             .to_string();
 
         let partition_fields = self.table.schema().partition_fields();
-        let mut splits = Vec::new();
-        for scan_root in self.scan_roots(&core_options, &table_path)? {
-            let statuses = self
-                .list_status_recursive_if_exists(&scan_root.path)
-                .await?;
-            for status in statuses {
-                if let Some(split) = self
-                    .status_to_split(
-                        status,
-                        &table_path,
-                        format_extension,
-                        schema_id,
-                        &partition_fields,
-                        scan_root.partition.clone(),
-                    )
-                    .await?
-                {
-                    splits.push(split);
+        let table_depth = path_segments(&table_path).len();
+        let scan_roots = self.scan_roots(&core_options, &table_path)?;
+        // A table with many partitions pays one listing per partition, so they run concurrently.
+        // `buffered` keeps the roots in order and stops at the first failure.
+        let table_path = table_path.as_str();
+        let partition_fields = partition_fields.as_slice();
+        let listed: Vec<Vec<crate::DataSplit>> = futures::stream::iter(scan_roots)
+            .map(|scan_root| async move {
+                let root_segments = path_segments(&scan_root.path);
+                let partition_levels_below_root = partition_fields
+                    .len()
+                    .saturating_sub(root_segments.len().saturating_sub(table_depth));
+                let statuses = self
+                    .list_status_recursive_if_exists(&scan_root.path)
+                    .await?;
+                let mut splits = Vec::new();
+                for status in statuses {
+                    if is_hidden_below_partitions(
+                        &root_segments,
+                        partition_levels_below_root,
+                        &status.path,
+                    ) {
+                        continue;
+                    }
+                    if let Some(split) = self
+                        .status_to_split(
+                            status,
+                            table_path,
+                            format_extension,
+                            schema_id,
+                            partition_fields,
+                            scan_root.partition.clone(),
+                        )
+                        .await?
+                    {
+                        splits.push(split);
+                    }
                 }
-            }
-        }
+                Ok::<_, crate::Error>(splits)
+            })
+            .buffered(core_options.format_table_scan_list_parallelism())
+            .try_collect()
+            .await?;
+        let mut splits = listed.into_iter().flatten().collect::<Vec<_>>();
 
         splits.sort_by(|left, right| {
             left.bucket_path().cmp(right.bucket_path()).then_with(|| {
@@ -310,6 +334,43 @@ struct ScanRoot {
 
 fn is_format_table_data_file_name(file_name: &str) -> bool {
     !file_name.is_empty() && !file_name.starts_with('.') && !file_name.starts_with('_')
+}
+
+/// Whether a listed file is, or lies inside, an entry whose name starts with `.` or `_` below
+/// the partition directories, such as a committer staging tree (`_temporary`, `__magic_*`)
+/// whose files may never be committed.
+///
+/// Partition directories are exempt: a value-only layout names the null partition
+/// `__DEFAULT_PARTITION__`. `partition_levels_below_root` is how many partition levels still
+/// lie under the scan root.
+fn is_hidden_below_partitions(
+    root_segments: &[&str],
+    partition_levels_below_root: usize,
+    file_path: &str,
+) -> bool {
+    let segments = path_segments(file_path);
+    // A listing may spell the scheme differently from the root (`file:/` against `file:///`),
+    // so what lies below the root is found by segments, not by string prefix. A path outside the
+    // root is left to the file-name check.
+    let Some(below_root) = segments.strip_prefix(root_segments) else {
+        return false;
+    };
+    below_root
+        .iter()
+        .skip(partition_levels_below_root)
+        .any(|segment| segment.starts_with('.') || segment.starts_with('_'))
+}
+
+/// The non-empty segments of a path, without its scheme.
+fn path_segments(path: &str) -> Vec<&str> {
+    let without_scheme = match path.find("://") {
+        Some(index) => &path[index + 3..],
+        None => path.split_once(':').map_or(path, |(_, rest)| rest),
+    };
+    without_scheme
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 fn split_parent_and_file(path: &str) -> Option<(&str, &str)> {
@@ -676,6 +737,256 @@ fn data_file_meta(file_name: String, file_size: i64, schema_id: i64) -> DataFile
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{IntType, Schema, TableSchema, VarCharType};
+    use bytes::Bytes;
+    use std::collections::HashSet;
+
+    /// A Parquet format table in memory, partitioned by the given string keys.
+    fn format_table(location: &str, partition_keys: &[&str], options: &[(&str, &str)]) -> Table {
+        let mut builder = Schema::builder();
+        for key in partition_keys {
+            builder = builder.column(*key, DataType::VarChar(VarCharType::string_type()));
+        }
+        builder = builder
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(partition_keys.iter().map(|key| key.to_string()))
+            .option("type", "format-table")
+            .option("file.format", "parquet");
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "format_t"),
+            location.to_string(),
+            TableSchema::new(0, &builder.build().unwrap()),
+            None,
+        )
+    }
+
+    /// Planning only lists files, so their content never has to be valid Parquet.
+    async fn write_files(table: &Table, relative_paths: &[&str]) {
+        for relative_path in relative_paths {
+            let path = format!("{}/{relative_path}", table.location().trim_end_matches('/'));
+            table
+                .file_io()
+                .new_output(&path)
+                .unwrap()
+                .write(Bytes::from_static(b"planned, never read"))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The planned files, relative to the table directory, in plan order.
+    async fn planned_files(table: &Table, filter: Option<PartitionFilter>) -> Vec<String> {
+        let table_prefix = format!("{}/", table.location().trim_end_matches('/'));
+        let plan = FormatTableScan::new(table, filter, None, None)
+            .plan()
+            .await
+            .unwrap();
+        plan.splits()
+            .iter()
+            .map(|split| {
+                let path = format!(
+                    "{}/{}",
+                    split.bucket_path(),
+                    split.data_files()[0].file_name
+                );
+                path.strip_prefix(&table_prefix)
+                    .map_or(path.clone(), str::to_string)
+            })
+            .collect()
+    }
+
+    /// A filter naming exactly the given partitions; `None` is a null partition value.
+    fn partition_set(table: &Table, partitions: &[&[Option<&str>]]) -> PartitionFilter {
+        let partition_fields = table.schema().partition_fields();
+        let partitions = partitions
+            .iter()
+            .map(|values| {
+                let mut builder = BinaryRowBuilder::new(values.len() as i32);
+                for (index, value) in values.iter().enumerate() {
+                    match value {
+                        Some(value) => builder.write_datum(
+                            index,
+                            &Datum::String(value.to_string()),
+                            partition_fields[index].data_type(),
+                        ),
+                        None => builder.set_null_at(index),
+                    }
+                }
+                builder.build_serialized()
+            })
+            .collect::<HashSet<_>>();
+        PartitionFilter::from_partition_set(partitions, &partition_fields).unwrap()
+    }
+
+    #[test]
+    fn test_hidden_names_count_only_below_the_partition_levels() {
+        let table_root = path_segments("file:///warehouse/db.db/t");
+        assert!(!is_hidden_below_partitions(
+            &table_root,
+            2,
+            "file:/warehouse/db.db/t/__DEFAULT_PARTITION__/b/part-0.parquet"
+        ));
+        assert!(is_hidden_below_partitions(
+            &table_root,
+            2,
+            "file:/warehouse/db.db/t/a/b/_temporary/0/part-0.parquet"
+        ));
+        assert!(is_hidden_below_partitions(
+            &table_root,
+            2,
+            "file:/warehouse/db.db/t/a/b/.part-0.parquet"
+        ));
+
+        // A root one level down, as a leading-equality scan plans it, has one partition level left.
+        let leading_root = path_segments("file:///warehouse/db.db/t/dt=a");
+        assert!(!is_hidden_below_partitions(
+            &leading_root,
+            1,
+            "file:/warehouse/db.db/t/dt=a/hh=__DEFAULT_PARTITION__/part-0.parquet"
+        ));
+        assert!(is_hidden_below_partitions(
+            &leading_root,
+            1,
+            "file:/warehouse/db.db/t/dt=a/hh=1/__magic_job/part-0.parquet"
+        ));
+
+        let partition_root = path_segments("file:///warehouse/db.db/t/dt=a/hh=1");
+        assert!(!is_hidden_below_partitions(
+            &partition_root,
+            0,
+            "file:/warehouse/db.db/t/dt=a/hh=1/part-0.parquet"
+        ));
+        assert!(!is_hidden_below_partitions(
+            &partition_root,
+            0,
+            "file:/elsewhere/_temporary/part-0.parquet"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_scan_skips_committer_staging_files_of_an_unpartitioned_table() {
+        let table = format_table("memory:/staging_unpartitioned", &[], &[]);
+        write_files(
+            &table,
+            &[
+                "part-0.parquet",
+                "_temporary/0/_temporary/attempt_0/part-1.parquet",
+                "__magic_job_1/tasks/part-2.parquet",
+                ".spark-staging-1/part-3.parquet",
+            ],
+        )
+        .await;
+
+        assert_eq!(planned_files(&table, None).await, vec!["part-0.parquet"]);
+    }
+
+    #[tokio::test]
+    async fn test_scan_skips_committer_staging_files_below_a_partition_directory() {
+        let table = format_table("memory:/staging_partitioned", &["dt"], &[]);
+        write_files(
+            &table,
+            &[
+                "dt=a/part-0.parquet",
+                "dt=a/_temporary/0/_temporary/attempt_0/part-1.parquet",
+                "dt=a/__magic_job_1/tasks/part-2.parquet",
+                "dt=b/part-3.parquet",
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            planned_files(&table, None).await,
+            vec!["dt=a/part-0.parquet", "dt=b/part-3.parquet"]
+        );
+        let only_a = partition_set(&table, &[&[Some("a")]]);
+        assert_eq!(
+            planned_files(&table, Some(only_a)).await,
+            vec!["dt=a/part-0.parquet"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_still_reads_a_value_only_default_partition_directory() {
+        let table = format_table(
+            "memory:/staging_value_only",
+            &["dt"],
+            &[("format-table.partition-path-only-value", "true")],
+        );
+        write_files(
+            &table,
+            &[
+                "__DEFAULT_PARTITION__/part-0.parquet",
+                "__DEFAULT_PARTITION__/_temporary/0/part-1.parquet",
+                "b/part-2.parquet",
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            planned_files(&table, None).await,
+            vec!["__DEFAULT_PARTITION__/part-0.parquet", "b/part-2.parquet"]
+        );
+        let null_partition = partition_set(&table, &[&[None]]);
+        assert_eq!(
+            planned_files(&table, Some(null_partition)).await,
+            vec!["__DEFAULT_PARTITION__/part-0.parquet"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_listing_keeps_the_plan_order() {
+        let partitions = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        // Written in reverse, so the plan order owes nothing to the order of the writes.
+        let files = partitions
+            .iter()
+            .rev()
+            .flat_map(|dt| {
+                [
+                    format!("dt={dt}/part-1.parquet"),
+                    format!("dt={dt}/part-0.parquet"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let file_names = files.iter().map(String::as_str).collect::<Vec<_>>();
+        let expected = partitions
+            .iter()
+            .flat_map(|dt| {
+                [
+                    format!("dt={dt}/part-0.parquet"),
+                    format!("dt={dt}/part-1.parquet"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let rows = partitions.iter().map(|dt| [Some(*dt)]).collect::<Vec<_>>();
+        let every_partition = rows.iter().map(|row| row.as_slice()).collect::<Vec<_>>();
+
+        for parallelism in ["1", "4"] {
+            let table = format_table(
+                &format!("memory:/listing_order_{parallelism}"),
+                &["dt"],
+                &[("format-table.scan.list-parallelism", parallelism)],
+            );
+            write_files(&table, &file_names).await;
+
+            let filter = partition_set(&table, &every_partition);
+            assert_eq!(
+                planned_files(&table, Some(filter)).await,
+                expected,
+                "one listing per partition, parallelism {parallelism}"
+            );
+            assert_eq!(
+                planned_files(&table, None).await,
+                expected,
+                "one listing of the table, parallelism {parallelism}"
+            );
+        }
+    }
 
     #[test]
     fn test_unsupported_format_lists_the_supported_ones() {
