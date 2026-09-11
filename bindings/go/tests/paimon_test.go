@@ -886,6 +886,18 @@ func TestReadWithProjection(t *testing.T) {
 func TestReadWithCaseInsensitiveProjection(t *testing.T) {
 	table := openTestTable(t)
 
+	// A name that matches no column under any casing is rejected by
+	// WithProjection itself, which is what makes the deferral below case-specific
+	// rather than a blanket "resolution happens later".
+	rbTypo, err := table.NewReadBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create read builder: %v", err)
+	}
+	defer rbTypo.Close()
+	if err := rbTypo.WithProjection([]string{"nosuchcolumn"}); err == nil {
+		t.Fatal("expected WithProjection to reject a name no casing can match")
+	}
+
 	// Default: exact matching, so the uppercase names do not resolve. The
 	// failure surfaces in NewRead, not in WithProjection.
 	rbDefault, err := table.NewReadBuilder()
@@ -952,6 +964,49 @@ func TestReadWithCaseInsensitiveProjection(t *testing.T) {
 	}
 }
 
+// TestCaseSensitivitySwitchesAreIndependent pins the asymmetry the two doc
+// comments promise: the read builder's flag governs projection only, and a
+// predicate keeps the mode of the builder that produced it whatever the read
+// builder is set to. Both halves were only ever documented, so without this the
+// contract rests on prose.
+func TestCaseSensitivitySwitchesAreIndependent(t *testing.T) {
+	table := openTestTable(t)
+
+	rb, err := table.NewReadBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create read builder: %v", err)
+	}
+	defer rb.Close()
+	if err := rb.WithCaseSensitive(false); err != nil {
+		t.Fatalf("WithCaseSensitive(false) failed: %v", err)
+	}
+	// The read builder folds case, but this predicate does not: its column was
+	// resolved when it was built, before the read builder was ever consulted.
+	if pred, err := table.PredicateBuilder().Eq("ID", int32(1)); err == nil {
+		pred.Close()
+		t.Fatal("expected the read-builder flag not to reach a default-builder predicate")
+	}
+
+	// The mirror image: a case-folding predicate stays case-folding on a read
+	// builder left at the default.
+	rbExact, err := table.NewReadBuilder()
+	if err != nil {
+		t.Fatalf("Failed to create read builder: %v", err)
+	}
+	defer rbExact.Close()
+	pred, err := table.PredicateBuilder().WithCaseSensitive(false).Eq("ID", int32(1))
+	if err != nil {
+		t.Fatalf("case-folding predicate failed to build: %v", err)
+	}
+	if err := rbExact.WithFilter(pred); err != nil {
+		t.Fatalf("WithFilter failed: %v", err)
+	}
+	rows := readRows(t, rbExact)
+	if len(rows) != 1 || rows[0].id != 1 {
+		t.Fatalf("expected exactly the id=1 row, got %v", rows)
+	}
+}
+
 // TestPredicateBuilderCaseSensitivity covers the predicate half. A predicate
 // resolves its column when it is built, so the choice belongs to the builder and
 // ReadBuilder.WithCaseSensitive has no bearing on it.
@@ -964,8 +1019,8 @@ func TestPredicateBuilderCaseSensitivity(t *testing.T) {
 		caseSensitive bool
 	}{
 		{"default", table.PredicateBuilder(), true},
-		{"case-sensitive", table.PredicateBuilderWithCaseSensitive(true), true},
-		{"case-insensitive", table.PredicateBuilderWithCaseSensitive(false), false},
+		{"case-sensitive", table.PredicateBuilder().WithCaseSensitive(true), true},
+		{"case-insensitive", table.PredicateBuilder().WithCaseSensitive(false), false},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			// Exercise every bound symbol, including all three argument shapes.

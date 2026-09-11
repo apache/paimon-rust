@@ -253,14 +253,21 @@ var errConsumedPredicate = fmt.Errorf("paimon: predicate already consumed or nil
 // PredicateBuilder creates filter predicates for a table.
 // It holds a Go-level reference to the Table and does not own any C resources,
 // so there is no Close() method.
-//
-// caseSensitive is baked into every predicate this builder produces: the core
-// resolves a column when the predicate is constructed, so it cannot be changed
-// afterwards. Use Table.PredicateBuilder for exact matching or
-// Table.PredicateBuilderWithCaseSensitive to opt out.
 type PredicateBuilder struct {
 	table         *Table
 	caseSensitive bool
+}
+
+// WithCaseSensitive returns a builder that matches column names by ASCII case
+// folding when caseSensitive is false, rejecting a name that folds onto two
+// schema columns as ambiguous. The default is true (exact match); the receiver is
+// left unchanged.
+//
+// The choice is fixed when each predicate is built, because that is when the core
+// resolves the column. ReadBuilder.WithCaseSensitive is the same switch for
+// projection and has no bearing on a predicate built here.
+func (pb *PredicateBuilder) WithCaseSensitive(caseSensitive bool) *PredicateBuilder {
+	return &PredicateBuilder{table: pb.table, caseSensitive: caseSensitive}
 }
 
 // Eq creates an equality predicate: column = value.
@@ -467,6 +474,22 @@ var ffiPredicateFree = newFFI(ffiOpts{
 	}
 })
 
+// boolByte renders a Go bool as the single byte a Rust `bool` argument expects.
+//
+// A Rust `bool` occupies one byte and admits no value but 0 or 1, so every FFI
+// wrapper that passes one declares the argument as a 1-byte integer (the ffi
+// package documents TypeUint8 as the way to pass a bool) and writes an explicit
+// 0/1 through here. This is the binding's first non-pointer scalar narrower than
+// four bytes; do not copy a wider type into such an argument, and do not hand the
+// callee a Go bool directly — a byte that is neither 0 nor 1 degrades silently to
+// case-sensitive rather than failing.
+func boolByte(value bool) uint8 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 var ffiPredicateEqual = newPredicateLeafFFI("paimon_predicate_equal_with_case_sensitive")
 var ffiPredicateNotEqual = newPredicateLeafFFI("paimon_predicate_not_equal_with_case_sensitive")
 var ffiPredicateLessThan = newPredicateLeafFFI("paimon_predicate_less_than_with_case_sensitive")
@@ -503,14 +526,6 @@ func newPredicateLeafFFI(
 			return result.predicate, nil
 		}
 	})
-}
-
-// boolByte renders a Go bool as the single byte a Rust `bool` argument expects.
-func boolByte(value bool) uint8 {
-	if value {
-		return 1
-	}
-	return 0
 }
 
 var ffiPredicateIsNull = newPredicateNullFFI("paimon_predicate_is_null_with_case_sensitive")

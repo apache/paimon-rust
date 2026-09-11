@@ -574,21 +574,22 @@ if err := rb.WithFilter(pred); err != nil {
 
 ### Case-Insensitive Predicates
 
-`Table.PredicateBuilder` matches column names exactly. Use
-`PredicateBuilderWithCaseSensitive(false)` for a builder that folds ASCII case
-instead; every predicate it produces resolves its column that way.
+`Table.PredicateBuilder` matches column names exactly. Its
+`WithCaseSensitive(false)` returns a builder that folds ASCII case instead; every
+predicate that builder produces resolves its column that way.
 
 ```go
-pb := table.PredicateBuilderWithCaseSensitive(false)
+pb := table.PredicateBuilder().WithCaseSensitive(false)
 
 // Resolves to the schema's "id" column.
 pred, err := pb.Eq("ID", int32(1))
 ```
 
-The choice is fixed when the predicate is built, which is why it belongs to the
-builder and not to the read builder. `ReadBuilder.WithCaseSensitive` does not
-affect predicates, and a predicate from a case-folding builder keeps that
-behaviour whatever the read builder is set to.
+The choice is fixed when the predicate is built, which is why it lives on the
+builder that produces predicates rather than on the read builder — the same
+`WithCaseSensitive` switch, on the object that owns the resolution.
+`ReadBuilder.WithCaseSensitive` does not affect predicates, and a predicate from a
+case-folding builder keeps that behaviour whatever the read builder is set to.
 
 The predicate stores the schema's own spelling of the column, not the one you
 passed, so file-level pruning and row-level filtering apply to it exactly as they

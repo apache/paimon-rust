@@ -46,9 +46,9 @@ func (rb *ReadBuilder) Close() {
 }
 
 // WithProjection sets column projection by name. Output order follows the
-// caller-specified order. Names matching no schema column under either case mode
-// are rejected immediately. Case-dependent errors and duplicate names cause
-// NewRead() to fail; an empty list is a valid zero-column projection.
+// caller-specified order. A name that matches no schema column under any case
+// sensitivity is rejected immediately; case-dependent errors and duplicate names
+// cause NewRead() to fail. An empty list is a valid zero-column projection.
 func (rb *ReadBuilder) WithProjection(columns []string) error {
 	if rb.inner == nil {
 		return ErrClosed
@@ -64,10 +64,10 @@ func (rb *ReadBuilder) WithProjection(columns []string) error {
 // spelling, not the requested one.
 //
 // This does not affect predicates. A predicate resolves its column when it is
-// built, so its case sensitivity comes from which builder produced it —
-// Table.PredicateBuilder or Table.PredicateBuilderWithCaseSensitive — and is
-// unaffected by this setting. Call order relative to WithProjection does not
-// matter: projection names are resolved in NewRead.
+// built, so its case sensitivity comes from the builder that produced it — see
+// PredicateBuilder.WithCaseSensitive — and is unaffected by this setting. Call
+// order relative to WithProjection does not matter: projection names are resolved
+// in NewRead.
 func (rb *ReadBuilder) WithCaseSensitive(caseSensitive bool) error {
 	if rb.inner == nil {
 		return ErrClosed
@@ -196,11 +196,8 @@ var ffiReadBuilderWithProjection = newFFI(ffiOpts{
 	}
 })
 
-// Rust `bool` is a single byte whose only valid values are 0 and 1, so the
-// argument is declared as a 1-byte integer (the ffi package documents TypeUint8
-// as the way to pass a bool) and an explicit 0/1 is written into it via
-// boolByte. This is the binding's first non-pointer scalar smaller than 4 bytes,
-// so do not copy a wider type here.
+// The trailing `bool` is passed as a 1-byte integer written through boolByte; see
+// that function for why.
 var ffiReadBuilderWithCaseSensitive = newFFI(ffiOpts{
 	sym:    "paimon_read_builder_with_case_sensitive",
 	rType:  &ffi.TypePointer,
