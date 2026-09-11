@@ -816,6 +816,81 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     }
 }
 
+#[test]
+fn vindex_build_logs_read_phases() {
+    // Run the real sparse and fallback builds in a separate process so the
+    // timing environment variable and stderr capture cannot race other tests.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "table::vindex_index_build_builder::tests::vindex_incremental_build_indexes_only_new_rows",
+            "--nocapture",
+        ])
+        .env("PAIMON_LOG_VECTOR_INDEX_BUILD_TIMING", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    let events = stderr
+        .lines()
+        .filter(|line| line.starts_with("event=paimon_vector_index_build"))
+        .map(|line| {
+            line.split_whitespace()
+                .filter_map(|field| field.split_once('='))
+                .collect::<HashMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+    let plans = events
+        .iter()
+        .filter(|event| event["event"] == "paimon_vector_index_build_plan")
+        .collect::<Vec<_>>();
+    assert_eq!(plans.len(), 2, "missing build provenance: {stderr}");
+    assert_eq!(plans[0]["sparse"], "true");
+    assert_eq!(plans[1]["sparse"], "false");
+    for plan in &plans {
+        assert!(plan["snapshot_id"].parse::<i64>().unwrap() > 0);
+        assert!(plan["training_seed"].parse::<u64>().is_ok());
+        assert_eq!(plan["parquet_row_group_parallelism"], "8");
+        assert_eq!(plan["parquet_max_inflight_bytes"], "268435456");
+    }
+    let phases = events
+        .iter()
+        .filter(|event| event["event"] == "paimon_vector_index_build_read")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases
+            .iter()
+            .map(|event| event["phase"])
+            .collect::<Vec<_>>(),
+        ["probe", "sample", "full_scan", "full_scan"]
+    );
+    for phase in &phases {
+        assert_eq!(phase["io_scope"], "file_read_wrapper");
+        assert!(phase["read_bytes"].parse::<u64>().unwrap() > 0);
+        assert!(phase["read_calls"].parse::<u64>().unwrap() > 0);
+        assert!(phase["read_ms"].parse::<f64>().unwrap() >= 0.0);
+    }
+    let totals = events
+        .iter()
+        .filter(|event| event["event"] == "paimon_vector_index_build")
+        .collect::<Vec<_>>();
+    for (total, reads) in [(totals[0], &phases[1..3]), (totals[1], &phases[3..4])] {
+        for (total_key, phase_key) in [
+            ("oss_read_bytes", "read_bytes"),
+            ("oss_range_requests", "read_calls"),
+        ] {
+            assert_eq!(
+                total[total_key].parse::<u64>().unwrap(),
+                reads
+                    .iter()
+                    .map(|event| event[phase_key].parse::<u64>().unwrap())
+                    .sum::<u64>(),
+                "phase counters must exclude probe and partition the existing total"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn vindex_upload_failure_preserves_committed_index() {
     use crate::io::multipart_test::{Fault, MultipartProvider};

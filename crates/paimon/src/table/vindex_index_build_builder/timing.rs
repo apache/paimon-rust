@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::planning::VindexIndexShard;
+use crate::table::data_file_reader::DataFileReadTiming;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -25,6 +27,29 @@ pub(super) fn vector_index_build_timing_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var_os(VECTOR_INDEX_BUILD_TIMING_ENV).is_some_and(|value| value == "1")
     })
+}
+
+// Snapshot only at drained phase boundaries. These are completed FileRead
+// calls (plus reader-open time), not OSS wire requests; concurrent read_ms
+// is cumulative and must not be added to wall-clock stage durations.
+pub(super) fn log_read_phase(
+    phase: &str,
+    shard: &VindexIndexShard,
+    timing: &DataFileReadTiming,
+    previous: (Duration, u64, u64),
+) -> (Duration, u64, u64) {
+    let read = timing.file_read();
+    let (bytes, calls) = timing.file_io();
+    eprintln!(
+        "event=paimon_vector_index_build_read phase={phase} snapshot_id={} row_range_start={} row_range_end={} io_scope=file_read_wrapper read_ms={:.3} read_bytes={} read_calls={}",
+        shard.snapshot_id,
+        shard.row_range_start,
+        shard.row_range_end,
+        read.saturating_sub(previous.0).as_secs_f64() * 1000.0,
+        bytes.saturating_sub(previous.1),
+        calls.saturating_sub(previous.2),
+    );
+    (read, bytes, calls)
 }
 
 pub(super) struct VectorIndexBuildTiming {

@@ -76,15 +76,7 @@ pub(super) fn plan_ivf_training_ranges(
     if range_count > MAX_IVF_TRAINING_RANGES {
         return Ok(None);
     }
-    let mut seed = mix_seed(
-        (shard.snapshot_id as u64)
-            ^ (shard.row_range_start as u64).rotate_left(21)
-            ^ (shard.row_range_end as u64).rotate_left(42)
-            ^ (shard.source_bucket as u64).rotate_left(11),
-    );
-    for byte in &shard.partition_bytes {
-        seed = mix_seed(seed ^ u64::from(*byte));
-    }
+    let seed = ivf_training_seed(shard);
     let mut cursor = shard.row_range_start;
     let mut ranges = Vec::with_capacity(range_count);
 
@@ -103,6 +95,19 @@ pub(super) fn plan_ivf_training_ranges(
     }
 
     Ok(Some(merge_row_ranges(ranges)))
+}
+
+pub(super) fn ivf_training_seed(shard: &VindexIndexShard) -> u64 {
+    let mut seed = mix_seed(
+        (shard.snapshot_id as u64)
+            ^ (shard.row_range_start as u64).rotate_left(21)
+            ^ (shard.row_range_end as u64).rotate_left(42)
+            ^ (shard.source_bucket as u64).rotate_left(11),
+    );
+    for byte in &shard.partition_bytes {
+        seed = mix_seed(seed ^ u64::from(*byte));
+    }
+    seed
 }
 
 fn checked_add_offset(value: i64, offset: usize, name: &str) -> Result<i64> {
