@@ -53,7 +53,7 @@ pub(crate) struct DataFileReadTiming {
 }
 
 impl DataFileReadTiming {
-    fn add_file_read(&self, duration: Duration) {
+    pub(crate) fn add_file_read(&self, duration: Duration) {
         self.file_read_nanos
             .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     }
@@ -92,6 +92,13 @@ impl DataFileReadTiming {
             self.file_read_bytes.load(Ordering::Relaxed),
             self.file_read_requests.load(Ordering::Relaxed),
         )
+    }
+
+    pub(crate) fn wrap_reader(self: &Arc<Self>, inner: Box<dyn FileRead>) -> Box<dyn FileRead> {
+        Box::new(TimedFileRead {
+            inner,
+            timing: Arc::clone(self),
+        })
     }
 
     pub(crate) fn parquet_decode(&self) -> Duration {
@@ -529,10 +536,7 @@ impl DataFileReader {
                 timing.add_file_read(start.elapsed());
             }
             let file_reader: Box<dyn FileRead> = match read_timing.as_ref() {
-                Some(timing) => Box::new(TimedFileRead {
-                    inner: Box::new(file_reader),
-                    timing: Arc::clone(timing),
-                }),
+                Some(timing) => timing.wrap_reader(Box::new(file_reader)),
                 None => Box::new(file_reader),
             };
             let is_parquet = path_to_read.to_ascii_lowercase().ends_with(".parquet");

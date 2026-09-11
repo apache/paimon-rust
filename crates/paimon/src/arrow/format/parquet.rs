@@ -553,12 +553,12 @@ impl FormatFileReader for ParquetFormatReader {
         // predicate-free path and run a bounded number concurrently.
         //
         // Row-group receivers are consumed in order and buffer one batch each,
-        // preserving positional `_ROW_ID`, sort order, and batch backpressure. Reads
-        // with predicates or an explicit row selection retain the original
-        // single-stream path until their selections are split per row group.
-        let read_budget = self.read_budget.as_ref().filter(|_| {
-            preds.is_empty() && row_filter_factory.is_none() && row_selection.is_none()
-        });
+        // preserving positional `_ROW_ID`, sort order, and batch backpressure.
+        // Reads with predicates retain the original single-stream path.
+        let read_budget = self
+            .read_budget
+            .as_ref()
+            .filter(|_| preds.is_empty() && row_filter_factory.is_none());
         let row_group_parallelism = read_budget
             .map(|budget| {
                 budget
@@ -566,39 +566,53 @@ impl FormatFileReader for ParquetFormatReader {
                     .min(batch_stream_builder.metadata().num_row_groups())
             })
             .unwrap_or(1);
-        let projected_bytes = self
+        let selected_row_groups = self
             .read_budget
             .as_ref()
             .filter(|budget| row_group_parallelism > 1 || budget.diagnostics_enabled())
             .map(|budget| {
-                let mut diagnostic_selection = combined_selection;
-                let projected_bytes = batch_stream_builder
+                let mut row_group_selection = combined_selection;
+                let selected_row_groups = batch_stream_builder
                     .metadata()
                     .row_groups()
                     .iter()
-                    .filter(|row_group| {
-                        diagnostic_selection.as_mut().is_none_or(|selection| {
-                            selection
-                                .split_off(row_group.num_rows() as usize)
-                                .selects_any()
-                        })
+                    .enumerate()
+                    .filter_map(|(row_group_index, row_group)| {
+                        let selection = row_group_selection
+                            .as_mut()
+                            .map(|selection| selection.split_off(row_group.num_rows() as usize));
+                        if selection
+                            .as_ref()
+                            .is_some_and(|selection| !selection.selects_any())
+                        {
+                            return None;
+                        }
+                        Some((
+                            row_group_index,
+                            selection,
+                            projected_row_group_bytes(row_group, &mask),
+                        ))
                     })
-                    .map(|row_group| projected_row_group_bytes(row_group, &mask))
+                    .collect::<Vec<_>>();
+                let projected_bytes = selected_row_groups
+                    .iter()
+                    .map(|(_, _, projected_bytes)| *projected_bytes)
                     .collect::<Vec<_>>();
                 budget.record_projected_row_groups(&projected_bytes);
-                projected_bytes
+                selected_row_groups
             });
         if row_group_parallelism > 1 {
-            let row_group_count = batch_stream_builder.metadata().num_row_groups();
+            let selected_row_groups =
+                selected_row_groups.expect("parallel row-group reads need a selection plan");
+            let row_group_count = selected_row_groups.len();
             let reader_metadata = ArrowReaderMetadata::try_new(
                 batch_stream_builder.metadata().clone(),
                 ArrowReaderOptions::new(),
             )?;
-            let projected_bytes = projected_bytes.expect("parallel row-group reads need sizes");
             let read_budget = Arc::clone(read_budget.expect("checked above"));
             let (row_group_tx, mut row_group_rx) = mpsc::channel(row_group_parallelism);
             tokio::spawn(async move {
-                for (row_group_index, projected_bytes) in projected_bytes.into_iter().enumerate() {
+                for (row_group_index, selection, projected_bytes) in selected_row_groups {
                     let Ok(slot) = row_group_tx.reserve().await else {
                         return;
                     };
@@ -623,6 +637,7 @@ impl FormatFileReader for ParquetFormatReader {
                         row_group_mask,
                         row_group_index,
                         batch_size,
+                        selection,
                         permit,
                         batch_tx,
                     ));
@@ -726,6 +741,7 @@ async fn read_row_group(
     projection: ProjectionMask,
     row_group_index: usize,
     batch_size: Option<usize>,
+    selection: Option<RowSelection>,
     _permit: ParquetReadPermit,
     sender: mpsc::Sender<ParquetRowGroupMessage>,
 ) {
@@ -735,6 +751,9 @@ async fn read_row_group(
     )
     .with_projection(projection)
     .with_row_groups(vec![row_group_index]);
+    if let Some(selection) = selection {
+        builder = builder.with_row_selection(selection);
+    }
     if let Some(size) = batch_size {
         builder = builder.with_batch_size(size);
     }
@@ -2882,6 +2901,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sparse_row_groups_preserve_selection_order_and_budget() {
+        let data = write_multi_row_group_parquet(64, 384, EnabledStatistics::Chunk, false).await;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let file_reader = ConcurrentTrackingFileRead {
+            data: Bytes::from(data),
+            in_flight,
+            max_in_flight,
+        };
+        let file_size = file_reader.data.len() as u64;
+        let ranges = vec![
+            RowRange::new(60, 68),
+            RowRange::new(130, 135),
+            RowRange::new(258, 263),
+            RowRange::new(380, 383),
+        ];
+        let budget = Arc::new(ParquetReadBudget::new(2, 256 * 1024 * 1024).unwrap());
+        budget.enable_diagnostics();
+
+        let batches = ParquetFormatReader::with_read_budget(Arc::clone(&budget))
+            .read_batch_stream(
+                Box::new(file_reader),
+                file_size,
+                &[int_field("id")],
+                None,
+                Some(32),
+                Some(ranges.clone()),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected = ranges
+            .iter()
+            .flat_map(|range| range.from() as i32..=range.to() as i32)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        let diagnostics = budget.diagnostics();
+        assert_eq!(diagnostics.row_group_count, 5);
+        assert_eq!(diagnostics.peak_inflight, 2);
+        assert_eq!(diagnostics.current_inflight, 0);
+    }
+
+    #[tokio::test]
     async fn test_parquet_read_budget_is_shared_across_readers() {
         const ROWS: i32 = 256;
         let schema = writer_arrow_schema();
@@ -2994,7 +3073,7 @@ mod tests {
         let diagnostics = budget.diagnostics();
         assert_eq!(diagnostics.row_group_count, 1);
         assert!(diagnostics.projected_bytes_total > 0);
-        assert_eq!(diagnostics.peak_inflight, 0);
+        assert_eq!(diagnostics.peak_inflight, 1);
     }
 
     #[tokio::test]
