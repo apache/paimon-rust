@@ -40,7 +40,7 @@ Mosaic support is always available and currently read-only. SQL queries can read
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... DROP PARTITION`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
 
 Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
@@ -897,6 +897,76 @@ Multiple partition key-value pairs can be specified:
 ```sql
 ALTER TABLE paimon.my_db.events DROP PARTITION (dt = '2024-01-01', region = 'us');
 ```
+
+## Format Table Partitions
+
+A `type=format-table` table loaded from a REST Catalog can have its partitions managed
+by the catalog instead of discovered from the directory layout. The catalog registration
+is then the authoritative partition set: it decides what a scan reads, and a directory
+nobody registered is not part of the table.
+
+A table opts in with `'metastore.partitioned-table' = 'true'`. The statements below apply
+only to such a table — a partitioned internal Format Table, loaded from a REST Catalog,
+with a non-`engine` `format-table.implementation`.
+
+A partition the catalog holds at a custom location (the partition option `path`) is not
+read from that location yet: a scan that reaches it fails rather than reading the table
+directory in its place.
+
+### SHOW PARTITIONS
+
+```sql
+SHOW PARTITIONS paimon.my_db.events;
+SHOW PARTITIONS paimon.my_db.events PARTITION (dt = '2024-01-01');
+```
+
+Partition names are returned in the escaped `key=value/...` form, sorted. The optional
+`PARTITION` clause keeps only the partitions matching the given values; it may fix any
+subset of the partition keys.
+
+### ADD PARTITION
+
+```sql
+ALTER TABLE paimon.my_db.events ADD PARTITION (dt = '2024-01-01', region = 'us');
+ALTER TABLE paimon.my_db.events ADD IF NOT EXISTS PARTITION (dt = '2024-01-01')
+                                                 PARTITION (dt = '2024-01-02');
+```
+
+Every specification must fix all partition keys. A value is read with its column type the
+way Paimon reads partition strings, so `month = '01'` and `month = 01` both register the INT
+value `1`, and a BOOLEAN column accepts `t`, `true`, `y`, `yes` and `1` or their false
+counterparts. The partitions are registered with the catalog first and their directories
+are created afterwards, so a failure to create a directory leaves the registration in place
+and re-running the statement with `IF NOT EXISTS` completes it. Without `IF NOT EXISTS`, an
+already registered partition is an error. A custom `LOCATION` is not supported: the
+directory always follows the table's partition layout.
+
+### DROP PARTITION
+
+```sql
+ALTER TABLE paimon.my_db.events DROP PARTITION (dt = '2024-01-01', region = 'us');
+ALTER TABLE paimon.my_db.events DROP IF EXISTS PARTITION (dt = '2024-01-01');
+```
+
+A specification that fixes only some of the partition keys drops every registered
+partition it matches, and the fixed keys need not be a leading prefix — on a
+`(dt, region)` table, `DROP PARTITION (region = 'us')` drops the `us` partition of every
+date. A specification that fixes all keys names one partition, so a missing one is an
+error unless `IF EXISTS` is given; a partial one describes a set that is allowed to come
+out empty.
+
+One statement may carry several specifications, each `DROP PARTITION` in its own clause:
+
+```sql
+ALTER TABLE paimon.my_db.events DROP PARTITION (dt = '2024-01-01'),
+                                DROP PARTITION (dt = '2024-01-02');
+```
+
+The catalog registration is removed first, then the directory is deleted by the client —
+the catalog never deletes data. If the deletion fails the partition is already invisible
+and the directory may survive; repair the file system and remove it there rather than
+re-registering it. A partition at a custom location is only unregistered; its directory
+is left where it is.
 
 ## Procedures
 
