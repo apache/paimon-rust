@@ -63,28 +63,20 @@ impl<'a> FormatTableScan<'a> {
     }
 
     pub(crate) async fn plan(&self) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed().await?;
+        self.table
+            .ensure_read_authorized_live("a format table")
+            .await?;
         self.plan_inner(None).await
     }
 
     pub(crate) async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        self.ensure_query_auth_allowed().await?;
+        self.table
+            .ensure_read_authorized_live("a format table")
+            .await?;
         let mut trace = ScanTrace::default();
         let plan = self.plan_inner(Some(&mut trace)).await?;
         trace.planned_data_file_bytes = plan.planned_data_file_bytes();
         Ok((plan, trace))
-    }
-
-    /// Refused outright. Asks the server: the option can be set after a load.
-    async fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
-        let core_options = CoreOptions::new(self.table.schema().options());
-        core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
-        if self.table.server_query_auth_enabled().await? {
-            return Err(super::query_auth::unsupported(
-                "a format table cannot apply a row filter or column masking",
-            ));
-        }
-        Ok(())
     }
 
     async fn plan_inner(&self, trace: Option<&mut ScanTrace>) -> crate::Result<Plan> {

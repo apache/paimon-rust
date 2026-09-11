@@ -104,6 +104,7 @@ impl TableProvider for TableIndexesTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        super::ensure_scan_authorized(&self.table).await?;
         let table = self.table.clone();
         let entries =
             crate::runtime::await_with_runtime(async move { collect_index_entries(&table).await })

@@ -256,13 +256,9 @@ impl<'a> IncrementalScan<'a> {
     }
 
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
-        let core_options = crate::spec::CoreOptions::new(self.table.schema().options());
-        core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
-        if self.table.server_query_auth_enabled().await? {
-            return Err(super::query_auth::unsupported(
-                "an incremental read cannot apply a row filter or column masking",
-            ));
-        }
+        self.table
+            .ensure_read_authorized_live("an incremental read")
+            .await?;
         let mode = self.resolve_mode();
         self.validate_snapshot_range(mode).await?;
         if self.start_exclusive == self.end_inclusive {

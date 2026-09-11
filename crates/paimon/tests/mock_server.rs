@@ -1486,10 +1486,13 @@ impl RESTServer {
         });
 
         let key = format!("{database}.{table}");
+        // A `t$branch_x` registration reports an id of its own: whether a real
+        // server shares the base table's is not something the client may assume.
+        let uuid = table.to_string();
         s.tables.insert(
             key,
             GetTableResponse::new(
-                Some(table.to_string()),
+                Some(uuid),
                 Some(table.to_string()),
                 Some(path.to_string()),
                 Some(true),

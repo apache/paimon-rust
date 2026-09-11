@@ -21,7 +21,9 @@
 
 use std::collections::HashMap;
 
-use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
+use crate::catalog::{
+    Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX, DEFAULT_MAIN_BRANCH,
+};
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
 use crate::io::cache::{create_local_cache, LocalCache};
@@ -188,26 +190,42 @@ impl FileSystemCatalog {
         Ok(dirs)
     }
 
-    /// Fetch the stored path and schema of an existing table, bypassing the
-    /// engine-type guard in [`Self::build_table`]: routing and catalog servers
-    /// need the declared type before deciding anything.
     pub async fn fetch_table_schema(
         &self,
         identifier: &Identifier,
     ) -> Result<(String, TableSchema)> {
         identifier.validate()?;
+        // Every load goes through here, so a system-table suffix is refused once,
+        // before any type-specific early return could hand back the base table.
+        if let Some(system) = identifier.system_table_name()? {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "'{}' names the system table '{system}', which this catalog does not serve",
+                    identifier.full_name()
+                ),
+            });
+        }
 
-        let table_path = self.table_path(identifier);
+        // `db.t$branch_x` names the base table's branch, as Java resolves it:
+        // the path is the table's, the schema the branch's latest.
+        let base = Identifier::new(identifier.database(), &identifier.table_name()?);
+        let table_path = self.table_path(&base);
 
-        if !self.table_exists(identifier).await? {
+        if !self.table_exists(&base).await? {
             return Err(Error::TableNotExist {
                 full_name: identifier.full_name(),
             });
         }
 
-        let schema = self
-            .load_latest_table_schema(&table_path)
+        let manager = SchemaManager::new(self.file_io.clone(), table_path.clone());
+        let manager = match identifier.branch_name()? {
+            Some(branch) if branch != DEFAULT_MAIN_BRANCH => manager.with_branch(&branch),
+            _ => manager,
+        };
+        let schema = manager
+            .latest()
             .await?
+            .map(|arc| (*arc).clone())
             .ok_or_else(|| Error::TableNotExist {
                 full_name: identifier.full_name(),
             })?;
@@ -370,11 +388,13 @@ impl Catalog for FileSystemCatalog {
     }
 
     async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
+        identifier.reject_decorated()?;
         let (table_path, schema) = self.fetch_table_schema(identifier).await?;
         self.build_table(identifier, table_path, schema)
     }
 
     async fn load_table(&self, identifier: &Identifier) -> Result<crate::catalog::LoadedTable> {
+        identifier.reject_decorated()?;
         let (table_path, schema) = self.fetch_table_schema(identifier).await?;
         let options = CoreOptions::new(schema.options());
         let declared = options.table_type()?;
@@ -431,6 +451,7 @@ impl Catalog for FileSystemCatalog {
         ignore_if_exists: bool,
     ) -> Result<()> {
         identifier.validate()?;
+        identifier.reject_decorated()?;
         // Never persist a type nothing can load.
         let declared = CoreOptions::new(creation.options()).table_type()?;
 
@@ -465,6 +486,7 @@ impl Catalog for FileSystemCatalog {
 
     async fn drop_table(&self, identifier: &Identifier, ignore_if_not_exists: bool) -> Result<()> {
         identifier.validate()?;
+        identifier.reject_decorated()?;
 
         let table_path = self.table_path(identifier);
 
@@ -492,6 +514,8 @@ impl Catalog for FileSystemCatalog {
     ) -> Result<()> {
         from.validate()?;
         to.validate()?;
+        from.reject_decorated()?;
+        to.reject_decorated()?;
 
         let from_path = self.table_path(from);
         let to_path = self.table_path(to);
@@ -525,6 +549,7 @@ impl Catalog for FileSystemCatalog {
         ignore_if_not_exists: bool,
     ) -> Result<()> {
         identifier.validate()?;
+        identifier.reject_decorated()?;
 
         let table_path = self.table_path(identifier);
         if !self.table_exists(identifier).await? {
@@ -1125,6 +1150,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fetch_table_schema_resolves_a_branch_name() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let base = Identifier::new("db1", "t");
+        catalog
+            .create_table(
+                &base,
+                Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .build()
+                    .unwrap(),
+                false,
+            )
+            .await
+            .unwrap();
+        let (table_path, _) = catalog.fetch_table_schema(&base).await.unwrap();
+
+        // A branch schema on disk, with one column more than the base.
+        let branch_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("extra", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let manager =
+            SchemaManager::new(catalog.file_io.clone(), table_path.clone()).with_branch("dev");
+        let schema_path = manager.schema_path(0);
+        let schema_dir = schema_path
+            .rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap();
+        catalog.file_io.mkdirs(&schema_dir).await.unwrap();
+        catalog
+            .file_io
+            .new_output(&schema_path)
+            .unwrap()
+            .write(serde_json::to_vec(&branch_schema).unwrap().into())
+            .await
+            .unwrap();
+
+        let (path, schema) = catalog
+            .fetch_table_schema(&Identifier::new("db1", "t$branch_dev"))
+            .await
+            .expect("a branch name resolves to the base table's branch");
+        assert_eq!(path, table_path, "the path is the table's");
+        assert_eq!(schema.fields().len(), 2, "the schema is the branch's");
+
+        // `main` named explicitly resolves at the table root, not a branch dir.
+        let (main_path, main_schema) = catalog
+            .fetch_table_schema(&Identifier::new("db1", "t$branch_main"))
+            .await
+            .unwrap();
+        assert_eq!(main_path, table_path);
+        assert_eq!(
+            main_schema.fields().len(),
+            1,
+            "the base schema, not a branch's"
+        );
+
+        // Only the server's lookup resolves these; no handle is built from one.
+        for name in ["t$branch_dev", "t$branch_main", "t$files"] {
+            assert!(
+                catalog
+                    .get_table(&Identifier::new("db1", name))
+                    .await
+                    .is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_create_table_rejects_an_unknown_type() {
         let (_temp_dir, catalog) = create_test_catalog();
         catalog
@@ -1186,6 +1288,33 @@ mod tests {
             stored.options().get(crate::spec::PATH_OPTION),
             Some(&expected_path.to_string())
         );
+
+        // With a branch schema present, only `load_table`'s own refusal stops the
+        // object-table early return from handing back the base relation.
+        let branch_schema_path =
+            SchemaManager::new(catalog.file_io.clone(), expected_path.to_string())
+                .with_branch("dev")
+                .schema_path(0);
+        let branch_dir = branch_schema_path.rsplit_once('/').map(|(d, _)| d).unwrap();
+        catalog.file_io.mkdirs(branch_dir).await.unwrap();
+        catalog
+            .file_io
+            .new_output(&branch_schema_path)
+            .unwrap()
+            .write(serde_json::to_vec(&stored).unwrap().into())
+            .await
+            .unwrap();
+        // The object-table early return must not hand back the base relation
+        // for a name with a system suffix.
+        for name in ["objects$does_not_exist", "objects$branch_dev"] {
+            assert!(
+                catalog
+                    .load_table(&Identifier::new("db1", name))
+                    .await
+                    .is_err(),
+                "{name}: a decorated object-table name is refused, not silently stripped"
+            );
+        }
 
         let loaded = catalog.load_table(&identifier).await.unwrap();
         let LoadedTable::Object(table) = loaded else {

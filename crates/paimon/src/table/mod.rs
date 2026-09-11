@@ -341,13 +341,21 @@ impl Table {
     }
 
     /// The live counterpart of [`CoreOptions::ensure_read_authorized`], which
-    /// reads the schema this handle was loaded with.
-    pub(crate) async fn ensure_read_authorized_live(&self, path: &str) -> Result<()> {
-        let local = CoreOptions::new(self.schema.options());
-        local.ensure_type_paimon_served(&self.identifier.full_name())?;
+    /// reads the schema this handle was loaded with. For a read that plans
+    /// nothing — DataFusion's system tables — since the option can be set
+    /// after a load.
+    pub async fn ensure_read_authorized(&self) -> Result<()> {
+        self.ensure_read_authorized_live("a read without a plan")
+            .await
+    }
+
+    /// As [`Self::ensure_read_authorized`], naming the operation that asks.
+    pub(crate) async fn ensure_read_authorized_live(&self, operation: &str) -> Result<()> {
+        CoreOptions::new(self.schema.options())
+            .ensure_type_paimon_served(&self.identifier.full_name())?;
         if self.server_query_auth_enabled().await? {
             return Err(query_auth::unsupported(&format!(
-                "{path} reads index files directly and cannot apply a row filter or column masking"
+                "{operation} cannot apply a row filter or column masking"
             )));
         }
         Ok(())
@@ -360,34 +368,34 @@ impl Table {
         let Some(rest_env) = &self.rest_env else {
             return Ok(local);
         };
-        // Only ever strengthens: the name can be re-created over this handle's
-        // files, so the answer may be about a different table.
+        // Only ever strengthens.
         if local {
             return Ok(true);
         }
-        match rest_env.current_table().await?.schema.as_ref() {
-            Some(schema) => Ok(CoreOptions::new(schema.options()).query_auth_enabled()),
-            None => Ok(true),
-        }
+        rest_env.query_auth_enabled_live(&self.branch).await
+    }
+
+    /// Whether this handle reads a schema other than the one the server rules
+    /// on: a time-travel selector (`copy_with_options` adds one without the
+    /// flag), a travelled or branch view, or a `$branch_x` / `$files` name
+    /// whose managers read the base table's own files.
+    pub(crate) fn reads_another_schema(&self) -> Result<bool> {
+        let travels = CoreOptions::new(self.schema.options())
+            .try_time_travel_selector()?
+            .is_some();
+        let decorated = self.identifier.branch_name()?.is_some()
+            || self.identifier.system_table_name()?.is_some();
+        Ok(travels || self.time_traveled || self.branch_reference || decorated)
     }
 
     /// Whether this user may read this table; `None` when it is not
-    /// `query-auth.enabled`. `server_query_auth` is the caller's, so planning
-    /// asks the server once.
+    /// `query-auth.enabled`. `server_query_auth` is the caller's own lookup.
     pub(crate) async fn authorize_read(
         &self,
         server_query_auth: bool,
     ) -> Result<Option<std::sync::Arc<query_auth::QueryAuthGrant>>> {
         let local = CoreOptions::new(self.schema.options());
-        // Ask the selector too: `copy_with_options` adds one without the flag.
-        let travels = local.try_time_travel_selector()?.is_some();
-        // A `$branch_x` or `$files` handle authorizes against the decorated
-        // name while its managers read the base table's own files.
-        let decorated = self.identifier.branch_name()?.is_some()
-            || self.identifier.system_table_name()?.is_some();
-        if (travels || self.time_traveled || self.branch_reference || decorated)
-            && local.query_auth_enabled()
-        {
+        if self.reads_another_schema()? && local.query_auth_enabled() {
             return Err(query_auth::unsupported(
                 "a time-travelled or branch read authorizes against the table's current schema, \
                  which is not the one it reads",
@@ -409,7 +417,7 @@ impl Table {
         if !server_query_auth {
             return Ok(None);
         }
-        if travels || self.time_traveled || self.branch_reference || decorated {
+        if self.reads_another_schema()? {
             return Err(query_auth::unsupported(
                 "a time-travelled or branch read authorizes against the table's current schema, \
                  which is not the one it reads",

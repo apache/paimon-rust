@@ -207,6 +207,7 @@ impl Catalog for RESTCatalog {
     // ======================= table methods ===============================
 
     async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
+        identifier.reject_decorated()?;
         RESTEnv::load_table(
             identifier,
             self.api.clone(),
@@ -218,6 +219,9 @@ impl Catalog for RESTCatalog {
     }
 
     async fn load_table(&self, identifier: &Identifier) -> Result<crate::catalog::LoadedTable> {
+        // Before type dispatch: the object- and external-table returns never
+        // reach `build_table`'s own refusal.
+        identifier.reject_decorated()?;
         let response = RESTEnv::fetch_table_response(identifier, &self.api).await?;
         if let Some(schema) = response.schema.as_ref() {
             let options = crate::spec::CoreOptions::new(schema.options());
