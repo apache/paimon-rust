@@ -46,8 +46,9 @@ func (rb *ReadBuilder) Close() {
 }
 
 // WithProjection sets column projection by name. Output order follows the
-// caller-specified order. Unknown or duplicate names cause NewRead() to fail;
-// an empty list is a valid zero-column projection.
+// caller-specified order. Names matching no schema column under either case mode
+// are rejected immediately. Case-dependent errors and duplicate names cause
+// NewRead() to fail; an empty list is a valid zero-column projection.
 func (rb *ReadBuilder) WithProjection(columns []string) error {
 	if rb.inner == nil {
 		return ErrClosed

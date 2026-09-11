@@ -958,75 +958,70 @@ func TestReadWithCaseInsensitiveProjection(t *testing.T) {
 func TestPredicateBuilderCaseSensitivity(t *testing.T) {
 	table := openTestTable(t)
 
-	// Exact is the default, and asking for it explicitly must agree.
-	for _, exact := range []struct {
-		name string
-		pb   *paimon.PredicateBuilder
+	for _, mode := range []struct {
+		name          string
+		pb            *paimon.PredicateBuilder
+		caseSensitive bool
 	}{
-		{"default", table.PredicateBuilder()},
-		{"explicitly-exact", table.PredicateBuilderWithCaseSensitive(true)},
+		{"default", table.PredicateBuilder(), true},
+		{"case-sensitive", table.PredicateBuilderWithCaseSensitive(true), true},
+		{"case-insensitive", table.PredicateBuilderWithCaseSensitive(false), false},
 	} {
-		if _, err := exact.pb.Eq("ID", int32(1)); err == nil {
-			t.Fatalf("%s: expected Eq on an uppercase column to fail", exact.name)
-		}
-		if _, err := exact.pb.IsNotNull("NAME"); err == nil {
-			t.Fatalf("%s: expected IsNotNull on an uppercase column to fail", exact.name)
-		}
-		if _, err := exact.pb.In("ID", int32(1)); err == nil {
-			t.Fatalf("%s: expected In on an uppercase column to fail", exact.name)
-		}
-		lower, err := exact.pb.Eq("id", int32(1))
-		if err != nil {
-			t.Fatalf("%s: exact lowercase name should still work: %v", exact.name, err)
-		}
-		lower.Close()
-	}
+		t.Run(mode.name, func(t *testing.T) {
+			// Exercise every bound symbol, including all three argument shapes.
+			for _, tc := range []struct {
+				name   string
+				column string
+				build  func(string) (*paimon.Predicate, error)
+				want   []int32
+			}{
+				{"Eq", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.Eq(c, int32(2)) }, []int32{2}},
+				{"NotEq", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.NotEq(c, int32(2)) }, []int32{1, 3}},
+				{"Lt", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.Lt(c, int32(2)) }, []int32{1}},
+				{"Le", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.Le(c, int32(2)) }, []int32{1, 2}},
+				{"Gt", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.Gt(c, int32(2)) }, []int32{3}},
+				{"Ge", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.Ge(c, int32(2)) }, []int32{2, 3}},
+				{"IsNull", "name", mode.pb.IsNull, nil},
+				{"IsNotNull", "name", mode.pb.IsNotNull, []int32{1, 2, 3}},
+				{"In", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.In(c, int32(1), int32(3)) }, []int32{1, 3}},
+				{"NotIn", "id", func(c string) (*paimon.Predicate, error) { return mode.pb.NotIn(c, int32(1), int32(3)) }, []int32{2}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					for _, column := range []string{tc.column, strings.ToUpper(tc.column)} {
+						t.Run(column, func(t *testing.T) {
+							pred, err := tc.build(column)
+							if mode.caseSensitive && column != tc.column {
+								if err == nil {
+									pred.Close()
+									t.Fatal("expected an uppercase column to fail")
+								}
+								return
+							}
+							if err != nil {
+								t.Fatalf("Failed to create predicate: %v", err)
+							}
+							defer pred.Close()
 
-	// All three constructor shapes have their own C entry point, so each needs
-	// its own case: (column, datum), (column) and (column, datums, len).
-	folded := table.PredicateBuilderWithCaseSensitive(false)
-	notNull, err := folded.IsNotNull("NAME")
-	if err != nil {
-		t.Fatalf("folded IsNotNull failed: %v", err)
-	}
-	notNull.Close()
-
-	eq, err := folded.Eq("ID", int32(2))
-	if err != nil {
-		t.Fatalf("folded Eq failed: %v", err)
-	}
-	rbEq, err := table.NewReadBuilder()
-	if err != nil {
-		t.Fatalf("Failed to create read builder: %v", err)
-	}
-	defer rbEq.Close()
-	if err := rbEq.WithFilter(eq); err != nil {
-		t.Fatalf("WithFilter failed: %v", err)
-	}
-	rows := readRows(t, rbEq)
-	if len(rows) != 1 || rows[0].id != 2 {
-		t.Fatalf("folded Eq should select id=2, got %v", rows)
-	}
-
-	in, err := folded.In("ID", int32(1), int32(3))
-	if err != nil {
-		t.Fatalf("folded In failed: %v", err)
-	}
-	rbIn, err := table.NewReadBuilder()
-	if err != nil {
-		t.Fatalf("Failed to create read builder: %v", err)
-	}
-	defer rbIn.Close()
-	if err := rbIn.WithFilter(in); err != nil {
-		t.Fatalf("WithFilter failed: %v", err)
-	}
-	rows = readRows(t, rbIn)
-	if len(rows) != 2 {
-		t.Fatalf("folded In should select two rows, got %v", rows)
-	}
-	for _, r := range rows {
-		if r.id != 1 && r.id != 3 {
-			t.Fatalf("folded In returned an unexpected row: %v", rows)
-		}
+							rb, err := table.NewReadBuilder()
+							if err != nil {
+								t.Fatalf("Failed to create read builder: %v", err)
+							}
+							defer rb.Close()
+							if err := rb.WithFilter(pred); err != nil {
+								t.Fatalf("WithFilter failed: %v", err)
+							}
+							var ids []int32
+							for _, r := range readRows(t, rb) {
+								ids = append(ids, r.id)
+							}
+							sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+							if !reflect.DeepEqual(ids, tc.want) {
+								t.Fatalf("Expected IDs %v, got %v", tc.want, ids)
+							}
+						})
+					}
+				})
+			}
+		})
 	}
 }
