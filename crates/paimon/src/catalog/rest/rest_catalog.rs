@@ -455,6 +455,36 @@ impl Catalog for RESTCatalog {
         Ok(())
     }
 
+    async fn drop_partitions(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<()> {
+        if partition_specs.is_empty() {
+            return Ok(());
+        }
+        // The endpoint only unregisters metadata. For a Format Table whose catalog owns the
+        // partitions that is the whole drop, and the caller deletes the directories; any other
+        // table would keep its data while the call reported success.
+        let table = self.get_table(identifier).await?;
+        if !table.has_catalog_managed_partitions() {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "Dropping partitions through the REST catalog is supported only for Format \
+                     Tables with catalog-managed partitions, and {} is not one",
+                    identifier.full_name()
+                ),
+            });
+        }
+        for batch in partition_specs.chunks(PARTITION_BATCH_SIZE) {
+            self.api
+                .drop_partitions(identifier, batch.to_vec(), true)
+                .await
+                .map_err(|error| map_rest_error_for_partition_request(error, identifier))?;
+        }
+        Ok(())
+    }
+
     async fn list_partitions_by_names(
         &self,
         identifier: &Identifier,
@@ -656,6 +686,13 @@ fn map_rest_error_for_create_partitions(err: Error, identifier: &Identifier) -> 
             ),
             source: None,
         },
+        other => map_rest_error_for_partition_request(other, identifier),
+    }
+}
+
+/// Map a REST API error from a partition request other than a create conflict.
+fn map_rest_error_for_partition_request(err: Error, identifier: &Identifier) -> Error {
+    match err {
         Error::RestApi {
             source: RestError::BadRequest { message },
         } => Error::DataInvalid {

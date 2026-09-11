@@ -118,6 +118,9 @@ pub use commit_message::CommitMessage;
 pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
+pub use format_partition::{
+    format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
+};
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;

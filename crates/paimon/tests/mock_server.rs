@@ -1435,6 +1435,26 @@ impl RESTServer {
         inner.partition_list_call_counts.remove(&key);
     }
 
+    /// Return the partition specs registered for a table, in registration order.
+    pub fn table_partition_specs(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Vec<HashMap<String, String>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .partitions
+            .get(&format!("{database}.{table}"))
+            .map(|partitions| {
+                partitions
+                    .iter()
+                    .map(|partition| partition.spec.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Set whether a stored table is external.
     pub fn set_table_external(&self, database: &str, table: &str, is_external: bool) {
         let key = format!("{database}.{table}");
