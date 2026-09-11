@@ -2438,6 +2438,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_file_index_narrowing_integer_schema_changes_preserve_query_results() {
+        use std::collections::HashMap;
+
+        use apache_avro::types::Value;
+        use arrow_array::Int8Array;
+
+        use crate::catalog::Identifier;
+        use crate::spec::TinyIntType;
+        use crate::table::{Table, TableRead};
+
+        let old_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let current_schema = old_schema
+            .apply_changes(vec![SchemaChange::update_column_type(
+                "value".to_string(),
+                DataType::TinyInt(TinyIntType::new()),
+            )])
+            .unwrap();
+        let avro_schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"row","fields":[{"name":"value","type":["null","int"]}]}"#,
+        )
+        .unwrap();
+        for (case, values, expected_values) in [
+            ("overflow_only", vec![Some(383)], vec![None]),
+            (
+                "mixed",
+                vec![Some(127), Some(383), None],
+                vec![Some(127), None, None],
+            ),
+        ] {
+            let mut avro_writer = apache_avro::Writer::new(&avro_schema, Vec::new());
+            let mut index_writer = FileIndexerFactory::create_writer(
+                BITMAP_INDEX,
+                old_schema.fields()[0].data_type().clone(),
+                &Options::new(),
+            )
+            .unwrap();
+            for value in &values {
+                let (tag, avro_value) = match value {
+                    Some(value) => (1, Value::Int(*value)),
+                    None => (0, Value::Null),
+                };
+                avro_writer
+                    .append(Value::Record(vec![(
+                        "value".to_string(),
+                        Value::Union(tag, Box::new(avro_value)),
+                    )]))
+                    .unwrap();
+                index_writer.write(value.map(Datum::Int).as_ref()).unwrap();
+            }
+            let data = Bytes::from(avro_writer.into_inner().unwrap());
+            let indexes = HashMap::from([(
+                "value".to_string(),
+                HashMap::from([(
+                    BITMAP_INDEX.to_string(),
+                    Some(index_writer.serialized_bytes().unwrap()),
+                )]),
+            )]);
+            let index = write_column_indexes(&format!("memory:/narrowing_{case}_index"), indexes)
+                .await
+                .unwrap()
+                .to_input_file()
+                .read()
+                .await
+                .unwrap();
+
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let table_path = format!("memory:/file_index_narrowing_{case}");
+            let bucket_path = format!("{table_path}/bucket-0");
+            let file_name = "part-0.avro";
+            file_io
+                .new_output(&format!("{bucket_path}/{file_name}"))
+                .unwrap()
+                .write(data.clone())
+                .await
+                .unwrap();
+            let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+            let schema_path = schema_manager.schema_path(old_schema.id());
+            file_io
+                .mkdirs(schema_path.rsplit_once('/').unwrap().0)
+                .await
+                .unwrap();
+            file_io
+                .new_output(&schema_path)
+                .unwrap()
+                .write(Bytes::from(serde_json::to_vec(&old_schema).unwrap()))
+                .await
+                .unwrap();
+            let mut file = data_file(
+                file_name,
+                data.len() as i64,
+                values.len() as i64,
+                old_schema.id(),
+            );
+            file.embedded_index = Some(index.to_vec());
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(crate::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path)
+                .with_total_buckets(1)
+                .with_data_files(vec![file])
+                .build()
+                .unwrap();
+            let table = Table::new(
+                file_io,
+                Identifier::new("default", "narrowing"),
+                table_path,
+                current_schema.clone(),
+                None,
+            );
+            let builder = PredicateBuilder::new(current_schema.fields());
+            for (query, predicate, expected) in [
+                ("all", Predicate::AlwaysTrue, expected_values.clone()),
+                (
+                    "IS NULL",
+                    builder.is_null("value").unwrap(),
+                    expected_values
+                        .iter()
+                        .copied()
+                        .filter(Option::is_none)
+                        .collect(),
+                ),
+                (
+                    "IS NOT NULL",
+                    builder.is_not_null("value").unwrap(),
+                    expected_values
+                        .iter()
+                        .copied()
+                        .filter(Option::is_some)
+                        .collect(),
+                ),
+                (
+                    "= 127",
+                    builder.equal("value", Datum::TinyInt(127)).unwrap(),
+                    expected_values
+                        .iter()
+                        .copied()
+                        .filter(|value| *value == Some(127))
+                        .collect(),
+                ),
+            ] {
+                for enabled in [false, true] {
+                    let table = table.copy_with_options(HashMap::from([(
+                        "file-index.read.enabled".to_string(),
+                        enabled.to_string(),
+                    )]));
+                    let batches = TableRead::new(
+                        &table,
+                        current_schema.fields().to_vec(),
+                        vec![predicate.clone()],
+                    )
+                    .to_arrow(std::slice::from_ref(&split))
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                    let actual = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int8Array>()
+                                .unwrap()
+                                .iter()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, expected,
+                        "case={case}, query={query}, enabled={enabled}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_file_index_nested_not_with_added_column_falls_back() {
         let old_schema = TableSchema::new(
             0,
