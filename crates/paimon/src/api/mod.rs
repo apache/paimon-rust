@@ -32,7 +32,9 @@ mod api_response;
 // Re-export request types
 pub use api_request::{
     AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
-    CreateFunctionRequest, CreateTableRequest, CreateViewRequest, RenameTableRequest,
+    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateViewRequest,
+    DropPartitionsRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
+    RenameTableRequest,
 };
 
 // Re-export response types

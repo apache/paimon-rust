@@ -31,8 +31,8 @@ use paimon::api::ConfigResponse;
 use paimon::catalog::{Catalog, Function, FunctionDefinition, Identifier, RESTCatalog, ViewSchema};
 use paimon::common::Options;
 use paimon::spec::{
-    BigIntType, BlobType, BlobViewStruct, DataField, DataType, Datum, IntType, PredicateBuilder,
-    Schema, SchemaChange, VarCharType,
+    BigIntType, BlobType, BlobViewStruct, DataField, DataType, Datum, IntType, PartitionStatistics,
+    PredicateBuilder, Schema, SchemaChange, VarCharType,
 };
 use paimon::{CatalogOptions, FileSystemCatalog, Table};
 
@@ -165,6 +165,323 @@ fn collect_blob_rows(batches: &[RecordBatch]) -> Vec<(i32, String, Option<Vec<u8
     }
     rows.sort_by_key(|(id, _, _)| *id);
     rows
+}
+
+// ==================== Partition Tests ====================
+
+#[tokio::test]
+async fn test_rest_catalog_skips_empty_and_batches_idempotent_create_partitions() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server.add_table("default", "managed_table");
+    let partition_specs = (0..1001)
+        .map(|value| HashMap::from([("dt".to_string(), value.to_string())]))
+        .collect::<Vec<_>>();
+
+    ctx.catalog
+        .create_partitions(&identifier, Vec::new(), false)
+        .await
+        .unwrap();
+    ctx.catalog
+        .create_partitions(&identifier, partition_specs.clone(), true)
+        .await
+        .unwrap();
+
+    let calls = ctx.server.create_partitions_calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].2.partition_specs, partition_specs[..1000]);
+    assert_eq!(calls[1].2.partition_specs, partition_specs[1000..]);
+    assert!(calls.iter().all(|(_, _, request)| request.ignore_if_exists));
+}
+
+#[tokio::test]
+async fn test_rest_catalog_keeps_non_idempotent_create_in_one_request() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server.add_table("default", "managed_table");
+    let partition_specs = (0..2500)
+        .map(|value| HashMap::from([("dt".to_string(), value.to_string())]))
+        .collect::<Vec<_>>();
+
+    ctx.catalog
+        .create_partitions(&identifier, partition_specs.clone(), false)
+        .await
+        .unwrap();
+
+    let calls = ctx.server.create_partitions_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2.partition_specs, partition_specs);
+    assert!(!calls[0].2.ignore_if_exists);
+}
+
+#[tokio::test]
+async fn test_rest_catalog_sends_partition_statistics_with_their_batch() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server.add_table("default", "managed_table");
+    let specs = (0..1001)
+        .map(|value| HashMap::from([("dt".to_string(), value.to_string())]))
+        .collect::<Vec<_>>();
+    let statistic = |spec: &HashMap<String, String>| PartitionStatistics {
+        spec: spec.clone(),
+        record_count: 1,
+        file_size_in_bytes: 2,
+        file_count: 3,
+        last_file_creation_time: 4,
+        total_buckets: -1,
+    };
+
+    // Reported for the last partition and the first, in that order.
+    ctx.catalog
+        .create_partitions_with_statistics(
+            &identifier,
+            specs.clone(),
+            true,
+            Some(vec![statistic(&specs[1000]), statistic(&specs[0])]),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let calls = ctx.server.create_partitions_calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0].2.partition_statistics,
+        Some(vec![statistic(&specs[0])])
+    );
+    assert_eq!(
+        calls[1].2.partition_statistics,
+        Some(vec![statistic(&specs[1000])])
+    );
+    assert!(calls
+        .iter()
+        .all(|(_, _, request)| request.replace_statistics == Some(true)));
+
+    // A report the catalog could not place is refused before anything is sent.
+    let unknown = HashMap::from([("dt".to_string(), "x".to_string())]);
+    for statistics in [
+        vec![statistic(&unknown)],
+        vec![statistic(&specs[0]), statistic(&specs[0])],
+    ] {
+        let error = ctx
+            .catalog
+            .create_partitions_with_statistics(
+                &identifier,
+                specs.clone(),
+                true,
+                Some(statistics),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, paimon::Error::DataInvalid { .. }),
+            "{error}"
+        );
+    }
+    assert_eq!(ctx.server.create_partitions_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn test_rest_catalog_refuses_a_partition_registered_twice_with_statistics() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server.add_table("default", "managed_table");
+    // The first and the last spec name the same partition, so they land in different batches.
+    let mut specs = (0..1000)
+        .map(|value| HashMap::from([("dt".to_string(), value.to_string())]))
+        .collect::<Vec<_>>();
+    specs.push(specs[0].clone());
+    let additive = PartitionStatistics {
+        spec: specs[0].clone(),
+        record_count: 7,
+        file_size_in_bytes: 70,
+        file_count: 1,
+        last_file_creation_time: 4,
+        total_buckets: -1,
+    };
+
+    // Both batches would carry the one report, and an additive catalog would apply it twice.
+    let error = ctx
+        .catalog
+        .create_partitions_with_statistics(
+            &identifier,
+            specs.clone(),
+            true,
+            Some(vec![additive]),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::DataInvalid { message, .. } if message.contains("registered twice")),
+        "{error}"
+    );
+    assert!(ctx.server.create_partitions_calls().is_empty());
+
+    // Without statistics a repeated spec carries nothing that could be counted twice.
+    ctx.catalog
+        .create_partitions(&identifier, specs, true)
+        .await
+        .unwrap();
+    assert_eq!(ctx.server.create_partitions_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn test_rest_catalog_maps_create_partition_conflict() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server
+        .set_create_partitions_error_status(Some(StatusCode::CONFLICT));
+
+    let error = ctx
+        .catalog
+        .create_partitions(
+            &identifier,
+            vec![HashMap::from([(
+                "dt".to_string(),
+                "2026-07-22".to_string(),
+            )])],
+            false,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        paimon::Error::DataInvalid { message, .. }
+            if message.contains("default.managed_table")
+                && message.contains("already exist")
+    ));
+}
+
+#[tokio::test]
+async fn test_rest_catalog_maps_invalid_partition_request() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server
+        .set_create_partitions_error_status(Some(StatusCode::BAD_REQUEST));
+
+    let error = ctx
+        .catalog
+        .create_partitions(
+            &identifier,
+            vec![HashMap::from([(
+                "unknown".to_string(),
+                "value".to_string(),
+            )])],
+            false,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        paimon::Error::DataInvalid { message, .. }
+            if message.contains("default.managed_table")
+    ));
+}
+
+#[tokio::test]
+async fn test_rest_catalog_create_partitions_maps_missing_table() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "missing");
+
+    let error = ctx
+        .catalog
+        .create_partitions(
+            &identifier,
+            vec![HashMap::from([(
+                "dt".to_string(),
+                "2026-07-22".to_string(),
+            )])],
+            false,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        paimon::Error::TableNotExist { full_name } if full_name == "default.missing"
+    ));
+}
+
+#[tokio::test]
+async fn test_rest_catalog_looks_up_partitions_by_names_in_batches() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server.add_table("default", "managed_table");
+    let spec = |value: usize| HashMap::from([("dt".to_string(), value.to_string())]);
+    let registered = (0..2500).step_by(2).map(spec).collect::<Vec<_>>();
+    ctx.server
+        .set_table_partitions("default", "managed_table", registered.clone());
+    let requested = (0..2500).map(spec).collect::<Vec<_>>();
+
+    assert!(ctx
+        .catalog
+        .list_partitions_by_names(&identifier, Vec::new())
+        .await
+        .unwrap()
+        .is_empty());
+    let found = ctx
+        .catalog
+        .list_partitions_by_names(&identifier, requested.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        found
+            .into_iter()
+            .map(|partition| partition.spec)
+            .collect::<Vec<_>>(),
+        registered
+    );
+    let calls = ctx
+        .server
+        .table_partition_list_by_names_calls("default", "managed_table");
+    assert_eq!(
+        calls.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![1000, 1000, 500]
+    );
+    assert_eq!(calls.concat(), requested);
+}
+
+#[tokio::test]
+async fn test_rest_catalog_looks_up_partitions_by_names_through_the_listing_when_unsupported() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server.add_table("default", "managed_table");
+    let registered = HashMap::from([("dt".to_string(), "2026-07-22".to_string())]);
+    let missing = HashMap::from([("dt".to_string(), "2026-07-23".to_string())]);
+    ctx.server
+        .set_table_partitions("default", "managed_table", vec![registered.clone()]);
+    ctx.server
+        .set_list_partitions_by_names_error_status(Some(StatusCode::NOT_IMPLEMENTED));
+
+    let found = ctx
+        .catalog
+        .list_partitions_by_names(&identifier, vec![registered.clone(), missing])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        found
+            .into_iter()
+            .map(|partition| partition.spec)
+            .collect::<Vec<_>>(),
+        vec![registered]
+    );
+    assert_eq!(
+        ctx.server
+            .table_partition_list_by_names_calls("default", "managed_table")
+            .len(),
+        1
+    );
+    assert_eq!(
+        ctx.server
+            .table_partition_list_name_patterns("default", "managed_table"),
+        vec![None]
+    );
 }
 
 // ==================== Database Tests ====================

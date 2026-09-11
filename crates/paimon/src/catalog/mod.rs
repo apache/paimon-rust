@@ -560,6 +560,73 @@ pub trait Catalog: Send + Sync {
         })
     }
 
+    // ======================= partition methods ===============================
+
+    /// Register table partition specs in the catalog.
+    ///
+    /// When `ignore_if_exists` is false, implementations must reject the
+    /// entire request if any supplied spec already exists. When true, existing
+    /// specs are ignored so callers can safely retry the request.
+    async fn create_partitions(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        self.create_partitions_with_statistics(
+            identifier,
+            partition_specs,
+            ignore_if_exists,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Register partition specs and report statistics for them in the same call, so a partition
+    /// is never registered by a request whose statistics failed on their own.
+    ///
+    /// Statistics are matched to `partition_specs` by spec and may cover only some of them.
+    /// `replace_statistics` says whether they replace what the catalog holds or add to it. A field
+    /// reported as [`Partition::UNKNOWN`] says nothing about itself and leaves the stored value as
+    /// it was. Reporting never unregisters a partition.
+    ///
+    /// This is the method implementations provide, so that one forwarding only
+    /// [`Self::create_partitions`] cannot drop every report without anyone noticing.
+    async fn create_partitions_with_statistics(
+        &self,
+        _identifier: &Identifier,
+        _partition_specs: Vec<HashMap<String, String>>,
+        _ignore_if_exists: bool,
+        _statistics: Option<Vec<crate::spec::PartitionStatistics>>,
+        _replace_statistics: bool,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support creating partitions".to_string(),
+        })
+    }
+
+    /// Return those of the given complete partition specs that are registered.
+    ///
+    /// Specs are compared with the registered values as they are, without normalizing them.
+    /// The default impl filters [`Self::list_partitions`]; catalogs that can look partitions up
+    /// by name (e.g. `RESTCatalog`) override it so a few specs never cost a full listing.
+    async fn list_partitions_by_names(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<Vec<Partition>> {
+        if partition_specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .list_partitions(identifier)
+            .await?
+            .into_iter()
+            .filter(|partition| partition_specs.contains(&partition.spec))
+            .collect())
+    }
+
     /// List partitions for a table.
     ///
     /// Default impl scans the table's manifest entries via
