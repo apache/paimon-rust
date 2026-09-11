@@ -53,7 +53,7 @@ fn branches_schema() -> SchemaRef {
 }
 
 #[derive(Debug)]
-struct BranchesTable {
+pub(super) struct BranchesTable {
     table: Table,
 }
 

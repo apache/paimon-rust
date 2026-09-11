@@ -59,7 +59,7 @@ fn schemas_schema() -> SchemaRef {
 }
 
 #[derive(Debug)]
-struct SchemasTable {
+pub(super) struct SchemasTable {
     table: Table,
 }
 

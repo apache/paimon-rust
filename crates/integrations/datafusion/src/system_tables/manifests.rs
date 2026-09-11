@@ -61,7 +61,7 @@ fn manifests_schema() -> SchemaRef {
 }
 
 #[derive(Debug)]
-struct ManifestsTable {
+pub(super) struct ManifestsTable {
     table: Table,
 }
 
