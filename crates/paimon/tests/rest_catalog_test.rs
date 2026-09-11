@@ -1004,6 +1004,9 @@ async fn test_rest_catalog_validates_dynamic_managed_partition_options() {
         ("metastore.partitioned-table", "false"),
         ("format-table.partition-path-only-value", "true"),
         ("format-table.implementation", "engine"),
+        ("type", "table"),
+        ("path", "memory:/elsewhere"),
+        ("file.format", "orc"),
     ] {
         let error = table
             .copy_with_time_travel(HashMap::from([(key.to_string(), value.to_string())]))
@@ -1029,7 +1032,10 @@ async fn test_rest_catalog_validates_dynamic_managed_partition_options() {
                 "format-table.implementation".to_string(),
                 "PAIMON".to_string(),
             ),
-            ("type".to_string(), "table".to_string()),
+            (
+                "format-table.scan.list-parallelism".to_string(),
+                "8".to_string(),
+            ),
         ]))
         .await
         .unwrap();
@@ -1071,44 +1077,6 @@ async fn test_rest_catalog_rejects_enabling_managed_partitions_in_dynamic_option
             && error.to_string().contains("metastore.partitioned-table"),
         "expected partition source validation error, got: {error}"
     );
-}
-
-#[tokio::test]
-async fn test_rest_catalog_rejects_invalid_catalog_managed_partition_options() {
-    let ctx = setup_catalog(vec!["default"]).await;
-    for (table, option, bad_value) in [
-        (
-            "invalid_partition_source",
-            "metastore.partitioned-table",
-            "tru",
-        ),
-        (
-            "invalid_format_implementation",
-            "format-table.implementation",
-            "unknown",
-        ),
-        (
-            "invalid_partition_layout",
-            "format-table.partition-path-only-value",
-            "tru",
-        ),
-    ] {
-        let schema = format_table_schema(&[(option, bad_value)]);
-        add_internal_table_with_schema(&ctx.server, table, schema, &format!("memory:/{table}"));
-
-        let error = ctx
-            .catalog
-            .get_table(&Identifier::new("default", table))
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(error, paimon::Error::ConfigInvalid { .. })
-                && error.to_string().contains(option)
-                && error.to_string().contains(bad_value),
-            "expected {option}={bad_value} validation error, got: {error}"
-        );
-    }
 }
 
 #[tokio::test]

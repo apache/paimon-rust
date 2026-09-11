@@ -22,14 +22,13 @@ use std::collections::{HashMap, HashSet};
 use super::format_partition::{
     format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
 };
-use super::rest_env::LoadedFormatTablePartitionOptions;
 use super::{Plan, RESTEnv, ScanTrace, Table};
 use crate::api::RestError;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    escape_path_name, extract_datum, unescape_path_name, BinaryRow, BinaryRowBuilder, CoreOptions,
-    DataField, DataFileMeta, DataType, Datum, Partition, PartitionComputer, Predicate,
-    PredicateOperator, PATH_OPTION,
+    escape_path_name, extract_datum, BinaryRow, BinaryRowBuilder, CoreOptions, DataField,
+    DataFileMeta, DataType, Datum, Partition, PartitionComputer, Predicate, PredicateOperator,
+    PATH_OPTION,
 };
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::source::{DataSplitBuilder, RowRange};
@@ -87,20 +86,10 @@ impl<'a> FormatTableScan<'a> {
             });
         }
         let core_options = CoreOptions::new(self.table.schema().options());
-        // A table with catalog-managed partitions reads from the file format and table path the
-        // catalog returned when it was loaded, which dynamic options do not change.
-        let managed_options = self
-            .table
-            .rest_env()
-            .and_then(RESTEnv::catalog_managed_partition_options);
-        let file_format = managed_options
-            .map(|options| options.file_format.clone())
-            .unwrap_or_else(|| core_options.file_format());
-        let format_extension = supported_format_table_extension(&file_format)?;
+        let format_extension = supported_format_table_extension(&core_options.file_format())?;
         let schema_id = self.table.schema().id();
-        let table_path = managed_options
-            .map(|options| options.table_path.as_str())
-            .or_else(|| core_options.path())
+        let table_path = core_options
+            .path()
             .unwrap_or_else(|| self.table.location())
             .trim_end_matches('/')
             .to_string();
@@ -179,18 +168,14 @@ impl<'a> FormatTableScan<'a> {
                 partition: BinaryRow::new(0),
             }]);
         }
-        if let Some(rest_env) = self.table.rest_env() {
-            if let Some(managed_options) = rest_env.catalog_managed_partition_options() {
-                return self
-                    .catalog_managed_scan_roots(
-                        rest_env,
-                        table_path,
-                        partition_keys,
-                        &partition_fields,
-                        managed_options,
-                    )
-                    .await;
-            }
+        if let Some(rest_env) = self
+            .table
+            .rest_env()
+            .filter(|_| self.table.has_catalog_managed_partitions())
+        {
+            return self
+                .catalog_managed_scan_roots(rest_env, table_path, partition_keys, &partition_fields)
+                .await;
         }
 
         let Some(PartitionFilter::PartitionSet { partitions, .. }) = &self.partition_filter else {
@@ -254,13 +239,12 @@ impl<'a> FormatTableScan<'a> {
         table_path: &str,
         partition_keys: &[String],
         partition_fields: &[DataField],
-        managed_options: &LoadedFormatTablePartitionOptions,
     ) -> crate::Result<Vec<ScanRoot>> {
+        let core_options = CoreOptions::new(self.table.schema().options());
         let partition_paths = FormatTablePartitionPaths::new(
             partition_keys.iter().cloned(),
-            managed_options.only_value_in_path,
+            core_options.format_table_partition_only_value_in_path(),
         );
-        let core_options = CoreOptions::new(self.table.schema().options());
         let default_partition_name = core_options.partition_default_name();
         // Ask the catalog only for the partitions the filter can reach. Downloading every
         // registration of a table with many partitions is what dominates planning time,
@@ -844,6 +828,36 @@ fn partition_segment_value(segment: &str, key: &str) -> Option<String> {
         unescape_path_name(segment_value)
     } else {
         None
+    }
+}
+
+fn unescape_path_name(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_value(bytes[i + 1])?;
+            let lo = hex_value(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 

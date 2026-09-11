@@ -340,16 +340,16 @@ impl Table {
     }
 
     pub(crate) fn is_format_table(&self) -> bool {
-        self.has_catalog_managed_partitions()
-            || CoreOptions::new(self.schema.options()).is_format_table()
+        CoreOptions::new(self.schema.options()).is_format_table()
     }
 
-    /// Whether this table uses catalog-managed Format Table partitions.
+    /// Whether this table uses catalog-managed Format Table partitions: a Format Table loaded
+    /// from a REST catalog with `metastore.partitioned-table=true`.
     pub fn has_catalog_managed_partitions(&self) -> bool {
-        self.rest_env
-            .as_ref()
-            .and_then(RESTEnv::catalog_managed_partition_options)
-            .is_some()
+        let options = CoreOptions::new(self.schema.options());
+        self.rest_env.is_some()
+            && options.is_format_table()
+            && options.partitioned_table_in_metastore()
     }
 
     /// Create a read builder for scan/read.
@@ -422,9 +422,6 @@ impl Table {
     /// `FileStoreTable.copyWithoutTimeTravel`. Use
     /// [`Table::copy_with_time_travel`] when the options may select a
     /// historical snapshot whose schema should be used for reading.
-    ///
-    /// Catalog-managed Format Table scans keep the partition source, table
-    /// path, file format, and path layout loaded from REST metadata.
     pub fn copy_with_options(&self, extra: HashMap<String, String>) -> Self {
         // Changing the time-travel selector invalidates the resolved snapshot
         // (a time-travelled schema then has no matching snapshot anymore, and
@@ -526,6 +523,60 @@ impl Table {
         self.copy_with_time_travel_mode(extra, true).await
     }
 
+    /// Refuse dynamic options that would change where a Format Table loaded from a REST catalog
+    /// takes its partitions from, or, when the catalog manages them, how they are read.
+    ///
+    /// Mirrors Java `FormatTable.copy`. Java also fixes a Format Table's type, location and
+    /// format when the table is loaded; this table reads them from its options, so changing
+    /// them is refused here too.
+    fn ensure_format_table_partition_options_unchanged(
+        &self,
+        extra: &HashMap<String, String>,
+    ) -> Result<()> {
+        let current = CoreOptions::new(self.schema.options());
+        if self.rest_env.is_none() || !current.is_format_table() {
+            return Ok(());
+        }
+        let mut merged_options = self.schema.options().clone();
+        merged_options.extend(
+            extra
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        let merged = CoreOptions::new(&merged_options);
+        let managed = current.partitioned_table_in_metastore();
+        let changed = if merged.partitioned_table_in_metastore() != managed {
+            Some("metastore.partitioned-table")
+        } else if !managed {
+            None
+        } else if !merged.is_format_table() {
+            Some("type")
+        } else if merged.format_table_partition_only_value_in_path()
+            != current.format_table_partition_only_value_in_path()
+        {
+            Some("format-table.partition-path-only-value")
+        } else if merged.format_table_implementation_is_engine() {
+            Some("format-table.implementation")
+        } else if merged.path() != current.path() {
+            Some("path")
+        } else if merged.file_format() != current.file_format() {
+            Some("file.format")
+        } else {
+            None
+        };
+        match changed {
+            Some(key) => Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Dynamic option '{key}' cannot change where Format Table {} takes its \
+                     partitions from, or how it reads them",
+                    self.identifier.full_name()
+                ),
+                source: None,
+            }),
+            None => Ok(()),
+        }
+    }
+
     async fn copy_with_time_travel_mode(
         &self,
         extra: HashMap<String, String>,
@@ -534,9 +585,7 @@ impl Table {
         // Resolution reads Paimon snapshot paths, so refuse before any IO.
         CoreOptions::new(self.schema.options())
             .ensure_type_paimon_served(&self.identifier.full_name())?;
-        if let Some(rest_env) = &self.rest_env {
-            rest_env.validate_dynamic_format_table_partition_options(&extra)?;
-        }
+        self.ensure_format_table_partition_options_unchanged(&extra)?;
         let mut table = self.copy_with_options(extra);
         // Reject unimplemented scan options on the merged view before any IO, so
         // both table-level and per-read options are covered.

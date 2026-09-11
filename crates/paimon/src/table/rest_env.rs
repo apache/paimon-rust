@@ -17,9 +17,6 @@
 
 //! REST environment for REST-backed table operations.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::catalog::{Identifier, RESTTokenFileIO};
@@ -27,24 +24,14 @@ use crate::common::Options;
 use crate::error::Error;
 use crate::io::cache::LocalCache;
 use crate::io::FileIO;
-use crate::spec::{
-    CoreOptions, FormatTableImplementation, TableSchema, FORMAT_TABLE_IMPLEMENTATION_OPTION,
-    FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION, METASTORE_PARTITIONED_TABLE_OPTION, PATH_OPTION,
-};
+use crate::spec::{CoreOptions, TableSchema, PATH_OPTION};
 use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
 use crate::table::{ObjectTable, Table};
 use crate::Result;
+use std::sync::Arc;
 
-/// The Format Table partition settings the REST catalog returned when the table was loaded.
-#[derive(Clone, Debug)]
-pub(crate) struct LoadedFormatTablePartitionOptions {
-    pub(crate) table_path: String,
-    pub(crate) file_format: String,
-    pub(crate) only_value_in_path: bool,
-    partitioned_table_in_metastore: bool,
-}
-
-/// REST-backed table context used by snapshot commits and catalog-managed Format Table scans.
+/// REST environment that holds the REST API client, identifier, and uuid
+/// needed to create a `RESTSnapshotCommit`.
 #[derive(Clone)]
 pub struct RESTEnv {
     identifier: Identifier,
@@ -53,7 +40,6 @@ pub struct RESTEnv {
     options: Options,
     data_token_enabled: bool,
     local_cache: Option<Arc<LocalCache>>,
-    loaded_format_table_partition_options: Option<LoadedFormatTablePartitionOptions>,
 }
 
 impl std::fmt::Debug for RESTEnv {
@@ -82,64 +68,12 @@ impl RESTEnv {
             options,
             data_token_enabled,
             local_cache,
-            loaded_format_table_partition_options: None,
         }
     }
 
     #[cfg(test)]
     fn has_local_cache(&self) -> bool {
         self.local_cache.is_some()
-    }
-
-    /// The partition settings of a Format Table whose partitions the catalog manages, or
-    /// `None` for any other table.
-    pub(crate) fn catalog_managed_partition_options(
-        &self,
-    ) -> Option<&LoadedFormatTablePartitionOptions> {
-        self.loaded_format_table_partition_options
-            .as_ref()
-            .filter(|options| options.partitioned_table_in_metastore)
-    }
-
-    /// Refuse dynamic options that would change where a Format Table's partitions come from or
-    /// how their paths are laid out: those are decided by the catalog when the table is loaded.
-    pub(crate) fn validate_dynamic_format_table_partition_options(
-        &self,
-        extra: &HashMap<String, String>,
-    ) -> Result<()> {
-        let Some(loaded_options) = &self.loaded_format_table_partition_options else {
-            return Ok(());
-        };
-        let options = CoreOptions::new(extra);
-        if extra.contains_key(METASTORE_PARTITIONED_TABLE_OPTION) {
-            ensure_partition_option_unchanged(
-                &self.identifier,
-                METASTORE_PARTITIONED_TABLE_OPTION,
-                loaded_options.partitioned_table_in_metastore,
-                options.partitioned_table_in_metastore()?,
-            )?;
-        }
-        if loaded_options.partitioned_table_in_metastore
-            && extra.contains_key(FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION)
-        {
-            ensure_partition_option_unchanged(
-                &self.identifier,
-                FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION,
-                loaded_options.only_value_in_path,
-                options.try_format_table_partition_only_value_in_path()?,
-            )?;
-        }
-        if loaded_options.partitioned_table_in_metastore
-            && extra.contains_key(FORMAT_TABLE_IMPLEMENTATION_OPTION)
-        {
-            ensure_partition_option_unchanged(
-                &self.identifier,
-                FORMAT_TABLE_IMPLEMENTATION_OPTION,
-                FormatTableImplementation::Paimon,
-                options.format_table_implementation()?,
-            )?;
-        }
-        Ok(())
     }
 
     /// Get the REST API client.
@@ -249,6 +183,7 @@ impl RESTEnv {
             ),
             source: None,
         })?;
+        validate_catalog_managed_format_table(identifier, &table_schema, is_external)?;
 
         let uuid = response.id.ok_or_else(|| Error::DataInvalid {
             message: format!(
@@ -269,7 +204,7 @@ impl RESTEnv {
         )
         .await?;
 
-        let mut rest_env = RESTEnv::new(
+        let rest_env = RESTEnv::new(
             identifier.clone(),
             uuid,
             api,
@@ -277,8 +212,6 @@ impl RESTEnv {
             data_token_enabled,
             local_cache,
         );
-        rest_env.loaded_format_table_partition_options =
-            load_format_table_partition_options(identifier, &table_schema, is_external)?;
 
         Ok(Table::new(
             file_io,
@@ -382,78 +315,40 @@ impl RESTEnv {
     }
 }
 
-fn load_format_table_partition_options(
+/// Refuse a Format Table that asks for catalog-managed partitions it cannot have: an engine
+/// implementation reads the table directory itself, and only an internal table's partitions
+/// belong to the catalog.
+///
+/// Mirrors Java `CatalogUtils.validateCatalogManagedFormatTablePartitions`.
+fn validate_catalog_managed_format_table(
     identifier: &Identifier,
     table_schema: &TableSchema,
     is_external: bool,
-) -> Result<Option<LoadedFormatTablePartitionOptions>> {
-    let core_options = CoreOptions::new(table_schema.options());
-    if !core_options.is_format_table() {
-        return Ok(None);
-    }
-
-    let partitioned_table_in_metastore = core_options.partitioned_table_in_metastore()?;
-    let only_value_in_path = if partitioned_table_in_metastore {
-        if core_options.format_table_implementation()? == FormatTableImplementation::Engine {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "Format Table {} cannot set metastore.partitioned-table=true when \
-                     format-table.implementation=engine",
-                    identifier.full_name()
-                ),
-                source: None,
-            });
-        }
-        if is_external {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "Catalog-managed partitions require an internal Format Table, but {} is external",
-                    identifier.full_name()
-                ),
-                source: None,
-            });
-        }
-        core_options.try_format_table_partition_only_value_in_path()?
-    } else {
-        core_options.format_table_partition_only_value_in_path()
-    };
-
-    Ok(Some(LoadedFormatTablePartitionOptions {
-        table_path: core_options
-            .path()
-            .ok_or_else(|| Error::DataInvalid {
-                message: format!(
-                    "REST Format Table {} is missing option '{PATH_OPTION}'",
-                    identifier.full_name()
-                ),
-                source: None,
-            })?
-            .to_string(),
-        file_format: core_options.file_format().to_string(),
-        partitioned_table_in_metastore,
-        only_value_in_path,
-    }))
-}
-
-fn ensure_partition_option_unchanged<T>(
-    identifier: &Identifier,
-    key: &str,
-    loaded_value: T,
-    dynamic_value: T,
-) -> Result<()>
-where
-    T: PartialEq,
-{
-    if loaded_value == dynamic_value {
+) -> Result<()> {
+    let options = CoreOptions::new(table_schema.options());
+    if !options.is_format_table() || !options.partitioned_table_in_metastore() {
         return Ok(());
     }
-    Err(Error::DataInvalid {
-        message: format!(
-            "Dynamic option '{key}' must match the value returned by the REST catalog for Format Table {}",
-            identifier.full_name()
-        ),
-        source: None,
-    })
+    if options.format_table_implementation_is_engine() {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Format Table {} cannot set metastore.partitioned-table=true when \
+                 format-table.implementation=engine",
+                identifier.full_name()
+            ),
+            source: None,
+        });
+    }
+    if is_external {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Catalog-managed partitions require an internal Format Table, but {} is external",
+                identifier.full_name()
+            ),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
