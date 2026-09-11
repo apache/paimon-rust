@@ -40,7 +40,7 @@ Mosaic support is always available and currently read-only. SQL queries can read
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
 
 Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
@@ -984,6 +984,41 @@ listing both complete before any change is made, so a listing failure cannot tur
 truncated view of the table into a `DROP` diff. There is no dry-run and no scope
 argument — repair always covers the whole table. A partition at a custom location is
 never unregistered by repair.
+
+### ANALYZE TABLE
+
+Measure what the registered partitions hold and report it to the catalog:
+
+```sql
+ANALYZE TABLE paimon.my_db.events COMPUTE STATISTICS NOSCAN;  -- files, size, last file time
+ANALYZE TABLE paimon.my_db.events COMPUTE STATISTICS;         -- also row counts
+ANALYZE TABLE paimon.my_db.events PARTITION (dt = '2024-01-01') COMPUTE STATISTICS;
+```
+
+Each partition is measured through the listing a scan uses, so it counts exactly the files
+a query reads and leaves staging entries such as `_temporary` out. `NOSCAN` stops at the
+listing: it reports the file count, the total size and the latest file modification time.
+Without `NOSCAN` the row count is also read from each file's footer, which Parquet and ORC
+keep; for other formats it stays unknown. A footer that cannot be read leaves the row count
+of its partition unknown rather than short, and a partition without files holds exactly
+zero rows. A field the statement does not measure, such as the row count under `NOSCAN`,
+is reported as unknown (`-1`).
+
+The measurement replaces the statistics the catalog holds for each partition; it never
+adds or removes a partition. `PARTITION (...)` must give values for a leading run of the
+partition keys and selects every registered partition under them: on a `(dt, region)`
+table, `PARTITION (dt = '2024-01-01')` measures every region of that date, while
+`PARTITION (region = 'us')` is rejected. It is an error when no registered partition
+matches. A selected partition at a custom location fails the statement, and
+`FOR COLUMNS` is not supported.
+
+A listing failure fails the statement before anything is reported.
+`format-table.statistics.parallelism` (default 8) bounds the storage requests in flight,
+listings and footer reads alike. Set it for the session:
+
+```sql
+SET 'paimon.format-table.statistics.parallelism' = '16';
+```
 
 ## Procedures
 
