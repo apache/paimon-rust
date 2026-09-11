@@ -30,7 +30,7 @@ pub(crate) use parquet::ParquetFormatWriter;
 
 use super::ParquetReadBudget;
 use super::RowFilterFactory;
-use crate::io::{FileRead, OutputFile};
+use crate::io::{FileIO, FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{DataField, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};
@@ -155,6 +155,31 @@ impl FormatWriteResult {
                 columns,
             }),
         }
+    }
+}
+
+/// Rows in a data file of the given format, read from its footer alone, or `None` when the
+/// format keeps no row count there and every row would have to be decoded to count them.
+pub(crate) async fn read_file_row_count(
+    file_io: &FileIO,
+    format: &str,
+    path: &str,
+    file_size: u64,
+) -> crate::Result<Option<i64>> {
+    match format.to_ascii_lowercase().as_str() {
+        "parquet" => {
+            let reader = file_io.new_input(path)?.reader().await?;
+            parquet::read_row_count(Box::new(reader), file_size)
+                .await
+                .map(Some)
+        }
+        "orc" => {
+            let reader = file_io.new_input(path)?.reader().await?;
+            orc::read_row_count(Box::new(reader), file_size)
+                .await
+                .map(Some)
+        }
+        _ => Ok(None),
     }
 }
 
