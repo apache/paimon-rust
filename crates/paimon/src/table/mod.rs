@@ -40,6 +40,7 @@ pub mod data_evolution_writer;
 mod data_file_reader;
 mod data_file_writer;
 mod dedicated_format_file_writer;
+mod format_partition;
 mod format_read_builder;
 mod format_table_read;
 mod format_table_scan;
@@ -339,7 +340,16 @@ impl Table {
     }
 
     pub(crate) fn is_format_table(&self) -> bool {
-        CoreOptions::new(self.schema.options()).is_format_table()
+        self.has_catalog_managed_partitions()
+            || CoreOptions::new(self.schema.options()).is_format_table()
+    }
+
+    /// Whether this table uses catalog-managed Format Table partitions.
+    pub fn has_catalog_managed_partitions(&self) -> bool {
+        self.rest_env
+            .as_ref()
+            .and_then(RESTEnv::catalog_managed_partition_options)
+            .is_some()
     }
 
     /// Create a read builder for scan/read.
@@ -412,6 +422,9 @@ impl Table {
     /// `FileStoreTable.copyWithoutTimeTravel`. Use
     /// [`Table::copy_with_time_travel`] when the options may select a
     /// historical snapshot whose schema should be used for reading.
+    ///
+    /// Catalog-managed Format Table scans keep the partition source, table
+    /// path, file format, and path layout loaded from REST metadata.
     pub fn copy_with_options(&self, extra: HashMap<String, String>) -> Self {
         // Changing the time-travel selector invalidates the resolved snapshot
         // (a time-travelled schema then has no matching snapshot anymore, and
@@ -521,6 +534,9 @@ impl Table {
         // Resolution reads Paimon snapshot paths, so refuse before any IO.
         CoreOptions::new(self.schema.options())
             .ensure_type_paimon_served(&self.identifier.full_name())?;
+        if let Some(rest_env) = &self.rest_env {
+            rest_env.validate_dynamic_format_table_partition_options(&extra)?;
+        }
         let mut table = self.copy_with_options(extra);
         // Reject unimplemented scan options on the merged view before any IO, so
         // both table-level and per-read options are covered.

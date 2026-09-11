@@ -42,7 +42,9 @@ const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
 const SOURCE_SPLIT_OPEN_FILE_COST_OPTION: &str = "source.split.open-file-cost";
 const PARTITION_DEFAULT_NAME_OPTION: &str = "partition.default-name";
 const PARTITION_LEGACY_NAME_OPTION: &str = "partition.legacy-name";
-const FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION: &str =
+pub(crate) const METASTORE_PARTITIONED_TABLE_OPTION: &str = "metastore.partitioned-table";
+pub(crate) const FORMAT_TABLE_IMPLEMENTATION_OPTION: &str = "format-table.implementation";
+pub(crate) const FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION: &str =
     "format-table.partition-path-only-value";
 const FORMAT_TABLE_SCAN_LIST_PARALLELISM_OPTION: &str = "format-table.scan.list-parallelism";
 const DEFAULT_FORMAT_TABLE_SCAN_LIST_PARALLELISM: usize = 64;
@@ -161,6 +163,14 @@ pub(crate) const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
 pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
 const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
 const PK_FULL_TEXT_INDEX_COLUMNS_OPTION: &str = "pk-full-text.index.columns";
+
+/// Which side reads a Format Table (`format-table.implementation`): Paimon's own reader, or
+/// the engine's native file source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FormatTableImplementation {
+    Paimon,
+    Engine,
+}
 
 /// Merge engine for primary-key tables.
 ///
@@ -702,6 +712,43 @@ impl<'a> CoreOptions<'a> {
             .get(FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    pub(crate) fn try_format_table_partition_only_value_in_path(&self) -> crate::Result<bool> {
+        self.try_boolean_option(FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION)
+    }
+
+    pub(crate) fn partitioned_table_in_metastore(&self) -> crate::Result<bool> {
+        self.try_boolean_option(METASTORE_PARTITIONED_TABLE_OPTION)
+    }
+
+    pub(crate) fn format_table_implementation(&self) -> crate::Result<FormatTableImplementation> {
+        match self
+            .options
+            .get(FORMAT_TABLE_IMPLEMENTATION_OPTION)
+            .map(String::as_str)
+            .unwrap_or("paimon")
+        {
+            value if value.eq_ignore_ascii_case("paimon") => Ok(FormatTableImplementation::Paimon),
+            value if value.eq_ignore_ascii_case("engine") => Ok(FormatTableImplementation::Engine),
+            value => Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Invalid value '{value}' for {FORMAT_TABLE_IMPLEMENTATION_OPTION}; \
+                     expected 'paimon' or 'engine'"
+                ),
+            }),
+        }
+    }
+
+    fn try_boolean_option(&self, key: &str) -> crate::Result<bool> {
+        match self.options.get(key).map(String::as_str) {
+            None => Ok(false),
+            Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+            Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+            Some(value) => Err(crate::Error::ConfigInvalid {
+                message: format!("Invalid value '{value}' for {key}; expected 'true' or 'false'"),
+            }),
+        }
     }
 
     pub fn global_index_enabled(&self) -> bool {
@@ -2273,6 +2320,47 @@ mod tests {
         )]);
         let core = CoreOptions::new(&options);
         assert!(core.format_table_partition_only_value_in_path());
+    }
+
+    #[test]
+    fn test_catalog_managed_format_table_options() {
+        let empty = HashMap::new();
+        let core = CoreOptions::new(&empty);
+        assert!(!core.partitioned_table_in_metastore().unwrap());
+        assert!(!core
+            .try_format_table_partition_only_value_in_path()
+            .unwrap());
+        assert_eq!(
+            core.format_table_implementation().unwrap(),
+            FormatTableImplementation::Paimon
+        );
+
+        let options = HashMap::from([
+            (
+                METASTORE_PARTITIONED_TABLE_OPTION.to_string(),
+                "TrUe".to_string(),
+            ),
+            (
+                FORMAT_TABLE_IMPLEMENTATION_OPTION.to_string(),
+                "ENGINE".to_string(),
+            ),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert!(core.partitioned_table_in_metastore().unwrap());
+        assert_eq!(
+            core.format_table_implementation().unwrap(),
+            FormatTableImplementation::Engine
+        );
+
+        // Unlike the lenient readers, a value that is not a boolean is an error, not `false`.
+        let invalid = HashMap::from([(
+            FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION.to_string(),
+            "tru".to_string(),
+        )]);
+        assert!(matches!(
+            CoreOptions::new(&invalid).try_format_table_partition_only_value_in_path(),
+            Err(crate::Error::ConfigInvalid { .. })
+        ));
     }
 
     #[test]

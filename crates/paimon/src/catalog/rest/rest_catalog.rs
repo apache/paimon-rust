@@ -468,8 +468,9 @@ impl Catalog for RESTCatalog {
                 .await
             {
                 Ok(found) => partitions.extend(found),
-                // A catalog without the lookup still answers the plain listing, which
-                // `list_partitions` falls back from the same way.
+                // A catalog without the lookup still answers the plain listing. That listing
+                // never stands in directories for the registrations of a table whose catalog
+                // manages its partitions, so neither does this lookup.
                 Err(Error::RestApi {
                     source: RestError::NotImplemented { .. },
                 }) => {
@@ -489,10 +490,17 @@ impl Catalog for RESTCatalog {
     async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
         match self.api.list_partitions(identifier).await {
             Ok(parts) => Ok(parts),
-            Err(Error::RestApi {
-                source: RestError::NotImplemented { .. },
-            }) => {
+            Err(
+                error @ Error::RestApi {
+                    source: RestError::NotImplemented { .. },
+                },
+            ) => {
                 let table = self.get_table(identifier).await?;
+                // The registrations of a catalog-managed table are its partitions; the
+                // directories under it are not a substitute for them.
+                if table.has_catalog_managed_partitions() {
+                    return Err(error);
+                }
                 list_partitions_from_file_system(&table).await
             }
             Err(e) => Err(map_rest_error_for_table(e, identifier)),
@@ -511,10 +519,15 @@ impl Catalog for RESTCatalog {
             .await
         {
             Ok(page) => Ok(page),
-            Err(Error::RestApi {
-                source: RestError::NotImplemented { .. },
-            }) => {
+            Err(
+                error @ Error::RestApi {
+                    source: RestError::NotImplemented { .. },
+                },
+            ) => {
                 let table = self.get_table(identifier).await?;
+                if table.has_catalog_managed_partitions() {
+                    return Err(error);
+                }
                 let parts = list_partitions_from_file_system(&table).await?;
                 Ok(PagedList::new(parts, None))
             }
