@@ -34,9 +34,11 @@ use crate::catalog::{
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
-use crate::spec::{Partition, Schema, SchemaChange};
+use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange};
 use crate::table::{RESTEnv, Table};
 use crate::Result;
+
+const PARTITION_BATCH_SIZE: usize = 1000;
 
 /// REST catalog implementation.
 ///
@@ -411,6 +413,79 @@ impl Catalog for RESTCatalog {
         ))
     }
 
+    async fn create_partitions_with_statistics(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+        ignore_if_exists: bool,
+        statistics: Option<Vec<PartitionStatistics>>,
+        replace_statistics: bool,
+    ) -> Result<()> {
+        let statistics = statistics
+            .map(|statistics| index_statistics_by_spec(identifier, &partition_specs, statistics))
+            .transpose()?;
+        if partition_specs.is_empty() {
+            return Ok(());
+        }
+        // A strict create is rejected whole when any partition already exists, so it is never
+        // split; an idempotent one is sent in bounded batches, each with its own statistics.
+        let batch_size = if ignore_if_exists {
+            PARTITION_BATCH_SIZE
+        } else {
+            partition_specs.len()
+        };
+        for batch in partition_specs.chunks(batch_size) {
+            let batch_statistics = statistics.as_ref().map(|by_spec| {
+                batch
+                    .iter()
+                    .filter_map(|spec| by_spec.get(&spec_key(spec)).cloned())
+                    .collect::<Vec<_>>()
+            });
+            self.api
+                .create_partitions_with_statistics(
+                    identifier,
+                    batch.to_vec(),
+                    ignore_if_exists,
+                    batch_statistics,
+                    replace_statistics,
+                )
+                .await
+                .map_err(|error| map_rest_error_for_create_partitions(error, identifier))?;
+        }
+        Ok(())
+    }
+
+    async fn list_partitions_by_names(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<Vec<Partition>> {
+        let mut partitions = Vec::new();
+        for batch in partition_specs.chunks(PARTITION_BATCH_SIZE) {
+            match self
+                .api
+                .list_partitions_by_names(identifier, batch.to_vec())
+                .await
+            {
+                Ok(found) => partitions.extend(found),
+                // A catalog without the lookup still answers the plain listing, which
+                // `list_partitions` falls back from the same way.
+                Err(Error::RestApi {
+                    source: RestError::NotImplemented { .. },
+                }) => {
+                    return Ok(self
+                        .list_partitions(identifier)
+                        .await?
+                        .into_iter()
+                        .filter(|partition| partition_specs.contains(&partition.spec))
+                        .collect());
+                }
+                Err(error) => return Err(map_rest_error_for_table(error, identifier)),
+            }
+        }
+        Ok(partitions)
+    }
+
     async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
         match self.api.list_partitions(identifier).await {
             Ok(parts) => Ok(parts),
@@ -432,7 +507,7 @@ impl Catalog for RESTCatalog {
     ) -> Result<PagedList<Partition>> {
         match self
             .api
-            .list_partitions_paged(identifier, max_results, page_token)
+            .list_partitions_paged(identifier, max_results, page_token, None)
             .await
         {
             Ok(page) => Ok(page),
@@ -490,6 +565,80 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
             full_name: identifier.full_name(),
         },
         other => other,
+    }
+}
+
+/// A partition spec in a form that can key a map.
+fn spec_key(spec: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut entries = spec
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    entries
+}
+
+/// Index reported statistics by the spec they describe, rejecting a report for a partition that
+/// is not being created and a partition reported twice: the catalog cannot tell which of two
+/// reports is meant.
+fn index_statistics_by_spec(
+    identifier: &Identifier,
+    partition_specs: &[HashMap<String, String>],
+    statistics: Vec<PartitionStatistics>,
+) -> Result<HashMap<Vec<(String, String)>, PartitionStatistics>> {
+    let requested = partition_specs
+        .iter()
+        .map(spec_key)
+        .collect::<std::collections::HashSet<_>>();
+    let mut by_spec = HashMap::with_capacity(statistics.len());
+    for statistic in statistics {
+        let key = spec_key(&statistic.spec);
+        if !requested.contains(&key) {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Partition statistics were reported for {:?} of table {}, which is not among \
+                     the partitions being created",
+                    statistic.spec,
+                    identifier.full_name()
+                ),
+                source: None,
+            });
+        }
+        let spec = statistic.spec.clone();
+        if by_spec.insert(key, statistic).is_some() {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Partition statistics were reported twice for {spec:?} of table {}",
+                    identifier.full_name()
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(by_spec)
+}
+
+fn map_rest_error_for_create_partitions(err: Error, identifier: &Identifier) -> Error {
+    match err {
+        Error::RestApi {
+            source: RestError::AlreadyExists { message, .. },
+        } => Error::DataInvalid {
+            message: format!(
+                "One or more partitions already exist for table {}: {message}",
+                identifier.full_name()
+            ),
+            source: None,
+        },
+        Error::RestApi {
+            source: RestError::BadRequest { message },
+        } => Error::DataInvalid {
+            message: format!(
+                "Invalid partition request for table {}: {message}",
+                identifier.full_name()
+            ),
+            source: None,
+        },
+        other => map_rest_error_for_table(other, identifier),
     }
 }
 

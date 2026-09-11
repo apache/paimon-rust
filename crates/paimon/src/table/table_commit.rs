@@ -2792,8 +2792,8 @@ impl TableCommit {
             let file = entry.file();
             let file_creation_time = file
                 .creation_time
-                .map(|t| t.timestamp_millis() as u64)
-                .unwrap_or_else(current_time_millis);
+                .map(|t| t.timestamp_millis())
+                .unwrap_or_else(|| current_time_millis() as i64);
 
             let stats = stats_map.entry(partition_bytes.clone()).or_insert_with(|| {
                 // Parse partition spec from BinaryRow

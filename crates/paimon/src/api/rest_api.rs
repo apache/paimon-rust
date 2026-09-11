@@ -20,7 +20,7 @@
 //! This module provides a REST API client for interacting with
 //! Paimon rest catalog services, supporting database operations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::api::rest_client::HttpClient;
 use crate::catalog::{Function, Identifier, ViewSchema};
@@ -30,7 +30,9 @@ use crate::Result;
 
 use super::api_request::{
     AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
-    CreateFunctionRequest, CreateTableRequest, CreateViewRequest, RenameTableRequest,
+    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateViewRequest,
+    DropPartitionsRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
+    RenameTableRequest,
 };
 use super::api_response::{
     AuthTableQueryResponse, ConfigResponse, GetDatabaseResponse, GetFunctionResponse,
@@ -91,6 +93,9 @@ impl RESTApi {
     pub const TABLE_NAME_PATTERN: &'static str = "tableNamePattern";
     pub const VIEW_NAME_PATTERN: &'static str = "viewNamePattern";
     pub const FUNCTION_NAME_PATTERN: &'static str = "functionNamePattern";
+    pub const PARTITION_NAME_PATTERN: &'static str = "partitionNamePattern";
+    /// Bounds one request: catalog services cap the partitions a single call may carry.
+    const PARTITION_REQUEST_SIZE: u32 = 1000;
     pub const TABLE_TYPE: &'static str = "tableType";
 
     /// Create a new RESTApi from options.
@@ -556,36 +561,232 @@ impl RESTApi {
 
     // ==================== Partition Operations ====================
 
+    /// Create table partitions in a single REST request.
+    pub async fn create_partitions(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        self.create_partitions_with_statistics(
+            identifier,
+            partition_specs,
+            ignore_if_exists,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Create table partitions and report statistics for them in a single REST request.
+    ///
+    /// Statistics are matched to the specs by spec and may cover only some of them.
+    /// `replace_statistics` says whether they replace what the catalog holds or add to it, and is
+    /// not sent when no statistics are.
+    pub async fn create_partitions_with_statistics(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+        ignore_if_exists: bool,
+        statistics: Option<Vec<PartitionStatistics>>,
+        replace_statistics: bool,
+    ) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self.resource_paths.partitions(database, table);
+        let mut request = CreatePartitionsRequest::new(partition_specs, ignore_if_exists);
+        if let Some(statistics) = statistics {
+            request = request.with_statistics(statistics, replace_statistics);
+        }
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
+
+    /// Unregister table partitions in a single REST request.
+    ///
+    /// The REST service removes metadata only; it does not delete partition
+    /// directories or data files.
+    pub async fn drop_partitions(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self.resource_paths.drop_partitions(database, table);
+        let request = DropPartitionsRequest::new(partition_specs, ignore_if_not_exists);
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
+
     /// List all partitions of a table, paging internally.
     pub async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
+        self.drain_partitions(identifier, None, None, None).await
+    }
+
+    /// List partitions, asking the catalog to return only those whose partition name
+    /// matches `partition_name_pattern`.
+    ///
+    /// The pattern is a pushdown hint: a catalog may apply it partially or not at all, so
+    /// the result is a superset of the matching partitions and never misses one. Callers
+    /// keep applying their own filter to what comes back.
+    pub async fn list_partitions_by_name_pattern(
+        &self,
+        identifier: &Identifier,
+        partition_name_pattern: Option<&str>,
+    ) -> Result<Vec<Partition>> {
+        self.drain_partitions(
+            identifier,
+            Some(Self::PARTITION_REQUEST_SIZE),
+            partition_name_pattern,
+            None,
+        )
+        .await
+    }
+
+    /// List partitions, asking the catalog to return only those matching `filter`, a partition
+    /// predicate in the REST catalog predicate JSON format, together with
+    /// `partition_name_pattern` when one is given.
+    ///
+    /// Like the pattern, the filter is a pushdown hint: a catalog may apply it partially or not
+    /// at all, so callers keep applying their own filter to what comes back.
+    pub async fn list_partitions_by_filter(
+        &self,
+        identifier: &Identifier,
+        filter: &str,
+        partition_name_pattern: Option<&str>,
+    ) -> Result<Vec<Partition>> {
+        self.drain_partitions(
+            identifier,
+            Some(Self::PARTITION_REQUEST_SIZE),
+            partition_name_pattern,
+            Some(filter),
+        )
+        .await
+    }
+
+    /// List one page of partitions matching `filter`. See [`Self::list_partitions_by_filter`].
+    pub async fn list_partitions_by_filter_paged(
+        &self,
+        identifier: &Identifier,
+        filter: &str,
+        max_results: Option<u32>,
+        page_token: Option<&str>,
+        partition_name_pattern: Option<&str>,
+    ) -> Result<PagedList<Partition>> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self
+            .resource_paths
+            .list_partitions_by_filter(database, table);
+        let request = ListPartitionsByFilterRequest::new(
+            filter.to_string(),
+            partition_name_pattern
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_string),
+            max_results,
+            page_token.map(str::to_string),
+        );
+        let response: ListPartitionsResponse = self.client.post(&path, &request).await?;
+        Ok(PagedList::new(
+            response.partitions.unwrap_or_default(),
+            response.next_page_token,
+        ))
+    }
+
+    /// Return those of the given complete partition specs that are registered.
+    ///
+    /// The specs go out in one request, so callers bound how many they send at once.
+    pub async fn list_partitions_by_names(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<Vec<Partition>> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self
+            .resource_paths
+            .list_partitions_by_names(database, table);
+        let request = ListPartitionsByNamesRequest::new(partition_specs);
+        let response: ListPartitionsResponse = self.client.post(&path, &request).await?;
+        Ok(response.partitions.unwrap_or_default())
+    }
+
+    async fn drain_partitions(
+        &self,
+        identifier: &Identifier,
+        max_results: Option<u32>,
+        partition_name_pattern: Option<&str>,
+        filter: Option<&str>,
+    ) -> Result<Vec<Partition>> {
         let database = identifier.database();
         let table = identifier.object();
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
 
         let mut results = Vec::new();
         let mut page_token: Option<String> = None;
+        let mut seen_page_tokens = HashSet::new();
 
         loop {
-            let paged = self
-                .list_partitions_paged(identifier, None, page_token.as_deref())
-                .await?;
-            let is_empty = paged.elements.is_empty();
+            let paged = match filter {
+                Some(filter) => {
+                    self.list_partitions_by_filter_paged(
+                        identifier,
+                        filter,
+                        max_results,
+                        page_token.as_deref(),
+                        partition_name_pattern,
+                    )
+                    .await?
+                }
+                None => {
+                    self.list_partitions_paged(
+                        identifier,
+                        max_results,
+                        page_token.as_deref(),
+                        partition_name_pattern,
+                    )
+                    .await?
+                }
+            };
             results.extend(paged.elements);
-            page_token = paged.next_page_token;
-            if page_token.is_none() || is_empty {
+
+            let Some(next_page_token) = paged.next_page_token.filter(|token| !token.is_empty())
+            else {
                 break;
+            };
+            if !seen_page_tokens.insert(next_page_token.clone()) {
+                return Err(crate::Error::UnexpectedError {
+                    message: format!(
+                        "REST catalog returned partition page token '{next_page_token}' more than \
+                         once for table {}",
+                        identifier.full_name()
+                    ),
+                    source: None,
+                });
             }
+            page_token = Some(next_page_token);
         }
 
         Ok(results)
     }
 
     /// List partitions with pagination.
+    ///
+    /// `partition_name_pattern` is a SQL LIKE pattern over partition names, where `%` is
+    /// the only wildcard. Like [`Self::list_partitions_by_name_pattern`], it is a hint the
+    /// catalog may ignore.
     pub async fn list_partitions_paged(
         &self,
         identifier: &Identifier,
         max_results: Option<u32>,
         page_token: Option<&str>,
+        partition_name_pattern: Option<&str>,
     ) -> Result<PagedList<Partition>> {
         let database = identifier.database();
         let table = identifier.object();
@@ -598,6 +799,9 @@ impl RESTApi {
         }
         if let Some(token) = page_token {
             params.push((Self::PAGE_TOKEN, token.to_string()));
+        }
+        if let Some(pattern) = partition_name_pattern.filter(|pattern| !pattern.is_empty()) {
+            params.push((Self::PARTITION_NAME_PATTERN, pattern.to_string()));
         }
 
         let response: ListPartitionsResponse = if params.is_empty() {

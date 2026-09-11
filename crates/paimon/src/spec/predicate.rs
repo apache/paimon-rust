@@ -672,6 +672,116 @@ impl Predicate {
             Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
         }
     }
+
+    /// Serialize this predicate in the REST catalog wire format, the inverse of
+    /// [`Self::from_rest_json`].
+    ///
+    /// Returns `None` when some part of the predicate has no wire form: the format has no `NOT`,
+    /// and Java cannot read temporal, decimal or binary literals back from JSON. Field references
+    /// carry each leaf's index as it is, so a predicate meant for a partition row must already be
+    /// indexed by partition field.
+    pub fn to_rest_json(&self) -> Option<serde_json::Value> {
+        match self {
+            Predicate::AlwaysTrue => Some(rest_constant_leaf("TRUE")),
+            Predicate::AlwaysFalse => Some(rest_constant_leaf("FALSE")),
+            Predicate::And(children) | Predicate::Or(children) => {
+                if children.is_empty() {
+                    return None;
+                }
+                let function = if matches!(self, Predicate::And(_)) {
+                    "AND"
+                } else {
+                    "OR"
+                };
+                let children = children
+                    .iter()
+                    .map(Predicate::to_rest_json)
+                    .collect::<Option<Vec<_>>>()?;
+                Some(serde_json::json!({
+                    "kind": "COMPOUND",
+                    "function": function,
+                    "children": children,
+                }))
+            }
+            Predicate::Not(_) => None,
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                op,
+                literals,
+            } => {
+                if matches!(op, PredicateOperator::Like) && literals.len() != 1 {
+                    return None;
+                }
+                let literals = literals
+                    .iter()
+                    .map(datum_to_rest_json)
+                    .collect::<Option<Vec<_>>>()?;
+                Some(serde_json::json!({
+                    "kind": "LEAF",
+                    "transform": {
+                        "name": "FIELD_REF",
+                        "fieldRef": {
+                            "index": index,
+                            "name": column,
+                            "type": serde_json::to_value(data_type).ok()?,
+                        },
+                    },
+                    "function": rest_leaf_function(*op),
+                    "literals": literals,
+                }))
+            }
+        }
+    }
+}
+
+fn rest_constant_leaf(function: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "LEAF",
+        "transform": {"name": "NULL"},
+        "function": function,
+        "literals": [],
+    })
+}
+
+fn rest_leaf_function(op: PredicateOperator) -> &'static str {
+    match op {
+        PredicateOperator::IsNull => "IS_NULL",
+        PredicateOperator::IsNotNull => "IS_NOT_NULL",
+        PredicateOperator::Eq => "EQUAL",
+        PredicateOperator::NotEq => "NOT_EQUAL",
+        PredicateOperator::Lt => "LESS_THAN",
+        PredicateOperator::LtEq => "LESS_OR_EQUAL",
+        PredicateOperator::Gt => "GREATER_THAN",
+        PredicateOperator::GtEq => "GREATER_OR_EQUAL",
+        PredicateOperator::In => "IN",
+        PredicateOperator::NotIn => "NOT_IN",
+        PredicateOperator::StartsWith => "STARTS_WITH",
+        PredicateOperator::EndsWith => "ENDS_WITH",
+        PredicateOperator::Contains => "CONTAINS",
+        PredicateOperator::ArrayContains => "ARRAY_CONTAINS",
+        PredicateOperator::ArraysOverlap => "ARRAYS_OVERLAP",
+        PredicateOperator::ArrayContainsAll => "ARRAY_CONTAINS_ALL",
+        PredicateOperator::Like => "LIKE",
+        PredicateOperator::Between => "BETWEEN",
+        PredicateOperator::NotBetween => "NOT_BETWEEN",
+    }
+}
+
+/// A literal the way Java writes it, for the types Java can also read back.
+fn datum_to_rest_json(datum: &Datum) -> Option<serde_json::Value> {
+    match datum {
+        Datum::Bool(value) => Some(serde_json::Value::Bool(*value)),
+        Datum::TinyInt(value) => Some(serde_json::Value::from(*value)),
+        Datum::SmallInt(value) => Some(serde_json::Value::from(*value)),
+        Datum::Int(value) => Some(serde_json::Value::from(*value)),
+        Datum::Long(value) => Some(serde_json::Value::from(*value)),
+        Datum::Float(value) => serde_json::Number::from_f64(f64::from(*value)).map(Into::into),
+        Datum::Double(value) => serde_json::Number::from_f64(*value).map(Into::into),
+        Datum::String(value) => Some(serde_json::Value::String(value.clone())),
+        _ => None,
+    }
 }
 
 fn rest_json_err(detail: impl fmt::Display) -> Error {
@@ -3388,6 +3498,102 @@ mod tests {
             .unwrap();
             assert!(matches!(parsed, Predicate::AlwaysFalse));
         }
+    }
+
+    #[test]
+    fn test_to_rest_json_is_read_back_by_from_rest_json() {
+        let fields = test_fields();
+        let builder = PredicateBuilder::new(&fields);
+        let id_is_one = builder.equal("id", Datum::Int(1)).unwrap();
+        let predicates = vec![
+            builder.is_null("id").unwrap(),
+            builder.is_not_null("name").unwrap(),
+            id_is_one.clone(),
+            builder
+                .not_equal("name", Datum::String("x".to_string()))
+                .unwrap(),
+            builder.less_than("hr", Datum::Int(3)).unwrap(),
+            builder.less_or_equal("hr", Datum::Int(3)).unwrap(),
+            builder.greater_than("hr", Datum::Int(3)).unwrap(),
+            builder.greater_or_equal("hr", Datum::Int(3)).unwrap(),
+            builder
+                .is_in("id", vec![Datum::Int(1), Datum::Int(2)])
+                .unwrap(),
+            builder
+                .is_not_in("id", vec![Datum::Int(1), Datum::Int(2)])
+                .unwrap(),
+            builder
+                .starts_with("name", Datum::String("a".to_string()))
+                .unwrap(),
+            builder
+                .ends_with("name", Datum::String("a".to_string()))
+                .unwrap(),
+            builder
+                .contains("name", Datum::String("a".to_string()))
+                .unwrap(),
+            builder
+                .like("name", Datum::String("a%".to_string()), None)
+                .unwrap(),
+            builder.between("hr", Datum::Int(1), Datum::Int(5)).unwrap(),
+            builder
+                .not_between("hr", Datum::Int(1), Datum::Int(5))
+                .unwrap(),
+            Predicate::and(vec![
+                id_is_one.clone(),
+                builder
+                    .equal("name", Datum::String("x".to_string()))
+                    .unwrap(),
+            ]),
+            Predicate::or(vec![id_is_one, builder.equal("id", Datum::Int(2)).unwrap()]),
+            Predicate::AlwaysTrue,
+            Predicate::AlwaysFalse,
+        ];
+        for predicate in predicates {
+            let json = predicate
+                .to_rest_json()
+                .unwrap_or_else(|| panic!("{predicate} should have a wire form"));
+            let parsed = Predicate::from_rest_json(&json.to_string(), &fields).unwrap();
+            assert_eq!(parsed.to_string(), predicate.to_string(), "{json}");
+        }
+    }
+
+    /// Wire strings below are taken verbatim from Java `PredicateJsonSerdeTest`.
+    #[test]
+    fn test_to_rest_json_matches_java_wire_format() {
+        let fields = vec![DataField::new(
+            0,
+            "f0".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+        for java in [
+            r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"EQUAL","literals":[1]}"#,
+            r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"IS_NULL","literals":[]}"#,
+            r#"{"kind":"LEAF","transform":{"name":"NULL"},"function":"TRUE","literals":[]}"#,
+            r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"f0","type":"INT"}},"function":"BETWEEN","literals":[3,7]}"#,
+        ] {
+            let predicate = Predicate::from_rest_json(java, &fields).unwrap();
+            assert_eq!(
+                predicate.to_rest_json().unwrap(),
+                serde_json::from_str::<serde_json::Value>(java).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_to_rest_json_refuses_what_java_cannot_read_back() {
+        let fields = test_fields();
+        let builder = PredicateBuilder::new(&fields);
+        let on_date = builder.equal("dt", Datum::Date(20_656)).unwrap();
+        let on_id = builder.equal("id", Datum::Int(1)).unwrap();
+
+        assert!(on_date.to_rest_json().is_none());
+        assert!(Predicate::Not(Box::new(on_id.clone()))
+            .to_rest_json()
+            .is_none());
+        // One child without a wire form keeps the whole compound off the wire.
+        assert!(Predicate::and(vec![on_id, on_date])
+            .to_rest_json()
+            .is_none());
     }
 
     #[test]

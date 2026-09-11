@@ -22,13 +22,17 @@ use std::collections::HashMap;
 ///
 /// Reference: [org.apache.paimon.partition.PartitionStatistics](https://github.com/apache/paimon)
 /// and [pypaimon snapshot_commit.py PartitionStatistics](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/snapshot/snapshot_commit.py)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The same shape reports what a partition holds when a Format Table's partitions are measured.
+/// There a negative field is unknown rather than a decrement, which is why
+/// `last_file_creation_time` is signed like the other counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PartitionStatistics {
     pub spec: HashMap<String, String>,
     pub record_count: i64,
     pub file_size_in_bytes: i64,
     pub file_count: i64,
-    pub last_file_creation_time: u64,
+    pub last_file_creation_time: i64,
     pub total_buckets: i32,
 }
