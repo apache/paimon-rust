@@ -37,6 +37,7 @@
 //! - `ALTER TABLE db.t ADD [IF NOT EXISTS] PARTITION (...) [PARTITION (...)]`
 //! - `ALTER TABLE db.t DROP [IF EXISTS] PARTITION (...)`
 //! - `SHOW PARTITIONS db.t [PARTITION (...)]`
+//! - `MSCK REPAIR TABLE db.t [{ADD|DROP|SYNC} PARTITIONS]`
 //! - `CREATE VIEW [IF NOT EXISTS] view [(col, ...)] AS query`
 //! - `DROP VIEW [IF EXISTS] view`
 //! - `CREATE FUNCTION name(args) RETURNS type [LANGUAGE SQL] RETURN expression`
@@ -609,6 +610,7 @@ impl SQLContext {
                 self.handle_truncate_table(truncate, enable_ident_normalization)
                     .await
             }
+            Statement::Msck(msck) => crate::format_partition_repair::execute_msck(self, msck).await,
             Statement::CreateView(create_view) => {
                 if create_view.temporary {
                     // Temporary views are always handled by us (Paimon catalog temp storage)

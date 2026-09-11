@@ -484,6 +484,76 @@ async fn test_drop_partition_leaves_a_custom_location_in_place() {
     assert!(temp_dir.path().join("dt=b").is_dir());
 }
 
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_msck_repair_reconciles_registrations_with_directories() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp_dir.path().join("dt=2026-07-21")).unwrap();
+    let (_server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = '2026-07-22')"),
+    )
+    .await;
+
+    // ADD registers a directory the catalog does not know yet.
+    common::exec(
+        &context,
+        &format!("MSCK REPAIR TABLE {TABLE_NAME} ADD PARTITIONS"),
+    )
+    .await;
+    assert_eq!(
+        show_partitions(&context, "").await,
+        ["dt=2026-07-21", "dt=2026-07-22"]
+    );
+
+    // SYNC also unregisters a partition whose directory is gone, without deleting anything.
+    std::fs::remove_dir_all(temp_dir.path().join("dt=2026-07-22")).unwrap();
+    common::exec(
+        &context,
+        &format!("MSCK REPAIR TABLE {TABLE_NAME} SYNC PARTITIONS"),
+    )
+    .await;
+    assert_eq!(show_partitions(&context, "").await, ["dt=2026-07-21"]);
+    assert!(temp_dir.path().join("dt=2026-07-21").is_dir());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_msck_repair_keeps_a_partition_at_a_custom_location() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let (server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = 'a') PARTITION (dt = 'b')"),
+    )
+    .await;
+    server.set_table_partition_options(
+        DATABASE,
+        TABLE,
+        &spec(&[("dt", "b")]),
+        HashMap::from([(
+            "path".to_string(),
+            format!("file://{}", external_dir.path().display()),
+        )]),
+    );
+
+    // Its directory is not under the table, so repair does not read it as missing.
+    std::fs::remove_dir_all(temp_dir.path().join("dt=b")).unwrap();
+    common::exec(
+        &context,
+        &format!("MSCK REPAIR TABLE {TABLE_NAME} SYNC PARTITIONS"),
+    )
+    .await;
+    assert_eq!(
+        server.table_partition_specs(DATABASE, TABLE),
+        vec![spec(&[("dt", "a")]), spec(&[("dt", "b")])]
+    );
+}
+
 /// `SQLContext::sql` futures have to stay `Send` for callers that box or spawn them; this stops
 /// compiling when a stream over borrowed items anywhere below a statement takes that away.
 #[allow(dead_code)]
