@@ -50,7 +50,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use paimon::arrow::ParquetReadBudget;
-use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator};
+use paimon::spec::{
+    CoreOptions, DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator,
+};
 use paimon::table::{ScanTrace, Table};
 use paimon::DataSplit;
 
@@ -217,6 +219,31 @@ fn paimon_predicate_covers_filter(
 struct RuntimeDecoderFilterPlan {
     paimon_predicates: Vec<Predicate>,
     datafusion_filters: Vec<Arc<dyn PhysicalExpr>>,
+}
+
+/// Whether a conjunct reads a partition column whose values the data files do not hold.
+///
+/// A format table keeps partition values in its directory names only, so a decoder filter on such
+/// a column would read it as missing and drop every row. Those conjuncts are left to the runtime
+/// filters, which run on batches with the partition columns filled in.
+fn reads_partition_column_absent_from_files(
+    conjunct: &Arc<dyn PhysicalExpr>,
+    table: &Table,
+    case_sensitive: bool,
+) -> bool {
+    if !CoreOptions::new(table.schema().options()).is_format_table() {
+        return false;
+    }
+    let partition_keys = table.schema().partition_keys();
+    collect_columns(conjunct).iter().any(|column| {
+        partition_keys.iter().any(|key| {
+            if case_sensitive {
+                key == column.name()
+            } else {
+                key.eq_ignore_ascii_case(column.name())
+            }
+        })
+    })
 }
 
 fn partition_runtime_decoder_filters(
@@ -1039,6 +1066,10 @@ impl ExecutionPlan for PaimonTableScan {
                             self.pushed_predicate.as_ref(),
                             conjunct,
                             self.table.schema().fields(),
+                            self.case_sensitive,
+                        ) && !reads_partition_column_absent_from_files(
+                            conjunct,
+                            &self.table,
                             self.case_sensitive,
                         )
                     })
