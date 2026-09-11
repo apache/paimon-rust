@@ -2075,9 +2075,9 @@ impl<'a> PaimonTableScan<'a> {
                 // Java MergeTreeSplitGenerator#splitForBatch). Only engines
                 // whose writer deduplicates at flush guarantee a file never
                 // holds two rows of one key, so only they may mark groups raw
-                // convertible; see merge_tree_split_for_batch. (First-row
-                // tables do not take this path today, but its writer dedups
-                // too, so keep the gate accurate.)
+                // convertible; see merge_tree_split_for_batch. Ordinary first-row
+                // scans do not take this path, but audit scans do. Its writer
+                // deduplicates at flush, so keep the gate accurate.
                 let file_keys_unique = matches!(
                     core_options.merge_engine(),
                     Ok(crate::spec::MergeEngine::Deduplicate)
