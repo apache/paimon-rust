@@ -909,6 +909,15 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    pub(super) fn with_scan_all_files_preserving_projection(self) -> Self {
+        match self.0 {
+            TableScanKind::Paimon(scan) => Self(TableScanKind::Paimon(
+                scan.with_scan_all_files_preserving_projection(),
+            )),
+            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan)),
+        }
+    }
+
     pub fn with_row_ranges(self, ranges: Vec<RowRange>) -> Self {
         match self.0 {
             TableScanKind::Paimon(scan) => {
@@ -1053,6 +1062,11 @@ impl<'a> PaimonTableScan<'a> {
     pub fn with_scan_all_files(mut self) -> Self {
         self.scan_all_files = true;
         self.projected_read_field_ids = None;
+        self
+    }
+
+    fn with_scan_all_files_preserving_projection(mut self) -> Self {
+        self.scan_all_files = true;
         self
     }
 
@@ -1271,7 +1285,7 @@ impl<'a> PaimonTableScan<'a> {
     }
 
     fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
-        can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
+        !self.scan_all_files && can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
     }
 
     fn global_index_scan_settings(
@@ -1279,12 +1293,14 @@ impl<'a> PaimonTableScan<'a> {
         core_options: &CoreOptions,
         data_evolution_enabled: bool,
     ) -> crate::Result<Option<GlobalIndexScanSettings>> {
-        if should_use_global_index_row_range_optimization(
-            self.row_range_optimization_disabled,
-            data_evolution_enabled,
-            core_options.global_index_enabled(),
-            !self.data_predicates.is_empty(),
-        ) {
+        if !self.scan_all_files
+            && should_use_global_index_row_range_optimization(
+                self.row_range_optimization_disabled,
+                data_evolution_enabled,
+                core_options.global_index_enabled(),
+                !self.data_predicates.is_empty(),
+            )
+        {
             Ok(Some(GlobalIndexScanSettings {
                 search_mode: core_options.scalar_index_search_mode()?,
                 thread_num: core_options.global_index_thread_num()?,
@@ -2172,10 +2188,10 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
-        ColumnMove, CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta,
-        FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry,
-        ManifestFileMeta, Predicate, PredicateBuilder, PredicateOperator, Schema as PaimonSchema,
-        SchemaChange, Snapshot, TableSchema, VarCharType,
+        ColumnMove, CommitKind, CoreOptions, DataField, DataFileMeta, DataType, Datum,
+        DeletionVectorMeta, FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType,
+        ManifestEntry, ManifestFileMeta, Predicate, PredicateBuilder, PredicateOperator,
+        Schema as PaimonSchema, SchemaChange, Snapshot, TableSchema, VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
@@ -2867,6 +2883,34 @@ mod tests {
             false,
             Ok(crate::spec::MergeEngine::FirstRow),
         ));
+    }
+
+    #[test]
+    fn test_audit_scan_all_files_preserves_data_evolution_projection() {
+        let table = data_evolution_test_table(
+            "memory:/de_audit_scan_projection",
+            two_column_schema(0, "id", "name"),
+        )
+        .copy_with_options(HashMap::from([(
+            "global-index.enabled".to_string(),
+            "true".to_string(),
+        )]));
+        let projected = HashSet::from([1]);
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("id", Datum::Int(1))
+            .unwrap();
+        let scan = PaimonTableScan::new(&table, None, vec![predicate], None, None, None)
+            .with_projected_read_field_ids(Some(projected.clone()))
+            .with_scan_all_files_preserving_projection();
+
+        assert!(scan.scan_all_files);
+        assert_eq!(scan.projected_read_field_ids, Some(projected));
+        assert!(
+            scan.global_index_scan_settings(&CoreOptions::new(table.schema().options()), true,)
+                .unwrap()
+                .is_none(),
+            "audit scans must not prune physical row versions via global indexes"
+        );
     }
 
     #[test]
@@ -3778,12 +3822,7 @@ mod tests {
             "only the value-matching file should be planned on first-row"
         );
 
-        let (audit_plan, audit_trace) = reader
-            .new_scan()
-            .with_scan_all_files()
-            .plan_with_trace()
-            .await
-            .unwrap();
+        let (audit_plan, audit_trace) = reader.new_audit_scan().plan_with_trace().await.unwrap();
         assert_eq!(audit_trace.manifest_entries_pruned_by_data_stats, 0);
         assert_eq!(
             audit_plan

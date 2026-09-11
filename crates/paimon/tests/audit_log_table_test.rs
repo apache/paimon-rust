@@ -487,15 +487,19 @@ async fn audit_log_current_scan_supports_first_row() {
     write_batch(&table, &make_batch(vec![1], vec![10])).await;
     write_batch(&table, &make_batch(vec![1], vec![20])).await;
 
-    let plan = table
-        .new_read_builder()
-        .new_scan()
-        .with_scan_all_files()
-        .plan()
-        .await
-        .unwrap();
+    let mut limited_reader = table.new_read_builder();
+    limited_reader.with_limit(1);
+    let limited_plan = limited_reader.new_audit_scan().plan().await.unwrap();
+    assert_eq!(
+        limited_plan.splits().len(),
+        2,
+        "audit LIMIT must not discard files needed to resolve row versions"
+    );
+
+    let audit = AuditLogTable::new(table);
+    let plan = audit.new_scan().plan().await.unwrap();
     assert_eq!(plan.splits().len(), 2);
-    let batches: Vec<RecordBatch> = AuditLogTable::new(table)
+    let batches: Vec<RecordBatch> = audit
         .to_arrow_for_splits(plan.splits())
         .unwrap()
         .try_collect()

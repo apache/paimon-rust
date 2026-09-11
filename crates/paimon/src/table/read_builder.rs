@@ -262,6 +262,11 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
+    /// Create a current-state audit scan that retains every visible row version.
+    pub fn new_audit_scan(&self) -> TableScan<'a> {
+        self.new_scan().with_scan_all_files_preserving_projection()
+    }
+
     /// Create a batch incremental scan over snapshot id range
     /// `(start_exclusive, end_inclusive]`.
     ///

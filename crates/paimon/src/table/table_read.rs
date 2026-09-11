@@ -60,6 +60,12 @@ impl<'a, const N: usize> From<&'a [DataSplit; N]> for AuditLogInput<'a> {
     }
 }
 
+impl<'a> From<&'a Vec<DataSplit>> for AuditLogInput<'a> {
+    fn from(splits: &'a Vec<DataSplit>) -> Self {
+        Self::Current(splits.as_slice())
+    }
+}
+
 impl<'a> From<&'a IncrementalPlan> for AuditLogInput<'a> {
     fn from(plan: &'a IncrementalPlan) -> Self {
         Self::Incremental(plan)
@@ -501,7 +507,7 @@ impl<'a> PaimonTableRead<'a> {
             include_sequence,
             has_primary_keys && include_rowkind,
         );
-        project_audit_stream(stream, &output_read_type)
+        project_audit_stream(stream, self.audit_projection.as_deref())
     }
 
     fn audit_incremental_stream(
@@ -595,7 +601,7 @@ impl<'a> PaimonTableRead<'a> {
             include_sequence,
             has_value_kind && include_rowkind,
         );
-        project_audit_stream(stream, &output_read_type)
+        project_audit_stream(stream, self.audit_projection.as_deref())
     }
 
     fn audit_diff_stream(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
@@ -634,7 +640,7 @@ impl<'a> PaimonTableRead<'a> {
                 yield batch?;
             }
         });
-        project_audit_stream(stream, &output_read_type)
+        project_audit_stream(stream, self.audit_projection.as_deref())
     }
 
     fn to_audit_log_arrow_for_diff(
@@ -1189,8 +1195,11 @@ fn audit_stream_from_physical(
 
 fn project_audit_stream(
     stream: ArrowRecordBatchStream,
-    read_type: &[DataField],
+    read_type: Option<&[DataField]>,
 ) -> crate::Result<ArrowRecordBatchStream> {
+    let Some(read_type) = read_type else {
+        return Ok(stream);
+    };
     let schema = build_target_arrow_schema(read_type)?;
     let names = read_type
         .iter()
@@ -1828,6 +1837,37 @@ mod tests {
     use arrow_schema::{DataType as ArrowDataType, Field};
     use futures::TryStreamExt;
 
+    #[tokio::test]
+    async fn test_default_audit_projection_bypasses_batch_rebuild() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let input = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let stream: ArrowRecordBatchStream =
+            Box::pin(stream::iter(vec![Ok::<_, crate::Error>(input.clone())]));
+
+        let output = project_audit_stream(stream, None)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&schema, &output[0].schema()));
+
+        let stream: ArrowRecordBatchStream =
+            Box::pin(stream::iter(vec![Ok::<_, crate::Error>(input)]));
+        let output = project_audit_stream(stream, Some(&[]))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(output[0].num_columns(), 0);
+        assert_eq!(output[0].num_rows(), 1);
+    }
+
     #[test]
     fn test_diff_batch_builders_pin_each_input_batch_once() {
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -2033,8 +2073,9 @@ mod tests {
             .equal("id", Datum::Int(99))
             .unwrap();
         let pk_read = TableRead::new(&pk_table, pk_fields, vec![pk_predicate]);
+        let splits = vec![split.clone()];
         let current_audit = pk_read
-            .to_audit_log_arrow(std::slice::from_ref(&split))
+            .to_audit_log_arrow(&splits)
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
