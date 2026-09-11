@@ -68,6 +68,7 @@ impl TableProvider for OptionsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        super::ensure_scan_authorized(&self.table).await?;
         // Java uses LinkedHashMap insertion order; HashMap has none — sort for stable output.
         let mut entries: Vec<(&String, &String)> = self.table.schema().options().iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));

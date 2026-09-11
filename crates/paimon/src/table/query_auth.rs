@@ -40,11 +40,10 @@ impl QueryAuthGrant {
         self.response.is_unrestricted()
     }
 
-    /// Travelled and branch views read a schema the server did not rule on.
-    /// Everything else follows from the session, which only the catalog mints.
+    /// A view of another schema is not the one the server ruled on. Everything
+    /// else follows from the session, which only the catalog mints.
     pub(crate) fn matches_table(&self, table: &super::Table) -> bool {
-        !table.is_time_traveled()
-            && !table.is_branch_reference()
+        !table.reads_another_schema().unwrap_or(true)
             && table.query_auth_session() == Some(self.session)
     }
 }
@@ -87,7 +86,7 @@ pub(crate) async fn reject_unauthorized_stats(
                 !current.fields().iter().any(|c| {
                     c.id() == f.id()
                         && c.name() == f.name()
-                        && shape(c.data_type()) == shape(f.data_type())
+                        && contains(c.data_type(), f.data_type())
                 })
             }) {
                 return refuse(gone.name());
@@ -97,33 +96,28 @@ pub(crate) async fn reject_unauthorized_stats(
     Ok(())
 }
 
-/// The physical shape, descriptions stripped: `DataField` equality includes them,
-/// so a comment-only edit would otherwise read as an unauthorized column.
-fn shape(ty: &crate::spec::DataType) -> crate::spec::DataType {
-    use crate::spec::{ArrayType, DataType, MapType, MultisetType, RowType};
-    match ty {
-        DataType::Row(row) => DataType::Row(RowType::new(
-            row.fields()
+/// Whether `narrow` reads nothing `wide` does not have: nested children are
+/// matched by name and must be contained in turn, so a projection of a `ROW`
+/// passes and an extra child does not. Descriptions are not columns and are
+/// ignored.
+fn contains(wide: &crate::spec::DataType, narrow: &crate::spec::DataType) -> bool {
+    use crate::spec::DataType;
+    match (wide, narrow) {
+        (DataType::Row(w), DataType::Row(n)) => n.fields().iter().all(|nf| {
+            w.fields()
                 .iter()
-                .map(|f| {
-                    crate::spec::DataField::new(f.id(), f.name().to_string(), shape(f.data_type()))
-                })
-                .collect(),
-        )),
-        DataType::Array(a) => DataType::Array(ArrayType::with_nullable(
-            ty.is_nullable(),
-            shape(a.element_type()),
-        )),
-        DataType::Multiset(m) => DataType::Multiset(MultisetType::with_nullable(
-            ty.is_nullable(),
-            shape(m.element_type()),
-        )),
-        DataType::Map(m) => DataType::Map(MapType::with_nullable(
-            ty.is_nullable(),
-            shape(m.key_type()),
-            shape(m.value_type()),
-        )),
-        other => other.clone(),
+                .any(|wf| wf.name() == nf.name() && contains(wf.data_type(), nf.data_type()))
+        }),
+        (DataType::Array(w), DataType::Array(n)) => contains(w.element_type(), n.element_type()),
+        (DataType::Multiset(w), DataType::Multiset(n)) => {
+            contains(w.element_type(), n.element_type())
+        }
+        (DataType::Map(w), DataType::Map(n)) => {
+            contains(w.key_type(), n.key_type()) && contains(w.value_type(), n.value_type())
+        }
+        // A `variant_get` pushdown reads a `VARIANT` column as a `ROW` of paths.
+        (DataType::Variant(_), DataType::Row(_)) => true,
+        (w, n) => w == n,
     }
 }
 
@@ -167,7 +161,7 @@ pub(crate) fn reject_noncanonical_fields(
         let canonical = schema_fields.iter().any(|f| {
             f.id() == field.id()
                 && f.name() == field.name()
-                && shape(f.data_type()) == shape(field.data_type())
+                && contains(f.data_type(), field.data_type())
         });
         if !canonical {
             return Err(unsupported(&format!(
@@ -238,6 +232,14 @@ mod tests {
         assert!(
             !grant.matches_table(&travelled),
             "an older schema is not the one the server ruled on"
+        );
+        let selected = table.copy_with_options(std::collections::HashMap::from([(
+            "scan.snapshot-id".to_string(),
+            "1".to_string(),
+        )]));
+        assert!(
+            !grant.matches_table(&selected),
+            "a selector travels without setting the flag"
         );
 
         let assembled = crate::table::Table::new(
@@ -392,26 +394,53 @@ mod tests {
     }
 
     #[test]
-    fn test_a_comment_only_change_is_not_a_different_column() {
+    fn test_containment_ignores_comments_and_allows_narrowing() {
         use crate::spec::{DataField, DataType, IntType, RowType};
-        let child = |desc: Option<&str>| {
-            let f = DataField::new(1, "a".to_string(), DataType::Int(IntType::new()));
+        let int = || DataType::Int(IntType::new());
+        let child = |name: &str, desc: Option<&str>| {
+            let f = DataField::new(1, name.to_string(), int());
             match desc {
                 Some(d) => f.with_description(Some(d.to_string())),
                 None => f,
             }
         };
-        let row = |desc| DataType::Row(RowType::new(vec![child(desc)]));
-        assert_ne!(
-            row(None),
-            row(Some("why")),
-            "equality includes descriptions"
-        );
-        assert_eq!(
-            super::shape(&row(None)),
-            super::shape(&row(Some("why"))),
-            "but a comment is not a column the server did not authorize"
-        );
+        let row = |children: Vec<DataField>| DataType::Row(RowType::new(children));
+        let wide = row(vec![child("a", None), child("b", None)]);
+
+        // A comment is not a column.
+        assert!(super::contains(
+            &wide,
+            &row(vec![child("a", Some("why")), child("b", None)])
+        ));
+        // Projecting a subset of the children reads nothing extra.
+        assert!(super::contains(&wide, &row(vec![child("a", None)])));
+        // An extra child would.
+        assert!(!super::contains(
+            &wide,
+            &row(vec![
+                child("a", None),
+                child("b", None),
+                child("hidden", None)
+            ])
+        ));
+        // And so would a child under another name.
+        assert!(!super::contains(&wide, &row(vec![child("c", None)])));
+    }
+
+    #[test]
+    fn test_a_variant_extraction_is_the_one_shape_change_allowed() {
+        use crate::spec::{DataField, DataType, IntType, RowType, VariantType};
+        let int = || DataType::Int(IntType::new());
+        let row = || DataType::Row(RowType::new(vec![DataField::new(0, "p".into(), int())]));
+        let schema = vec![
+            DataField::new(1, "v".into(), DataType::Variant(VariantType::new())),
+            DataField::new(2, "n".into(), int()),
+        ];
+        let read = |id, name: &str, ty| vec![DataField::new(id, name.into(), ty)];
+
+        assert!(super::reject_noncanonical_fields(&read(1, "v", row()), &schema).is_ok());
+        assert!(super::reject_noncanonical_fields(&read(1, "v", int()), &schema).is_err());
+        assert!(super::reject_noncanonical_fields(&read(2, "n", row()), &schema).is_err());
     }
 
     #[test]

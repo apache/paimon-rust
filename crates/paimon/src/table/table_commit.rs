@@ -205,7 +205,12 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        self.table.ensure_read_authorized_live("a commit").await?;
+        // Refused before anything is submitted, so the prepared files — index
+        // shards included — are safe to remove rather than leave orphaned.
+        if let Err(error) = self.table.ensure_read_authorized_live("a commit").await {
+            let _ = self.abort(&commit_messages).await;
+            return Err(error);
+        }
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -337,7 +342,12 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        self.table.ensure_read_authorized_live("a commit").await?;
+        // Refused before anything is submitted, so the prepared files — index
+        // shards included — are safe to remove rather than leave orphaned.
+        if let Err(error) = self.table.ensure_read_authorized_live("a commit").await {
+            let _ = self.abort(&commit_messages).await;
+            return Err(error);
+        }
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -5525,6 +5535,47 @@ mod tests {
         assert!(
             !file_io.exists(&index_path).await.unwrap(),
             "abort must remove newly written index files"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_commit_removes_the_prepared_index_files() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_refused_commit_index_cleanup";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([("query-auth.enabled".to_string(), "true".to_string())]),
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
+
+        let index_path = format!("{table_path}/index/bucket-index");
+        file_io
+            .mkdirs(&format!("{table_path}/index/"))
+            .await
+            .unwrap();
+        file_io
+            .new_output(&index_path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"index"))
+            .await
+            .unwrap();
+        let mut message = CommitMessage::new(vec![], 0, vec![]);
+        message.new_index_files = vec![IndexFileMeta {
+            index_type: "HASH".to_string(),
+            file_name: "bucket-index".to_string(),
+            file_size: 5,
+            row_count: 1,
+            deletion_vectors_ranges: None,
+            external_path: None,
+            global_index_meta: None,
+        }];
+
+        assert!(commit.commit(vec![message]).await.is_err());
+        assert!(
+            !file_io.exists(&index_path).await.unwrap(),
+            "a commit refused before submission must not leave its index files behind"
         );
     }
 

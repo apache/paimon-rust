@@ -80,6 +80,7 @@ impl TableProvider for SchemasTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        super::ensure_scan_authorized(&self.table).await?;
         let table = self.table.clone();
         let schemas =
             crate::runtime::await_with_runtime(
