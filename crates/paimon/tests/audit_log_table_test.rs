@@ -485,6 +485,7 @@ async fn audit_log_current_scan_supports_first_row() {
     persist_table_schema(&file_io, table_path, table.schema()).await;
 
     write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![3], vec![30])).await;
     write_batch(&table, &make_batch(vec![1], vec![20])).await;
 
     let mut limited_reader = table.new_read_builder();
@@ -495,20 +496,34 @@ async fn audit_log_current_scan_supports_first_row() {
         2,
         "audit LIMIT must not discard files needed to resolve row versions"
     );
+    assert_eq!(
+        limited_plan
+            .splits()
+            .iter()
+            .map(|split| split.data_files().len())
+            .sum::<usize>(),
+        3,
+        "audit LIMIT must retain every physical row version"
+    );
 
     let audit = AuditLogTable::new(table);
     let plan = audit.new_scan().plan().await.unwrap();
     assert_eq!(plan.splits().len(), 2);
-    let batches: Vec<RecordBatch> = audit
-        .to_arrow_for_splits(plan.splits())
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
+    let mut rows = Vec::new();
+    for split in plan.splits() {
+        let batches: Vec<RecordBatch> = audit
+            .to_arrow_for_splits(std::slice::from_ref(split))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        rows.extend(collect_audit_rows(&batches));
+    }
+    rows.sort_unstable();
 
     assert_eq!(
-        collect_audit_rows(&batches),
-        vec![("+I".to_string(), 1, 10)]
+        rows,
+        vec![("+I".to_string(), 1, 10), ("+I".to_string(), 3, 30)]
     );
 }
 

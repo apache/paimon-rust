@@ -1030,6 +1030,8 @@ struct PaimonTableScan<'a> {
     /// Used by non-read paths (overwrite, truncate, writer restore) that need
     /// the complete file set. Normal read scans leave this as `false`.
     scan_all_files: bool,
+    /// Whether each split must contain every file whose primary-key range overlaps.
+    merge_key_overlaps: bool,
     projected_read_field_ids: Option<HashSet<i32>>,
 }
 
@@ -1051,6 +1053,7 @@ impl<'a> PaimonTableScan<'a> {
             row_ranges,
             row_range_optimization_disabled: false,
             scan_all_files: false,
+            merge_key_overlaps: false,
             projected_read_field_ids: None,
         }
     }
@@ -1067,6 +1070,7 @@ impl<'a> PaimonTableScan<'a> {
 
     fn with_scan_all_files_preserving_projection(mut self) -> Self {
         self.scan_all_files = true;
+        self.merge_key_overlaps = true;
         self
     }
 
@@ -1930,16 +1934,17 @@ impl<'a> PaimonTableScan<'a> {
         // sort-merge reader sees every version of a key. The comparator decodes
         // the trimmed-PK min/max keys written by the kv writer.
         //
-        // Deletion-vector tables without merge-on-read and first-row tables read
-        // without merging (stale rows are masked by DVs / level-0 is skipped),
-        // so they keep plain size-based packing. DV merge-on-read includes L0
-        // files and must preserve overlapping key ranges just like ordinary MOR.
-        let read_merges_overlapping_keys = (!core_options.deletion_vectors_enabled()
-            || core_options.deletion_vectors_merge_on_read())
-            && !matches!(
-                core_options.merge_engine(),
-                Ok(crate::spec::MergeEngine::FirstRow)
-            );
+        // Deletion-vector tables without merge-on-read and ordinary first-row scans
+        // read without merging (stale rows are masked by DVs / level-0 is skipped),
+        // so they keep plain size-based packing. Audit scans merge every visible
+        // primary-key version, so they must keep overlapping ranges together.
+        let read_merges_overlapping_keys = self.merge_key_overlaps
+            || ((!core_options.deletion_vectors_enabled()
+                || core_options.deletion_vectors_merge_on_read())
+                && !matches!(
+                    core_options.merge_engine(),
+                    Ok(crate::spec::MergeEngine::FirstRow)
+                ));
         let pk_comparator = if read_merges_overlapping_keys {
             KeyComparator::from_table_schema(self.table.schema())
         } else {
@@ -2904,6 +2909,7 @@ mod tests {
             .with_scan_all_files_preserving_projection();
 
         assert!(scan.scan_all_files);
+        assert!(scan.merge_key_overlaps);
         assert_eq!(scan.projected_read_field_ids, Some(projected));
         assert!(
             scan.global_index_scan_settings(&CoreOptions::new(table.schema().options()), true,)

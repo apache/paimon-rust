@@ -32,7 +32,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use paimon::spec::{
-    BigIntType, CoreOptions, DataField, DataType, MergeEngine, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
 use paimon::table::Table;
 
@@ -384,21 +384,9 @@ impl PaimonScanBuilder<'_> {
         } else {
             (self.schema.clone(), read_fields)
         };
-        let first_row_audit = audit_log
-            && self
-                .table
-                .schema()
-                .core_options()
-                .merge_engine()
-                .map_err(to_datafusion_error)?
-                == MergeEngine::FirstRow;
         let splits = self.plan.into_splits();
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
             vec![Arc::from(Vec::new())]
-        } else if first_row_audit {
-            // ponytail: keep merge groups intact; add group-aware balancing if
-            // first-row audit parallelism becomes necessary.
-            vec![Arc::from(splits)]
         } else {
             let num_partitions = splits.len().min(self.target_partitions.max(1));
             bucket_round_robin(splits, num_partitions)
@@ -600,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn test_first_row_audit_keeps_split_group_in_one_partition() {
+    fn test_first_row_audit_distributes_independent_splits() {
         let file_io = paimon::io::FileIOBuilder::new("memory").build().unwrap();
         let schema = paimon::spec::Schema::builder()
             .column(
@@ -650,8 +638,11 @@ mod tests {
             .downcast_ref::<PaimonTableScan>()
             .expect("Expected PaimonTableScan");
 
-        assert_eq!(scan.planned_partitions().len(), 1);
-        assert_eq!(scan.planned_partitions()[0].len(), 2);
+        assert_eq!(scan.planned_partitions().len(), 2);
+        assert!(scan
+            .planned_partitions()
+            .iter()
+            .all(|splits| splits.len() == 1));
     }
 
     fn get_test_warehouse() -> String {
