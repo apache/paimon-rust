@@ -1439,13 +1439,14 @@ impl<'a> PaimonTableScan<'a> {
     /// `KeyValueFileReader`.
     ///
     /// Exempt (full predicates kept):
-    /// - Deletion-vector tables without merge-on-read: they read raw with
+    /// - Ordinary deletion-vector reads without merge-on-read: they read raw with
     ///   per-row masks, stats are a superset of live rows, full pruning stays
     ///   safe. With merge-on-read enabled, visible L0 versions require the
     ///   same key-only pruning rule as an ordinary PK merge read.
-    /// - Ordinary `merge-engine=first-row` reads: planned with
-    ///   `skip_level_zero` and read via `DataFileReader`. Audit reads use
-    ///   `scan_all_files` and merge visible versions, so they are not exempt.
+    /// - Non-audit `merge-engine=first-row` reads: read via `DataFileReader`
+    ///   without merging versions.
+    ///
+    /// Audit reads set `merge_key_overlaps` and are not exempt.
     fn stats_pruning_predicates(&self) -> Vec<Predicate> {
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema().options());
@@ -1458,8 +1459,8 @@ impl<'a> PaimonTableScan<'a> {
             Ok(crate::spec::MergeEngine::FirstRow)
         );
         if has_primary_keys
-            && (!deletion_vectors_enabled || deletion_vectors_merge_on_read)
-            && (!first_row || self.scan_all_files)
+            && (self.merge_key_overlaps
+                || ((!deletion_vectors_enabled || deletion_vectors_merge_on_read) && !first_row))
         {
             retain_primary_key_conjuncts(
                 &self.data_predicates,
@@ -3764,6 +3765,65 @@ mod tests {
                 .sum::<usize>(),
             2,
             "both key versions must reach the merge path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dv_without_mor_audit_stats_pruning_ignores_non_key_conjuncts() {
+        let table_path = "memory:/test_dv_audit_stats_gate";
+        let table = pk_stats_gate_table(table_path).copy_with_options(HashMap::from([
+            ("deletion-vectors.enabled".to_string(), "true".to_string()),
+            (
+                "deletion-vectors.merge-on-read".to_string(),
+                "false".to_string(),
+            ),
+        ]));
+        setup_scan_trace_dirs(&table).await;
+
+        let mut old = pk_stats_file("old-version.parquet", (1, 5), (100, 200));
+        old.level = 1;
+        let mut new = pk_stats_file("new-version.parquet", (1, 5), (10, 60));
+        new.level = 1;
+        TableCommit::new(table.clone(), "dv-audit-gate-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![old, new],
+            )])
+            .await
+            .unwrap();
+
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ];
+        let value_filter = PredicateBuilder::new(&fields)
+            .greater_than("value", Datum::Int(90))
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_filter(value_filter);
+
+        let (ordinary_plan, ordinary_trace) = reader.new_scan().plan_with_trace().await.unwrap();
+        assert!(ordinary_trace.manifest_entries_pruned_by_data_stats >= 1);
+        assert_eq!(
+            ordinary_plan
+                .splits()
+                .iter()
+                .map(|split| split.data_files().len())
+                .sum::<usize>(),
+            1
+        );
+
+        let (audit_plan, audit_trace) = reader.new_audit_scan().plan_with_trace().await.unwrap();
+        assert_eq!(audit_trace.manifest_entries_pruned_by_data_stats, 0);
+        assert_eq!(
+            audit_plan
+                .splits()
+                .iter()
+                .map(|split| split.data_files().len())
+                .sum::<usize>(),
+            2,
+            "both key versions must reach the audit merge path"
         );
     }
 

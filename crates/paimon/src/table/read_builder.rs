@@ -511,16 +511,10 @@ impl<'a> PaimonReadBuilder<'a> {
         let core_options = self.table.schema.core_options();
         core_options.ensure_read_authorized()?;
         let audit_projection = self.resolve_read_type()?;
-        let mut read_type = match &audit_projection {
+        let read_type = match &audit_projection {
             None => self.table.schema.fields().to_vec(),
             Some(fields) => fields.clone(),
         };
-        read_type.retain(|field| {
-            !matches!(
-                field.id(),
-                crate::spec::ROW_KIND_FIELD_ID | crate::spec::SEQUENCE_NUMBER_FIELD_ID
-            )
-        });
 
         // Pass the FULL data predicate through (including `And`/`Or`/`Not`).
         // Pushdown/stats skip compound nodes; the residual pass enforces the full

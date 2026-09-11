@@ -412,7 +412,7 @@ impl<'a> PaimonTableRead<'a> {
         let output_read_type = self.audit_read_type()?;
         let include_rowkind = audit_field_requested(&output_read_type, ROW_KIND_FIELD_ID);
         let include_sequence = audit_field_requested(&output_read_type, SEQUENCE_NUMBER_FIELD_ID);
-        let user_read_type = self.read_type.clone();
+        let user_read_type = self.audit_user_read_type();
         let audit_schema =
             audit_schema_for_read_type(&user_read_type, include_rowkind, include_sequence)?;
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
@@ -547,6 +547,14 @@ impl<'a> PaimonTableRead<'a> {
         Ok(fields)
     }
 
+    fn audit_user_read_type(&self) -> Vec<DataField> {
+        self.read_type
+            .iter()
+            .filter(|field| !matches!(field.id(), ROW_KIND_FIELD_ID | SEQUENCE_NUMBER_FIELD_ID))
+            .cloned()
+            .collect()
+    }
+
     fn audit_raw_stream(
         &self,
         plan: &IncrementalPlan,
@@ -556,7 +564,7 @@ impl<'a> PaimonTableRead<'a> {
         let core_options = self.table.schema().core_options();
         let data_splits = plan.data_splits();
         let output_read_type = self.audit_read_type()?;
-        let user_read_type = self.read_type.clone();
+        let user_read_type = self.audit_user_read_type();
         let include_rowkind = audit_field_requested(&output_read_type, ROW_KIND_FIELD_ID);
         let include_sequence = audit_field_requested(&output_read_type, SEQUENCE_NUMBER_FIELD_ID);
         let audit_schema =
@@ -610,7 +618,7 @@ impl<'a> PaimonTableRead<'a> {
         let output_read_type = self.audit_read_type()?;
         let include_sequence = audit_field_requested(&output_read_type, SEQUENCE_NUMBER_FIELD_ID);
         let table = self.table.clone();
-        let read_type = self.read_type.clone();
+        let read_type = self.audit_user_read_type();
         let data_predicates = self.data_predicates.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
 

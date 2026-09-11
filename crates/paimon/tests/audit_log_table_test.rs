@@ -20,8 +20,8 @@ mod common;
 use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use paimon::spec::{
-    DataType, IntType, Schema, TableSchema, VarCharType, ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME,
-    SEQUENCE_NUMBER_FIELD_NAME,
+    BigIntType, DataField, DataType, IntType, Schema, TableSchema, VarCharType, ROW_KIND_FIELD_ID,
+    ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
 };
 use paimon::table::{AuditLogTable, IncrementalPlan, IncrementalScanMode, IncrementalSplit};
 
@@ -318,6 +318,60 @@ async fn audit_log_exposes_sequence_number_when_enabled() {
     let rows = collect_audit_rows_with_sequence(&batches);
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|(_, seq, _, _)| *seq >= 0));
+}
+
+#[tokio::test]
+async fn ordinary_read_projection_keeps_sequence_number() {
+    let table_path = "memory:/audit_log/ordinary_sequence_projection";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+            ("table-read.sequence-number.enabled", "true"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+
+    let mut builder = table.new_read_builder();
+    builder.with_read_type(vec![
+        DataField::new(
+            SEQUENCE_NUMBER_FIELD_ID,
+            SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+            DataType::BigInt(BigIntType::new()),
+        ),
+        table.schema().fields()[0].clone(),
+    ]);
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        vec![SEQUENCE_NUMBER_FIELD_NAME, "id"]
+    );
+    assert_eq!(
+        batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
 }
 
 #[tokio::test]
