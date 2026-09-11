@@ -43,6 +43,7 @@ mod catalog;
 mod delete;
 mod error;
 mod filter_pushdown;
+mod format_partition_analyze;
 mod format_partition_ddl;
 mod format_partition_repair;
 #[cfg(feature = "fulltext")]

@@ -107,29 +107,22 @@ impl<'a> FormatTableScan<'a> {
                 let partition_levels_below_root = partition_fields
                     .len()
                     .saturating_sub(root_segments.len().saturating_sub(table_depth));
-                let statuses = self
-                    .list_status_recursive_if_exists(&scan_root.path)
-                    .await?;
+                let files = list_format_table_data_files(
+                    self.table.file_io(),
+                    &scan_root.path,
+                    partition_levels_below_root,
+                    format_extension,
+                )
+                .await?;
                 let mut splits = Vec::new();
-                for status in statuses {
-                    if is_hidden_below_partitions(
-                        &root_segments,
-                        partition_levels_below_root,
-                        &status.path,
-                    ) {
-                        continue;
-                    }
-                    if let Some(split) = self
-                        .status_to_split(
-                            status,
-                            table_path,
-                            format_extension,
-                            schema_id,
-                            partition_fields,
-                            scan_root.partition.clone(),
-                        )
-                        .await?
-                    {
+                for status in files {
+                    if let Some(split) = self.status_to_split(
+                        status,
+                        table_path,
+                        schema_id,
+                        partition_fields,
+                        scan_root.partition.clone(),
+                    )? {
                         splits.push(split);
                     }
                 }
@@ -363,27 +356,11 @@ impl<'a> FormatTableScan<'a> {
         }
     }
 
-    async fn list_status_recursive_if_exists(
-        &self,
-        path: &str,
-    ) -> crate::Result<Vec<crate::io::FileStatus>> {
-        match self.table.file_io().list_status_recursive(path).await {
-            Ok(statuses) => Ok(statuses),
-            Err(err) => {
-                if !self.table.file_io().exists(path).await.unwrap_or(true) {
-                    Ok(Vec::new())
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-
-    async fn status_to_split(
+    /// The split reading one file that [`list_format_table_data_files`] returned.
+    fn status_to_split(
         &self,
         status: crate::io::FileStatus,
         table_path: &str,
-        format_extension: &str,
         schema_id: i64,
         partition_fields: &[DataField],
         known_partition: BinaryRow,
@@ -393,17 +370,6 @@ impl<'a> FormatTableScan<'a> {
         };
         let parent = parent.to_string();
         let file_name = file_name.to_string();
-        if !is_format_table_data_file_name(&file_name) {
-            return Ok(None);
-        }
-        if !file_name.to_ascii_lowercase().ends_with(format_extension) {
-            return Ok(None);
-        }
-        let status = if status.size == 0 {
-            self.table.file_io().get_status(&status.path).await?
-        } else {
-            status
-        };
         let file_size = i64::try_from(status.size).map_err(|_| crate::Error::DataInvalid {
             message: format!(
                 "Format table file '{}' is too large to fit in i64 metadata",
@@ -481,6 +447,51 @@ struct ScanRoot {
 
 fn is_format_table_data_file_name(file_name: &str) -> bool {
     !file_name.is_empty() && !file_name.starts_with('.') && !file_name.starts_with('_')
+}
+
+/// The data files a Format Table scan reads below `root`: files whose own name is not hidden and
+/// ends with the format's extension, outside any entry that [`is_hidden_below_partitions`] skips.
+/// `partition_levels_below_root` is how many partition levels still lie under `root`.
+///
+/// A root that does not exist holds no files. Any other listing failure is returned, since a
+/// partial listing cannot be told apart from a partition that lost files. `ANALYZE TABLE`
+/// measures a partition through this listing, so it counts exactly the files a scan reads.
+pub(crate) async fn list_format_table_data_files(
+    file_io: &crate::io::FileIO,
+    root: &str,
+    partition_levels_below_root: usize,
+    format_extension: &str,
+) -> crate::Result<Vec<crate::io::FileStatus>> {
+    let statuses = match file_io.list_status_recursive(root).await {
+        Ok(statuses) => statuses,
+        Err(error) => {
+            if !file_io.exists(root).await.unwrap_or(true) {
+                return Ok(Vec::new());
+            }
+            return Err(error);
+        }
+    };
+    let root_segments = path_segments(root);
+    let mut files = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        if is_hidden_below_partitions(&root_segments, partition_levels_below_root, &status.path) {
+            continue;
+        }
+        let is_data_file = split_parent_and_file(&status.path).is_some_and(|(_, file_name)| {
+            is_format_table_data_file_name(file_name)
+                && file_name.to_ascii_lowercase().ends_with(format_extension)
+        });
+        if !is_data_file {
+            continue;
+        }
+        let status = if status.size == 0 {
+            file_io.get_status(&status.path).await?
+        } else {
+            status
+        };
+        files.push(status);
+    }
+    Ok(files)
 }
 
 /// Whether a listed file is, or lies inside, an entry whose name starts with `.` or `_` below
@@ -843,7 +854,7 @@ fn supported_format_table_formats() -> Vec<&'static str> {
     ]
 }
 
-fn supported_format_table_extension(format: &str) -> crate::Result<&'static str> {
+pub(crate) fn supported_format_table_extension(format: &str) -> crate::Result<&'static str> {
     match format.to_ascii_lowercase().as_str() {
         "parquet" => Ok(".parquet"),
         "orc" => Ok(".orc"),
@@ -1090,6 +1101,50 @@ mod tests {
         assert_eq!(
             planned_files(&table, Some(null_partition)).await,
             vec!["__DEFAULT_PARTITION__/part-0.parquet"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_data_file_listing_returns_what_a_partition_scan_reads() {
+        let table = format_table("memory:/data_file_listing", &["dt"], &[]);
+        write_files(
+            &table,
+            &[
+                "dt=a/part-0.parquet",
+                "dt=a/_temporary/0/part-1.parquet",
+                "dt=a/__magic_job_1/tasks/part-2.parquet",
+                "dt=a/.part-3.parquet",
+                "dt=a/_SUCCESS",
+                "dt=a/notes.txt",
+            ],
+        )
+        .await;
+        let file_names = |files: Vec<crate::io::FileStatus>| {
+            files
+                .iter()
+                .filter_map(|file| {
+                    split_parent_and_file(&file.path).map(|(_, name)| name.to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let partition = format!("{}/dt=a", table.location());
+        let listed = list_format_table_data_files(table.file_io(), &partition, 0, ".parquet")
+            .await
+            .unwrap();
+        assert_eq!(file_names(listed), vec!["part-0.parquet"]);
+        assert_eq!(
+            planned_files(&table, Some(partition_set(&table, &[&[Some("a")]]))).await,
+            vec!["dt=a/part-0.parquet"]
+        );
+
+        // A partition whose directory is gone holds no files rather than failing the listing.
+        let missing = format!("{}/dt=b", table.location());
+        assert!(
+            list_format_table_data_files(table.file_io(), &missing, 0, ".parquet")
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -436,7 +436,6 @@ impl SQLContext {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn dynamic_options(&self) -> &DynamicOptions {
         &self.dynamic_options
     }
@@ -611,6 +610,14 @@ impl SQLContext {
                     .await
             }
             Statement::Msck(msck) => crate::format_partition_repair::execute_msck(self, msck).await,
+            Statement::Analyze(analyze) => {
+                crate::format_partition_analyze::execute_analyze(
+                    self,
+                    analyze,
+                    enable_ident_normalization,
+                )
+                .await
+            }
             Statement::CreateView(create_view) => {
                 if create_view.temporary {
                     // Temporary views are always handled by us (Paimon catalog temp storage)
