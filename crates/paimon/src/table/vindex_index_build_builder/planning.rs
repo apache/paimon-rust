@@ -73,7 +73,7 @@ pub(super) fn plan_ivf_training_ranges(
         });
     }
     let range_count = training_rows.div_ceil(MAX_IVF_TRAINING_RANGE_ROWS);
-    if range_count > MAX_IVF_TRAINING_RANGES {
+    if range_count == 1 || range_count > MAX_IVF_TRAINING_RANGES {
         return Ok(None);
     }
     let seed = ivf_training_seed(shard);

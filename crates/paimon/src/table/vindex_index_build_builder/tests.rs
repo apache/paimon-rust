@@ -152,7 +152,7 @@ fn test_ivf_training_ranges_are_bounded_and_exact() {
     .unwrap()
     .remove(0);
 
-    for training_rows in [1, 63, 64, 65, 200, 899] {
+    for training_rows in [129, 200, 899] {
         let ranges = plan_ivf_training_ranges(&shard, training_rows)
             .unwrap()
             .expect("sparse ranges expected");
@@ -184,6 +184,18 @@ fn test_ivf_training_ranges_are_bounded_and_exact() {
             .unwrap()
             .expect("sparse ranges expected")
     );
+}
+
+#[test]
+fn test_ivf_training_ranges_fall_back_for_a_single_range_sample() {
+    let shard = plan(
+        vec![manifest_entry(data_file("a", Some(100), 1_000))],
+        1_000,
+    )
+    .unwrap()
+    .remove(0);
+
+    assert!(plan_ivf_training_ranges(&shard, 128).unwrap().is_none());
 }
 
 #[test]
@@ -727,19 +739,27 @@ async fn vindex_second_build_without_new_data_is_noop() {
 #[tokio::test]
 async fn vindex_incremental_build_indexes_only_new_rows() {
     let table_path = "memory:/test_vindex_incremental";
-    let table = vindex_e2e_table(table_path, "10");
+    let mut options = vindex_e2e_options("2048");
+    options.insert("ivf-flat.dimension".to_string(), "4096".to_string());
+    options.insert("ivf-flat.nlist".to_string(), "3".to_string());
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        table_path,
+        vindex_schema_builder(options).build().unwrap(),
+    );
     setup_dirs(table.file_io(), table_path).await;
 
     // Build #1 over the initial batch via a real end-to-end build.
     write_vectors(
         &table,
-        vec![0, 1, 2, 3],
-        vec![
-            vec![1.0, 0.0],
-            vec![0.0, 1.0],
-            vec![1.0, 1.0],
-            vec![2.0, 1.0],
-        ],
+        (0..1024).collect(),
+        (0..1024)
+            .map(|id| {
+                (0..4096)
+                    .map(|component| (id * 4096 + component) as f32)
+                    .collect()
+            })
+            .collect(),
     )
     .await;
     let first_built = table
@@ -747,7 +767,7 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
         .with_index_column("embedding")
         .with_options(HashMap::from([(
             "ivf-flat.train.sample-ratio".to_string(),
-            "0.5".to_string(),
+            "0.2".to_string(),
         )]))
         .execute()
         .await
@@ -769,8 +789,14 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     // Append a second batch (new row-ids [n..]).
     write_vectors(
         &table,
-        vec![4, 5, 6],
-        vec![vec![2.0, 0.0], vec![0.0, 2.0], vec![2.0, 2.0]],
+        vec![1024, 1025, 1026],
+        (1024..1027)
+            .map(|id| {
+                (0..4096)
+                    .map(|component| (id * 4096 + component) as f32)
+                    .collect()
+            })
+            .collect(),
     )
     .await;
 
