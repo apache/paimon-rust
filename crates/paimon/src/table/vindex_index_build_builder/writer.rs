@@ -26,7 +26,7 @@ use super::validation::{
     checked_training_vector_count, checked_vector_bytes,
 };
 use super::VindexIndexBuildBuilder;
-use crate::arrow::format::parquet::has_usable_offset_index;
+use crate::arrow::format::parquet::has_beneficial_offset_index;
 use crate::spec::{GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME};
 use crate::table::data_file_reader::DataFileReadTiming;
 use crate::table::table_read::configured_parquet_read_budget;
@@ -170,7 +170,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                             Some(timing) => timing.wrap_reader(reader),
                             None => reader,
                         };
-                        has_usable_offset_index(reader, file_size, index_column, &local_ranges)
+                        has_beneficial_offset_index(reader, file_size, index_column, &local_ranges)
                             .await
                     })
                     .buffer_unordered(concurrency);
@@ -183,7 +183,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             }
             if !usable || !found_vector_file {
                 log::warn!(
-                    "vindex sparse training read is unavailable for column '{}' in shard [{}, {}]; falling back to a full scan (usable_offset_indexes={usable}, found_vector_file={found_vector_file})",
+                    "vindex sparse training read is unavailable for column '{}' in shard [{}, {}]; falling back to a full scan (beneficial_offset_indexes={usable}, found_vector_file={found_vector_file})",
                     index_column,
                     shard.row_range_start,
                     shard.row_range_end,
