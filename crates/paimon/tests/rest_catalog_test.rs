@@ -283,6 +283,51 @@ async fn test_rest_catalog_sends_partition_statistics_with_their_batch() {
 }
 
 #[tokio::test]
+async fn test_rest_catalog_refuses_a_partition_registered_twice_with_statistics() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server.add_table("default", "managed_table");
+    // The first and the last spec name the same partition, so they land in different batches.
+    let mut specs = (0..1000)
+        .map(|value| HashMap::from([("dt".to_string(), value.to_string())]))
+        .collect::<Vec<_>>();
+    specs.push(specs[0].clone());
+    let additive = PartitionStatistics {
+        spec: specs[0].clone(),
+        record_count: 7,
+        file_size_in_bytes: 70,
+        file_count: 1,
+        last_file_creation_time: 4,
+        total_buckets: -1,
+    };
+
+    // Both batches would carry the one report, and an additive catalog would apply it twice.
+    let error = ctx
+        .catalog
+        .create_partitions_with_statistics(
+            &identifier,
+            specs.clone(),
+            true,
+            Some(vec![additive]),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::DataInvalid { message, .. } if message.contains("registered twice")),
+        "{error}"
+    );
+    assert!(ctx.server.create_partitions_calls().is_empty());
+
+    // Without statistics a repeated spec carries nothing that could be counted twice.
+    ctx.catalog
+        .create_partitions(&identifier, specs, true)
+        .await
+        .unwrap();
+    assert_eq!(ctx.server.create_partitions_calls().len(), 2);
+}
+
+#[tokio::test]
 async fn test_rest_catalog_maps_create_partition_conflict() {
     let ctx = setup_catalog(vec!["default"]).await;
     let identifier = Identifier::new("default", "managed_table");

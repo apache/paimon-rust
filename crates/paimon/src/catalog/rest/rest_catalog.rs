@@ -578,18 +578,32 @@ fn spec_key(spec: &HashMap<String, String>) -> Vec<(String, String)> {
     entries
 }
 
-/// Index reported statistics by the spec they describe, rejecting a report for a partition that
-/// is not being created and a partition reported twice: the catalog cannot tell which of two
-/// reports is meant.
+/// Index reported statistics by the spec they describe, before anything is sent.
+///
+/// A partition registered twice is rejected: every occurrence would carry the same report, so a
+/// spec repeated across batches would have an additive report applied once per batch. A report
+/// for a partition that is not being created and a partition reported twice are rejected too: the
+/// catalog cannot tell which of two reports is meant.
+///
+/// Mirrors Java `CatalogFormatTablePartitionManager.validateAndIndexStatistics`.
 fn index_statistics_by_spec(
     identifier: &Identifier,
     partition_specs: &[HashMap<String, String>],
     statistics: Vec<PartitionStatistics>,
 ) -> Result<HashMap<Vec<(String, String)>, PartitionStatistics>> {
-    let requested = partition_specs
-        .iter()
-        .map(spec_key)
-        .collect::<std::collections::HashSet<_>>();
+    let mut requested = std::collections::HashSet::with_capacity(partition_specs.len());
+    for spec in partition_specs {
+        if !requested.insert(spec_key(spec)) {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Partition {spec:?} of table {} is registered twice in one request that \
+                     reports statistics; report each partition once",
+                    identifier.full_name()
+                ),
+                source: None,
+            });
+        }
+    }
     let mut by_spec = HashMap::with_capacity(statistics.len());
     for statistic in statistics {
         let key = spec_key(&statistic.spec);
