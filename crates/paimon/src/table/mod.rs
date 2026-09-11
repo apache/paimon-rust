@@ -152,7 +152,7 @@ pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
 pub use table_commit::TableCommit;
-pub use table_read::TableRead;
+pub use table_read::{AuditLogInput, TableRead};
 pub use table_scan::TableScan;
 pub use table_update::TableUpdate;
 pub use table_write::TableWrite;

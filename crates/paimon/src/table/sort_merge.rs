@@ -40,7 +40,7 @@ use futures::StreamExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // MergeFunction
@@ -141,6 +141,39 @@ pub(crate) trait MergeFunction: Send + Sync {
 /// Filters out DELETE and UPDATE_BEFORE rows.
 pub(crate) struct DeduplicateMergeFunction;
 
+/// Configured deduplicate merge used when deletes must be kept or ignored.
+pub(crate) struct ConfiguredDeduplicateMergeFunction {
+    keep_delete: bool,
+    ignore_delete: bool,
+}
+
+impl ConfiguredDeduplicateMergeFunction {
+    pub(crate) fn new(table_options: &HashMap<String, String>, keep_delete: bool) -> Self {
+        Self {
+            keep_delete,
+            ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+        }
+    }
+}
+
+/// First-row merge used when audit reads disable the normal raw-file shortcut.
+pub(crate) struct FirstRowMergeFunction {
+    ignore_delete: bool,
+}
+
+impl FirstRowMergeFunction {
+    pub(crate) fn new(table_options: &HashMap<String, String>) -> Self {
+        Self {
+            ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+        }
+    }
+}
+
+fn insert_value_kind_array() -> ArrayRef {
+    static INSERT: OnceLock<ArrayRef> = OnceLock::new();
+    Arc::clone(INSERT.get_or_init(|| Arc::new(Int8Array::from(vec![0]))))
+}
+
 fn compare_sequence_order(lhs: &MergeRow, rhs: &MergeRow) -> Ordering {
     match (lhs.user_sequences.is_empty(), rhs.user_sequences.is_empty()) {
         (false, false) => lhs
@@ -151,6 +184,32 @@ fn compare_sequence_order(lhs: &MergeRow, rhs: &MergeRow) -> Ordering {
     }
 }
 
+fn deduplicate(
+    rows: &[MergeRow],
+    keep_delete: bool,
+    ignore_delete: bool,
+) -> crate::Result<MergeResult> {
+    let mut winner = None;
+    for row in rows {
+        if ignore_delete && !RowKind::from_value(row.value_kind)?.is_add() {
+            continue;
+        }
+        if winner.is_none_or(|best| compare_sequence_order(row, best).is_ge()) {
+            winner = Some(row);
+        }
+    }
+    let Some(winner) = winner else {
+        return Ok(MergeResult::Omit);
+    };
+    if !keep_delete && !RowKind::from_value(winner.value_kind)?.is_add() {
+        return Ok(MergeResult::Omit);
+    }
+    Ok(MergeResult::SourceRow {
+        batch_idx: winner.batch_idx,
+        row_idx: winner.row_idx,
+    })
+}
+
 impl MergeFunction for DeduplicateMergeFunction {
     fn merge(
         &self,
@@ -159,26 +218,51 @@ impl MergeFunction for DeduplicateMergeFunction {
         _source_output_col_indices: &[usize],
         _output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
-        let winner = rows
-            .iter()
-            .reduce(|best, r| {
-                let ord = compare_sequence_order(r, best);
-                // >= semantics: last-writer-wins for equal values.
-                if ord.is_ge() {
-                    r
-                } else {
-                    best
+        deduplicate(rows, false, false)
+    }
+}
+
+impl MergeFunction for ConfiguredDeduplicateMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        _batch_buffer: &[BufferedBatch],
+        _source_output_col_indices: &[usize],
+        _output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        deduplicate(rows, self.keep_delete, self.ignore_delete)
+    }
+}
+
+impl MergeFunction for FirstRowMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        _batch_buffer: &[BufferedBatch],
+        _source_output_col_indices: &[usize],
+        _output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        let mut first = None;
+        for row in rows {
+            if !RowKind::from_value(row.value_kind)?.is_add() {
+                if self.ignore_delete {
+                    continue;
                 }
-            })
-            .expect("merge called with empty rows");
-        if RowKind::from_value(winner.value_kind)?.is_add() {
-            Ok(MergeResult::SourceRow {
-                batch_idx: winner.batch_idx,
-                row_idx: winner.row_idx,
-            })
-        } else {
-            Ok(MergeResult::Omit)
+                return Err(Error::Unsupported {
+                    message: "merge-engine=first-row does not support DELETE or UPDATE_BEFORE rows; set ignore-delete=true to ignore them".to_string(),
+                });
+            }
+            if first.is_none_or(|current| compare_sequence_order(row, current).is_lt()) {
+                first = Some(row);
+            }
         }
+        Ok(match first {
+            Some(row) => MergeResult::SourceRow {
+                batch_idx: row.batch_idx,
+                row_idx: row.row_idx,
+            },
+            None => MergeResult::Omit,
+        })
     }
 }
 
@@ -194,6 +278,7 @@ impl MergeFunction for DeduplicateMergeFunction {
 #[derive(Debug)]
 pub(crate) struct PartialUpdateMergeFunction {
     ignore_delete: bool,
+    value_kind_index: Option<usize>,
     sequence_groups: Vec<RuntimeSequenceGroup>,
     grouped_fields: HashSet<usize>,
     aggregators: Option<Mutex<FieldAggregatorSlots>>,
@@ -216,6 +301,7 @@ impl PartialUpdateMergeFunction {
         PartialUpdateConfig::new(table_options).validate_write_mode(true, table_name)?;
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            value_kind_index: None,
             sequence_groups: Vec::new(),
             grouped_fields: HashSet::new(),
             aggregators: None,
@@ -302,6 +388,9 @@ impl PartialUpdateMergeFunction {
 
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            value_kind_index: output_fields
+                .iter()
+                .position(|field| field.id() == crate::spec::VALUE_KIND_FIELD_ID),
             sequence_groups,
             grouped_fields,
             aggregators: aggregators
@@ -364,7 +453,9 @@ impl MergeFunction for PartialUpdateMergeFunction {
             saw_add = true;
 
             for (output_col_idx, selected) in selected_by_col.iter_mut().enumerate() {
-                if self.grouped_fields.contains(&output_col_idx) {
+                if self.value_kind_index == Some(output_col_idx)
+                    || self.grouped_fields.contains(&output_col_idx)
+                {
                     continue;
                 }
                 let source_array = batch_buffer[row.batch_idx]
@@ -442,18 +533,22 @@ impl MergeFunction for PartialUpdateMergeFunction {
             .iter()
             .enumerate()
             .map(|(output_col_idx, field)| {
-                let column = match aggregators
-                    .as_ref()
-                    .and_then(|aggregators| aggregators.get(output_col_idx))
-                    .and_then(Option::as_ref)
-                {
-                    Some(aggregator) => aggregator.result()?,
-                    None => match selected_by_col[output_col_idx] {
-                        Some((batch_idx, row_idx)) => batch_buffer[batch_idx]
-                            .column_for_output(output_col_idx, source_output_col_indices)
-                            .slice(row_idx, 1),
-                        None => new_null_array(field.data_type(), 1),
-                    },
+                let column = if self.value_kind_index == Some(output_col_idx) {
+                    insert_value_kind_array()
+                } else {
+                    match aggregators
+                        .as_ref()
+                        .and_then(|aggregators| aggregators.get(output_col_idx))
+                        .and_then(Option::as_ref)
+                    {
+                        Some(aggregator) => aggregator.result()?,
+                        None => match selected_by_col[output_col_idx] {
+                            Some((batch_idx, row_idx)) => batch_buffer[batch_idx]
+                                .column_for_output(output_col_idx, source_output_col_indices)
+                                .slice(row_idx, 1),
+                            None => new_null_array(field.data_type(), 1),
+                        },
+                    }
                 };
                 if !field.is_nullable() && column.is_null(0) {
                     return Err(Error::DataInvalid {
@@ -551,6 +646,7 @@ pub(crate) struct AggregateMergeFunction {
     /// One slot per output column.  `None` marks primary-key columns that are
     /// copied through; `Some` holds the aggregator that owns the column.
     aggregators: Mutex<Vec<Option<Box<dyn FieldAggregator>>>>,
+    value_kind_index: Option<usize>,
 }
 
 impl AggregateMergeFunction {
@@ -580,7 +676,12 @@ impl AggregateMergeFunction {
             .iter()
             .map(|field| -> crate::Result<Option<Box<dyn FieldAggregator>>> {
                 let name = field.name();
-                let agg_name: &str = if seq_set.contains(name) {
+                if field.id() == crate::spec::VALUE_KIND_FIELD_ID {
+                    return Ok(None);
+                }
+                let agg_name: &str = if field.id() == crate::spec::SEQUENCE_NUMBER_FIELD_ID
+                    || seq_set.contains(name)
+                {
                     "last_value"
                 } else if pk_set.contains(name) {
                     return Ok(None);
@@ -602,6 +703,9 @@ impl AggregateMergeFunction {
 
         Ok(Self {
             aggregators: Mutex::new(aggregators),
+            value_kind_index: output_fields
+                .iter()
+                .position(|field| field.id() == crate::spec::VALUE_KIND_FIELD_ID),
         })
     }
 }
@@ -673,6 +777,9 @@ impl MergeFunction for AggregateMergeFunction {
             .iter()
             .enumerate()
             .map(|(col_idx, slot)| -> crate::Result<ArrayRef> {
+                if self.value_kind_index == Some(col_idx) {
+                    return Ok(insert_value_kind_array());
+                }
                 match slot {
                     Some(agg) => agg.result(),
                     None => Ok(batch_buffer[pk_source.batch_idx]

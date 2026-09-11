@@ -16,7 +16,7 @@
 // under the License.
 
 use super::incremental_scan::{IncrementalPlan, IncrementalScan, IncrementalScanMode};
-use super::{ArrowRecordBatchStream, Table};
+use super::{ArrowRecordBatchStream, DataSplit, Table, TableScan};
 use crate::spec::{
     BigIntType, DataField, DataType, VarCharType, ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME,
     SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
@@ -32,8 +32,6 @@ use crate::spec::{
 pub struct AuditLogTable {
     wrapped: Table,
 }
-
-const TABLE_READ_SEQUENCE_NUMBER_ENABLED: &str = "table-read.sequence-number.enabled";
 
 impl AuditLogTable {
     pub fn new(wrapped: Table) -> Self {
@@ -66,9 +64,8 @@ impl AuditLogTable {
     fn sequence_number_enabled(&self) -> bool {
         self.wrapped
             .schema()
-            .options()
-            .get(TABLE_READ_SEQUENCE_NUMBER_ENABLED)
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            .core_options()
+            .table_read_sequence_number_enabled()
     }
 
     pub fn new_incremental_scan(
@@ -80,9 +77,25 @@ impl AuditLogTable {
         IncrementalScan::for_table(&self.wrapped, mode, start_exclusive, end_inclusive)
     }
 
+    /// Plan a current-state audit read for [`Self::to_arrow_for_splits`].
+    pub fn new_scan(&self) -> TableScan<'_> {
+        self.wrapped.new_read_builder().new_audit_scan()
+    }
+
     pub fn to_arrow(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
         plan.validate()?;
         let read = self.wrapped.new_read_builder().new_read()?;
         read.to_audit_log_arrow(plan)
+    }
+
+    /// Reads the current table state, retaining retract rows for primary-key tables.
+    pub fn to_arrow_for_splits(
+        &self,
+        splits: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.wrapped
+            .new_read_builder()
+            .new_read()?
+            .to_audit_log_arrow(splits)
     }
 }

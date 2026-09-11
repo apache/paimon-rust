@@ -20,6 +20,7 @@
 //! Mirrors Java [SystemTableLoader](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/system/SystemTableLoader.java):
 //! `TABLES` maps each system-table name to its builder function.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::datasource::TableProvider;
@@ -29,6 +30,7 @@ use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
 
+mod audit_log;
 mod branches;
 mod consumers;
 mod files;
@@ -49,6 +51,7 @@ type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 // in `load` because it needs the catalog handle (for metastore-tracked audit
 // metadata via `Catalog::list_partitions`).
 const TABLES: &[(&str, Builder)] = &[
+    ("audit_log", audit_log::build),
     ("branches", branches::build),
     ("consumers", consumers::build),
     ("files", files::build),
@@ -63,6 +66,7 @@ const TABLES: &[(&str, Builder)] = &[
 ];
 
 const SYSTEM_TABLE_NAMES: &[&str] = &[
+    "audit_log",
     "branches",
     "consumers",
     "files",
@@ -75,6 +79,21 @@ const SYSTEM_TABLE_NAMES: &[&str] = &[
     "snapshots",
     "table_indexes",
     "tags",
+];
+
+// Reject system tables whose contents can expose protected table data or
+// persisted credentials until Rust can apply row filters and column masks.
+const QUERY_AUTH_UNSUPPORTED_TABLES: &[&str] = &[
+    "audit_log",
+    "files",
+    "file_key_ranges",
+    "binlog",
+    "statistics",
+    "options",
+    "schemas",
+    "partitions",
+    "manifests",
+    "table_indexes",
 ];
 
 /// Parse a Paimon object name into table, branch, and optional system table.
@@ -124,6 +143,21 @@ fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dy
         .map(|(_, build)| build(base_table))
 }
 
+fn ensure_system_table_read_supported(
+    options: &HashMap<String, String>,
+    name: &str,
+) -> DFResult<()> {
+    if QUERY_AUTH_UNSUPPORTED_TABLES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    {
+        paimon::spec::CoreOptions::new(options)
+            .ensure_read_authorized()
+            .map_err(to_datafusion_error)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn provider_for_table(
     catalog: Arc<dyn Catalog>,
     identifier: Identifier,
@@ -133,10 +167,8 @@ pub(crate) fn provider_for_table(
     if !is_registered(system_name) {
         return Ok(None);
     }
-    // Fail closed: system tables expose file metadata the client can't authorize.
-    paimon::spec::CoreOptions::new(table.schema().options())
-        .ensure_read_authorized()
-        .map_err(to_datafusion_error)?;
+    crate::table_loader::ensure_paimon_served(&table, &identifier)?;
+    ensure_system_table_read_supported(table.schema().options(), system_name)?;
     if system_name.eq_ignore_ascii_case("partitions") {
         return partitions::build(catalog, identifier, table).map(Some);
     }
@@ -156,13 +188,25 @@ pub(crate) async fn load(
     database: String,
     object: ParsedObjectName,
     system_name: String,
+    dynamic_options: HashMap<String, String>,
 ) -> DFResult<Option<Arc<dyn TableProvider>>> {
     if !is_registered(&system_name) {
         return Ok(None);
     }
+    if system_name.eq_ignore_ascii_case("audit_log")
+        && paimon::spec::CoreOptions::new(&dynamic_options).table_read_sequence_number_enabled()
+    {
+        return Err(DataFusionError::Plan(
+            "table-read.sequence-number.enabled is not supported by dynamic options for $audit_log"
+                .to_string(),
+        ));
+    }
+    ensure_system_table_read_supported(&dynamic_options, &system_name)?;
     let identifier = Identifier::new(database, object.table().to_string());
     match catalog.get_table(&identifier).await {
         Ok(mut table) => {
+            crate::table_loader::ensure_paimon_served(&table, &identifier)?;
+            ensure_system_table_read_supported(table.schema().options(), &system_name)?;
             if let Some(branch) = object.branch() {
                 if !system_name.eq_ignore_ascii_case("branches") {
                     table = table
@@ -170,6 +214,12 @@ pub(crate) async fn load(
                         .await
                         .map_err(to_datafusion_error)?;
                 }
+            }
+            if system_name.eq_ignore_ascii_case("audit_log") && !dynamic_options.is_empty() {
+                table = table
+                    .copy_with_time_travel(dynamic_options)
+                    .await
+                    .map_err(to_datafusion_error)?;
             }
             provider_for_table(catalog, identifier, table, &system_name)
         }
@@ -209,6 +259,9 @@ mod tests {
 
     #[test]
     fn is_registered_is_case_insensitive() {
+        assert!(is_registered("audit_log"));
+        assert!(is_registered("Audit_Log"));
+        assert!(is_registered("AUDIT_LOG"));
         assert!(is_registered("options"));
         assert!(is_registered("Options"));
         assert!(is_registered("OPTIONS"));

@@ -693,11 +693,17 @@ impl SchemaProvider for PaimonSchemaProvider {
 
         let object = system_tables::parse_object_name_for_datafusion(name)?;
         if let Some(system_name) = object.system_table().map(str::to_string) {
+            let dynamic_options = self
+                .dynamic_options
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             return await_with_runtime(system_tables::load(
                 Arc::clone(&self.catalog),
                 self.database.clone(),
                 object,
                 system_name,
+                dynamic_options,
             ))
             .await;
         }

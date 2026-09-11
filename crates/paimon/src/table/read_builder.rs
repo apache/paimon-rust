@@ -262,6 +262,11 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
+    /// Create a current-state audit scan that retains every visible row version.
+    pub fn new_audit_scan(&self) -> TableScan<'a> {
+        self.new_scan().with_scan_all_files_preserving_projection()
+    }
+
     /// Create a batch incremental scan over snapshot id range
     /// `(start_exclusive, end_inclusive]`.
     ///
@@ -505,9 +510,10 @@ impl<'a> PaimonReadBuilder<'a> {
         // `to_arrow` (e.g. an empty-splits fast path) can't bypass the guard.
         let core_options = self.table.schema.core_options();
         core_options.ensure_read_authorized()?;
-        let read_type = match self.resolve_read_type()? {
+        let audit_projection = self.resolve_read_type()?;
+        let read_type = match &audit_projection {
             None => self.table.schema.fields().to_vec(),
-            Some(fields) => fields,
+            Some(fields) => fields.clone(),
         };
 
         // Pass the FULL data predicate through (including `And`/`Or`/`Not`).
@@ -517,10 +523,13 @@ impl<'a> PaimonReadBuilder<'a> {
             Some(budget) => Arc::clone(budget),
             None => configured_parquet_read_budget(self.table)?,
         };
-        Ok(
-            TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
-                .with_parquet_read_budget(parquet_read_budget),
+        Ok(TableRead::new_with_audit_projection(
+            self.table,
+            read_type,
+            self.filter.data_predicates.clone(),
+            audit_projection,
         )
+        .with_parquet_read_budget(parquet_read_budget))
     }
 
     /// Resolve the effective read type, deferring projection name resolution to

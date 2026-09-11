@@ -27,14 +27,14 @@
 
 use super::data_file_reader::DataFileReader;
 use super::sort_merge::{
-    AggregateMergeFunction, DeduplicateMergeFunction, PartialUpdateMergeFunction,
-    SortMergeReaderBuilder,
+    AggregateMergeFunction, ConfiguredDeduplicateMergeFunction, DeduplicateMergeFunction,
+    FirstRowMergeFunction, PartialUpdateMergeFunction, SortMergeReaderBuilder,
 };
 use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::io::FileIO;
 use crate::spec::{
-    BigIntType, DataField, DataFileMeta, DataType as PaimonDataType, MergeEngine,
+    BigIntType, CoreOptions, DataField, DataFileMeta, DataType as PaimonDataType, MergeEngine,
     PartialUpdateConfig, Predicate, TinyIntType, SEQUENCE_NUMBER_FIELD_ID,
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
@@ -49,6 +49,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Reads primary-key table data files using sort-merge deduplication.
+#[derive(Clone)]
 pub(crate) struct KeyValueFileReader {
     file_io: FileIO,
     config: KeyValueReadConfig,
@@ -63,6 +64,7 @@ pub(crate) struct KeyValueFileReader {
 
 /// Configuration for [`KeyValueFileReader`], grouping table schema and
 /// key/predicate parameters.
+#[derive(Clone)]
 pub(crate) struct KeyValueReadConfig {
     pub table_name: String,
     pub table_options: HashMap<String, String>,
@@ -75,6 +77,8 @@ pub(crate) struct KeyValueReadConfig {
     pub merge_engine: MergeEngine,
     pub sequence_fields: Vec<String>,
     pub read_batch_size: usize,
+    /// Keep a winning retract row instead of dropping it after key merge.
+    pub keep_delete: bool,
     /// Merge files from all supplied splits into one globally key-sorted stream.
     pub merge_splits: bool,
     /// Optional cap on sorted-run inputs merged concurrently by one LoserTree.
@@ -282,6 +286,7 @@ impl KeyValueFileReader {
         self
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_merge_function(
         merge_engine: MergeEngine,
         table_options: &HashMap<String, String>,
@@ -290,21 +295,28 @@ impl KeyValueFileReader {
         merge_output_fields: &[DataField],
         primary_keys: &[String],
         sequence_fields: &[String],
+        keep_delete: bool,
     ) -> crate::Result<Box<dyn super::sort_merge::MergeFunction>> {
         match merge_engine {
+            MergeEngine::Deduplicate
+                if keep_delete || CoreOptions::new(table_options).ignore_delete() =>
+            {
+                Ok(Box::new(ConfiguredDeduplicateMergeFunction::new(
+                    table_options,
+                    keep_delete,
+                )))
+            }
             MergeEngine::Deduplicate => Ok(Box::new(DeduplicateMergeFunction)),
-            MergeEngine::PartialUpdate => Ok(Box::new(
-                PartialUpdateMergeFunction::new_with_schema(
+            MergeEngine::PartialUpdate => {
+                Ok(Box::new(PartialUpdateMergeFunction::new_with_schema(
                     table_options,
                     table_name,
                     table_fields,
                     merge_output_fields,
                     primary_keys,
-                )?,
-            )),
-            MergeEngine::FirstRow => Err(Error::Unsupported {
-                message: "KeyValueFileReader does not support merge-engine=first-row; first-row reads should use the non-KV path".to_string(),
-            }),
+                )?))
+            }
+            MergeEngine::FirstRow => Ok(Box::new(FirstRowMergeFunction::new(table_options))),
             MergeEngine::Aggregation => Ok(Box::new(AggregateMergeFunction::new(
                 table_options,
                 table_name,
@@ -370,11 +382,29 @@ impl KeyValueFileReader {
                     .collect(),
             ))
         };
+        let expose_sequence = self
+            .config
+            .read_type
+            .iter()
+            .any(|field| field.id() == SEQUENCE_NUMBER_FIELD_ID);
+        let expose_value_kind = self
+            .config
+            .read_type
+            .iter()
+            .any(|field| field.id() == VALUE_KIND_FIELD_ID);
+
         // User columns = read_type fields + any key fields not already in read_type
-        //              + any sequence fields not already included.
+        //              + any sequence fields not already included. Physical system
+        // fields are already the first two columns of every KV file.
         let read_type_names: std::collections::HashSet<&str> =
             self.config.read_type.iter().map(|f| f.name()).collect();
-        let mut user_fields: Vec<DataField> = self.config.read_type.clone();
+        let mut user_fields: Vec<DataField> = self
+            .config
+            .read_type
+            .iter()
+            .filter(|field| !matches!(field.id(), SEQUENCE_NUMBER_FIELD_ID | VALUE_KIND_FIELD_ID))
+            .cloned()
+            .collect();
         for kf in &key_fields {
             if !read_type_names.contains(kf.name()) {
                 user_fields.push(kf.clone());
@@ -423,8 +453,8 @@ impl KeyValueFileReader {
 
         // Internal read type: [_SEQ, _VK, user_fields...]
         let mut internal_read_type: Vec<DataField> = Vec::new();
-        internal_read_type.push(seq_field);
-        internal_read_type.push(value_kind_field);
+        internal_read_type.push(seq_field.clone());
+        internal_read_type.push(value_kind_field.clone());
         internal_read_type.extend(user_fields.clone());
 
         let internal_schema = build_target_arrow_schema(&internal_read_type)?;
@@ -447,17 +477,29 @@ impl KeyValueFileReader {
                     .unwrap()
             })
             .collect();
-        let value_fields: Vec<DataField> = user_fields
-            .iter()
-            .filter(|f| !key_names.contains(f.name()))
-            .cloned()
-            .collect();
-        let value_indices: Vec<usize> = user_fields
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| !key_names.contains(f.name()))
-            .map(|(i, _)| i + 2)
-            .collect();
+        let mut value_fields = Vec::new();
+        let mut value_indices = Vec::new();
+        if expose_sequence {
+            value_fields.push(seq_field);
+            value_indices.push(seq_index);
+        }
+        if expose_value_kind {
+            value_fields.push(value_kind_field);
+            value_indices.push(value_kind_index);
+        }
+        value_fields.extend(
+            user_fields
+                .iter()
+                .filter(|field| !key_names.contains(field.name()))
+                .cloned(),
+        );
+        value_indices.extend(
+            user_fields
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| !key_names.contains(field.name()))
+                .map(|(index, _)| index + 2),
+        );
 
         // If sequence.field is configured, find each field's index in the internal schema.
         let user_sequence_indices: Vec<usize> = self
@@ -517,6 +559,7 @@ impl KeyValueFileReader {
         let primary_keys = self.config.primary_keys;
         let sequence_fields = self.config.sequence_fields;
         let read_batch_size = self.config.read_batch_size;
+        let keep_delete = self.config.keep_delete;
         let max_merge_input_streams = self.config.max_merge_input_streams;
         let parquet_read_budget = self.config.parquet_read_budget;
         #[cfg(test)]
@@ -654,6 +697,7 @@ impl KeyValueFileReader {
                             &merge_output_fields,
                             &primary_keys,
                             &sequence_fields,
+                            keep_delete,
                         )?,
                     )
                     .build()?;
@@ -1314,6 +1358,7 @@ mod tests {
                 merge_engine: core_options.merge_engine().unwrap(),
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
+                keep_delete: false,
                 merge_splits: true,
                 max_merge_input_streams: None,
                 parquet_read_budget: Some(budget),
@@ -1433,6 +1478,7 @@ mod tests {
                 merge_engine: core_options.merge_engine().unwrap(),
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
+                keep_delete: false,
                 merge_splits: true,
                 max_merge_input_streams: Some(256),
                 parquet_read_budget: None,
@@ -1640,6 +1686,7 @@ mod tests {
                     .map(|field| field.to_string())
                     .collect(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
+                keep_delete: false,
                 merge_splits: false,
                 max_merge_input_streams: None,
                 parquet_read_budget: None,
@@ -1711,6 +1758,7 @@ mod tests {
                 merge_engine: core_options.merge_engine().unwrap(),
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
+                keep_delete: false,
                 merge_splits: false,
                 max_merge_input_streams: None,
                 parquet_read_budget: Some(Arc::new(ParquetReadBudget::new(2, 256 << 20).unwrap())),
@@ -1905,6 +1953,7 @@ mod tests {
                     merge_engine: core_options.merge_engine().unwrap(),
                     sequence_fields: Vec::new(),
                     read_batch_size: core_options.read_batch_size().unwrap(),
+                    keep_delete: false,
                     merge_splits,
                     max_merge_input_streams: None,
                     parquet_read_budget: None,
@@ -1972,6 +2021,7 @@ mod tests {
                 merge_engine: core_options.merge_engine().unwrap(),
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
+                keep_delete: false,
                 merge_splits: true,
                 max_merge_input_streams: Some(256),
                 parquet_read_budget: None,

@@ -1863,7 +1863,22 @@ let df = ctx.sql("SELECT * FROM paimon.my_db.table_a JOIN paimon.my_db.table_b O
 
 ## System Tables
 
-Access table metadata via the `$` syntax.
+Access table metadata and audit rows via the `$` syntax.
+
+### $audit_log
+
+Read the current table state with each row's Paimon row kind (`+I`, `-U`, `+U`, or `-D`):
+
+```sql
+SELECT * FROM paimon.default.my_table$audit_log;
+```
+
+`rowkind` is the first column, followed by the table columns. Append-only rows are
+reported as `+I`; deduplicate primary-key reads retain the latest physical retract row
+instead of dropping it. Other primary-key merge engines retain or reject retracts
+according to their merge-engine options. As in Paimon Java, rows masked by deletion
+vectors are not reconstructed as retract records. When
+`table-read.sequence-number.enabled=true`, `_SEQUENCE_NUMBER` appears after `rowkind`.
 
 ### $options
 
