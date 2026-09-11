@@ -26,6 +26,7 @@ use crate::spec::{
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::source::{DataSplitBuilder, RowRange};
 use chrono::NaiveDate;
+use futures::{StreamExt, TryStreamExt};
 
 #[derive(Debug, Clone)]
 pub(crate) struct FormatTableScan<'a> {
@@ -89,38 +90,49 @@ impl<'a> FormatTableScan<'a> {
 
         let partition_fields = self.table.schema().partition_fields();
         let table_depth = path_segments(&table_path).len();
-        let mut splits = Vec::new();
-        for scan_root in self.scan_roots(&core_options, &table_path)? {
-            let root_segments = path_segments(&scan_root.path);
-            let partition_levels_below_root = partition_fields
-                .len()
-                .saturating_sub(root_segments.len().saturating_sub(table_depth));
-            let statuses = self
-                .list_status_recursive_if_exists(&scan_root.path)
-                .await?;
-            for status in statuses {
-                if is_hidden_below_partitions(
-                    &root_segments,
-                    partition_levels_below_root,
-                    &status.path,
-                ) {
-                    continue;
+        let scan_roots = self.scan_roots(&core_options, &table_path)?;
+        // A table with many partitions pays one listing per partition, so they run concurrently.
+        // `buffered` keeps the roots in order and stops at the first failure.
+        let table_path = table_path.as_str();
+        let partition_fields = partition_fields.as_slice();
+        let listed: Vec<Vec<crate::DataSplit>> = futures::stream::iter(scan_roots)
+            .map(|scan_root| async move {
+                let root_segments = path_segments(&scan_root.path);
+                let partition_levels_below_root = partition_fields
+                    .len()
+                    .saturating_sub(root_segments.len().saturating_sub(table_depth));
+                let statuses = self
+                    .list_status_recursive_if_exists(&scan_root.path)
+                    .await?;
+                let mut splits = Vec::new();
+                for status in statuses {
+                    if is_hidden_below_partitions(
+                        &root_segments,
+                        partition_levels_below_root,
+                        &status.path,
+                    ) {
+                        continue;
+                    }
+                    if let Some(split) = self
+                        .status_to_split(
+                            status,
+                            table_path,
+                            format_extension,
+                            schema_id,
+                            partition_fields,
+                            scan_root.partition.clone(),
+                        )
+                        .await?
+                    {
+                        splits.push(split);
+                    }
                 }
-                if let Some(split) = self
-                    .status_to_split(
-                        status,
-                        &table_path,
-                        format_extension,
-                        schema_id,
-                        &partition_fields,
-                        scan_root.partition.clone(),
-                    )
-                    .await?
-                {
-                    splits.push(split);
-                }
-            }
-        }
+                Ok::<_, crate::Error>(splits)
+            })
+            .buffered(core_options.format_table_scan_list_parallelism())
+            .try_collect()
+            .await?;
+        let mut splits = listed.into_iter().flatten().collect::<Vec<_>>();
 
         splits.sort_by(|left, right| {
             left.bucket_path().cmp(right.bucket_path()).then_with(|| {
@@ -789,25 +801,27 @@ mod tests {
             .collect()
     }
 
-    /// A filter naming exactly one partition; `None` is the null partition.
-    fn partition_set(table: &Table, values: &[Option<&str>]) -> PartitionFilter {
+    /// A filter naming exactly the given partitions; `None` is a null partition value.
+    fn partition_set(table: &Table, partitions: &[&[Option<&str>]]) -> PartitionFilter {
         let partition_fields = table.schema().partition_fields();
-        let mut builder = BinaryRowBuilder::new(values.len() as i32);
-        for (index, value) in values.iter().enumerate() {
-            match value {
-                Some(value) => builder.write_datum(
-                    index,
-                    &Datum::String(value.to_string()),
-                    partition_fields[index].data_type(),
-                ),
-                None => builder.set_null_at(index),
-            }
-        }
-        PartitionFilter::from_partition_set(
-            HashSet::from([builder.build_serialized()]),
-            &partition_fields,
-        )
-        .unwrap()
+        let partitions = partitions
+            .iter()
+            .map(|values| {
+                let mut builder = BinaryRowBuilder::new(values.len() as i32);
+                for (index, value) in values.iter().enumerate() {
+                    match value {
+                        Some(value) => builder.write_datum(
+                            index,
+                            &Datum::String(value.to_string()),
+                            partition_fields[index].data_type(),
+                        ),
+                        None => builder.set_null_at(index),
+                    }
+                }
+                builder.build_serialized()
+            })
+            .collect::<HashSet<_>>();
+        PartitionFilter::from_partition_set(partitions, &partition_fields).unwrap()
     }
 
     #[test]
@@ -890,7 +904,7 @@ mod tests {
             planned_files(&table, None).await,
             vec!["dt=a/part-0.parquet", "dt=b/part-3.parquet"]
         );
-        let only_a = partition_set(&table, &[Some("a")]);
+        let only_a = partition_set(&table, &[&[Some("a")]]);
         assert_eq!(
             planned_files(&table, Some(only_a)).await,
             vec!["dt=a/part-0.parquet"]
@@ -918,11 +932,60 @@ mod tests {
             planned_files(&table, None).await,
             vec!["__DEFAULT_PARTITION__/part-0.parquet", "b/part-2.parquet"]
         );
-        let null_partition = partition_set(&table, &[None]);
+        let null_partition = partition_set(&table, &[&[None]]);
         assert_eq!(
             planned_files(&table, Some(null_partition)).await,
             vec!["__DEFAULT_PARTITION__/part-0.parquet"]
         );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_listing_keeps_the_plan_order() {
+        let partitions = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        // Written in reverse, so the plan order owes nothing to the order of the writes.
+        let files = partitions
+            .iter()
+            .rev()
+            .flat_map(|dt| {
+                [
+                    format!("dt={dt}/part-1.parquet"),
+                    format!("dt={dt}/part-0.parquet"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let file_names = files.iter().map(String::as_str).collect::<Vec<_>>();
+        let expected = partitions
+            .iter()
+            .flat_map(|dt| {
+                [
+                    format!("dt={dt}/part-0.parquet"),
+                    format!("dt={dt}/part-1.parquet"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let rows = partitions.iter().map(|dt| [Some(*dt)]).collect::<Vec<_>>();
+        let every_partition = rows.iter().map(|row| row.as_slice()).collect::<Vec<_>>();
+
+        for parallelism in ["1", "4"] {
+            let table = format_table(
+                &format!("memory:/listing_order_{parallelism}"),
+                &["dt"],
+                &[("format-table.scan.list-parallelism", parallelism)],
+            );
+            write_files(&table, &file_names).await;
+
+            let filter = partition_set(&table, &every_partition);
+            assert_eq!(
+                planned_files(&table, Some(filter)).await,
+                expected,
+                "one listing per partition, parallelism {parallelism}"
+            );
+            assert_eq!(
+                planned_files(&table, None).await,
+                expected,
+                "one listing of the table, parallelism {parallelism}"
+            );
+        }
     }
 
     #[test]
