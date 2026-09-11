@@ -269,14 +269,9 @@ impl<'a> IncrementalScan<'a> {
     }
 
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
-        let core_options = crate::spec::CoreOptions::new(self.table.schema().options());
-        core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
-        if self.table.server_query_auth_enabled().await? {
-            return Err(super::query_auth::unsupported(
-                "an incremental read cannot apply a row filter or column masking",
-            ));
-        }
-        crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table
+            .ensure_read_authorized_live("an incremental read")
+            .await?;
         if self.scan.has_row_position_selection() {
             return Err(crate::Error::Unsupported {
                 message: "Incremental row-position selection requires combined delta planning"

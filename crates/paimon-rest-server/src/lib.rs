@@ -437,10 +437,11 @@ async fn get_table(path: RestPath, Extension(state): Extension<Arc<AppState>>) -
             }
         };
 
+    // FileSystemCatalog has no UUID concept; the full name is a stable id that
+    // satisfies the client's RESTEnv requirement.
+    let uuid = identifier.full_name();
     let response = GetTableResponse::new(
-        // FileSystemCatalog has no UUID concept; the full name is a stable id
-        // that satisfies the client's RESTEnv requirement.
-        Some(identifier.full_name()),
+        Some(uuid),
         Some(table),
         Some(location),
         Some(false),

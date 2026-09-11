@@ -121,6 +121,7 @@ impl TableProvider for PartitionsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        super::ensure_scan_authorized(&self.table).await?;
         let table = self.table.clone();
         let partitions = if table.travel_snapshot().is_some() {
             crate::runtime::await_with_runtime(async move {
