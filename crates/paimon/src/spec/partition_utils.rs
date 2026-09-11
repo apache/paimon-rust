@@ -498,7 +498,7 @@ fn format_timestamp_non_legacy(dt: NaiveDateTime, precision: u32) -> String {
 /// Escape a path component following Java `PartitionPathUtils.escapePathName`.
 ///
 /// Characters that need escaping are encoded as `%XX` (uppercase hex).
-fn escape_path_name(path: &str) -> String {
+pub(crate) fn escape_path_name(path: &str) -> String {
     if !path.chars().any(needs_escaping) {
         return path.to_string();
     }

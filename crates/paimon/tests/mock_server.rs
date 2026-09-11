@@ -69,6 +69,7 @@ struct MockState {
     create_partitions_calls: Vec<(String, String, CreatePartitionsRequest)>,
     drop_partitions_calls: Vec<(String, String, DropPartitionsRequest)>,
     create_partitions_error_status: Option<StatusCode>,
+    list_partitions_error_status: Option<StatusCode>,
     /// ECS metadata role name (for token loader testing)
     ecs_role_name: Option<String>,
     /// ECS metadata token (for token loader testing)
@@ -958,6 +959,15 @@ impl RESTServer {
             );
             return (StatusCode::NOT_FOUND, Json(error)).into_response();
         }
+        if let Some(status) = inner.list_partitions_error_status {
+            let error = ErrorResponse::new(
+                Some("partition".to_string()),
+                Some(table),
+                Some("Partition listing is not implemented".to_string()),
+                Some(status.as_u16() as i32),
+            );
+            return (status, Json(error)).into_response();
+        }
         if inner.partition_page_responses.contains_key(&key) {
             let request_index = {
                 let calls = inner
@@ -1309,6 +1319,11 @@ impl RESTServer {
         self.inner.lock().unwrap().create_partitions_error_status = status;
     }
 
+    /// Make the list-partitions endpoint return the given status.
+    pub fn set_list_partitions_error_status(&self, status: Option<StatusCode>) {
+        self.inner.lock().unwrap().list_partitions_error_status = status;
+    }
+
     /// Make the list-partitions-by-names endpoint return the given status.
     pub fn set_list_partitions_by_names_error_status(&self, status: Option<StatusCode>) {
         self.inner
@@ -1418,6 +1433,38 @@ impl RESTServer {
         inner.partitions.insert(key.clone(), partitions);
         inner.partition_page_responses.remove(&key);
         inner.partition_list_call_counts.remove(&key);
+    }
+
+    /// Set whether a stored table is external.
+    pub fn set_table_external(&self, database: &str, table: &str, is_external: bool) {
+        let key = format!("{database}.{table}");
+        let mut state = self.inner.lock().unwrap();
+        state
+            .tables
+            .get_mut(&key)
+            .unwrap_or_else(|| panic!("table {key} does not exist"))
+            .is_external = Some(is_external);
+    }
+
+    /// Attach catalog options, such as a custom `path`, to a registered partition.
+    pub fn set_table_partition_options(
+        &self,
+        database: &str,
+        table: &str,
+        spec: &HashMap<String, String>,
+        options: HashMap<String, String>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let partition = inner
+            .partitions
+            .get_mut(&format!("{database}.{table}"))
+            .and_then(|partitions| {
+                partitions
+                    .iter_mut()
+                    .find(|partition| &partition.spec == spec)
+            })
+            .unwrap_or_else(|| panic!("partition {spec:?} is not registered"));
+        partition.options = Some(options);
     }
 
     /// Set explicit list-partitions pages and response tokens in request order.

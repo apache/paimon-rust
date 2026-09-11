@@ -98,7 +98,9 @@ pub use types::*;
 mod partition;
 pub use partition::Partition;
 mod partition_utils;
-pub(crate) use partition_utils::{bucket_path, bucket_path_under, PartitionComputer};
+pub(crate) use partition_utils::{
+    bucket_path, bucket_path_under, escape_path_name, PartitionComputer,
+};
 mod predicate;
 pub(crate) use predicate::datum_cmp;
 pub(crate) use predicate::eval_row;
