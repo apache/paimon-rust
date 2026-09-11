@@ -46,6 +46,7 @@ use parquet::file::metadata::{
     KeyValue, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use std::cmp::Ordering;
@@ -572,6 +573,7 @@ impl FormatFileReader for ParquetFormatReader {
             .filter(|budget| row_group_parallelism > 1 || budget.diagnostics_enabled())
             .map(|budget| {
                 let mut row_group_selection = combined_selection;
+                let offset_index = batch_stream_builder.metadata().offset_index();
                 let selected_row_groups = batch_stream_builder
                     .metadata()
                     .row_groups()
@@ -587,11 +589,15 @@ impl FormatFileReader for ParquetFormatReader {
                         {
                             return None;
                         }
-                        Some((
-                            row_group_index,
-                            selection,
-                            projected_row_group_bytes(row_group, &mask),
-                        ))
+                        let projected_bytes = projected_row_group_bytes(
+                            row_group,
+                            &mask,
+                            selection.as_ref(),
+                            offset_index
+                                .and_then(|index| index.get(row_group_index))
+                                .map(Vec::as_slice),
+                        );
+                        Some((row_group_index, selection, projected_bytes))
                     })
                     .collect::<Vec<_>>();
                 let projected_bytes = selected_row_groups
@@ -723,13 +729,50 @@ impl FormatFileReader for ParquetFormatReader {
     }
 }
 
-fn projected_row_group_bytes(row_group: &RowGroupMetaData, projection: &ProjectionMask) -> u64 {
+fn projected_row_group_bytes(
+    row_group: &RowGroupMetaData,
+    projection: &ProjectionMask,
+    selection: Option<&RowSelection>,
+    offset_index: Option<&[OffsetIndexMetaData]>,
+) -> u64 {
     row_group
         .columns()
         .iter()
         .enumerate()
         .filter(|(leaf_index, _)| projection.leaf_included(*leaf_index))
-        .filter_map(|(_, column)| u64::try_from(column.uncompressed_size()).ok())
+        .filter_map(|(leaf_index, column)| {
+            let uncompressed_bytes = u64::try_from(column.uncompressed_size()).ok()?;
+            let selected_bytes = selection
+                .zip(offset_index.and_then(|index| index.get(leaf_index)))
+                .and_then(|(selection, page_index)| {
+                    let page_locations = page_index.page_locations();
+                    let column_start = u64::try_from(
+                        column
+                            .dictionary_page_offset()
+                            .unwrap_or_else(|| column.data_page_offset()),
+                    )
+                    .ok()?;
+                    let dictionary_bytes = u64::try_from(page_locations.first()?.offset)
+                        .ok()?
+                        .checked_sub(column_start)?;
+                    let selected_compressed_bytes = selection
+                        .scan_ranges(page_locations)
+                        .into_iter()
+                        .try_fold(dictionary_bytes, |total, range| {
+                            total.checked_add(range.end.checked_sub(range.start)?)
+                        })?;
+                    let compressed_bytes = u64::try_from(column.compressed_size()).ok()?;
+                    if compressed_bytes == 0 || selected_compressed_bytes > compressed_bytes {
+                        return None;
+                    }
+                    Some(
+                        ((u128::from(uncompressed_bytes) * u128::from(selected_compressed_bytes))
+                            .div_ceil(u128::from(compressed_bytes)))
+                        .min(u128::from(u64::MAX)) as u64,
+                    )
+                });
+            Some(selected_bytes.unwrap_or(uncompressed_bytes))
+        })
         .fold(0u64, u64::saturating_add)
 }
 
@@ -2958,6 +3001,58 @@ mod tests {
         assert_eq!(diagnostics.row_group_count, 5);
         assert_eq!(diagnostics.peak_inflight, 2);
         assert_eq!(diagnostics.current_inflight, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sparse_page_budget_allows_large_row_groups_to_overlap() {
+        const MIB: i64 = 1024 * 1024;
+
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let offset_index = &metadata.offset_index().unwrap()[0];
+        let page_locations = offset_index[0].page_locations();
+        let compressed_bytes = page_locations
+            .iter()
+            .map(|page| i64::from(page.compressed_page_size))
+            .sum();
+        let mut row_group = metadata.row_groups()[0].clone();
+        let column = row_group
+            .column(0)
+            .clone()
+            .into_builder()
+            .set_total_compressed_size(compressed_bytes)
+            .set_total_uncompressed_size(308 * MIB)
+            .set_data_page_offset(page_locations[0].offset)
+            .set_dictionary_page_offset(None)
+            .build()
+            .unwrap();
+        row_group.columns_mut()[0] = column;
+
+        let projection = super::ProjectionMask::roots(row_group.schema_descr(), [0]);
+        let selection = RowSelection::from_consecutive_ranges(std::iter::once(0..1), 80);
+        let projected_bytes = super::projected_row_group_bytes(
+            &row_group,
+            &projection,
+            Some(&selection),
+            Some(offset_index.as_slice()),
+        );
+
+        assert!(projected_bytes < 128 * MIB as u64);
+        assert_eq!(
+            super::projected_row_group_bytes(
+                &row_group,
+                &projection,
+                None,
+                Some(offset_index.as_slice()),
+            ),
+            308 * MIB as u64
+        );
+
+        let budget = ParquetReadBudget::new(8, 256 * MIB as u64).unwrap();
+        budget.enable_diagnostics();
+        let _first = budget.acquire(projected_bytes).await.unwrap();
+        let _second = budget.acquire(projected_bytes).await.unwrap();
+        assert_eq!(budget.diagnostics().peak_inflight, 2);
     }
 
     #[tokio::test]
