@@ -22,6 +22,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
+use crate::api::management::PermissionAssignment;
 use crate::catalog::{Function, FunctionDefinition, ViewSchema};
 use crate::spec::{DataField, Schema};
 
@@ -493,6 +494,27 @@ impl AuthTableQueryResponse {
     }
 }
 
+/// Response of `GET {prefix}/permissions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPermissionsResponse {
+    /// Direct assignments on the requested resource.
+    #[serde(default)]
+    pub permissions: Vec<PermissionAssignment>,
+    /// Continuation token; absent on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+impl ListPermissionsResponse {
+    pub fn new(permissions: Vec<PermissionAssignment>, next_page_token: Option<String>) -> Self {
+        Self {
+            permissions,
+            next_page_token,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +653,24 @@ mod tests {
         let blank: AuthTableQueryResponse =
             serde_json::from_str(r#"{"filter":[],"columnMasking":{}}"#).unwrap();
         assert!(blank.is_unrestricted());
+    }
+
+    #[test]
+    fn test_list_permissions_response_deserialization() {
+        let response: ListPermissionsResponse = serde_json::from_str(
+            r#"{"permissions":[{"resource":{"type":"TABLE","database":"sales","table":"orders"},"access":"SELECT","principal":"analyst"}],"nextPageToken":"next"}"#,
+        )
+        .unwrap();
+        assert_eq!(response.permissions.len(), 1);
+        assert_eq!(response.permissions[0].principal(), "analyst");
+        assert_eq!(response.next_page_token.as_deref(), Some("next"));
+        let last: ListPermissionsResponse = serde_json::from_str("{}").unwrap();
+        assert!(last.permissions.is_empty());
+        assert_eq!(last.next_page_token, None);
+        assert_eq!(
+            serde_json::to_string(&ListPermissionsResponse::new(vec![], None)).unwrap(),
+            r#"{"permissions":[]}"#
+        );
     }
 
     #[test]

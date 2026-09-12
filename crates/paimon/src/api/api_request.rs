@@ -22,6 +22,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
+use crate::api::management::{PermissionAccess, PermissionAssignment, PermissionResource};
 use crate::{
     catalog::{Function, FunctionDefinition, Identifier, ViewSchema},
     spec::{DataField, PartitionStatistics, Schema, SchemaChange},
@@ -311,6 +312,30 @@ impl AuthTableQueryRequest {
     }
 }
 
+/// Body of `POST {prefix}/permissions/revoke`: the assignment identity only. Revoking a
+/// `COLUMN` assignment removes its whole column range, so no `columns` travel here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevokePermissionRequest {
+    pub resource: PermissionResource,
+    /// Canonicalized before sending.
+    pub access: String,
+    pub principal: String,
+}
+
+impl RevokePermissionRequest {
+    pub fn new(resource: PermissionResource, access: &str, principal: &str) -> crate::Result<Self> {
+        let access = PermissionAccess::canonicalize_for(resource.resource_type(), access)?;
+        PermissionAssignment::validate_principal(principal)?;
+        resource.validate()?;
+        Ok(Self {
+            resource,
+            access,
+            principal: principal.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +372,27 @@ mod tests {
         // `None` omits the key entirely (matches the server's optional field).
         let req = AuthTableQueryRequest::new(None);
         assert_eq!(serde_json::to_string(&req).unwrap(), "{}");
+    }
+
+    #[test]
+    fn test_revoke_permission_request_canonicalizes_access_and_carries_only_the_identity() {
+        let request = RevokePermissionRequest::new(
+            PermissionResource::table("sales", "orders"),
+            "select",
+            "analyst",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"resource":{"type":"TABLE","database":"sales","table":"orders"},"access":"SELECT","principal":"analyst"}"#
+        );
+        let error =
+            RevokePermissionRequest::new(PermissionResource::catalog(), "select", "analyst")
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("not valid for CATALOG"),
+            "{error}"
+        );
     }
 
     #[test]

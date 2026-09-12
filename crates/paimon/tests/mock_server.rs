@@ -38,8 +38,9 @@ use paimon::api::{
     CreateFunctionRequest, CreatePartitionsRequest, CreateViewRequest, DropPartitionsRequest,
     ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
     ListDatabasesResponse, ListFunctionsResponse, ListPartitionsByFilterRequest,
-    ListPartitionsByNamesRequest, ListPartitionsResponse, ListTablesResponse, ListViewsResponse,
-    RenameTableRequest, ResourcePaths,
+    ListPartitionsByNamesRequest, ListPartitionsResponse, ListPermissionsResponse,
+    ListTablesResponse, ListViewsResponse, PermissionAssignment, PermissionResource,
+    RenameTableRequest, ResourcePaths, ResourceType, RevokePermissionRequest,
 };
 use paimon::catalog::{Function, Identifier};
 use paimon::spec::Partition;
@@ -70,6 +71,11 @@ struct MockState {
     drop_partitions_calls: Vec<(String, String, DropPartitionsRequest)>,
     create_partitions_error_status: Option<StatusCode>,
     list_partitions_error_status: Option<StatusCode>,
+    permissions: Vec<PermissionAssignment>,
+    list_permissions_queries: Vec<HashMap<String, String>>,
+    grant_permission_bodies: Vec<serde_json::Value>,
+    revoke_permission_bodies: Vec<serde_json::Value>,
+    grant_permission_error_status: Option<StatusCode>,
     /// ECS metadata role name (for token loader testing)
     ecs_role_name: Option<String>,
     /// ECS metadata token (for token loader testing)
@@ -111,22 +117,22 @@ fn partition_from_spec(spec: HashMap<String, String>) -> Partition {
     }
 }
 
-fn paginate_names(
-    names: Vec<String>,
+fn paginate<T: Clone>(
+    items: Vec<T>,
     params: &HashMap<String, String>,
     page_size: Option<usize>,
-) -> (Vec<String>, Option<String>) {
+) -> (Vec<T>, Option<String>) {
     let Some(page_size) = page_size else {
-        return (names, None);
+        return (items, None);
     };
     let offset = params
         .get("pageToken")
         .and_then(|token| token.parse::<usize>().ok())
         .unwrap_or(0)
-        .min(names.len());
-    let end = (offset + page_size).min(names.len());
-    let next_page_token = (end < names.len()).then(|| end.to_string());
-    (names[offset..end].to_vec(), next_page_token)
+        .min(items.len());
+    let end = (offset + page_size).min(items.len());
+    let next_page_token = (end < items.len()).then(|| end.to_string());
+    (items[offset..end].to_vec(), next_page_token)
 }
 
 #[derive(Clone)]
@@ -488,7 +494,7 @@ impl RESTServer {
             .filter_map(|key| key.strip_prefix(&prefix).map(ToString::to_string))
             .collect();
         views.sort();
-        let (views, next_page_token) = paginate_names(views, &params, s.list_page_size);
+        let (views, next_page_token) = paginate(views, &params, s.list_page_size);
         (
             StatusCode::OK,
             Json(ListViewsResponse::new(views, next_page_token)),
@@ -594,7 +600,7 @@ impl RESTServer {
             .filter_map(|key| key.strip_prefix(&prefix).map(ToString::to_string))
             .collect();
         functions.sort();
-        let (functions, next_page_token) = paginate_names(functions, &params, s.list_page_size);
+        let (functions, next_page_token) = paginate(functions, &params, s.list_page_size);
         (
             StatusCode::OK,
             Json(ListFunctionsResponse::new(functions, next_page_token)),
@@ -1156,6 +1162,117 @@ impl RESTServer {
             .into_response()
     }
 
+    // ==================== Permission management ====================
+
+    fn same_assignment_identity(left: &PermissionAssignment, right: &PermissionAssignment) -> bool {
+        left.resource() == right.resource()
+            && left.access() == right.access()
+            && left.principal() == right.principal()
+    }
+
+    fn bad_request(message: String) -> axum::response::Response {
+        let error = ErrorResponse::new(None, None, Some(message), Some(400));
+        (StatusCode::BAD_REQUEST, Json(error)).into_response()
+    }
+
+    /// Handle GET {prefix}/permissions - direct assignments on the exact resource in the query.
+    pub async fn list_permissions(
+        Query(params): Query<HashMap<String, String>>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.list_permissions_queries.push(params.clone());
+        let Some(resource_type) = params
+            .get("resourceType")
+            .and_then(|value| value.parse::<ResourceType>().ok())
+        else {
+            return Self::bad_request("resourceType is required".to_string());
+        };
+        let locator = |name: &str| params.get(name).map(String::as_str);
+        let resource = match PermissionResource::new(
+            resource_type,
+            locator("database"),
+            locator("table"),
+            locator("function"),
+            locator("view"),
+        ) {
+            Ok(resource) => resource,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        let matching: Vec<PermissionAssignment> = inner
+            .permissions
+            .iter()
+            .filter(|assignment| assignment.resource() == &resource)
+            .filter(|assignment| {
+                params
+                    .get("principal")
+                    .is_none_or(|p| p == assignment.principal())
+            })
+            .filter(|assignment| {
+                params
+                    .get("access")
+                    .is_none_or(|a| a == assignment.access())
+            })
+            .cloned()
+            .collect();
+        let page_size = params
+            .get("maxResults")
+            .and_then(|value| value.parse().ok());
+        let (permissions, next_page_token) = paginate(matching, &params, page_size);
+        (
+            StatusCode::OK,
+            Json(ListPermissionsResponse::new(permissions, next_page_token)),
+        )
+            .into_response()
+    }
+
+    /// Handle POST {prefix}/permissions/grant - upsert by (resource, access, principal).
+    /// Answers 200 with an empty body, like the Java server.
+    pub async fn grant_permission(
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.grant_permission_bodies.push(body.clone());
+        if let Some(status) = inner.grant_permission_error_status {
+            let error = ErrorResponse::new(
+                None,
+                None,
+                Some("forbidden".to_string()),
+                Some(status.as_u16() as i32),
+            );
+            return (status, Json(error)).into_response();
+        }
+        let assignment: PermissionAssignment = match serde_json::from_value(body) {
+            Ok(assignment) => assignment,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        inner
+            .permissions
+            .retain(|existing| !Self::same_assignment_identity(existing, &assignment));
+        inner.permissions.push(assignment);
+        StatusCode::OK.into_response()
+    }
+
+    /// Handle POST {prefix}/permissions/revoke - idempotent removal by identity.
+    pub async fn revoke_permission(
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.revoke_permission_bodies.push(body.clone());
+        let request: RevokePermissionRequest = match serde_json::from_value(body) {
+            Ok(request) => request,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        inner.permissions.retain(|existing| {
+            !(existing.resource() == &request.resource
+                && existing.access() == request.access
+                && existing.principal() == request.principal)
+        });
+        StatusCode::OK.into_response()
+    }
+
     /// Handle POST /rename-table - rename a table.
     pub async fn rename_table(
         Extension(state): Extension<Arc<RESTServer>>,
@@ -1517,6 +1634,31 @@ impl RESTServer {
             .unwrap_or_default()
     }
 
+    /// Every query string received by `GET /permissions`.
+    pub fn list_permissions_queries(&self) -> Vec<HashMap<String, String>> {
+        self.inner.lock().unwrap().list_permissions_queries.clone()
+    }
+
+    /// Raw JSON bodies received by `POST /permissions/grant`.
+    pub fn grant_permission_bodies(&self) -> Vec<serde_json::Value> {
+        self.inner.lock().unwrap().grant_permission_bodies.clone()
+    }
+
+    /// Raw JSON bodies received by `POST /permissions/revoke`.
+    pub fn revoke_permission_bodies(&self) -> Vec<serde_json::Value> {
+        self.inner.lock().unwrap().revoke_permission_bodies.clone()
+    }
+
+    /// The assignments the server currently holds.
+    pub fn permissions(&self) -> Vec<PermissionAssignment> {
+        self.inner.lock().unwrap().permissions.clone()
+    }
+
+    /// Make every grant fail with `status` (e.g. 403) instead of storing it.
+    pub fn set_grant_permission_error_status(&self, status: Option<StatusCode>) {
+        self.inner.lock().unwrap().grant_permission_error_status = status;
+    }
+
     /// Return all create-partitions calls received by the server.
     pub fn create_partitions_calls(&self) -> Vec<(String, String, CreatePartitionsRequest)> {
         self.inner.lock().unwrap().create_partitions_calls.clone()
@@ -1679,6 +1821,18 @@ pub async fn start_mock_server(
         .route(
             &format!("{prefix}/tables/rename"),
             post(RESTServer::rename_table),
+        )
+        .route(
+            &format!("{prefix}/permissions"),
+            get(RESTServer::list_permissions),
+        )
+        .route(
+            &format!("{prefix}/permissions/grant"),
+            post(RESTServer::grant_permission),
+        )
+        .route(
+            &format!("{prefix}/permissions/revoke"),
+            post(RESTServer::revoke_permission),
         )
         // ECS metadata endpoints (for token loader testing)
         .route(

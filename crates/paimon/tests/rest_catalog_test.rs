@@ -28,6 +28,7 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 use axum::http::StatusCode;
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
+use paimon::api::{ListPermissionsRequest, PermissionAssignment, PermissionResource};
 use paimon::catalog::{Catalog, Function, FunctionDefinition, Identifier, RESTCatalog, ViewSchema};
 use paimon::common::Options;
 use paimon::spec::{
@@ -2360,4 +2361,31 @@ async fn test_load_table_rejects_unknown_declared_type() {
             if message.contains("unknown table type")),
         "{err:?}"
     );
+}
+
+#[tokio::test]
+async fn test_rest_catalog_manages_permissions_end_to_end() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let resource = PermissionResource::table("default", "orders");
+    let assignment =
+        PermissionAssignment::new(resource.clone(), "select", "analyst", None, None).unwrap();
+
+    ctx.catalog.grant_permission(&assignment).await.unwrap();
+    let page = ctx
+        .catalog
+        .list_permissions_paged(&ListPermissionsRequest::new(resource.clone()))
+        .await
+        .unwrap();
+    assert_eq!(page.elements, vec![assignment]);
+
+    ctx.catalog
+        .revoke_permission(&resource, "SELECT", "analyst")
+        .await
+        .unwrap();
+    let page = ctx
+        .catalog
+        .list_permissions_paged(&ListPermissionsRequest::new(resource))
+        .await
+        .unwrap();
+    assert!(page.elements.is_empty());
 }
