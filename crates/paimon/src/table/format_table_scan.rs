@@ -449,13 +449,8 @@ fn is_format_table_data_file_name(file_name: &str) -> bool {
     !file_name.is_empty() && !file_name.starts_with('.') && !file_name.starts_with('_')
 }
 
-/// The data files a Format Table scan reads below `root`: files whose own name is not hidden and
-/// ends with the format's extension, outside any entry that [`is_hidden_below_partitions`] skips.
-/// `partition_levels_below_root` is how many partition levels still lie under `root`.
-///
-/// A root that does not exist holds no files. Any other listing failure is returned, since a
-/// partial listing cannot be told apart from a partition that lost files. `ANALYZE TABLE`
-/// measures a partition through this listing, so it counts exactly the files a scan reads.
+/// The non-hidden files with the format's extension that a Format Table scan reads below `root`.
+/// A missing root holds no files; any other listing failure is returned, never a partial list.
 pub(crate) async fn list_format_table_data_files(
     file_io: &crate::io::FileIO,
     root: &str,
