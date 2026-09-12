@@ -28,20 +28,7 @@ use crate::arrow::format::read_file_row_count;
 use crate::io::FileStatus;
 use crate::spec::{CoreOptions, Partition, PartitionStatistics};
 
-/// Measures what the partitions of a Format Table currently hold.
-///
-/// File count, byte size and last file creation time come from a directory listing. The row
-/// count needs every file's footer, which no listing opens, so it is asked for rather than
-/// assumed. A partition holding nothing measures as an exact zero, with no last file to date.
-///
-/// It lists through the listing the scan uses, so a measurement counts exactly the files a
-/// reader would return and committer staging trees are left out. A listing failure aborts the
-/// whole collection: a truncated listing looks exactly like a partition that lost files.
-///
-/// The result is a whole-partition measurement, so a catalog should replace what it holds with
-/// it rather than add it up. It never decides that a partition should exist; it measures the
-/// ones it is given.
-///
+/// Measures whole partitions of a Format Table through the listing a scan uses.
 /// Mirrors Java `FormatTablePartitionStatsCollector`.
 #[derive(Debug)]
 pub struct FormatTablePartitionStatsCollector<'a> {
@@ -52,10 +39,7 @@ pub struct FormatTablePartitionStatsCollector<'a> {
 
 impl<'a> FormatTablePartitionStatsCollector<'a> {
     /// Measure `table`, reading file footers for row counts only when `with_record_count` is set.
-    ///
-    /// `parallelism` bounds the storage requests in flight: partition listings and footer reads
-    /// share it, so it applies to one large partition as much as to many small ones. A value below
-    /// one is read as one.
+    /// `parallelism` bounds listings and footer reads together; a value below one is read as one.
     pub fn new(table: &'a Table, with_record_count: bool, parallelism: usize) -> Self {
         Self {
             table,
@@ -159,9 +143,8 @@ impl<'a> FormatTablePartitionStatsCollector<'a> {
             .collect()
             .await;
 
-        // A partition with no files counted nothing and so holds exactly zero rows. One file
-        // whose count is unknown makes the whole partition unknown rather than short: a sum
-        // missing a file, reported as exact, is worse than no number at all.
+        // A partition with no files holds exactly zero rows; one file whose count is unknown
+        // makes the whole partition unknown rather than short.
         let mut record_counts = vec![Some(0i64); listings.len()];
         for (index, count) in counts {
             record_counts[index] = match (record_counts[index], count) {

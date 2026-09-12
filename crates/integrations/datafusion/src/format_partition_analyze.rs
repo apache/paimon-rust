@@ -33,19 +33,7 @@ use crate::sql_context::{
 };
 
 /// `ANALYZE TABLE t [PARTITION (...)] COMPUTE STATISTICS [NOSCAN]` on a Format Table with
-/// catalog-managed partitions.
-///
-/// The registered partitions are measured from storage and each measured field replaces what
-/// the catalog holds, which is how a table catches up with writers the catalog never saw.
-/// NOSCAN stops at what a listing gives, file count, byte size and last file creation time,
-/// while a full ANALYZE also reads every file footer for its row count.
-///
-/// Analyzing never adds or removes a partition: it measures the ones registered when it
-/// listed them. There is no lock between that listing and the write, so a partition dropped
-/// in between can come back with its last measurement, the same last-writer-wins window every
-/// lock-free partition operation on these tables has.
-///
-/// Mirrors Java `PaimonAnalyzeFormatTablePartitionsCommand`.
+/// catalog-managed partitions. Mirrors Java `PaimonAnalyzeFormatTablePartitionsCommand`.
 pub(crate) async fn execute_analyze(
     ctx: &SQLContext,
     analyze: &Analyze,
@@ -140,9 +128,6 @@ pub(crate) async fn execute_analyze(
 
 /// `format-table.statistics.parallelism` from the session (`SET 'paimon.<key>'`), default 8.
 /// A value below one is read as one.
-///
-/// Like Java's Spark connector option of the same name, it is a session setting, not a table
-/// option.
 fn format_table_statistics_parallelism(ctx: &SQLContext) -> usize {
     const KEY: &str = "format-table.statistics.parallelism";
     ctx.dynamic_options()
@@ -154,13 +139,8 @@ fn format_table_statistics_parallelism(ctx: &SQLContext) -> usize {
         .unwrap_or(8)
 }
 
-/// The values an `ANALYZE ... PARTITION (...)` clause fixes, in partition-key order.
-///
-/// A column named without a value means every value of it, and the columns that carry a value
-/// must be a leading run of the partition keys: `PARTITION (dt = 'x', hour)` selects every hour of
-/// that day, while `PARTITION (hour = '00')` is rejected rather than quietly widened to more
-/// partitions than were asked for. Values are spelled the way ADD PARTITION writes them, so
-/// `p = '01'` selects the INT partition registered as `1`.
+/// The values an `ANALYZE ... PARTITION (...)` clause fixes, in partition-key order; valued
+/// columns must be a leading run of the keys, so `PARTITION (hour = '00')` is rejected.
 fn analyze_partition_prefix(
     expressions: &[SqlExpr],
     table: &paimon::Table,
