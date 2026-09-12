@@ -55,6 +55,39 @@ Available storage features:
 
 Mosaic data file reads are always available. The current Mosaic support is read-only: Paimon Rust can read existing `.mosaic` data files, including array and map columns, in a Paimon table, but it does not write Mosaic data files yet.
 
+## FileIndexes for Append Writes
+
+Ordinary append writes can generate Bitmap and Bloom Filter indexes for supported
+top-level columns using table options:
+
+```text
+file-index.bitmap.columns = category
+file-index.bloom-filter.columns = id
+file-index.bloom-filter.id.items = 100000
+file-index.bloom-filter.id.fpp = 0.01
+file-index.in-manifest-threshold = 500 B
+```
+
+Column lists are comma-separated. Bitmap supports `version` (currently `2` only)
+and `index-block-size` per column. Bloom Filter supports `items` and `fpp`.
+Invalid columns, unsupported index/data types, and invalid index options fail
+when creating the writer.
+
+Each data file gets its own index containing all configured columns and index
+types. The complete serialized index is embedded in the manifest when its size
+is at most `file-index.in-manifest-threshold` (default `500 B`); larger indexes
+are stored beside the data file as a `.index` sidecar. Failed indexed writes
+must be discarded; their newly created files are cleaned up on a best-effort
+basis. Use commit `abort` to clean up files after a successful `prepare_commit`
+when the prepared write will not be committed.
+
+`file-index.read.enabled` controls only reading, independently of index creation.
+Existing files are not backfilled. Index generation is not supported for
+primary-key writes, data-evolution writes, or dedicated Blob/Vector paths;
+ordinary writer creation rejects index configuration on these paths. COW and
+partial DataEvolution rewrites do not generate indexes. Nested indexes and
+additional index types are not supported.
+
 ## Catalog Management
 
 Paimon supports multiple catalog types. The `CatalogFactory` provides a unified way to create catalogs based on configuration options.
