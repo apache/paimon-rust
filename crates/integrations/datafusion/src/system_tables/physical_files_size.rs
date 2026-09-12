@@ -75,6 +75,7 @@ impl TableProvider for PhysicalFilesSizeTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        super::ensure_scan_authorized(&self.table).await?;
         let table = self.table.clone();
         let summary = crate::runtime::await_with_runtime(async move {
             let partition_depth = table.schema().partition_keys().len();

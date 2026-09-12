@@ -19,6 +19,7 @@
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
+use crate::api::GetTableResponse;
 use crate::catalog::{Identifier, RESTTokenFileIO};
 use crate::common::Options;
 use crate::error::Error;
@@ -81,6 +82,110 @@ impl RESTEnv {
         &self.api
     }
 
+    /// Bracketed by a freshness check: the response names no table, so a drop
+    /// and re-create in between would let a replacement's grant serve this one.
+    pub(crate) async fn table_query_auth(
+        &self,
+        branch: &str,
+        schema_id: i64,
+        select: Option<Vec<String>>,
+    ) -> Result<crate::api::AuthTableQueryResponse> {
+        self.current_table_checked(schema_id).await?;
+        let response = self
+            .api
+            .auth_table_query(&self.branch_identifier(branch)?, select)
+            .await?;
+        self.current_table_checked(schema_id).await?;
+        Ok(response)
+    }
+
+    /// Asked of the branch this handle reads. A `false` is trusted only from the
+    /// uuid this handle was loaded with — a replacement's says nothing about
+    /// these files.
+    pub(crate) async fn query_auth_enabled_live(&self, branch: &str) -> Result<bool> {
+        let identifier = self.branch_identifier(branch)?;
+        let response = self.api.get_table(&identifier).await?;
+        let Some(schema) = response.schema.as_ref() else {
+            return Ok(true);
+        };
+        if crate::spec::CoreOptions::new(schema.options()).query_auth_enabled() {
+            return Ok(true);
+        }
+        // A branch answers for its own schema only. Whether the server reports
+        // the base table's id for `t$branch_x` is its own business, so the
+        // identity check below is for the name this handle was loaded with.
+        if identifier != self.identifier {
+            return Ok(false);
+        }
+        match response.id.as_deref() {
+            Some(uuid) if uuid == self.uuid => Ok(false),
+            Some(uuid) => Err(crate::Error::DataInvalid {
+                message: format!(
+                    "table '{}' now resolves to uuid {uuid}, not the {} this handle was loaded \
+                     with; re-load the table before reading it",
+                    identifier.full_name(),
+                    self.uuid
+                ),
+                source: None,
+            }),
+            None => Ok(true),
+        }
+    }
+
+    /// Refused unless the name still resolves to the loaded table — a missing
+    /// identity too, which checks nothing. Asserts nothing on its own: an
+    /// ordinary table must not inherit a freshness restriction.
+    pub(crate) async fn current_table_checked(&self, schema_id: i64) -> Result<GetTableResponse> {
+        let response = self.api.get_table(&self.identifier).await?;
+        let name = self.identifier.full_name();
+        let same = |what: &str, loaded: String, now: Option<String>| match now {
+            Some(now) if now == loaded => Ok(()),
+            now => Err(crate::Error::DataInvalid {
+                message: format!(
+                    "table '{name}' now resolves to {what} {}, not the {loaded} this handle was \
+                     loaded with; re-load the table before reading it",
+                    now.as_deref().unwrap_or("nothing the server reports")
+                ),
+                source: None,
+            }),
+        };
+        same("uuid", self.uuid.clone(), response.id.clone())?;
+        same(
+            "schema",
+            schema_id.to_string(),
+            response.schema_id.map(|id| id.to_string()),
+        )?;
+        Ok(response)
+    }
+
+    /// `db.table$branch_<name>`, as Java names a branch. Only the auth call uses it.
+    /// Built from the base table name: a handle loaded as `db.t$branch_x`
+    /// already carries the decoration, and must not double it.
+    fn branch_identifier(&self, branch: &str) -> Result<Identifier> {
+        // The object-name encoding cannot carry a `$`: `t$branch_a$b` parses as
+        // branch `a` plus system table `b`, for Java clients as much as here.
+        if branch.contains(crate::catalog::SYSTEM_TABLE_SPLITTER) {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "branch '{branch}' cannot be addressed over REST: its name contains '{}'",
+                    crate::catalog::SYSTEM_TABLE_SPLITTER
+                ),
+            });
+        }
+        let base = self.identifier.table_name()?;
+        if branch == crate::catalog::DEFAULT_MAIN_BRANCH {
+            return Ok(Identifier::new(self.identifier.database(), base));
+        }
+        Ok(Identifier::new(
+            self.identifier.database(),
+            format!(
+                "{base}{}{}{branch}",
+                crate::catalog::SYSTEM_TABLE_SPLITTER,
+                crate::catalog::SYSTEM_BRANCH_PREFIX
+            ),
+        ))
+    }
+
     /// Get the table identifier.
     pub fn identifier(&self) -> &Identifier {
         &self.identifier
@@ -128,8 +233,6 @@ impl RESTEnv {
             .map_err(|e| map_rest_error_for_table(e, identifier))
     }
 
-    /// Build a Table from an already-fetched response, so routing can
-    /// inspect the declared type first.
     pub(crate) async fn build_table(
         identifier: &Identifier,
         response: crate::api::GetTableResponse,
@@ -138,6 +241,7 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
     ) -> Result<Table> {
+        identifier.reject_decorated()?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
             message: format!("Table {} response missing schema", identifier.full_name()),
             source: None,
@@ -219,7 +323,8 @@ impl RESTEnv {
             table_path,
             table_schema,
             Some(rest_env),
-        ))
+        )
+        .with_query_auth_session())
     }
 
     pub(crate) async fn build_object_table(
@@ -400,5 +505,40 @@ mod tests {
 
         assert!(rest_env.has_local_cache());
         assert!(rest_env.clone().has_local_cache());
+    }
+
+    #[tokio::test]
+    async fn test_branch_identifier_is_built_from_the_base_name() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, "http://localhost:1");
+        options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+        options.set(CatalogOptions::TOKEN, "test-token");
+        let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+        let env = |object: &str| {
+            RESTEnv::new(
+                Identifier::new("db", object),
+                "uuid".to_string(),
+                api.clone(),
+                options.clone(),
+                false,
+                None,
+            )
+        };
+        // Loaded as the branch itself: must not become `t$branch_dev$branch_dev`.
+        let decorated = env("t$branch_dev").branch_identifier("dev").unwrap();
+        assert_eq!(decorated.object(), "t$branch_dev");
+        assert_eq!(
+            env("t").branch_identifier("dev").unwrap().object(),
+            "t$branch_dev"
+        );
+        assert_eq!(
+            env("t$branch_dev")
+                .branch_identifier("main")
+                .unwrap()
+                .object(),
+            "t"
+        );
+        // The encoding has no room for a `$` inside the branch name.
+        assert!(env("t").branch_identifier("release$one").is_err());
     }
 }

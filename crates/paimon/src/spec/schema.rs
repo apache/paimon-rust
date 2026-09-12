@@ -638,22 +638,27 @@ impl TableSchema {
     }
 }
 
-/// Reject column names reserved for system use, mirroring Java `SpecialFields`:
-/// the five `SYSTEM_FIELD_NAMES` and the `_KEY_` key-field prefix.
+/// Whether `name` is one Paimon reserves for a system column. Java
+/// `SpecialFields.SYSTEM_FIELD_NAMES` plus the `_KEY_` key-field prefix.
+pub(crate) fn is_reserved_system_field_name(name: &str) -> bool {
+    name.starts_with(KEY_FIELD_PREFIX) || SYSTEM_FIELD_NAMES.contains(&name)
+}
+
+// Java SpecialFields.SYSTEM_FIELD_NAMES.
+const SYSTEM_FIELD_NAMES: [&str; 5] = [
+    SEQUENCE_NUMBER_FIELD_NAME,
+    VALUE_KIND_FIELD_NAME,
+    "_LEVEL",
+    ROW_KIND_FIELD_NAME,
+    ROW_ID_FIELD_NAME,
+];
+const KEY_FIELD_PREFIX: &str = "_KEY_";
+
+/// Reject column names reserved for system use, mirroring Java `SpecialFields`.
 ///
 /// A user column colliding with a system field is otherwise excluded from the
 /// physical read and silently filled with the system value.
 fn validate_no_reserved_field_names(fields: &[DataField]) -> crate::Result<()> {
-    // Java SpecialFields.SYSTEM_FIELD_NAMES.
-    const SYSTEM_FIELD_NAMES: [&str; 5] = [
-        SEQUENCE_NUMBER_FIELD_NAME,
-        VALUE_KIND_FIELD_NAME,
-        "_LEVEL",
-        ROW_KIND_FIELD_NAME,
-        ROW_ID_FIELD_NAME,
-    ];
-    const KEY_FIELD_PREFIX: &str = "_KEY_";
-
     for field in fields {
         let name = field.name();
         if name.starts_with(KEY_FIELD_PREFIX) || SYSTEM_FIELD_NAMES.contains(&name) {

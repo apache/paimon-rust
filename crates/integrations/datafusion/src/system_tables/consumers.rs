@@ -72,6 +72,7 @@ impl TableProvider for ConsumersTable {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        super::ensure_scan_authorized(&self.table).await?;
         let manager = self.table.consumer_manager();
         let requested_ids = requested_consumer_ids(filters);
         let consumers = crate::runtime::await_with_runtime(async move {

@@ -501,10 +501,12 @@ impl<'a> PaimonReadBuilder<'a> {
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
-        // Fail closed at read construction so bindings that short-circuit before
-        // `to_arrow` (e.g. an empty-splits fast path) can't bypass the guard.
-        let core_options = self.table.schema.core_options();
-        core_options.ensure_read_authorized()?;
+        // Stays here: a table's declared type is known without a grant. Only
+        // query-auth moved to `to_arrow`, where the split's grant is visible.
+        self.table
+            .schema
+            .core_options()
+            .ensure_type_paimon_served(&self.table.identifier().full_name())?;
         let read_type = match self.resolve_read_type()? {
             None => self.table.schema.fields().to_vec(),
             Some(fields) => fields,
@@ -946,12 +948,28 @@ mod tests {
     #[test]
     fn test_read_fails_closed_when_query_auth_enabled() {
         let table = query_auth_table();
-        // `new_read` fails closed, so bindings that short-circuit before `to_arrow` can't bypass.
-        let err = table.new_read_builder().new_read().unwrap_err();
+        let read = table.new_read_builder().new_read().unwrap();
+        let err = ungranted_read_error(&read);
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
-            "building a read for a query-auth.enabled table must fail closed"
+            "reading a query-auth.enabled table without a grant must fail closed"
         );
+    }
+
+    fn ungranted_read_error(read: &crate::table::TableRead<'_>) -> crate::Error {
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("memory:/t/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(Vec::new())
+            .build()
+            .unwrap();
+        match read.to_arrow(&[split]) {
+            Ok(_) => panic!("reading without a grant must fail closed"),
+            Err(err) => err,
+        }
     }
 
     #[test]
@@ -961,7 +979,8 @@ mod tests {
             "query-auth.enabled".to_string(),
             "false".to_string(),
         )]));
-        let err = table.new_read_builder().new_read().unwrap_err();
+        let read = table.new_read_builder().new_read().unwrap();
+        let err = ungranted_read_error(&read);
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "a dynamic override must not disable query-auth"

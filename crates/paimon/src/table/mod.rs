@@ -84,6 +84,7 @@ mod postpone_fixed_bucket_router;
 mod postpone_fixed_bucket_write;
 mod postpone_fixed_bucket_write_builder;
 mod prepared_files;
+mod query_auth;
 mod read_builder;
 pub mod referenced_files;
 pub(crate) mod rest_env;
@@ -182,6 +183,9 @@ pub struct Table {
     schema_manager: SchemaManager,
     branch: String,
     branch_reference: bool,
+    /// Minted only by [`RESTEnv::build_table`], so a handle assembled with the
+    /// public [`Table::new`] cannot replay a grant.
+    query_auth_session: Option<u64>,
     rest_env: Option<RESTEnv>,
     /// True when this table copy was switched to a historical schema by
     /// [`Table::copy_with_time_travel`]. Such a copy is read-only.
@@ -211,6 +215,7 @@ impl Table {
             schema_manager,
             branch,
             branch_reference: false,
+            query_auth_session: None,
             rest_env,
             time_traveled: false,
             travel_snapshot: None,
@@ -251,6 +256,7 @@ impl Table {
             schema_manager,
             branch,
             branch_reference,
+            query_auth_session: None,
             rest_env: None,
             time_traveled: false,
             travel_snapshot: None,
@@ -332,6 +338,116 @@ impl Table {
         } else {
             manager.with_branch(&self.branch)
         }
+    }
+
+    /// The live counterpart of [`CoreOptions::ensure_read_authorized`], which
+    /// reads the schema this handle was loaded with. For a read that plans
+    /// nothing — DataFusion's system tables — since the option can be set
+    /// after a load.
+    pub async fn ensure_read_authorized(&self) -> Result<()> {
+        self.ensure_read_authorized_live("a read without a plan")
+            .await
+    }
+
+    /// As [`Self::ensure_read_authorized`], naming the operation that asks.
+    pub(crate) async fn ensure_read_authorized_live(&self, operation: &str) -> Result<()> {
+        CoreOptions::new(self.schema.options())
+            .ensure_type_paimon_served(&self.identifier.full_name())?;
+        if self.server_query_auth_enabled().await? {
+            return Err(query_auth::unsupported(&format!(
+                "{operation} cannot apply a row filter or column masking"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether the server says this table is `query-auth.enabled` right now: the
+    /// handle's schema is a snapshot, and a cached `false` would skip the check.
+    pub(crate) async fn server_query_auth_enabled(&self) -> Result<bool> {
+        let local = CoreOptions::new(self.schema.options()).query_auth_enabled();
+        let Some(rest_env) = &self.rest_env else {
+            return Ok(local);
+        };
+        // Only ever strengthens.
+        if local {
+            return Ok(true);
+        }
+        rest_env.query_auth_enabled_live(&self.branch).await
+    }
+
+    /// Whether this handle reads a schema other than the one the server rules
+    /// on: a time-travel selector (`copy_with_options` adds one without the
+    /// flag), a travelled or branch view, or a `$branch_x` / `$files` name
+    /// whose managers read the base table's own files.
+    pub(crate) fn reads_another_schema(&self) -> Result<bool> {
+        let travels = CoreOptions::new(self.schema.options())
+            .try_time_travel_selector()?
+            .is_some();
+        let decorated = self.identifier.branch_name()?.is_some()
+            || self.identifier.system_table_name()?.is_some();
+        Ok(travels || self.time_traveled || self.branch_reference || decorated)
+    }
+
+    /// Whether this user may read this table; `None` when it is not
+    /// `query-auth.enabled`. `server_query_auth` is the caller's own lookup.
+    pub(crate) async fn authorize_read(
+        &self,
+        server_query_auth: bool,
+    ) -> Result<Option<std::sync::Arc<query_auth::QueryAuthGrant>>> {
+        let local = CoreOptions::new(self.schema.options());
+        if self.reads_another_schema()? && local.query_auth_enabled() {
+            return Err(query_auth::unsupported(
+                "a time-travelled or branch read authorizes against the table's current schema, \
+                 which is not the one it reads",
+            ));
+        }
+
+        let Some(rest_env) = &self.rest_env else {
+            // Only a REST catalog can authorize.
+            return if local.query_auth_enabled() {
+                Err(query_auth::unsupported(
+                    "it requires a REST catalog to authorize the query",
+                ))
+            } else {
+                Ok(None)
+            };
+        };
+
+        // No freshness assertion yet — an ordinary table must not inherit one.
+        if !server_query_auth {
+            return Ok(None);
+        }
+        if self.reads_another_schema()? {
+            return Err(query_auth::unsupported(
+                "a time-travelled or branch read authorizes against the table's current schema, \
+                 which is not the one it reads",
+            ));
+        }
+
+        // Before any RPC: only the catalog mints a session, so a handle the
+        // caller assembled stops here whatever name or files it wears.
+        let session = self.query_auth_session.ok_or_else(|| {
+            query_auth::unsupported("this table handle was assembled rather than loaded")
+        })?;
+
+        // Naming a system column here would fail the server's column check.
+        let response = rest_env
+            .table_query_auth(&self.branch, self.schema.id(), None)
+            .await?;
+        Ok(Some(std::sync::Arc::new(query_auth::QueryAuthGrant::new(
+            response, session,
+        ))))
+    }
+
+    /// Handed out once per catalog-loaded table; wraps only after 2^64 loads.
+    pub(crate) fn with_query_auth_session(mut self) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        self.query_auth_session = Some(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        self
+    }
+
+    pub(crate) fn query_auth_session(&self) -> Option<u64> {
+        self.query_auth_session
     }
 
     /// Get the REST environment, if this table was loaded from a REST catalog.
@@ -442,6 +558,7 @@ impl Table {
             schema_manager: self.schema_manager.clone(),
             branch: self.branch.clone(),
             branch_reference: self.branch_reference,
+            query_auth_session: self.query_auth_session,
             rest_env: self.rest_env.clone(),
             time_traveled: self.time_traveled,
             travel_snapshot: if selector_changed {
@@ -490,6 +607,7 @@ impl Table {
             schema_manager: self.schema_manager.clone(),
             branch: self.branch.clone(),
             branch_reference: self.branch_reference,
+            query_auth_session: self.query_auth_session,
             rest_env: self.rest_env.clone(),
             time_traveled: true,
             travel_snapshot: Some(snapshot.clone()),
@@ -651,6 +769,7 @@ impl Table {
             schema_manager,
             branch,
             branch_reference: true,
+            query_auth_session: self.query_auth_session,
             rest_env: self.rest_env.clone(),
             time_traveled: false,
             travel_snapshot: None,
@@ -683,6 +802,32 @@ pub type ArrowRecordBatchStream = BoxStream<'static, Result<RecordBatch>>;
 
 pub(crate) fn find_field_id_by_name(fields: &[DataField], name: &str) -> Option<i32> {
     fields.iter().find(|f| f.name() == name).map(|f| f.id())
+}
+
+/// A `query-auth.enabled` table wired to its own REST session.
+#[cfg(test)]
+pub(crate) async fn rest_query_auth_table() -> Table {
+    use crate::api::rest_api::RESTApi;
+    use crate::common::{CatalogOptions, Options};
+
+    let mut options = Options::default();
+    options.set(CatalogOptions::URI, "http://127.0.0.1:1");
+    options.set("token.provider", "bear");
+    options.set("token", "test_token");
+    let api = std::sync::Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+    let table = query_auth_table();
+    Table {
+        rest_env: Some(RESTEnv::new(
+            table.identifier.clone(),
+            "uuid-1".to_string(),
+            api,
+            options,
+            false,
+            None,
+        )),
+        ..table
+    }
+    .with_query_auth_session()
 }
 
 /// A minimal table with `query-auth.enabled = true`, for the fail-closed read guard.

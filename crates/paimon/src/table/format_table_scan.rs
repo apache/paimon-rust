@@ -63,20 +63,20 @@ impl<'a> FormatTableScan<'a> {
     }
 
     pub(crate) async fn plan(&self) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
+        self.table
+            .ensure_read_authorized_live("a format table")
+            .await?;
         self.plan_inner(None).await
     }
 
     pub(crate) async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        self.ensure_query_auth_allowed()?;
+        self.table
+            .ensure_read_authorized_live("a format table")
+            .await?;
         let mut trace = ScanTrace::default();
         let plan = self.plan_inner(Some(&mut trace)).await?;
         trace.planned_data_file_bytes = plan.planned_data_file_bytes();
         Ok((plan, trace))
-    }
-
-    fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
     }
 
     async fn plan_inner(&self, trace: Option<&mut ScanTrace>) -> crate::Result<Plan> {

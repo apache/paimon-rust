@@ -124,6 +124,14 @@ fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dy
         .map(|(_, build)| build(base_table))
 }
 
+/// Fail closed at scan time, asking the server: the option can be set after
+/// the provider was built.
+pub(crate) async fn ensure_scan_authorized(table: &Table) -> DFResult<()> {
+    crate::runtime::await_with_runtime(table.ensure_read_authorized())
+        .await
+        .map_err(to_datafusion_error)
+}
+
 pub(crate) fn provider_for_table(
     catalog: Arc<dyn Catalog>,
     identifier: Identifier,

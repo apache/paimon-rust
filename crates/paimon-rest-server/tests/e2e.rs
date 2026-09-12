@@ -525,3 +525,173 @@ async fn altering_the_declared_type_is_rejected() {
         .await
         .expect("still readable");
 }
+
+#[tokio::test]
+async fn test_branch_scan_against_the_real_server() {
+    let ctx = setup().await;
+    ctx.catalog
+        .create_database("db", true, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("db", "t");
+    ctx.catalog
+        .create_table(&identifier, append_only_schema(), false)
+        .await
+        .unwrap();
+    let base = ctx.catalog.get_table(&identifier).await.unwrap();
+
+    // A branch schema on disk, so `copy_with_branch` and the server both see it.
+    let branch_schema = paimon::spec::TableSchema::new(0, &append_only_schema());
+    let schema_path = base.schema_manager().with_branch("dev").schema_path(0);
+    let schema_dir = schema_path.rsplit_once('/').map(|(d, _)| d).unwrap();
+    base.file_io().mkdirs(schema_dir).await.unwrap();
+    base.file_io()
+        .new_output(&schema_path)
+        .unwrap()
+        .write(serde_json::to_vec(&branch_schema).unwrap().into())
+        .await
+        .unwrap();
+
+    // The branch reports the base table's uuid, so an ordinary branch scan
+    // through the copied handle still plans.
+    base.copy_with_branch("dev")
+        .await
+        .unwrap()
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .expect("an ordinary branch read must plan against the real server");
+
+    // A decorated name is answered by the server for the live check only;
+    // the catalog never builds a handle from one.
+    assert!(ctx
+        .catalog
+        .get_table(&Identifier::new("db", "t$branch_dev"))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn test_a_commit_addressed_to_a_branch_is_refused() {
+    let ctx = setup().await;
+    ctx.catalog
+        .create_database("db", true, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("db", "t");
+    ctx.catalog
+        .create_table(&identifier, append_only_schema(), false)
+        .await
+        .unwrap();
+    let base = ctx.catalog.get_table(&identifier).await.unwrap();
+    let schema_path = base.schema_manager().with_branch("dev").schema_path(0);
+    let schema_dir = schema_path.rsplit_once('/').map(|(d, _)| d).unwrap();
+    base.file_io().mkdirs(schema_dir).await.unwrap();
+    base.file_io()
+        .new_output(&schema_path)
+        .unwrap()
+        .write(
+            serde_json::to_vec(&paimon::spec::TableSchema::new(0, &append_only_schema()))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+
+    // Straight at the endpoint, past the client's own branch-write refusal:
+    // the server used to resolve the branch and then commit to main.
+    let snapshot = paimon::spec::Snapshot::builder()
+        .version(3)
+        .id(1)
+        .schema_id(0)
+        .base_manifest_list("manifest-list-0".to_string())
+        .delta_manifest_list("manifest-list-1".to_string())
+        .commit_user("e2e".to_string())
+        .commit_identifier(1)
+        .commit_kind(paimon::spec::CommitKind::APPEND)
+        .time_millis(0)
+        .build();
+    let outcome = base
+        .rest_env()
+        .unwrap()
+        .api()
+        .commit_snapshot(
+            &Identifier::new("db", "t$branch_dev"),
+            "db.t",
+            &snapshot,
+            &[],
+        )
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a commit addressed to a branch must be refused"
+    );
+    assert!(
+        base.snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap()
+            .is_none(),
+        "and main must be untouched"
+    );
+}
+
+#[tokio::test]
+async fn test_load_table_refuses_a_decorated_object_table() {
+    let ctx = setup().await;
+    ctx.catalog
+        .create_database("db", true, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("db", "objects");
+    let schema = paimon::spec::Schema::builder()
+        .column(
+            "ignored",
+            paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+        )
+        .option("type", "object-table")
+        .build()
+        .unwrap();
+    ctx.catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
+    // With a branch schema on disk the server resolves the name, so only the
+    // client's own refusal keeps `load_table`'s object-table early return from
+    // handing back the base relation.
+    let loaded = ctx.catalog.load_table(&identifier).await.unwrap();
+    let paimon::catalog::LoadedTable::Object(object) = loaded else {
+        panic!("expected an object table");
+    };
+    let manager =
+        paimon::table::SchemaManager::new(object.file_io().clone(), object.location().to_string())
+            .with_branch("dev");
+    let schema_path = manager.schema_path(0);
+    let schema_dir = schema_path.rsplit_once('/').map(|(d, _)| d).unwrap();
+    object.file_io().mkdirs(schema_dir).await.unwrap();
+    let (_, stored) = paimon::catalog::FileSystemCatalog::new({
+        let mut o = Options::new();
+        o.set(
+            CatalogOptions::WAREHOUSE,
+            ctx._warehouse.path().to_str().unwrap(),
+        );
+        o
+    })
+    .unwrap()
+    .fetch_table_schema(&identifier)
+    .await
+    .unwrap();
+    object
+        .file_io()
+        .new_output(&schema_path)
+        .unwrap()
+        .write(serde_json::to_vec(&stored).unwrap().into())
+        .await
+        .unwrap();
+    assert!(ctx
+        .catalog
+        .load_table(&Identifier::new("db", "objects$branch_dev"))
+        .await
+        .is_err());
+}

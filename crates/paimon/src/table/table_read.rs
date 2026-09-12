@@ -183,7 +183,7 @@ impl<'a> TableRead<'a> {
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        self.ensure_query_auth_allowed()?;
+        self.ensure_query_auth_allowed(plan)?;
         plan.validate()?;
         match &self.0 {
             TableReadKind::Paimon(read) => read.to_incremental_arrow(plan),
@@ -203,7 +203,7 @@ impl<'a> TableRead<'a> {
         &self,
         plan: &IncrementalPlan,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        self.ensure_query_auth_allowed()?;
+        self.ensure_query_auth_allowed(plan)?;
         plan.validate()?;
         match &self.0 {
             TableReadKind::Paimon(read) => read.to_audit_log_arrow(plan),
@@ -213,8 +213,33 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
-        CoreOptions::new(self.table().schema().options()).ensure_read_authorized()
+    /// Sync, so the split's marker stands in for asking the server.
+    fn ensure_query_auth_allowed(&self, plan: &IncrementalPlan) -> crate::Result<()> {
+        let core_options = CoreOptions::new(self.table().schema().options());
+        core_options.ensure_type_paimon_served(&self.table().identifier().full_name())?;
+        if core_options.query_auth_enabled() || plan.any_query_auth_required() {
+            return Err(super::query_auth::unsupported(
+                "an incremental read cannot apply a row filter or column masking",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Every leaf's column name. Unlike the index-based walks this sees system
+/// columns, whose leaf index is only a placeholder.
+fn collect_leaf_column_names(predicate: &Predicate, out: &mut std::collections::HashSet<String>) {
+    match predicate {
+        Predicate::Leaf { column, .. } => {
+            out.insert(column.clone());
+        }
+        Predicate::And(children) | Predicate::Or(children) => {
+            children
+                .iter()
+                .for_each(|child| collect_leaf_column_names(child, out));
+        }
+        Predicate::Not(inner) => collect_leaf_column_names(inner, out),
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
     }
 }
 
@@ -714,12 +739,70 @@ impl<'a> PaimonTableRead<'a> {
         reader.read(splits)
     }
 
+    /// Allowed only if the splits carry a grant saying the server imposed
+    /// nothing. Never fetched here, so a split without one fails closed.
+    fn ensure_authorized_by_splits(
+        &self,
+        core_options: &CoreOptions,
+        data_splits: &[DataSplit],
+    ) -> crate::Result<()> {
+        // Unconditional: unrelated to query-auth.
+        core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        // Decided at plan time, as in Java. Known limitation: a split predating
+        // the option, or built by hand, has neither flag and is read on the
+        // caller's word — re-plan after an authorization change.
+        let required = core_options.query_auth_enabled()
+            || data_splits.iter().any(|s| s.query_auth_required());
+        if !required {
+            return Ok(());
+        }
+        // The read's own scope: a caller can plan clean, then read differently.
+        let mut filter_columns = std::collections::HashSet::new();
+        for predicate in &self.data_predicates {
+            collect_leaf_column_names(predicate, &mut filter_columns);
+        }
+        super::query_auth::reject_system_columns(
+            self.read_type
+                .iter()
+                .map(|f| f.name())
+                .chain(filter_columns.iter().map(String::as_str)),
+        )?;
+        // By id AND name: older files resolve by id, so a dropped field passed
+        // through the public `with_read_type` returns an uncovered column.
+        super::query_auth::reject_noncanonical_fields(
+            &self.read_type,
+            self.table.schema().fields(),
+        )?;
+        // Per split, as Java binds one `QueryAuthSplit` each: lists get
+        // concatenated and the first grant must not cover the rest.
+        for split in data_splits {
+            let Some(grant) = split.query_auth_grant() else {
+                return Err(super::query_auth::unsupported(
+                    "the split carries no authorization; it was built directly, or serialized, \
+                     which drops the grant — re-plan the scan",
+                ));
+            };
+            if !grant.matches_table(self.table) {
+                return Err(super::query_auth::unsupported(
+                    "the grant was issued for a different table, schema or session; re-plan the \
+                     scan",
+                ));
+            }
+            if !grant.is_unrestricted() {
+                return Err(super::query_auth::unsupported(
+                    "this client cannot apply a row filter or column masking, so it refuses \
+                     rather than return unfiltered rows",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let core_options = self.table.schema.core_options();
-        // Fail closed for a direct `TableRead` (bypassing `ReadBuilder::new_read`).
-        core_options.ensure_read_authorized()?;
+        self.ensure_authorized_by_splits(&core_options, data_splits)?;
         let merge_engine = core_options.merge_engine()?;
 
         // Route supported PK merge engines through the split-aware reader.
@@ -1689,14 +1772,301 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_table_read_fails_closed_when_query_auth_enabled() {
+    fn test_incremental_and_audit_log_reads_refuse_a_query_auth_table() {
         let table = query_auth_table();
-        // Bypass `ReadBuilder` by constructing `TableRead` directly; the `to_arrow` guard
-        // still fails closed.
         let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let plan = IncrementalPlan::new(IncrementalScanMode::Delta, Vec::new());
+        for err in [
+            read.to_incremental_arrow(&plan).err(),
+            read.to_audit_log_arrow(&plan).err(),
+        ] {
+            let err = err.expect("both must refuse a query-auth.enabled table");
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("query-auth.enabled")),
+                "got {err:?}"
+            );
+        }
+    }
+
+    fn stale_handle(name: &str, options: &[(&str, &str)]) -> Table {
+        let mut builder = crate::spec::Schema::builder().column(
+            "id",
+            crate::spec::DataType::Int(crate::spec::IntType::new()),
+        );
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", name),
+            format!("/tmp/test-{name}"),
+            crate::spec::TableSchema::new(0, &builder.build().unwrap()),
+            None,
+        )
+    }
+
+    #[test]
+    fn test_a_marked_split_refuses_the_format_and_incremental_reads() {
+        let stamped = split_with_grant(None);
+
+        let format = stale_handle(
+            "fmt",
+            &[("type", "format-table"), ("file.format", "parquet")],
+        );
+        let read =
+            TableRead::new_format(&format, format.schema().fields().to_vec(), Vec::new(), None);
+        let Err(err) = read.to_arrow(std::slice::from_ref(&stamped)) else {
+            panic!("a marked split must refuse a format read")
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("query-auth.enabled")),
+            "{err:?}"
+        );
+
+        let paimon = stale_handle("inc", &[]);
+        let read = TableRead::new(&paimon, paimon.schema().fields().to_vec(), Vec::new());
+        let plan = IncrementalPlan::new(
+            IncrementalScanMode::Delta,
+            vec![IncrementalSplit::Data(stamped)],
+        );
+        let Err(err) = read.to_incremental_arrow(&plan) else {
+            panic!("a marked split must refuse an incremental read")
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("query-auth.enabled")),
+            "{err:?}"
+        );
+    }
+
+    fn split_with_grant(
+        grant: Option<crate::table::query_auth::QueryAuthGrant>,
+    ) -> crate::table::DataSplit {
+        crate::table::DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("memory:/t/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(Vec::new())
+            .build()
+            .unwrap()
+            .planned(grant.map(std::sync::Arc::new))
+    }
+
+    fn grant_for(table: &Table, restricted: bool) -> crate::table::query_auth::QueryAuthGrant {
+        crate::table::query_auth::QueryAuthGrant::new(
+            crate::api::AuthTableQueryResponse {
+                filter: restricted.then(|| vec!["{}".to_string()]),
+                column_masking: None,
+            },
+            table
+                .query_auth_session()
+                .expect("a catalog-loaded table has a session"),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_one_unrestricted_grant_does_not_cover_the_other_splits() {
+        let table = crate::table::rest_query_auth_table().await;
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let allowed = split_with_grant(Some(grant_for(&table, false)));
+        for other in [
+            split_with_grant(Some(grant_for(&table, true))),
+            split_with_grant(None),
+        ] {
+            assert!(
+                read.to_arrow(&[allowed.clone(), other]).is_err(),
+                "every split must be authorized on its own"
+            );
+        }
+    }
+
+    #[test]
+    fn test_engine_served_table_is_refused_at_the_read_boundary() {
+        let schema = crate::spec::Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .option("type", "iceberg-table")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            crate::io::FileIOBuilder::new("file").build().unwrap(),
+            crate::catalog::Identifier::new("default", "ice_t"),
+            "/tmp/test-engine-served-read".to_string(),
+            crate::spec::TableSchema::new(0, &schema),
+            None,
+        );
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let err = match read.to_arrow(&[split_with_grant(None)]) {
+            Ok(_) => panic!("an engine-served table must not be read as Paimon"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("cannot be served as a Paimon table")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_row_id_filter_configured_on_the_read_is_refused() {
+        let table = crate::table::rest_query_auth_table().await;
+        let row_id = Predicate::Leaf {
+            index: 0,
+            column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
+            data_type: crate::spec::DataType::BigInt(crate::spec::BigIntType::new()),
+            op: crate::spec::PredicateOperator::GtEq,
+            literals: vec![crate::spec::Datum::Long(1)],
+        };
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), vec![row_id]);
+        let split = split_with_grant(Some(grant_for(&table, false)));
+        let err = match read.to_arrow(&[split]) {
+            Ok(_) => panic!("a system-column filter must be refused"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("system column '_ROW_ID'")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_field_outside_the_current_schema_is_refused() {
+        let table = crate::table::rest_query_auth_table().await;
+        let dropped = crate::spec::DataField::new(
+            999,
+            "dropped".to_string(),
+            crate::spec::DataType::Int(crate::spec::IntType::new()),
+        );
+        let real = table.schema().fields()[0].clone();
+        let reshaped = crate::spec::DataField::new(
+            real.id(),
+            real.name().to_string(),
+            crate::spec::DataType::Row(crate::spec::RowType::new(vec![
+                crate::spec::DataField::new(
+                    1,
+                    "hidden".to_string(),
+                    crate::spec::DataType::Int(crate::spec::IntType::new()),
+                ),
+            ])),
+        );
+
+        for field in [dropped, reshaped] {
+            let read = TableRead::new(&table, vec![field], Vec::new());
+            let split = split_with_grant(Some(grant_for(&table, false)));
+            let err = match read.to_arrow(&[split]) {
+                Ok(_) => panic!("a field outside the current schema must be refused"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("not a column of the current schema")),
+                "got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_serialized_split_still_demands_authorization() {
+        let stamped = split_with_grant(None);
+        let bytes = serde_json::to_vec(&stamped).unwrap();
+        let restored: crate::table::DataSplit = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            restored.query_auth_grant().is_none(),
+            "the grant is dropped"
+        );
+        assert!(
+            restored.query_auth_required(),
+            "but the demand for authorization survives"
+        );
+
+        let stale = Table::new(
+            crate::io::FileIOBuilder::new("file").build().unwrap(),
+            crate::catalog::Identifier::new("default", "stale"),
+            "/tmp/test-stale-handle".to_string(),
+            crate::spec::TableSchema::new(
+                0,
+                &crate::spec::Schema::builder()
+                    .column(
+                        "id",
+                        crate::spec::DataType::Int(crate::spec::IntType::new()),
+                    )
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        );
+        assert!(!stale.schema().core_options().query_auth_enabled());
+        let read = TableRead::new(&stale, stale.schema().fields().to_vec(), Vec::new());
+        assert!(
+            read.to_arrow(&[restored]).is_err(),
+            "a round-tripped split must fail closed even on a handle that predates the option"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_grant_from_another_handle_refuses_the_read() {
+        let table = crate::table::rest_query_auth_table().await;
+        let other = crate::table::rest_query_auth_table().await;
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let err = match read.to_arrow(&[split_with_grant(Some(grant_for(&other, false)))]) {
+            Ok(_) => panic!("a grant obtained elsewhere must not authorize this read"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("different table, schema or session")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restricted_grant_on_a_split_refuses_the_read() {
+        let table = crate::table::rest_query_auth_table().await;
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let split = split_with_grant(Some(grant_for(&table, true)));
         assert!(
             matches!(
-                read.to_arrow(&[]),
+                read.to_arrow(&[split]),
+                Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
+            ),
+            "a row filter this client cannot apply must refuse the read"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unrestricted_grant_on_a_split_allows_the_read() {
+        let table = crate::table::rest_query_auth_table().await;
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let split = split_with_grant(Some(grant_for(&table, false)));
+        assert!(
+            read.to_arrow(&[split]).is_ok(),
+            "an unrestricted grant must let the read through"
+        );
+    }
+
+    #[test]
+    fn test_direct_table_read_fails_closed_when_query_auth_enabled() {
+        let table = query_auth_table();
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let split = crate::table::DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("memory:/t/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(Vec::new())
+            .build()
+            .unwrap();
+        assert!(
+            matches!(
+                read.to_arrow(&[split]),
                 Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
             ),
             "directly-constructed read of a query-auth.enabled table must fail closed"

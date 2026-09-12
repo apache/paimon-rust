@@ -168,6 +168,21 @@ impl Identifier {
     pub fn system_table_name(&self) -> Result<Option<String>> {
         Ok(self.parsed_object_name()?.system_table)
     }
+
+    /// A `$branch_x` or `$files` name addresses a view of the table rather than
+    /// the table: no handle is built from one, and no mutation acts on one.
+    pub(crate) fn reject_decorated(&self) -> Result<()> {
+        let parsed = self.parsed_object_name()?;
+        if parsed.branch.is_some() || parsed.system_table.is_some() {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "'{}' is a decorated name; load the table and use `copy_with_branch`",
+                    self.full_name()
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Parse a Paimon object name into table, optional branch, and optional system table.
