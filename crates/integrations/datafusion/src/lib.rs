@@ -43,6 +43,7 @@ mod catalog;
 mod delete;
 mod error;
 mod filter_pushdown;
+mod format_partition_ddl;
 #[cfg(feature = "fulltext")]
 mod full_text_search;
 mod hybrid_search;
