@@ -35,6 +35,7 @@ impl ResourcePaths {
     const PARTITIONS: &'static str = "partitions";
     const VIEWS: &'static str = "views";
     const FUNCTIONS: &'static str = "functions";
+    const PERMISSIONS: &'static str = "permissions";
 
     /// Create a new ResourcePaths with the given prefix.
     pub fn new(prefix: &str) -> Self {
@@ -237,6 +238,21 @@ impl ResourcePaths {
             self.partitions(database_name, table_name)
         )
     }
+
+    /// Get the permission collection of the catalog (`{base}/permissions`).
+    pub fn permissions(&self) -> String {
+        format!("{}/{}", self.base_path, Self::PERMISSIONS)
+    }
+
+    /// Get the action endpoint that grants or replaces one permission assignment.
+    pub fn grant_permission(&self) -> String {
+        format!("{}/grant", self.permissions())
+    }
+
+    /// Get the action endpoint that revokes one permission assignment.
+    pub fn revoke_permission(&self) -> String {
+        format!("{}/revoke", self.permissions())
+    }
 }
 
 #[cfg(test)]
@@ -325,5 +341,13 @@ mod tests {
             paths.drop_partitions("analytics db", "user events"),
             "/v1/catalog/databases/analytics+db/tables/user+events/partitions/drop"
         );
+    }
+
+    #[test]
+    fn test_permission_paths_hang_off_the_catalog_prefix() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(paths.permissions(), "/v1/catalog/permissions");
+        assert_eq!(paths.grant_permission(), "/v1/catalog/permissions/grant");
+        assert_eq!(paths.revoke_permission(), "/v1/catalog/permissions/revoke");
     }
 }

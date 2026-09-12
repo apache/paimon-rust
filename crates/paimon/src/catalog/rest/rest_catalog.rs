@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::api::management::{ListPermissionsRequest, PermissionAssignment, PermissionResource};
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::api::PagedList;
@@ -124,6 +125,34 @@ impl RESTCatalog {
     ) -> Result<PagedList<String>> {
         self.api
             .list_databases_paged(max_results, page_token, database_name_pattern)
+            .await
+    }
+
+    // ======================= permission management ==========================
+    //
+    // Experimental REST management API. Like Java's `RESTCatalog.permissionManagement()`,
+    // these live on the REST catalog only and are deliberately not part of the `Catalog`
+    // trait. Errors are the unmapped `Error::RestApi` the server answered with.
+
+    pub async fn list_permissions_paged(
+        &self,
+        request: &ListPermissionsRequest,
+    ) -> Result<PagedList<PermissionAssignment>> {
+        self.api.list_permissions_paged(request).await
+    }
+
+    pub async fn grant_permission(&self, assignment: &PermissionAssignment) -> Result<()> {
+        self.api.grant_permission(assignment).await
+    }
+
+    pub async fn revoke_permission(
+        &self,
+        resource: &PermissionResource,
+        access: &str,
+        principal: &str,
+    ) -> Result<()> {
+        self.api
+            .revoke_permission(resource, access, principal)
             .await
     }
 }

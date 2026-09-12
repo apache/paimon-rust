@@ -32,14 +32,16 @@ use super::api_request::{
     AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
     CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateViewRequest,
     DropPartitionsRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
-    RenameTableRequest,
+    RenameTableRequest, RevokePermissionRequest,
 };
 use super::api_response::{
     AuthTableQueryResponse, ConfigResponse, GetDatabaseResponse, GetFunctionResponse,
     GetTableResponse, GetViewResponse, ListDatabasesResponse, ListFunctionsResponse,
-    ListPartitionsResponse, ListTablesResponse, ListViewsResponse, PagedList,
+    ListPartitionsResponse, ListPermissionsResponse, ListTablesResponse, ListViewsResponse,
+    PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
+use super::management::{ListPermissionsRequest, PermissionAssignment, PermissionResource};
 use super::resource_paths::ResourcePaths;
 use super::rest_util::RESTUtil;
 
@@ -845,6 +847,51 @@ impl RESTApi {
         let path = self.resource_paths.auth_table(database, table);
         let request = AuthTableQueryRequest::new(select);
         self.client.post(&path, &request).await
+    }
+
+    // ==================== Permission Management ====================
+    //
+    // Experimental REST management API (Java `RESTPermissionManagement`). Validation
+    // failures come back as `RestError::BadRequest` before anything is sent.
+
+    /// List the direct permission assignments on one exact resource or scope.
+    ///
+    /// The server does not synthesize assignments inherited through `CATALOG_ALL` /
+    /// `DATABASE_ALL`; expired assignments may still be listed until it cleans them up.
+    pub async fn list_permissions_paged(
+        &self,
+        request: &ListPermissionsRequest,
+    ) -> Result<PagedList<PermissionAssignment>> {
+        let params = request.query_params()?;
+        let response: ListPermissionsResponse = self
+            .client
+            .get(&self.resource_paths.permissions(), Some(&params))
+            .await?;
+        Ok(PagedList::new(
+            response.permissions,
+            response.next_page_token,
+        ))
+    }
+
+    /// Grant an assignment, replacing the expiry and column range of an identical one.
+    pub async fn grant_permission(&self, assignment: &PermissionAssignment) -> Result<()> {
+        assignment.validate()?;
+        let path = self.resource_paths.grant_permission();
+        let _resp: serde_json::Value = self.client.post(&path, assignment).await?;
+        Ok(())
+    }
+
+    /// Revoke an assignment by identity; revoking an absent one succeeds.
+    pub async fn revoke_permission(
+        &self,
+        resource: &PermissionResource,
+        access: &str,
+        principal: &str,
+    ) -> Result<()> {
+        let request = RevokePermissionRequest::new(resource.clone(), access, principal)?;
+        let path = self.resource_paths.revoke_permission();
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
     }
 
     // ==================== Commit Operations ====================
