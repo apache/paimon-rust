@@ -111,16 +111,8 @@ impl FormatTablePartitionPaths {
             .join("/"))
     }
 
-    /// Discover complete raw partition specs from the table directory.
-    ///
-    /// Hidden directories whose names begin with `.` or `_`, segments that do
-    /// not match the configured layout, and paths shallower than the declared
-    /// partition depth are ignored. In value-only layouts, the configured
-    /// default-partition directory is the only hidden-name exception.
-    /// A matching segment that is malformed or not canonically escaped returns
-    /// an error rather than being skipped, because its catalog spec would not
-    /// resolve back to the same physical path.
-    /// Results are sorted and deduplicated by canonical `key=value/...` name.
+    /// Discover complete raw partition specs from the table directory, sorted and deduplicated.
+    /// Skips hidden or non-matching entries; a malformed or non-canonical segment is an error.
     pub async fn discover(
         &self,
         file_io: &FileIO,

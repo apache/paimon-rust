@@ -90,9 +90,8 @@ async fn repair(
         )
         .await?;
     let registered_partitions = catalog.list_partitions(identifier).await?;
-    // A partition registered at a location of its own does not live under the table directory,
-    // so discovery never finds it there. Repair leaves it registered rather than reading that as
-    // a directory gone missing.
+    // A partition registered at a location of its own is never discovered under the table
+    // directory, so repair leaves it registered.
     let custom_located = registered_partitions
         .iter()
         .filter(|partition| {
