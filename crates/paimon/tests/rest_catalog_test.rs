@@ -2726,6 +2726,9 @@ async fn test_a_disabled_answer_from_a_replacement_table_is_not_trusted() {
     );
 }
 
+// Writes a branch schema under the `file://` tempdir, which `FileIO` cannot
+// derive on Windows (see #397).
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_an_ordinary_branch_read_still_plans() {
     let ctx = setup_catalog(vec!["default"]).await;
@@ -2762,6 +2765,9 @@ async fn test_an_ordinary_branch_read_still_plans() {
         .expect("asking the branch must not break an ordinary branch read");
 }
 
+// Writes a branch schema under the `file://` tempdir, which `FileIO` cannot
+// derive on Windows (see #397).
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_query_auth_enabled_on_a_branch_is_seen_by_a_branch_handle() {
     let ctx = setup_catalog(vec!["default"]).await;
@@ -2805,6 +2811,9 @@ async fn test_query_auth_enabled_on_a_branch_is_seen_by_a_branch_handle() {
     );
 }
 
+// Writes a branch schema under the `file://` tempdir, which `FileIO` cannot
+// derive on Windows (see #397).
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_a_branch_reporting_its_own_uuid_still_reads() {
     let ctx = setup_catalog(vec!["default"]).await;
