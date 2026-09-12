@@ -350,7 +350,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 .table
                 .file_io()
                 .new_output(&index_path)?
-                .async_writer()
+                .async_writer_with_concurrency(8)
                 .await?;
             let mut output = SyncIoBridge::new(async_writer);
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {
