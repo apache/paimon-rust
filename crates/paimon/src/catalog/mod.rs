@@ -606,10 +606,8 @@ pub trait Catalog: Send + Sync {
         })
     }
 
-    /// Unregister table partition metadata from the catalog.
-    ///
-    /// This does not delete partition directories or data files. Missing specs
-    /// are ignored so callers can safely retry the request.
+    /// Unregister table partition metadata from the catalog, keeping directories and data files.
+    /// Missing specs are ignored so callers can safely retry the request.
     async fn drop_partitions(
         &self,
         _identifier: &Identifier,

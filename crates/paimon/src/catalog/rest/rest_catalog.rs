@@ -463,9 +463,8 @@ impl Catalog for RESTCatalog {
         if partition_specs.is_empty() {
             return Ok(());
         }
-        // The endpoint only unregisters metadata. For a Format Table whose catalog owns the
-        // partitions that is the whole drop, and the caller deletes the directories; any other
-        // table would keep its data while the call reported success.
+        // The endpoint only unregisters metadata, which is the whole drop only for a Format Table
+        // whose catalog owns the partitions; any other table would keep its data.
         let table = self.get_table(identifier).await?;
         if !table.has_catalog_managed_partitions() {
             return Err(Error::Unsupported {

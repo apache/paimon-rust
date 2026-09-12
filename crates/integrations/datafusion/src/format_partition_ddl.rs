@@ -16,9 +16,7 @@
 // under the License.
 
 //! SHOW, ADD and DROP PARTITION for Format Tables with catalog-managed partitions.
-//!
-//! `SQLContext` parses these statements and dispatches them here. DROP PARTITION on a Paimon
-//! table stays in `SQLContext`, where it is a snapshot commit.
+//! DROP PARTITION on a Paimon table stays in `SQLContext`, where it is a snapshot commit.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -244,11 +242,7 @@ pub(crate) async fn execute_add_partitions(
 }
 
 /// Unregister catalog-managed partitions and then delete their directories.
-///
-/// A specification that fixes only some of the partition keys expands to every
-/// registered partition it matches, the way Java Format Tables behave. The keys need
-/// not be a leading prefix, so `hh = '10'` alone is a valid specification. One catalog
-/// listing serves the whole statement, however many specifications it carries.
+/// A partial specification, keys in any position, drops every registered partition it matches.
 pub(crate) async fn drop_catalog_managed_partitions(
     ctx: &SQLContext,
     catalog: &Arc<dyn Catalog>,
@@ -313,9 +307,8 @@ pub(crate) async fn drop_catalog_managed_partitions(
     let mut selected: Vec<(HashMap<String, String>, String, bool)> = Vec::new();
     let mut selected_paths = HashSet::new();
     for (spec, ignore_if_not_exists) in &requested {
-        // Values are compared as the catalog holds them. A request is spelled the way ADD
-        // PARTITION writes it, while repair registers the directory spelling, so a partition
-        // registered as `month=01` is not the partition `month = 1` names.
+        // Values are compared as the catalog holds them, so a partition registered as
+        // `month=01` is not the partition `month = 1` names.
         let mut matched = false;
         for (registered_spec, path, custom_located) in &registered {
             if !spec
@@ -329,9 +322,8 @@ pub(crate) async fn drop_catalog_managed_partitions(
                 selected.push((registered_spec.clone(), path.clone(), *custom_located));
             }
         }
-        // Only a complete specification names one partition, so only it can be
-        // reported as missing. A partial one describes a set that is allowed to be
-        // empty, which is how Java reads it too.
+        // Only a complete specification can be reported as missing; a partial one may match
+        // nothing, as in Java.
         if !matched && spec.len() == partition_key_count && !ignore_if_not_exists {
             return Err(DataFusionError::Plan(format!(
                 "Partition {spec:?} does not exist in table {}",
@@ -352,9 +344,8 @@ pub(crate) async fn drop_catalog_managed_partitions(
         .await
         .map_err(to_datafusion_error)?;
     for (_, path, custom_located) in selected {
-        // A partition registered at a location of its own keeps its data there, as in Java:
-        // dropping it only unregisters it, and the table directory it does not use is left
-        // alone.
+        // A partition registered at a location of its own is only unregistered, as in Java,
+        // and keeps its data there.
         if custom_located {
             continue;
         }
@@ -432,14 +423,12 @@ fn parse_format_partition_spec(
         let data_type = field.data_type();
         let value = match partition_literal_to_string(literal)? {
             None => options.partition_default_name().to_string(),
-            // The literal is read with the column type the way a registration or directory is,
-            // which is how Java casts partition strings (`TypeUtils.castFromString`), and written
-            // back in the spelling ADD PARTITION registers.
+            // Read with the column type as Java `TypeUtils.castFromString` does, then written back
+            // in the spelling ADD PARTITION registers.
             Some(text) => {
                 let text = match data_type {
                     PaimonDataType::Char(_) | PaimonDataType::VarChar(_) => {
-                        // A blank string is written to the default partition, so a statement
-                        // that changes partitions would address that partition instead. Java
+                        // A blank string would address the default partition; Java
                         // `PaimonFormatTable.requireNameablePartitionValues` refuses it too.
                         if let Some(operation) = mutating_operation {
                             if text.trim().is_empty() {
@@ -493,9 +482,8 @@ fn parse_format_partition_spec(
     Ok(spec)
 }
 
-/// The string a SQL partition literal stands for, the way Spark hands partition values to Paimon:
-/// a quoted or `DATE '...'` string as written, a boolean as `true` or `false`, and a number in its
-/// canonical form, so `month = 01` and `month = 1` name the same partition. `None` is NULL.
+/// The string a SQL partition literal stands for, as Spark hands it to Paimon; `None` is NULL.
+/// A number is canonical, so `month = 01` and `month = 1` name the same partition.
 fn partition_literal_to_string(expr: &SqlExpr) -> DFResult<Option<String>> {
     use datafusion::sql::sqlparser::ast::{DataType as SqlDataType, UnaryOperator};
 

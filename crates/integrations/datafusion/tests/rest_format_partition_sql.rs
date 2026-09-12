@@ -484,9 +484,8 @@ async fn test_drop_partition_leaves_a_custom_location_in_place() {
     assert!(temp_dir.path().join("dt=b").is_dir());
 }
 
-/// `SQLContext::sql` futures have to stay `Send` for callers that box them the way
-/// `#[async_trait]` does, or spawn them. A stream over borrowed items anywhere below a statement
-/// takes that away from every statement; this function stops compiling when that happens.
+/// `SQLContext::sql` futures have to stay `Send` for callers that box or spawn them; this stops
+/// compiling when a stream over borrowed items anywhere below a statement takes that away.
 #[allow(dead_code)]
 fn sql_future_is_send<'a>(
     context: &'a SQLContext,
