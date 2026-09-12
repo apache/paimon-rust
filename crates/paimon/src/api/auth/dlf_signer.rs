@@ -85,6 +85,7 @@ use uuid::Uuid;
 
 use super::base::RESTAuthParameter;
 use super::dlf_provider::DLFToken;
+use crate::api::rest_util::RESTUtil;
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacSha1 = Hmac<Sha1>;
@@ -486,10 +487,10 @@ impl DLFOpenApiSigner {
     }
 
     fn build_canonicalized_resource(&self, rest_auth_parameter: &RESTAuthParameter) -> String {
-        let path = urlencoding::decode(&rest_auth_parameter.path).unwrap_or_default();
+        let path = RESTUtil::decode_string(&rest_auth_parameter.path);
 
         if rest_auth_parameter.parameters.is_empty() {
-            return path.to_string();
+            return path;
         }
 
         let mut sorted_params: Vec<_> = rest_auth_parameter.parameters.iter().collect();
@@ -498,7 +499,7 @@ impl DLFOpenApiSigner {
         let query_parts: Vec<String> = sorted_params
             .iter()
             .map(|(key, value)| {
-                let decoded_value = urlencoding::decode(value).unwrap_or_default();
+                let decoded_value = RESTUtil::decode_string(value);
                 if !decoded_value.is_empty() {
                     format!("{key}={decoded_value}")
                 } else {
@@ -646,5 +647,47 @@ impl DLFSignerFactory {
         } else {
             Box::new(DLFDefaultSigner::new(region))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::resource_paths::ResourcePaths;
+
+    /// Java signs the decoded path and values, so a `+` on the wire canonicalises as a space.
+    #[test]
+    fn test_canonicalized_resource_decodes_plus_as_space() {
+        let path = ResourcePaths::new("").database("analytics db");
+        let parameter = RESTAuthParameter::for_get(
+            path,
+            HashMap::from([("principal".to_string(), "a b".to_string())]),
+        );
+
+        let resource = DLFOpenApiSigner.build_canonicalized_resource(&parameter);
+
+        assert_eq!(resource, "/v1/databases/analytics db?principal=a b");
+    }
+
+    /// `HttpClient::get` takes its path from the caller, so a raw `=` or `&` has to survive the
+    /// decode rather than truncate the resource that gets signed.
+    #[test]
+    fn test_canonicalized_resource_keeps_raw_delimiters_in_path() {
+        let parameter = RESTAuthParameter::for_get("/v1/a=b/databases/x&y", HashMap::new());
+
+        let resource = DLFOpenApiSigner.build_canonicalized_resource(&parameter);
+
+        assert_eq!(resource, "/v1/a=b/databases/x&y");
+    }
+
+    /// The signer signs the decoded path, so an encoded prefix canonicalises back to its raw form.
+    #[test]
+    fn test_canonicalized_resource_keeps_encoded_prefix() {
+        let path = ResourcePaths::new("clg=paimon").databases();
+        let parameter = RESTAuthParameter::for_get(path, HashMap::new());
+
+        let resource = DLFOpenApiSigner.build_canonicalized_resource(&parameter);
+
+        assert_eq!(resource, "/v1/clg=paimon/databases");
     }
 }

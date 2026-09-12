@@ -143,10 +143,9 @@ impl RESTApi {
                 });
             }
 
-            let query_params: Vec<(&str, String)> = vec![(
-                CatalogOptions::WAREHOUSE,
-                RESTUtil::encode_string(warehouse),
-            )];
+            // Pass the warehouse raw: the client and the signer each encode it once.
+            let query_params: Vec<(&str, String)> =
+                vec![(CatalogOptions::WAREHOUSE, warehouse.to_string())];
             let config_response: ConfigResponse = client
                 .get(&ResourcePaths::config(), Some(&query_params))
                 .await?;
