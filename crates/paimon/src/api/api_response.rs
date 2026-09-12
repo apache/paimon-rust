@@ -22,7 +22,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
-use crate::api::management::PermissionAssignment;
+use crate::api::management::{DataPolicy, PermissionAssignment};
 use crate::catalog::{Function, FunctionDefinition, ViewSchema};
 use crate::spec::{DataField, Schema, Snapshot};
 
@@ -41,6 +41,9 @@ pub struct ErrorResponse {
 }
 
 impl ErrorResponse {
+    /// `resource_type` of a 404/409 about a policy (Java `ErrorResponse.RESOURCE_TYPE_POLICY`).
+    pub const RESOURCE_TYPE_POLICY: &'static str = "POLICY";
+
     /// Create a new ErrorResponse.
     pub fn new(
         resource_type: Option<String>,
@@ -523,6 +526,25 @@ impl ListPermissionsResponse {
     }
 }
 
+/// Response of `GET .../tables/{table}/policies`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPoliciesResponse {
+    #[serde(default)]
+    pub policies: Vec<DataPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+impl ListPoliciesResponse {
+    pub fn new(policies: Vec<DataPolicy>, next_page_token: Option<String>) -> Self {
+        Self {
+            policies,
+            next_page_token,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,6 +701,20 @@ mod tests {
             serde_json::to_string(&ListPermissionsResponse::new(vec![], None)).unwrap(),
             r#"{"permissions":[]}"#
         );
+    }
+
+    #[test]
+    fn test_list_policies_response_deserialization() {
+        let response: ListPoliciesResponse = serde_json::from_str(
+            r#"{"policies":[{"resource":{"type":"TABLE","database":"sales","table":"orders"},"rowFilter":{"predicate":"{}"},"principal":"analyst"}],"nextPageToken":"next"}"#,
+        )
+        .unwrap();
+        assert_eq!(response.policies.len(), 1);
+        assert_eq!(response.policies[0].row_filter().unwrap().predicate(), "{}");
+        assert_eq!(response.next_page_token.as_deref(), Some("next"));
+        let last: ListPoliciesResponse = serde_json::from_str("{}").unwrap();
+        assert!(last.policies.is_empty());
+        assert_eq!(ErrorResponse::RESOURCE_TYPE_POLICY, "POLICY");
     }
 
     #[test]

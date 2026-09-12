@@ -22,7 +22,10 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
-use crate::api::management::{PermissionAccess, PermissionAssignment, PermissionResource};
+use crate::api::management::{
+    bad_request, is_blank, ColumnMask, DataPolicy, PermissionAccess, PermissionAssignment,
+    PermissionResource, PolicyType, RowFilter,
+};
 use crate::{
     catalog::{Function, FunctionDefinition, Identifier, ViewSchema},
     spec::{DataField, PartitionStatistics, Schema, SchemaChange},
@@ -353,6 +356,62 @@ impl RevokePermissionRequest {
     }
 }
 
+/// Body of `POST .../tables/{table}/policies`: the policy without its resource, which the
+/// path already names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_filter: Option<RowFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_mask: Option<ColumnMask>,
+    pub principal: String,
+}
+
+impl From<&DataPolicy> for PolicyRequest {
+    fn from(policy: &DataPolicy) -> Self {
+        Self {
+            row_filter: policy.row_filter().cloned(),
+            column_mask: policy.column_mask().cloned(),
+            principal: policy.principal().to_string(),
+        }
+    }
+}
+
+/// Body of `POST .../tables/{table}/policies/drop`: a policy identity (Java `DropPolicyRequest`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DropPolicyRequest {
+    #[serde(rename = "type")]
+    pub policy_type: PolicyType,
+    pub principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+}
+
+impl DropPolicyRequest {
+    pub fn new(
+        policy_type: PolicyType,
+        principal: &str,
+        column: Option<&str>,
+    ) -> crate::Result<Self> {
+        PermissionAssignment::validate_principal(principal)?;
+        let column = column.filter(|column| !is_blank(column));
+        match (policy_type, column) {
+            (PolicyType::RowFilter, Some(_)) => {
+                Err(bad_request("ROW_FILTER identity cannot contain a column."))
+            }
+            (PolicyType::ColumnMasking, None) => Err(bad_request(
+                "column is required for COLUMN_MASKING identity.",
+            )),
+            (_, column) => Ok(Self {
+                policy_type,
+                principal: principal.to_string(),
+                column: column.map(str::to_string),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +491,96 @@ mod tests {
             error.to_string().contains("not valid for CATALOG"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn test_policy_request_requires_a_definition_and_carries_no_resource() {
+        let policy = DataPolicy::new_column_mask(
+            PermissionResource::table("sales", "orders"),
+            ColumnMask::new("email", "{}").unwrap(),
+            "analyst",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(PolicyRequest::from(&policy)).unwrap(),
+            serde_json::json!({"columnMask": {"onColumn": "email", "transform": "{}"}, "principal": "analyst"})
+        );
+        // A policy with neither definition, or with both, cannot be deserialized at all, so it
+        // can never reach a request body. Java's `@JsonCreator` constructor rejects the same two.
+        for body in [
+            r#"{"resource":{"type":"TABLE","database":"sales","table":"orders"},"principal":"analyst"}"#,
+            r#"{"resource":{"type":"TABLE","database":"sales","table":"orders"},"rowFilter":{"predicate":"{}"},"columnMask":{"onColumn":"email","transform":"{}"},"principal":"analyst"}"#,
+        ] {
+            let error = serde_json::from_str::<DataPolicy>(body).unwrap_err();
+            assert!(error.to_string().contains("exactly one"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_drop_policy_request_round_trip_and_identity_rules() {
+        let request =
+            DropPolicyRequest::new(PolicyType::ColumnMasking, "analyst", Some("email")).unwrap();
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"COLUMN_MASKING","principal":"analyst","column":"email"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<DropPolicyRequest>(&json).unwrap(),
+            request
+        );
+        assert_eq!(
+            serde_json::to_string(
+                &DropPolicyRequest::new(PolicyType::RowFilter, "analyst", Some(" ")).unwrap()
+            )
+            .unwrap(),
+            r#"{"type":"ROW_FILTER","principal":"analyst"}"#
+        );
+        let message = |result: crate::Result<DropPolicyRequest>| result.unwrap_err().to_string();
+        assert!(message(DropPolicyRequest::new(
+            PolicyType::ColumnMasking,
+            "analyst",
+            None
+        ))
+        .contains("column is required"));
+        assert!(message(DropPolicyRequest::new(
+            PolicyType::RowFilter,
+            "analyst",
+            Some("email")
+        ))
+        .contains("cannot contain a column"));
+        assert!(
+            message(DropPolicyRequest::new(PolicyType::RowFilter, " ", None))
+                .contains("principal cannot be empty")
+        );
+
+        // Blank here is Java `String.trim()`, not Rust's Unicode `trim()`: NUL is blank and a
+        // non-breaking space is not. The two disagree in opposite directions.
+        assert_eq!(
+            DropPolicyRequest::new(PolicyType::ColumnMasking, "analyst", Some("\u{a0}"))
+                .unwrap()
+                .column
+                .as_deref(),
+            Some("\u{a0}")
+        );
+        assert!(message(DropPolicyRequest::new(
+            PolicyType::RowFilter,
+            "analyst",
+            Some("\u{a0}")
+        ))
+        .contains("cannot contain a column"));
+        assert!(
+            DropPolicyRequest::new(PolicyType::RowFilter, "analyst", Some("\0"))
+                .unwrap()
+                .column
+                .is_none()
+        );
+        assert!(message(DropPolicyRequest::new(
+            PolicyType::ColumnMasking,
+            "analyst",
+            Some("\0")
+        ))
+        .contains("column is required"));
     }
 
     #[test]

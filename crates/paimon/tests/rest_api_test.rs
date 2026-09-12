@@ -26,8 +26,9 @@ use axum::http::StatusCode;
 use paimon::api::auth::{DLFECSTokenLoader, DLFToken, DLFTokenLoader};
 use paimon::api::rest_api::RESTApi;
 use paimon::api::{
-    ConfigResponse, CreatePartitionsRequest, DropPartitionsRequest, ListPermissionsRequest,
-    PermissionAssignment, PermissionColumns, PermissionResource, RestError,
+    ColumnMask, ConfigResponse, CreatePartitionsRequest, DataPolicy, DropPartitionsRequest,
+    ErrorResponse, ListPermissionsRequest, ListPoliciesRequest, PermissionAssignment,
+    PermissionColumns, PermissionResource, PolicyType, RestError, RowFilter,
 };
 use paimon::catalog::{Function, FunctionDefinition, Identifier, ViewSchema};
 use paimon::common::Options;
@@ -1238,4 +1239,227 @@ async fn test_ecs_loader_token() {
     assert!(error
         .to_string()
         .contains("Failed to parse token Expiration"));
+}
+
+// ==================== Policy Management Tests ====================
+
+const PREDICATE_JSON: &str = r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"region","type":"STRING"}},"function":"EQUAL","literals":["APAC"]}"#;
+const TRANSFORM_JSON: &str =
+    r#"{"name":"CONCAT","inputs":[{"index":0,"name":"region","type":"STRING"},"****"]}"#;
+
+fn managed_table() -> PermissionResource {
+    PermissionResource::table("default", "managed_table")
+}
+
+fn mask_policy() -> DataPolicy {
+    DataPolicy::new_column_mask(
+        managed_table(),
+        ColumnMask::new("email", TRANSFORM_JSON).unwrap(),
+        "analyst",
+    )
+    .unwrap()
+}
+
+fn policy_error(resource_type: &str, code: i32) -> ErrorResponse {
+    ErrorResponse::new(
+        Some(resource_type.to_string()),
+        Some("orders".to_string()),
+        Some(format!("{resource_type} error")),
+        Some(code),
+    )
+}
+
+#[tokio::test]
+async fn test_policies_round_trip_through_the_table_nested_endpoints() {
+    let (ctx, _identifier) = setup_partition_api().await;
+    let mask = mask_policy();
+    let filter = DataPolicy::new_row_filter(
+        managed_table(),
+        RowFilter::new(PREDICATE_JSON).unwrap(),
+        "analyst",
+    )
+    .unwrap();
+    ctx.api.create_policy(&mask).await.unwrap();
+    ctx.api.create_policy(&filter).await.unwrap();
+
+    let create = &ctx.server.create_policy_bodies()[0];
+    assert_eq!(
+        *create,
+        json!({"columnMask": {"onColumn": "email", "transform": TRANSFORM_JSON}, "principal": "analyst"})
+    );
+    assert!(create.get("resource").is_none());
+
+    let mut request = ListPoliciesRequest::new(managed_table());
+    request.policy_type = Some(PolicyType::ColumnMasking);
+    request.principal = Some("analyst".to_string());
+    request.column = Some("email".to_string());
+    request.max_results = Some(25);
+    request.page_token = Some("0".to_string());
+    let page = ctx.api.list_policies_paged(&request).await.unwrap();
+    assert_eq!(page.elements, vec![mask]);
+    assert_eq!(page.next_page_token, None);
+    assert_eq!(
+        ctx.server.list_policies_queries(),
+        vec![HashMap::from([
+            ("type".to_string(), "COLUMN_MASKING".to_string()),
+            ("principal".to_string(), "analyst".to_string()),
+            ("column".to_string(), "email".to_string()),
+            ("maxResults".to_string(), "25".to_string()),
+            ("pageToken".to_string(), "0".to_string()),
+        ])]
+    );
+
+    ctx.api
+        .drop_policy(
+            &managed_table(),
+            PolicyType::ColumnMasking,
+            "analyst",
+            Some("email"),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.server.drop_policy_bodies(),
+        vec![json!({"type": "COLUMN_MASKING", "principal": "analyst", "column": "email"})]
+    );
+    let page = ctx
+        .api
+        .list_policies_paged(&ListPoliciesRequest::new(managed_table()))
+        .await
+        .unwrap();
+    assert_eq!(page.elements, vec![filter]);
+}
+
+#[tokio::test]
+async fn test_create_policy_surfaces_conflicts_with_their_resource_type() {
+    let (ctx, _identifier) = setup_partition_api().await;
+    ctx.api.create_policy(&mask_policy()).await.unwrap();
+    let error = ctx.api.create_policy(&mask_policy()).await.unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi { source: RestError::AlreadyExists { resource_type: Some(t), .. } } if t == "POLICY"),
+        "{error:?}"
+    );
+    ctx.server
+        .set_create_policy_error(Some(policy_error("TABLE", 409)));
+    let error = ctx.api.create_policy(&mask_policy()).await.unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi { source: RestError::AlreadyExists { resource_type: Some(t), .. } } if t == "TABLE"),
+        "{error:?}"
+    );
+    // An unknown table is a 404 on the table, not on the policy.
+    ctx.server.set_create_policy_error(None);
+    let error = ctx
+        .api
+        .create_policy(
+            &DataPolicy::new_column_mask(
+                PermissionResource::table("default", "missing"),
+                ColumnMask::new("email", "{}").unwrap(),
+                "analyst",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi { source: RestError::NoSuchResource { resource_type: Some(t), .. } } if t == "TABLE"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_drop_policy_if_exists_ignores_only_a_missing_policy() {
+    let (ctx, _identifier) = setup_partition_api().await;
+    ctx.api
+        .drop_policy(
+            &managed_table(),
+            PolicyType::ColumnMasking,
+            "analyst",
+            Some("email"),
+            true,
+        )
+        .await
+        .unwrap();
+    let error = ctx
+        .api
+        .drop_policy(
+            &managed_table(),
+            PolicyType::ColumnMasking,
+            "analyst",
+            Some("email"),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi { source: RestError::NoSuchResource { resource_type: Some(t), .. } } if t == "POLICY"),
+        "{error:?}"
+    );
+    ctx.server
+        .set_drop_policy_error(Some(policy_error("TABLE", 404)));
+    let error = ctx
+        .api
+        .drop_policy(
+            &managed_table(),
+            PolicyType::ColumnMasking,
+            "analyst",
+            Some("email"),
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi { source: RestError::NoSuchResource { resource_type: Some(t), .. } } if t == "TABLE"),
+        "{error:?}"
+    );
+    assert_eq!(ctx.server.drop_policy_bodies().len(), 3);
+}
+
+#[tokio::test]
+async fn test_invalid_policy_requests_never_reach_the_server() {
+    let (ctx, _identifier) = setup_partition_api().await;
+    let error = ctx
+        .api
+        .drop_policy(
+            &managed_table(),
+            PolicyType::RowFilter,
+            "analyst",
+            Some("email"),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cannot contain a column"),
+        "{error}"
+    );
+    let error = ctx
+        .api
+        .list_policies_paged(&ListPoliciesRequest::new(PermissionResource::catalog()))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("only to TABLE"), "{error}");
+    // A blank locator is not a TABLE-only violation, so only the resource rules catch it.
+    let blank_table = PermissionResource::table("default", "");
+    let error = ctx
+        .api
+        .list_policies_paged(&ListPoliciesRequest::new(blank_table.clone()))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("table is required for TABLE"),
+        "{error}"
+    );
+    let error = ctx
+        .api
+        .drop_policy(&blank_table, PolicyType::RowFilter, "analyst", None, false)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("table is required for TABLE"),
+        "{error}"
+    );
+    assert!(ctx.server.create_policy_bodies().is_empty());
+    assert!(ctx.server.drop_policy_bodies().is_empty());
+    assert!(ctx.server.list_policies_queries().is_empty());
 }

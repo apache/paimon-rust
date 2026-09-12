@@ -25,10 +25,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::api::management::{ListPermissionsRequest, PermissionAssignment, PermissionResource};
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
-use crate::api::{GetTagResponse, PagedList};
+use crate::api::{
+    DataPolicy, GetTagResponse, ListPermissionsRequest, ListPoliciesRequest, PagedList,
+    PermissionAssignment, PermissionResource, PolicyType,
+};
 use crate::catalog::{
     list_partitions_from_file_system, Catalog, Database, Identifier, DB_LOCATION_PROP,
 };
@@ -152,6 +154,40 @@ impl RESTCatalog {
     ) -> Result<()> {
         self.api
             .revoke_permission(resource, access, principal)
+            .await
+    }
+
+    // ======================= policy management ==============================
+    //
+    // Java `RESTCatalog.policyManagement()`.
+
+    pub async fn list_policies_paged(
+        &self,
+        request: &ListPoliciesRequest,
+    ) -> Result<PagedList<DataPolicy>> {
+        self.api.list_policies_paged(request).await
+    }
+
+    pub async fn create_policy(&self, policy: &DataPolicy) -> Result<()> {
+        self.api.create_policy(policy).await
+    }
+
+    pub async fn drop_policy(
+        &self,
+        resource: &PermissionResource,
+        policy_type: PolicyType,
+        principal: &str,
+        column: Option<&str>,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        self.api
+            .drop_policy(
+                resource,
+                policy_type,
+                principal,
+                column,
+                ignore_if_not_exists,
+            )
             .await
     }
 }
