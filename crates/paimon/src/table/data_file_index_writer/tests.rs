@@ -720,11 +720,6 @@ async fn test_file_index_sidecar_failure_cleans_all_partitions_and_rolled_files(
         }
         let error = writer.prepare_commit().await.unwrap_err();
         assert!(error.to_string().contains("Injected sidecar"), "{error}");
-        assert!(writer.prepare_commit().await.is_err());
-        assert!(writer
-            .write_arrow_batch(&batch(vec![Some(4)], vec![Some(4)]))
-            .await
-            .is_err());
         let files = table
             .file_io()
             .list_status_recursive(table.location())

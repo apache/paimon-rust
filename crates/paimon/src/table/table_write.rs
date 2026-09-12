@@ -150,7 +150,6 @@ pub struct TableWrite {
     row_kind_generator: Option<RowKindGenerator>,
     row_kind_filter: Option<RowKindFilter>,
     file_index_options: Option<Arc<FileIndexOptions>>,
-    indexed_write_failed: bool,
 }
 
 impl TableWrite {
@@ -425,7 +424,6 @@ impl TableWrite {
             row_kind_generator,
             row_kind_filter,
             file_index_options: file_index_options.map(Arc::new),
-            indexed_write_failed: false,
         })
     }
 
@@ -503,7 +501,6 @@ impl TableWrite {
 
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.ensure_indexed_write_active()?;
         let Some(batch) = self.normalize_write_batch(batch)? else {
             return Ok(());
         };
@@ -820,7 +817,6 @@ impl TableWrite {
         bucket: i32,
         batch: RecordBatch,
     ) -> Result<()> {
-        self.ensure_indexed_write_active()?;
         let result = async {
             let key = (partition_bytes, bucket);
             if !self.partition_writers.contains_key(&key) {
@@ -834,7 +830,6 @@ impl TableWrite {
         }
         .await;
         if result.is_err() && self.file_index_options.is_some() {
-            self.indexed_write_failed = true;
             for (_, writer) in self.partition_writers.drain() {
                 if let FileWriter::Append(mut writer) = writer {
                     writer.abort().await;
@@ -855,7 +850,6 @@ impl TableWrite {
     /// Close all writers and collect CommitMessages for use with TableCommit.
     /// Writers are cleared after this call, allowing the TableWrite to be reused.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
-        self.ensure_indexed_write_active()?;
         if self.file_index_options.is_some() {
             return self.prepare_indexed_append_commit().await;
         }
@@ -926,22 +920,11 @@ impl TableWrite {
             }
         }
         if let Some(error) = error {
-            self.indexed_write_failed = true;
             let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
             let _ = commit.abort(&messages).await;
             return Err(error);
         }
         Ok(messages)
-    }
-
-    fn ensure_indexed_write_active(&self) -> Result<()> {
-        if self.indexed_write_failed {
-            return Err(crate::Error::DataInvalid {
-                message: "Cannot reuse a failed indexed table writer".to_string(),
-                source: None,
-            });
-        }
-        Ok(())
     }
 
     async fn create_writer(&mut self, partition_bytes: Vec<u8>, bucket: i32) -> Result<()> {

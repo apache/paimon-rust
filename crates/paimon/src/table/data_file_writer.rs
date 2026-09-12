@@ -69,7 +69,6 @@ pub(crate) struct DataFileWriter {
     current_index: Option<DataFileIndexWriter>,
     /// Paths owned by this indexed write until prepare_commit hands them to the caller.
     created_paths: Vec<String>,
-    failed: bool,
 }
 
 impl DataFileWriter {
@@ -115,7 +114,6 @@ impl DataFileWriter {
             index_options: None,
             current_index: None,
             created_paths: Vec::new(),
-            failed: false,
         }
     }
 
@@ -126,7 +124,6 @@ impl DataFileWriter {
 
     /// Write a RecordBatch. Rolls to a new file when target size is reached.
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.ensure_writable()?;
         let result = self.write_batch(batch).await;
         if result.is_err() && self.index_options.is_some() {
             self.abort().await;
@@ -270,7 +267,6 @@ impl DataFileWriter {
 
     /// Close the current writer and return all written file metadata.
     pub(crate) async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
-        self.ensure_writable()?;
         let result = self.finish().await;
         if result.is_err() && self.index_options.is_some() {
             self.abort().await;
@@ -292,7 +288,6 @@ impl DataFileWriter {
     }
 
     pub(super) async fn abort(&mut self) {
-        self.failed = true;
         if let Some(writer) = self.current_writer.take() {
             let _ = writer.close().await;
         }
@@ -303,16 +298,6 @@ impl DataFileWriter {
             let _ = self.file_io.delete_file(&path).await;
         }
         self.written_files.clear();
-    }
-
-    fn ensure_writable(&self) -> Result<()> {
-        if self.failed {
-            return Err(crate::Error::DataInvalid {
-                message: "Cannot reuse a failed indexed data-file writer".to_string(),
-                source: None,
-            });
-        }
-        Ok(())
     }
 
     fn bucket_dir(&self) -> String {

@@ -76,9 +76,9 @@ when creating the writer.
 Each data file gets its own index containing all configured columns and index
 types. The complete serialized index is embedded in the manifest when its size
 is at most `file-index.in-manifest-threshold` (default `500 B`); larger indexes
-are stored beside the data file as a `.index` sidecar. Failed indexed writes
-must be discarded; their newly created files are cleaned up on a best-effort
-basis. Use commit `abort` to clean up files after a successful `prepare_commit`
+are stored beside the data file as a `.index` sidecar. Indexed write failures
+return an error and clean up newly created files on a best-effort basis.
+Use commit `abort` to clean up files after a successful `prepare_commit`
 when the prepared write will not be committed.
 
 `file-index.read.enabled` controls only reading, independently of index creation.
