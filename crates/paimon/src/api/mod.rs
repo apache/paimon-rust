@@ -21,6 +21,7 @@
 
 pub mod api_request;
 pub mod auth;
+pub mod management;
 pub mod resource_paths;
 pub mod rest_api;
 pub mod rest_client;
@@ -34,15 +35,21 @@ pub use api_request::{
     AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
     CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateViewRequest,
     DropPartitionsRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
-    RenameTableRequest,
+    RenameTableRequest, RevokePermissionRequest,
 };
 
 // Re-export response types
 pub use api_response::{
     AuditRESTResponse, AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
     GetFunctionResponse, GetTableResponse, GetTableTokenResponse, GetViewResponse,
-    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListTablesResponse,
-    ListViewsResponse, PagedList,
+    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse,
+    ListTablesResponse, ListViewsResponse, PagedList,
+};
+
+// Re-export management types
+pub use management::{
+    ListPermissionsRequest, PermissionAccess, PermissionAssignment, PermissionColumns,
+    PermissionResource, ResourceType,
 };
 
 // Re-export error types
