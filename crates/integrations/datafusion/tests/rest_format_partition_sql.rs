@@ -237,6 +237,40 @@ async fn test_partition_literals() {
     }
 }
 
+/// A blank string for a string partition column is written to the default partition, so ADD and
+/// DROP refuse it rather than address the NULL partition, as Java does.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_partition_ddl_refuses_blank_string_values() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let schema = format_table_schema(&[("label", varchar())]);
+    let (_server, context) = setup_rest_table(&temp_dir, schema).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (label = NULL)"),
+    )
+    .await;
+    let default_directory = temp_dir.path().join("label=__DEFAULT_PARTITION__");
+    assert!(default_directory.is_dir());
+
+    for statement in [
+        "DROP PARTITION (label = '')",
+        "DROP IF EXISTS PARTITION (label = '   ')",
+        "ADD PARTITION (label = '')",
+        "ADD IF NOT EXISTS PARTITION (label = ' ')",
+    ] {
+        common::assert_sql_error(
+            &context,
+            &format!("ALTER TABLE {TABLE_NAME} {statement}"),
+            "empty or whitespace-only string for partition column 'label'",
+        )
+        .await;
+    }
+
+    assert_eq!(show_partitions(&context, "").await, ["label=null"]);
+    assert!(default_directory.is_dir());
+}
+
 #[cfg(not(windows))]
 #[tokio::test]
 async fn test_drop_partition_specifications() {

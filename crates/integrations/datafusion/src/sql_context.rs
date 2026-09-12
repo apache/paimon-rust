@@ -2068,8 +2068,13 @@ impl SQLContext {
         let partition_key_count = table.schema().partition_keys().len();
         let mut requested = Vec::with_capacity(requests.len());
         for (expressions, ignore_if_not_exists) in requests {
-            let spec =
-                parse_format_partition_spec(expressions, table, false, enable_ident_normalization)?;
+            let spec = parse_format_partition_spec(
+                expressions,
+                table,
+                false,
+                Some("DROP PARTITION"),
+                enable_ident_normalization,
+            )?;
             requested.push((spec, *ignore_if_not_exists));
         }
 
@@ -2209,8 +2214,13 @@ impl SQLContext {
                     )))
                 }
             };
-            let spec =
-                parse_format_partition_spec(expressions, &table, true, enable_ident_normalization)?;
+            let spec = parse_format_partition_spec(
+                expressions,
+                &table,
+                true,
+                Some("ADD PARTITION"),
+                enable_ident_normalization,
+            )?;
             let relative_path = partition_paths
                 .relative_path(&spec)
                 .map_err(to_datafusion_error)?;
@@ -2256,6 +2266,7 @@ impl SQLContext {
                 &show_partitions.partition_filter,
                 &table,
                 false,
+                None,
                 enable_ident_normalization,
             )?;
             Some(display_partition_values(&spec, &table)?)
@@ -3475,10 +3486,13 @@ fn ensure_catalog_managed_format_table(table: &paimon::Table, operation: &str) -
     Ok(())
 }
 
+/// `mutating_operation` names the statement when it changes partitions (ADD or DROP PARTITION),
+/// which refuses a blank string for a string partition column.
 fn parse_format_partition_spec(
     exprs: &[SqlExpr],
     table: &paimon::Table,
     require_complete: bool,
+    mutating_operation: Option<&str>,
     enable_ident_normalization: bool,
 ) -> DFResult<HashMap<String, String>> {
     let fields = table
@@ -3514,7 +3528,24 @@ fn parse_format_partition_spec(
             // back in the spelling ADD PARTITION registers.
             Some(text) => {
                 let text = match data_type {
-                    PaimonDataType::Char(_) | PaimonDataType::VarChar(_) => text,
+                    PaimonDataType::Char(_) | PaimonDataType::VarChar(_) => {
+                        // A blank string is written to the default partition, so a statement
+                        // that changes partitions would address that partition instead. Java
+                        // `PaimonFormatTable.requireNameablePartitionValues` refuses it too.
+                        if let Some(operation) = mutating_operation {
+                            if text.trim().is_empty() {
+                                return Err(DataFusionError::Plan(format!(
+                                    "{operation} does not support an empty or whitespace-only \
+                                     string for partition column '{column}' of Format Table {}. \
+                                     Such a value is written to the partition named {}, name it \
+                                     directly to address it",
+                                    table.identifier().full_name(),
+                                    options.partition_default_name()
+                                )));
+                            }
+                        }
+                        text
+                    }
                     _ => text.trim().to_string(),
                 };
                 parse_format_partition_value(&text, data_type)
