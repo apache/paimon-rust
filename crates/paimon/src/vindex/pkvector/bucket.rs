@@ -26,6 +26,7 @@ use super::ann::PkVectorAnnSearcher;
 use super::data_invalid;
 use super::metric::{java_float_compare, VectorSearchMetric};
 use super::result::PkVectorSearchResult;
+use super::{FileRowSelection, FileRowSelections};
 use crate::deletion_vector::DeletionVector;
 use crate::spec::PrimaryKeyIndexSourceMeta as PkVectorSourceMeta;
 use crate::vindex::executor::{
@@ -162,7 +163,7 @@ fn validate_per_query_len(
 /// closure borrows the allow-list for its lifetime.
 fn position_excluder(
     dv: Option<Arc<DeletionVector>>,
-    residual_allowed: Option<&roaring::RoaringTreemap>,
+    selection: Option<&FileRowSelection>,
 ) -> impl Fn(i64) -> bool + Sync + '_ {
     move |position: i64| -> bool {
         let dv_deleted = match &dv {
@@ -174,12 +175,12 @@ fn position_excluder(
         if dv_deleted {
             return true;
         }
-        match residual_allowed {
-            // No residual restriction: the row is allowed.
+        match selection {
+            // No entry: the file is unrestricted, so the row is allowed.
             None => false,
-            // Residual present: exclude positions outside the allow-list.
-            Some(allowed) => match u64::try_from(position) {
-                Ok(p) => !allowed.contains(p),
+            // Restricted: exclude positions the selection does not list.
+            Some(selection) => match u64::try_from(position) {
+                Ok(p) => !selection.contains(p),
                 Err(_) => true,
             },
         }
@@ -353,12 +354,11 @@ enum BucketLeaf {
 /// `ann_searcher` may be `None` only when there are no ANN segments; segments
 /// present with `None` is an error.
 ///
-/// `residual_ranges` (when `Some`) is a residual-predicate allow-list keyed by
-/// data-file name whose value is the set of physical row positions in that file
-/// that pass the predicate; only those rows may produce candidates. `None` applies
-/// no residual restriction (every row is allowed). A file absent from the map (or
-/// with an empty set) has no allowed rows and produces no candidates. Mirrors Java
-/// `rowRangesByFile`.
+/// `row_selections` is the pre-filter allow-list keyed by data-file name: a file
+/// with **no entry is unrestricted**, an empty entry excludes it (the file is
+/// skipped without a read), and a non-empty one limits which of its rows may
+/// produce candidates. `None` restricts nothing at all. Mirrors Java
+/// `rowRangesByFile`; see [`FileRowSelection`].
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub(crate) async fn bucket_search(
@@ -381,7 +381,7 @@ pub(crate) async fn bucket_search(
     exact_limit: usize,
     search_options: &HashMap<String, String>,
     skip_exact_fallback: bool,
-    residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+    row_selections: Option<&FileRowSelections>,
     concurrency: usize,
     search_budget: Option<SearchBudget>,
 ) -> crate::Result<BucketSearchResult> {
@@ -516,7 +516,7 @@ pub(crate) async fn bucket_search(
     let ann_shared = searcher.as_ref().map(|searcher| {
         (
             searcher.clone(),
-            residual_ranges.map(|r| Arc::new(r.clone())),
+            row_selections.map(|selections| Arc::new(selections.clone())),
             Arc::new(active_source_files.clone()),
             Arc::new(deletion_vectors.clone()),
             Arc::new(search_options.clone()),
@@ -533,15 +533,16 @@ pub(crate) async fn bucket_search(
             if covered.contains(&file.file_name) {
                 continue;
             }
-            let residual_allowed: Option<&roaring::RoaringTreemap> = match residual_ranges {
-                Some(ranges) => match ranges.get(&file.file_name) {
-                    Some(allowed) if !allowed.is_empty() => Some(allowed),
-                    _ => continue,
-                },
-                None => None,
-            };
+            // No entry means unrestricted; an empty one excludes the file, which is
+            // skipped without a read. Mirrors Java
+            // `if (rowRanges != null && rowRanges.isEmpty()) continue;`.
+            let selection: Option<&FileRowSelection> =
+                match row_selections.and_then(|selections| selections.get(&file.file_name)) {
+                    Some(selection) if selection.is_excluded() => continue,
+                    other => other,
+                };
             let dv = deletion_vectors.get(&file.file_name).cloned();
-            exact_tasks.push((file, Box::new(position_excluder(dv, residual_allowed))));
+            exact_tasks.push((file, Box::new(position_excluder(dv, selection))));
         }
     }
 
@@ -658,7 +659,7 @@ pub(crate) async fn bucket_search_batch(
     exact_limit: usize,
     search_options: &HashMap<String, String>,
     skip_exact_fallback: bool,
-    residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+    row_selections: Option<&FileRowSelections>,
     concurrency: usize,
     search_budget: Option<SearchBudget>,
 ) -> crate::Result<Vec<BucketSearchResult>> {
@@ -681,7 +682,7 @@ pub(crate) async fn bucket_search_batch(
             exact_limit,
             search_options,
             skip_exact_fallback,
-            residual_ranges,
+            row_selections,
             concurrency,
             search_budget,
         )
@@ -806,7 +807,7 @@ pub(crate) async fn bucket_search_batch(
             Arc::new(queries.iter().map(|q| q.to_vec()).collect());
         (
             searcher.clone(),
-            residual_ranges.map(|r| Arc::new(r.clone())),
+            row_selections.map(|selections| Arc::new(selections.clone())),
             Arc::new(active_source_files.clone()),
             Arc::new(deletion_vectors.clone()),
             Arc::new(search_options.clone()),
@@ -821,15 +822,16 @@ pub(crate) async fn bucket_search_batch(
             if covered.contains(&file.file_name) {
                 continue;
             }
-            let residual_allowed: Option<&roaring::RoaringTreemap> = match residual_ranges {
-                Some(ranges) => match ranges.get(&file.file_name) {
-                    Some(allowed) if !allowed.is_empty() => Some(allowed),
-                    _ => continue,
-                },
-                None => None,
-            };
+            // No entry means unrestricted; an empty one excludes the file, which is
+            // skipped without a read. Mirrors Java
+            // `if (rowRanges != null && rowRanges.isEmpty()) continue;`.
+            let selection: Option<&FileRowSelection> =
+                match row_selections.and_then(|selections| selections.get(&file.file_name)) {
+                    Some(selection) if selection.is_excluded() => continue,
+                    other => other,
+                };
             let dv = deletion_vectors.get(&file.file_name).cloned();
-            exact_tasks.push((file, Box::new(position_excluder(dv, residual_allowed))));
+            exact_tasks.push((file, Box::new(position_excluder(dv, selection))));
         }
     }
 
@@ -1075,7 +1077,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+            _row_selections: Option<&FileRowSelections>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             Ok(queries.iter().map(|_| self.result.clone()).collect())
         }
@@ -1746,6 +1748,11 @@ mod tests {
         t
     }
 
+    /// A residual selection over one file's physical positions.
+    fn selected(positions: &[u64]) -> FileRowSelection {
+        FileRowSelection::Positions(treemap(positions))
+    }
+
     #[tokio::test]
     async fn test_exact_residual_allow_list_restricts_positions() {
         // No ANN. data-1 has 3 rows: pos0 {1,0} dist 1.0, pos1 {2,0} dist 4.0,
@@ -1756,8 +1763,8 @@ mod tests {
             Some(vec![2.0, 0.0]),
             Some(vec![3.0, 0.0]),
         ]);
-        let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
-        residual.insert("data-1".into(), treemap(&[0, 2]));
+        let mut residual: FileRowSelections = HashMap::new();
+        residual.insert("data-1".into(), selected(&[0, 2]));
         let out = bucket_search(
             None,
             &[],
@@ -1798,9 +1805,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_exact_residual_file_absent_from_map_is_skipped_without_reading() {
-        // residual covers only data-1; data-2 has no entry -> no allowed rows, so
-        // data-2 is skipped entirely (its factory reader is never built).
+    async fn test_exact_file_absent_from_the_selection_map_is_searched_whole() {
+        // The selections cover only data-1; data-2 has no entry, which is Java's
+        // "unrestricted", so data-2 is searched in full rather than skipped. Skipping
+        // it is the empty-entry case, covered by the test below.
         let calls = std::sync::Mutex::new(Vec::<String>::new());
         let factory = as_search(
             |file: &BucketActiveFile,
@@ -1826,8 +1834,8 @@ mod tests {
                 })
             },
         );
-        let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
-        residual.insert("data-1".into(), treemap(&[0, 1]));
+        let mut residual: FileRowSelections = HashMap::new();
+        residual.insert("data-1".into(), selected(&[0, 1]));
         let out = bucket_search(
             None,
             &[],
@@ -1850,9 +1858,12 @@ mod tests {
         results.extend(out.exact.clone());
         results.sort_by(best_first);
         results.truncate(5);
-        // Only data-1 rows appear; data-2 was never read.
-        assert!(results.iter().all(|r| r.data_file_name == "data-1"));
-        assert_eq!(calls.lock().unwrap().as_slice(), &["data-1".to_string()]);
+        // Both files were searched: data-1 under its restriction, data-2 unrestricted.
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["data-1".to_string(), "data-2".to_string()]
+        );
+        assert!(results.iter().any(|r| r.data_file_name == "data-2"));
     }
 
     #[tokio::test]
@@ -1873,8 +1884,8 @@ mod tests {
                 })
             },
         );
-        let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
-        residual.insert("data-1".into(), treemap(&[]));
+        let mut residual: FileRowSelections = HashMap::new();
+        residual.insert("data-1".into(), selected(&[]));
         let out = bucket_search(
             None,
             &[],
@@ -1911,8 +1922,8 @@ mod tests {
         let mut bm = RoaringBitmap::new();
         bm.insert(0); // pos0 deleted
         dvs.insert("data-1".into(), Arc::new(DeletionVector::from_bitmap(bm)));
-        let mut residual: HashMap<String, roaring::RoaringTreemap> = HashMap::new();
-        residual.insert("data-1".into(), treemap(&[0, 1, 2]));
+        let mut residual: FileRowSelections = HashMap::new();
+        residual.insert("data-1".into(), selected(&[0, 1, 2]));
         let out = bucket_search(
             None,
             &[],
@@ -2546,7 +2557,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+            _row_selections: Option<&FileRowSelections>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             use std::sync::atomic::Ordering::SeqCst;
             let current = self.inflight.fetch_add(1, SeqCst) + 1;
@@ -2842,7 +2853,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+            _row_selections: Option<&FileRowSelections>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             panic!("scorer panic to exercise JoinError mapping");
         }
@@ -2907,7 +2918,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+            _row_selections: Option<&FileRowSelections>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             let file = segment.source_meta.source_files()[0]
                 .file_name()
@@ -3085,7 +3096,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+            _row_selections: Option<&FileRowSelections>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             // Runs on the blocking pool. Announce arrival, then wait (bounded) for the
             // exact leaf. Both arriving proves overlap; a timeout means no overlap.
@@ -3210,7 +3221,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+            _row_selections: Option<&FileRowSelections>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             // The bytes handed to the scorer must be exactly this segment's loaded
             // bytes (its path), proving load→score threads the right payload.

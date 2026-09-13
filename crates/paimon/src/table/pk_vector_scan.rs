@@ -24,8 +24,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use roaring::RoaringTreemap;
-
 use crate::spec::{
     should_read_pk_index_source, BinaryRow, DataFileMeta, FileKind, IndexManifest, Predicate,
     PrimaryKeyIndexSourceFile, PrimaryKeyIndexSourceMeta,
@@ -52,37 +50,6 @@ struct UnresolvedAnnSegment {
 /// A bucket's identity across planning inputs: the partition's serialized bytes
 /// (`BinaryRow` is not hashable) paired with the bucket number.
 type BucketKey = (Vec<u8>, i32);
-
-/// Expand inclusive row ranges into the positions they allow. Only the search
-/// kernel's membership tests need this; a read is limited by the ranges themselves.
-pub(super) fn positions_in_ranges(ranges: &[RowRange]) -> crate::Result<RoaringTreemap> {
-    let mut positions = RoaringTreemap::new();
-    for range in ranges {
-        let from = u64::try_from(range.from())
-            .map_err(|_| data_invalid("row range bound must not be negative"))?;
-        let to = u64::try_from(range.to())
-            .map_err(|_| data_invalid("row range bound must not be negative"))?;
-        positions.insert_range(from..=to);
-    }
-    Ok(positions)
-}
-
-/// The whole of a file, for a file the message left unrestricted.
-///
-/// A zero-row file gets no range rather than an empty one: `RowRange` is inclusive,
-/// so it cannot express "nothing". An unknown count (`DataFileMeta::ROW_COUNT_UNKNOWN`,
-/// or anything else negative) is rejected rather than read as "nothing", which would
-/// silently drop the file from the search. Decoding only checks the count of a file
-/// the message lists ranges for, so this is where an omitted one is checked.
-fn whole_file_range(row_count: i64) -> crate::Result<Vec<RowRange>> {
-    match row_count {
-        0 => Ok(Vec::new()),
-        count if count > 0 => Ok(vec![RowRange::new(0, count - 1)]),
-        count => Err(data_invalid(format!(
-            "data file row count must be known and non-negative, got {count}"
-        ))),
-    }
-}
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -248,16 +215,18 @@ pub(crate) struct PkVectorScanPlan {
     // at all (never written), which also yields empty `splits`.
     pub snapshot_id: i64,
     pub splits: Vec<PkVectorSearchSplit>,
-    // Per-split allow-list of physical rows, indexed parallel to `splits`: only the
-    // rows listed for a data file may produce candidates from it. Ranges rather than
-    // materialized positions, because this is what a read is limited to — expanding
-    // a whole-file range of a large file into positions costs memory no reader needs.
+    // Per-split allow-list of physical rows, indexed parallel to `splits`, holding
+    // ONLY the files the engine's split actually restricted. Three states per file,
+    // as in Java `rowRangesByFile`: absent means every row is readable, an empty
+    // list means none is, and a non-empty list means exactly those. Ranges rather
+    // than materialized positions, because this is what a read is limited to, and
+    // because the row counts these arrive with are untrusted — sizing an allow-list
+    // from one is unbounded work.
     // Each list is normalized: sorted, non-overlapping, inclusive, file-local.
     // Populated when the plan was built from engine-supplied bucket splits, which
-    // carry row ranges the engine's own planner already resolved. `None` for a plan
-    // read from this table's index manifest, which places no positional restriction
-    // of its own -- distinct from `Some` of an empty allow-list, which permits
-    // nothing.
+    // carry row ranges the engine's own planner already resolved -- possibly an
+    // empty map, when that planner narrowed nothing. `None` for a plan read from
+    // this table's index manifest, which places no positional restriction at all.
     pub physical_row_ranges_by_split: Option<Vec<HashMap<String, Vec<RowRange>>>>,
 }
 
@@ -414,9 +383,6 @@ impl<'a> PkVectorScan<'a> {
     /// Mirrors what Java's `PrimaryKeyVectorRead` does with a
     /// `BucketVectorSearchSplit`: search the payloads the split names, over the rows
     /// the split allows.
-    // Entry point for engine-supplied splits; no in-tree caller reads a plan from
-    // them yet, and the tests drive `plan_from_bucket_splits` directly.
-    #[allow(dead_code)]
     pub(crate) fn plan_for_bucket_vector_splits(
         &self,
         splits: Vec<BucketVectorSearchSplit>,
@@ -451,7 +417,6 @@ impl<'a> PkVectorScan<'a> {
 /// The `Table`-independent core of [`PkVectorScan::plan_for_bucket_vector_splits`],
 /// so planning from engine-supplied splits is testable the same way planning from a
 /// manifest is.
-#[cfg_attr(not(test), allow(dead_code))]
 fn plan_from_bucket_splits(
     index_type: &str,
     vector_field_id: i32,
@@ -577,15 +542,16 @@ fn plan_from_bucket_splits(
         index_file_in_data_file_dir,
     )?;
 
-    // Normalize the row ranges against the planned splits, which are grouped by
-    // bucket and so may be ordered differently from the input.
+    // Re-key the row ranges against the planned splits, which are grouped by bucket
+    // and so may be ordered differently from the input.
     //
-    // A file the message lists is restricted to the positions it lists. A file it
-    // omits is unrestricted: Java records ranges only for the files its own
-    // pre-filter narrowed, and leaves the rest out. The search kernel reads a
-    // missing entry as "no rows allowed", the opposite meaning, so the omission
-    // has to be turned into an explicit full-file range here rather than passed
-    // through.
+    // Only what the message actually listed is carried. A file it omits gets NO
+    // entry, which is what "every row" is spelled as throughout the search kernel
+    // and in Java (`rowRangesByFile.get(file) == null`). Synthesizing an explicit
+    // `[0, row_count - 1]` for it instead would look equivalent and is not: the
+    // row count arrives on the wire, and sizing an allow-list from an untrusted
+    // number is unbounded work. An explicitly empty list stays empty — that is the
+    // separate "no rows" state.
     let physical_row_ranges_by_split = splits
         .iter()
         .map(|split| {
@@ -597,18 +563,15 @@ fn plan_from_bucket_splits(
                 .data_split
                 .data_files()
                 .iter()
-                .map(|file| {
-                    let allowed = match listed.and_then(|ranges| ranges.get(&file.file_name)) {
-                        // Decoding checks each range's bounds but not their order or
-                        // whether they overlap, and a read needs them normalized.
-                        Some(ranges) => merge_row_ranges(ranges.clone()),
-                        None => whole_file_range(file.row_count)?,
-                    };
-                    Ok((file.file_name.clone(), allowed))
+                .filter_map(|file| {
+                    let ranges = listed.and_then(|ranges| ranges.get(&file.file_name))?;
+                    // Decoding checks each range's bounds but not their order or
+                    // whether they overlap, and a read needs them normalized.
+                    Some((file.file_name.clone(), merge_row_ranges(ranges.clone())))
                 })
-                .collect::<crate::Result<HashMap<String, Vec<RowRange>>>>()
+                .collect::<HashMap<String, Vec<RowRange>>>()
         })
-        .collect::<crate::Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
 
     Ok(PkVectorScanPlan {
         snapshot_id,
@@ -1268,6 +1231,12 @@ mod tests {
 
     const BUCKET_SPLIT_GOLDEN: &[u8] = include_bytes!("goldens/bucket_vector_search_split_v1.bin");
 
+    /// The Java-planned fixture #771's read test uses: one bucket, no pre-filter,
+    /// so `rangeFileCount == 0`. Provenance is in
+    /// `tests/pk_vector_bucket_split_read_test.rs`.
+    const BUCKET_SPLIT_NO_PREFILTER: &[u8] =
+        include_bytes!("../../testdata/pkvector_split/bucket_split_0.bin");
+
     fn int_partition(value: i32) -> BinaryRow {
         let mut builder = crate::spec::BinaryRowBuilder::new(1);
         builder.write_int(0, value);
@@ -1333,13 +1302,14 @@ mod tests {
     }
 
     /// The positions a file's normalized ranges allow, for assertions that read
-    /// better as a row list than as ranges.
-    fn allowed(map: &HashMap<String, Vec<RowRange>>, file: &str) -> Vec<u64> {
+    /// better as a row list than as ranges. Test-only: the production path never
+    /// expands a range into positions.
+    fn allowed(map: &HashMap<String, Vec<RowRange>>, file: &str) -> Vec<i64> {
         map.get(file)
             .map(|ranges| {
-                positions_in_ranges(ranges)
-                    .expect("planned ranges are in range")
+                ranges
                     .iter()
+                    .flat_map(|range| range.from()..=range.to())
                     .collect()
             })
             .unwrap_or_default()
@@ -1373,17 +1343,103 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_unknown_row_count_on_an_unlisted_file() {
-        // A file the message lists no ranges for is read as "the whole file", which
-        // needs a real row count. `ROW_COUNT_UNKNOWN` is -1, and reading that as "no
-        // rows" would drop the file from the search without a word; the decoder only
-        // checks the count of files it does carry ranges for.
-        let error = whole_file_range(DataFileMeta::ROW_COUNT_UNKNOWN)
-            .map(|_| ())
-            .expect_err("an unknown row count cannot stand in for the whole file");
-        assert!(error.to_string().contains("must be known"), "{error}");
-        assert!(whole_file_range(0).unwrap().is_empty());
-        assert_eq!(whole_file_range(3).unwrap(), vec![RowRange::new(0, 2)]);
+    fn an_unlisted_file_is_left_out_rather_than_expanded_from_its_row_count() {
+        // The row count comes off the wire. Turning an unlisted file into an explicit
+        // [0, row_count - 1] hands that number to the allow-list materialization, and
+        // i64::MAX does not come back. Java never writes the entry: absence already
+        // means "every row", so nothing has to be sized from the count.
+        let split = engine_split(
+            11,
+            0,
+            BinaryRow::new(0),
+            vec![dfm("d0", i64::MAX, 5, Some(1))],
+            vec![engine_payload(gim(2, 5, &[("d0", i64::MAX)]))],
+            &[],
+        );
+        let plan = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split]).unwrap();
+        let selections = plan
+            .physical_row_ranges_by_split
+            .expect("split-driven plan");
+        assert!(
+            !selections[0].contains_key("d0"),
+            "an unlisted file must stay absent (unrestricted), not be expanded"
+        );
+    }
+
+    #[test]
+    fn the_java_fixture_lists_no_ranges_so_the_plan_restricts_nothing() {
+        // The committed Java-planned fixture is the no-pre-filter shape an engine
+        // ships by default. Nothing in it is restricted, so the plan must carry no
+        // per-file entry at all -- that absence is what lets the search skip the
+        // filtered ANN path.
+        let split = BucketVectorSearchSplit::deserialize(BUCKET_SPLIT_NO_PREFILTER).unwrap();
+        assert!(
+            split.row_ranges_by_file().is_empty(),
+            "fixture provenance: Java recorded no pre-filter ranges"
+        );
+        // Derived from the fixture itself so the test cannot drift from it.
+        let payload = &split.payload_files()[0];
+        let index_type = payload.index_type().to_string();
+        let field_id = payload.global_index_meta().index_field_id;
+
+        let plan = plan_from_bucket_splits(&index_type, field_id, None, "/tbl", false, vec![split])
+            .unwrap();
+        let selections = plan
+            .physical_row_ranges_by_split
+            .expect("split-driven plan");
+        assert_eq!(selections.len(), 1);
+        assert!(
+            selections[0].is_empty(),
+            "a split that lists no ranges restricts no file"
+        );
+    }
+
+    #[test]
+    fn the_java_fixture_reaches_the_ann_layer_with_no_mask_at_all() {
+        // The chain the two tests above only cover in halves: the committed
+        // Java-planned fixture, through planning, into the function that decides
+        // whether the ANN backend is handed an `include_row_ids` filter. `None` here
+        // is what makes Lumina call `search` rather than `search_with_filter`.
+        // Result equality against the manifest route cannot see this difference --
+        // both return the same rows for this fixture.
+        let split = BucketVectorSearchSplit::deserialize(BUCKET_SPLIT_NO_PREFILTER).unwrap();
+        let payload = &split.payload_files()[0];
+        let index_type = payload.index_type().to_string();
+        let field_id = payload.global_index_meta().index_field_id;
+        let source_meta =
+            PrimaryKeyIndexSourceMeta::from_global_index_meta(payload.global_index_meta()).unwrap();
+
+        let plan = plan_from_bucket_splits(&index_type, field_id, None, "/tbl", false, vec![split])
+            .unwrap();
+        let selections: crate::vindex::pkvector::FileRowSelections = plan
+            .physical_row_ranges_by_split
+            .expect("split-driven plan")
+            .remove(0)
+            .into_iter()
+            .map(|(file, ranges)| {
+                (
+                    file,
+                    crate::vindex::pkvector::FileRowSelection::Ranges(ranges),
+                )
+            })
+            .collect();
+
+        let active: HashSet<String> = source_meta
+            .source_files()
+            .iter()
+            .map(|file| file.file_name().to_string())
+            .collect();
+        assert!(
+            crate::vindex::pkvector::ann::build_live_row_ids(
+                source_meta.source_files(),
+                &active,
+                &HashMap::new(),
+                Some(&selections),
+            )
+            .unwrap()
+            .is_none(),
+            "the no-pre-filter fixture must not put the backend on the filtered path"
+        );
     }
 
     #[test]
@@ -1474,8 +1530,9 @@ mod tests {
             .physical_row_ranges_by_split
             .expect("split-driven plan");
 
-        assert!(allowed(&ranges[0], "d0").is_empty());
-        assert_eq!(allowed(&ranges[0], "d1"), vec![0, 1, 2]);
+        // Listed empty: present and excluded. Unlisted: absent, meaning every row.
+        assert_eq!(ranges[0].get("d0").map(Vec::as_slice), Some(&[][..]));
+        assert!(!ranges[0].contains_key("d1"));
     }
 
     #[test]
@@ -1542,8 +1599,8 @@ mod tests {
         let ranges = plan
             .physical_row_ranges_by_split
             .expect("split-driven plan");
-        // Unaffected: the whole file stays readable.
-        assert_eq!(allowed(&ranges[0], "d0"), vec![0, 1, 2, 3]);
+        // Unaffected: the file stays unlisted, which is "every row".
+        assert!(!ranges[0].contains_key("d0"));
     }
 
     #[test]
