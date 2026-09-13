@@ -19,6 +19,7 @@
 
 pub(crate) mod aggregator;
 mod audit_log_table;
+mod batch_vector_search_builder;
 pub(crate) mod bin_pack;
 mod bitmap_global_index_format;
 mod bitmap_global_index_reader;
@@ -39,6 +40,8 @@ mod data_evolution_reader;
 pub mod data_evolution_writer;
 mod data_file_reader;
 mod data_file_writer;
+mod de_vector_read;
+mod de_vector_scan;
 mod dedicated_format_file_writer;
 mod format_partition;
 mod format_read_builder;
@@ -77,7 +80,9 @@ mod pk_vector_data_file_reader;
 mod pk_vector_indexed_split_read;
 mod pk_vector_orchestrator;
 mod pk_vector_position_read;
+mod pk_vector_read;
 mod pk_vector_scan;
+mod pk_vector_search_params;
 mod postpone_bucket_plan;
 mod postpone_file_writer;
 mod postpone_fixed_bucket_router;
@@ -105,19 +110,27 @@ mod table_update;
 pub(crate) mod table_write;
 mod tag_manager;
 pub(crate) mod time_travel;
+mod vector_read;
+mod vector_scan;
 mod vector_search_builder;
+mod vector_search_common;
+pub(crate) mod vector_search_result;
+#[cfg(test)]
+mod vector_search_test_utils;
 mod vindex_index_build_builder;
 mod write_builder;
 
 use crate::Result;
 use arrow_array::RecordBatch;
 pub use audit_log_table::AuditLogTable;
+pub use batch_vector_search_builder::BatchVectorSearchBuilder;
 pub use blob_resolver::{BlobReader, BlobStream};
 pub use branch_manager::BranchManager;
 pub use commit_message::CommitMessage;
 pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
+pub use de_vector_scan::PreparedVectorSearchFilter;
 pub use format_partition::{
     format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
 };
@@ -161,9 +174,9 @@ pub use table_scan::TableScan;
 pub use table_update::TableUpdate;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
-pub use vector_search_builder::{
-    BatchVectorSearchBuilder, PreparedVectorSearchFilter, VectorSearchBuilder,
-};
+pub use vector_read::{BatchVectorRead, VectorRead};
+pub use vector_scan::{VectorScan, VectorScanPlan};
+pub use vector_search_builder::VectorSearchBuilder;
 pub use vindex_index_build_builder::VindexIndexBuildBuilder;
 pub use write_builder::WriteBuilder;
 

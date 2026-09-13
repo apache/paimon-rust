@@ -38,7 +38,7 @@ use crate::vindex::pkvector::bucket::{
 };
 use crate::vindex::pkvector::metric::{java_float_compare, VectorSearchMetric};
 use crate::vindex::pkvector::result::PkVectorSearchResult;
-use crate::vindex::pkvector::FileRowSelections;
+use crate::vindex::pkvector::RowRangesByFile;
 
 fn data_invalid(message: impl Into<String>) -> crate::Error {
     crate::Error::DataInvalid {
@@ -111,6 +111,7 @@ pub(crate) fn validate_row_position(
 /// One bucket's search input. Rust equivalent of Java
 /// `BucketVectorSearchSplit`. Constructed from a snapshot/manifest plan by
 /// `PkVectorScan`.
+#[derive(Clone)]
 pub(crate) struct PkVectorSearchSplit {
     /// The bucket's combined data split (>= 1 data file); source of the
     /// partition/bucket/bucket_path/snapshot, the per-file `DataFileMeta`, and the
@@ -355,13 +356,12 @@ impl PkVectorOrchestrator {
     /// and split so a caller can build a reader keyed to the specific split/file.
     /// `skip_exact_fallback` forwards to `bucket_search`.
     ///
-    /// `row_selections_by_split`, when present, carries one per-file row selection
-    /// per split (indexed parallel to `splits`), in the three states of
-    /// [`FileRowSelection`]: a file with NO entry is unrestricted, an empty entry
-    /// contributes no candidates, and a non-empty one limits which of its rows may.
-    /// A selection is either interval `Ranges` (from an engine's bucket split) or
-    /// `Positions` (from a residual data predicate). `None` restricts nothing at
-    /// all. The slice must have the same length as `splits`.
+    /// `row_ranges_by_split`, when present, carries one per-file row selection
+    /// per split (indexed parallel to `splits`), using [`RowRangesByFile`]: a file
+    /// with no entry is unrestricted, an empty list contributes no candidates,
+    /// and a non-empty list limits its rows. Both plans and residual predicates
+    /// use merged intervals. `None` restricts nothing; the slice must have the
+    /// same length as `splits`.
     ///
     /// This is the single-query wrapper over
     /// [`search_candidates_batch`](Self::search_candidates_batch): it searches the
@@ -391,7 +391,7 @@ impl PkVectorOrchestrator {
               + Sync),
         search_options: &HashMap<String, String>,
         skip_exact_fallback: bool,
-        row_selections_by_split: Option<&[FileRowSelections]>,
+        row_ranges_by_split: Option<&[RowRangesByFile]>,
         concurrency: usize,
     ) -> crate::Result<OrchestratorSearchResult> {
         let mut results = self
@@ -405,7 +405,7 @@ impl PkVectorOrchestrator {
                 exact_file_search,
                 search_options,
                 skip_exact_fallback,
-                row_selections_by_split,
+                row_ranges_by_split,
                 concurrency,
             )
             .await?;
@@ -423,7 +423,7 @@ impl PkVectorOrchestrator {
     /// into another's (independent per-query heaps).
     ///
     /// The row selections depend only on the filter and the plan, not the
-    /// query vector, so the SAME `row_selections_by_split` slice is shared across every
+    /// query vector, so the SAME `row_ranges_by_split` slice is shared across every
     /// query. Input-shape validation (positive limits, non-empty query, residual
     /// count) is applied per query / once as appropriate.
     ///
@@ -457,7 +457,7 @@ impl PkVectorOrchestrator {
               + Sync),
         search_options: &HashMap<String, String>,
         skip_exact_fallback: bool,
-        row_selections_by_split: Option<&[FileRowSelections]>,
+        row_ranges_by_split: Option<&[RowRangesByFile]>,
         concurrency: usize,
     ) -> crate::Result<Vec<OrchestratorSearchResult>> {
         // Eager input-shape validation (Java checkArgument parity).
@@ -475,7 +475,7 @@ impl PkVectorOrchestrator {
                 return Err(data_invalid("vector search query must not be empty"));
             }
         }
-        if let Some(per_split) = row_selections_by_split {
+        if let Some(per_split) = row_ranges_by_split {
             if per_split.len() != splits.len() {
                 return Err(data_invalid(
                     "row selection map count does not match split count",
@@ -528,8 +528,8 @@ impl PkVectorOrchestrator {
                         )
                     },
                 );
-                let row_selections =
-                    row_selections_by_split.map(|per_split| &per_split[split_index]);
+                let row_ranges_by_file =
+                    row_ranges_by_split.map(|per_split| &per_split[split_index]);
                 let per_query = bucket_search_batch(
                     ann_searcher,
                     &split.ann_segments,
@@ -542,7 +542,7 @@ impl PkVectorOrchestrator {
                     limit,
                     search_options,
                     skip_exact_fallback,
-                    row_selections,
+                    row_ranges_by_file,
                     concurrency,
                     search_budget,
                 )
@@ -578,6 +578,9 @@ impl PkVectorOrchestrator {
                 Ok::<_, crate::Error>(tagged)
             }
         });
+
+        // Erase the borrowing map closure before awaiting Send search futures.
+        let per_bucket = per_bucket.collect::<Vec<_>>().into_iter();
 
         // Drive the per-bucket futures. `concurrency == 1` uses a strictly
         // sequential loop so buckets are searched in split order; larger values fan
@@ -1264,7 +1267,7 @@ mod e2e_tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _row_selections: Option<&FileRowSelections>,
+            _row_ranges_by_file: Option<&RowRangesByFile>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             Ok(queries.iter().map(|_| self.hits.clone()).collect())
         }
@@ -1796,12 +1799,9 @@ mod e2e_tests {
         );
         // Allow only positions 0 and 2 for "r.mosaic"; pos1 (the best hit) is
         // excluded by the residual.
-        let mut allowed = roaring::RoaringTreemap::new();
-        allowed.insert(0);
-        allowed.insert(2);
-        let row_selections_by_split: Vec<FileRowSelections> = vec![HashMap::from([(
+        let row_ranges_by_split: Vec<RowRangesByFile> = vec![HashMap::from([(
             "r.mosaic".to_string(),
-            crate::vindex::pkvector::FileRowSelection::Positions(allowed),
+            vec![RowRange::new(0, 0), RowRange::new(2, 2)],
         )])];
         let opts = HashMap::new();
         let result = PkVectorOrchestrator::new(make_reader(file_io, table_path))
@@ -1815,7 +1815,7 @@ mod e2e_tests {
                 &factory,
                 &opts,
                 false,
-                Some(&row_selections_by_split),
+                Some(&row_ranges_by_split),
                 1,
             )
             .await
@@ -1856,7 +1856,7 @@ mod e2e_tests {
         };
         let factory = unreachable_split_search();
         // Two residual maps for a single split.
-        let row_selections_by_split: Vec<FileRowSelections> = vec![HashMap::new(), HashMap::new()];
+        let row_ranges_by_split: Vec<RowRangesByFile> = vec![HashMap::new(), HashMap::new()];
         let opts = HashMap::new();
         let err = PkVectorOrchestrator::new(make_reader(file_io, table_path))
             .search_candidates(
@@ -1869,7 +1869,7 @@ mod e2e_tests {
                 &factory,
                 &opts,
                 false,
-                Some(&row_selections_by_split),
+                Some(&row_ranges_by_split),
                 1,
             )
             .await

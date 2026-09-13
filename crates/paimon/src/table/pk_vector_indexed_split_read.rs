@@ -51,6 +51,7 @@ fn data_invalid(message: impl Into<String>) -> crate::Error {
 ///
 /// Deliberately NOT reusing `DataSplit.row_ranges`, whose ranges mean stable/global
 /// row ids on the append/data-evolution path. Not serialized.
+#[derive(Debug, Clone)]
 pub(crate) struct PkVectorIndexedSplit {
     pub split: DataSplit,
     pub row_ranges: Vec<RowRange>,

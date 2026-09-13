@@ -29,13 +29,12 @@ use crate::table::data_file_reader::DataFileReader;
 use crate::table::pk_search_position::PrimaryKeySearchPosition;
 use crate::table::pk_search_ranker::{self, Ranking};
 use crate::table::pk_vector_indexed_split_read::{PkVectorIndexedSplit, PkVectorIndexedSplitRead};
-use crate::table::pk_vector_orchestrator::build_indexed_splits;
 use crate::table::source::DataSplit;
-use crate::table::vector_search_builder::{
+use crate::table::vector_search_common::{
     collect_ranked_rows, ensure_no_reserved_read_columns, reorder_and_strip_position, RankedRow,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange, Table};
-use crate::vector_search::SearchResult;
+use crate::vector_search::ScoredRowIds;
 
 #[cfg(feature = "fulltext")]
 use crate::spec::GlobalIndexSearchMode;
@@ -285,7 +284,7 @@ impl<'a> HybridSearchBuilder<'a> {
         self.execute_scored().await?.to_row_ranges()
     }
 
-    pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
+    pub async fn execute_scored(&self) -> crate::Result<ScoredRowIds> {
         let core = CoreOptions::new(self.table.schema().options());
         core.ensure_read_authorized()?;
         let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
@@ -324,7 +323,7 @@ impl<'a> HybridSearchBuilder<'a> {
                         .with_query_vector(route.vector.clone().expect("validated vector route"))
                         .with_limit(route.limit)
                         .with_options(route.options.clone());
-                    builder.execute_scored().await?
+                    builder.execute().await?.into_row_ids()?
                 }
                 HybridSearchRouteKind::FullText => {
                     execute_full_text_route(self.table, route).await?
@@ -437,9 +436,7 @@ impl<'a> HybridSearchBuilder<'a> {
         let mut routes: Vec<PkRoute> = Vec::with_capacity(self.routes.len());
         for route in &self.routes {
             let pk_route = match route.kind {
-                HybridSearchRouteKind::Vector => {
-                    self.pk_vector_route(route_table, core, route).await?
-                }
+                HybridSearchRouteKind::Vector => self.pk_vector_route(route_table, route).await?,
                 HybridSearchRouteKind::FullText => {
                     self.pk_full_text_route(route_table, core, route).await?
                 }
@@ -562,13 +559,11 @@ impl<'a> HybridSearchBuilder<'a> {
         Ok(Some(pinned))
     }
 
-    /// Run the vector route's primary-key candidate producer and convert its hits
-    /// into shared physical positions (distance → score via the resolved metric),
-    /// keeping the route's single-file source splits and pinned snapshot.
+    /// Consume the vector search's scored positions, retaining its source files
+    /// and pinned snapshot for fusion before materialization.
     async fn pk_vector_route(
         &self,
         table: &Table,
-        core: &CoreOptions<'_>,
         route: &HybridSearchRoute,
     ) -> crate::Result<PkRoute> {
         let vector = route.vector.as_deref().expect("validated vector route");
@@ -578,24 +573,21 @@ impl<'a> HybridSearchBuilder<'a> {
             .with_query_vector(vector.to_vec())
             .with_limit(route.limit)
             .with_options(route.options.clone());
-        let result = builder
-            .search_pk_route(core, &route.field_name, vector, route.limit)
-            .await?;
+        let result = builder.execute().await?;
         let positions = result
-            .candidates
+            .positions()?
             .iter()
-            .map(|candidate| {
-                PrimaryKeySearchPosition::from_vector_candidate(candidate, result.metric)
-            })
+            .map(PrimaryKeySearchPosition::from_vector_position)
             .collect::<crate::Result<Vec<_>>>()?;
-        let source_splits = build_indexed_splits(result.candidates, &result.splits, result.metric)?
-            .into_iter()
-            .map(|split| split.split)
+        let source_splits = result
+            .indexed_splits()?
+            .iter()
+            .map(|split| split.split.clone())
             .collect();
         Ok(PkRoute {
             positions,
             source_splits,
-            snapshot_id: result.snapshot_id,
+            snapshot_id: result.snapshot_id().unwrap_or(0),
             weight: route.weight as f64,
         })
     }
@@ -901,7 +893,7 @@ fn build_hybrid_indexed_splits(
 async fn execute_full_text_route(
     table: &Table,
     route: &HybridSearchRoute,
-) -> crate::Result<SearchResult> {
+) -> crate::Result<ScoredRowIds> {
     let mut builder = table.new_full_text_search_builder();
     builder
         .with_text_column(&route.field_name)
@@ -913,21 +905,21 @@ async fn execute_full_text_route(
         )
         .with_limit(route.limit);
     let result = builder.execute_scored().await?;
-    Ok(SearchResult::new(result.row_ids, result.scores))
+    Ok(ScoredRowIds::new(result.row_ids, result.scores))
 }
 
 #[cfg(not(feature = "fulltext"))]
 async fn execute_full_text_route(
     _table: &Table,
     _route: &HybridSearchRoute,
-) -> crate::Result<SearchResult> {
+) -> crate::Result<ScoredRowIds> {
     Err(crate::Error::ConfigInvalid {
         message: "Full-text hybrid routes require the fulltext feature".to_string(),
     })
 }
 
 struct WeightedRouteResult {
-    result: SearchResult,
+    result: ScoredRowIds,
     weight: f32,
 }
 
@@ -935,7 +927,7 @@ fn rank_results(
     ranker: HybridSearchRanker,
     route_results: &[WeightedRouteResult],
     limit: usize,
-) -> SearchResult {
+) -> ScoredRowIds {
     match ranker {
         HybridSearchRanker::Rrf => rrf(route_results, limit),
         HybridSearchRanker::WeightedScore => weighted_score(route_results, limit),
@@ -943,7 +935,7 @@ fn rank_results(
     }
 }
 
-fn rrf(route_results: &[WeightedRouteResult], limit: usize) -> SearchResult {
+fn rrf(route_results: &[WeightedRouteResult], limit: usize) -> ScoredRowIds {
     let mut scores = HashMap::new();
     for route_result in route_results {
         for (rank, (row_id, _score)) in ranked_row_ids(&route_result.result).iter().enumerate() {
@@ -954,7 +946,7 @@ fn rrf(route_results: &[WeightedRouteResult], limit: usize) -> SearchResult {
     top_k(scores, limit)
 }
 
-fn mrr(route_results: &[WeightedRouteResult], limit: usize) -> SearchResult {
+fn mrr(route_results: &[WeightedRouteResult], limit: usize) -> ScoredRowIds {
     let mut scores = HashMap::new();
     for route_result in route_results {
         for (rank, (row_id, _score)) in ranked_row_ids(&route_result.result).iter().enumerate() {
@@ -965,7 +957,7 @@ fn mrr(route_results: &[WeightedRouteResult], limit: usize) -> SearchResult {
     top_k(scores, limit)
 }
 
-fn weighted_score(route_results: &[WeightedRouteResult], limit: usize) -> SearchResult {
+fn weighted_score(route_results: &[WeightedRouteResult], limit: usize) -> ScoredRowIds {
     let mut scores = HashMap::new();
     for route_result in route_results {
         let ranked = ranked_row_ids(&route_result.result);
@@ -992,7 +984,7 @@ fn weighted_score(route_results: &[WeightedRouteResult], limit: usize) -> Search
     top_k(scores, limit)
 }
 
-fn ranked_row_ids(result: &SearchResult) -> Vec<(u64, f32)> {
+fn ranked_row_ids(result: &ScoredRowIds) -> Vec<(u64, f32)> {
     let mut best_scores = HashMap::new();
     for (&row_id, &score) in result.row_ids.iter().zip(&result.scores) {
         best_scores
@@ -1022,9 +1014,9 @@ fn add_score(scores: &mut HashMap<u64, f32>, row_id: u64, score: f32) {
         .or_insert(score);
 }
 
-fn top_k(scores: HashMap<u64, f32>, limit: usize) -> SearchResult {
+fn top_k(scores: HashMap<u64, f32>, limit: usize) -> ScoredRowIds {
     if scores.is_empty() || limit == 0 {
-        return SearchResult::empty();
+        return ScoredRowIds::empty();
     }
 
     let mut entries: Vec<_> = scores.into_iter().collect();
@@ -1037,7 +1029,7 @@ fn top_k(scores: HashMap<u64, f32>, limit: usize) -> SearchResult {
     entries.truncate(limit);
 
     let (row_ids, scores): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
-    SearchResult::new(row_ids, scores)
+    ScoredRowIds::new(row_ids, scores)
 }
 
 #[cfg(test)]
@@ -1046,7 +1038,7 @@ mod tests {
 
     fn route_result(row_ids: Vec<u64>, scores: Vec<f32>, weight: f32) -> WeightedRouteResult {
         WeightedRouteResult {
-            result: SearchResult::new(row_ids, scores),
+            result: ScoredRowIds::new(row_ids, scores),
             weight,
         }
     }
@@ -1549,6 +1541,54 @@ mod pk_hybrid_tests {
         }
     }
 
+    #[tokio::test]
+    async fn pk_hybrid_weighted_score_uses_vector_scores_and_reads_in_fused_order() {
+        let table = build_hybrid_table(
+            "memory:/pk_hybrid_weighted_vector",
+            &[100, 101, 102],
+            &[
+                [8.0, 0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0, 0.0],
+                [9.0, 0.0, 0.0, 0.0],
+            ],
+            &["alpha", "beta", "gamma"],
+            &[],
+        )
+        .await;
+        let mut builder = table.new_hybrid_search_builder();
+        builder
+            .add_vector_route(
+                VECTOR_COLUMN,
+                vec![10.0, 0.0, 0.0, 0.0],
+                3,
+                2.0,
+                HashMap::new(),
+            )
+            .unwrap()
+            .with_limit(3)
+            .with_weighted_score_ranker();
+
+        let batches: Vec<RecordBatch> = builder
+            .execute_read()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(column_i32(&batches, "id"), vec![101, 102, 100]);
+        // L2 distances [0, 1, 4] become scores [1, .5, .2]. Min-max normalization
+        // with weight 2 yields [2, .75, 0]. Raw distances or a second distance-to-
+        // score conversion would change both the order and these scores.
+        let scores = column_f32(&batches, SEARCH_SCORE_COLUMN);
+        assert_eq!(scores.len(), 3);
+        for (score, expected) in scores.into_iter().zip([2.0, 0.75, 0.0]) {
+            assert!(
+                (score - expected).abs() < 1e-6,
+                "expected {expected}, got {score}"
+            );
+        }
+    }
+
     // (c) A mixed PK/global route set must fail loud on execute_read.
     #[tokio::test]
     async fn mixed_pk_and_global_routes_fail_loud() {
@@ -1859,5 +1899,13 @@ mod pk_hybrid_tests {
             Some(&"1".to_string()),
             "read-latest hybrid must pin the resolved latest snapshot id"
         );
+        let route = builder
+            .pk_vector_route(&pinned, &builder.routes[0])
+            .await
+            .unwrap();
+        assert_eq!(route.snapshot_id, 1);
+        assert_eq!(route.positions.len(), 2);
+        assert_eq!(route.source_splits.len(), 1);
+        assert_eq!(route.source_splits[0].snapshot_id(), route.snapshot_id);
     }
 }

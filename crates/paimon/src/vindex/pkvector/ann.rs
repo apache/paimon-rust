@@ -25,7 +25,7 @@ use super::bucket::BucketAnnSegment;
 use super::data_invalid;
 use super::metric::{java_float_compare, VectorSearchMetric};
 use super::result::PkVectorSearchResult;
-use super::{FileRowSelection, FileRowSelections};
+use super::{contains_row_position, RowRangesByFile};
 use crate::deletion_vector::DeletionVector;
 use crate::spec::{
     PrimaryKeyIndexSourceFile as PkVectorSourceFile,
@@ -77,9 +77,9 @@ fn charge_live_rows(remaining: &mut u64, rows: u64) -> crate::Result<()> {
     Ok(())
 }
 
-/// `row_selections` restricts each source file to the rows a pre-filter allows,
+/// `row_ranges_by_file` restricts each source file to the rows a pre-filter allows,
 /// keyed by data-file name. A file with **no entry is unrestricted**, an empty
-/// entry excludes it, and a non-empty one limits it — see [`FileRowSelection`].
+/// entry excludes it, and a non-empty one limits it — see [`RowRangesByFile`].
 /// Mirrors Java `rowRangesByFile`.
 ///
 /// Returns `None` when nothing is restricted, every source file is active, AND no
@@ -96,7 +96,7 @@ pub(crate) fn build_live_row_ids(
     source_files: &[PkVectorSourceFile],
     active_source_files: &HashSet<String>,
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
-    row_selections: Option<&FileRowSelections>,
+    row_ranges_by_file: Option<&RowRangesByFile>,
 ) -> crate::Result<Option<roaring::RoaringTreemap>> {
     let all_active = source_files
         .iter()
@@ -109,7 +109,7 @@ pub(crate) fn build_live_row_ids(
     // more segments unfiltered, but it also changes which backend entry point they
     // take (`search` vs `search_with_filter`), and those can differ in recall. Not
     // worth diverging for.
-    let nothing_restricted = row_selections.is_none_or(FileRowSelections::is_empty);
+    let nothing_restricted = row_ranges_by_file.is_none_or(RowRangesByFile::is_empty);
     if nothing_restricted && all_active && !has_relevant_dv {
         return Ok(None);
     }
@@ -126,7 +126,8 @@ pub(crate) fn build_live_row_ids(
             .ok_or_else(|| data_invalid("vector source row counts overflow u64"))?;
         let active = active_source_files.contains(source_file.file_name());
         if active && row_count > 0 {
-            match row_selections.and_then(|selections| selections.get(source_file.file_name())) {
+            match row_ranges_by_file.and_then(|selections| selections.get(source_file.file_name()))
+            {
                 // Unrestricted: the whole active file range is live. This is the
                 // no-entry case Java spells as `rowRanges == null`.
                 None => {
@@ -137,7 +138,7 @@ pub(crate) fn build_live_row_ids(
                 // these bounds ride in on an engine-supplied split, so walking them
                 // would be unbounded work driven by untrusted numbers. Mirrors Java
                 // `live.addRange(range.addOffset(fileOffset))`.
-                Some(FileRowSelection::Ranges(ranges)) => {
+                Some(ranges) => {
                     for range in ranges {
                         // Java checks each range against the SOURCE file's row count.
                         // On the bucket-split route that count came off the wire as
@@ -160,32 +161,6 @@ pub(crate) fn build_live_row_ids(
                         }
                         charge_live_rows(&mut budget, to - from + 1)?;
                         live.insert_range((file_offset + from)..=(file_offset + to));
-                    }
-                }
-                // Restricted to positions a residual predicate left behind. Bounded
-                // by the rows that read actually returned, so walking them is safe.
-                Some(FileRowSelection::Positions(allowed)) => {
-                    // `len` plus a maximum of `row_count - 1` can only describe the
-                    // full set; inserting it as one range subsumes the per-position
-                    // bound check below.
-                    if allowed.len() == row_count && allowed.max() == Some(row_count - 1) {
-                        charge_live_rows(&mut budget, row_count)?;
-                        live.insert_range(file_offset..end);
-                    } else {
-                        charge_live_rows(&mut budget, allowed.len())?;
-                        for position in allowed.iter() {
-                            if position >= row_count {
-                                return Err(data_invalid(format!(
-                                    "residual position {position} is out of range for source file {} ({} rows)",
-                                    source_file.file_name(),
-                                    row_count
-                                )));
-                            }
-                            let global = file_offset.checked_add(position).ok_or_else(|| {
-                                data_invalid("vector residual position overflows u64")
-                            })?;
-                            live.insert(global);
-                        }
                     }
                 }
             }
@@ -228,7 +203,7 @@ pub(crate) fn map_ann_results(
     source_meta: &PkVectorSourceMeta,
     active_source_files: &HashSet<String>,
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
-    row_selections: Option<&FileRowSelections>,
+    row_ranges_by_file: Option<&RowRangesByFile>,
     metric: VectorSearchMetric,
 ) -> crate::Result<Vec<PkVectorSearchResult>> {
     let mut results = Vec::with_capacity(scored.len());
@@ -252,9 +227,9 @@ pub(crate) fn map_ann_results(
         }
         // A file with no entry is unrestricted, so only an entry can reject.
         if let Some(selection) =
-            row_selections.and_then(|selections| selections.get(&data_file_name))
+            row_ranges_by_file.and_then(|selections| selections.get(&data_file_name))
         {
-            if !selection.contains(pos) {
+            if !contains_row_position(selection, row_position) {
                 return Err(data_invalid(format!(
                     "ANN segment returned row position {row_position} in {data_file_name} outside the row selection for that file"
                 )));
@@ -314,7 +289,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        row_selections: Option<&FileRowSelections>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>>;
 
     #[allow(clippy::too_many_arguments)]
@@ -328,7 +303,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        row_selections: Option<&FileRowSelections>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
         match segment_source {
             AnnSegmentSource::Buffered(bytes) => self.search_batch(
@@ -340,7 +315,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
                 active_source_files,
                 deletion_vectors,
                 search_options,
-                row_selections,
+                row_ranges_by_file,
             ),
             AnnSegmentSource::Vindex(_) => Err(data_invalid(
                 "ANN searcher does not support a range-backed segment source",
@@ -362,7 +337,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        row_selections: Option<&FileRowSelections>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<PkVectorSearchResult>> {
         let mut results = self.search_batch(
             segment,
@@ -373,7 +348,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
             active_source_files,
             deletion_vectors,
             search_options,
-            row_selections,
+            row_ranges_by_file,
         )?;
         if results.len() != 1 {
             return Err(data_invalid(format!(
@@ -395,7 +370,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        row_selections: Option<&FileRowSelections>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<PkVectorSearchResult>> {
         let mut results = self.search_batch_source(
             segment,
@@ -406,7 +381,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
             active_source_files,
             deletion_vectors,
             search_options,
-            row_selections,
+            row_ranges_by_file,
         )?;
         if results.len() != 1 {
             return Err(data_invalid(format!(
@@ -538,7 +513,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        row_selections: Option<&FileRowSelections>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
         self.search_batch_source(
             segment,
@@ -549,7 +524,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
             active_source_files,
             deletion_vectors,
             search_options,
-            row_selections,
+            row_ranges_by_file,
         )
     }
 
@@ -563,7 +538,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        row_selections: Option<&FileRowSelections>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
         if limit == 0 {
             return Err(data_invalid("vector search limit must be positive"));
@@ -579,7 +554,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
             source_files,
             active_source_files,
             deletion_vectors,
-            row_selections,
+            row_ranges_by_file,
         )?;
         let mut searches = Vec::with_capacity(queries.len());
         for query in queries {
@@ -608,7 +583,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
                         &segment.source_meta,
                         active_source_files,
                         deletion_vectors,
-                        row_selections,
+                        row_ranges_by_file,
                         metric,
                     )?
                 }
@@ -623,6 +598,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::RowRange;
     use roaring::RoaringBitmap;
 
     /// A trivial loader returning empty bytes — the synthetic scorers below ignore
@@ -653,24 +629,20 @@ mod tests {
         Arc::new(DeletionVector::from_bitmap(bitmap))
     }
 
-    /// A residual selection: the physical positions of one file that passed a data
-    /// predicate.
-    fn positions(at: &[u64]) -> FileRowSelection {
-        let mut t = roaring::RoaringTreemap::new();
-        for &p in at {
-            t.insert(p);
-        }
-        FileRowSelection::Positions(t)
-    }
-
-    /// A pre-filter selection in the interval form an engine's split carries.
-    fn ranges(bounds: &[(i64, i64)]) -> FileRowSelection {
-        FileRowSelection::Ranges(
-            bounds
-                .iter()
-                .map(|(from, to)| crate::table::RowRange::new(*from, *to))
+    /// Build the merged ranges a residual predicate hands to the search.
+    fn positions(at: &[u64]) -> Vec<RowRange> {
+        crate::table::merge_row_ranges(
+            at.iter()
+                .map(|&p| RowRange::new(p as i64, p as i64))
                 .collect(),
         )
+    }
+
+    fn ranges(bounds: &[(i64, i64)]) -> Vec<RowRange> {
+        bounds
+            .iter()
+            .map(|&(from, to)| RowRange::new(from, to))
+            .collect()
     }
 
     fn active_set(names: &[&str]) -> HashSet<String> {
@@ -979,14 +951,6 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    fn treemap(positions: &[u64]) -> roaring::RoaringTreemap {
-        let mut t = roaring::RoaringTreemap::new();
-        for &p in positions {
-            t.insert(p);
-        }
-        t
-    }
-
     #[test]
     fn test_build_live_row_ids_residual_intersects_with_active_and_dv() {
         // f0 rows 0..3 (global 0,1,2), f1 rows 0..2 (global 3,4). Both active.
@@ -1002,10 +966,7 @@ mod tests {
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1]));
         let mut residual = HashMap::new();
-        residual.insert(
-            "f0".to_string(),
-            FileRowSelection::Positions(treemap(&[0, 1])),
-        );
+        residual.insert("f0".to_string(), positions(&[0, 1]));
         let live = build_live_row_ids(&files, &active_set(&["f0", "f1"]), &dvs, Some(&residual))
             .unwrap()
             .unwrap();
@@ -1023,14 +984,8 @@ mod tests {
         ];
         let active = active_set(&["f0", "f1"]);
         let mut residual = HashMap::new();
-        residual.insert(
-            "f0".to_string(),
-            FileRowSelection::Positions(treemap(&[0, 1, 2])),
-        );
-        residual.insert(
-            "f1".to_string(),
-            FileRowSelection::Positions(treemap(&[0, 1])),
-        );
+        residual.insert("f0".to_string(), positions(&[0, 1, 2]));
+        residual.insert("f1".to_string(), positions(&[0, 1]));
 
         let spelled_out = build_live_row_ids(&files, &active, &HashMap::new(), Some(&residual))
             .unwrap()
@@ -1049,10 +1004,7 @@ mod tests {
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1]));
         let mut residual = HashMap::new();
-        residual.insert(
-            "f0".to_string(),
-            FileRowSelection::Positions(treemap(&[0, 1, 2])),
-        );
+        residual.insert("f0".to_string(), positions(&[0, 1, 2]));
         let live = build_live_row_ids(&files, &active_set(&["f0"]), &dvs, Some(&residual))
             .unwrap()
             .unwrap();
@@ -1100,8 +1052,8 @@ mod tests {
             PkVectorSourceFile::new("f1".into(), 2).unwrap(),
         ];
         let mut residual = HashMap::new();
-        residual.insert("f0".to_string(), FileRowSelection::Positions(treemap(&[2])));
-        residual.insert("f1".to_string(), FileRowSelection::Positions(treemap(&[1])));
+        residual.insert("f0".to_string(), positions(&[2]));
+        residual.insert("f1".to_string(), positions(&[1]));
         let live = build_live_row_ids(
             &files,
             &active_set(&["f0", "f1"]),
@@ -1119,10 +1071,7 @@ mod tests {
         // present, a mask is always required.
         let files = [PkVectorSourceFile::new("f0".into(), 3).unwrap()];
         let mut residual = HashMap::new();
-        residual.insert(
-            "f0".to_string(),
-            FileRowSelection::Positions(treemap(&[0, 2])),
-        );
+        residual.insert("f0".to_string(), positions(&[0, 2]));
         let live = build_live_row_ids(
             &files,
             &active_set(&["f0"]),
@@ -1140,10 +1089,7 @@ mod tests {
         // naming position 3 is out of range and must fail loud, not be skipped.
         let files = source_meta(&[("f0", 3)]);
         let mut residual = HashMap::new();
-        residual.insert(
-            "f0".to_string(),
-            FileRowSelection::Positions(treemap(&[0, 3])),
-        );
+        residual.insert("f0".to_string(), positions(&[0, 3]));
         let err = build_live_row_ids(
             files.source_files(),
             &active_set(&["f0"]),
@@ -1182,7 +1128,7 @@ mod tests {
         // (e.g. an ANN reader that ignored include_row_ids) must fail loud.
         let meta = source_meta(&[("f0", 3)]);
         let mut residual = HashMap::new();
-        residual.insert("f0".to_string(), FileRowSelection::Positions(treemap(&[0])));
+        residual.insert("f0".to_string(), positions(&[0]));
         let err = map_ann_results(
             &[(1u64, 0.5)],
             &meta,
@@ -1215,10 +1161,7 @@ mod tests {
         );
         let segment = BucketAnnSegment::for_test(source_meta(&[("f0", 3)]));
         let mut residual = HashMap::new();
-        residual.insert(
-            "f0".to_string(),
-            FileRowSelection::Positions(treemap(&[0, 2])),
-        );
+        residual.insert("f0".to_string(), positions(&[0, 2]));
         searcher
             .search(
                 &segment,
@@ -1255,7 +1198,7 @@ mod tests {
             ),
         );
         let segment = BucketAnnSegment::for_test(source_meta(&[("f0", 3)]));
-        let no_prefilter: FileRowSelections = HashMap::new();
+        let no_prefilter: RowRangesByFile = HashMap::new();
         searcher
             .search(
                 &segment,
@@ -1395,16 +1338,9 @@ mod tests {
         );
     }
 
-    /// A treemap holding `0..=to`, built as one run so the test itself stays cheap.
-    fn positions_through(to: u64) -> roaring::RoaringTreemap {
-        let mut t = roaring::RoaringTreemap::new();
-        t.insert_range(0..=to);
-        t
-    }
-
     #[test]
     fn an_oversized_range_selection_is_charged() {
-        // The `Ranges` charge site, distinct from the unrestricted one: the file is
+        // The range charge site, distinct from the unrestricted one: the file is
         // restricted, so it never reaches the whole-file insert.
         let files = vec![PkVectorSourceFile::new("f0".into(), i32::MAX as i64 + 1).unwrap()];
         let mut selections = HashMap::new();
@@ -1421,46 +1357,21 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_whole_file_position_set_is_charged() {
-        // The `Positions` whole-file shortcut: `len` equals the row count and the
-        // maximum is the last row, so it inserts as one range.
-        let rows = i32::MAX as u64 + 1;
-        let files = vec![PkVectorSourceFile::new("f0".into(), rows as i64).unwrap()];
-        let mut selections = HashMap::new();
-        selections.insert(
+    fn the_live_row_budget_is_shared_across_ranges() {
+        // Each range fits individually; their combined size exceeds the mask
+        // budget. Keep the first range tiny so the rejected test allocates little.
+        let files = vec![PkVectorSourceFile::new("f0".into(), i32::MAX as i64 + 2).unwrap()];
+        let selections = HashMap::from([(
             "f0".to_string(),
-            FileRowSelection::Positions(positions_through(rows - 1)),
-        );
+            ranges(&[(0, 0), (2, i32::MAX as i64 + 1)]),
+        )]);
         let error = build_live_row_ids(
             &files,
             &active_set(&["f0"]),
             &HashMap::new(),
             Some(&selections),
         )
-        .map(|_| ())
-        .expect_err("a whole-file position set this large cannot be filtered");
-        assert!(error.to_string().contains("more than"), "{error}");
-    }
-
-    #[test]
-    fn an_oversized_sparse_position_set_is_charged() {
-        // The per-position `Positions` path: the set is large but is NOT the whole
-        // file, so the shortcut above does not apply and the loop would walk it.
-        let rows = i32::MAX as u64 + 5;
-        let files = vec![PkVectorSourceFile::new("f0".into(), rows as i64).unwrap()];
-        let mut selections = HashMap::new();
-        selections.insert(
-            "f0".to_string(),
-            FileRowSelection::Positions(positions_through(i32::MAX as u64)),
-        );
-        let error = build_live_row_ids(
-            &files,
-            &active_set(&["f0"]),
-            &HashMap::new(),
-            Some(&selections),
-        )
-        .map(|_| ())
-        .expect_err("a position set this large cannot be filtered");
+        .unwrap_err();
         assert!(error.to_string().contains("more than"), "{error}");
     }
 

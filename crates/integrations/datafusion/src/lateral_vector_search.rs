@@ -59,7 +59,7 @@ use datafusion::prelude::SessionConfig;
 use futures::{Stream, StreamExt, TryStreamExt};
 use paimon::spec::{Predicate, ROW_ID_FIELD_NAME};
 use paimon::table::{PreparedVectorSearchFilter, RowRange, Table};
-use paimon::vector_search::SearchResult;
+use paimon::vector_search::ScoredRowIds;
 use tokio::sync::OnceCell;
 
 use crate::error::to_datafusion_error;
@@ -781,7 +781,13 @@ impl LateralVectorSearchExec {
         if let Some(prepared_filter) = prepared_filter {
             builder.with_prepared_filter(prepared_filter.clone());
         }
-        let results = builder.execute().await.map_err(to_datafusion_error)?;
+        let results = builder
+            .execute()
+            .await
+            .map_err(to_datafusion_error)?
+            .into_iter()
+            .map(|result| result.into_row_ids().map_err(to_datafusion_error))
+            .collect::<DFResult<Vec<_>>>()?;
 
         let (target_batch, target_row_id_to_index) =
             read_target_rows(target_table, &self.target_schema, &results).await?;
@@ -989,7 +995,7 @@ fn collect_query_vectors(array: &ArrayRef) -> DFResult<(Vec<Vec<f32>>, Vec<usize
 async fn read_target_rows(
     table: &Table,
     target_schema: &ArrowSchemaRef,
-    results: &[SearchResult],
+    results: &[ScoredRowIds],
 ) -> DFResult<(RecordBatch, HashMap<u64, u32>)> {
     let mut row_ids = results
         .iter()
@@ -1092,7 +1098,7 @@ async fn read_target_rows(
 
 fn row_ranges_from_row_ids(row_ids: &[u64]) -> DFResult<Vec<RowRange>> {
     let scores = vec![0.0; row_ids.len()];
-    SearchResult::new(row_ids.to_vec(), scores)
+    ScoredRowIds::new(row_ids.to_vec(), scores)
         .to_row_ranges()
         .map_err(to_datafusion_error)
 }

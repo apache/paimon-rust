@@ -15,31 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// This crate is the C binding for the Paimon project.
-// So it's type node can't meet camel case.
-#![allow(non_camel_case_types)]
+use super::*;
+use crate::spec::{ArrayType, FloatType};
 
-mod blob_reader;
-mod bucket_vector_search_split;
-mod catalog;
-mod error;
-mod file_io;
-mod identifier;
-mod result;
-mod table;
-#[cfg(test)]
-mod tests;
-mod types;
-mod vector_read;
-mod vector_scan;
-mod vector_search;
-mod write;
+#[test]
+fn vindex_array_dimension_accepts_diskann_search_options() {
+    let field = DataField::new(
+        1,
+        "embedding".to_string(),
+        DataType::Array(ArrayType::new(DataType::Float(FloatType::new()))),
+    );
+    let query_options = HashMap::from([
+        ("diskann.dimension".to_string(), "8".to_string()),
+        ("diskann.l_search".to_string(), "64".to_string()),
+        (
+            "vindex.reader.memory-budget-bytes".to_string(),
+            "1048576".to_string(),
+        ),
+    ]);
 
-use std::sync::OnceLock;
-use tokio::runtime::Runtime;
-
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-fn runtime() -> &'static Runtime {
-    RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create tokio runtime"))
+    assert_eq!(
+        pk_vector_query_dimension(&HashMap::new(), &query_options, "diskann", &field).unwrap(),
+        Some(8)
+    );
 }
