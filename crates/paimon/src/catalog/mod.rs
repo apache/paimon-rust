@@ -606,6 +606,18 @@ pub trait Catalog: Send + Sync {
         })
     }
 
+    /// Unregister table partition metadata from the catalog, keeping directories and data files.
+    /// Missing specs are ignored so callers can safely retry the request.
+    async fn drop_partitions(
+        &self,
+        _identifier: &Identifier,
+        _partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support dropping partitions".to_string(),
+        })
+    }
+
     /// Return those of the given complete partition specs that are registered.
     ///
     /// Specs are compared with the registered values as they are, without normalizing them.

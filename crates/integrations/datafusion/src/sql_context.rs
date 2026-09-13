@@ -34,7 +34,9 @@
 //! - `ALTER TABLE db.t ALTER COLUMN col TYPE new_type`
 //! - `ALTER TABLE db.t ALTER COLUMN col SET|DROP NOT NULL`
 //! - `ALTER TABLE db.t RENAME TO new_name`
-//! - `ALTER TABLE db.t DROP PARTITION (col = val, ...)`
+//! - `ALTER TABLE db.t ADD [IF NOT EXISTS] PARTITION (...) [PARTITION (...)]`
+//! - `ALTER TABLE db.t DROP [IF EXISTS] PARTITION (...)`
+//! - `SHOW PARTITIONS db.t [PARTITION (...)]`
 //! - `CREATE VIEW [IF NOT EXISTS] view [(col, ...)] AS query`
 //! - `DROP VIEW [IF EXISTS] view`
 //! - `CREATE FUNCTION name(args) RETURNS type [LANGUAGE SQL] RETURN expression`
@@ -72,11 +74,11 @@ use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 use futures::StreamExt;
-use paimon::catalog::{parse_object_name, Catalog, Identifier};
+use paimon::catalog::{parse_object_name, Catalog, Identifier, ParsedObjectName};
 use paimon::spec::{
     ArrayType as PaimonArrayType, BigIntType, BinaryType, BlobType, BooleanType, CharType,
-    DataField as PaimonDataField, DataType as PaimonDataType, DateType, Datum, DecimalType,
-    DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType as PaimonMapType,
+    CoreOptions, DataField as PaimonDataField, DataType as PaimonDataType, DateType, Datum,
+    DecimalType, DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType as PaimonMapType,
     RowType as PaimonRowType, SchemaChange, SmallIntType, TimestampType, TinyIntType,
     VarBinaryType, VarCharType, VariantType,
 };
@@ -452,6 +454,16 @@ impl SQLContext {
             // Time-travel queries are not DDL; skip our own parsing and handle directly.
             return self.handle_time_travel_query(&rewritten_sql).await;
         }
+        if let Some(show_partitions) =
+            crate::format_partition_ddl::parse_show_partitions(&rewritten_sql)?
+        {
+            return crate::format_partition_ddl::execute_show_partitions(
+                self,
+                &show_partitions,
+                enable_ident_normalization,
+            )
+            .await;
+        }
 
         let statements = parse_sql_statements(&rewritten_sql)?;
 
@@ -524,6 +536,15 @@ impl SQLContext {
                 obj_name,
             } => self.handle_show_create_table(sql, obj_name).await,
             Statement::AlterTable(alter_table) => {
+                if alter_table.location.is_some()
+                    && alter_table.operations.iter().any(|operation| {
+                        matches!(operation, AlterTableOperation::AddPartitions { .. })
+                    })
+                {
+                    return Err(DataFusionError::Plan(
+                        "LOCATION is not supported for Format Table partitions".to_string(),
+                    ));
+                }
                 let (catalog, _catalog_name, _) =
                     self.resolve_catalog_and_table(&alter_table.name)?;
                 self.handle_alter_table(
@@ -1262,20 +1283,64 @@ impl SQLContext {
         if_exists: bool,
         enable_ident_normalization: bool,
     ) -> DFResult<DataFrame> {
-        Self::ensure_main_branch_write_target(name, "ALTER TABLE")?;
+        let has_partition_operation = operations.iter().any(|operation| {
+            matches!(
+                operation,
+                AlterTableOperation::AddPartitions { .. }
+                    | AlterTableOperation::DropPartitions { .. }
+            )
+        });
+        if has_partition_operation {
+            Self::ensure_partition_command_target(name, "ALTER TABLE")?;
+        } else {
+            Self::ensure_main_branch_write_target(name, "ALTER TABLE")?;
+        }
         let identifier = self.resolve_table_name(name)?;
 
         if operations.len() > 1
-            && operations.iter().any(|operation| {
-                matches!(
-                    operation,
-                    AlterTableOperation::RenameTable { .. }
-                        | AlterTableOperation::DropPartitions { .. }
-                )
-            })
+            && operations
+                .iter()
+                .any(|operation| matches!(operation, AlterTableOperation::RenameTable { .. }))
         {
             return Err(DataFusionError::Plan(
-                "ALTER TABLE RENAME TO and DROP PARTITION must be used alone".to_string(),
+                "ALTER TABLE RENAME TO must be used alone".to_string(),
+            ));
+        }
+        // A statement may drop several partitions, but only partitions: mixing the drop
+        // with schema changes would commit two unrelated changes under one statement.
+        let drop_partition_requests = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                AlterTableOperation::DropPartitions {
+                    partitions,
+                    if_exists: partition_if_exists,
+                } => Some((partitions.as_slice(), *partition_if_exists)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !drop_partition_requests.is_empty() {
+            if drop_partition_requests.len() != operations.len() {
+                return Err(DataFusionError::Plan(
+                    "ALTER TABLE DROP PARTITION must be used alone".to_string(),
+                ));
+            }
+            return self
+                .handle_drop_partitions(
+                    catalog,
+                    &identifier,
+                    &drop_partition_requests,
+                    if_exists,
+                    enable_ident_normalization,
+                )
+                .await;
+        }
+        if operations
+            .iter()
+            .any(|operation| matches!(operation, AlterTableOperation::AddPartitions { .. }))
+            && operations.len() != 1
+        {
+            return Err(DataFusionError::Plan(
+                "ALTER TABLE ADD PARTITION cannot be combined with other operations".to_string(),
             ));
         }
 
@@ -1335,19 +1400,20 @@ impl SQLContext {
                         }
                     }
                 }
-                AlterTableOperation::DropPartitions {
-                    partitions,
-                    if_exists: partition_if_exists,
+                AlterTableOperation::AddPartitions {
+                    if_not_exists,
+                    new_partitions,
                 } => {
-                    return self
-                        .handle_drop_partitions(
-                            catalog,
-                            &identifier,
-                            partitions,
-                            if_exists || *partition_if_exists,
-                            enable_ident_normalization,
-                        )
-                        .await;
+                    return crate::format_partition_ddl::execute_add_partitions(
+                        self,
+                        catalog,
+                        &identifier,
+                        new_partitions,
+                        *if_not_exists,
+                        if_exists,
+                        enable_ident_normalization,
+                    )
+                    .await;
                 }
                 other => {
                     return Err(DataFusionError::Plan(format!(
@@ -1930,32 +1996,57 @@ impl SQLContext {
         &self,
         catalog: &Arc<dyn Catalog>,
         identifier: &Identifier,
-        partitions: &[SqlExpr],
-        if_exists: bool,
+        requests: &[(&[SqlExpr], bool)],
+        ignore_if_table_not_exists: bool,
         enable_ident_normalization: bool,
     ) -> DFResult<DataFrame> {
-        if partitions.is_empty() {
+        if requests
+            .iter()
+            .any(|(expressions, _)| expressions.is_empty())
+        {
             return Err(DataFusionError::Plan(
-                "DROP PARTITIONS requires at least one partition specification".to_string(),
+                "DROP PARTITION requires a partition specification".to_string(),
             ));
         }
         let table = match catalog.get_table(identifier).await {
-            Ok(t) => t,
-            Err(e) if if_exists && is_table_not_exist(&e) => {
+            Ok(table) => table,
+            Err(error) if ignore_if_table_not_exists && is_table_not_exist(&error) => {
                 return ok_result(&self.ctx);
             }
-            Err(e) => return Err(to_datafusion_error(e)),
+            Err(error) => return Err(to_datafusion_error(error)),
         };
 
-        let partition_values = parse_partition_values(
-            partitions,
-            table.schema().fields(),
-            table.schema().partition_keys(),
-            enable_ident_normalization,
-        )?;
+        if table.has_catalog_managed_partitions() {
+            return crate::format_partition_ddl::drop_catalog_managed_partitions(
+                self,
+                catalog,
+                identifier,
+                &table,
+                requests,
+                enable_ident_normalization,
+            )
+            .await;
+        }
+        if CoreOptions::new(table.schema().options()).is_format_table() {
+            crate::format_partition_ddl::ensure_catalog_managed_format_table(
+                &table,
+                "ALTER TABLE DROP PARTITION",
+            )?;
+        }
 
-        let wb = table.new_write_builder();
-        let commit = wb.try_new_commit().map_err(to_datafusion_error)?;
+        let mut partition_values = Vec::with_capacity(requests.len());
+        for (expressions, _) in requests {
+            partition_values.extend(parse_partition_values(
+                expressions,
+                table.schema().fields(),
+                table.schema().partition_keys(),
+                enable_ident_normalization,
+            )?);
+        }
+        let commit = table
+            .new_write_builder()
+            .try_new_commit()
+            .map_err(to_datafusion_error)?;
         commit
             .truncate_partitions(partition_values)
             .await
@@ -2099,7 +2190,7 @@ impl SQLContext {
     }
 
     /// Resolve an ObjectName like `catalog.db.table` or `db.table` to a catalog and Identifier.
-    fn resolve_catalog_and_table(
+    pub(crate) fn resolve_catalog_and_table(
         &self,
         name: &ObjectName,
     ) -> DFResult<(Arc<dyn Catalog>, String, Identifier)> {
@@ -2149,19 +2240,41 @@ impl SQLContext {
     }
 
     fn ensure_main_branch_write_target(name: &ObjectName, operation: &str) -> DFResult<()> {
-        let object = name
-            .0
-            .last()
-            .and_then(|part| part.as_ident())
-            .map(|ident| ident.value.as_str())
-            .ok_or_else(|| DataFusionError::Plan(format!("Invalid table reference: {name}")))?;
-        let parsed = parse_object_name(object).map_err(to_datafusion_error)?;
+        let parsed = Self::parse_target_object_name(name)?;
         if let Some(branch) = parsed.branch() {
             return Err(DataFusionError::NotImplemented(format!(
                 "{operation} on Paimon branch '{branch}' is not supported"
             )));
         }
         Ok(())
+    }
+
+    pub(crate) fn ensure_partition_command_target(
+        name: &ObjectName,
+        operation: &str,
+    ) -> DFResult<()> {
+        let parsed = Self::parse_target_object_name(name)?;
+        if let Some(branch) = parsed.branch() {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{operation} on Paimon branch '{branch}' is not supported"
+            )));
+        }
+        if let Some(system_table) = parsed.system_table() {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{operation} on Paimon system table '{system_table}' is not supported"
+            )));
+        }
+        Ok(())
+    }
+
+    fn parse_target_object_name(name: &ObjectName) -> DFResult<ParsedObjectName> {
+        let object = name
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .map(|ident| ident.value.as_str())
+            .ok_or_else(|| DataFusionError::Plan(format!("Invalid table reference: {name}")))?;
+        parse_object_name(object).map_err(to_datafusion_error)
     }
 
     /// Resolve an ObjectName to just the Identifier (for backward compat in handle_alter_table).
@@ -3029,8 +3142,33 @@ fn extract_options(opts: &CreateTableOptions) -> DFResult<Vec<(String, String)>>
         .collect()
 }
 
-fn is_table_not_exist(e: &paimon::Error) -> bool {
+pub(crate) fn is_table_not_exist(e: &paimon::Error) -> bool {
     matches!(e, paimon::Error::TableNotExist { .. })
+}
+
+pub(crate) fn partition_assignment(
+    expr: &SqlExpr,
+    enable_ident_normalization: bool,
+) -> DFResult<(String, &SqlExpr)> {
+    let SqlExpr::BinaryOp {
+        left,
+        op: datafusion::sql::sqlparser::ast::BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return Err(DataFusionError::Plan(format!(
+            "Expected 'column = value' in partition spec, got: {expr}"
+        )));
+    };
+    let SqlExpr::Identifier(identifier) = left.as_ref() else {
+        return Err(DataFusionError::Plan(format!(
+            "Expected column name in partition spec, got: {left}"
+        )));
+    };
+    Ok((
+        normalize_schema_identifier(identifier, enable_ident_normalization),
+        right.as_ref(),
+    ))
 }
 
 /// Parse partition expressions (`col = val, ...`) into partition value maps
@@ -3050,37 +3188,14 @@ fn parse_partition_values(
     let mut partition = HashMap::new();
     let mut seen_columns = HashSet::new();
     for expr in exprs {
-        let (col_name, val_expr) = match expr {
-            SqlExpr::BinaryOp {
-                left,
-                op: datafusion::sql::sqlparser::ast::BinaryOperator::Eq,
-                right,
-            } => {
-                let col = match left.as_ref() {
-                    SqlExpr::Identifier(ident) => {
-                        normalize_schema_identifier(ident, enable_ident_normalization)
-                    }
-                    other => {
-                        return Err(DataFusionError::Plan(format!(
-                            "Expected column name in partition spec, got: {other}"
-                        )))
-                    }
-                };
-                (col, right.as_ref())
-            }
-            other => {
-                return Err(DataFusionError::Plan(format!(
-                    "Expected 'column = value' in partition spec, got: {other}"
-                )))
-            }
-        };
+        let (col_name, val_expr) = partition_assignment(expr, enable_ident_normalization)?;
 
         if !seen_columns.insert(col_name.clone()) {
             return Err(DataFusionError::Plan(format!(
                 "Duplicate partition column '{col_name}'"
             )));
         }
-        if !partition_keys.iter().any(|k| k == &col_name) {
+        if !partition_keys.contains(&col_name) {
             return Err(DataFusionError::Plan(format!(
                 "Column '{col_name}' is not a partition column"
             )));
@@ -3633,7 +3748,7 @@ fn extract_all_timestamp_as_of(sql: &str) -> Vec<TimestampAsOfInfo> {
 }
 
 /// Return an empty DataFrame with a single "result" column containing "OK".
-fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
+pub(crate) fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "result",
         ArrowDataType::Utf8,
@@ -7751,6 +7866,20 @@ mod tests {
             .sql("ALTER TABLE IF EXISTS paimon.test_db.nonexistent DROP PARTITION (pt = 'a')")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_drop_if_exists_partition_does_not_ignore_missing_table() {
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
+
+        let err = sql_context
+            .sql("ALTER TABLE paimon.test_db.nonexistent DROP IF EXISTS PARTITION (pt = 'a')")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "Expected table-not-exist error, got: {err}"
+        );
     }
 
     #[tokio::test]

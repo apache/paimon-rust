@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Format Table partition names, paths and values, shared by the scan and the catalog
-//! registrations it reads.
+//! Format Table partition names, paths and values, shared by the scan, the catalog
+//! registrations it reads and the SQL statements that administer them.
 
 use std::collections::HashMap;
 
@@ -28,14 +28,14 @@ const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
 
 /// Generates canonical names and physical paths for Format Table partitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FormatTablePartitionPaths {
+pub struct FormatTablePartitionPaths {
     partition_keys: Vec<String>,
     only_value_in_path: bool,
 }
 
 impl FormatTablePartitionPaths {
     /// Create a helper for the declared partition-key order and physical layout.
-    pub(crate) fn new<I, S>(partition_keys: I, only_value_in_path: bool) -> Self
+    pub fn new<I, S>(partition_keys: I, only_value_in_path: bool) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -47,7 +47,7 @@ impl FormatTablePartitionPaths {
     }
 
     /// Return the canonical logical partition name (`key=value/...`).
-    pub(crate) fn partition_name(&self, spec: &HashMap<String, String>) -> crate::Result<String> {
+    pub fn partition_name(&self, spec: &HashMap<String, String>) -> crate::Result<String> {
         let values = self.ordered_values(spec)?;
         Ok(self
             .partition_keys
@@ -98,7 +98,7 @@ impl FormatTablePartitionPaths {
     }
 
     /// Return the physical partition path relative to the table location.
-    pub(crate) fn relative_path(&self, spec: &HashMap<String, String>) -> crate::Result<String> {
+    pub fn relative_path(&self, spec: &HashMap<String, String>) -> crate::Result<String> {
         if !self.only_value_in_path {
             return self.partition_name(spec);
         }
@@ -150,7 +150,7 @@ impl FormatTablePartitionPaths {
 }
 
 /// Parse a raw Format Table partition value from a path or catalog registration.
-pub(crate) fn parse_format_partition_value(value: &str, data_type: &DataType) -> Option<Datum> {
+pub fn parse_format_partition_value(value: &str, data_type: &DataType) -> Option<Datum> {
     match data_type {
         DataType::Boolean(_) => parse_partition_bool(value).map(Datum::Bool),
         DataType::TinyInt(_) => value.parse::<i8>().ok().map(Datum::TinyInt),
@@ -165,7 +165,7 @@ pub(crate) fn parse_format_partition_value(value: &str, data_type: &DataType) ->
 }
 
 /// Format a typed value for Format Table partition metadata and paths.
-pub(crate) fn format_partition_value(
+pub fn format_partition_value(
     datum: &Datum,
     data_type: &DataType,
     default_partition_name: &str,
