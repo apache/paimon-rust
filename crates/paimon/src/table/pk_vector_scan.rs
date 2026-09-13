@@ -34,6 +34,7 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::pk_vector_bucket_split::BucketVectorSearchSplit;
 use crate::table::pk_vector_orchestrator::PkVectorSearchSplit;
 use crate::table::source::{merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, RowRange};
+use crate::table::vector_scan::Scan;
 use crate::table::Table;
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment};
 
@@ -207,6 +208,7 @@ impl BucketAccumulator {
 }
 
 /// The per-bucket search splits produced by planning.
+#[derive(Clone)]
 pub(crate) struct PkVectorScanPlan {
     // The snapshot the plan resolved during planning (pinned before the index
     // manifest is read). It is authoritative even when planning yields zero
@@ -230,29 +232,75 @@ pub(crate) struct PkVectorScanPlan {
     pub physical_row_ranges_by_split: Option<Vec<HashMap<String, Vec<RowRange>>>>,
 }
 
-pub(crate) struct PkVectorScan<'a> {
-    table: &'a Table,
+pub(crate) struct PkVectorScan {
+    table: Table,
     vector_field_id: i32,
     index_type: String,
     filter: Option<Predicate>,
 }
 
-impl<'a> PkVectorScan<'a> {
+impl PkVectorScan {
     pub(crate) fn new(
-        table: &'a Table,
+        table: &Table,
         vector_field_id: i32,
         index_type: String,
         filter: Option<Predicate>,
     ) -> Self {
         Self {
-            table,
+            table: table.clone(),
             vector_field_id,
             index_type,
             filter,
         }
     }
 
-    pub(crate) async fn plan(&self) -> crate::Result<PkVectorScanPlan> {
+    /// Build a plan from bucket splits an engine planned elsewhere, instead of from
+    /// this table's index manifest.
+    ///
+    /// The splits are the planning input and are taken as authoritative: their
+    /// payload files, their per-file row ranges, and the snapshot they pin are used
+    /// as given, and no index manifest is read. Only the partition conjuncts of this
+    /// scan's filter are re-applied, because a caller may narrow the query further
+    /// than the planner that produced the splits.
+    ///
+    /// Mirrors what Java's `PrimaryKeyVectorRead` does with a
+    /// `BucketVectorSearchSplit`: search the payloads the split names, over the rows
+    /// the split allows.
+    pub(crate) fn plan_for_bucket_vector_splits(
+        &self,
+        splits: Vec<BucketVectorSearchSplit>,
+    ) -> crate::Result<PkVectorScanPlan> {
+        // Partition conjuncts only. Data conjuncts stay a per-row residual applied
+        // during the search: pruning a whole bucket on them would drop rows that
+        // still match.
+        let partition_filter = self.filter.as_ref().and_then(|filter| {
+            let (partition_predicate, _data_predicates) = split_partition_and_data_predicates(
+                filter.clone(),
+                self.table.schema().fields(),
+                self.table.schema().partition_keys(),
+            );
+            partition_predicate.map(|predicate| {
+                PartitionFilter::from_predicate(predicate, &self.table.schema().partition_fields())
+            })
+        });
+        plan_from_bucket_splits(
+            &self.index_type,
+            self.vector_field_id,
+            partition_filter.as_ref(),
+            self.table.location().trim_end_matches('/'),
+            self.table
+                .schema()
+                .core_options()
+                .index_file_in_data_file_dir(),
+            splits,
+        )
+    }
+}
+
+impl Scan for PkVectorScan {
+    type Plan = PkVectorScanPlan;
+
+    async fn plan(&self) -> crate::Result<PkVectorScanPlan> {
         let snapshot_manager = self.table.snapshot_manager();
 
         // Data splits first, via the table's own scan resolution (which honors
@@ -369,48 +417,6 @@ impl<'a> PkVectorScan<'a> {
             splits,
             physical_row_ranges_by_split: None,
         })
-    }
-
-    /// Build a plan from bucket splits an engine planned elsewhere, instead of from
-    /// this table's index manifest.
-    ///
-    /// The splits are the planning input and are taken as authoritative: their
-    /// payload files, their per-file row ranges, and the snapshot they pin are used
-    /// as given, and no index manifest is read. Only the partition conjuncts of this
-    /// scan's filter are re-applied, because a caller may narrow the query further
-    /// than the planner that produced the splits.
-    ///
-    /// Mirrors what Java's `PrimaryKeyVectorRead` does with a
-    /// `BucketVectorSearchSplit`: search the payloads the split names, over the rows
-    /// the split allows.
-    pub(crate) fn plan_for_bucket_vector_splits(
-        &self,
-        splits: Vec<BucketVectorSearchSplit>,
-    ) -> crate::Result<PkVectorScanPlan> {
-        // Partition conjuncts only. Data conjuncts stay a per-row residual applied
-        // during the search: pruning a whole bucket on them would drop rows that
-        // still match.
-        let partition_filter = self.filter.as_ref().and_then(|filter| {
-            let (partition_predicate, _data_predicates) = split_partition_and_data_predicates(
-                filter.clone(),
-                self.table.schema().fields(),
-                self.table.schema().partition_keys(),
-            );
-            partition_predicate.map(|predicate| {
-                PartitionFilter::from_predicate(predicate, &self.table.schema().partition_fields())
-            })
-        });
-        plan_from_bucket_splits(
-            &self.index_type,
-            self.vector_field_id,
-            partition_filter.as_ref(),
-            self.table.location().trim_end_matches('/'),
-            self.table
-                .schema()
-                .core_options()
-                .index_file_in_data_file_dir(),
-            splits,
-        )
     }
 }
 

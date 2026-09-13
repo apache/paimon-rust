@@ -183,20 +183,32 @@ fn batch_f32(batches: &[RecordBatch], column: &str) -> Vec<f32> {
 }
 
 async fn read_over_splits(table: &Table, splits: &[Vec<u8>], limit: usize) -> Vec<RecordBatch> {
-    let refs: Vec<&[u8]> = splits.iter().map(Vec::as_slice).collect();
+    let splits = splits
+        .iter()
+        .map(|bytes| BucketVectorSearchSplit::deserialize(bytes))
+        .collect::<paimon::Result<Vec<_>>>()
+        .unwrap();
     let mut builder = table.new_vector_search_builder();
     builder
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(vec![0.0, 0.0])
-        .with_limit(limit)
-        .with_projection(&["id"]);
-    builder
-        .execute_read_for_bucket_splits(&refs)
-        .await
-        .expect("bucket-split read over the Java fixture failed")
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("collecting read batches failed")
+        .with_limit(limit);
+    async {
+        let plan = builder.new_scan()?.plan_from_bucket_splits(splits)?;
+        builder
+            .new_read()?
+            .read(plan)
+            .await?
+            .new_read_builder()
+            .with_projection(&["id"])
+            .read()
+            .await
+    }
+    .await
+    .expect("bucket-split read over the Java fixture failed")
+    .try_collect::<Vec<_>>()
+    .await
+    .expect("collecting read batches failed")
 }
 
 /// The read is driven entirely by the Java-planned split: no index manifest is
@@ -236,15 +248,21 @@ async fn agrees_with_the_manifest_route() {
     builder
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(vec![0.0, 0.0])
-        .with_limit(3)
-        .with_projection(&["id"]);
-    let from_manifest = builder
-        .execute_read()
-        .await
-        .expect("manifest-route read failed")
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("collecting manifest-route batches failed");
+        .with_limit(3);
+    let from_manifest = async {
+        builder
+            .execute()
+            .await?
+            .new_read_builder()
+            .with_projection(&["id"])
+            .read()
+            .await
+    }
+    .await
+    .expect("manifest-route read failed")
+    .try_collect::<Vec<_>>()
+    .await
+    .expect("collecting manifest-route batches failed");
 
     assert_eq!(
         batch_i32(&from_splits, "id"),
@@ -279,12 +297,24 @@ async fn rejects_an_empty_split_list() {
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(vec![0.0, 0.0])
         .with_limit(3);
-    let error = match builder.execute_read_for_bucket_splits(&[]).await {
+    let error = match async {
+        let plan = builder.new_scan()?.plan_from_bucket_splits(Vec::new())?;
+        builder
+            .new_read()?
+            .read(plan)
+            .await?
+            .new_read_builder()
+            .with_projection(&["id"])
+            .read()
+            .await
+    }
+    .await
+    {
         Ok(_) => panic!("an empty split list must be rejected"),
         Err(e) => e,
     };
     assert!(
-        error.to_string().contains("at least one split"),
+        error.to_string().contains("at least one bucket split"),
         "unexpected error: {error}"
     );
 }
@@ -293,10 +323,7 @@ async fn rejects_an_empty_split_list() {
 /// invalid data rather than as an internal fault.
 #[tokio::test]
 async fn rejects_corrupt_split_bytes() {
-    // A decoder assertion, not a read assertion. The entry point takes SERIALIZED
-    // bytes and decodes them at that boundary, so corrupt input is refused there
-    // and never reaches a search; driving the read as well would run the same
-    // decoder behind a query that cannot execute either way.
+    // Decode at the caller boundary before creating a typed plan or reader.
     let (_tmp, _table, splits) = open_bucket_split_fixture().await;
     let mut corrupt = splits[0].clone();
     corrupt[0] ^= 0xFF; // break the PKVSPLIT magic
@@ -364,4 +391,60 @@ fn with_row_range(bytes: &[u8], file: &str, to: i64) -> Vec<u8> {
     out.extend_from_slice(&0i64.to_be_bytes()); // from
     out.extend_from_slice(&to.to_be_bytes());
     out
+}
+
+#[tokio::test]
+async fn typed_bucket_plan_is_reusable_without_the_index_manifest() {
+    let (_tmp, table, bytes) = open_bucket_split_fixture().await;
+    let splits = bytes
+        .iter()
+        .map(|bytes| BucketVectorSearchSplit::deserialize(bytes))
+        .collect::<paimon::Result<Vec<_>>>()
+        .unwrap();
+    let mut builder = table.new_vector_search_builder();
+    builder.with_vector_column(VECTOR_COLUMN);
+    let scan = builder.new_scan().unwrap();
+    let plan = scan.plan_from_bucket_splits(splits).unwrap();
+    let snapshot_id = plan.snapshot_id().unwrap();
+    let manager = table.snapshot_manager();
+    let snapshot = manager.get_snapshot(snapshot_id).await.unwrap();
+    table
+        .file_io()
+        .delete_file(&manager.manifest_path(snapshot.index_manifest().unwrap()))
+        .await
+        .unwrap();
+    assert!(
+        scan.plan().await.is_err(),
+        "replanning must require the removed manifest"
+    );
+    builder.with_query_vector(vec![0.0, 0.0]).with_limit(1);
+    let read = builder.new_read().unwrap();
+    drop(builder);
+    drop(scan);
+    let result = read.read(plan.clone()).await.unwrap();
+    assert_eq!(result.positions().unwrap()[0].row_position, 0);
+    assert_eq!(result.snapshot_id(), Some(snapshot_id));
+    let read = table
+        .new_batch_vector_search_builder()
+        .with_vector_column(VECTOR_COLUMN)
+        .with_query_vectors(vec![vec![0.0, 0.0], vec![2.0, 0.0]])
+        .with_limit(1)
+        .new_read()
+        .unwrap();
+    let results = read.read(plan).await.unwrap();
+    assert_eq!(results.len(), 2);
+    for (result, row_position) in results.iter().zip([0, 2]) {
+        assert_eq!(result.positions().unwrap()[0].row_position, row_position);
+        assert_eq!(result.snapshot_id(), Some(snapshot_id));
+        let batches = result
+            .new_read_builder()
+            .with_projection(&["id"])
+            .read()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batch_i32(&batches, "id"), vec![row_position as i32]);
+    }
 }

@@ -46,10 +46,13 @@ use paimon::spec::{
 use paimon::table::{SnapshotManager, Table};
 
 use crate::blob_reader::*;
+use crate::bucket_vector_search_split::*;
 use crate::error::*;
 use crate::file_io::*;
 use crate::table::*;
 use crate::types::*;
+use crate::vector_read::*;
+use crate::vector_scan::*;
 use crate::vector_search::*;
 use crate::write::*;
 
@@ -2513,7 +2516,7 @@ fn test_two_commits_same_builder() {
 //
 // Two storage shapes are exercised end-to-end through the C `execute_read`
 // terminal, each compared against an independent core Rust
-// `VectorSearchBuilder::execute_read()` reference:
+// `SearchResultReadBuilder::read()` reference:
 //
 //   * A primary-key vector table backed by a real vindex IVF-flat ANN segment
 //     built in-process (bucket-local ANN search, residual filter supported).
@@ -2987,7 +2990,9 @@ fn rust_execute_read_rows(
             .with_vector_column(column)
             .with_query_vector(query)
             .with_limit(limit);
-        let mut stream = builder.execute_read().await.unwrap();
+        let mut stream = async { builder.execute().await?.new_read_builder().read().await }
+            .await
+            .unwrap();
         let (mut rows, mut has_score) = (0usize, false);
         while let Some(b) = stream.try_next().await.unwrap() {
             rows += b.num_rows();
@@ -3014,7 +3019,9 @@ fn rust_execute_read_pairs(
         if let Some(f) = filter {
             builder.with_filter(f);
         }
-        let mut stream = builder.execute_read().await.unwrap();
+        let mut stream = async { builder.execute().await?.new_read_builder().read().await }
+            .await
+            .unwrap();
         let mut pairs = Vec::new();
         while let Some(b) = stream.try_next().await.unwrap() {
             pairs.extend(batch_id_score_pairs(&b));
@@ -3247,169 +3254,181 @@ fn stage_split_fixture() -> (tempfile::TempDir, Table, Vec<Vec<u8>>) {
     (tmp, table, splits)
 }
 
-/// The happy path over the ABI, driven by bytes JAVA planned: marshal the split
-/// array, read the rows out, free everything.
-///
-/// The one C test that reads real Java-produced splits. What the read MEANS -- the
-/// row ranges, the projection, the routing rules -- is asserted on the Rust side,
-/// where a failure names the semantic that broke; repeating those here would only
-/// re-test the same kernel through a thinner lens. This asserts that the marshalling
-/// is right and that the rows arrive.
+/// Consume a common vector read's Arrow stream in relevance order.
+unsafe fn vector_plan_pairs(
+    result: crate::result::paimon_result_record_batch_reader,
+) -> Vec<(i32, f32)> {
+    assert!(
+        result.error.is_null(),
+        "{}",
+        if result.error.is_null() {
+            String::new()
+        } else {
+            error_message(result.error)
+        }
+    );
+    let mut pairs = Vec::new();
+    loop {
+        let next = paimon_record_batch_reader_next(result.reader);
+        assert!(next.error.is_null());
+        if next.batch.array.is_null() {
+            break;
+        }
+        pairs.extend(batch_id_score_pairs(&import_batch(&next.batch)));
+        paimon_arrow_batch_free(next.batch);
+    }
+    paimon_record_batch_reader_free(result.reader);
+    pairs
+}
+
+/// Decode before planning. Each handle owns its state independently, including
+/// the Arrow stream after every planning/query handle has been freed.
 #[cfg(not(target_os = "windows"))]
 #[test]
 fn vector_search_bucket_splits_read_the_java_planned_fixture() {
-    let (_tmp, table, splits) = stage_split_fixture();
+    let (_tmp, table, bytes) = stage_split_fixture();
     let handle = unsafe { wrap_table(table) };
-
     unsafe {
-        let ptrs: Vec<*const u8> = splits.iter().map(|s| s.as_ptr()).collect();
-        let lens: Vec<usize> = splits.iter().map(Vec::len).collect();
-        let builder = c_vector_builder(handle, "embedding", &[0.0, 0.0], 3, ptr::null_mut());
-        let result = paimon_vector_search_builder_execute_read_for_bucket_splits(
-            builder,
-            ptrs.as_ptr(),
-            lens.as_ptr(),
-            splits.len(),
-        );
-        paimon_vector_search_builder_free(builder);
-        assert!(result.error.is_null(), "the fixture read must succeed");
-        assert!(!result.reader.is_null());
-
-        let mut pairs = Vec::new();
-        loop {
-            let next = paimon_record_batch_reader_next(result.reader);
-            assert!(next.error.is_null());
-            if next.batch.array.is_null() {
-                break;
-            }
-            let batch = import_batch(&next.batch);
-            pairs.extend(batch_id_score_pairs(&batch));
-            paimon_arrow_batch_free(next.batch);
+        let mut splits = Vec::new();
+        for bytes in &bytes {
+            let decoded =
+                paimon_bucket_vector_search_split_deserialize(bytes.as_ptr(), bytes.len());
+            assert!(decoded.error.is_null());
+            splits.push(decoded.split);
         }
-        paimon_record_batch_reader_free(result.reader);
-
-        assert_eq!(
-            pairs.iter().map(|p| p.0).collect::<Vec<_>>(),
-            vec![0, 1, 2],
-            "the fixture's top-3 for query [0,0]"
-        );
+        drop(bytes);
+        let builder = c_vector_builder(handle, "embedding", &[0.0, 0.0], 3, ptr::null_mut());
+        let scan = paimon_vector_search_builder_new_scan(builder);
+        let read = paimon_vector_search_builder_new_read(builder);
+        assert!(scan.error.is_null() && read.error.is_null());
+        paimon_vector_search_builder_free(builder);
+        unwrap_table(handle);
+        let ptrs: Vec<*const paimon_bucket_vector_search_split> =
+            splits.iter().map(|&p| p as *const _).collect();
+        let plan = paimon_vector_scan_plan_from_bucket_splits(scan.scan, ptrs.as_ptr(), ptrs.len());
+        assert!(plan.error.is_null());
+        for split in splits {
+            paimon_bucket_vector_search_split_free(split);
+        }
+        paimon_vector_scan_free(scan.scan);
+        // The same decoded plan can be read more than once without re-decoding.
+        let first = vector_plan_pairs(paimon_vector_read_read(read.read, plan.plan));
+        let stream = paimon_vector_read_read(read.read, plan.plan);
+        paimon_vector_read_free(read.read);
+        paimon_vector_plan_free(plan.plan);
+        let pairs = vector_plan_pairs(stream);
+        assert_eq!(pairs, first);
+        assert_eq!(pairs.iter().map(|p| p.0).collect::<Vec<_>>(), vec![0, 1, 2]);
         for (got, want) in pairs.iter().map(|p| p.1).zip([1.0f32, 0.5, 0.2]) {
             assert!((got - want).abs() < 1e-4, "score {got} != {want}");
         }
-
-        unwrap_table(handle);
     }
 }
 
-/// The bucket-split terminal marshals an array of buffers, which the single-split
-/// terminal does not: a caller passing a null array, a zero count, or a null
-/// entry has made an input error, and it must be reported as one rather than
-/// reaching the decoder as corrupt data.
 #[test]
-fn vector_search_bucket_splits_reject_malformed_input() {
-    let path = "memory:/vsearch_pk_split_args";
-    let (query, vectors) = pk_fixture_smoke();
-    let table = build_pk_vector_table(path, &vectors);
-    let handle = unsafe { wrap_table(table) };
-
+fn vector_search_de_uses_the_common_scan_plan_read_api() {
+    let table = build_append_vector_table("memory:/vector_plan_de");
+    let expected = rust_execute_read_pairs(&table, "embedding", vec![1.0, 0.0], 2, None);
     unsafe {
-        // No splits at all.
-        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
-        let result = paimon_vector_search_builder_execute_read_for_bucket_splits(
-            builder,
-            ptr::null(),
-            ptr::null(),
-            0,
-        );
+        let handle = wrap_table(table);
+        let builder = c_vector_builder(handle, "embedding", &[1.0, 0.0], 2, ptr::null_mut());
+        let scan = paimon_vector_search_builder_new_scan(builder);
+        let read = paimon_vector_search_builder_new_read(builder);
+        assert!(scan.error.is_null() && read.error.is_null());
         paimon_vector_search_builder_free(builder);
-        assert!(!result.error.is_null(), "a null split array must error");
-        paimon_error_free(result.error);
-
-        // A count that does not match the (absent) arrays.
-        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
-        let result = paimon_vector_search_builder_execute_read_for_bucket_splits(
-            builder,
-            ptr::null(),
-            ptr::null(),
-            1,
-        );
-        paimon_vector_search_builder_free(builder);
-        assert!(!result.error.is_null(), "a null split array must error");
-        paimon_error_free(result.error);
-
-        // A null entry inside an otherwise valid array.
-        let bytes: Vec<u8> = vec![1, 2, 3, 4];
-        let ptrs: [*const u8; 2] = [bytes.as_ptr(), ptr::null()];
-        let lens: [usize; 2] = [bytes.len(), 0];
-        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
-        let result = paimon_vector_search_builder_execute_read_for_bucket_splits(
-            builder,
-            ptrs.as_ptr(),
-            lens.as_ptr(),
-            2,
-        );
-        paimon_vector_search_builder_free(builder);
-        assert!(!result.error.is_null(), "a null split entry must error");
-        paimon_error_free(result.error);
-
         unwrap_table(handle);
+        let plan = paimon_vector_scan_plan(scan.scan);
+        assert!(plan.error.is_null());
+        paimon_vector_scan_free(scan.scan);
+        let stream = paimon_vector_read_read(read.read, plan.plan);
+        paimon_vector_plan_free(plan.plan);
+        paimon_vector_read_free(read.read);
+        let mut actual = vector_plan_pairs(stream);
+        actual.sort_by_key(|p| p.0);
+        assert_eq!(actual, expected);
     }
 }
 
-/// A zero-initialized `#[repr(C)]` wrapper passes a null-POINTER check while carrying a
-/// null `inner`, which the terminal dereferences. It has to be caught at the boundary,
-/// not become a null dereference inside the library.
 #[test]
-fn vector_search_bucket_splits_reject_an_uninitialized_builder() {
+fn vector_search_split_decoder_rejects_invalid_buffers_without_a_builder() {
     unsafe {
-        let mut zero_builder = paimon_vector_search_builder {
+        for (bytes, len) in [
+            (ptr::null(), 0),
+            (ptr::null(), 1),
+            (b"x".as_ptr(), 0),
+            (b"x".as_ptr(), usize::MAX),
+        ] {
+            let result = paimon_bucket_vector_search_split_deserialize(bytes, len);
+            assert!(result.split.is_null());
+            assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
+            paimon_error_free(result.error);
+        }
+        for bytes in [vec![0xAB; 64], vec![0; 3]] {
+            let result = paimon_bucket_vector_search_split_deserialize(bytes.as_ptr(), bytes.len());
+            assert!(result.split.is_null() && !result.error.is_null());
+            paimon_error_free(result.error);
+        }
+        paimon_bucket_vector_search_split_free(ptr::null_mut());
+    }
+}
+
+#[test]
+fn vector_search_plan_rejects_invalid_split_handles() {
+    let table = build_append_vector_table("memory:/vector_plan_invalid_handles");
+    unsafe {
+        let handle = wrap_table(table);
+        let builder = c_vector_builder(handle, "embedding", &[1.0, 0.0], 2, ptr::null_mut());
+        let scan = paimon_vector_search_builder_new_scan(builder);
+        assert!(scan.error.is_null());
+        let zero = paimon_bucket_vector_search_split {
             inner: ptr::null_mut(),
         };
-        let bytes: Vec<u8> = vec![1, 2, 3, 4];
-        let ptrs: [*const u8; 1] = [bytes.as_ptr()];
-        let lens: [usize; 1] = [bytes.len()];
-        let result = paimon_vector_search_builder_execute_read_for_bucket_splits(
-            &mut zero_builder,
-            ptrs.as_ptr(),
-            lens.as_ptr(),
-            1,
-        );
-        assert!(result.reader.is_null());
-        assert!(
-            !result.error.is_null(),
-            "a zeroed builder must error, not crash"
-        );
-        let msg = error_message(result.error);
-        assert!(msg.contains("not initialized"), "got: {msg}");
-        paimon_error_free(result.error);
+        let null_entry = [ptr::null()];
+        let zero_entry = [&zero as *const _];
+        for (splits, count) in [
+            (ptr::null(), 0),
+            (ptr::null(), 1),
+            (null_entry.as_ptr(), 1),
+            (zero_entry.as_ptr(), 1),
+            (zero_entry.as_ptr(), usize::MAX),
+        ] {
+            let result = paimon_vector_scan_plan_from_bucket_splits(scan.scan, splits, count);
+            assert!(result.plan.is_null() && !result.error.is_null());
+            assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
+            paimon_error_free(result.error);
+        }
+        paimon_vector_scan_free(scan.scan);
+        paimon_vector_search_builder_free(builder);
+        unwrap_table(handle);
     }
 }
 
-/// Split bytes come from outside the process, so a buffer that is not a split
-/// must surface as an error, not a panic across the ABI boundary.
 #[test]
-fn vector_search_bucket_splits_reject_corrupt_bytes() {
-    let path = "memory:/vsearch_pk_split_corrupt";
-    let (query, vectors) = pk_fixture_smoke();
-    let table = build_pk_vector_table(path, &vectors);
-    let handle = unsafe { wrap_table(table) };
-
+fn vector_search_factories_and_reads_reject_uninitialized_handles() {
     unsafe {
-        let garbage: Vec<u8> = vec![0xAB; 64];
-        let ptrs: [*const u8; 1] = [garbage.as_ptr()];
-        let lens: [usize; 1] = [garbage.len()];
-        let builder = c_vector_builder(handle, VECTOR_COLUMN, &query, 3, ptr::null_mut());
-        let result = paimon_vector_search_builder_execute_read_for_bucket_splits(
-            builder,
-            ptrs.as_ptr(),
-            lens.as_ptr(),
-            1,
-        );
-        paimon_vector_search_builder_free(builder);
-        assert!(!result.error.is_null(), "garbage bytes must error");
-        assert!(result.reader.is_null());
+        let mut builder = paimon_vector_search_builder {
+            inner: ptr::null_mut(),
+        };
+        let scan = paimon_vector_search_builder_new_scan(&builder);
+        let read = paimon_vector_search_builder_new_read(&builder);
+        let stream = paimon_vector_search_builder_execute_read(&mut builder);
+        for error in [scan.error, read.error, stream.error] {
+            assert!(!error.is_null());
+            assert!(error_message(error).contains("not initialized"));
+            paimon_error_free(error);
+        }
+        let scan = paimon_vector_scan {
+            inner: ptr::null_mut(),
+        };
+        let plan = paimon_vector_scan_plan(&scan);
+        assert!(plan.plan.is_null() && !plan.error.is_null());
+        paimon_error_free(plan.error);
+        let read = paimon_vector_read {
+            inner: ptr::null_mut(),
+        };
+        let result = paimon_vector_read_read(&read, ptr::null());
+        assert!(result.reader.is_null() && !result.error.is_null());
         paimon_error_free(result.error);
-        unwrap_table(handle);
     }
 }
 
@@ -3743,10 +3762,12 @@ fn rust_execute_read_column_names(
             .with_vector_column(column)
             .with_query_vector(query)
             .with_limit(limit);
+        let result = builder.execute().await.unwrap();
+        let mut reader = result.new_read_builder();
         if let Some(cols) = projection {
-            builder.with_projection(cols);
+            reader.with_projection(cols);
         }
-        let mut stream = builder.execute_read().await.unwrap();
+        let mut stream = reader.read().await.unwrap();
         let mut names: Vec<String> = Vec::new();
         while let Some(b) = stream.try_next().await.unwrap() {
             names = b

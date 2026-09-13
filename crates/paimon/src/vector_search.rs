@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub use crate::table::vector_search_result::{
+    PrimaryKeySearchPosition, SearchResult, SearchResultReadBuilder,
+};
+
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
@@ -111,8 +115,10 @@ impl GlobalIndexIOMeta {
     }
 }
 
+/// Global row IDs and aligned scores used by DE index evaluation and ranking.
+/// Table searches return [`SearchResult`], which also represents PK file positions.
 #[derive(Debug, Clone)]
-pub struct SearchResult {
+pub struct ScoredRowIds {
     pub row_ids: Vec<u64>,
     pub scores: Vec<f32>,
 }
@@ -157,7 +163,7 @@ fn sort_scored_rows_by_rank(rows: &mut [ScoredRow]) {
     });
 }
 
-impl SearchResult {
+impl ScoredRowIds {
     pub fn new(row_ids: Vec<u64>, scores: Vec<f32>) -> Self {
         assert_eq!(row_ids.len(), scores.len());
         Self { row_ids, scores }
@@ -209,7 +215,7 @@ impl SearchResult {
         }
     }
 
-    pub fn or(&self, other: &SearchResult) -> Self {
+    pub fn or(&self, other: &ScoredRowIds) -> Self {
         let mut row_ids = self.row_ids.clone();
         let mut scores = self.scores.clone();
         row_ids.extend_from_slice(&other.row_ids);
@@ -361,13 +367,13 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(1u64, 0.9f32);
         map.insert(2, 0.5);
-        let result = SearchResult::from_scored_map(map);
+        let result = ScoredRowIds::from_scored_map(map);
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn test_search_result_top_k() {
-        let result = SearchResult::new(vec![1, 2, 3, 4, 5], vec![0.1, 0.9, 0.5, 0.8, 0.3]);
+        let result = ScoredRowIds::new(vec![1, 2, 3, 4, 5], vec![0.1, 0.9, 0.5, 0.8, 0.3]);
         let top = result.top_k(2);
         assert_eq!(top.len(), 2);
         assert!(top.row_ids.contains(&2));
@@ -376,8 +382,8 @@ mod tests {
 
     #[test]
     fn test_search_result_top_k_deduplicates_overlapping_rows() {
-        let indexed = SearchResult::new(vec![1], vec![0.9]);
-        let fallback = SearchResult::new(vec![1, 2], vec![0.8, 0.7]);
+        let indexed = ScoredRowIds::new(vec![1], vec![0.9]);
+        let fallback = ScoredRowIds::new(vec![1, 2], vec![0.8, 0.7]);
 
         let merged = indexed.or(&fallback);
         assert_eq!(merged.row_ids, vec![1, 1, 2]);
@@ -390,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_search_result_top_k_keeps_highest_duplicate_score() {
-        let result = SearchResult::new(vec![1, 2, 1, 3], vec![0.5, 0.8, 0.9, 0.7]);
+        let result = ScoredRowIds::new(vec![1, 2, 1, 3], vec![0.5, 0.8, 0.9, 0.7]);
 
         let top = result.top_k(2);
         assert_eq!(top.row_ids, vec![1, 2]);
@@ -401,7 +407,7 @@ mod tests {
     fn test_search_result_top_k_sorts_best_first_without_truncation() {
         // Even when k >= candidate count (no truncation), results must be returned
         // best-first by score, not in the input/insertion order.
-        let result = SearchResult::new(vec![3, 1, 2], vec![0.1, 0.9, 0.5]);
+        let result = ScoredRowIds::new(vec![3, 1, 2], vec![0.1, 0.9, 0.5]);
 
         let top = result.top_k(3);
         assert_eq!(top.row_ids, vec![1, 2, 3]);
@@ -410,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_search_result_top_k_tie_breaks_by_smaller_row_id() {
-        let result = SearchResult::new(vec![30, 10, 20], vec![0.9, 0.9, 0.9]);
+        let result = ScoredRowIds::new(vec![30, 10, 20], vec![0.9, 0.9, 0.9]);
         let top = result.top_k(2);
         assert_eq!(top.row_ids, vec![10, 20]);
         assert_eq!(top.scores, vec![0.9, 0.9]);
@@ -418,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_search_result_filters_deleted_row_ranges() {
-        let result = SearchResult::new(vec![1, 2, 3, 4], vec![0.1, 0.9, 0.8, 0.2]);
+        let result = ScoredRowIds::new(vec![1, 2, 3, 4], vec![0.1, 0.9, 0.8, 0.2]);
         let deleted = crate::table::global_index_scanner::RowRangeIndex::create(vec![
             crate::table::RowRange::new(2, 3),
         ]);
@@ -434,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_search_result_offset() {
-        let result = SearchResult::new(vec![0, 1], vec![0.5, 0.6]);
+        let result = ScoredRowIds::new(vec![0, 1], vec![0.5, 0.6]);
         let offset = result.offset(100);
         assert_eq!(offset.row_ids, vec![100, 101]);
         assert_eq!(offset.scores, vec![0.5, 0.6]);
@@ -442,15 +448,15 @@ mod tests {
 
     #[test]
     fn test_search_result_or() {
-        let a = SearchResult::new(vec![1, 2], vec![0.5, 0.6]);
-        let b = SearchResult::new(vec![3], vec![0.7]);
+        let a = ScoredRowIds::new(vec![1, 2], vec![0.5, 0.6]);
+        let b = ScoredRowIds::new(vec![3], vec![0.7]);
         let merged = a.or(&b);
         assert_eq!(merged.len(), 3);
     }
 
     #[test]
     fn test_search_result_to_row_ranges() {
-        let result = SearchResult::new(vec![5, 1, 2, 3, 10], vec![0.1; 5]);
+        let result = ScoredRowIds::new(vec![5, 1, 2, 3, 10], vec![0.1; 5]);
         let ranges = result.to_row_ranges().unwrap();
         assert_eq!(ranges.len(), 3);
         assert_eq!(ranges[0].from(), 1);
@@ -463,7 +469,7 @@ mod tests {
 
     #[test]
     fn test_search_result_to_row_ranges_rejects_i64_overflow() {
-        let result = SearchResult::new(vec![i64::MAX as u64 + 1], vec![0.1]);
+        let result = ScoredRowIds::new(vec![i64::MAX as u64 + 1], vec![0.1]);
         let err = result.to_row_ranges().unwrap_err();
         assert!(
             err.to_string().contains("exceeds i64::MAX"),

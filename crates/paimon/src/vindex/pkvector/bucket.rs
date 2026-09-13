@@ -77,6 +77,7 @@ impl BucketAnnSegment {
 
 /// A data file participating in the bucket search, with its row count. Used by
 /// the bucket kernel to plan exact vs. ANN search over active files.
+#[derive(Clone)]
 pub(crate) struct BucketActiveFile {
     pub file_name: String,
     pub row_count: i64,
@@ -527,7 +528,8 @@ pub(crate) async fn bucket_search(
     // Eligible uncovered exact files (active-file order) with their exclusion
     // predicate; a file with no residual-allowed rows is skipped without reading.
     #[allow(clippy::type_complexity)]
-    let mut exact_tasks: Vec<(&BucketActiveFile, Box<dyn Fn(i64) -> bool + Sync>)> = Vec::new();
+    let mut exact_tasks: Vec<(&BucketActiveFile, Box<dyn Fn(i64) -> bool + Send + Sync>)> =
+        Vec::new();
     if !skip_exact_fallback {
         for file in active_files {
             if covered.contains(&file.file_name) {
@@ -816,7 +818,8 @@ pub(crate) async fn bucket_search_batch(
     });
 
     #[allow(clippy::type_complexity)]
-    let mut exact_tasks: Vec<(&BucketActiveFile, Box<dyn Fn(i64) -> bool + Sync>)> = Vec::new();
+    let mut exact_tasks: Vec<(&BucketActiveFile, Box<dyn Fn(i64) -> bool + Send + Sync>)> =
+        Vec::new();
     if !skip_exact_fallback {
         for file in active_files {
             if covered.contains(&file.file_name) {

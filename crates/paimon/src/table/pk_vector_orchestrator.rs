@@ -111,6 +111,7 @@ pub(crate) fn validate_row_position(
 /// One bucket's search input. Rust equivalent of Java
 /// `BucketVectorSearchSplit`. Constructed from a snapshot/manifest plan by
 /// `PkVectorScan`.
+#[derive(Clone)]
 pub(crate) struct PkVectorSearchSplit {
     /// The bucket's combined data split (>= 1 data file); source of the
     /// partition/bucket/bucket_path/snapshot, the per-file `DataFileMeta`, and the
@@ -578,6 +579,9 @@ impl PkVectorOrchestrator {
                 Ok::<_, crate::Error>(tagged)
             }
         });
+
+        // Erase the borrowing map closure before awaiting Send search futures.
+        let per_bucket = per_bucket.collect::<Vec<_>>().into_iter();
 
         // Drive the per-bucket futures. `concurrency == 1` uses a strictly
         // sequential loop so buckets are searched in split order; larger values fan
