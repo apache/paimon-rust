@@ -202,6 +202,9 @@ fn build_lumina_options(
     }
 
     for (key, value) in paimon_options {
+        if key == LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION {
+            continue;
+        }
         if let Some(native_key) = key.strip_prefix(LUMINA_PREFIX) {
             result
                 .entry(native_key.to_string())
@@ -216,6 +219,9 @@ fn build_lumina_options(
 pub fn strip_lumina_options(paimon_options: &HashMap<String, String>) -> HashMap<String, String> {
     let mut result = HashMap::new();
     for (key, value) in paimon_options {
+        if key == LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION {
+            continue;
+        }
         if let Some(native_key) = key.strip_prefix(LUMINA_PREFIX) {
             result.insert(native_key.to_string(), value.to_string());
         }
@@ -229,6 +235,8 @@ pub const KEY_INDEX_TYPE: &str = "index.type";
 
 /// Paimon-prefixed option key for the vector index dimension.
 pub const LUMINA_DIMENSION_OPTION: &str = "lumina.index.dimension";
+/// Rust reader memory budget for densifying a Lumina row-id filter.
+pub const LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION: &str = "lumina.search.max-filter-bytes";
 
 pub struct LuminaIndexMeta {
     options: HashMap<String, String>,
@@ -396,11 +404,28 @@ mod tests {
             "lumina.diskann.search.beam_width".to_string(),
             "8".to_string(),
         );
+        opts.insert(
+            LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION.to_string(),
+            "64 mb".to_string(),
+        );
         opts.insert("non_lumina_key".to_string(), "ignored".to_string());
         let result = strip_lumina_options(&opts);
         assert_eq!(result.get("index.dimension").unwrap(), "128");
         assert_eq!(result.get("diskann.search.beam_width").unwrap(), "8");
+        assert!(!result.contains_key("search.max-filter-bytes"));
         assert!(!result.contains_key("non_lumina_key"));
+    }
+
+    #[test]
+    fn rust_dense_filter_budget_is_not_a_native_build_option() {
+        let options = HashMap::from([(
+            LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION.to_string(),
+            "64 mb".to_string(),
+        )]);
+        let native = LuminaVectorIndexOptions::new(&options)
+            .unwrap()
+            .to_lumina_options();
+        assert!(!native.contains_key("search.max-filter-bytes"));
     }
 
     #[test]

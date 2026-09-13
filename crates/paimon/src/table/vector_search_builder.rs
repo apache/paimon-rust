@@ -33,6 +33,7 @@ use crate::table::global_index_scanner::{
     unindexed_ranges_for_global_index_entries, RowRangeIndex,
 };
 use crate::table::index_file_path::IndexFileLocation;
+use crate::table::pk_vector_bucket_split::BucketVectorSearchSplit;
 use crate::table::pk_vector_data_file_reader::{
     append_batch_vectors, DataFilePkVectorReaderFactory,
 };
@@ -44,7 +45,7 @@ use crate::table::pk_vector_orchestrator::{
 use crate::table::pk_vector_position_read::{
     PkVectorPositionRead, PKEY_VECTOR_POSITION_COLUMN, SEARCH_SCORE_COLUMN,
 };
-use crate::table::pk_vector_scan::{positions_in_ranges, PkVectorScan, PkVectorScanPlan};
+use crate::table::pk_vector_scan::{PkVectorScan, PkVectorScanPlan};
 use crate::table::read_builder::resolve_projected_fields;
 use crate::table::row_id_predicate::intersect_sorted_ranges;
 use crate::table::source::DataSplit;
@@ -60,6 +61,7 @@ use crate::vindex::pkvector::ann::{AnnSegmentSource, PkVectorAnnSearcher, Vindex
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
 use crate::vindex::pkvector::exact::validate_query;
 use crate::vindex::pkvector::metric::VectorSearchMetric;
+use crate::vindex::pkvector::{FileRowSelection, FileRowSelections};
 use crate::vindex::range_reader::{RangeIoStats, RangeReadLimiter, VindexFileReader};
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use crate::vindex::{is_vindex_index_type, vector_search_timing_enabled, VindexVectorIndexOptions};
@@ -442,6 +444,134 @@ impl<'a> VectorSearchBuilder<'a> {
             .await
     }
 
+    /// Run this search over bucket splits an engine planned elsewhere, and
+    /// materialize the hits.
+    ///
+    /// The unit of work is Java's `BucketVectorSearchSplit` byte form: a planner
+    /// running in Paimon Java enumerates one split per bucket -- a bucket is never
+    /// divided, because the ANN current-segment decision needs the bucket's whole
+    /// active file set -- and ships each to a worker that calls this. The splits
+    /// are the plan: their payload files, their per-file row ranges and the
+    /// snapshot they pin are used as given, and this table's index manifest is not
+    /// read.
+    ///
+    /// Everything after planning is the ordinary primary-key vector read, so
+    /// search, optional refine, local Top-K and materialization stay identical to
+    /// [`execute_read`](Self::execute_read): output is the projected user columns
+    /// plus `__paimon_search_score`, best-first. The Top-K is local to the supplied
+    /// splits; a caller distributing one call per bucket merges the per-bucket
+    /// results itself.
+    ///
+    /// Only a primary-key vector column can be read this way. The data-evolution
+    /// route plans through the global index rather than through bucket splits, so
+    /// it is rejected rather than silently answered from a different plan.
+    pub async fn execute_read_for_bucket_splits(
+        &self,
+        split_bytes: &[&[u8]],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        // Fail closed: returns data outside `TableScan`/`TableRead`.
+        let core = CoreOptions::new(self.table.schema().options());
+        core.ensure_read_authorized()?;
+        let vector_column =
+            self.vector_column
+                .as_deref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Vector column must be set via with_vector_column()".to_string(),
+                })?;
+        let query_vector =
+            self.query_vector
+                .as_ref()
+                .ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: "Query vector must be set via with_query_vector()".to_string(),
+                })?;
+        let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
+            message: "Limit must be set via with_limit()".to_string(),
+        })?;
+
+        let pk_col = if core.primary_key_vector_index_enabled() {
+            let targets_pk_column = core
+                .primary_key_vector_index_columns()
+                .ok()
+                .is_some_and(|cols| cols.iter().any(|c| c == vector_column));
+            if targets_pk_column {
+                core.primary_key_vector_index_column()?
+            } else {
+                return Err(bucket_split_route_error(vector_column));
+            }
+        } else {
+            return Err(bucket_split_route_error(vector_column));
+        };
+
+        // Decoding is the trust boundary: these bytes come from outside the
+        // process. Reject an empty request here rather than let it reach planning
+        // as "no splits", which cannot pin a snapshot.
+        if split_bytes.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "bucket-split read requires at least one split".to_string(),
+                source: None,
+            });
+        }
+        let splits = split_bytes
+            .iter()
+            .map(|bytes| BucketVectorSearchSplit::deserialize(bytes))
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        // Resolve the query parameters (and reject a query the search cannot answer
+        // correctly) before planning, exactly as the manifest route does.
+        let params = resolve_pk_vector_search_params(
+            self.table,
+            &self.options,
+            self.filter.as_ref(),
+            &core,
+            &pk_col,
+            &[query_vector.as_slice()],
+            limit,
+        )?;
+        let plan = PkVectorScan::new(
+            self.table,
+            params.field_id,
+            params.index_type.clone(),
+            self.filter.clone(),
+        )
+        .plan_for_bucket_vector_splits(splits)?;
+
+        // Resolve the materialization read-type up front so an invalid projection
+        // fails loud even when the plan is empty and no rows will be read.
+        let read_type = self.resolve_materialize_read_type()?;
+
+        let candidates = search_pk_candidates_batch_with_plan(
+            self.table,
+            &self.options,
+            self.filter.as_ref(),
+            &core,
+            &pk_col,
+            &[query_vector.as_slice()],
+            limit,
+            &plan,
+            &params,
+        )
+        .await?;
+        // One query in, so one candidate list out -- no more and no less. Checked
+        // rather than asserted, because this route is reached from the C ABI, where a
+        // debug-only assert leaves a release build indexing an empty vector or
+        // answering the caller's one query with another query's list.
+        let candidates = take_only_result(candidates, "bucket-split vector search")?;
+
+        // A separate, predicate-free materialization reader projecting the user
+        // columns (the search reader projects only the vector column).
+        let materialize_reader = DataFileReader::new(
+            self.table.file_io().clone(),
+            self.table.schema_manager().clone(),
+            self.table.schema().id(),
+            self.table.schema().fields().to_vec(),
+            read_type,
+            Vec::new(),
+        );
+
+        Self::materialize_candidates(candidates, &plan.splits, params.metric, &materialize_reader)
+            .await
+    }
+
     /// Materialize the best-first data-evolution vector search hits into Arrow
     /// rows. The global-index search returns global `_ROW_ID`s and their scores; a
     /// subsequent row-range read materializes those rows, and each row's score is
@@ -808,6 +938,18 @@ struct PkVectorSearchParams {
     indexed_limit: usize,
 }
 
+/// A bucket split is a primary-key vector plan. The data-evolution route plans
+/// through the global index instead, so answering it here would silently use a
+/// different plan than the caller supplied.
+fn bucket_split_route_error(vector_column: &str) -> crate::Error {
+    crate::Error::DataInvalid {
+        message: format!(
+            "bucket-split read requires a primary-key vector column, but '{vector_column}' is not one"
+        ),
+        source: None,
+    }
+}
+
 /// Resolve the query-level parameters and reject a query the search cannot answer
 /// correctly, before any planning or read happens.
 fn resolve_pk_vector_search_params(
@@ -943,19 +1085,30 @@ fn resolve_pk_vector_search_params(
 /// rows an engine-supplied plan restricts each file to, and the positions a residual
 /// data predicate leaves behind.
 ///
-/// Both sides list what is permitted, and both read a file's absence as "no rows
-/// allowed", so combining them intersects files as well as positions. Either side
-/// alone passes through unchanged; neither side means no positional restriction.
+/// The two sides read a file's ABSENCE differently, and the merge has to respect
+/// both readings:
 ///
-/// This is where the plan's ranges become positions: the search kernel tests
-/// membership, while a read is limited by the ranges themselves. When the residual
-/// was evaluated over those same ranges the intersection cannot remove anything, and
-/// is kept as the invariant that says so.
+/// * The plan lists only what the engine's split narrowed, so an absent file is
+///   unrestricted -- Java's `rowRangesByFile.get(file) == null`.
+/// * The residual is exhaustive over the files a search can read from
+///   (`residual_positions_by_file` registers every active file, empty when nothing
+///   passed), so once a residual exists its silence about a file means "no rows".
+///
+/// So: with no residual, a file the plan omits stays absent and unrestricted. With a
+/// residual, a file it omits is excluded even if the plan restricted it, and a file
+/// both describe keeps the intersection. Absent from BOTH is unrestricted, which is
+/// what lets the ANN backend search unfiltered.
+///
+/// The plan's ranges stay ranges. Expanding them into positions would be work sized
+/// by row counts that arrived on the wire; where an intersection is genuinely needed
+/// the residual positions — bounded by the rows its own read returned — are filtered
+/// BY the ranges instead. When the residual was evaluated over those same ranges the
+/// intersection cannot remove anything, and is kept as the invariant that says so.
 fn intersect_row_allow_lists(
     physical: Option<&[HashMap<String, Vec<RowRange>>]>,
     residual: Option<Vec<HashMap<String, RoaringTreemap>>>,
     split_count: usize,
-) -> crate::Result<Option<Vec<HashMap<String, RoaringTreemap>>>> {
+) -> crate::Result<Option<Vec<FileRowSelections>>> {
     if let Some(maps) = physical {
         if maps.len() != split_count {
             return Err(crate::Error::DataInvalid {
@@ -967,45 +1120,79 @@ fn intersect_row_allow_lists(
             });
         }
     }
+    if let Some(maps) = residual.as_ref() {
+        if maps.len() != split_count {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "residual carries {} row allow-lists for {split_count} splits",
+                    maps.len()
+                ),
+                source: None,
+            });
+        }
+    }
     match (physical, residual) {
-        (None, residual) => Ok(residual),
+        (None, None) => Ok(None),
+        (None, Some(residual)) => Ok(Some(
+            residual
+                .into_iter()
+                .map(|per_file| {
+                    per_file
+                        .into_iter()
+                        .map(|(file, positions)| (file, FileRowSelection::Positions(positions)))
+                        .collect()
+                })
+                .collect(),
+        )),
         (Some(physical), None) => Ok(Some(
             physical
                 .iter()
                 .map(|per_file| {
                     per_file
                         .iter()
-                        .map(|(file, ranges)| Ok((file.clone(), positions_in_ranges(ranges)?)))
-                        .collect::<crate::Result<HashMap<String, RoaringTreemap>>>()
+                        .map(|(file, ranges)| {
+                            (file.clone(), FileRowSelection::Ranges(ranges.clone()))
+                        })
+                        .collect()
                 })
-                .collect::<crate::Result<Vec<_>>>()?,
+                .collect(),
         )),
         (Some(physical), Some(residual)) => {
-            if residual.len() != split_count {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "residual carries {} row allow-lists for {split_count} splits",
-                        residual.len()
-                    ),
-                    source: None,
-                });
-            }
             Ok(Some(
                 physical
                     .iter()
                     .zip(residual)
-                    .map(|(physical, residual)| {
-                        physical
-                            .iter()
-                            .filter(|(file, _)| residual.contains_key(file.as_str()))
-                            .map(|(file, ranges)| {
-                                let allowed = positions_in_ranges(ranges)?;
-                                let kept = &residual[file.as_str()];
-                                Ok((file.clone(), allowed & kept))
-                            })
-                            .collect::<crate::Result<HashMap<String, RoaringTreemap>>>()
+                    .map(|(physical, mut residual)| {
+                        let mut merged: FileRowSelections = HashMap::new();
+                        for (file, ranges) in physical {
+                            let range_selection = FileRowSelection::Ranges(ranges.clone());
+                            let selection = match residual.remove(file.as_str()) {
+                                // Both restrict: keep the positions the ranges also
+                                // allow. Filtering the positions (bounded by the read)
+                                // by the ranges never expands the ranges.
+                                Some(positions) => FileRowSelection::Positions(
+                                    positions
+                                        .iter()
+                                        .filter(|position| range_selection.contains(*position))
+                                        .collect(),
+                                ),
+                                // The residual is exhaustive over the files the search
+                                // can read from -- `residual_positions_by_file`
+                                // registers every active file, empty when nothing
+                                // passed. Its silence about a file therefore means "no
+                                // rows", NOT "unrestricted", and must stay fail-closed
+                                // here even though the plan has something to say.
+                                None => FileRowSelection::Positions(RoaringTreemap::new()),
+                            };
+                            merged.insert(file.clone(), selection);
+                        }
+                        // Whatever the residual restricted and the plan did not.
+                        merged.extend(residual.into_iter().map(|(file, positions)| {
+                            (file, FileRowSelection::Positions(positions))
+                        }));
+                        merged
                     })
-                    .collect::<crate::Result<Vec<_>>>()?,
+                    .collect(),
             ))
         }
     }
@@ -1260,7 +1447,7 @@ async fn search_pk_raw_candidates_batch_with_plan(
     // built from engine-supplied bucket splits carries the physical positions each
     // file is limited to; a plan read from the index manifest carries none. Both
     // sides list what is permitted, so combining them is an intersection.
-    let residual_by_split = intersect_row_allow_lists(
+    let row_selections_by_split = intersect_row_allow_lists(
         plan.physical_row_ranges_by_split.as_deref(),
         residual_by_split,
         plan.splits.len(),
@@ -1338,7 +1525,7 @@ async fn search_pk_raw_candidates_batch_with_plan(
             &factory,
             &search_options,
             skip_exact_fallback,
-            residual_by_split.as_deref(),
+            row_selections_by_split.as_deref(),
             concurrency,
         )
         .await?;
@@ -2523,18 +2710,23 @@ fn is_vector_global_index_file(index_file: &IndexFileMeta) -> bool {
 /// from the selection the read was limited to. This needs no `_ROW_ID` and no
 /// `first_row_id` — real primary-key tables never write one.
 ///
-/// `allowed_rows` is the plan's per-file physical selection, when it has one. The
-/// residual is evaluated over exactly those rows: an engine-supplied bucket split
-/// can restrict a huge file to a handful of ranges, and reading the whole file only
-/// to discard everything outside them afterwards would defeat the split. With no
-/// selection every physical row is scanned, as before.
+/// `allowed_rows` is the plan's per-file physical selection, keyed by data-file
+/// name, with the plan's three states: a file it does not list is unrestricted and
+/// the whole file is scanned; an empty range list excludes the file, which is
+/// registered empty without a read; a non-empty list is scanned over exactly those
+/// ranges, because an engine-supplied bucket split can restrict a huge file to a
+/// handful of ranges and reading all of it to discard the rest would defeat the
+/// split.
 ///
-/// Every *active* data file in the split gets an entry, possibly empty. The
-/// bucket search treats an absent entry and an empty entry identically (the file
-/// contributes no candidates), so the empty entries only make the map cover every
-/// active file. Non-active files (e.g. level-0 files the bucket search excludes)
-/// are skipped entirely: they are never searched, so re-reading them would be
-/// wasted IO.
+/// Every *active* data file in the split gets an entry in the RESULT, possibly
+/// empty, and that exhaustiveness is load-bearing. The search kernel reads a file's
+/// absence from its selections as "unrestricted", so an active file missing here
+/// would reach the search with no predicate applied at all -- the residual would be
+/// silently dropped for it. (The merge below reads a residual's silence about a
+/// file the PLAN listed as exclusion, so only a file both omit falls through, which
+/// is exactly the case this exhaustiveness rules out.) Non-active files (e.g.
+/// level-0 files the bucket search excludes) are skipped entirely: they are never
+/// searched, so re-reading them would be wasted IO.
 ///
 /// `reader` must be predicate-free and project the residual columns;
 /// `residual.file_fields` are the fields the residual leaf indices point into
@@ -2555,18 +2747,15 @@ async fn residual_positions_by_file(
         if !active_names.contains(file_meta.file_name.as_str()) {
             continue;
         }
-        let selection = match allowed_rows {
-            // A plan that lists nothing for a file permits nothing from it, whether
-            // the list is empty or the file is absent: both sides of the eventual
-            // intersection read absence that way. Registering it empty says so and
-            // costs no read.
-            Some(by_file) => match by_file.get(&file_meta.file_name) {
-                Some(ranges) if !ranges.is_empty() => Some(ranges.clone()),
-                _ => {
-                    out.entry(file_meta.file_name.clone()).or_default();
-                    continue;
-                }
-            },
+        // A file the plan lists an EMPTY range list for permits nothing; registering
+        // it empty says so and costs no read. A file the plan does not list at all
+        // is unrestricted, so the residual is evaluated over the whole file.
+        let selection = match allowed_rows.and_then(|by_file| by_file.get(&file_meta.file_name)) {
+            Some(ranges) if ranges.is_empty() => {
+                out.entry(file_meta.file_name.clone()).or_default();
+                continue;
+            }
+            Some(ranges) => Some(ranges.clone()),
             None => None,
         };
         let data_fields = reader.derive_data_fields(file_meta).await?;
@@ -8130,30 +8319,39 @@ mod residual_positions_tests {
 
     #[tokio::test]
     async fn test_residual_does_not_read_a_file_the_plan_excludes() {
-        // A file the plan lists no rows for is registered empty and never opened. The
-        // empty entry is what tells the search the file contributes nothing; an
-        // absent one would mean the same, but then the map would not cover the split.
+        // An EMPTY range list is how a plan says "no rows of this file": it is
+        // registered empty and never opened. Absence means the opposite -- the plan
+        // narrowed nothing there -- so the residual reads the whole file.
         let (reader, split, active) = build_reader_and_split(
             "memory:/rpf_plan_excludes",
             &[("part-0.mosaic", vec![1, 2, 3], 0)],
         )
         .await;
-        for allowed in [
-            HashMap::from([("part-0.mosaic".to_string(), Vec::new())]),
-            HashMap::new(),
-        ] {
-            let map = residual_positions_by_file(
-                &reader,
-                &split,
-                &active,
-                &residual_id_gt(0),
-                Some(&allowed),
-            )
-            .await
-            .unwrap();
-            assert!(map.contains_key("part-0.mosaic"));
-            assert!(sorted(&map["part-0.mosaic"]).is_empty());
-        }
+
+        let excluded = HashMap::from([("part-0.mosaic".to_string(), Vec::new())]);
+        let map = residual_positions_by_file(
+            &reader,
+            &split,
+            &active,
+            &residual_id_gt(0),
+            Some(&excluded),
+        )
+        .await
+        .unwrap();
+        assert!(map.contains_key("part-0.mosaic"));
+        assert!(sorted(&map["part-0.mosaic"]).is_empty());
+
+        let unrestricted = HashMap::new();
+        let map = residual_positions_by_file(
+            &reader,
+            &split,
+            &active,
+            &residual_id_gt(0),
+            Some(&unrestricted),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
     }
 
     #[tokio::test]
@@ -8318,10 +8516,17 @@ mod residual_positions_tests {
             .collect()
     }
 
-    fn listed(map: &HashMap<String, RoaringTreemap>, file: &str) -> Vec<u64> {
-        map.get(file)
-            .map(|positions| positions.iter().collect())
-            .unwrap_or_default()
+    /// The positions a merged selection allows, expanded for readable assertions.
+    /// Test-only: the production path never expands a range.
+    fn listed(map: &FileRowSelections, file: &str) -> Vec<u64> {
+        match map.get(file) {
+            None => Vec::new(),
+            Some(FileRowSelection::Positions(positions)) => positions.iter().collect(),
+            Some(FileRowSelection::Ranges(ranges)) => ranges
+                .iter()
+                .flat_map(|range| (range.from() as u64)..=(range.to() as u64))
+                .collect(),
+        }
     }
 
     #[test]
@@ -8336,6 +8541,12 @@ mod residual_positions_tests {
             .unwrap()
             .expect("a plan restriction survives on its own");
         assert_eq!(listed(&only_physical[0], "d0"), vec![1, 2]);
+        // Still intervals. Expanding them here is the unbounded step the plan side
+        // must never take, and the positions above cannot tell the two apart.
+        assert!(
+            matches!(only_physical[0]["d0"], FileRowSelection::Ranges(_)),
+            "the plan's ranges must reach the search as ranges"
+        );
 
         let residual = vec![allow_list(&[("d0", &[3])])];
         let only_residual = intersect_row_allow_lists(None, Some(residual), 1)
@@ -8345,17 +8556,53 @@ mod residual_positions_tests {
     }
 
     #[test]
-    fn both_sides_intersect_and_a_file_either_omits_is_dropped() {
-        // `d0`: both list positions, so only the shared ones survive. `d1`: the
-        // residual kept nothing there, and its absence means "no rows", so the file
-        // must not come back unrestricted from the plan side.
+    fn both_sides_intersect_and_the_residual_stays_fail_closed() {
+        // `d0`: both restrict it, so only the shared positions survive. `d1`: the
+        // residual says nothing about it. The residual registers EVERY file the
+        // search can read from, so its silence is "no rows" -- the plan's ranges
+        // must not resurrect the file, and neither may its absence make it
+        // unrestricted.
         let physical = vec![range_allow_list(&[("d0", &[1, 2, 3]), ("d1", &[0, 1])])];
         let residual = vec![allow_list(&[("d0", &[2, 3, 4])])];
         let combined = intersect_row_allow_lists(Some(&physical), Some(residual), 1)
             .unwrap()
             .expect("both sides restrict");
         assert_eq!(listed(&combined[0], "d0"), vec![2, 3]);
+        assert!(
+            combined[0]["d1"].is_excluded(),
+            "a file the residual omits must stay excluded"
+        );
+    }
+
+    #[test]
+    fn a_file_neither_side_restricts_stays_absent() {
+        // Absence is how "every row" is spelled. A merged map must not invent an
+        // entry for a file no one narrowed, or the ANN backend takes the filtered
+        // path for a query that filters nothing.
+        let physical = vec![range_allow_list(&[("d0", &[1])])];
+        let combined = intersect_row_allow_lists(Some(&physical), None, 1)
+            .unwrap()
+            .expect("the plan restricts d0");
         assert!(!combined[0].contains_key("d1"));
+
+        let residual = vec![allow_list(&[("d0", &[1])])];
+        let combined = intersect_row_allow_lists(Some(&physical), Some(residual), 1)
+            .unwrap()
+            .expect("both restrict d0");
+        assert!(!combined[0].contains_key("d1"));
+        assert!(!combined[0].contains_key("d2"));
+    }
+
+    #[test]
+    fn a_plan_that_restricts_nothing_produces_an_empty_selection_map() {
+        // The no-pre-filter split: the plan carries a map with no entries at all,
+        // and that must survive the merge as an empty map (which the ANN layer reads
+        // as "nothing to mask"), not become a per-file all-permitting mask.
+        let physical = vec![HashMap::new()];
+        let combined = intersect_row_allow_lists(Some(&physical), None, 1)
+            .unwrap()
+            .expect("a split-driven plan is always Some");
+        assert!(combined[0].is_empty());
     }
 
     /// The batch terminals here are handed exactly one query, so a result vector of any
