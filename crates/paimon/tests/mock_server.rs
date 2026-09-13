@@ -1455,6 +1455,17 @@ impl RESTServer {
             .unwrap_or_default()
     }
 
+    /// Return the partitions registered for a table, statistics included, in registration order.
+    pub fn table_partitions(&self, database: &str, table: &str) -> Vec<Partition> {
+        self.inner
+            .lock()
+            .unwrap()
+            .partitions
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Set whether a stored table is external.
     pub fn set_table_external(&self, database: &str, table: &str, is_external: bool) {
         let key = format!("{database}.{table}");
