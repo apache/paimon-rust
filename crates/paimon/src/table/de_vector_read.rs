@@ -225,7 +225,7 @@ impl Read for DeVectorRead {
             }
             evaluate_batch_vector_search(
                 VectorSearchEvaluation {
-                    table: Some(&pinned_table),
+                    table: Some(pinned_table),
                     file_io: pinned_table.file_io(),
                     table_path: pinned_table.location(),
                     table_options: pinned_table.schema().options(),

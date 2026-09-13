@@ -19,7 +19,7 @@
 
 use crate::spec::{CoreOptions, Predicate};
 use crate::table::vector_read::{BatchVectorRead, VectorRead};
-use crate::table::vector_scan::VectorScan;
+use crate::table::vector_scan::{PlanContext, VectorScan};
 use crate::table::Table;
 use crate::vector_search::SearchResult;
 use std::collections::HashMap;
@@ -98,6 +98,7 @@ impl<'a> VectorSearchBuilder<'a> {
     /// Create an owned reader; query errors are reported before planning.
     pub fn new_read(&self) -> crate::Result<VectorRead> {
         let (column, query, limit) = self.query()?;
+        let context = PlanContext::new(self.table, column, self.filter.as_ref(), None, None)?;
         Ok(VectorRead {
             batch: BatchVectorRead::new(
                 self.table,
@@ -106,8 +107,7 @@ impl<'a> VectorSearchBuilder<'a> {
                 limit,
                 &self.options,
                 self.filter.as_ref(),
-                None,
-                None,
+                context,
             )?,
         })
     }

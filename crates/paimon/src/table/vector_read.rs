@@ -19,17 +19,14 @@
 
 use crate::spec::{CoreOptions, Predicate};
 use crate::table::de_vector_read::DeVectorRead;
-use crate::table::de_vector_scan::PreparedVectorSearchFilter;
 use crate::table::pk_vector_read::PkVectorRead;
 use crate::table::pk_vector_search_params::PkVectorSearchParams;
 use crate::table::vector_scan::{PlanContext, VectorScanPlan, VectorScanWork};
 use crate::table::vector_search_common::{take_only_result, targets_primary_key_column};
 use crate::table::Table;
 use crate::vector_search::SearchResult;
-use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 
 /// Execute a resolved plan without resolving another snapshot or manifest.
 ///
@@ -64,7 +61,7 @@ pub struct BatchVectorRead {
 
 enum VectorReadKind {
     DataEvolution(DeVectorRead),
-    PrimaryKey(PkVectorRead),
+    PrimaryKey(Box<PkVectorRead>),
 }
 
 impl BatchVectorRead {
@@ -75,18 +72,16 @@ impl BatchVectorRead {
         limit: usize,
         options: &HashMap<String, String>,
         filter: Option<&Predicate>,
-        include_row_ids: Option<&Arc<RoaringTreemap>>,
-        prepared: Option<&PreparedVectorSearchFilter>,
+        context: PlanContext,
     ) -> crate::Result<Self> {
-        let context = PlanContext::new(table, column, filter, include_row_ids, prepared)?;
         let core = CoreOptions::new(table.schema().options());
         let reader = if targets_primary_key_column(&core, column) {
             let pk_col = core.primary_key_vector_index_column()?;
             let params =
                 PkVectorSearchParams::resolve(table, options, filter, &pk_col, queries, limit)?;
-            VectorReadKind::PrimaryKey(PkVectorRead::new(
+            VectorReadKind::PrimaryKey(Box::new(PkVectorRead::new(
                 table, options, filter, &pk_col, queries, limit, params,
-            ))
+            )))
         } else {
             VectorReadKind::DataEvolution(DeVectorRead::new(column, queries, limit, options)?)
         };
@@ -103,7 +98,7 @@ impl BatchVectorRead {
         }
         match (&self.reader, plan.work) {
             (VectorReadKind::DataEvolution(reader), VectorScanWork::DataEvolution(plan)) => {
-                reader.read(plan).await
+                reader.read(*plan).await
             }
             (VectorReadKind::PrimaryKey(reader), VectorScanWork::PrimaryKey(plan)) => {
                 reader.read(plan).await

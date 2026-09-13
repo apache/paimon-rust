@@ -120,7 +120,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
     /// Create an owned batch reader; result i belongs to input query i.
     pub fn new_read(&self) -> crate::Result<BatchVectorRead> {
         let column = self.column()?;
-        PlanContext::new(
+        let context = PlanContext::new(
             self.table,
             column,
             self.filter.as_ref(),
@@ -145,8 +145,7 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             limit,
             &self.options,
             self.filter.as_ref(),
-            self.include_row_ids.as_ref(),
-            self.prepared_filter.as_ref(),
+            context,
         )
     }
 

@@ -951,7 +951,7 @@ async fn pk_vector_residual_filter_excludes_non_matching_rows() {
             .positions()
             .unwrap()
             .iter()
-            .map(|p| p.row_position as i64)
+            .map(|p| p.row_position)
             .collect::<Vec<_>>(),
         unfiltered_ids
             .iter()
@@ -973,7 +973,7 @@ async fn pk_vector_residual_filter_excludes_non_matching_rows() {
             .positions()
             .unwrap()
             .iter()
-            .map(|p| p.row_position as i64)
+            .map(|p| p.row_position)
             .collect::<Vec<_>>(),
         expected_ids.iter().map(|id| *id as i64).collect::<Vec<_>>()
     );

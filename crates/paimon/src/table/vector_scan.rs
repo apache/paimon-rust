@@ -48,7 +48,7 @@ pub struct VectorScanPlan {
 
 #[derive(Clone)]
 pub(super) enum VectorScanWork {
-    DataEvolution(DeVectorScanPlan),
+    DataEvolution(Box<DeVectorScanPlan>),
     PrimaryKey(PkVectorScanPlan),
 }
 
@@ -127,8 +127,8 @@ pub struct VectorScan {
 }
 
 enum VectorScanKind {
-    DataEvolution(DeVectorScan),
-    PrimaryKey(PkVectorScan),
+    DataEvolution(Box<DeVectorScan>),
+    PrimaryKey(Box<PkVectorScan>),
 }
 
 impl VectorScan {
@@ -150,19 +150,19 @@ impl VectorScan {
                         source: None,
                     }
                 })?;
-            VectorScanKind::PrimaryKey(PkVectorScan::new(
+            VectorScanKind::PrimaryKey(Box::new(PkVectorScan::new(
                 table,
                 field_id,
                 core.primary_key_vector_index_type(&column)?,
                 filter.cloned(),
-            ))
+            )))
         } else {
-            VectorScanKind::DataEvolution(DeVectorScan::new(
+            VectorScanKind::DataEvolution(Box::new(DeVectorScan::new(
                 table,
                 filter,
                 include_row_ids,
                 prepared,
-            ))
+            )))
         };
         Ok(Self { context, scan })
     }
@@ -170,7 +170,7 @@ impl VectorScan {
     pub async fn plan(&self) -> crate::Result<VectorScanPlan> {
         let work = match &self.scan {
             VectorScanKind::DataEvolution(scan) => {
-                VectorScanWork::DataEvolution(scan.plan().await?)
+                VectorScanWork::DataEvolution(Box::new(scan.plan().await?))
             }
             VectorScanKind::PrimaryKey(scan) => VectorScanWork::PrimaryKey(scan.plan().await?),
         };
