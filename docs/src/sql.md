@@ -40,7 +40,7 @@ Mosaic support is always available and currently read-only. SQL queries can read
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
 
 Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
@@ -967,6 +967,23 @@ the catalog never deletes data. If the deletion fails the partition is already i
 and the directory may survive; repair the file system and remove it there rather than
 re-registering it. A partition at a custom location is only unregistered; its directory
 is left where it is.
+
+### MSCK REPAIR TABLE
+
+Reconcile the catalog registrations with the directories that actually exist:
+
+```sql
+MSCK REPAIR TABLE paimon.my_db.events;                  -- same as ADD PARTITIONS
+MSCK REPAIR TABLE paimon.my_db.events ADD PARTITIONS;   -- register discovered directories
+MSCK REPAIR TABLE paimon.my_db.events DROP PARTITIONS;  -- unregister vanished directories
+MSCK REPAIR TABLE paimon.my_db.events SYNC PARTITIONS;  -- both
+```
+
+Repair is metadata-only: it never deletes data. Directory discovery and the catalog
+listing both complete before any change is made, so a listing failure cannot turn a
+truncated view of the table into a `DROP` diff. There is no dry-run and no scope
+argument — repair always covers the whole table. A partition at a custom location is
+never unregistered by repair.
 
 ## Procedures
 

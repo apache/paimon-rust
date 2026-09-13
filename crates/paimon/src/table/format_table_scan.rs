@@ -26,9 +26,9 @@ use super::{Plan, RESTEnv, ScanTrace, Table};
 use crate::api::RestError;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    escape_path_name, extract_datum, BinaryRow, BinaryRowBuilder, CoreOptions, DataField,
-    DataFileMeta, DataType, Datum, Partition, PartitionComputer, Predicate, PredicateOperator,
-    PATH_OPTION,
+    escape_path_name, extract_datum, unescape_path_name, BinaryRow, BinaryRowBuilder, CoreOptions,
+    DataField, DataFileMeta, DataType, Datum, Partition, PartitionComputer, Predicate,
+    PredicateOperator, PATH_OPTION,
 };
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::source::{DataSplitBuilder, RowRange};
@@ -828,36 +828,6 @@ fn partition_segment_value(segment: &str, key: &str) -> Option<String> {
         unescape_path_name(segment_value)
     } else {
         None
-    }
-}
-
-fn unescape_path_name(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return None;
-            }
-            let hi = hex_value(bytes[i + 1])?;
-            let lo = hex_value(bytes[i + 2])?;
-            out.push((hi << 4) | lo);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
     }
 }
 

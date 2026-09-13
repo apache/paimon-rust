@@ -522,6 +522,37 @@ pub(crate) fn escape_path_name(path: &str) -> String {
     sb
 }
 
+/// Unescape a path component following Java `PartitionPathUtils.unescapePathName`.
+pub(crate) fn unescape_path_name(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_value(bytes[i + 1])?;
+            let lo = hex_value(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Check if a character needs escaping in partition path names.
 ///
 /// Matches Java `PartitionPathUtils.CHAR_TO_ESCAPE`:
@@ -689,6 +720,14 @@ mod tests {
         assert_eq!(escape_path_name("a\x01b"), "a%01b");
         assert_eq!(escape_path_name("a\nb"), "a%0Ab");
         assert_eq!(escape_path_name("a\x7Fb"), "a%7Fb");
+    }
+
+    #[test]
+    fn test_unescape_path_name() {
+        assert_eq!(unescape_path_name("a%2Fb"), Some("a/b".to_string()));
+        assert_eq!(unescape_path_name("%E4%B8%AD"), Some("中".to_string()));
+        assert_eq!(unescape_path_name("a%ZZb"), None);
+        assert_eq!(unescape_path_name("a%b"), None);
     }
 
     // ======================== PartitionComputer tests ========================
