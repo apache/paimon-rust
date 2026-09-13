@@ -21,13 +21,17 @@ mod common;
 mod mock_server;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
+use arrow_array::{Int64Array, RecordBatch};
+use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use paimon::api::ConfigResponse;
 use paimon::catalog::RESTCatalog;
 use paimon::spec::{BigIntType, BooleanType, DataType, DateType, IntType, Schema, VarCharType};
 use paimon::{CatalogOptions, Options};
 use paimon_datafusion::SQLContext;
+use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
 use mock_server::{start_mock_server, RESTServer};
@@ -128,6 +132,66 @@ fn spec(values: &[(&str, &str)]) -> HashMap<String, String> {
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect()
+}
+
+const UNKNOWN: i64 = paimon::spec::Partition::UNKNOWN;
+
+/// The partitions the catalog holds, by partition name with keys in name order.
+fn partition_statistics(server: &RESTServer) -> HashMap<String, paimon::spec::Partition> {
+    server
+        .table_partitions(DATABASE, TABLE)
+        .into_iter()
+        .map(|partition| {
+            let mut entries = partition.spec.iter().collect::<Vec<_>>();
+            entries.sort();
+            let name = entries
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("/");
+            (name, partition)
+        })
+        .collect()
+}
+
+fn counts(partition: &paimon::spec::Partition) -> (i64, i64) {
+    (partition.record_count, partition.file_count)
+}
+
+fn write_ids(directory: &Path, ids: &[i64]) {
+    write_ids_file(&directory.join("part-0.parquet"), ids);
+}
+
+fn write_ids_file(path: &Path, ids: &[i64]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        ArrowDataType::Int64,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(ids.to_vec()))],
+    )
+    .unwrap();
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+async fn ids(context: &SQLContext, sql: &str) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for batch in context.sql(sql).await.unwrap().collect().await.unwrap() {
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        ids.extend(values.iter().flatten());
+    }
+    ids.sort_unstable();
+    ids
 }
 
 #[cfg(not(windows))]
@@ -482,6 +546,350 @@ async fn test_drop_partition_leaves_a_custom_location_in_place() {
     );
     assert!(external_dir.path().join("part-0.parquet").exists());
     assert!(temp_dir.path().join("dt=b").is_dir());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_msck_repair_reconciles_registrations_with_directories() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp_dir.path().join("dt=2026-07-21")).unwrap();
+    let (_server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = '2026-07-22')"),
+    )
+    .await;
+
+    // ADD registers a directory the catalog does not know yet.
+    common::exec(
+        &context,
+        &format!("MSCK REPAIR TABLE {TABLE_NAME} ADD PARTITIONS"),
+    )
+    .await;
+    assert_eq!(
+        show_partitions(&context, "").await,
+        ["dt=2026-07-21", "dt=2026-07-22"]
+    );
+
+    // SYNC also unregisters a partition whose directory is gone, without deleting anything.
+    std::fs::remove_dir_all(temp_dir.path().join("dt=2026-07-22")).unwrap();
+    common::exec(
+        &context,
+        &format!("MSCK REPAIR TABLE {TABLE_NAME} SYNC PARTITIONS"),
+    )
+    .await;
+    assert_eq!(show_partitions(&context, "").await, ["dt=2026-07-21"]);
+    assert!(temp_dir.path().join("dt=2026-07-21").is_dir());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_msck_repair_keeps_a_partition_at_a_custom_location() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let (server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = 'a') PARTITION (dt = 'b')"),
+    )
+    .await;
+    server.set_table_partition_options(
+        DATABASE,
+        TABLE,
+        &spec(&[("dt", "b")]),
+        HashMap::from([(
+            "path".to_string(),
+            format!("file://{}", external_dir.path().display()),
+        )]),
+    );
+
+    // Its directory is not under the table, so repair does not read it as missing.
+    std::fs::remove_dir_all(temp_dir.path().join("dt=b")).unwrap();
+    common::exec(
+        &context,
+        &format!("MSCK REPAIR TABLE {TABLE_NAME} SYNC PARTITIONS"),
+    )
+    .await;
+    assert_eq!(
+        server.table_partition_specs(DATABASE, TABLE),
+        vec![spec(&[("dt", "a")]), spec(&[("dt", "b")])]
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_analyze_measures_registered_partitions_and_replaces_their_statistics() {
+    let (temp_dir, server, context) = dt_hh_table(&[("a", "00"), ("a", "01"), ("b", "00")]).await;
+    write_ids_file(&temp_dir.path().join("dt=a/hh=00/part-0.parquet"), &[1, 2]);
+    write_ids_file(&temp_dir.path().join("dt=a/hh=00/part-1.parquet"), &[3]);
+    write_ids_file(&temp_dir.path().join("dt=a/hh=01/part-0.parquet"), &[4]);
+
+    // NOSCAN measures what a listing gives and leaves the row counts as they were.
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS NOSCAN"),
+    )
+    .await;
+    let measured = partition_statistics(&server);
+    assert_eq!(counts(&measured["dt=a/hh=00"]), (UNKNOWN, 2));
+    assert_eq!(counts(&measured["dt=a/hh=01"]), (UNKNOWN, 1));
+    assert_eq!(counts(&measured["dt=b/hh=00"]), (UNKNOWN, 0));
+    assert!(measured["dt=a/hh=00"].file_size_in_bytes > 0);
+    assert!(measured["dt=a/hh=00"].last_file_creation_time > 0);
+    assert_eq!(measured["dt=b/hh=00"].file_size_in_bytes, 0);
+    assert_eq!(measured["dt=b/hh=00"].last_file_creation_time, UNKNOWN);
+
+    // A full ANALYZE reads every footer, and an empty partition holds exactly no rows.
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS"),
+    )
+    .await;
+    let measured = partition_statistics(&server);
+    assert_eq!(counts(&measured["dt=a/hh=00"]), (3, 2));
+    assert_eq!(counts(&measured["dt=a/hh=01"]), (1, 1));
+    assert_eq!(counts(&measured["dt=b/hh=00"]), (0, 0));
+
+    // A later NOSCAN keeps the known row counts, and measuring again replaces rather than adds.
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS NOSCAN"),
+    )
+    .await;
+    let remeasured = partition_statistics(&server);
+    assert_eq!(counts(&remeasured["dt=a/hh=00"]), (3, 2));
+    assert_eq!(counts(&remeasured["dt=a/hh=01"]), (1, 1));
+    assert_eq!(
+        remeasured["dt=a/hh=00"].file_size_in_bytes,
+        measured["dt=a/hh=00"].file_size_in_bytes
+    );
+
+    let calls = server.create_partitions_calls();
+    let (_, _, request) = calls.last().unwrap();
+    assert!(request.ignore_if_exists);
+    assert_eq!(request.replace_statistics, Some(true));
+    assert_eq!(server.table_partition_specs(DATABASE, TABLE).len(), 3);
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_analyze_partition_clause_selects_a_leading_run_of_partition_values() {
+    let (temp_dir, server, context) = dt_hh_table(&[("a", "00"), ("a", "01"), ("b", "00")]).await;
+    for directory in ["dt=a/hh=00", "dt=a/hh=01", "dt=b/hh=00"] {
+        write_ids(&temp_dir.path().join(directory), &[1]);
+    }
+    let file_counts = |server: &RESTServer| {
+        let measured = partition_statistics(server);
+        ["dt=a/hh=00", "dt=a/hh=01", "dt=b/hh=00"].map(|name| measured[name].file_count)
+    };
+
+    common::exec(
+        &context,
+        &format!(
+            "ANALYZE TABLE {TABLE_NAME} PARTITION (dt = 'a', hh = '00') COMPUTE STATISTICS NOSCAN"
+        ),
+    )
+    .await;
+    assert_eq!(file_counts(&server), [1, UNKNOWN, UNKNOWN]);
+
+    // A column named without a value means every value of it.
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} PARTITION (dt = 'a', hh) COMPUTE STATISTICS NOSCAN"),
+    )
+    .await;
+    assert_eq!(file_counts(&server), [1, 1, UNKNOWN]);
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} PARTITION (dt, hh) COMPUTE STATISTICS NOSCAN"),
+    )
+    .await;
+    assert_eq!(file_counts(&server), [1, 1, 1]);
+
+    for (clause, message) in [
+        ("PARTITION (hh = '00')", "leading run"),
+        ("PARTITION (id = 1)", "not a partition column"),
+        ("PARTITION (dt = 'zzz')", "does not exist"),
+    ] {
+        common::assert_sql_error(
+            &context,
+            &format!("ANALYZE TABLE {TABLE_NAME} {clause} COMPUTE STATISTICS NOSCAN"),
+            message,
+        )
+        .await;
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_analyze_reads_a_partition_value_as_its_column_type() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let schema = format_table_schema(&[("p", DataType::Int(IntType::new()))]);
+    let (server, context) = setup_rest_table(&temp_dir, schema).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (p = 1)"),
+    )
+    .await;
+    write_ids(&temp_dir.path().join("p=1"), &[1]);
+
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} PARTITION (p = '01') COMPUTE STATISTICS NOSCAN"),
+    )
+    .await;
+
+    assert_eq!(partition_statistics(&server)["p=1"].file_count, 1);
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_analyze_and_scan_count_only_the_files_a_reader_returns() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = 'a')"),
+    )
+    .await;
+    let partition = temp_dir.path().join("dt=a");
+    write_ids_file(&partition.join("part-0.parquet"), &[1]);
+    // What committers and tools leave beside the data: staging trees, markers, hidden files.
+    write_ids_file(&partition.join("_temporary/0/part-9.parquet"), &[9]);
+    write_ids_file(&partition.join("__magic_job-1/tasks/part-8.parquet"), &[8]);
+    write_ids_file(&partition.join(".part-7.parquet"), &[7]);
+    std::fs::write(partition.join("_SUCCESS"), b"").unwrap();
+    std::fs::write(partition.join("notes.txt"), b"not data").unwrap();
+
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS"),
+    )
+    .await;
+
+    assert_eq!(counts(&partition_statistics(&server)["dt=a"]), (1, 1));
+    assert_eq!(
+        ids(
+            &context,
+            &format!("SELECT id FROM {TABLE_NAME} WHERE dt = 'a'")
+        )
+        .await,
+        vec![1]
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_analyze_leaves_a_row_count_unknown_rather_than_short() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = 'a')"),
+    )
+    .await;
+    write_ids_file(&temp_dir.path().join("dt=a/part-0.parquet"), &[1, 2]);
+    std::fs::write(
+        temp_dir.path().join("dt=a/part-1.parquet"),
+        b"not a parquet footer",
+    )
+    .unwrap();
+
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS"),
+    )
+    .await;
+
+    // A sum missing one file, reported as exact, would be worse than no number.
+    assert_eq!(counts(&partition_statistics(&server)["dt=a"]), (UNKNOWN, 2));
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_analyze_refuses_what_it_cannot_measure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    for dt in ["a", "b"] {
+        common::exec(
+            &context,
+            &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = '{dt}')"),
+        )
+        .await;
+        write_ids(&temp_dir.path().join(format!("dt={dt}")), &[1]);
+    }
+
+    common::assert_sql_error(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS FOR COLUMNS id"),
+        "FOR COLUMNS",
+    )
+    .await;
+
+    // A blank string names the default partition, which the statement would measure instead.
+    common::assert_sql_error(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} PARTITION (dt = '') COMPUTE STATISTICS"),
+        "empty or whitespace-only string for partition column 'dt'",
+    )
+    .await;
+
+    server.set_table_partition_options(
+        DATABASE,
+        TABLE,
+        &spec(&[("dt", "b")]),
+        HashMap::from([("path".to_string(), "file:///elsewhere/b".to_string())]),
+    );
+    common::assert_sql_error(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS NOSCAN"),
+        "custom location",
+    )
+    .await;
+    assert!(partition_statistics(&server)
+        .values()
+        .all(|partition| partition.file_count == UNKNOWN));
+
+    // A non-positive parallelism is read as one rather than failing the statement.
+    common::exec(
+        &context,
+        "SET \"paimon.format-table.statistics.parallelism\" = '0'",
+    )
+    .await;
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} PARTITION (dt = 'a') COMPUTE STATISTICS"),
+    )
+    .await;
+    assert_eq!(counts(&partition_statistics(&server)["dt=a"]), (1, 1));
+
+    // Without catalog-managed partitions there is no catalog to write the numbers to.
+    let plain = Schema::builder()
+        .column("dt", varchar())
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .partition_keys(["dt"])
+        .option("type", "format-table")
+        .option("file.format", "parquet")
+        .build()
+        .unwrap();
+    server.add_table_with_schema(
+        DATABASE,
+        "plain",
+        plain,
+        &format!("file://{}/plain", temp_dir.path().display()),
+    );
+    server.set_table_external(DATABASE, "plain", false);
+    common::assert_sql_error(
+        &context,
+        "ANALYZE TABLE paimon.default.plain COMPUTE STATISTICS",
+        "catalog-managed",
+    )
+    .await;
 }
 
 /// `SQLContext::sql` futures have to stay `Send` for callers that box or spawn them; this stops

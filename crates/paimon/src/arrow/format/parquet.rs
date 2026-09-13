@@ -1964,6 +1964,23 @@ const METADATA_SIZE_HINT: usize = 512 * 1024;
 /// avoid excessive small IO requests whose per-request overhead dominates.
 const IO_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 
+/// Rows in a Parquet file, read from its footer alone.
+pub(crate) async fn read_row_count(
+    reader: Box<dyn FileRead>,
+    file_size: u64,
+) -> crate::Result<i64> {
+    let reader = ArrowFileReader::new(file_size, Arc::from(reader));
+    let metadata = ParquetMetaDataReader::new()
+        .with_prefetch_hint(Some(METADATA_SIZE_HINT))
+        .load_and_finish(reader, file_size)
+        .await
+        .map_err(|error| Error::UnexpectedError {
+            message: format!("Failed to read the Parquet footer: {error}"),
+            source: Some(Box::new(error)),
+        })?;
+    Ok(metadata.file_metadata().num_rows())
+}
+
 impl ArrowFileReader {
     fn new(file_size: u64, r: Arc<dyn FileRead>) -> Self {
         Self { file_size, r }
