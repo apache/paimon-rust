@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
+use crate::api::rest_util::RESTUtil;
 use crate::Result;
 
 /// Parameter for REST authentication.
@@ -40,6 +41,10 @@ pub struct RESTAuthParameter {
 
 impl RESTAuthParameter {
     /// Create a new RESTAuthParameter.
+    ///
+    /// Values are URL-encoded here, so every signer signs the bytes the request actually
+    /// carries. Signing a raw value while sending the encoded one is a signature mismatch for
+    /// anything outside `A-Za-z0-9` plus `*`, `-`, `.` and `_`. Keys stay raw, as in Java.
     pub fn new(
         method: impl Into<String>,
         path: impl Into<String>,
@@ -50,7 +55,10 @@ impl RESTAuthParameter {
             method: method.into(),
             path: path.into(),
             data,
-            parameters,
+            parameters: parameters
+                .into_iter()
+                .map(|(key, value)| (key, RESTUtil::encode_string(&value)))
+                .collect(),
         }
     }
 
