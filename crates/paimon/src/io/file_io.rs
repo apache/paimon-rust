@@ -34,6 +34,9 @@ use snafu::ResultExt;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use url::Url;
 
+#[cfg(test)]
+pub(crate) mod multipart_test;
+
 use super::cache::{CachedFileReader, LocalCache};
 use super::Storage;
 

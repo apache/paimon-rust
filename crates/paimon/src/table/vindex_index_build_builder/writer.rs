@@ -15,21 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::extraction::{data_split_for_shard, validate_vector_batch};
-use super::planning::VindexIndexShard;
-use super::timing::{vector_index_build_timing_enabled, VectorIndexBuildTiming};
+use super::extraction::{
+    data_split_for_shard, data_split_for_shard_ranges, validate_vector_batch,
+    validate_vector_batch_ranges,
+};
+use super::planning::{ivf_training_seed, plan_ivf_training_ranges, VindexIndexShard};
+use super::timing::{log_read_phase, vector_index_build_timing_enabled, VectorIndexBuildTiming};
 use super::validation::{
     checked_i64, checked_row_count, checked_std_vector_bytes, checked_training_sample_index,
     checked_training_vector_count, checked_vector_bytes,
 };
 use super::VindexIndexBuildBuilder;
+use crate::arrow::format::parquet::has_beneficial_offset_index;
 use crate::spec::{GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME};
 use crate::table::data_file_reader::DataFileReadTiming;
 use crate::table::table_read::configured_parquet_read_budget;
-use crate::vindex::VindexVectorIndexOptions;
+use crate::table::RowRange;
+use crate::vindex::{VindexVectorIndexOptions, DISKANN_IDENTIFIER};
 use crate::{Error, Result};
 use arrow_buffer::MutableBuffer;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use paimon_vindex_core::autotune::default_training_vector_count;
 use paimon_vindex_core::index::{VectorIndexTrainer, VectorIndexWriter};
 use paimon_vindex_core::io::PosWriter;
@@ -41,6 +46,7 @@ use tokio_util::io::SyncIoBridge;
 
 const INDEX_DIR: &str = "index";
 const VECTOR_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const READ_ADD_QUEUE_CAPACITY: usize = 2;
 pub(super) struct BuiltIndexFile {
     pub(super) meta: IndexFileMeta,
     pub(super) timing: Option<VectorIndexBuildTiming>,
@@ -87,245 +93,619 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let expected_bytes = checked_vector_bytes(row_count_usize, dimension_usize)?;
         let training_vector_count =
             checked_training_vector_count(row_count_usize, options.train_sample_ratio)?;
-        let training_buffer_rows =
-            (VECTOR_BUFFER_BYTES / checked_vector_bytes(1, dimension_usize)?).max(1);
-        let training_buffer_floats = training_buffer_rows
-            .checked_mul(dimension_usize)
-            .ok_or_else(|| Error::DataInvalid {
-                message: "vindex training buffer length overflows usize".to_string(),
-                source: None,
-            })?;
+        let training_rows_retained = if self.index_type == DISKANN_IDENTIFIER {
+            0
+        } else {
+            // This only gates sparse reads; errors must preserve the full-scan fallback.
+            default_training_vector_count(training_vector_count, options.config.nlist())
+                .unwrap_or(0)
+        };
+        let mut sparse_ranges =
+            if training_rows_retained > 0 && training_rows_retained < row_count_usize {
+                plan_ivf_training_ranges(shard, training_rows_retained)?
+            } else {
+                None
+            };
+        let capability_start = (timing_enabled && sparse_ranges.is_some()).then(Instant::now);
+        let capability_read_timing =
+            capability_start.map(|_| Arc::new(DataFileReadTiming::default()));
+        if let Some(ranges) = sparse_ranges.as_ref() {
+            let mut checks = Vec::new();
+            let mut usable = true;
+            for file in &shard.files {
+                if file
+                    .write_cols
+                    .as_ref()
+                    .is_some_and(|columns| !columns.iter().any(|column| column == index_column))
+                {
+                    continue;
+                }
+                let Some((file_start, file_end)) = file.row_id_range() else {
+                    usable = false;
+                    break;
+                };
+                let local_ranges = ranges
+                    .iter()
+                    .filter_map(|range| {
+                        let from = range.from().max(file_start);
+                        let to = range.to().min(file_end);
+                        (from <= to).then(|| RowRange::new(from - file_start, to - file_start))
+                    })
+                    .collect::<Vec<_>>();
+                if local_ranges.is_empty() {
+                    continue;
+                }
+                let path = file.data_file_path(&shard.bucket_path);
+                if !path.to_ascii_lowercase().ends_with(".parquet") {
+                    usable = false;
+                    break;
+                }
+                let file_size = u64::try_from(file.file_size).map_err(|e| Error::DataInvalid {
+                    message: format!(
+                        "Invalid data file size for '{}': {}",
+                        file.file_name, file.file_size
+                    ),
+                    source: Some(Box::new(e)),
+                })?;
+                checks.push((path, file_size, local_ranges));
+            }
+            let found_vector_file = !checks.is_empty();
+            if usable && found_vector_file {
+                let concurrency = self
+                    .table
+                    .schema()
+                    .core_options()
+                    .parquet_row_group_parallelism()?;
+                let file_io = self.table.file_io();
+                let timing = capability_read_timing.as_ref();
+                let mut checks = futures::stream::iter(checks)
+                    .map(|(path, file_size, local_ranges)| async move {
+                        let input = file_io.new_input(&path)?;
+                        let open_start = timing.map(|_| Instant::now());
+                        let reader = Box::new(input.reader().await?);
+                        if let (Some(timing), Some(start)) = (timing, open_start) {
+                            timing.add_file_read(start.elapsed());
+                        }
+                        let reader = match timing {
+                            Some(timing) => timing.wrap_reader(reader),
+                            None => reader,
+                        };
+                        has_beneficial_offset_index(reader, file_size, index_column, &local_ranges)
+                            .await
+                    })
+                    .buffer_unordered(concurrency);
+                while let Some(file_usable) = checks.try_next().await? {
+                    if !file_usable {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+            if !usable || !found_vector_file {
+                log::warn!(
+                    "vindex sparse training read is unavailable for column '{}' in shard [{}, {}]; falling back to a full scan (beneficial_offset_indexes={usable}, found_vector_file={found_vector_file})",
+                    index_column,
+                    shard.row_range_start,
+                    shard.row_range_end,
+                );
+                sparse_ranges = None;
+            }
+        }
+        let capability_check = capability_start.map_or(Duration::ZERO, |start| start.elapsed());
+        if let Some(timing) = capability_read_timing.as_ref() {
+            log_read_phase("probe", shard, timing, Default::default());
+        }
+        if let Some(budget) = parquet_read_budget.as_ref() {
+            eprintln!(
+                "event=paimon_vector_index_build_plan snapshot_id={} row_range_start={} row_range_end={} source_bucket={} sparse={} training_seed={} training_range_count={} parquet_row_group_parallelism={} parquet_max_inflight_bytes={}",
+                shard.snapshot_id,
+                shard.row_range_start,
+                shard.row_range_end,
+                shard.source_bucket,
+                sparse_ranges.is_some(),
+                ivf_training_seed(shard),
+                sparse_ranges.as_ref().map_or(0, Vec::len),
+                budget.parallelism(),
+                budget.max_inflight_bytes(),
+            );
+        }
 
         let mut trainer =
             VectorIndexTrainer::new(options.config.clone()).map_err(|e| Error::DataInvalid {
                 message: format!("Failed to initialize vindex trainer: {e}"),
                 source: Some(Box::new(e)),
             })?;
-        let raw_file = tempfile::tempfile().map_err(|e| Error::UnexpectedError {
-            message: format!("Failed to create temporary vindex vector file: {e}"),
-            source: Some(Box::new(e)),
-        })?;
-        let mut raw_file = tokio::fs::File::from_std(raw_file);
-        let split = data_split_for_shard(shard)?;
-        let mut read_builder = self.table.new_read_builder();
-        read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
-        let read = read_builder.new_read()?;
-        let read = match read_timing.as_ref() {
-            Some(timing) => read.with_data_file_read_timing(Arc::clone(timing)),
-            None => read,
-        };
-        let read = match parquet_read_budget.as_ref() {
-            Some(budget) => read.with_parquet_read_budget(Arc::clone(budget)),
-            None => read,
-        };
-        let mut batches = read.to_arrow(&[split])?;
-        let mut expected_row_id = shard.row_range_start;
-        let mut rows_seen = 0usize;
+        let mut sample_read = Duration::ZERO;
+        let mut full_scan_add = Duration::ZERO;
+        let mut pipeline_blocked = Duration::ZERO;
+        let mut producer_blocked = Duration::ZERO;
+        let mut consumer_validate_add = Duration::ZERO;
+        let mut batch_bytes_min = 0usize;
+        let mut batch_bytes_max = 0usize;
+        let mut batch_bytes_total = 0usize;
+        let mut peak_ready_batches = 0usize;
+        let raw_temp_reread;
+        let index_add;
+        let train_finish;
         let mut bytes_written = 0usize;
-        let mut next_training_sample = 0usize;
-        let mut training_buffer = Vec::with_capacity(training_buffer_floats);
+        let training_rows_seen;
+        let mut sample_io = Default::default();
 
-        loop {
-            let source_start = timing_enabled.then(Instant::now);
-            let batch = batches.try_next().await?;
-            if let Some(source_start) = source_start {
-                source_batch_wait = source_batch_wait.saturating_add(source_start.elapsed());
-            }
-            let Some(batch) = batch else { break };
-            batch_count += 1;
-            let vectors =
-                validate_vector_batch(&batch, index_column, dimension_usize, &mut expected_row_id)?;
-            let batch_end =
-                rows_seen
-                    .checked_add(vectors.row_count)
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: "vindex streamed row count overflows usize".to_string(),
-                        source: None,
-                    })?;
-
-            if training_vector_count == row_count_usize {
+        let writer = if let Some(ranges) = sparse_ranges {
+            let sample_start = timing_enabled.then(Instant::now);
+            let split = data_split_for_shard_ranges(shard, ranges.clone())?;
+            let mut read_builder = self.table.new_read_builder();
+            read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
+            let read = read_builder.new_read()?;
+            let read = match read_timing.as_ref() {
+                Some(timing) => read.with_data_file_read_timing(Arc::clone(timing)),
+                None => read,
+            };
+            let read = match parquet_read_budget.as_ref() {
+                Some(budget) => read.with_parquet_read_budget(Arc::clone(budget)),
+                None => read,
+            };
+            let mut batches = read.to_arrow(&[split])?;
+            let mut range_index = 0usize;
+            let mut expected_row_id = ranges[0].from();
+            let mut rows_seen = 0usize;
+            while let Some(batch) = batches.try_next().await? {
+                let vectors = validate_vector_batch_ranges(
+                    &batch,
+                    index_column,
+                    dimension_usize,
+                    &ranges,
+                    &mut range_index,
+                    &mut expected_row_id,
+                )?;
+                rows_seen =
+                    rows_seen
+                        .checked_add(vectors.row_count)
+                        .ok_or_else(|| Error::DataInvalid {
+                            message: "vindex training row count overflows usize".to_string(),
+                            source: None,
+                        })?;
                 trainer
                     .add_training_vectors_mut(vectors.values, vectors.row_count)
                     .map_err(|e| Error::DataInvalid {
                         message: format!("Failed to add vindex training vectors: {e}"),
                         source: Some(Box::new(e)),
                     })?;
-            } else {
-                while next_training_sample < training_vector_count {
-                    let sample_row = checked_training_sample_index(
-                        next_training_sample,
-                        row_count_usize,
-                        training_vector_count,
-                    )?;
-                    if sample_row >= batch_end {
-                        break;
-                    }
-                    let start = (sample_row - rows_seen) * dimension_usize;
-                    training_buffer
-                        .extend_from_slice(&vectors.values[start..start + dimension_usize]);
-                    next_training_sample += 1;
-                    if training_buffer.len() == training_buffer_floats {
-                        trainer
-                            .add_training_vectors_mut(
-                                &training_buffer,
-                                training_buffer.len() / dimension_usize,
-                            )
-                            .map_err(|e| Error::DataInvalid {
-                                message: format!("Failed to add vindex training vectors: {e}"),
-                                source: Some(Box::new(e)),
-                            })?;
-                        training_buffer.clear();
-                    }
-                }
+            }
+            if rows_seen != training_rows_retained || range_index != ranges.len() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "vindex sparse training data mismatch: rows={rows_seen}/{training_rows_retained}, ranges={range_index}/{}",
+                        ranges.len()
+                    ),
+                    source: None,
+                });
+            }
+            training_rows_seen = rows_seen;
+            sample_read = sample_start.map_or(Duration::ZERO, |start| start.elapsed());
+            if let Some(timing) = read_timing.as_ref() {
+                sample_io = log_read_phase("sample", shard, timing, Default::default());
             }
 
-            let raw_write_start = timing_enabled.then(Instant::now);
-            raw_file
-                .write_all(vectors.bytes)
+            let train_start = timing_enabled.then(Instant::now);
+            let training = tokio::task::spawn_blocking(move || trainer.finish())
                 .await
                 .map_err(|e| Error::UnexpectedError {
-                    message: format!("Failed to spill vindex vectors: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-            if let Some(raw_write_start) = raw_write_start {
-                raw_temp_write = raw_temp_write.saturating_add(raw_write_start.elapsed());
-            }
-            bytes_written = bytes_written
-                .checked_add(vectors.bytes.len())
-                .ok_or_else(|| Error::DataInvalid {
-                    message: "vindex spilled byte count overflows usize".to_string(),
+                    message: format!("vindex training task failed: {e}"),
                     source: None,
-                })?;
-            rows_seen = batch_end;
-        }
-
-        if !training_buffer.is_empty() {
-            trainer
-                .add_training_vectors_mut(&training_buffer, training_buffer.len() / dimension_usize)
-                .map_err(|e| Error::DataInvalid {
-                    message: format!("Failed to add vindex training vectors: {e}"),
+                })?
+                .map_err(|e| Error::UnexpectedError {
+                    message: format!("Failed to train vindex index: {e}"),
                     source: Some(Box::new(e)),
                 })?;
-        }
-        if rows_seen != row_count_usize
-            || expected_row_id
-                != shard
+            train_finish = train_start.map_or(Duration::ZERO, |start| start.elapsed());
+            let writer = VectorIndexWriter::new(training);
+
+            let split = data_split_for_shard(shard)?;
+            let mut read_builder = self.table.new_read_builder();
+            read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
+            let read = read_builder.new_read()?;
+            let read = match read_timing.as_ref() {
+                Some(timing) => read.with_data_file_read_timing(Arc::clone(timing)),
+                None => read,
+            };
+            let read = match parquet_read_budget.as_ref() {
+                Some(budget) => read.with_parquet_read_budget(Arc::clone(budget)),
+                None => read,
+            };
+            let mut batches = read.to_arrow(&[split])?;
+            let expected_end =
+                shard
                     .row_range_end
                     .checked_add(1)
                     .ok_or_else(|| Error::DataInvalid {
                         message: "vindex row range end overflows i64".to_string(),
                         source: None,
-                    })?
-            || (training_vector_count != row_count_usize
-                && next_training_sample != training_vector_count)
-            || bytes_written != expected_bytes
-        {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "vindex streamed data mismatch: rows={rows_seen}/{row_count_usize}, training={next_training_sample}/{training_vector_count}, bytes={bytes_written}/{expected_bytes}"
-                ),
-                source: None,
-            });
-        }
-        let raw_write_start = timing_enabled.then(Instant::now);
-        raw_file.flush().await.map_err(|e| Error::UnexpectedError {
-            message: format!("Failed to flush temporary vindex vector file: {e}"),
-            source: Some(Box::new(e)),
-        })?;
-        if let Some(raw_write_start) = raw_write_start {
-            raw_temp_write = raw_temp_write.saturating_add(raw_write_start.elapsed());
-        }
-        let raw_file_len = raw_file
-            .metadata()
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to inspect temporary vindex vector file: {e}"),
-                source: Some(Box::new(e)),
-            })?
-            .len();
-        if raw_file_len != expected_bytes as u64 {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "temporary vindex vector file size mismatch: {raw_file_len}/{expected_bytes}"
-                ),
-                source: None,
-            });
-        }
-        let raw_file = raw_file.into_std().await;
-        // Diagnostics only: never fail the build for a timing log field.
-        let training_rows_retained = if timing_enabled {
-            default_training_vector_count(training_vector_count, options.config.nlist())
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        let (writer, train_finish, raw_temp_reread, index_add) = tokio::task::spawn_blocking(
-            move || -> std::io::Result<(VectorIndexWriter, Duration, Duration, Duration)> {
-                let train_start = timing_enabled.then(Instant::now);
-                let training = trainer.finish()?;
-                let train_finish = train_start.map_or(Duration::ZERO, |start| start.elapsed());
-                let mut writer = VectorIndexWriter::new(training);
-                let mut raw_temp_reread = Duration::ZERO;
-                let mut index_add = Duration::ZERO;
-                let mut raw_file = raw_file;
-                let reread_start = timing_enabled.then(Instant::now);
-                raw_file.seek(SeekFrom::Start(0))?;
-                if let Some(start) = reread_start {
-                    raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
-                }
-                let batch_rows = training_buffer_rows.min(row_count_usize);
-                let batch_bytes = checked_std_vector_bytes(batch_rows, dimension_usize)?;
-                let mut buffer = MutableBuffer::new(batch_bytes);
-                let mut ids = Vec::with_capacity(batch_rows);
+                    })?;
+            let index_column = index_column.to_string();
+            let row_range_start = shard.row_range_start;
+            let (sender, mut receiver) =
+                tokio::sync::mpsc::channel::<arrow_array::RecordBatch>(READ_ADD_QUEUE_CAPACITY);
+            let full_scan_start = timing_enabled.then(Instant::now);
+            let consumer = tokio::task::spawn_blocking(move || -> Result<_> {
+                let mut writer = writer;
+                let mut expected_row_id = row_range_start;
                 let mut rows_added = 0usize;
-                while rows_added < row_count_usize {
-                    let rows = batch_rows.min(row_count_usize - rows_added);
-                    buffer.resize(checked_std_vector_bytes(rows, dimension_usize)?, 0);
+                let mut batches_added = 0usize;
+                let mut blocked = Duration::ZERO;
+                let mut validate_add = Duration::ZERO;
+                let mut batch_bytes_min = usize::MAX;
+                let mut batch_bytes_max = 0usize;
+                let mut batch_bytes_total = 0usize;
+                let mut ids = Vec::new();
+                loop {
+                    let wait_start = timing_enabled.then(Instant::now);
+                    let batch = receiver.blocking_recv();
+                    if let Some(start) = wait_start {
+                        blocked = blocked.saturating_add(start.elapsed());
+                    }
+                    let Some(batch) = batch else { break };
+                    let validate_add_start = timing_enabled.then(Instant::now);
+                    let batch_bytes = batch.get_array_memory_size();
+                    batch_bytes_min = batch_bytes_min.min(batch_bytes);
+                    batch_bytes_max = batch_bytes_max.max(batch_bytes);
+                    batch_bytes_total = batch_bytes_total.saturating_add(batch_bytes);
+                    let vectors = validate_vector_batch(
+                        &batch,
+                        &index_column,
+                        dimension_usize,
+                        &mut expected_row_id,
+                    )?;
+                    let batch_end = rows_added.checked_add(vectors.row_count).ok_or_else(|| {
+                        Error::DataInvalid {
+                            message: "vindex streamed row count overflows usize".to_string(),
+                            source: None,
+                        }
+                    })?;
+                    ids.clear();
+                    for row in rows_added..batch_end {
+                        ids.push(i64::try_from(row).map_err(|e| Error::DataInvalid {
+                            message: "vindex row id does not fit i64".to_string(),
+                            source: Some(Box::new(e)),
+                        })?);
+                    }
+                    writer
+                        .add_vectors(&ids, vectors.values, vectors.row_count)
+                        .map_err(|e| Error::UnexpectedError {
+                            message: format!("Failed to add vectors to vindex index: {e}"),
+                            source: Some(Box::new(e)),
+                        })?;
+                    if let Some(start) = validate_add_start {
+                        validate_add = validate_add.saturating_add(start.elapsed());
+                    }
+                    rows_added = batch_end;
+                    batches_added += 1;
+                }
+                Ok((
+                    writer,
+                    rows_added,
+                    expected_row_id,
+                    batches_added,
+                    blocked,
+                    validate_add,
+                    if batches_added == 0 {
+                        0
+                    } else {
+                        batch_bytes_min
+                    },
+                    batch_bytes_max,
+                    batch_bytes_total,
+                ))
+            });
+
+            let mut producer_error = None;
+            loop {
+                let source_start = timing_enabled.then(Instant::now);
+                let batch = batches.try_next().await;
+                if let Some(start) = source_start {
+                    source_batch_wait = source_batch_wait.saturating_add(start.elapsed());
+                }
+                let batch = match batch {
+                    Ok(Some(batch)) => batch,
+                    Ok(None) => break,
+                    Err(error) => {
+                        producer_error = Some(error);
+                        break;
+                    }
+                };
+                let send_start = timing_enabled.then(Instant::now);
+                let send_result = sender.send(batch).await;
+                if let Some(start) = send_start {
+                    producer_blocked = producer_blocked.saturating_add(start.elapsed());
+                }
+                if send_result.is_err() {
+                    break;
+                }
+                peak_ready_batches = peak_ready_batches
+                    .max(READ_ADD_QUEUE_CAPACITY.saturating_sub(sender.capacity()));
+            }
+            drop(sender);
+            let consumer_result = consumer.await;
+            let (
+                writer,
+                rows_added,
+                next_row_id,
+                batches_added,
+                blocked,
+                validate_add,
+                min_bytes,
+                max_bytes,
+                total_bytes,
+            ) = consumer_result.map_err(|e| Error::UnexpectedError {
+                message: format!("vindex add task failed: {e}"),
+                source: None,
+            })??;
+            if let Some(error) = producer_error {
+                return Err(error);
+            }
+            if rows_added != row_count_usize || next_row_id != expected_end {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "vindex streamed data mismatch: rows={rows_added}/{row_count_usize}, next_row_id={next_row_id}/{expected_end}"
+                    ),
+                    source: None,
+                });
+            }
+            batch_count = batches_added;
+            pipeline_blocked = blocked;
+            consumer_validate_add = validate_add;
+            batch_bytes_min = min_bytes;
+            batch_bytes_max = max_bytes;
+            batch_bytes_total = total_bytes;
+            full_scan_add = full_scan_start.map_or(Duration::ZERO, |start| start.elapsed());
+            raw_temp_reread = Duration::ZERO;
+            index_add = Duration::ZERO;
+            writer
+        } else {
+            let training_buffer_rows =
+                (VECTOR_BUFFER_BYTES / checked_vector_bytes(1, dimension_usize)?).max(1);
+            let training_buffer_floats = training_buffer_rows
+                .checked_mul(dimension_usize)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "vindex training buffer length overflows usize".to_string(),
+                    source: None,
+                })?;
+            let raw_file = tempfile::tempfile().map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to create temporary vindex vector file: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+            let mut raw_file = tokio::fs::File::from_std(raw_file);
+            let split = data_split_for_shard(shard)?;
+            let mut read_builder = self.table.new_read_builder();
+            read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
+            let read = read_builder.new_read()?;
+            let read = match read_timing.as_ref() {
+                Some(timing) => read.with_data_file_read_timing(Arc::clone(timing)),
+                None => read,
+            };
+            let read = match parquet_read_budget.as_ref() {
+                Some(budget) => read.with_parquet_read_budget(Arc::clone(budget)),
+                None => read,
+            };
+            let mut batches = read.to_arrow(&[split])?;
+            let mut expected_row_id = shard.row_range_start;
+            let mut rows_seen = 0usize;
+            let mut next_training_sample = 0usize;
+            let mut training_buffer = Vec::with_capacity(training_buffer_floats);
+
+            loop {
+                let source_start = timing_enabled.then(Instant::now);
+                let batch = batches.try_next().await?;
+                if let Some(source_start) = source_start {
+                    source_batch_wait = source_batch_wait.saturating_add(source_start.elapsed());
+                }
+                let Some(batch) = batch else { break };
+                batch_count += 1;
+                let vectors = validate_vector_batch(
+                    &batch,
+                    index_column,
+                    dimension_usize,
+                    &mut expected_row_id,
+                )?;
+                let batch_end =
+                    rows_seen
+                        .checked_add(vectors.row_count)
+                        .ok_or_else(|| Error::DataInvalid {
+                            message: "vindex streamed row count overflows usize".to_string(),
+                            source: None,
+                        })?;
+
+                if training_vector_count == row_count_usize {
+                    trainer
+                        .add_training_vectors_mut(vectors.values, vectors.row_count)
+                        .map_err(|e| Error::DataInvalid {
+                            message: format!("Failed to add vindex training vectors: {e}"),
+                            source: Some(Box::new(e)),
+                        })?;
+                } else {
+                    while next_training_sample < training_vector_count {
+                        let sample_row = checked_training_sample_index(
+                            next_training_sample,
+                            row_count_usize,
+                            training_vector_count,
+                        )?;
+                        if sample_row >= batch_end {
+                            break;
+                        }
+                        let start = (sample_row - rows_seen) * dimension_usize;
+                        training_buffer
+                            .extend_from_slice(&vectors.values[start..start + dimension_usize]);
+                        next_training_sample += 1;
+                        if training_buffer.len() == training_buffer_floats {
+                            trainer
+                                .add_training_vectors_mut(
+                                    &training_buffer,
+                                    training_buffer.len() / dimension_usize,
+                                )
+                                .map_err(|e| Error::DataInvalid {
+                                    message: format!("Failed to add vindex training vectors: {e}"),
+                                    source: Some(Box::new(e)),
+                                })?;
+                            training_buffer.clear();
+                        }
+                    }
+                }
+
+                let raw_write_start = timing_enabled.then(Instant::now);
+                raw_file
+                    .write_all(vectors.bytes)
+                    .await
+                    .map_err(|e| Error::UnexpectedError {
+                        message: format!("Failed to spill vindex vectors: {e}"),
+                        source: Some(Box::new(e)),
+                    })?;
+                if let Some(raw_write_start) = raw_write_start {
+                    raw_temp_write = raw_temp_write.saturating_add(raw_write_start.elapsed());
+                }
+                bytes_written =
+                    bytes_written
+                        .checked_add(vectors.bytes.len())
+                        .ok_or_else(|| Error::DataInvalid {
+                            message: "vindex spilled byte count overflows usize".to_string(),
+                            source: None,
+                        })?;
+                rows_seen = batch_end;
+            }
+
+            if !training_buffer.is_empty() {
+                trainer
+                    .add_training_vectors_mut(
+                        &training_buffer,
+                        training_buffer.len() / dimension_usize,
+                    )
+                    .map_err(|e| Error::DataInvalid {
+                        message: format!("Failed to add vindex training vectors: {e}"),
+                        source: Some(Box::new(e)),
+                    })?;
+            }
+            let expected_end =
+                shard
+                    .row_range_end
+                    .checked_add(1)
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: "vindex row range end overflows i64".to_string(),
+                        source: None,
+                    })?;
+            if rows_seen != row_count_usize
+                || expected_row_id != expected_end
+                || (training_vector_count != row_count_usize
+                    && next_training_sample != training_vector_count)
+                || bytes_written != expected_bytes
+            {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "vindex streamed data mismatch: rows={rows_seen}/{row_count_usize}, training={next_training_sample}/{training_vector_count}, bytes={bytes_written}/{expected_bytes}"
+                    ),
+                    source: None,
+                });
+            }
+            training_rows_seen = training_vector_count;
+            let raw_write_start = timing_enabled.then(Instant::now);
+            raw_file.flush().await.map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to flush temporary vindex vector file: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+            if let Some(raw_write_start) = raw_write_start {
+                raw_temp_write = raw_temp_write.saturating_add(raw_write_start.elapsed());
+            }
+            let raw_file_len = raw_file
+                .metadata()
+                .await
+                .map_err(|e| Error::UnexpectedError {
+                    message: format!("Failed to inspect temporary vindex vector file: {e}"),
+                    source: Some(Box::new(e)),
+                })?
+                .len();
+            if raw_file_len != expected_bytes as u64 {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "temporary vindex vector file size mismatch: {raw_file_len}/{expected_bytes}"
+                    ),
+                    source: None,
+                });
+            }
+            let raw_file = raw_file.into_std().await;
+
+            let result = tokio::task::spawn_blocking(
+                move || -> std::io::Result<(VectorIndexWriter, Duration, Duration, Duration)> {
+                    let train_start = timing_enabled.then(Instant::now);
+                    let training = trainer.finish()?;
+                    let train_finish = train_start.map_or(Duration::ZERO, |start| start.elapsed());
+                    let mut writer = VectorIndexWriter::new(training);
+                    let mut raw_temp_reread = Duration::ZERO;
+                    let mut index_add = Duration::ZERO;
+                    let mut raw_file = raw_file;
                     let reread_start = timing_enabled.then(Instant::now);
-                    raw_file.read_exact(buffer.as_slice_mut())?;
+                    raw_file.seek(SeekFrom::Start(0))?;
                     if let Some(start) = reread_start {
                         raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
                     }
-                    ids.clear();
-                    for row in rows_added..rows_added + rows {
-                        ids.push(i64::try_from(row).map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "vindex row id does not fit i64",
-                            )
-                        })?);
+                    let batch_rows = training_buffer_rows.min(row_count_usize);
+                    let batch_bytes = checked_std_vector_bytes(batch_rows, dimension_usize)?;
+                    let mut buffer = MutableBuffer::new(batch_bytes);
+                    let mut ids = Vec::with_capacity(batch_rows);
+                    let mut rows_added = 0usize;
+                    while rows_added < row_count_usize {
+                        let rows = batch_rows.min(row_count_usize - rows_added);
+                        buffer.resize(checked_std_vector_bytes(rows, dimension_usize)?, 0);
+                        let reread_start = timing_enabled.then(Instant::now);
+                        raw_file.read_exact(buffer.as_slice_mut())?;
+                        if let Some(start) = reread_start {
+                            raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
+                        }
+                        ids.clear();
+                        for row in rows_added..rows_added + rows {
+                            ids.push(i64::try_from(row).map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "vindex row id does not fit i64",
+                                )
+                            })?);
+                        }
+                        let add_start = timing_enabled.then(Instant::now);
+                        writer.add_vectors(&ids, buffer.typed_data::<f32>(), rows)?;
+                        if let Some(start) = add_start {
+                            index_add = index_add.saturating_add(start.elapsed());
+                        }
+                        rows_added += rows;
                     }
-                    let add_start = timing_enabled.then(Instant::now);
-                    writer.add_vectors(&ids, buffer.typed_data::<f32>(), rows)?;
-                    if let Some(start) = add_start {
-                        index_add = index_add.saturating_add(start.elapsed());
+                    let mut trailing = [0u8; 1];
+                    let reread_start = timing_enabled.then(Instant::now);
+                    if raw_file.read(&mut trailing)? != 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "temporary vindex vector file contains trailing bytes",
+                        ));
                     }
-                    rows_added += rows;
-                }
-                let mut trailing = [0u8; 1];
-                let reread_start = timing_enabled.then(Instant::now);
-                if raw_file.read(&mut trailing)? != 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "temporary vindex vector file contains trailing bytes",
-                    ));
-                }
-                if let Some(start) = reread_start {
-                    raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
-                }
-                Ok((writer, train_finish, raw_temp_reread, index_add))
-            },
-        )
-        .await
-        .map_err(|e| Error::UnexpectedError {
-            message: format!("vindex training task failed: {e}"),
-            source: None,
-        })?
-        .map_err(|e| Error::UnexpectedError {
-            message: format!("Failed to train or add vectors to vindex index: {e}"),
-            source: Some(Box::new(e)),
-        })?;
+                    if let Some(start) = reread_start {
+                        raw_temp_reread = raw_temp_reread.saturating_add(start.elapsed());
+                    }
+                    Ok((writer, train_finish, raw_temp_reread, index_add))
+                },
+            )
+            .await
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("vindex training task failed: {e}"),
+                source: None,
+            })?
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to train or add vectors to vindex index: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+            train_finish = result.1;
+            raw_temp_reread = result.2;
+            index_add = result.3;
+            result.0
+        };
+
+        if let Some(timing) = read_timing.as_ref() {
+            log_read_phase("full_scan", shard, timing, sample_io);
+        }
 
         let serialize_upload_start = timing_enabled.then(Instant::now);
         self.table
@@ -403,6 +783,9 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             .map_or((Duration::ZERO, Duration::ZERO), |timing| {
                 (timing.file_read(), timing.parquet_decode())
             });
+        let (oss_read_bytes, oss_range_requests) = read_timing
+            .as_ref()
+            .map_or((0, 0), |timing| timing.file_io());
         let (file_schema_open, first_batch_wait, remaining_batch_wait) = read_timing
             .as_ref()
             .map_or((Duration::ZERO, Duration::ZERO, Duration::ZERO), |timing| {
@@ -415,6 +798,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             total_without_commit: start.elapsed(),
             source_batch_wait,
             oss_read,
+            oss_read_bytes,
+            oss_range_requests,
             parquet_decode,
             file_schema_open,
             first_batch_wait,
@@ -425,14 +810,24 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             parquet_projected_bytes_total: parquet_diagnostics.projected_bytes_total,
             parquet_peak_inflight_row_groups: parquet_diagnostics.peak_inflight,
             raw_temp_write,
+            capability_check,
+            sample_read,
             train_finish,
             raw_temp_reread,
             index_add,
+            full_scan_add,
+            pipeline_blocked,
+            producer_blocked,
+            consumer_validate_add,
             serialize_upload,
             rows: row_count_usize,
-            training_rows_seen: training_vector_count,
+            training_rows_seen,
             training_rows_retained,
             batch_count,
+            batch_bytes_min,
+            batch_bytes_max,
+            batch_bytes_total,
+            peak_ready_batches,
             raw_temp_bytes: bytes_written,
             index_bytes: status.size,
             data_file_count: shard.files.len(),

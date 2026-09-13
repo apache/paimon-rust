@@ -17,8 +17,14 @@
 
 use crate::spec::{CoreOptions, DataField, ManifestEntry};
 use crate::table::global_index_build_common::vector::{plan_vector_index_shards, VectorIndexShard};
-use crate::table::RowRange;
-use crate::Result;
+use crate::table::{merge_row_ranges, RowRange};
+use crate::{Error, Result};
+
+use super::validation::checked_row_count;
+
+// Keep samples short enough to avoid storage-order bias; fall back before range I/O explodes.
+const MAX_IVF_TRAINING_RANGE_ROWS: usize = 128;
+const MAX_IVF_TRAINING_RANGES: usize = 4_096;
 
 pub(crate) type VindexIndexShard = VectorIndexShard;
 
@@ -44,4 +50,79 @@ pub(super) fn plan_vindex_shards(
         indexed,
         "vindex",
     )
+}
+
+pub(super) fn plan_ivf_training_ranges(
+    shard: &VindexIndexShard,
+    training_rows: usize,
+) -> Result<Option<Vec<RowRange>>> {
+    let shard_rows = usize::try_from(checked_row_count(
+        shard.row_range_start,
+        shard.row_range_end,
+    )?)
+    .map_err(|error| Error::DataInvalid {
+        message: "vindex shard row count does not fit usize".to_string(),
+        source: Some(Box::new(error)),
+    })?;
+    if training_rows == 0 || training_rows > shard_rows {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Invalid IVF training row count: {training_rows}; shard contains {shard_rows} rows"
+            ),
+            source: None,
+        });
+    }
+    let range_count = training_rows.div_ceil(MAX_IVF_TRAINING_RANGE_ROWS);
+    if range_count == 1 || range_count > MAX_IVF_TRAINING_RANGES {
+        return Ok(None);
+    }
+    let seed = ivf_training_seed(shard);
+    let mut cursor = shard.row_range_start;
+    let mut ranges = Vec::with_capacity(range_count);
+
+    for range_index in 0..range_count {
+        let stratum_length =
+            shard_rows / range_count + usize::from(range_index < shard_rows % range_count);
+        let length =
+            training_rows / range_count + usize::from(range_index < training_rows % range_count);
+        debug_assert!(length <= stratum_length);
+        let available_offsets = stratum_length - length + 1;
+        let offset = mix_seed(seed ^ range_index as u64) as usize % available_offsets;
+        let start = checked_add_offset(cursor, offset, "training range")?;
+        let end = checked_add_offset(start, length - 1, "training range")?;
+        ranges.push(RowRange::new(start, end));
+        cursor = checked_add_offset(cursor, stratum_length, "training stratum")?;
+    }
+
+    Ok(Some(merge_row_ranges(ranges)))
+}
+
+pub(super) fn ivf_training_seed(shard: &VindexIndexShard) -> u64 {
+    let mut seed = mix_seed(
+        (shard.snapshot_id as u64)
+            ^ (shard.row_range_start as u64).rotate_left(21)
+            ^ (shard.row_range_end as u64).rotate_left(42)
+            ^ (shard.source_bucket as u64).rotate_left(11),
+    );
+    for byte in &shard.partition_bytes {
+        seed = mix_seed(seed ^ u64::from(*byte));
+    }
+    seed
+}
+
+fn checked_add_offset(value: i64, offset: usize, name: &str) -> Result<i64> {
+    let offset = i64::try_from(offset).map_err(|error| Error::DataInvalid {
+        message: format!("vindex {name} offset does not fit i64"),
+        source: Some(Box::new(error)),
+    })?;
+    value.checked_add(offset).ok_or_else(|| Error::DataInvalid {
+        message: format!("vindex {name} offset overflows i64"),
+        source: None,
+    })
+}
+
+fn mix_seed(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
