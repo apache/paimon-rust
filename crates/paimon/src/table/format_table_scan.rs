@@ -20,7 +20,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::format_partition::{
-    format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
+    format_partition_value, is_storage_not_found, parse_format_partition_value,
+    FormatTablePartitionPaths,
 };
 use super::{Plan, RESTEnv, ScanTrace, Table};
 use crate::api::RestError;
@@ -450,21 +451,17 @@ fn is_format_table_data_file_name(file_name: &str) -> bool {
 }
 
 /// The non-hidden files with the format's extension that a Format Table scan reads below `root`.
-/// A missing root holds no files; any other listing failure is returned, never a partial list.
+/// Only a root the store reports as not found holds no files; other listing failures are returned.
 pub(crate) async fn list_format_table_data_files(
     file_io: &crate::io::FileIO,
     root: &str,
     partition_levels_below_root: usize,
     format_extension: &str,
 ) -> crate::Result<Vec<crate::io::FileStatus>> {
-    let statuses = match file_io.list_status_recursive(root).await {
-        Ok(statuses) => statuses,
-        Err(error) => {
-            if !file_io.exists(root).await.unwrap_or(true) {
-                return Ok(Vec::new());
-            }
-            return Err(error);
-        }
+    let statuses = match file_io.list_status_recursive_stream(root, None).await {
+        Ok(listing) => collect_listing(listing).await?,
+        Err(error) if is_storage_not_found(&error) => Vec::new(),
+        Err(error) => return Err(error),
     };
     let root_segments = path_segments(root);
     let mut files = Vec::with_capacity(statuses.len());
@@ -487,6 +484,23 @@ pub(crate) async fn list_format_table_data_files(
         files.push(status);
     }
     Ok(files)
+}
+
+/// Every listed status, or none when the store reports the root not found before listing anything.
+async fn collect_listing(
+    mut listing: impl futures::Stream<Item = crate::Result<crate::io::FileStatus>> + Unpin,
+) -> crate::Result<Vec<crate::io::FileStatus>> {
+    let mut statuses = Vec::new();
+    while let Some(status) = listing.next().await {
+        match status {
+            Ok(status) => statuses.push(status),
+            Err(error) if statuses.is_empty() && is_storage_not_found(&error) => {
+                return Ok(statuses)
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(statuses)
 }
 
 /// Whether a listed file is, or lies inside, an entry whose name starts with `.` or `_` below
@@ -1141,6 +1155,38 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn test_listing_failure_is_not_read_as_an_empty_directory() {
+        let file = crate::io::FileStatus {
+            size: 1,
+            is_dir: false,
+            path: "memory:/t/dt=a/part-0.parquet".to_string(),
+            last_modified: None,
+        };
+        let failure = |kind: opendal::ErrorKind| crate::Error::IoUnexpected {
+            message: "list partition directory".to_string(),
+            source: Box::new(opendal::Error::new(kind, "injected")),
+        };
+        // A failure after a listed file, or of any kind but not found, is not an empty list.
+        for listing in [
+            vec![
+                Ok(file.clone()),
+                Err(failure(opendal::ErrorKind::Unexpected)),
+            ],
+            vec![Err(failure(opendal::ErrorKind::Unexpected))],
+            vec![Ok(file.clone()), Err(failure(opendal::ErrorKind::NotFound))],
+        ] {
+            assert!(collect_listing(futures::stream::iter(listing))
+                .await
+                .is_err());
+        }
+        let missing = vec![Err(failure(opendal::ErrorKind::NotFound))];
+        assert!(collect_listing(futures::stream::iter(missing))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
