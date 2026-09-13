@@ -181,8 +181,48 @@ fn residual_id_gt(threshold: i32) -> FilePredicates {
     }
 }
 
-fn sorted(t: &roaring::RoaringTreemap) -> Vec<u64> {
-    t.iter().collect()
+fn sorted(ranges: &[RowRange]) -> Vec<u64> {
+    ranges
+        .iter()
+        .flat_map(|r| (r.from() as u64)..=(r.to() as u64))
+        .collect()
+}
+
+#[tokio::test]
+async fn residual_ranges_coalesce_matches_without_bridging_gaps() {
+    let (reader, split, active) = build_reader_and_split(
+        "memory:/residual_range_gaps",
+        &[("part-0.mosaic", vec![7, 7, 0, 7, 7, 0, 7], 100)],
+    )
+    .await;
+    let ranges = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(0), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        ranges["part-0.mosaic"],
+        vec![
+            RowRange::new(0, 1),
+            RowRange::new(3, 4),
+            RowRange::new(6, 6)
+        ]
+    );
+
+    let allowed = HashMap::from([(
+        "part-0.mosaic".to_string(),
+        vec![RowRange::new(1, 3), RowRange::new(5, 6)],
+    )]);
+    let ranges =
+        residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(0), Some(&allowed))
+            .await
+            .unwrap();
+    assert_eq!(
+        ranges["part-0.mosaic"],
+        vec![
+            RowRange::new(1, 1),
+            RowRange::new(3, 3),
+            RowRange::new(6, 6)
+        ]
+    );
 }
 
 #[tokio::test]
@@ -193,7 +233,7 @@ async fn test_residual_selects_matching_positions() {
         &[("part-0.mosaic", vec![1, 2, 3, 4, 5], 0)],
     )
     .await;
-    let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2), None)
+    let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(2), None)
         .await
         .unwrap();
     assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
@@ -215,7 +255,7 @@ async fn test_residual_only_evaluates_the_rows_the_plan_allows() {
     .await;
     let allowed = HashMap::from([("part-0.mosaic".to_string(), vec![RowRange::new(3, 4)])]);
     let map =
-        residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2), Some(&allowed))
+        residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(2), Some(&allowed))
             .await
             .unwrap();
     assert_eq!(sorted(&map["part-0.mosaic"]), vec![3, 4]);
@@ -233,7 +273,7 @@ async fn test_residual_does_not_read_a_file_the_plan_excludes() {
     .await;
 
     let excluded = HashMap::from([("part-0.mosaic".to_string(), Vec::new())]);
-    let map = residual_positions_by_file(
+    let map = residual_row_ranges_by_file(
         &reader,
         &split,
         &active,
@@ -246,7 +286,7 @@ async fn test_residual_does_not_read_a_file_the_plan_excludes() {
     assert!(sorted(&map["part-0.mosaic"]).is_empty());
 
     let unrestricted = HashMap::new();
-    let map = residual_positions_by_file(
+    let map = residual_row_ranges_by_file(
         &reader,
         &split,
         &active,
@@ -263,7 +303,7 @@ async fn test_residual_matches_none_yields_empty_entry() {
     // id > 100 matches nothing; the file still gets a (present, empty) entry.
     let (reader, split, active) =
         build_reader_and_split("memory:/rpf_none", &[("part-0.mosaic", vec![1, 2, 3], 0)]).await;
-    let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(100), None)
+    let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(100), None)
         .await
         .unwrap();
     assert!(map.contains_key("part-0.mosaic"));
@@ -274,7 +314,7 @@ async fn test_residual_matches_none_yields_empty_entry() {
 async fn test_residual_matches_all_yields_full_set() {
     let (reader, split, active) =
         build_reader_and_split("memory:/rpf_all", &[("part-0.mosaic", vec![1, 2, 3], 0)]).await;
-    let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0), None)
+    let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(0), None)
         .await
         .unwrap();
     assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
@@ -292,7 +332,7 @@ async fn test_residual_positions_are_file_local_across_files() {
         ],
     )
     .await;
-    let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(3), None)
+    let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(3), None)
         .await
         .unwrap();
     assert_eq!(sorted(&map["part-0.mosaic"]), vec![3, 4]);
@@ -335,7 +375,7 @@ async fn test_non_active_files_are_skipped() {
         .with_data_files(metas)
         .build()
         .unwrap();
-    let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(2), None)
+    let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(2), None)
         .await
         .unwrap();
     assert_eq!(sorted(&map["part-0.mosaic"]), vec![2, 3, 4]);
@@ -351,7 +391,7 @@ async fn test_missing_first_row_id_recovers_local_positions() {
     // recovered from each row's ordinal in the scan, so the residual still
     // works: ids [1,2,3] with id > 0 -> all match -> local positions [0,1,2].
     let (reader, split, active) = build_reader_and_split_no_first_row_id().await;
-    let map = residual_positions_by_file(&reader, &split, &active, &residual_id_gt(0), None)
+    let map = residual_row_ranges_by_file(&reader, &split, &active, &residual_id_gt(0), None)
         .await
         .expect("missing first_row_id must not fail the residual read");
     assert_eq!(sorted(&map["part-0.mosaic"]), vec![0, 1, 2]);
@@ -397,22 +437,13 @@ async fn build_reader_and_split_no_first_row_id(
 
 // ---- combining the plan's positional restriction with the residual ----
 
-fn allow_list(entries: &[(&str, &[u64])]) -> HashMap<String, RoaringTreemap> {
-    entries
-        .iter()
-        .map(|(file, positions)| ((*file).to_string(), positions.iter().copied().collect()))
-        .collect()
-}
-
-/// The plan side carries ranges, so its fixtures are built from the positions
-/// each file allows and coalesced the way the planner normalizes them.
-fn range_allow_list(entries: &[(&str, &[u64])]) -> HashMap<String, Vec<RowRange>> {
+fn range_allow_list(entries: &[(&str, &[u64])]) -> RowRangesByFile {
     entries
         .iter()
         .map(|(file, positions)| {
             let ranges = positions
                 .iter()
-                .map(|p| RowRange::new(*p as i64, *p as i64))
+                .map(|&p| RowRange::new(p as i64, p as i64))
                 .collect();
             ((*file).to_string(), merge_row_ranges(ranges))
         })
@@ -421,11 +452,10 @@ fn range_allow_list(entries: &[(&str, &[u64])]) -> HashMap<String, Vec<RowRange>
 
 /// The positions a merged selection allows, expanded for readable assertions.
 /// Test-only: the production path never expands a range.
-fn listed(map: &FileRowSelections, file: &str) -> Vec<u64> {
+fn listed(map: &RowRangesByFile, file: &str) -> Vec<u64> {
     match map.get(file) {
         None => Vec::new(),
-        Some(FileRowSelection::Positions(positions)) => positions.iter().collect(),
-        Some(FileRowSelection::Ranges(ranges)) => ranges
+        Some(ranges) => ranges
             .iter()
             .flat_map(|range| (range.from() as u64)..=(range.to() as u64))
             .collect(),
@@ -434,25 +464,41 @@ fn listed(map: &FileRowSelections, file: &str) -> Vec<u64> {
 
 #[test]
 fn no_restriction_on_either_side_stays_unrestricted() {
-    assert!(intersect_row_allow_lists(None, None, 1).unwrap().is_none());
+    assert!(intersect_row_ranges_by_split(None, None, 1)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn range_intersection_keeps_large_spans_compact_and_inclusive() {
+    let physical = vec![HashMap::from([(
+        "f".to_string(),
+        vec![RowRange::new(1, i64::MAX)],
+    )])];
+    let residual = vec![HashMap::from([(
+        "f".to_string(),
+        vec![RowRange::new(0, 1), RowRange::new(i64::MAX - 1, i64::MAX)],
+    )])];
+    let combined = intersect_row_ranges_by_split(Some(&physical), Some(residual), 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        combined[0]["f"],
+        vec![RowRange::new(1, 1), RowRange::new(i64::MAX - 1, i64::MAX)]
+    );
 }
 
 #[test]
 fn one_side_alone_passes_through() {
     let physical = vec![range_allow_list(&[("d0", &[1, 2])])];
-    let only_physical = intersect_row_allow_lists(Some(&physical), None, 1)
+    let only_physical = intersect_row_ranges_by_split(Some(&physical), None, 1)
         .unwrap()
         .expect("a plan restriction survives on its own");
     assert_eq!(listed(&only_physical[0], "d0"), vec![1, 2]);
-    // Still intervals. Expanding them here is the unbounded step the plan side
-    // must never take, and the positions above cannot tell the two apart.
-    assert!(
-        matches!(only_physical[0]["d0"], FileRowSelection::Ranges(_)),
-        "the plan's ranges must reach the search as ranges"
-    );
+    assert_eq!(only_physical[0]["d0"], vec![RowRange::new(1, 2)]);
 
-    let residual = vec![allow_list(&[("d0", &[3])])];
-    let only_residual = intersect_row_allow_lists(None, Some(residual), 1)
+    let residual = vec![range_allow_list(&[("d0", &[3])])];
+    let only_residual = intersect_row_ranges_by_split(None, Some(residual), 1)
         .unwrap()
         .expect("a residual survives on its own");
     assert_eq!(listed(&only_residual[0], "d0"), vec![3]);
@@ -466,13 +512,13 @@ fn both_sides_intersect_and_the_residual_stays_fail_closed() {
     // must not resurrect the file, and neither may its absence make it
     // unrestricted.
     let physical = vec![range_allow_list(&[("d0", &[1, 2, 3]), ("d1", &[0, 1])])];
-    let residual = vec![allow_list(&[("d0", &[2, 3, 4])])];
-    let combined = intersect_row_allow_lists(Some(&physical), Some(residual), 1)
+    let residual = vec![range_allow_list(&[("d0", &[2, 3, 4])])];
+    let combined = intersect_row_ranges_by_split(Some(&physical), Some(residual), 1)
         .unwrap()
         .expect("both sides restrict");
     assert_eq!(listed(&combined[0], "d0"), vec![2, 3]);
     assert!(
-        combined[0]["d1"].is_excluded(),
+        combined[0]["d1"].is_empty(),
         "a file the residual omits must stay excluded"
     );
 }
@@ -483,13 +529,13 @@ fn a_file_neither_side_restricts_stays_absent() {
     // entry for a file no one narrowed, or the ANN backend takes the filtered
     // path for a query that filters nothing.
     let physical = vec![range_allow_list(&[("d0", &[1])])];
-    let combined = intersect_row_allow_lists(Some(&physical), None, 1)
+    let combined = intersect_row_ranges_by_split(Some(&physical), None, 1)
         .unwrap()
         .expect("the plan restricts d0");
     assert!(!combined[0].contains_key("d1"));
 
-    let residual = vec![allow_list(&[("d0", &[1])])];
-    let combined = intersect_row_allow_lists(Some(&physical), Some(residual), 1)
+    let residual = vec![range_allow_list(&[("d0", &[1])])];
+    let combined = intersect_row_ranges_by_split(Some(&physical), Some(residual), 1)
         .unwrap()
         .expect("both restrict d0");
     assert!(!combined[0].contains_key("d1"));
@@ -502,7 +548,7 @@ fn a_plan_that_restricts_nothing_produces_an_empty_selection_map() {
     // and that must survive the merge as an empty map (which the ANN layer reads
     // as "nothing to mask"), not become a per-file all-permitting mask.
     let physical = vec![HashMap::new()];
-    let combined = intersect_row_allow_lists(Some(&physical), None, 1)
+    let combined = intersect_row_ranges_by_split(Some(&physical), None, 1)
         .unwrap()
         .expect("a split-driven plan is always Some");
     assert!(combined[0].is_empty());
@@ -523,13 +569,13 @@ fn take_only_result_rejects_bad_batch_arity() {
 #[test]
 fn rejects_allow_lists_that_do_not_cover_every_split() {
     let physical = vec![range_allow_list(&[("d0", &[1])])];
-    let error = intersect_row_allow_lists(Some(&physical), None, 2)
+    let error = intersect_row_ranges_by_split(Some(&physical), None, 2)
         .map(|_| ())
         .expect_err("an allow-list per split is what makes the index meaningful");
     assert!(error.to_string().contains("for 2 splits"), "{error}");
 
-    let residual = vec![allow_list(&[("d0", &[1])])];
-    let error = intersect_row_allow_lists(Some(&physical), Some(residual), 2)
+    let residual = vec![range_allow_list(&[("d0", &[1])])];
+    let error = intersect_row_ranges_by_split(Some(&physical), Some(residual), 2)
         .map(|_| ())
         .expect_err("the residual must cover every split too");
     assert!(error.to_string().contains("for 2 splits"), "{error}");

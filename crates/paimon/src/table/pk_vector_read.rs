@@ -35,6 +35,7 @@ use crate::table::pk_vector_orchestrator::{
 use crate::table::pk_vector_position_read::{PkVectorPositionRead, PKEY_VECTOR_POSITION_COLUMN};
 use crate::table::pk_vector_scan::PkVectorScanPlan;
 use crate::table::pk_vector_search_params::PkVectorSearchParams;
+use crate::table::row_id_predicate::intersect_sorted_ranges;
 use crate::table::source::DataSplit;
 use crate::table::vector_read::Read;
 use crate::table::vector_search_common::{
@@ -46,12 +47,11 @@ use crate::vector_search::{GlobalIndexIOMeta, SearchResult, VectorSearch};
 use crate::vindex::pkvector::ann::{AnnSegmentSource, PkVectorAnnSearcher, VindexAnnSearcher};
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment, ExactFileSearchFuture};
 use crate::vindex::pkvector::metric::VectorSearchMetric;
-use crate::vindex::pkvector::{FileRowSelection, FileRowSelections};
+use crate::vindex::pkvector::RowRangesByFile;
 use crate::vindex::range_reader::{RangeReadLimiter, VindexFileReader};
 use crate::vindex::reader::VindexVectorGlobalIndexReader;
 use arrow_array::{Array, Int64Array, RecordBatch};
 use futures::{stream, TryStreamExt};
-use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
@@ -183,41 +183,16 @@ pub(super) async fn materialize_positions(
     Ok(Box::pin(stream::iter(output.into_iter().map(Ok))))
 }
 
-/// Search an already-resolved plan across every query and return each query's raw
-/// indexed and exact candidate lists, before any rerank or merge.
-///
-/// Plan-dependent concurrency — the vindex segment count, batch-index parallelism
-/// and the range-read bound — is derived here from the plan that is actually being
-/// searched, so a narrowed plan can never be searched under limits computed for a
-/// wider one.
-/// Combine the two per-split row allow-lists a search can be handed: the physical
-/// rows an engine-supplied plan restricts each file to, and the positions a residual
-/// data predicate leaves behind.
-///
-/// The two sides read a file's ABSENCE differently, and the merge has to respect
-/// both readings:
-///
-/// * The plan lists only what the engine's split narrowed, so an absent file is
-///   unrestricted -- Java's `rowRangesByFile.get(file) == null`.
-/// * The residual is exhaustive over the files a search can read from
-///   (`residual_positions_by_file` registers every active file, empty when nothing
-///   passed), so once a residual exists its silence about a file means "no rows".
-///
-/// So: with no residual, a file the plan omits stays absent and unrestricted. With a
-/// residual, a file it omits is excluded even if the plan restricted it, and a file
-/// both describe keeps the intersection. Absent from BOTH is unrestricted, which is
-/// what lets the ANN backend search unfiltered.
-///
-/// The plan's ranges stay ranges. Expanding them into positions would be work sized
-/// by row counts that arrived on the wire; where an intersection is genuinely needed
-/// the residual positions — bounded by the rows its own read returned — are filtered
-/// BY the ranges instead. When the residual was evaluated over those same ranges the
-/// intersection cannot remove anything, and is kept as the invariant that says so.
-fn intersect_row_allow_lists(
-    physical: Option<&[HashMap<String, Vec<RowRange>>]>,
-    residual: Option<Vec<HashMap<String, RoaringTreemap>>>,
+/// Intersect the plan's physical row ranges with the residual predicate's ranges.
+/// The plan omits unrestricted files; the residual registers every active file,
+/// including empty results. A file listed only by the plan must therefore stay
+/// excluded when a residual exists. Files absent from both inputs stay absent.
+/// Both inputs are sorted and merged, so intersection never expands large spans.
+fn intersect_row_ranges_by_split(
+    physical: Option<&[RowRangesByFile]>,
+    residual: Option<Vec<RowRangesByFile>>,
     split_count: usize,
-) -> crate::Result<Option<Vec<FileRowSelections>>> {
+) -> crate::Result<Option<Vec<RowRangesByFile>>> {
     if let Some(maps) = physical {
         if maps.len() != split_count {
             return Err(crate::Error::DataInvalid {
@@ -241,72 +216,28 @@ fn intersect_row_allow_lists(
         }
     }
     match (physical, residual) {
-        (None, None) => Ok(None),
-        (None, Some(residual)) => Ok(Some(
-            residual
-                .into_iter()
-                .map(|per_file| {
-                    per_file
-                        .into_iter()
-                        .map(|(file, positions)| (file, FileRowSelection::Positions(positions)))
-                        .collect()
-                })
-                .collect(),
-        )),
-        (Some(physical), None) => Ok(Some(
+        (None, residual) => Ok(residual),
+        (Some(physical), None) => Ok(Some(physical.to_vec())),
+        (Some(physical), Some(residual)) => Ok(Some(
             physical
                 .iter()
-                .map(|per_file| {
-                    per_file
-                        .iter()
-                        .map(|(file, ranges)| {
-                            (file.clone(), FileRowSelection::Ranges(ranges.clone()))
-                        })
-                        .collect()
+                .zip(residual)
+                .map(|(physical, mut residual)| {
+                    for (file, ranges) in physical {
+                        // The residual covers every active file. A missing entry
+                        // must not restore rows excluded by that residual.
+                        let allowed = residual.entry(file.clone()).or_default();
+                        *allowed = intersect_sorted_ranges(ranges, allowed);
+                    }
+                    residual
                 })
                 .collect(),
         )),
-        (Some(physical), Some(residual)) => {
-            Ok(Some(
-                physical
-                    .iter()
-                    .zip(residual)
-                    .map(|(physical, mut residual)| {
-                        let mut merged: FileRowSelections = HashMap::new();
-                        for (file, ranges) in physical {
-                            let range_selection = FileRowSelection::Ranges(ranges.clone());
-                            let selection = match residual.remove(file.as_str()) {
-                                // Both restrict: keep the positions the ranges also
-                                // allow. Filtering the positions (bounded by the read)
-                                // by the ranges never expands the ranges.
-                                Some(positions) => FileRowSelection::Positions(
-                                    positions
-                                        .iter()
-                                        .filter(|position| range_selection.contains(*position))
-                                        .collect(),
-                                ),
-                                // The residual is exhaustive over the files the search
-                                // can read from -- `residual_positions_by_file`
-                                // registers every active file, empty when nothing
-                                // passed. Its silence about a file therefore means "no
-                                // rows", NOT "unrestricted", and must stay fail-closed
-                                // here even though the plan has something to say.
-                                None => FileRowSelection::Positions(RoaringTreemap::new()),
-                            };
-                            merged.insert(file.clone(), selection);
-                        }
-                        // Whatever the residual restricted and the plan did not.
-                        merged.extend(residual.into_iter().map(|(file, positions)| {
-                            (file, FileRowSelection::Positions(positions))
-                        }));
-                        merged
-                    })
-                    .collect(),
-            ))
-        }
     }
 }
 
+/// Search a resolved plan across all queries before reranking and merging.
+/// Concurrency is derived from the actual plan, including external split subsets.
 #[allow(clippy::too_many_arguments)]
 async fn search_pk_raw_candidates_batch_with_plan(
     table: &Table,
@@ -481,21 +412,11 @@ async fn search_pk_raw_candidates_batch_with_plan(
         field_name, scorer, loader,
     ));
 
-    // Residual (post-recall) filtering: for each candidate file, re-read its
-    // physical rows and keep the positions whose rows satisfy the filter. The
-    // per-split allow-list is threaded into the bucket search so the residual folds
-    // into recall (best-first order and Top-K are preserved). Built only when the
-    // filter has data (non-partition) conjuncts; a partition-only filter (or no
-    // filter) leaves `None`, which leaves the search unfiltered — partition
-    // pruning is already handled in planning. The residual depends only on the
-    // filter and the plan, not the query vector, so it is computed once here and
-    // shared across every query in the batch. The residual reader projects only
-    // the predicate columns and carries no pushdown; `residual_positions_by_file`
-    // recovers each surviving row's file-local physical position from its ordinal
-    // in the unfiltered scan (no `_ROW_ID`, no `first_row_id`). A file the
-    // allow-list leaves empty is skipped by the bucket search without opening an
-    // exact reader.
-    let residual_by_split: Option<Vec<HashMap<String, RoaringTreemap>>> = match filter {
+    // Resolve data predicates before recall so both ANN and exact Top-K honor
+    // them. Partition-only predicates were already applied by the scan. The
+    // residual depends on the filter and plan, so its file-local ranges are
+    // shared by all queries. A file with an empty range list is skipped.
+    let residual_by_split: Option<Vec<RowRangesByFile>> = match filter {
         Some(filter) => {
             // The whole filter is pushed into scan planning (`PkVectorScan`), where
             // partition-only conjuncts already prune partitions/files. Re-applying
@@ -537,7 +458,7 @@ async fn search_pk_raw_candidates_batch_with_plan(
                         .as_ref()
                         .and_then(|per_split| per_split.get(index));
                     per_split.push(
-                        residual_positions_by_file(
+                        residual_row_ranges_by_file(
                             &residual_reader,
                             &split.data_split,
                             &split.active_files,
@@ -552,11 +473,8 @@ async fn search_pk_raw_candidates_batch_with_plan(
         }
         None => None,
     };
-    // Fold the plan's own positional restriction into the same allow-list. A plan
-    // built from engine-supplied bucket splits carries the physical positions each
-    // file is limited to; a plan read from the index manifest carries none. Both
-    // sides list what is permitted, so combining them is an intersection.
-    let row_selections_by_split = intersect_row_allow_lists(
+    // Preserve the external plan's ranges as well as the residual restriction.
+    let row_ranges_by_split = intersect_row_ranges_by_split(
         plan.physical_row_ranges_by_split.as_deref(),
         residual_by_split,
         plan.splits.len(),
@@ -634,7 +552,7 @@ async fn search_pk_raw_candidates_batch_with_plan(
             &factory,
             &search_options,
             skip_exact_fallback,
-            row_selections_by_split.as_deref(),
+            row_ranges_by_split.as_deref(),
             concurrency,
         )
         .await?;
@@ -713,47 +631,30 @@ async fn search_pk_candidates_batch_with_plan(
     Ok(per_query_candidates)
 }
 
-/// Compute, per data file in `split`, the set of file-LOCAL physical row
-/// positions whose rows satisfy the residual predicate. Mirrors the
-/// row-collecting half of Java `PrimaryKeyVectorRead`'s `executeFilter`: the
-/// predicate is NOT pushed down (a pushed filter would drop rows before their
-/// position could be recovered). Instead `reader` projects only the residual
-/// columns and carries no pushdown predicate, the residual is evaluated here at the
-/// Arrow level, and each surviving row's file-local 0-based position is recovered
-/// from the selection the read was limited to. This needs no `_ROW_ID` and no
-/// `first_row_id` — real primary-key tables never write one.
+/// Read the plan's allowed physical rows and return merged ranges matching the
+/// residual, as in Java `PrimaryKeyVectorRead.residualRowRanges`.
 ///
-/// `allowed_rows` is the plan's per-file physical selection, keyed by data-file
-/// name, with the plan's three states: a file it does not list is unrestricted and
-/// the whole file is scanned; an empty range list excludes the file, which is
-/// registered empty without a read; a non-empty list is scanned over exactly those
-/// ranges, because an engine-supplied bucket split can restrict a huge file to a
-/// handful of ranges and reading all of it to discard the rest would defeat the
-/// split.
+/// The reader projects predicate columns without pushing the predicate down, so
+/// each emitted row can be mapped back to its physical position. This uses neither
+/// `_ROW_ID` nor `first_row_id`. Ascending matches are coalesced as they arrive.
 ///
-/// Every *active* data file in the split gets an entry in the RESULT, possibly
-/// empty, and that exhaustiveness is load-bearing. The search kernel reads a file's
-/// absence from its selections as "unrestricted", so an active file missing here
-/// would reach the search with no predicate applied at all -- the residual would be
-/// silently dropped for it. (The merge below reads a residual's silence about a
-/// file the PLAN listed as exclusion, so only a file both omit falls through, which
-/// is exactly the case this exhaustiveness rules out.) Non-active files (e.g.
-/// level-0 files the bucket search excludes) are skipped entirely: they are never
-/// searched, so re-reading them would be wasted IO.
+/// Missing `allowed_rows` entries permit the entire file; empty ranges skip it
+/// without a read. Every active file gets an output entry, including empty results,
+/// so a rejected file cannot become unrestricted in the search kernel. Inactive
+/// files are not searched and need no residual read.
 ///
-/// `reader` must be predicate-free and project the residual columns;
-/// `residual.file_fields` are the fields the residual leaf indices point into
-/// (resolved by name against each emitted batch).
-async fn residual_positions_by_file(
+/// `reader` must be predicate-free; `residual.file_fields` resolves predicate
+/// indices against each emitted batch by name.
+async fn residual_row_ranges_by_file(
     reader: &DataFileReader,
     split: &DataSplit,
     active_files: &[BucketActiveFile],
     residual: &FilePredicates,
-    allowed_rows: Option<&HashMap<String, Vec<RowRange>>>,
-) -> crate::Result<HashMap<String, RoaringTreemap>> {
+    allowed_rows: Option<&RowRangesByFile>,
+) -> crate::Result<RowRangesByFile> {
     let scan_fields = reader.read_type().to_vec();
     let active_names: HashSet<&str> = active_files.iter().map(|f| f.file_name.as_str()).collect();
-    let mut out: HashMap<String, RoaringTreemap> = HashMap::new();
+    let mut out: RowRangesByFile = HashMap::new();
     for file_meta in split.data_files() {
         // Only files the bucket search actually recalls from need residual
         // positions; skip everything else to avoid a wasted read.
@@ -786,18 +687,18 @@ async fn residual_positions_by_file(
         };
         // Register the file up front so a file whose rows all fail the residual
         // still appears in the map (empty set).
-        let positions = out.entry(file_meta.file_name.clone()).or_default();
+        let ranges = out.entry(file_meta.file_name.clone()).or_default();
         // Rows arrive in ascending physical order, and the read emitted exactly what
         // was selected (no pushdown predicate, no deletion vector), so walking the
         // selection in step with the rows recovers each row's file-local position.
-        let mut selected: Box<dyn Iterator<Item = u64> + Send> = match &selection {
+        let mut selected: Box<dyn Iterator<Item = i64> + Send> = match &selection {
             Some(ranges) => Box::new(
                 ranges
                     .clone()
                     .into_iter()
-                    .flat_map(|range| (range.from() as u64)..=(range.to() as u64)),
+                    .flat_map(|range| range.from()..=range.to()),
             ),
-            None => Box::new(0..file_meta.row_count.max(0) as u64),
+            None => Box::new(0..file_meta.row_count.max(0)),
         };
         while let Some(batch) = stream.try_next().await? {
             let num_rows = batch.num_rows();
@@ -823,7 +724,14 @@ async fn residual_positions_by_file(
                     None => true,
                 };
                 if keep {
-                    positions.insert(position);
+                    // Reads return ascending physical positions, so coalesce
+                    // consecutive matches directly into Java's range form.
+                    match ranges.last_mut() {
+                        Some(last) if last.to().checked_add(1) == Some(position) => {
+                            *last = RowRange::new(last.from(), position);
+                        }
+                        _ => ranges.push(RowRange::new(position, position)),
+                    }
                 }
             }
         }
@@ -1023,4 +931,4 @@ async fn rerank_indexed_positional(
 mod tests;
 
 #[cfg(test)]
-mod residual_positions_tests;
+mod residual_row_ranges_tests;

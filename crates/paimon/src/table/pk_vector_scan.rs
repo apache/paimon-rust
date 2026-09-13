@@ -37,6 +37,7 @@ use crate::table::source::{merge_row_ranges, DataSplit, DataSplitBuilder, Deleti
 use crate::table::vector_scan::Scan;
 use crate::table::Table;
 use crate::vindex::pkvector::bucket::{BucketActiveFile, BucketAnnSegment};
+use crate::vindex::pkvector::RowRangesByFile;
 
 /// A payload whose bucket-local path is resolved in planning Phase C, once the
 /// owning bucket's data split (and directory) is known.
@@ -229,7 +230,7 @@ pub(crate) struct PkVectorScanPlan {
     // carry row ranges the engine's own planner already resolved -- possibly an
     // empty map, when that planner narrowed nothing. `None` for a plan read from
     // this table's index manifest, which places no positional restriction at all.
-    pub physical_row_ranges_by_split: Option<Vec<HashMap<String, Vec<RowRange>>>>,
+    pub physical_row_ranges_by_split: Option<Vec<RowRangesByFile>>,
 }
 
 pub(crate) struct PkVectorScan {
@@ -1417,18 +1418,10 @@ mod tests {
 
         let plan = plan_from_bucket_splits(&index_type, field_id, None, "/tbl", false, vec![split])
             .unwrap();
-        let selections: crate::vindex::pkvector::FileRowSelections = plan
+        let row_ranges_by_file = plan
             .physical_row_ranges_by_split
             .expect("split-driven plan")
-            .remove(0)
-            .into_iter()
-            .map(|(file, ranges)| {
-                (
-                    file,
-                    crate::vindex::pkvector::FileRowSelection::Ranges(ranges),
-                )
-            })
-            .collect();
+            .remove(0);
 
         let active: HashSet<String> = source_meta
             .source_files()
@@ -1440,7 +1433,7 @@ mod tests {
                 source_meta.source_files(),
                 &active,
                 &HashMap::new(),
-                Some(&selections),
+                Some(&row_ranges_by_file),
             )
             .unwrap()
             .is_none(),

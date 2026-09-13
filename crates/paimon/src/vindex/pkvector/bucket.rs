@@ -26,9 +26,10 @@ use super::ann::PkVectorAnnSearcher;
 use super::data_invalid;
 use super::metric::{java_float_compare, VectorSearchMetric};
 use super::result::PkVectorSearchResult;
-use super::{FileRowSelection, FileRowSelections};
+use super::{contains_row_position, RowRangesByFile};
 use crate::deletion_vector::DeletionVector;
 use crate::spec::PrimaryKeyIndexSourceMeta as PkVectorSourceMeta;
+use crate::table::RowRange;
 use crate::vindex::executor::{
     acquire_process_global_search_permit, drain_indexed_jobs, execute_global_index,
 };
@@ -164,7 +165,7 @@ fn validate_per_query_len(
 /// closure borrows the allow-list for its lifetime.
 fn position_excluder(
     dv: Option<Arc<DeletionVector>>,
-    selection: Option<&FileRowSelection>,
+    selection: Option<&[RowRange]>,
 ) -> impl Fn(i64) -> bool + Sync + '_ {
     move |position: i64| -> bool {
         let dv_deleted = match &dv {
@@ -180,10 +181,7 @@ fn position_excluder(
             // No entry: the file is unrestricted, so the row is allowed.
             None => false,
             // Restricted: exclude positions the selection does not list.
-            Some(selection) => match u64::try_from(position) {
-                Ok(p) => !selection.contains(p),
-                Err(_) => true,
-            },
+            Some(ranges) => !contains_row_position(ranges, position),
         }
     }
 }
@@ -355,11 +353,11 @@ enum BucketLeaf {
 /// `ann_searcher` may be `None` only when there are no ANN segments; segments
 /// present with `None` is an error.
 ///
-/// `row_selections` is the pre-filter allow-list keyed by data-file name: a file
+/// `row_ranges_by_file` is the pre-filter allow-list keyed by data-file name: a file
 /// with **no entry is unrestricted**, an empty entry excludes it (the file is
 /// skipped without a read), and a non-empty one limits which of its rows may
 /// produce candidates. `None` restricts nothing at all. Mirrors Java
-/// `rowRangesByFile`; see [`FileRowSelection`].
+/// `rowRangesByFile`; see [`RowRangesByFile`].
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 pub(crate) async fn bucket_search(
@@ -382,7 +380,7 @@ pub(crate) async fn bucket_search(
     exact_limit: usize,
     search_options: &HashMap<String, String>,
     skip_exact_fallback: bool,
-    row_selections: Option<&FileRowSelections>,
+    row_ranges_by_file: Option<&RowRangesByFile>,
     concurrency: usize,
     search_budget: Option<SearchBudget>,
 ) -> crate::Result<BucketSearchResult> {
@@ -517,7 +515,7 @@ pub(crate) async fn bucket_search(
     let ann_shared = searcher.as_ref().map(|searcher| {
         (
             searcher.clone(),
-            row_selections.map(|selections| Arc::new(selections.clone())),
+            row_ranges_by_file.map(|selections| Arc::new(selections.clone())),
             Arc::new(active_source_files.clone()),
             Arc::new(deletion_vectors.clone()),
             Arc::new(search_options.clone()),
@@ -538,13 +536,16 @@ pub(crate) async fn bucket_search(
             // No entry means unrestricted; an empty one excludes the file, which is
             // skipped without a read. Mirrors Java
             // `if (rowRanges != null && rowRanges.isEmpty()) continue;`.
-            let selection: Option<&FileRowSelection> =
-                match row_selections.and_then(|selections| selections.get(&file.file_name)) {
-                    Some(selection) if selection.is_excluded() => continue,
+            let selection: Option<&Vec<RowRange>> =
+                match row_ranges_by_file.and_then(|selections| selections.get(&file.file_name)) {
+                    Some(selection) if selection.is_empty() => continue,
                     other => other,
                 };
             let dv = deletion_vectors.get(&file.file_name).cloned();
-            exact_tasks.push((file, Box::new(position_excluder(dv, selection))));
+            exact_tasks.push((
+                file,
+                Box::new(position_excluder(dv, selection.map(Vec::as_slice))),
+            ));
         }
     }
 
@@ -661,7 +662,7 @@ pub(crate) async fn bucket_search_batch(
     exact_limit: usize,
     search_options: &HashMap<String, String>,
     skip_exact_fallback: bool,
-    row_selections: Option<&FileRowSelections>,
+    row_ranges_by_file: Option<&RowRangesByFile>,
     concurrency: usize,
     search_budget: Option<SearchBudget>,
 ) -> crate::Result<Vec<BucketSearchResult>> {
@@ -684,7 +685,7 @@ pub(crate) async fn bucket_search_batch(
             exact_limit,
             search_options,
             skip_exact_fallback,
-            row_selections,
+            row_ranges_by_file,
             concurrency,
             search_budget,
         )
@@ -809,7 +810,7 @@ pub(crate) async fn bucket_search_batch(
             Arc::new(queries.iter().map(|q| q.to_vec()).collect());
         (
             searcher.clone(),
-            row_selections.map(|selections| Arc::new(selections.clone())),
+            row_ranges_by_file.map(|selections| Arc::new(selections.clone())),
             Arc::new(active_source_files.clone()),
             Arc::new(deletion_vectors.clone()),
             Arc::new(search_options.clone()),
@@ -828,13 +829,16 @@ pub(crate) async fn bucket_search_batch(
             // No entry means unrestricted; an empty one excludes the file, which is
             // skipped without a read. Mirrors Java
             // `if (rowRanges != null && rowRanges.isEmpty()) continue;`.
-            let selection: Option<&FileRowSelection> =
-                match row_selections.and_then(|selections| selections.get(&file.file_name)) {
-                    Some(selection) if selection.is_excluded() => continue,
+            let selection: Option<&Vec<RowRange>> =
+                match row_ranges_by_file.and_then(|selections| selections.get(&file.file_name)) {
+                    Some(selection) if selection.is_empty() => continue,
                     other => other,
                 };
             let dv = deletion_vectors.get(&file.file_name).cloned();
-            exact_tasks.push((file, Box::new(position_excluder(dv, selection))));
+            exact_tasks.push((
+                file,
+                Box::new(position_excluder(dv, selection.map(Vec::as_slice))),
+            ));
         }
     }
 
@@ -1080,7 +1084,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _row_selections: Option<&FileRowSelections>,
+            _row_ranges_by_file: Option<&RowRangesByFile>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             Ok(queries.iter().map(|_| self.result.clone()).collect())
         }
@@ -1743,17 +1747,14 @@ mod tests {
         assert!(covered.is_empty());
     }
 
-    fn treemap(positions: &[u64]) -> roaring::RoaringTreemap {
-        let mut t = roaring::RoaringTreemap::new();
-        for &p in positions {
-            t.insert(p);
-        }
-        t
-    }
-
     /// A residual selection over one file's physical positions.
-    fn selected(positions: &[u64]) -> FileRowSelection {
-        FileRowSelection::Positions(treemap(positions))
+    fn selected(positions: &[u64]) -> Vec<RowRange> {
+        crate::table::merge_row_ranges(
+            positions
+                .iter()
+                .map(|&p| RowRange::new(p as i64, p as i64))
+                .collect(),
+        )
     }
 
     #[tokio::test]
@@ -1766,7 +1767,7 @@ mod tests {
             Some(vec![2.0, 0.0]),
             Some(vec![3.0, 0.0]),
         ]);
-        let mut residual: FileRowSelections = HashMap::new();
+        let mut residual: RowRangesByFile = HashMap::new();
         residual.insert("data-1".into(), selected(&[0, 2]));
         let out = bucket_search(
             None,
@@ -1837,7 +1838,7 @@ mod tests {
                 })
             },
         );
-        let mut residual: FileRowSelections = HashMap::new();
+        let mut residual: RowRangesByFile = HashMap::new();
         residual.insert("data-1".into(), selected(&[0, 1]));
         let out = bucket_search(
             None,
@@ -1887,7 +1888,7 @@ mod tests {
                 })
             },
         );
-        let mut residual: FileRowSelections = HashMap::new();
+        let mut residual: RowRangesByFile = HashMap::new();
         residual.insert("data-1".into(), selected(&[]));
         let out = bucket_search(
             None,
@@ -1925,7 +1926,7 @@ mod tests {
         let mut bm = RoaringBitmap::new();
         bm.insert(0); // pos0 deleted
         dvs.insert("data-1".into(), Arc::new(DeletionVector::from_bitmap(bm)));
-        let mut residual: FileRowSelections = HashMap::new();
+        let mut residual: RowRangesByFile = HashMap::new();
         residual.insert("data-1".into(), selected(&[0, 1, 2]));
         let out = bucket_search(
             None,
@@ -2560,7 +2561,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _row_selections: Option<&FileRowSelections>,
+            _row_ranges_by_file: Option<&RowRangesByFile>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             use std::sync::atomic::Ordering::SeqCst;
             let current = self.inflight.fetch_add(1, SeqCst) + 1;
@@ -2856,7 +2857,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _row_selections: Option<&FileRowSelections>,
+            _row_ranges_by_file: Option<&RowRangesByFile>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             panic!("scorer panic to exercise JoinError mapping");
         }
@@ -2921,7 +2922,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _row_selections: Option<&FileRowSelections>,
+            _row_ranges_by_file: Option<&RowRangesByFile>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             let file = segment.source_meta.source_files()[0]
                 .file_name()
@@ -3099,7 +3100,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _row_selections: Option<&FileRowSelections>,
+            _row_ranges_by_file: Option<&RowRangesByFile>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             // Runs on the blocking pool. Announce arrival, then wait (bounded) for the
             // exact leaf. Both arriving proves overlap; a timeout means no overlap.
@@ -3224,7 +3225,7 @@ mod tests {
             _active_source_files: &HashSet<String>,
             _dvs: &HashMap<String, Arc<DeletionVector>>,
             _opts: &HashMap<String, String>,
-            _row_selections: Option<&FileRowSelections>,
+            _row_ranges_by_file: Option<&RowRangesByFile>,
         ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
             // The bytes handed to the scorer must be exactly this segment's loaded
             // bytes (its path), proving load→score threads the right payload.
