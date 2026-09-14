@@ -356,21 +356,10 @@ impl PaimonScanBuilder<'_> {
         self,
         read_fields: Vec<DataField>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.build_scan(read_fields, false)
+        Ok(Arc::new(self.build_scan(read_fields)?))
     }
 
-    pub(crate) fn build_audit_log(
-        self,
-        audit_fields: Vec<DataField>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.build_scan(audit_fields, true)
-    }
-
-    fn build_scan(
-        self,
-        read_fields: Vec<DataField>,
-        audit_log: bool,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    pub(crate) fn build_scan(self, read_fields: Vec<DataField>) -> DFResult<PaimonTableScan> {
         let (projected_schema, read_type) = if let Some(indices) = self.projection {
             let fields: Vec<Field> = indices
                 .iter()
@@ -395,31 +384,18 @@ impl PaimonScanBuilder<'_> {
                 .collect()
         };
 
-        if audit_log {
-            Ok(Arc::new(PaimonTableScan::try_new_audit_log(
-                projected_schema,
-                self.table.clone(),
-                read_type,
-                self.pushed_predicate,
-                planned_partitions,
-                self.limit,
-                self.scan_trace,
-                self.case_sensitive,
-            )?))
-        } else {
-            Ok(Arc::new(PaimonTableScan::try_new(
-                projected_schema,
-                self.table.clone(),
-                read_type,
-                self.pushed_predicate,
-                planned_partitions,
-                self.limit,
-                self.filter_exact,
-                self.scan_trace,
-                None,
-                self.case_sensitive,
-            )?))
-        }
+        PaimonTableScan::try_new(
+            projected_schema,
+            self.table.clone(),
+            read_type,
+            self.pushed_predicate,
+            planned_partitions,
+            self.limit,
+            self.filter_exact,
+            self.scan_trace,
+            None,
+            self.case_sensitive,
+        )
     }
 }
 
@@ -563,9 +539,7 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use paimon::catalog::Identifier;
     use paimon::spec::{ArrayType, MapType, RowType, VarCharType};
-    use paimon::{
-        Catalog, CatalogOptions, DataSplit, DataSplitBuilder, FileSystemCatalog, Options,
-    };
+    use paimon::{Catalog, CatalogOptions, DataSplit, FileSystemCatalog, Options};
 
     use crate::physical_plan::PaimonTableScan;
 
@@ -585,64 +559,6 @@ mod tests {
     fn test_bucket_round_robin_single_bucket() {
         let result = bucket_round_robin(vec![1, 2, 3], 1);
         assert_eq!(result, vec![vec![1, 2, 3]]);
-    }
-
-    #[test]
-    fn test_first_row_audit_distributes_independent_splits() {
-        let file_io = paimon::io::FileIOBuilder::new("memory").build().unwrap();
-        let schema = paimon::spec::Schema::builder()
-            .column(
-                "id",
-                paimon::spec::DataType::Int(paimon::spec::IntType::new()),
-            )
-            .primary_key(["id"])
-            .option("bucket", "1")
-            .option("merge-engine", "first-row")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "first_row_audit"),
-            "memory:/first-row-audit".to_string(),
-            paimon::spec::TableSchema::new(0, &schema),
-            None,
-        );
-        let split = |snapshot| {
-            DataSplitBuilder::new()
-                .with_snapshot(snapshot)
-                .with_partition(paimon::spec::BinaryRow::new(0))
-                .with_bucket(0)
-                .with_bucket_path("memory:/first-row-audit/bucket-0".to_string())
-                .with_total_buckets(1)
-                .with_data_files(vec![])
-                .build()
-                .unwrap()
-        };
-        let read_fields = datafusion_read_fields(&table);
-        let arrow_schema = datafusion_arrow_schema(&read_fields, true).unwrap();
-        let plan = PaimonScanBuilder {
-            table: &table,
-            schema: &arrow_schema,
-            plan: paimon::table::Plan::new(vec![split(1), split(2)]),
-            scan_trace: None,
-            projection: None,
-            pushed_predicate: None,
-            limit: None,
-            target_partitions: 8,
-            filter_exact: false,
-            case_sensitive: true,
-        }
-        .build_audit_log(read_fields)
-        .unwrap();
-        let scan = plan
-            .downcast_ref::<PaimonTableScan>()
-            .expect("Expected PaimonTableScan");
-
-        assert_eq!(scan.planned_partitions().len(), 2);
-        assert!(scan
-            .planned_partitions()
-            .iter()
-            .all(|splits| splits.len() == 1));
     }
 
     fn get_test_warehouse() -> String {

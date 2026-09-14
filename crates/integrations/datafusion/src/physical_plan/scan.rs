@@ -51,7 +51,7 @@ use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProp
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use paimon::arrow::ParquetReadBudget;
 use paimon::spec::{DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator};
-use paimon::table::{ScanTrace, Table};
+use paimon::table::{ArrowRecordBatchStream, ScanTrace, Table, TableRead};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
@@ -778,8 +778,6 @@ pub struct PaimonTableScan {
     decoder_filters: Vec<Arc<dyn PhysicalExpr>>,
     /// Query-wide budget shared by every DataFusion scan partition.
     parquet_read_budget: Arc<ParquetReadBudget>,
-    /// Retain retract rows and expose their row kind through `$audit_log`.
-    audit_log: bool,
 }
 
 impl PaimonTableScan {
@@ -886,35 +884,7 @@ impl PaimonTableScan {
             runtime_filters: Vec::new(),
             decoder_filters: Vec::new(),
             parquet_read_budget,
-            audit_log: false,
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_new_audit_log(
-        schema: ArrowSchemaRef,
-        table: Table,
-        read_type: Vec<DataField>,
-        pushed_predicate: Option<Predicate>,
-        planned_partitions: Vec<Arc<[DataSplit]>>,
-        limit: Option<usize>,
-        scan_trace: Option<ScanTrace>,
-        case_sensitive: bool,
-    ) -> DFResult<Self> {
-        let mut scan = Self::try_new(
-            schema,
-            table,
-            read_type,
-            pushed_predicate,
-            planned_partitions,
-            limit,
-            false,
-            scan_trace,
-            None,
-            case_sensitive,
-        )?;
-        scan.audit_log = true;
-        Ok(scan)
     }
 
     pub fn table(&self) -> &Table {
@@ -999,38 +969,12 @@ impl PaimonTableScan {
             .map(|(accumulator, field)| accumulator.finish(field.data_type(), exact_null_counts))
             .collect()
     }
-}
 
-impl ExecutionPlan for PaimonTableScan {
-    fn name(&self) -> &str {
-        if self.audit_log {
-            "PaimonAuditLogScan"
-        } else {
-            "PaimonTableScan"
-        }
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.plan_properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(self)
-    }
-
-    fn handle_child_pushdown_result(
+    pub(crate) fn pushdown_filters(
         &self,
-        _phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
-        _config: &ConfigOptions,
-    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        supported: impl Fn(&Arc<dyn PhysicalExpr>) -> bool,
+    ) -> DFResult<FilterPushdownPropagation<Self>> {
         let filters = child_pushdown_result
             .parent_filters
             .into_iter()
@@ -1046,16 +990,7 @@ impl ExecutionPlan for PaimonTableScan {
         let parent_filter_handled = filters
             .into_iter()
             .map(|filter| {
-                let physical_columns_available = !self.audit_log
-                    || collect_columns(&filter).iter().all(|column| {
-                        resolve_physical_field(
-                            column.name(),
-                            self.table.schema().fields(),
-                            self.case_sensitive,
-                        )
-                        .is_some()
-                    });
-                if physical_columns_available
+                if supported(&filter)
                     && can_expr_be_pushed_down_with_schemas(&filter, schema.as_ref())
                 {
                     accepted.push(filter);
@@ -1092,14 +1027,16 @@ impl ExecutionPlan for PaimonTableScan {
         }
         Ok(
             FilterPushdownPropagation::with_parent_pushdown_result(parent_filter_handled)
-                .with_updated_node(Arc::new(scan)),
+                .with_updated_node(scan),
         )
     }
 
-    fn execute(
+    pub(crate) fn execute_with(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        read_splits: impl FnOnce(TableRead<'_>, &[DataSplit]) -> paimon::Result<ArrowRecordBatchStream>
+            + Send
+            + 'static,
     ) -> DFResult<SendableRecordBatchStream> {
         let splits = Arc::clone(self.planned_partitions.get(partition).ok_or_else(|| {
             datafusion::error::DataFusionError::Internal(format!(
@@ -1116,7 +1053,6 @@ impl ExecutionPlan for PaimonTableScan {
         let runtime_filters = self.runtime_filters.clone();
         let decoder_filters = self.decoder_filters.clone();
         let parquet_read_budget = Arc::clone(&self.parquet_read_budget);
-        let audit_log = self.audit_log;
 
         let fut = async move {
             let mut read_builder = table.new_read_builder();
@@ -1143,12 +1079,7 @@ impl ExecutionPlan for PaimonTableScan {
                     Arc::clone(&schema),
                 )));
             }
-            let stream = if audit_log {
-                read.to_audit_log_arrow(splits.as_ref())
-            } else {
-                read.to_arrow(&splits)
-            }
-            .map_err(to_datafusion_error)?;
+            let stream = read_splits(read, &splits).map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
             let stream = stream.map(move |result| {
                 let batch = result.map_err(to_datafusion_error)?;
@@ -1185,56 +1116,8 @@ impl ExecutionPlan for PaimonTableScan {
         )))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
-        let partitions: &[Arc<[DataSplit]>] = match partition {
-            Some(idx) => std::slice::from_ref(&self.planned_partitions[idx]),
-            None => &self.planned_partitions,
-        };
-
-        let mut total_rows: usize = 0;
-        let mut all_row_counts_known = true;
-        for splits in partitions {
-            for split in splits.iter() {
-                if let Some(row_count) = split.merged_row_count() {
-                    total_rows += row_count as usize;
-                } else {
-                    all_row_counts_known = false;
-                    total_rows += split.row_count() as usize;
-                }
-            }
-        }
-
-        // Return exact statistics when:
-        // 1. All splits have known merged_row_count (no deletion files with unknown cardinality)
-        // 2. No limit is applied (limit would make row count inexact)
-        // 3. Filter is exact (no residual filtering needed above the scan)
-        let num_rows_precision = if self.audit_log {
-            Precision::Absent
-        } else if all_row_counts_known
-            && self.limit.is_none()
-            && self.filter_exact
-            && self.runtime_filters.is_empty()
-        {
-            Precision::Exact(total_rows)
-        } else {
-            Precision::Inexact(total_rows)
-        };
-
-        Ok(Arc::new(Statistics {
-            num_rows: num_rows_precision,
-            total_byte_size: Precision::Absent,
-            column_statistics: self.manifest_column_statistics(partitions),
-        }))
-    }
-}
-
-impl DisplayAs for PaimonTableScan {
-    fn fmt_as(
-        &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        write!(f, "{}: table={}", self.name(), self.table.identifier())?;
+    pub(crate) fn fmt_scan(&self, name: &str, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}: table={}", name, self.table.identifier())?;
 
         let total_splits: usize = self.planned_partitions.iter().map(|p| p.len()).sum();
         let total_files: usize = self
@@ -1276,6 +1159,100 @@ impl DisplayAs for PaimonTableScan {
             write!(f, ", runtime_filters=[{}]", filters.join(" AND "))?;
         }
         Ok(())
+    }
+}
+
+impl ExecutionPlan for PaimonTableScan {
+    fn name(&self) -> &str {
+        "PaimonTableScan"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.plan_properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan + 'static>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        _phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let result = self.pushdown_filters(child_pushdown_result, |_| true)?;
+        Ok(FilterPushdownPropagation {
+            filters: result.filters,
+            updated_node: result
+                .updated_node
+                .map(|scan| Arc::new(scan) as Arc<dyn ExecutionPlan>),
+        })
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        self.execute_with(partition, |read, splits| read.to_arrow(splits))
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+        let partitions: &[Arc<[DataSplit]>] = match partition {
+            Some(idx) => std::slice::from_ref(&self.planned_partitions[idx]),
+            None => &self.planned_partitions,
+        };
+
+        let mut total_rows: usize = 0;
+        let mut all_row_counts_known = true;
+        for splits in partitions {
+            for split in splits.iter() {
+                if let Some(row_count) = split.merged_row_count() {
+                    total_rows += row_count as usize;
+                } else {
+                    all_row_counts_known = false;
+                    total_rows += split.row_count() as usize;
+                }
+            }
+        }
+
+        // Return exact statistics when:
+        // 1. All splits have known merged_row_count (no deletion files with unknown cardinality)
+        // 2. No limit is applied (limit would make row count inexact)
+        // 3. Filter is exact (no residual filtering needed above the scan)
+        let num_rows_precision = if all_row_counts_known
+            && self.limit.is_none()
+            && self.filter_exact
+            && self.runtime_filters.is_empty()
+        {
+            Precision::Exact(total_rows)
+        } else {
+            Precision::Inexact(total_rows)
+        };
+
+        Ok(Arc::new(Statistics {
+            num_rows: num_rows_precision,
+            total_byte_size: Precision::Absent,
+            column_statistics: self.manifest_column_statistics(partitions),
+        }))
+    }
+}
+
+impl DisplayAs for PaimonTableScan {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        self.fmt_scan(self.name(), f)
     }
 }
 

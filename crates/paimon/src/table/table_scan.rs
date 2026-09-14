@@ -909,11 +909,11 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    pub(super) fn with_scan_all_files_preserving_projection(self) -> Self {
+    /// Retain all visible versions and group overlapping keys for merging,
+    /// preserving the read projection.
+    pub(super) fn with_all_versions(self) -> Self {
         match self.0 {
-            TableScanKind::Paimon(scan) => Self(TableScanKind::Paimon(
-                scan.with_scan_all_files_preserving_projection(),
-            )),
+            TableScanKind::Paimon(scan) => Self(TableScanKind::Paimon(scan.with_all_versions())),
             TableScanKind::Format(scan) => Self(TableScanKind::Format(scan)),
         }
     }
@@ -1068,7 +1068,7 @@ impl<'a> PaimonTableScan<'a> {
         self
     }
 
-    fn with_scan_all_files_preserving_projection(mut self) -> Self {
+    fn with_all_versions(mut self) -> Self {
         self.scan_all_files = true;
         self.merge_key_overlaps = true;
         self
@@ -2907,7 +2907,7 @@ mod tests {
             .unwrap();
         let scan = PaimonTableScan::new(&table, None, vec![predicate], None, None, None)
             .with_projected_read_field_ids(Some(projected.clone()))
-            .with_scan_all_files_preserving_projection();
+            .with_all_versions();
 
         assert!(scan.scan_all_files);
         assert!(scan.merge_key_overlaps);

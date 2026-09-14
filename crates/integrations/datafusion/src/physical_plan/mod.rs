@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod audit_log;
 pub(crate) mod scan;
 mod search_score;
 pub(crate) mod sink;
 
+pub(crate) use audit_log::PaimonAuditLogScan;
 pub use scan::PaimonTableScan;
 pub(crate) use search_score::{SearchScoreExec, SearchScoreOutputColumn};
 pub use sink::PaimonDataSink;

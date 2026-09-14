@@ -31,6 +31,7 @@ use paimon::table::{AuditLogTable as PaimonAuditLogTable, Table};
 
 use crate::error::to_datafusion_error;
 use crate::filter_pushdown::{analyze_filters, classify_filter_pushdown};
+use crate::physical_plan::PaimonAuditLogScan;
 use crate::runtime::await_with_runtime;
 use crate::table::{datafusion_arrow_schema, PaimonScanBuilder};
 
@@ -98,7 +99,7 @@ impl TableProvider for AuditLogTable {
             .await
             .map_err(to_datafusion_error)?;
 
-        PaimonScanBuilder {
+        let scan = PaimonScanBuilder {
             table: &self.table,
             schema: &self.schema,
             plan,
@@ -110,7 +111,8 @@ impl TableProvider for AuditLogTable {
             filter_exact: false,
             case_sensitive: true,
         }
-        .build_audit_log(self.fields.clone())
+        .build_scan(self.fields.clone())?;
+        Ok(Arc::new(PaimonAuditLogScan::new(scan)))
     }
 
     fn supports_filters_pushdown(
