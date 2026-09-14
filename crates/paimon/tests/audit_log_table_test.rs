@@ -455,7 +455,11 @@ async fn audit_log_current_scan_uses_merged_rowkind() {
         let table_path = format!("memory:/audit_log/current_{merge_engine}");
         let (file_io, table) = memory_table(
             &table_path,
-            pk_schema(&[("merge-engine", merge_engine), ("bucket", "1")]),
+            pk_schema(&[
+                ("merge-engine", merge_engine),
+                ("bucket", "1"),
+                ("table-read.sequence-number.enabled", "true"),
+            ]),
         );
         setup_dirs(&file_io, &table_path).await;
         persist_table_schema(&file_io, &table_path, table.schema()).await;
@@ -478,8 +482,8 @@ async fn audit_log_current_scan_uses_merged_rowkind() {
             .await
             .unwrap();
         assert_eq!(
-            collect_audit_rows(&batches),
-            vec![("+I".to_string(), 1, 20)],
+            collect_audit_rows_with_sequence(&batches),
+            vec![("+I".to_string(), 1, 1, 20)],
             "merge-engine={merge_engine}"
         );
     }

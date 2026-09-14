@@ -363,16 +363,17 @@ impl PaimonScanBuilder<'_> {
         let (projected_schema, read_type) = if let Some(indices) = self.projection {
             let fields: Vec<Field> = indices
                 .iter()
-                .map(|&index| self.schema.field(index).clone())
+                .map(|&i| self.schema.field(i).clone())
                 .collect();
             let read_type = indices
                 .iter()
-                .map(|&index| read_fields[index].clone())
-                .collect();
+                .map(|&i| read_fields[i].clone())
+                .collect::<Vec<_>>();
             (Arc::new(Schema::new(fields)), read_type)
         } else {
             (self.schema.clone(), read_fields)
         };
+
         let splits = self.plan.into_splits();
         let planned_partitions: Vec<Arc<[_]>> = if splits.is_empty() {
             vec![Arc::from(Vec::new())]

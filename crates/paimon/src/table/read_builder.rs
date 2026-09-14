@@ -505,9 +505,10 @@ impl<'a> PaimonReadBuilder<'a> {
         // `to_arrow` (e.g. an empty-splits fast path) can't bypass the guard.
         let core_options = self.table.schema.core_options();
         core_options.ensure_read_authorized()?;
-        let projection = self.resolve_read_type()?;
-        let explicit_projection = projection.is_some();
-        let read_type = projection.unwrap_or_else(|| self.table.schema.fields().to_vec());
+        let read_type = match self.resolve_read_type()? {
+            None => self.table.schema.fields().to_vec(),
+            Some(fields) => fields,
+        };
 
         // Pass the FULL data predicate through (including `And`/`Or`/`Not`).
         // Pushdown/stats skip compound nodes; the residual pass enforces the full
@@ -518,7 +519,6 @@ impl<'a> PaimonReadBuilder<'a> {
         };
         Ok(
             TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
-                .with_explicit_projection(explicit_projection)
                 .with_parquet_read_budget(parquet_read_budget),
         )
     }

@@ -56,6 +56,10 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[path = "audit_log_table/scan.rs"]
+mod audit;
+pub use audit::AuditLogScan;
+
 /// Path segment for manifest directory under table.
 const MANIFEST_DIR: &str = "manifest";
 /// Path segment for index directory under table.
@@ -909,15 +913,6 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// Retain all visible versions and group overlapping keys for merging,
-    /// preserving the read projection.
-    pub(super) fn with_all_versions(self) -> Self {
-        match self.0 {
-            TableScanKind::Paimon(scan) => Self(TableScanKind::Paimon(scan.with_all_versions())),
-            TableScanKind::Format(scan) => Self(TableScanKind::Format(scan)),
-        }
-    }
-
     pub fn with_row_ranges(self, ranges: Vec<RowRange>) -> Self {
         match self.0 {
             TableScanKind::Paimon(scan) => {
@@ -1030,8 +1025,6 @@ struct PaimonTableScan<'a> {
     /// Used by non-read paths (overwrite, truncate, writer restore) that need
     /// the complete file set. Normal read scans leave this as `false`.
     scan_all_files: bool,
-    /// Whether each split must contain every file whose primary-key range overlaps.
-    merge_key_overlaps: bool,
     projected_read_field_ids: Option<HashSet<i32>>,
 }
 
@@ -1053,7 +1046,6 @@ impl<'a> PaimonTableScan<'a> {
             row_ranges,
             row_range_optimization_disabled: false,
             scan_all_files: false,
-            merge_key_overlaps: false,
             projected_read_field_ids: None,
         }
     }
@@ -1065,12 +1057,6 @@ impl<'a> PaimonTableScan<'a> {
     pub fn with_scan_all_files(mut self) -> Self {
         self.scan_all_files = true;
         self.projected_read_field_ids = None;
-        self
-    }
-
-    fn with_all_versions(mut self) -> Self {
-        self.scan_all_files = true;
-        self.merge_key_overlaps = true;
         self
     }
 
@@ -1289,7 +1275,7 @@ impl<'a> PaimonTableScan<'a> {
     }
 
     fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
-        !self.scan_all_files && can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
+        can_push_down_limit_hint_for_scan(&self.data_predicates, row_ranges)
     }
 
     fn global_index_scan_settings(
@@ -1297,14 +1283,12 @@ impl<'a> PaimonTableScan<'a> {
         core_options: &CoreOptions,
         data_evolution_enabled: bool,
     ) -> crate::Result<Option<GlobalIndexScanSettings>> {
-        if !self.scan_all_files
-            && should_use_global_index_row_range_optimization(
-                self.row_range_optimization_disabled,
-                data_evolution_enabled,
-                core_options.global_index_enabled(),
-                !self.data_predicates.is_empty(),
-            )
-        {
+        if should_use_global_index_row_range_optimization(
+            self.row_range_optimization_disabled,
+            data_evolution_enabled,
+            core_options.global_index_enabled(),
+            !self.data_predicates.is_empty(),
+        ) {
             Ok(Some(GlobalIndexScanSettings {
                 search_mode: core_options.scalar_index_search_mode()?,
                 thread_num: core_options.global_index_thread_num()?,
@@ -1439,14 +1423,15 @@ impl<'a> PaimonTableScan<'a> {
     /// `KeyValueFileReader`.
     ///
     /// Exempt (full predicates kept):
-    /// - Ordinary deletion-vector reads without merge-on-read: they read raw with
+    /// - Deletion-vector tables without merge-on-read: they read raw with
     ///   per-row masks, stats are a superset of live rows, full pruning stays
     ///   safe. With merge-on-read enabled, visible L0 versions require the
     ///   same key-only pruning rule as an ordinary PK merge read.
-    /// - Non-audit `merge-engine=first-row` reads: read via `DataFileReader`
-    ///   without merging versions.
-    ///
-    /// Audit reads set `merge_key_overlaps` and are not exempt.
+    /// - `merge-engine=first-row`: planned with `skip_level_zero` and read
+    ///   via `DataFileReader` (see `TableRead::to_arrow`), no merge on the
+    ///   read path — pruning a file drops exactly the rows the raw path's
+    ///   exact residual filter would drop anyway. If first-row ever gains a
+    ///   merge read path, this exemption must be revisited.
     fn stats_pruning_predicates(&self) -> Vec<Predicate> {
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
         let core_options = CoreOptions::new(self.table.schema().options());
@@ -1459,8 +1444,8 @@ impl<'a> PaimonTableScan<'a> {
             Ok(crate::spec::MergeEngine::FirstRow)
         );
         if has_primary_keys
-            && (self.merge_key_overlaps
-                || ((!deletion_vectors_enabled || deletion_vectors_merge_on_read) && !first_row))
+            && (!deletion_vectors_enabled || deletion_vectors_merge_on_read)
+            && !first_row
         {
             retain_primary_key_conjuncts(
                 &self.data_predicates,
@@ -1935,17 +1920,16 @@ impl<'a> PaimonTableScan<'a> {
         // sort-merge reader sees every version of a key. The comparator decodes
         // the trimmed-PK min/max keys written by the kv writer.
         //
-        // Deletion-vector tables without merge-on-read and ordinary first-row scans
-        // read without merging (stale rows are masked by DVs / level-0 is skipped),
-        // so they keep plain size-based packing. Audit scans merge every visible
-        // primary-key version, so they must keep overlapping ranges together.
-        let read_merges_overlapping_keys = self.merge_key_overlaps
-            || ((!core_options.deletion_vectors_enabled()
-                || core_options.deletion_vectors_merge_on_read())
-                && !matches!(
-                    core_options.merge_engine(),
-                    Ok(crate::spec::MergeEngine::FirstRow)
-                ));
+        // Deletion-vector tables without merge-on-read and first-row tables read
+        // without merging (stale rows are masked by DVs / level-0 is skipped),
+        // so they keep plain size-based packing. DV merge-on-read includes L0
+        // files and must preserve overlapping key ranges just like ordinary MOR.
+        let read_merges_overlapping_keys = (!core_options.deletion_vectors_enabled()
+            || core_options.deletion_vectors_merge_on_read())
+            && !matches!(
+                core_options.merge_engine(),
+                Ok(crate::spec::MergeEngine::FirstRow)
+            );
         let pk_comparator = if read_merges_overlapping_keys {
             KeyComparator::from_table_schema(self.table.schema())
         } else {
@@ -2076,9 +2060,9 @@ impl<'a> PaimonTableScan<'a> {
                 // Java MergeTreeSplitGenerator#splitForBatch). Only engines
                 // whose writer deduplicates at flush guarantee a file never
                 // holds two rows of one key, so only they may mark groups raw
-                // convertible; see merge_tree_split_for_batch. Ordinary first-row
-                // scans do not take this path, but audit scans do. Its writer
-                // deduplicates at flush, so keep the gate accurate.
+                // convertible; see merge_tree_split_for_batch. (First-row
+                // tables do not take this path today, but its writer dedups
+                // too, so keep the gate accurate.)
                 let file_keys_unique = matches!(
                     core_options.merge_engine(),
                     Ok(crate::spec::MergeEngine::Deduplicate)
@@ -2194,10 +2178,10 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::{
         stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
-        ColumnMove, CommitKind, CoreOptions, DataField, DataFileMeta, DataType, Datum,
-        DeletionVectorMeta, FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType,
-        ManifestEntry, ManifestFileMeta, Predicate, PredicateBuilder, PredicateOperator,
-        Schema as PaimonSchema, SchemaChange, Snapshot, TableSchema, VarCharType,
+        ColumnMove, CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta,
+        FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry,
+        ManifestFileMeta, Predicate, PredicateBuilder, PredicateOperator, Schema as PaimonSchema,
+        SchemaChange, Snapshot, TableSchema, VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
@@ -2436,7 +2420,7 @@ mod tests {
         );
     }
 
-    fn data_evolution_test_table(table_path: &str, schema: TableSchema) -> Table {
+    pub(super) fn data_evolution_test_table(table_path: &str, schema: TableSchema) -> Table {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let schema = schema.copy_with_options(HashMap::from([(
             "data-evolution.enabled".to_string(),
@@ -2451,7 +2435,7 @@ mod tests {
         )
     }
 
-    fn two_column_schema(id: i64, left: &str, right: &str) -> TableSchema {
+    pub(super) fn two_column_schema(id: i64, left: &str, right: &str) -> TableSchema {
         TableSchema::new(
             id,
             &PaimonSchema::builder()
@@ -2652,7 +2636,7 @@ mod tests {
         ]))
     }
 
-    async fn setup_scan_trace_dirs(table: &Table) {
+    pub(super) async fn setup_scan_trace_dirs(table: &Table) {
         table
             .file_io()
             .mkdirs(&format!("{}/snapshot/", table.location()))
@@ -2889,35 +2873,6 @@ mod tests {
             false,
             Ok(crate::spec::MergeEngine::FirstRow),
         ));
-    }
-
-    #[test]
-    fn test_audit_scan_all_files_preserves_data_evolution_projection() {
-        let table = data_evolution_test_table(
-            "memory:/de_audit_scan_projection",
-            two_column_schema(0, "id", "name"),
-        )
-        .copy_with_options(HashMap::from([(
-            "global-index.enabled".to_string(),
-            "true".to_string(),
-        )]));
-        let projected = HashSet::from([1]);
-        let predicate = PredicateBuilder::new(table.schema().fields())
-            .equal("id", Datum::Int(1))
-            .unwrap();
-        let scan = PaimonTableScan::new(&table, None, vec![predicate], None, None, None)
-            .with_projected_read_field_ids(Some(projected.clone()))
-            .with_all_versions();
-
-        assert!(scan.scan_all_files);
-        assert!(scan.merge_key_overlaps);
-        assert_eq!(scan.projected_read_field_ids, Some(projected));
-        assert!(
-            scan.global_index_scan_settings(&CoreOptions::new(table.schema().options()), true,)
-                .unwrap()
-                .is_none(),
-            "audit scans must not prune physical row versions via global indexes"
-        );
     }
 
     #[test]
@@ -3579,7 +3534,7 @@ mod tests {
         );
     }
 
-    fn pk_stats_gate_table(table_path: &str) -> Table {
+    pub(super) fn pk_stats_gate_table(table_path: &str) -> Table {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let schema = PaimonSchema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -3648,7 +3603,11 @@ mod tests {
         builder.build_serialized()
     }
 
-    fn pk_stats_file(name: &str, id_range: (i32, i32), value_range: (i32, i32)) -> DataFileMeta {
+    pub(super) fn pk_stats_file(
+        name: &str,
+        id_range: (i32, i32),
+        value_range: (i32, i32),
+    ) -> DataFileMeta {
         let mut file = test_data_file_meta(
             two_int_stats_row(Some(id_range.0), Some(value_range.0)),
             two_int_stats_row(Some(id_range.1), Some(value_range.1)),
@@ -3768,68 +3727,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_dv_without_mor_audit_stats_pruning_ignores_non_key_conjuncts() {
-        let table_path = "memory:/test_dv_audit_stats_gate";
-        let table = pk_stats_gate_table(table_path).copy_with_options(HashMap::from([
-            ("deletion-vectors.enabled".to_string(), "true".to_string()),
-            (
-                "deletion-vectors.merge-on-read".to_string(),
-                "false".to_string(),
-            ),
-        ]));
-        setup_scan_trace_dirs(&table).await;
-
-        let mut old = pk_stats_file("old-version.parquet", (1, 5), (100, 200));
-        old.level = 1;
-        let mut new = pk_stats_file("new-version.parquet", (1, 5), (10, 60));
-        new.level = 1;
-        TableCommit::new(table.clone(), "dv-audit-gate-test".to_string())
-            .commit(vec![CommitMessage::new(
-                BinaryRowBuilder::new(0).build_serialized(),
-                0,
-                vec![old, new],
-            )])
-            .await
-            .unwrap();
-
-        let fields = vec![
-            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
-            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
-        ];
-        let value_filter = PredicateBuilder::new(&fields)
-            .greater_than("value", Datum::Int(90))
-            .unwrap();
-        let mut reader = table.new_read_builder();
-        reader.with_filter(value_filter);
-
-        let (ordinary_plan, ordinary_trace) = reader.new_scan().plan_with_trace().await.unwrap();
-        assert!(ordinary_trace.manifest_entries_pruned_by_data_stats >= 1);
-        assert_eq!(
-            ordinary_plan
-                .splits()
-                .iter()
-                .map(|split| split.data_files().len())
-                .sum::<usize>(),
-            1
-        );
-
-        let (audit_plan, audit_trace) = reader.new_audit_scan().plan_with_trace().await.unwrap();
-        assert_eq!(audit_trace.manifest_entries_pruned_by_data_stats, 0);
-        assert_eq!(
-            audit_plan
-                .splits()
-                .iter()
-                .map(|split| split.data_files().len())
-                .sum::<usize>(),
-            2,
-            "both key versions must reach the audit merge path"
-        );
-    }
-
-    /// Ordinary `merge-engine=first-row` reads skip level-0 files and read raw,
-    /// so full-predicate stats pruning stays safe. A scan of all files retains
-    /// level-0 versions for audit merging and must use key-only pruning.
+    /// `merge-engine=first-row` PK tables read raw (no merge on the read
+    /// path: planned with `skip_level_zero`, read via `DataFileReader`), so
+    /// pruning a file by a non-key conjunct cannot resurrect anything — it
+    /// drops exactly the rows the raw path's exact residual filter would
+    /// drop. The key-only gate must exempt first-row and keep full-predicate
+    /// stats pruning, matching the split-generation path.
     #[tokio::test]
     async fn test_first_row_table_stats_pruning_keeps_non_key_conjuncts() {
         let table_path = "memory:/test_first_row_stats_gate";
@@ -3886,18 +3789,6 @@ mod tests {
         assert_eq!(
             planned_files, 1,
             "only the value-matching file should be planned on first-row"
-        );
-
-        let (audit_plan, audit_trace) = reader.new_audit_scan().plan_with_trace().await.unwrap();
-        assert_eq!(audit_trace.manifest_entries_pruned_by_data_stats, 0);
-        assert_eq!(
-            audit_plan
-                .splits()
-                .iter()
-                .map(|split| split.data_files().len())
-                .sum::<usize>(),
-            2,
-            "all versions must reach the first-row audit merge"
         );
     }
 

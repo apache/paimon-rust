@@ -16,11 +16,13 @@
 // under the License.
 
 use super::incremental_scan::{IncrementalPlan, IncrementalScan, IncrementalScanMode};
-use super::{ArrowRecordBatchStream, AuditLogRead, DataSplit, Table, TableScan};
+use super::{ArrowRecordBatchStream, AuditLogRead, AuditLogScan, DataSplit, Table};
 use crate::spec::{
     BigIntType, DataField, DataType, VarCharType, ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME,
     SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
 };
+
+pub(super) mod merge;
 
 /// Wrapper that exposes table rows with a leading `rowkind` audit column.
 ///
@@ -32,6 +34,8 @@ use crate::spec::{
 pub struct AuditLogTable {
     wrapped: Table,
 }
+
+const TABLE_READ_SEQUENCE_NUMBER_ENABLED: &str = "table-read.sequence-number.enabled";
 
 impl AuditLogTable {
     pub fn new(wrapped: Table) -> Self {
@@ -64,8 +68,9 @@ impl AuditLogTable {
     fn sequence_number_enabled(&self) -> bool {
         self.wrapped
             .schema()
-            .core_options()
-            .table_read_sequence_number_enabled()
+            .options()
+            .get(TABLE_READ_SEQUENCE_NUMBER_ENABLED)
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 
     pub fn new_incremental_scan(
@@ -78,18 +83,24 @@ impl AuditLogTable {
     }
 
     /// Plan a current-state audit read for [`Self::to_arrow_for_splits`].
-    pub fn new_scan(&self) -> TableScan<'_> {
+    pub fn new_scan(&self) -> AuditLogScan<'_> {
         self.wrapped.new_read_builder().new_audit_scan()
     }
 
     /// Creates an audit reader using the table's configured fields and options.
     pub fn new_read(&self) -> crate::Result<AuditLogRead<'_>> {
-        AuditLogRead::new(self.wrapped.new_read_builder().new_read()?)
+        AuditLogRead::new(
+            self.wrapped
+                .new_read_builder()
+                .with_read_type(self.fields()?)
+                .new_read()?,
+        )
     }
 
     pub fn to_arrow(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
         plan.validate()?;
-        self.new_read()?.to_arrow(plan)
+        let read = self.wrapped.new_read_builder().new_read()?;
+        read.to_audit_log_arrow(plan)
     }
 
     /// Reads the current table state, retaining retract rows for primary-key tables.

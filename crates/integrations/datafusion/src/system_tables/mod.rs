@@ -81,21 +81,6 @@ const SYSTEM_TABLE_NAMES: &[&str] = &[
     "tags",
 ];
 
-// Reject system tables whose contents can expose protected table data or
-// persisted credentials until Rust can apply row filters and column masks.
-const QUERY_AUTH_UNSUPPORTED_TABLES: &[&str] = &[
-    "audit_log",
-    "files",
-    "file_key_ranges",
-    "binlog",
-    "statistics",
-    "options",
-    "schemas",
-    "partitions",
-    "manifests",
-    "table_indexes",
-];
-
 /// Parse a Paimon object name into table, branch, and optional system table.
 ///
 /// Mirrors Java [Identifier.splitObjectName](https://github.com/apache/paimon/blob/release-1.3/paimon-api/src/main/java/org/apache/paimon/catalog/Identifier.java).
@@ -143,21 +128,6 @@ fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dy
         .map(|(_, build)| build(base_table))
 }
 
-fn ensure_system_table_read_supported(
-    options: &HashMap<String, String>,
-    name: &str,
-) -> DFResult<()> {
-    if QUERY_AUTH_UNSUPPORTED_TABLES
-        .iter()
-        .any(|candidate| name.eq_ignore_ascii_case(candidate))
-    {
-        paimon::spec::CoreOptions::new(options)
-            .ensure_read_authorized()
-            .map_err(to_datafusion_error)?;
-    }
-    Ok(())
-}
-
 pub(crate) fn provider_for_table(
     catalog: Arc<dyn Catalog>,
     identifier: Identifier,
@@ -168,7 +138,10 @@ pub(crate) fn provider_for_table(
         return Ok(None);
     }
     crate::table_loader::ensure_paimon_served(&table, &identifier)?;
-    ensure_system_table_read_supported(table.schema().options(), system_name)?;
+    // Fail closed: system tables expose file metadata the client can't authorize.
+    paimon::spec::CoreOptions::new(table.schema().options())
+        .ensure_read_authorized()
+        .map_err(to_datafusion_error)?;
     if system_name.eq_ignore_ascii_case("partitions") {
         return partitions::build(catalog, identifier, table).map(Some);
     }
@@ -201,12 +174,16 @@ pub(crate) async fn load(
                 .to_string(),
         ));
     }
-    ensure_system_table_read_supported(&dynamic_options, &system_name)?;
+    paimon::spec::CoreOptions::new(&dynamic_options)
+        .ensure_read_authorized()
+        .map_err(to_datafusion_error)?;
     let identifier = Identifier::new(database, object.table().to_string());
     match catalog.get_table(&identifier).await {
         Ok(mut table) => {
             crate::table_loader::ensure_paimon_served(&table, &identifier)?;
-            ensure_system_table_read_supported(table.schema().options(), &system_name)?;
+            paimon::spec::CoreOptions::new(table.schema().options())
+                .ensure_read_authorized()
+                .map_err(to_datafusion_error)?;
             if let Some(branch) = object.branch() {
                 if !system_name.eq_ignore_ascii_case("branches") {
                     table = table

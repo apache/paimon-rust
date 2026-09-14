@@ -171,8 +171,8 @@ pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
 pub use table_commit::TableCommit;
-pub use table_read::{AuditLogInput, AuditLogRead, TableRead};
-pub use table_scan::TableScan;
+pub use table_read::{AuditLogRead, TableRead};
+pub use table_scan::{AuditLogScan, TableScan};
 pub use table_update::TableUpdate;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
