@@ -1629,7 +1629,10 @@ impl<'a> PaimonTableScan<'a> {
         if manifest_row_ranges.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         }
-        let row_range_index = if data_evolution_enabled {
+        // Positional scans count all candidate row IDs. Pruning a preceding
+        // manifest or file here would renumber the surviving rows; intersect
+        // explicit/global-index ranges after assigning positions instead.
+        let row_range_index = if data_evolution_enabled && self.row_position_selection.is_none() {
             manifest_row_ranges.clone().map(RowRangeIndex::create)
         } else {
             None
@@ -1897,7 +1900,10 @@ impl<'a> PaimonTableScan<'a> {
             }
             return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         }
-        let row_range_index = if data_evolution_enabled {
+        // Positional scans count all candidate row IDs. Pruning a preceding
+        // manifest or file here would renumber the surviving rows; intersect
+        // explicit/global-index ranges after assigning positions instead.
+        let row_range_index = if data_evolution_enabled && self.row_position_selection.is_none() {
             manifest_row_ranges.clone().map(RowRangeIndex::create)
         } else {
             None
@@ -3236,7 +3242,10 @@ mod tests {
             .commit(vec![CommitMessage::new(
                 BinaryRowBuilder::new(0).build_serialized(),
                 0,
-                vec![make_evo_file("range.parquet", 10, 6, 1, Some(0))],
+                vec![
+                    make_evo_file("early.parquet", 10, 3, 1, Some(0)),
+                    make_evo_file("late.parquet", 10, 3, 1, Some(3)),
+                ],
             )])
             .await
             .unwrap();

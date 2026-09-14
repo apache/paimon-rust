@@ -173,9 +173,10 @@ plan = rb.new_scan().with_row_position_slice(10, 20).plan()
 plan = rb.new_scan().with_row_position_shard(1, 4).plan()
 ```
 
-Positions count candidate rows before group pruning and projection; column
-updates sharing row IDs count once. Explicit `with_row_ranges` intersect the
-selected positions. Slices require `start < end`; shards require a positive
+Positions count candidate rows before explicit/global-index range pruning,
+group statistics, projection, and deletion-vector filtering. Column updates
+sharing row IDs count once. Explicit `with_row_ranges` and index-selected ranges
+intersect the positions after assignment, even when they exclude earlier files. Slices require `start < end`; shards require a positive
 count and `0 <= index < count`. Slice and shard selection are mutually exclusive
 and may also be applied to `new_incremental_scan` results, where positions count
 the combined APPEND-delta batch. The selection is encoded in the returned splits
@@ -542,3 +543,15 @@ for batch in read.read(splits):
 for batch in ctx.sql("SELECT id, name FROM paimon.wdb.t ORDER BY id"):
     print(batch)
 ```
+
+### Floating-point primary keys
+
+FLOAT and DOUBLE primary keys distinguish negative and positive zero. NaN signs
+and payloads compare as one key, ordered after finite values, matching Java and
+PyPaimon. This comparison applies to writer sorting and deduplication as well as
+cross-file merging; the original column values are preserved.
+
+Legacy Rust files sorted by raw NaN bits can violate this ordering. Merge reads
+reject non-monotonic floating-point keys, including across record batches, with
+an error requesting a file rewrite. This change does not automatically repair
+those legacy files.

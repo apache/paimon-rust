@@ -28,6 +28,7 @@
 
 use crate::spec::{AggregationConfig, CoreOptions, DataField, PartialUpdateConfig, RowKind};
 use crate::table::aggregator::{new_aggregator, FieldAggregator};
+use crate::table::key_normalization::normalize_float_key;
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
 use arrow_array::{new_null_array, ArrayRef, Int64Array, Int8Array, RecordBatch};
@@ -979,17 +980,39 @@ fn convert_batch_keys(
     batch: &RecordBatch,
     key_indices: &[usize],
     converter: &mut RowConverter,
+    previous_key: Option<arrow_row::Row<'_>>,
 ) -> crate::Result<Rows> {
     let key_columns: Vec<ArrayRef> = key_indices
         .iter()
-        .map(|&idx| batch.column(idx).clone())
+        .map(|&idx| normalize_float_key(batch.column(idx)))
         .collect();
-    converter
+    let rows = converter
         .convert_columns(&key_columns)
         .map_err(|e| Error::UnexpectedError {
             message: format!("Failed to convert key columns to Rows: {e}"),
             source: Some(Box::new(e)),
-        })
+        })?;
+    // Older Rust writers ordered NaNs by their raw sign/payload. Such files
+    // can cease to be monotonic under Java's canonical ordering; merging them
+    // would silently resurrect older finite keys. Check within and across
+    // batches and reject the malformed input instead of returning wrong rows.
+    let float_keys = key_columns.iter().any(|column| {
+        matches!(
+            column.data_type(),
+            arrow_schema::DataType::Float32 | arrow_schema::DataType::Float64
+        )
+    });
+    if float_keys
+        && rows.num_rows() > 0
+        && (previous_key.is_some_and(|previous| rows.row(0) < previous)
+            || (1..rows.num_rows()).any(|index| rows.row(index) < rows.row(index - 1)))
+    {
+        return Err(Error::DataInvalid {
+            message: "Floating-point primary keys are not sorted in Java-compatible order; rewrite legacy files with noncanonical NaN key ordering".into(),
+            source: None,
+        });
+    }
+    Ok(rows)
 }
 
 /// Compare two cursors by their current key. `None` cursors are treated as
@@ -1044,7 +1067,7 @@ fn sort_merge_stream(
             while let Some(batch_result) = stream.next().await {
                 let batch = batch_result?;
                 if batch.num_rows() > 0 {
-                    let rows = convert_batch_keys(&batch, &key_indices, &mut row_converter)?;
+                    let rows = convert_batch_keys(&batch, &key_indices, &mut row_converter, None)?;
                     cursors.push(Some(SortMergeCursor { batch, rows, offset: 0 }));
                     found = true;
                     break;
@@ -1129,7 +1152,7 @@ fn sort_merge_stream(
                         while let Some(batch_result) = streams[current_winner].next().await {
                             let batch = batch_result?;
                             if batch.num_rows() > 0 {
-                                let rows = convert_batch_keys(&batch, &key_indices, &mut row_converter)?;
+                                let rows = convert_batch_keys(&batch, &key_indices, &mut row_converter, Some(winner_key.row()))?;
                                 let buf_idx = batch_buffer.len();
                                 batch_buffer.push(BufferedBatch::Source(batch.clone()));
                                 stream_batch_idx[current_winner] = Some(buf_idx);
@@ -1340,6 +1363,76 @@ mod tests {
 
     fn stream_from_batches(batches: Vec<RecordBatch>) -> ArrowRecordBatchStream {
         futures::stream::iter(batches.into_iter().map(Ok)).boxed()
+    }
+
+    #[tokio::test]
+    async fn legacy_nan_order_is_rejected_within_and_across_batches() {
+        use arrow_array::{Float32Array, Float64Array};
+        for double in [false, true] {
+            for separate_batches in [false, true] {
+                let float_type = if double {
+                    DataType::Float64
+                } else {
+                    DataType::Float32
+                };
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("pk", float_type.clone(), false),
+                    Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+                    Field::new("_VALUE_KIND", DataType::Int8, false),
+                    Field::new("value", DataType::Utf8, false),
+                ]));
+                let batch = |keys: Vec<f64>, seq: i64| {
+                    let count = keys.len();
+                    let keys: ArrayRef = if double {
+                        Arc::new(Float64Array::from(keys))
+                    } else {
+                        Arc::new(Float32Array::from(
+                            keys.into_iter().map(|v| v as f32).collect::<Vec<_>>(),
+                        ))
+                    };
+                    RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            keys,
+                            Arc::new(Int64Array::from(vec![seq; count])),
+                            Arc::new(Int8Array::from(vec![0; count])),
+                            Arc::new(StringArray::from(vec!["value"; count])),
+                        ],
+                    )
+                    .unwrap()
+                };
+                // Match the old writer's raw IEEE order: negative NaN precedes
+                // finite keys, including when the descent crosses batch bounds.
+                let old = if separate_batches {
+                    vec![batch(vec![-f64::NAN], 1), batch(vec![1.0], 1)]
+                } else {
+                    vec![batch(vec![-f64::NAN, 1.0], 1)]
+                };
+                let latest = batch(vec![1.0], 2);
+                let output = Arc::new(Schema::new(vec![
+                    Field::new("pk", float_type, false),
+                    Field::new("value", DataType::Utf8, false),
+                ]));
+                let stream = SortMergeReaderBuilder::new(
+                    vec![stream_from_batches(old), stream_from_batches(vec![latest])],
+                    schema,
+                    vec![0],
+                    1,
+                    2,
+                    vec![],
+                    vec![3],
+                    output,
+                    Box::new(DeduplicateMergeFunction),
+                )
+                .build()
+                .unwrap();
+                let error = stream.try_collect::<Vec<_>>().await.unwrap_err();
+                assert!(
+                    matches!(error, Error::DataInvalid { ref message, .. } if message.contains("NaN key ordering")),
+                    "double={double}, separate_batches={separate_batches}: {error:?}"
+                );
+            }
+        }
     }
 
     struct MaterializingMergeFunction;

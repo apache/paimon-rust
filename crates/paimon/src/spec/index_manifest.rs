@@ -237,6 +237,79 @@ mod tests {
     }
 
     #[test]
+    fn test_deletion_vector_records_allow_reordered_and_unknown_fields() {
+        let mut schema: serde_json::Value =
+            serde_json::from_str(INDEX_MANIFEST_ENTRY_SCHEMA).unwrap();
+        let fields = schema["fields"][8]["type"][1]["items"][1]["fields"]
+            .as_array_mut()
+            .unwrap();
+        fields.reverse();
+        fields.insert(
+            1,
+            serde_json::json!({"name": "future", "type": {"type": "array", "items": "string"}}),
+        );
+        // The following field guards cursor alignment after the array.
+        let entry = IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: vec![0; 12],
+            bucket: 7,
+            index_file: IndexFileMeta {
+                index_type: "DELETION_VECTORS".into(),
+                file_name: "index".into(),
+                file_size: 256,
+                row_count: 1,
+                deletion_vectors_ranges: Some(IndexMap::from([(
+                    "data.parquet".into(),
+                    DeletionVectorMeta {
+                        offset: 17,
+                        length: 31,
+                        cardinality: Some(2),
+                    },
+                )])),
+                external_path: Some("memory:/external/index".into()),
+                global_index_meta: None,
+            },
+        };
+        let schema = Schema::parse_str(&schema.to_string()).unwrap();
+        let original =
+            crate::spec::to_avro_bytes(INDEX_MANIFEST_ENTRY_SCHEMA, std::slice::from_ref(&entry))
+                .unwrap();
+        let mut value = apache_avro::Reader::new(original.as_slice())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let Value::Record(fields) = &mut value else {
+            panic!("record");
+        };
+        let (_, dv) = fields
+            .iter_mut()
+            .find(|(name, _)| name == "_DELETIONS_VECTORS_RANGES")
+            .unwrap();
+        let Value::Union(_, dv) = dv else {
+            panic!("nullable ranges");
+        };
+        let Value::Array(items) = dv.as_mut() else {
+            panic!("array");
+        };
+        let Value::Union(_, item) = &mut items[0] else {
+            panic!("nullable item");
+        };
+        let Value::Record(fields) = item.as_mut() else {
+            panic!("DV record");
+        };
+        fields.push((
+            "future".into(),
+            Value::Array(vec![Value::String("ignored".into())]),
+        ));
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        writer.append(value.resolve(&schema).unwrap()).unwrap();
+        let bytes = writer.into_inner().unwrap();
+        assert_eq!(IndexManifest::read_from_bytes(&bytes).unwrap(), vec![entry]);
+    }
+
+    #[test]
     fn test_read_index_manifest_file() {
         let workdir =
             std::env::current_dir().unwrap_or_else(|err| panic!("current_dir must exist: {err}"));

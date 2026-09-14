@@ -235,4 +235,79 @@ mod tests {
         assert!(RowPositionSelection::shard(0, 0).is_err());
         assert!(RowPositionSelection::shard(2, 2).is_err());
     }
+
+    #[test]
+    fn positions_match_an_independent_row_enumeration() {
+        // Enumerating a small row-id space supplies an oracle independent of
+        // the range-merging and offset arithmetic used by the implementation.
+        for mask in 0u16..256 {
+            let ids: Vec<i64> = (0..8).filter(|id| mask & (1 << id) != 0).collect();
+            let mut candidates: Vec<_> = ids.iter().map(|&id| RowRange::new(id, id)).collect();
+            candidates.extend(candidates.clone()); // duplicate column/update files
+            candidates.reverse(); // manifest order must not assign positions
+            for explicit in [
+                None,
+                Some(ranges(&[])),
+                Some(ranges(&[(1, 2), (5, 6), (2, 2)])),
+            ] {
+                let expected = |start: usize, end: usize| {
+                    ids.iter()
+                        .skip(start)
+                        .take(end.saturating_sub(start))
+                        .copied()
+                        .filter(|id| {
+                            explicit.as_ref().is_none_or(|ranges| {
+                                ranges
+                                    .iter()
+                                    .any(|range| range.from() <= *id && *id <= range.to())
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let expand = |ranges: Vec<RowRange>| {
+                    ranges
+                        .into_iter()
+                        .flat_map(|range| range.from()..=range.to())
+                        .collect::<Vec<_>>()
+                };
+                for start in 0..10 {
+                    for end in start + 1..=10 {
+                        assert_eq!(
+                            expand(
+                                RowPositionSelection::slice(start as u64, end as u64)
+                                    .unwrap()
+                                    .select_from_ranges(candidates.clone(), explicit.as_deref())
+                            ),
+                            expected(start, end),
+                            "mask={mask}, slice=({start},{end}), explicit={explicit:?}"
+                        );
+                    }
+                }
+                for count in 1..=10 {
+                    let mut all = vec![];
+                    for index in 0..count {
+                        let start = index * (ids.len() / count) + index.min(ids.len() % count);
+                        let end =
+                            start + ids.len() / count + usize::from(index < ids.len() % count);
+                        let actual = expand(
+                            RowPositionSelection::shard(index as u64, count as u64)
+                                .unwrap()
+                                .select_from_ranges(candidates.clone(), explicit.as_deref()),
+                        );
+                        assert_eq!(
+                            actual,
+                            expected(start, end),
+                            "mask={mask}, shard=({index},{count})"
+                        );
+                        all.extend(actual);
+                    }
+                    assert_eq!(
+                        all,
+                        expected(0, ids.len()),
+                        "shards must cover each selected row exactly once"
+                    );
+                }
+            }
+        }
+    }
 }

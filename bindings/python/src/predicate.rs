@@ -1606,6 +1606,27 @@ value = datetime.datetime(2024, 1, 1, tzinfo=FloatingTz())",
     }
 
     #[test]
+    fn binary_fields_reject_implicit_string_and_sequence_conversion() {
+        Python::attach(|py| {
+            for dt in [
+                DataType::Binary(Default::default()),
+                DataType::VarBinary(Default::default()),
+            ] {
+                let values = [
+                    "text".into_pyobject(py).unwrap().into_any(),
+                    42i32.into_pyobject(py).unwrap().into_any(),
+                    PyList::new(py, [0, 128, 255]).unwrap().into_any(),
+                ];
+                for value in values {
+                    let error = py_to_datum(&value, &dt).unwrap_err();
+                    assert!(error.is_instance_of::<PyValueError>(py));
+                    assert!(error.to_string().contains("bytes or bytearray"));
+                }
+            }
+        });
+    }
+
+    #[test]
     fn unsupported_field_type_still_not_implemented() {
         Python::attach(|py| {
             // Complex types remain out of scope for literal conversion.
