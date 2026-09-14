@@ -21,7 +21,7 @@ use super::decode_helpers::{
     extract_record_schema, normalize_partition, read_bytes_field, read_int_field, read_long_field,
     read_nullable_string_field, read_string_field,
 };
-use super::schema::{skip_nullable_field, WriterSchema};
+use super::schema::{skip_nullable_field, FieldSchema, WriterSchema};
 use crate::spec::index_manifest::IndexManifestEntry;
 use crate::spec::manifest_common::FileKind;
 use crate::spec::{DeletionVectorMeta, GlobalIndexMeta, IndexFileMeta};
@@ -64,7 +64,8 @@ impl AvroRecordDecode for IndexManifestEntry {
                 "_FILE_SIZE" => file_size = Some(read_long_field(cursor, field.nullable)?),
                 "_ROW_COUNT" => row_count = Some(read_long_field(cursor, field.nullable)?),
                 "_DELETIONS_VECTORS_RANGES" | "_DELETION_VECTORS_RANGES" => {
-                    deletion_vectors_ranges = decode_nullable_dv_ranges(cursor, field.nullable)?;
+                    deletion_vectors_ranges =
+                        decode_nullable_dv_ranges(cursor, field.nullable, &field.schema)?;
                 }
                 "_EXTERNAL_PATH" => {
                     external_path = read_nullable_string_field(cursor, field.nullable)?;
@@ -98,6 +99,7 @@ impl AvroRecordDecode for IndexManifestEntry {
 fn decode_nullable_dv_ranges(
     cursor: &mut AvroCursor,
     nullable: bool,
+    schema: &FieldSchema,
 ) -> crate::Result<Option<IndexMap<String, DeletionVectorMeta>>> {
     if nullable {
         let idx = cursor.read_union_index()?;
@@ -105,7 +107,12 @@ fn decode_nullable_dv_ranges(
             return Ok(None);
         }
     }
-    // Array of nullable records
+    let FieldSchema::Array(item_schema) = schema else {
+        return Err(crate::Error::UnexpectedError {
+            message: "deletion vector ranges must be an Avro array".into(),
+            source: None,
+        });
+    };
     let mut map = IndexMap::new();
     loop {
         let count = cursor.read_long()?;
@@ -119,28 +126,52 @@ fn decode_nullable_dv_ranges(
             count as usize
         };
         for _ in 0..count {
-            // Each item is union ["null", record]
-            let item_idx = cursor.read_union_index()?;
-            if item_idx == 0 {
+            // Java writes nullable items; PyPaimon writes plain records.
+            // Reading a union tag for a plain record consumes the file-name
+            // length and can silently attach the deletion vector to a wrong key.
+            let item_schema = match item_schema.as_ref() {
+                FieldSchema::Union(branches) => {
+                    let index = cursor.read_union_index()?;
+                    branches
+                        .get(index as usize)
+                        .ok_or_else(|| crate::Error::UnexpectedError {
+                            message: format!("invalid deletion vector item union index: {index}"),
+                            source: None,
+                        })?
+                }
+                schema => schema,
+            };
+            if matches!(item_schema, FieldSchema::Null) {
                 continue;
             }
-            // Record fields: f0 (string), f1 (int), f2 (int), _CARDINALITY (nullable long)
-            let f0 = cursor.read_string()?.to_string();
-            let f1 = cursor.read_int()?;
-            let f2 = cursor.read_int()?;
-            let cardinality = {
-                let c_idx = cursor.read_union_index()?;
-                if c_idx == 0 {
-                    None
-                } else {
-                    Some(cursor.read_long()?)
-                }
+            let FieldSchema::Record(record) = item_schema else {
+                return Err(crate::Error::UnexpectedError {
+                    message: "deletion vector array item must be an Avro record".into(),
+                    source: None,
+                });
             };
+            let mut file_name = String::new();
+            let mut offset = 0;
+            let mut length = 0;
+            let mut cardinality = None;
+            for field in &record.fields {
+                match field.name.as_str() {
+                    "f0" => file_name = read_string_field(cursor, field.nullable)?,
+                    "f1" => offset = read_int_field(cursor, field.nullable)?,
+                    "f2" => length = read_int_field(cursor, field.nullable)?,
+                    "_CARDINALITY" => {
+                        if !field.nullable || cursor.read_union_index()? != 0 {
+                            cardinality = Some(cursor.read_long()?);
+                        }
+                    }
+                    _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
+                }
+            }
             map.insert(
-                f0,
+                file_name,
                 DeletionVectorMeta {
-                    offset: f1,
-                    length: f2,
+                    offset,
+                    length,
                     cardinality,
                 },
             );

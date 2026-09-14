@@ -95,6 +95,7 @@ pub mod referenced_files;
 pub(crate) mod rest_env;
 pub(crate) mod row_id_predicate;
 mod row_kind_generator;
+mod row_position_selection;
 mod scan_trace;
 pub(crate) mod schema_manager;
 pub(crate) mod snapshot_commit;

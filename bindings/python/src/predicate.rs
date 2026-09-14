@@ -19,7 +19,9 @@ use paimon::spec::{DataField, DataType, Datum, DecimalType, Predicate, Predicate
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyTzInfoAccess;
-use pyo3::types::{PyBool, PyDateTime, PyDict, PyInt, PyList, PyString, PyTime, PyTzInfo};
+use pyo3::types::{
+    PyBool, PyByteArray, PyBytes, PyDateTime, PyDict, PyInt, PyList, PyString, PyTime, PyTzInfo,
+};
 
 /// Convert a single Python literal into a typed [`Datum`] driven by the target
 /// [`DataType`].
@@ -45,7 +47,9 @@ use pyo3::types::{PyBool, PyDateTime, PyDict, PyInt, PyList, PyString, PyTime, P
 /// - `Decimal` accepts a `decimal.Decimal` or an `int`, rescaled losslessly to
 ///   the column's scale; anything needing rounding, exceeding the column's
 ///   precision, non-finite, or a binary `float` is rejected.
-/// - All other types (Bytes/complex) are not supported yet and raise
+/// - `Binary`/`VarBinary` accept Python `bytes` or `bytearray`, copied without
+///   decoding or changing their length.
+/// - Complex types are not supported yet and raise
 ///   `NotImplementedError`.
 ///
 /// Errors:
@@ -77,6 +81,18 @@ pub(crate) fn py_to_datum(value: &Bound<'_, PyAny>, data_type: &DataType) -> PyR
                 .cast::<PyString>()
                 .map_err(|_| PyValueError::new_err("expected a str literal for String field"))?;
             Ok(Datum::String(s.to_str()?.to_string()))
+        }
+        DataType::Binary(_) | DataType::VarBinary(_) => {
+            let bytes = if let Ok(bytes) = value.cast::<PyBytes>() {
+                bytes.as_bytes().to_vec()
+            } else if let Ok(bytes) = value.cast::<PyByteArray>() {
+                bytes.to_vec()
+            } else {
+                return Err(PyValueError::new_err(
+                    "expected a bytes or bytearray literal for Binary field",
+                ));
+            };
+            Ok(Datum::Bytes(bytes))
         }
         DataType::Date(_) => date_datum(value),
         DataType::Time(_) => time_datum(value),
@@ -1567,17 +1583,57 @@ value = datetime.datetime(2024, 1, 1, tzinfo=FloatingTz())",
     }
 
     #[test]
-    fn unsupported_field_type_still_not_implemented() {
+    fn binary_fields_preserve_raw_bytes() {
         Python::attach(|py| {
-            // Bytes/complex types remain out of scope for literal conversion.
-            let v = 0i64.into_pyobject(py).unwrap();
             for dt in [
                 DataType::Binary(Default::default()),
-                DataType::Array(paimon::spec::ArrayType::new(DataType::Int(IntType::new()))),
+                DataType::VarBinary(Default::default()),
             ] {
-                let err = py_to_datum(&v, &dt).unwrap_err();
-                assert!(err.is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py));
+                for bytes in [vec![], vec![0, 0x80, 0xff]] {
+                    let value = PyBytes::new(py, &bytes);
+                    assert_eq!(
+                        py_to_datum(value.as_any(), &dt).unwrap(),
+                        Datum::Bytes(bytes.clone())
+                    );
+                    let value = PyByteArray::new(py, &bytes);
+                    assert_eq!(
+                        py_to_datum(value.as_any(), &dt).unwrap(),
+                        Datum::Bytes(bytes)
+                    );
+                }
             }
+        });
+    }
+
+    #[test]
+    fn binary_fields_reject_implicit_string_and_sequence_conversion() {
+        Python::attach(|py| {
+            for dt in [
+                DataType::Binary(Default::default()),
+                DataType::VarBinary(Default::default()),
+            ] {
+                let values = [
+                    "text".into_pyobject(py).unwrap().into_any(),
+                    42i32.into_pyobject(py).unwrap().into_any(),
+                    PyList::new(py, [0, 128, 255]).unwrap().into_any(),
+                ];
+                for value in values {
+                    let error = py_to_datum(&value, &dt).unwrap_err();
+                    assert!(error.is_instance_of::<PyValueError>(py));
+                    assert!(error.to_string().contains("bytes or bytearray"));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn unsupported_field_type_still_not_implemented() {
+        Python::attach(|py| {
+            // Complex types remain out of scope for literal conversion.
+            let v = 0i64.into_pyobject(py).unwrap();
+            let dt = DataType::Array(paimon::spec::ArrayType::new(DataType::Int(IntType::new())));
+            let err = py_to_datum(&v, &dt).unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py));
         });
     }
 

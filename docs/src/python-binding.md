@@ -136,6 +136,7 @@ rb = table.new_read_builder()
 scan = rb.new_scan()
 plan = scan.plan()
 splits = plan.splits()
+snapshot_id = plan.snapshot_id()
 
 # Step 2: Read — consumes splits and returns PyArrow RecordBatches
 read = rb.new_read()
@@ -144,6 +145,47 @@ batches = read.read(splits)
 for batch in batches:
     print(batch)
 ```
+
+`plan.snapshot_id()` identifies the snapshot used for planning, including when
+filters or a zero limit produce no splits. It returns `None` when no snapshot
+exists or the scan is for a format table without Paimon snapshots.
+
+Use an explicit snapshot range to plan a single incremental batch:
+
+```python
+plan = rb.new_incremental_scan(2, 5).plan()
+batches = rb.new_read().read(plan.splits())
+```
+
+The range is `(start_snapshot_id, end_snapshot_id]`. Only APPEND snapshots
+contribute delta manifests. Their entries are merged together before building
+splits, so overlapping primary-key versions across those snapshots use one merge
+reader. This is an ordinary batch `Plan`, not a per-commit changelog. The end
+snapshot must exist and supplies snapshot metadata and deletion vectors, even
+when the range produces no splits. Existing builder filters, projections, and
+limits also apply.
+
+For Data Evolution tables, select half-open row positions or one balanced shard
+on a scan:
+
+```python
+plan = rb.new_scan().with_row_position_slice(10, 20).plan()
+plan = rb.new_scan().with_row_position_shard(1, 4).plan()
+```
+
+Positions count candidate rows before explicit/global-index range pruning,
+group statistics, projection, and deletion-vector filtering. Column updates
+sharing row IDs count once. Explicit `with_row_ranges` and index-selected ranges
+intersect the positions after assignment, even when they exclude earlier files. Slices require `start < end`; shards require a positive
+count and `0 <= index < count`. Slice and shard selection are mutually exclusive
+and may also be applied to `new_incremental_scan` results, where positions count
+the combined APPEND-delta batch. The selection is encoded in the returned splits
+and survives serialization.
+
+Deletion-vector reads accept both Java and Python Avro array-item schemas.
+Historical Python bucket-local references are resolved from the table's index
+directory when the canonical bucket path is absent. Explicit external paths
+and existing canonical paths retain priority.
 
 Alternatively, read via SQL using `SQLContext`:
 
@@ -342,6 +384,7 @@ Literal values are automatically converted from Python types based on the column
 | `int`                          | TinyInt / SmallInt / Int / BigInt |
 | `int` / `float`                | Float / Double       |
 | `str`                          | String               |
+| `bytes` / `bytearray`          | Binary / VarBinary   |
 | `datetime.date`                | Date                 |
 | `datetime.time` (naive)        | Time                 |
 | `datetime.datetime` (naive)    | Timestamp            |
@@ -393,7 +436,18 @@ rb = table.new_read_builder({"scan.tag-name": "release-1.0"})
 
 ## Table Inspection
 
-Inspect snapshots, tags, and partition statistics on a table:
+Inspect snapshots, tags, and partition statistics on a table. A branch-qualified
+identifier selects that branch's schema and snapshots:
+
+```python
+branch_table = catalog.get_table("default.my_table$branch_blue")
+assert branch_table.branch() == "blue"
+```
+
+`table.branch()` returns `"main"` for an ordinary table. `latest_snapshot()`,
+`list_snapshots()`, `list_tags()`, `list_partitions()`, and `partition_stats()`
+inspect the selected branch, including returning empty metadata for an empty
+branch.
 
 ```python
 # Latest snapshot

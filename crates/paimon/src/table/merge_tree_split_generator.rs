@@ -72,9 +72,11 @@ impl KeyComparator {
         Some(Self::new(key_types))
     }
 
-    /// Decode a serialized min/max key. Returns `None` when the key is empty
-    /// or malformed, letting callers degrade to the safe "treat everything as
-    /// overlapping" path instead of failing the scan.
+    /// Decode a serialized min/max key. Returns `None` when the key is empty,
+    /// malformed, or contains NaN, letting callers degrade to the safe "treat
+    /// everything as overlapping" path instead of failing the scan. NaN must
+    /// not compare equal to finite values: for composite keys that would let
+    /// later fields separate ranges which actually overlap.
     fn decode(&self, key: &[u8]) -> Option<DecodedKey> {
         if key.is_empty() {
             return None;
@@ -86,14 +88,21 @@ impl KeyComparator {
         self.key_types
             .iter()
             .enumerate()
-            .map(|(pos, dt)| row.get_datum(pos, dt).ok())
+            .map(|(pos, dt)| {
+                let datum = row.get_datum(pos, dt).ok()?;
+                match datum {
+                    Some(Datum::Float(value)) if value.is_nan() => None,
+                    Some(Datum::Double(value)) if value.is_nan() => None,
+                    _ => Some(datum),
+                }
+            })
             .collect()
     }
 }
 
-/// Compare decoded keys field-by-field. NULL sorts first; fields that
-/// `datum_cmp` cannot order (e.g. float NaN) compare as equal, which forces
-/// the files into the same section — conservative but never incorrect.
+/// Compare decoded keys field-by-field. NULL sorts first; floating-point
+/// values preserve the Java key ordering of -0 before +0. NaN keys are rejected
+/// during decoding so unordered values never reach this comparator.
 /// Binary keys use unsigned lexicographic order, matching the generated Java
 /// key comparator and the on-disk row order.
 fn compare_decoded(a: &DecodedKey, b: &DecodedKey) -> Ordering {
@@ -102,6 +111,8 @@ fn compare_decoded(a: &DecodedKey, b: &DecodedKey) -> Ordering {
             (None, None) => Ordering::Equal,
             (None, Some(_)) => Ordering::Less,
             (Some(_), None) => Ordering::Greater,
+            (Some(Datum::Float(a)), Some(Datum::Float(b))) => a.total_cmp(b),
+            (Some(Datum::Double(a)), Some(Datum::Double(b))) => a.total_cmp(b),
             (Some(da), Some(db)) => datum_cmp(da, db).unwrap_or(Ordering::Equal),
         };
         if ord != Ordering::Equal {
@@ -626,6 +637,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["c", "d"]
         );
+    }
+
+    #[test]
+    fn nan_composite_keys_keep_overlapping_files_in_one_split() {
+        // Java orders NaN after finite values, so the broad range contains
+        // (2, 100). Treating its first field as equal instead compares 100 to
+        // 10 and incorrectly separates two versions of that key.
+        for first_type in [
+            DataType::Float(crate::spec::FloatType::new()),
+            DataType::Double(crate::spec::DoubleType::new()),
+        ] {
+            let key = |first: f64, second: i32| {
+                let mut builder = BinaryRowBuilder::new(2);
+                match first_type {
+                    DataType::Float(_) => builder.write_float(0, first as f32),
+                    DataType::Double(_) => builder.write_double(0, first),
+                    _ => unreachable!(),
+                }
+                builder.write_int(1, second);
+                builder.build_serialized()
+            };
+            let mut broad = keyed_file("broad", 0, 0, 100, 0);
+            broad.min_key = key(1.0, 0);
+            broad.max_key = key(f64::NAN, 10);
+            let mut point = keyed_file("point", 0, 0, 100, 0);
+            point.min_key = key(2.0, 100);
+            point.max_key = point.min_key.clone();
+            let comparator = KeyComparator::new(vec![first_type, DataType::Int(IntType::new())]);
+            let files = vec![broad, point];
+
+            let splits = merge_tree_split_for_batch(files.clone(), &comparator, 1, 1, true);
+            assert_eq!(splits.len(), 1, "overlapping versions must share a split");
+            assert_eq!(splits[0].files.len(), 2);
+            assert!(!splits[0].raw_convertible);
+
+            let runs = pack_sorted_runs(files, &comparator);
+            assert_eq!(runs.len(), 2, "overlapping files cannot be concatenated");
+        }
+    }
+
+    #[test]
+    fn signed_zero_composite_keys_keep_overlapping_files_in_one_split() {
+        for first_type in [
+            DataType::Float(crate::spec::FloatType::new()),
+            DataType::Double(crate::spec::DoubleType::new()),
+        ] {
+            let key = |first: f64, second: i32| {
+                let mut builder = BinaryRowBuilder::new(2);
+                match first_type {
+                    DataType::Float(_) => builder.write_float(0, first as f32),
+                    DataType::Double(_) => builder.write_double(0, first),
+                    _ => unreachable!(),
+                }
+                builder.write_int(1, second);
+                builder.build_serialized()
+            };
+            // -0 sorts before +0, so (-0, 100) is below (+0, 10)
+            // regardless of the second field. Numeric equality of the first
+            // field would incorrectly put these files in separate splits.
+            let mut broad = keyed_file("broad", 0, 0, 100, 0);
+            broad.min_key = key(-0.0, 0);
+            broad.max_key = key(0.0, 10);
+            let mut point = keyed_file("point", 0, 0, 100, 0);
+            point.min_key = key(-0.0, 100);
+            point.max_key = point.min_key.clone();
+            let comparator = KeyComparator::new(vec![first_type, DataType::Int(IntType::new())]);
+            let files = vec![broad, point];
+
+            let splits = merge_tree_split_for_batch(files.clone(), &comparator, 1, 1, true);
+            assert_eq!(splits.len(), 1, "overlapping versions must share a split");
+            assert_eq!(splits[0].files.len(), 2);
+            assert!(!splits[0].raw_convertible);
+            assert_eq!(pack_sorted_runs(files, &comparator).len(), 2);
+        }
     }
 
     #[test]

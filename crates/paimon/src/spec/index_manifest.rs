@@ -177,6 +177,139 @@ mod tests {
     use crate::spec::{DeletionVectorMeta, GlobalIndexMeta};
 
     #[test]
+    fn test_deletion_vectors_follow_writer_item_schema() {
+        for nullable_items in [false, true] {
+            for has_cardinality in [false, true] {
+                let mut schema: serde_json::Value =
+                    serde_json::from_str(INDEX_MANIFEST_ENTRY_SCHEMA).unwrap();
+                let items = &mut schema["fields"][8]["type"][1]["items"];
+                let mut record = items[1].clone();
+                if !has_cardinality {
+                    record["fields"].as_array_mut().unwrap().pop();
+                }
+                *items = if nullable_items {
+                    serde_json::json!(["null", record])
+                } else {
+                    record
+                };
+                let entry = IndexManifestEntry {
+                    version: 1,
+                    kind: FileKind::Add,
+                    partition: vec![0; 12],
+                    bucket: 0,
+                    index_file: IndexFileMeta {
+                        index_type: "DELETION_VECTORS".into(),
+                        file_name: "index-0".into(),
+                        file_size: 100,
+                        row_count: 2,
+                        deletion_vectors_ranges: Some(IndexMap::from([
+                            (
+                                "data-00000000-0000-0000-0000-000000000000-0.parquet".into(),
+                                DeletionVectorMeta {
+                                    offset: 1,
+                                    length: 26,
+                                    cardinality: has_cardinality.then_some(3),
+                                },
+                            ),
+                            (
+                                "data-1.parquet".into(),
+                                DeletionVectorMeta {
+                                    offset: 31,
+                                    length: 22,
+                                    cardinality: None,
+                                },
+                            ),
+                        ])),
+                        external_path: Some("s3://bucket/index-0".into()),
+                        global_index_meta: None,
+                    },
+                };
+                // Two entries also catch a cursor shifted past the final DV.
+                let entries = vec![entry.clone(), entry];
+                let bytes = crate::spec::to_avro_bytes(&schema.to_string(), &entries).unwrap();
+                assert_eq!(
+                    IndexManifest::read_from_bytes(&bytes).unwrap(),
+                    entries,
+                    "nullable_items={nullable_items}, has_cardinality={has_cardinality}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_deletion_vector_records_allow_reordered_and_unknown_fields() {
+        let mut schema: serde_json::Value =
+            serde_json::from_str(INDEX_MANIFEST_ENTRY_SCHEMA).unwrap();
+        let fields = schema["fields"][8]["type"][1]["items"][1]["fields"]
+            .as_array_mut()
+            .unwrap();
+        fields.reverse();
+        fields.insert(
+            1,
+            serde_json::json!({"name": "future", "type": {"type": "array", "items": "string"}}),
+        );
+        // The following field guards cursor alignment after the array.
+        let entry = IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: vec![0; 12],
+            bucket: 7,
+            index_file: IndexFileMeta {
+                index_type: "DELETION_VECTORS".into(),
+                file_name: "index".into(),
+                file_size: 256,
+                row_count: 1,
+                deletion_vectors_ranges: Some(IndexMap::from([(
+                    "data.parquet".into(),
+                    DeletionVectorMeta {
+                        offset: 17,
+                        length: 31,
+                        cardinality: Some(2),
+                    },
+                )])),
+                external_path: Some("memory:/external/index".into()),
+                global_index_meta: None,
+            },
+        };
+        let schema = Schema::parse_str(&schema.to_string()).unwrap();
+        let original =
+            crate::spec::to_avro_bytes(INDEX_MANIFEST_ENTRY_SCHEMA, std::slice::from_ref(&entry))
+                .unwrap();
+        let mut value = apache_avro::Reader::new(original.as_slice())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let Value::Record(fields) = &mut value else {
+            panic!("record");
+        };
+        let (_, dv) = fields
+            .iter_mut()
+            .find(|(name, _)| name == "_DELETIONS_VECTORS_RANGES")
+            .unwrap();
+        let Value::Union(_, dv) = dv else {
+            panic!("nullable ranges");
+        };
+        let Value::Array(items) = dv.as_mut() else {
+            panic!("array");
+        };
+        let Value::Union(_, item) = &mut items[0] else {
+            panic!("nullable item");
+        };
+        let Value::Record(fields) = item.as_mut() else {
+            panic!("DV record");
+        };
+        fields.push((
+            "future".into(),
+            Value::Array(vec![Value::String("ignored".into())]),
+        ));
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        writer.append(value.resolve(&schema).unwrap()).unwrap();
+        let bytes = writer.into_inner().unwrap();
+        assert_eq!(IndexManifest::read_from_bytes(&bytes).unwrap(), vec![entry]);
+    }
+
+    #[test]
     fn test_read_index_manifest_file() {
         let workdir =
             std::env::current_dir().unwrap_or_else(|err| panic!("current_dir must exist: {err}"));

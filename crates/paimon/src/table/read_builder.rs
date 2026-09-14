@@ -267,6 +267,8 @@ impl<'a> ReadBuilder<'a> {
     ///
     /// Filters and projection configured on this builder are pushed into the
     /// incremental plan (partition / bucket pruning on the delta path).
+    /// Use [`IncrementalScan::plan_combined_delta`] to merge APPEND deltas into
+    /// one ordinary batch plan instead of preserving each snapshot separately.
     pub fn new_incremental_scan(
         &self,
         mode: IncrementalScanMode,

@@ -1016,3 +1016,430 @@ async fn diff_rejects_bucket_rescale_between_snapshots() {
         "expected Unsupported for bucket rescale, got {err:?}"
     );
 }
+
+/// An ordinary incremental batch must merge overlapping PK files across commits;
+/// the existing per-commit Delta API must still expose both versions.
+#[tokio::test]
+async fn combined_delta_merges_primary_key_versions_and_preserves_delta_api() {
+    let path = "memory:/incremental_batch/combined_pk";
+    let (file_io, table) = memory_table(path, pk_schema(&[("changelog-producer", "none")]));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![1], vec![20])).await;
+
+    let builder = table.new_read_builder();
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    assert_eq!(plan.snapshot_id(), Some(2));
+    assert_eq!(
+        plan.splits().len(),
+        1,
+        "overlapping PK files need one merge reader"
+    );
+    assert_eq!(plan.splits()[0].data_files().len(), 2);
+    assert!(plan.splits().iter().all(|split| split.snapshot_id() == 2));
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_pairs(&batches), vec![(1, 20)]);
+    assert_eq!(
+        read_incremental_pairs(&table, IncrementalScanMode::Delta, 0, 2).await,
+        vec![(1, 10), (1, 20)]
+    );
+
+    let selected = builder
+        .new_incremental_scan(IncrementalScanMode::Auto, 1, 2)
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    assert_eq!(
+        selected
+            .splits()
+            .iter()
+            .map(|split| split.data_files().len())
+            .sum::<usize>(),
+        1
+    );
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(selected.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_pairs(&batches), vec![(1, 20)]);
+
+    let empty = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 2, 2)
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    assert_eq!(empty.snapshot_id(), Some(2));
+    assert!(empty.splits().is_empty());
+}
+
+#[tokio::test]
+async fn combined_delta_skips_overwrite_but_retains_endpoint_metadata() {
+    let path = "memory:/incremental_batch/combined_overwrite";
+    let (file_io, table) = memory_table(path, pk_schema(&[]));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    let writer = table.new_write_builder().with_overwrite();
+    let mut write = writer.new_write().unwrap();
+    write
+        .write_arrow_batch(&make_batch(vec![2], vec![99]))
+        .await
+        .unwrap();
+    writer
+        .new_commit()
+        .overwrite(write.prepare_commit().await.unwrap(), None)
+        .await
+        .unwrap();
+    let end = table.snapshot_manager().get_snapshot(2).await.unwrap();
+    assert_eq!(end.commit_kind(), &paimon::spec::CommitKind::OVERWRITE);
+    let builder = table.new_read_builder();
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    assert_eq!(plan.snapshot_id(), Some(2));
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_pairs(&batches), vec![(1, 10)]);
+    assert_eq!(read_current_pairs(&table).await, vec![(2, 99)]);
+    let only_overwrite = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 1, 2)
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    assert_eq!(only_overwrite.snapshot_id(), Some(2));
+    assert!(only_overwrite.splits().is_empty());
+}
+
+#[tokio::test]
+async fn combined_delta_merges_add_delete_entries_across_appends() {
+    let path = "memory:/incremental_batch/combined_rewrite";
+    let (file_io, table) = memory_table(path, pk_schema(&[]));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    let builder = table.new_write_builder();
+    let mut first = builder.new_write().unwrap();
+    first
+        .write_arrow_batch(&make_batch(vec![1], vec![10]))
+        .await
+        .unwrap();
+    let first_messages = first.prepare_commit().await.unwrap();
+    let old_file = first_messages[0].new_files[0].clone();
+    builder.new_commit().commit(first_messages).await.unwrap();
+    let mut second = builder.new_write().unwrap();
+    second
+        .write_arrow_batch(&make_batch(vec![1], vec![20]))
+        .await
+        .unwrap();
+    let mut messages = second.prepare_commit().await.unwrap();
+    let new_name = messages[0].new_files[0].file_name.clone();
+    messages[0].deleted_files.push(old_file);
+    builder.new_commit().commit(messages).await.unwrap();
+    // The Rust rewrite writer labels deletions OVERWRITE. Construct an APPEND
+    // metadata fixture over its real ADD/DELETE manifests to exercise the batch
+    // planner's entry cancellation independently of that writer policy.
+    let manager = table.snapshot_manager();
+    let snapshot = manager.get_snapshot(2).await.unwrap();
+    let mut metadata = serde_json::to_value(snapshot).unwrap();
+    metadata["commitKind"] = serde_json::json!("APPEND");
+    file_io
+        .new_output(&manager.snapshot_path(2))
+        .unwrap()
+        .write(bytes::Bytes::from(serde_json::to_vec(&metadata).unwrap()))
+        .await
+        .unwrap();
+    let plan = table
+        .new_read_builder()
+        .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    let files: Vec<_> = plan
+        .splits()
+        .iter()
+        .flat_map(|split| split.data_files())
+        .map(|file| file.file_name.as_str())
+        .collect();
+    assert_eq!(files, vec![new_name.as_str()]);
+}
+
+#[tokio::test]
+async fn combined_delta_rejects_invalid_ranges_and_non_delta_modes() {
+    let path = "memory:/incremental_batch/combined_invalid";
+    let (file_io, table) = memory_table(path, pk_schema(&[]));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    for (start, end) in [(-1, 1), (0, 2), (1, 0)] {
+        let result = table
+            .new_read_builder()
+            .new_incremental_scan(IncrementalScanMode::Delta, start, end)
+            .plan_combined_delta()
+            .await;
+        assert!(matches!(result, Err(paimon::Error::DataInvalid { .. })));
+    }
+    for mode in [IncrementalScanMode::Changelog, IncrementalScanMode::Diff] {
+        let result = table
+            .new_read_builder()
+            .new_incremental_scan(mode, 1, 1)
+            .plan_combined_delta()
+            .await;
+        assert!(matches!(result, Err(paimon::Error::Unsupported { .. })));
+    }
+}
+
+#[tokio::test]
+async fn combined_delta_row_positions_span_appends_before_range_intersection() {
+    use paimon::spec::{DataType, IntType, Schema, TableSchema};
+    use paimon::table::RowRange;
+
+    let path = "memory:/incremental_batch/combined_positions";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    for start in [0, 3, 6] {
+        write_batch(
+            &table,
+            &make_batch(
+                (start..start + 3).collect(),
+                (start..start + 3).map(|id| id * 10).collect(),
+            ),
+        )
+        .await;
+    }
+    let builder = table.new_read_builder();
+    let scan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 1, 3)
+        .with_row_position_slice(1, 4)
+        .unwrap();
+    assert!(
+        matches!(scan.plan().await, Err(paimon::Error::Unsupported { .. })),
+        "per-commit Delta must not silently renumber the slice per snapshot"
+    );
+    let plan = scan.plan_combined_delta().await.unwrap();
+    assert_eq!(plan.snapshot_id(), Some(3));
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_pairs(&batches), vec![(4, 40), (5, 50), (6, 60)]);
+
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 1, 3)
+        .with_row_position_shard(1, 4)
+        .unwrap()
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_pairs(&batches), vec![(5, 50), (6, 60)]);
+
+    let mut builder = table.new_read_builder();
+    builder
+        .with_row_ranges(vec![RowRange::new(5, 7)])
+        .with_limit(2);
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 1, 3)
+        .with_row_position_slice(1, 4)
+        .unwrap()
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_pairs(&batches), vec![(5, 50), (6, 60)]);
+}
+
+#[tokio::test]
+async fn combined_delta_skips_compaction_inside_and_at_the_end_of_the_window() {
+    let path = "memory:/incremental_batch/combined_compact";
+    let (io, table) = memory_table(path, pk_schema(&[]));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    for id in 1..=3 {
+        write_batch(&table, &make_batch(vec![id], vec![id * 10])).await;
+    }
+    // Model a compaction commit using real manifests: it contributes no APPEND
+    // data, whether it is the endpoint or lies between two appends.
+    let manager = table.snapshot_manager();
+    let mut snapshot = serde_json::to_value(manager.get_snapshot(2).await.unwrap()).unwrap();
+    snapshot["commitKind"] = serde_json::json!("COMPACT");
+    io.new_output(&manager.snapshot_path(2))
+        .unwrap()
+        .write(bytes::Bytes::from(serde_json::to_vec(&snapshot).unwrap()))
+        .await
+        .unwrap();
+    for (end, expected) in [(2, vec![(1, 10)]), (3, vec![(1, 10), (3, 30)])] {
+        let builder = table.new_read_builder();
+        let plan = builder
+            .new_incremental_scan(IncrementalScanMode::Delta, 0, end)
+            .plan_combined_delta()
+            .await
+            .unwrap();
+        assert_eq!(plan.snapshot_id(), Some(end));
+        let batches = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_pairs(&batches), expected);
+    }
+}
+
+#[tokio::test]
+async fn combined_delta_preserves_partition_filter_and_projection_across_appends() {
+    use paimon::spec::{Datum, PredicateBuilder};
+    let path = "memory:/incremental_batch/combined_partition";
+    let (io, table) = memory_table(path, partitioned_pk_schema("1"));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    write_partitioned(
+        &table,
+        make_partitioned_batch(vec!["a", "b"], vec![1, 2], vec![10, 20]),
+    )
+    .await;
+    write_partitioned(
+        &table,
+        make_partitioned_batch(vec!["a", "b"], vec![1, 2], vec![99, 88]),
+    )
+    .await;
+    let mut builder = table.new_read_builder();
+    builder
+        .with_projection(&["id", "value"])
+        .unwrap()
+        .with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .equal("pt", Datum::String("a".into()))
+                .unwrap(),
+        );
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    assert_eq!(plan.snapshot_id(), Some(2));
+    let batches = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(collect_pairs(&batches), vec![(1, 99)]);
+}
+
+#[tokio::test]
+async fn combined_delta_rejects_missing_history_and_auto_changelog() {
+    let path = "memory:/incremental_batch/combined_history";
+    let (io, table) = memory_table(path, pk_schema(&[]));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let builder = table.new_read_builder();
+    assert!(matches!(
+        builder
+            .new_incremental_scan(IncrementalScanMode::Delta, 0, 0)
+            .plan_combined_delta()
+            .await,
+        Err(paimon::Error::DataInvalid { .. })
+    ));
+    for id in 1..=3 {
+        write_batch(&table, &make_batch(vec![id], vec![id * 10])).await;
+    }
+    let changelog = table.copy_with_options(std::collections::HashMap::from([(
+        "changelog-producer".into(),
+        "input".into(),
+    )]));
+    assert!(matches!(
+        changelog
+            .new_read_builder()
+            .new_incremental_scan(IncrementalScanMode::Auto, 0, 3)
+            .plan_combined_delta()
+            .await,
+        Err(paimon::Error::Unsupported { .. })
+    ));
+    // A missing interior snapshot must fail rather than return a partial batch.
+    io.delete_file(&table.snapshot_manager().snapshot_path(2))
+        .await
+        .unwrap();
+    assert!(builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 0, 3)
+        .plan_combined_delta()
+        .await
+        .is_err());
+    // Expiring the prefix makes start=0 invalid even when the endpoint exists.
+    io.delete_file(&table.snapshot_manager().snapshot_path(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        builder
+            .new_incremental_scan(IncrementalScanMode::Delta, 0, 3)
+            .plan_combined_delta()
+            .await,
+        Err(paimon::Error::DataInvalid { .. })
+    ));
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 2, 3)
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    let batches = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(collect_pairs(&batches), vec![(3, 30)]);
+}
