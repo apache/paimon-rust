@@ -71,7 +71,8 @@ pub(crate) async fn has_beneficial_offset_index(
     reader: Box<dyn FileRead>,
     file_size: u64,
     column_name: &str,
-    row_ranges: &[RowRange],
+    sample_ranges: &[RowRange],
+    scan_ranges: &[RowRange],
 ) -> crate::Result<bool> {
     let options = ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional);
     let mut reader = ArrowFileReader::new(file_size, reader.into());
@@ -79,14 +80,16 @@ pub(crate) async fn has_beneficial_offset_index(
     Ok(metadata_has_beneficial_offset_index(
         &metadata,
         column_name,
-        row_ranges,
+        sample_ranges,
+        scan_ranges,
     ))
 }
 
 fn metadata_has_beneficial_offset_index(
     metadata: &ParquetMetaData,
     column_name: &str,
-    row_ranges: &[RowRange],
+    sample_ranges: &[RowRange],
+    scan_ranges: &[RowRange],
 ) -> bool {
     let columns = metadata
         .file_metadata()
@@ -109,30 +112,27 @@ fn metadata_has_beneficial_offset_index(
     if columns.is_empty() || offset_index.len() != metadata.row_groups().len() {
         return false;
     }
-    let mut selection = build_row_ranges_selection(metadata.row_groups(), row_ranges);
+    let mut sample_selection = build_row_ranges_selection(metadata.row_groups(), sample_ranges);
+    let mut scan_selection = build_row_ranges_selection(metadata.row_groups(), scan_ranges);
     let mut checked = false;
-    let mut full_bytes = 0u64;
-    let mut selected_bytes = 0u64;
+    let mut sample_bytes = 0u64;
+    let mut scan_bytes = 0u64;
     for (row_group, indexes) in metadata.row_groups().iter().zip(offset_index) {
         let Ok(row_count) = usize::try_from(row_group.num_rows()) else {
             return false;
         };
-        let row_group_selection = selection.split_off(row_count);
-        let mut selected_ranges = Vec::new();
+        let sample_row_group_selection = sample_selection.split_off(row_count);
+        let scan_row_group_selection = scan_selection.split_off(row_count);
+        let sample_selected = sample_row_group_selection.selects_any();
+        let scan_selected = scan_row_group_selection.selects_any();
+        checked |= sample_selected;
+        if !sample_selected && !scan_selected {
+            continue;
+        }
+        let mut sample_byte_ranges = Vec::new();
+        let mut scan_byte_ranges = Vec::new();
         for index in &columns {
             let column = row_group.column(*index);
-            let Ok(column_bytes) = u64::try_from(column.compressed_size()) else {
-                return false;
-            };
-            let Some(total) = full_bytes.checked_add(column_bytes) else {
-                return false;
-            };
-            full_bytes = total;
-
-            if !row_group_selection.selects_any() {
-                continue;
-            }
-            checked = true;
             let Some(page_locations) = indexes.get(*index).map(|index| index.page_locations())
             else {
                 return false;
@@ -150,30 +150,40 @@ fn metadata_has_beneficial_offset_index(
             let Ok(first_page_offset) = u64::try_from(first_page.offset) else {
                 return false;
             };
-            if column_start < first_page_offset {
-                selected_ranges.push(column_start..first_page_offset);
+            for (selection, selected_ranges) in [
+                (&sample_row_group_selection, &mut sample_byte_ranges),
+                (&scan_row_group_selection, &mut scan_byte_ranges),
+            ] {
+                if !selection.selects_any() {
+                    continue;
+                }
+                if column_start < first_page_offset {
+                    selected_ranges.push(column_start..first_page_offset);
+                }
+                selected_ranges.extend(selection.scan_ranges(page_locations));
             }
-            selected_ranges.extend(row_group_selection.scan_ranges(page_locations));
         }
-        if row_group_selection.selects_any() {
-            let Some(group_selected_bytes) =
-                merge_byte_ranges(&selected_ranges, RANGE_COALESCE_BYTES)
-                    .into_iter()
-                    .try_fold(0u64, |total, range| {
-                        total.checked_add(range.end.checked_sub(range.start)?)
-                    })
+        for (selected_ranges, total_bytes) in [
+            (sample_byte_ranges, &mut sample_bytes),
+            (scan_byte_ranges, &mut scan_bytes),
+        ] {
+            let Some(group_bytes) = merge_byte_ranges(&selected_ranges, RANGE_COALESCE_BYTES)
+                .into_iter()
+                .try_fold(0u64, |total, range| {
+                    total.checked_add(range.end.checked_sub(range.start)?)
+                })
             else {
                 return false;
             };
-            let Some(total) = selected_bytes.checked_add(group_selected_bytes) else {
+            let Some(total) = total_bytes.checked_add(group_bytes) else {
                 return false;
             };
-            selected_bytes = total;
+            *total_bytes = total;
         }
     }
     // Sparse training is followed by a full scan, so require it to skip at
     // least half of the projected bytes instead of accepting marginal savings.
-    checked && selected_bytes <= full_bytes / 2
+    checked && sample_bytes <= scan_bytes / 2
 }
 
 enum ParquetRowGroupMessage {
@@ -3715,21 +3725,37 @@ mod tests {
         let bytes = write_multi_row_group_parquet(10, 30, EnabledStatistics::Chunk, false).await;
         let metadata = load_metadata_with_page_index(&bytes, true);
         assert!(
-            !metadata_has_beneficial_offset_index(&metadata, "value", &[RowRange::new(0, 19)]),
+            !metadata_has_beneficial_offset_index(
+                &metadata,
+                "value",
+                &[RowRange::new(0, 19)],
+                &[RowRange::new(0, 29)],
+            ),
             "reading two of three row groups is not sufficiently sparse"
         );
 
         let bytes = write_multi_page_parquet(10, 80).await;
         let metadata = load_metadata_with_page_index(&bytes, true);
+        assert!(
+            !metadata_has_beneficial_offset_index(
+                &metadata,
+                "value",
+                &[RowRange::new(20, 38)],
+                &[RowRange::new(20, 39)],
+            ),
+            "near-full reads within one shard must not use the whole file as the baseline"
+        );
         assert!(!metadata_has_beneficial_offset_index(
             &metadata,
             "value",
-            &[RowRange::new(0, 69)]
+            &[RowRange::new(0, 69)],
+            &[RowRange::new(0, 79)],
         ));
         assert!(!metadata_has_beneficial_offset_index(
             &metadata,
             "value",
-            &[RowRange::new(0, 0), RowRange::new(79, 79)]
+            &[RowRange::new(0, 0), RowRange::new(79, 79)],
+            &[RowRange::new(0, 79)],
         ));
 
         let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, false).await;
@@ -3738,18 +3764,21 @@ mod tests {
         assert!(!metadata_has_beneficial_offset_index(
             &metadata,
             "value",
-            &[RowRange::new(0, 19)]
+            &[RowRange::new(0, 19)],
+            &[RowRange::new(0, 19)],
         ));
         let sparse_ranges = [RowRange::new(0, 0)];
         assert!(metadata_has_beneficial_offset_index(
             &metadata,
             "value",
-            &sparse_ranges
+            &sparse_ranges,
+            &[RowRange::new(0, 19)],
         ));
         assert!(!metadata_has_beneficial_offset_index(
             &metadata,
             "missing",
-            &sparse_ranges
+            &sparse_ranges,
+            &[RowRange::new(0, 19)],
         ));
         let bytes_without_index =
             write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, true).await;
@@ -3757,7 +3786,8 @@ mod tests {
         assert!(!metadata_has_beneficial_offset_index(
             &metadata_without_index,
             "value",
-            &sparse_ranges
+            &sparse_ranges,
+            &[RowRange::new(0, 19)],
         ));
     }
 
