@@ -20,19 +20,14 @@
 use std::sync::Arc;
 
 use datafusion::common::{stats::Precision, Statistics};
-use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::utils::collect_columns;
-use datafusion::physical_plan::filter_pushdown::{
-    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation,
-};
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, PlanProperties};
 use paimon::table::AuditLogRead;
 
 use super::PaimonTableScan;
 
-/// Retains retract rows and keeps logical audit columns out of physical pushdown.
+/// Retains retract rows; physical filters remain above this scan.
 #[derive(Debug, Clone)]
 pub(crate) struct PaimonAuditLogScan {
     inner: PaimonTableScan,
@@ -64,34 +59,6 @@ impl ExecutionPlan for PaimonAuditLogScan {
         Ok(self)
     }
 
-    fn handle_child_pushdown_result(
-        &self,
-        _phase: FilterPushdownPhase,
-        child_pushdown_result: ChildPushdownResult,
-        _config: &ConfigOptions,
-    ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        let result = self
-            .inner
-            .pushdown_filters(child_pushdown_result, |filter| {
-                // Audit system-table names are case sensitive. Synthetic columns
-                // have no counterpart in the underlying data files.
-                collect_columns(filter).iter().all(|column| {
-                    self.inner
-                        .table()
-                        .schema()
-                        .fields()
-                        .iter()
-                        .any(|field| field.name() == column.name())
-                })
-            })?;
-        Ok(FilterPushdownPropagation {
-            filters: result.filters,
-            updated_node: result
-                .updated_node
-                .map(|scan| Arc::new(Self::new(scan)) as Arc<dyn ExecutionPlan>),
-        })
-    }
-
     fn execute(
         &self,
         partition: usize,
@@ -112,10 +79,11 @@ impl ExecutionPlan for PaimonAuditLogScan {
 impl DisplayAs for PaimonAuditLogScan {
     fn fmt_as(
         &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
+        t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        self.inner.fmt_scan(self.name(), f)
+        write!(f, "{}: ", self.name())?;
+        self.inner.fmt_as(t, f)
     }
 }
 
@@ -123,10 +91,13 @@ impl DisplayAs for PaimonAuditLogScan {
 mod tests {
     use super::*;
     use crate::table::{datafusion_arrow_schema, PaimonScanBuilder};
+    use datafusion::config::ConfigOptions;
     use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::expressions::{lit, BinaryExpr, Column};
     use datafusion::physical_expr::PhysicalExpr;
-    use datafusion::physical_plan::filter_pushdown::{ChildFilterPushdownResult, PushedDown};
+    use datafusion::physical_plan::filter_pushdown::{
+        ChildFilterPushdownResult, ChildPushdownResult, FilterPushdownPhase, PushedDown,
+    };
     use paimon::catalog::Identifier;
     use paimon::table::Table;
     use paimon::DataSplitBuilder;
@@ -195,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn test_audit_policy_survives_filter_pushdown() {
+    fn test_audit_physical_filters_remain_above_scan() {
         let scan = first_row_audit_scan();
         let filters: Vec<Arc<dyn PhysicalExpr>> = vec![
             Arc::new(BinaryExpr::new(
@@ -228,12 +199,11 @@ mod tests {
 
         assert!(matches!(
             result.filters.as_slice(),
-            [PushedDown::Yes, PushedDown::No]
+            [PushedDown::No, PushedDown::No]
         ));
-        let updated = result.updated_node.unwrap();
-        assert!(updated.downcast_ref::<PaimonAuditLogScan>().is_some());
+        assert!(result.updated_node.is_none());
         assert_eq!(
-            updated.partition_statistics(None).unwrap().num_rows,
+            scan.partition_statistics(None).unwrap().num_rows,
             Precision::Absent
         );
     }

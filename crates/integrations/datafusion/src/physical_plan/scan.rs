@@ -997,71 +997,6 @@ impl PaimonTableScan {
             .collect()
     }
 
-    pub(crate) fn pushdown_filters(
-        &self,
-        child_pushdown_result: ChildPushdownResult,
-        supported: impl Fn(&Arc<dyn PhysicalExpr>) -> bool,
-    ) -> DFResult<FilterPushdownPropagation<Self>> {
-        let filters = child_pushdown_result
-            .parent_filters
-            .into_iter()
-            .map(|result| result.filter)
-            .collect::<Vec<_>>();
-        if filters.is_empty() {
-            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                Vec::new(),
-            ));
-        }
-        let schema = self.schema();
-        let mut accepted = Vec::new();
-        let parent_filter_handled = filters
-            .into_iter()
-            .map(|filter| {
-                if supported(&filter)
-                    && can_expr_be_pushed_down_with_schemas(&filter, schema.as_ref())
-                {
-                    accepted.push(filter);
-                    // This scan evaluates accepted expressions exactly, so the
-                    // parent FilterExec can be removed.
-                    PushedDown::Yes
-                } else {
-                    PushedDown::No
-                }
-            })
-            .collect::<Vec<_>>();
-        if accepted.is_empty() {
-            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                parent_filter_handled,
-            ));
-        }
-
-        let mut scan = self.clone();
-        for filter in accepted {
-            scan.decoder_filters.extend(
-                split_conjunction(&filter)
-                    .into_iter()
-                    .filter(|conjunct| {
-                        !paimon_predicate_covers_filter(
-                            self.pushed_predicate.as_ref(),
-                            conjunct,
-                            self.table.schema().fields(),
-                            self.case_sensitive,
-                        ) && !reads_partition_column_absent_from_files(
-                            conjunct,
-                            &self.table,
-                            self.case_sensitive,
-                        )
-                    })
-                    .cloned(),
-            );
-            scan.runtime_filters.push(filter);
-        }
-        Ok(
-            FilterPushdownPropagation::with_parent_pushdown_result(parent_filter_handled)
-                .with_updated_node(scan),
-        )
-    }
-
     pub(crate) fn execute_with(
         &self,
         partition: usize,
@@ -1113,8 +1048,9 @@ impl PaimonTableScan {
             let stream = read_splits(read, &splits).map_err(to_datafusion_error)?;
             let batch_schema = Arc::clone(&schema);
             let stream = stream.map(move |result| {
-                let batch = result.map_err(to_datafusion_error)?;
-                let mut batch = to_datafusion_batch(batch, &batch_schema)?;
+                let mut batch = result
+                    .map_err(to_datafusion_error)
+                    .and_then(|batch| to_datafusion_batch(batch, &batch_schema))?;
                 // The decoder hook is an optimization and may be unavailable
                 // for a file/path. Retain every original live expression as
                 // the exact fallback; evaluating it on decoder survivors is
@@ -1146,51 +1082,6 @@ impl PaimonTableScan {
             futures::stream::once(fut).try_flatten(),
         )))
     }
-
-    pub(crate) fn fmt_scan(&self, name: &str, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}: table={}", name, self.table.identifier())?;
-
-        let total_splits: usize = self.planned_partitions.iter().map(|p| p.len()).sum();
-        let total_files: usize = self
-            .planned_partitions
-            .iter()
-            .flat_map(|p| p.iter())
-            .map(|s| s.data_files().len())
-            .sum();
-        write!(
-            f,
-            ", partitions={}, splits={total_splits}, files={total_files}",
-            self.planned_partitions.len()
-        )?;
-
-        let columns = self
-            .read_type
-            .iter()
-            .map(|field| field.name())
-            .collect::<Vec<_>>();
-        write!(f, ", projection=[{}]", columns.join(", "))?;
-        if let Some(ref predicate) = self.pushed_predicate {
-            write!(f, ", predicate={predicate}")?;
-        }
-        if let Some(limit) = self.limit {
-            write!(f, ", limit={limit}")?;
-        }
-        if let Some(ref trace) = self.scan_trace {
-            write!(f, ", trace={trace}")?;
-        }
-        if let Some(ref pushed_variants) = self.pushed_variants {
-            write!(f, ", PushedVariants=[{pushed_variants}]")?;
-        }
-        if !self.runtime_filters.is_empty() {
-            let filters = self
-                .runtime_filters
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            write!(f, ", runtime_filters=[{}]", filters.join(" AND "))?;
-        }
-        Ok(())
-    }
 }
 
 impl ExecutionPlan for PaimonTableScan {
@@ -1219,13 +1110,63 @@ impl ExecutionPlan for PaimonTableScan {
         child_pushdown_result: ChildPushdownResult,
         _config: &ConfigOptions,
     ) -> DFResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
-        let result = self.pushdown_filters(child_pushdown_result, |_| true)?;
-        Ok(FilterPushdownPropagation {
-            filters: result.filters,
-            updated_node: result
-                .updated_node
-                .map(|scan| Arc::new(scan) as Arc<dyn ExecutionPlan>),
-        })
+        let filters = child_pushdown_result
+            .parent_filters
+            .into_iter()
+            .map(|result| result.filter)
+            .collect::<Vec<_>>();
+        if filters.is_empty() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                Vec::new(),
+            ));
+        }
+
+        let schema = self.schema();
+        let mut accepted = Vec::new();
+        let parent_filter_handled = filters
+            .into_iter()
+            .map(|filter| {
+                if can_expr_be_pushed_down_with_schemas(&filter, schema.as_ref()) {
+                    accepted.push(filter);
+                    // This scan evaluates accepted expressions exactly, so the
+                    // parent FilterExec can be removed.
+                    PushedDown::Yes
+                } else {
+                    PushedDown::No
+                }
+            })
+            .collect::<Vec<_>>();
+        if accepted.is_empty() {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                parent_filter_handled,
+            ));
+        }
+
+        let mut scan = self.clone();
+        for filter in accepted {
+            scan.decoder_filters.extend(
+                split_conjunction(&filter)
+                    .into_iter()
+                    .filter(|conjunct| {
+                        !paimon_predicate_covers_filter(
+                            self.pushed_predicate.as_ref(),
+                            conjunct,
+                            self.table.schema().fields(),
+                            self.case_sensitive,
+                        ) && !reads_partition_column_absent_from_files(
+                            conjunct,
+                            &self.table,
+                            self.case_sensitive,
+                        )
+                    })
+                    .cloned(),
+            );
+            scan.runtime_filters.push(filter);
+        }
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(parent_filter_handled)
+                .with_updated_node(Arc::new(scan)),
+        )
     }
 
     fn execute(
@@ -1283,7 +1224,48 @@ impl DisplayAs for PaimonTableScan {
         _t: datafusion::physical_plan::DisplayFormatType,
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
-        self.fmt_scan(self.name(), f)
+        write!(f, "PaimonTableScan: table={}", self.table.identifier())?;
+
+        let total_splits: usize = self.planned_partitions.iter().map(|p| p.len()).sum();
+        let total_files: usize = self
+            .planned_partitions
+            .iter()
+            .flat_map(|p| p.iter())
+            .map(|s| s.data_files().len())
+            .sum();
+        write!(
+            f,
+            ", partitions={}, splits={total_splits}, files={total_files}",
+            self.planned_partitions.len()
+        )?;
+
+        let columns = self
+            .read_type
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>();
+        write!(f, ", projection=[{}]", columns.join(", "))?;
+        if let Some(ref predicate) = self.pushed_predicate {
+            write!(f, ", predicate={predicate}")?;
+        }
+        if let Some(limit) = self.limit {
+            write!(f, ", limit={limit}")?;
+        }
+        if let Some(ref trace) = self.scan_trace {
+            write!(f, ", trace={trace}")?;
+        }
+        if let Some(ref pushed_variants) = self.pushed_variants {
+            write!(f, ", PushedVariants=[{pushed_variants}]")?;
+        }
+        if !self.runtime_filters.is_empty() {
+            let filters = self
+                .runtime_filters
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            write!(f, ", runtime_filters=[{}]", filters.join(" AND "))?;
+        }
+        Ok(())
     }
 }
 

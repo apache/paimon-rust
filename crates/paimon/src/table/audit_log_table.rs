@@ -16,7 +16,7 @@
 // under the License.
 
 use super::incremental_scan::{IncrementalPlan, IncrementalScan, IncrementalScanMode};
-use super::{ArrowRecordBatchStream, AuditLogRead, AuditLogScan, DataSplit, Table};
+use super::{ArrowRecordBatchStream, AuditLogRead, AuditLogScan, Table};
 use crate::spec::{
     BigIntType, DataField, DataType, VarCharType, ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME,
     SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
@@ -82,7 +82,7 @@ impl AuditLogTable {
         IncrementalScan::for_table(&self.wrapped, mode, start_exclusive, end_inclusive)
     }
 
-    /// Plan a current-state audit read for [`Self::to_arrow_for_splits`].
+    /// Plan a current-state audit read for [`Self::new_read`].
     pub fn new_scan(&self) -> AuditLogScan<'_> {
         self.wrapped.new_read_builder().new_audit_scan()
     }
@@ -101,13 +101,5 @@ impl AuditLogTable {
         plan.validate()?;
         let read = self.wrapped.new_read_builder().new_read()?;
         read.to_audit_log_arrow(plan)
-    }
-
-    /// Reads the current table state, retaining retract rows for primary-key tables.
-    pub fn to_arrow_for_splits(
-        &self,
-        splits: &[DataSplit],
-    ) -> crate::Result<ArrowRecordBatchStream> {
-        self.new_read()?.to_arrow(splits)
     }
 }

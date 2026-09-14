@@ -401,7 +401,9 @@ async fn audit_log_current_scan_keeps_delete_and_sequence_number() {
 
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
     let batches: Vec<RecordBatch> = AuditLogTable::new(table)
-        .to_arrow_for_splits(plan.splits())
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
         .unwrap()
         .try_collect()
         .await
@@ -476,7 +478,9 @@ async fn audit_log_current_scan_uses_merged_rowkind() {
 
         let plan = table.new_read_builder().new_scan().plan().await.unwrap();
         let batches: Vec<RecordBatch> = AuditLogTable::new(table)
-            .to_arrow_for_splits(plan.splits())
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
             .unwrap()
             .try_collect()
             .await
@@ -515,7 +519,9 @@ async fn audit_log_current_scan_respects_ignore_delete() {
 
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
     let batches: Vec<RecordBatch> = AuditLogTable::new(table)
-        .to_arrow_for_splits(plan.splits())
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
         .unwrap()
         .try_collect()
         .await
@@ -570,7 +576,9 @@ async fn audit_log_current_scan_supports_first_row() {
     let mut rows = Vec::new();
     for split in plan.splits() {
         let batches: Vec<RecordBatch> = audit
-            .to_arrow_for_splits(std::slice::from_ref(split))
+            .new_read()
+            .unwrap()
+            .to_arrow(std::slice::from_ref(split))
             .unwrap()
             .try_collect()
             .await
