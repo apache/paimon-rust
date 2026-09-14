@@ -3877,7 +3877,7 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         for _ in 0..4 {
             let values = Int32Array::from_iter_values((0..GROUP_ROWS).map(|row| {
-                if row / PAGE_ROWS % 2 == 0 {
+                if (row / PAGE_ROWS).is_multiple_of(2) {
                     0
                 } else {
                     rng.next_u32() as i32
