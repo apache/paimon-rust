@@ -30,15 +30,15 @@ use crate::Result;
 
 use super::api_request::{
     AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
-    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateViewRequest,
-    DropPartitionsRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
-    RenameTableRequest, RevokePermissionRequest,
+    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateTagRequest,
+    CreateViewRequest, DropPartitionsRequest, ListPartitionsByFilterRequest,
+    ListPartitionsByNamesRequest, RenameTableRequest, RevokePermissionRequest,
 };
 use super::api_response::{
     AuthTableQueryResponse, ConfigResponse, GetDatabaseResponse, GetFunctionResponse,
-    GetTableResponse, GetViewResponse, ListDatabasesResponse, ListFunctionsResponse,
-    ListPartitionsResponse, ListPermissionsResponse, ListTablesResponse, ListViewsResponse,
-    PagedList,
+    GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
+    ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse, ListTablesResponse,
+    ListViewsResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
 use super::management::{ListPermissionsRequest, PermissionAssignment, PermissionResource};
@@ -887,6 +887,53 @@ impl RESTApi {
         let request = RevokePermissionRequest::new(resource.clone(), access, principal)?;
         let path = self.resource_paths.revoke_permission();
         let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
+
+    // ==================== Tag Operations ====================
+
+    pub async fn create_tag(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+    ) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[
+            (database, "database name"),
+            (table, "table name"),
+            (tag_name, "tag name"),
+        ])?;
+        let path = self.resource_paths.tags(database, table);
+        let request = CreateTagRequest::new(tag_name.to_string(), snapshot_id);
+        let _response: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
+
+    pub async fn get_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<GetTagResponse> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[
+            (database, "database name"),
+            (table, "table name"),
+            (tag_name, "tag name"),
+        ])?;
+        let path = self.resource_paths.tag(database, table, tag_name);
+        self.client.get(&path, None::<&[(&str, &str)]>).await
+    }
+
+    pub async fn delete_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[
+            (database, "database name"),
+            (table, "table name"),
+            (tag_name, "tag name"),
+        ])?;
+        let path = self.resource_paths.tag(database, table, tag_name);
+        let _response: serde_json::Value =
+            self.client.delete(&path, None::<&[(&str, &str)]>).await?;
         Ok(())
     }
 

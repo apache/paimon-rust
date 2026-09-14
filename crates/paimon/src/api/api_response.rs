@@ -24,7 +24,7 @@ use std::collections::HashMap;
 
 use crate::api::management::PermissionAssignment;
 use crate::catalog::{Function, FunctionDefinition, ViewSchema};
-use crate::spec::{DataField, Schema};
+use crate::spec::{DataField, Schema, Snapshot};
 
 /// Error response from REST API calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +130,16 @@ pub struct GetTableResponse {
     pub schema_id: Option<i64>,
     /// The schema of the table.
     pub schema: Option<Schema>,
+}
+
+/// Response for getting a table tag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTagResponse {
+    pub tag_name: String,
+    pub snapshot: Snapshot,
+    pub tag_create_time: Option<i64>,
+    pub tag_time_retained: Option<String>,
 }
 
 /// Response for getting a persistent view.

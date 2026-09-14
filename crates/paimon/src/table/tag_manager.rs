@@ -66,6 +66,7 @@ impl TagManager {
 
     /// Check if a tag exists.
     pub async fn tag_exists(&self, tag_name: &str) -> crate::Result<bool> {
+        validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         let input = self.file_io.new_input(&path)?;
         input.exists().await
@@ -76,6 +77,7 @@ impl TagManager {
     /// Tag files are JSON with the same schema as Snapshot.
     /// Reads directly and catches NotFound to avoid a separate exists() IO round-trip.
     pub async fn get(&self, tag_name: &str) -> crate::Result<Option<Snapshot>> {
+        validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         let input = self.file_io.new_input(&path)?;
         let bytes = match input.read().await {
@@ -103,6 +105,22 @@ impl TagManager {
         &self,
         tag_name: &str,
     ) -> crate::Result<Option<(Snapshot, Option<i64>, Option<f64>)>> {
+        Ok(self.get_with_raw_metadata(tag_name).await?.map(
+            |(snapshot, create_time, time_retained)| {
+                (
+                    snapshot,
+                    create_time.map(|value| value.and_utc().timestamp_millis()),
+                    time_retained,
+                )
+            },
+        ))
+    }
+
+    pub(crate) async fn get_with_raw_metadata(
+        &self,
+        tag_name: &str,
+    ) -> crate::Result<Option<(Snapshot, Option<chrono::NaiveDateTime>, Option<f64>)>> {
+        validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         let input = self.file_io.new_input(&path)?;
         let bytes = match input.read().await {
@@ -126,7 +144,7 @@ impl TagManager {
             })?;
         let create_time = value
             .get(FIELD_TAG_CREATE_TIME)
-            .and_then(parse_tag_create_time_millis);
+            .and_then(parse_tag_create_time);
         let time_retained = value
             .get(FIELD_TAG_TIME_RETAINED)
             .and_then(serde_json::Value::as_f64);
@@ -181,17 +199,20 @@ impl TagManager {
 
     /// Create a tag by writing the snapshot JSON to the tag path.
     pub async fn create(&self, tag_name: &str, snapshot: &Snapshot) -> crate::Result<()> {
+        validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         let json = serde_json::to_string(snapshot).map_err(|e| crate::Error::DataInvalid {
             message: format!("failed to serialize snapshot for tag '{tag_name}': {e}"),
             source: Some(Box::new(e)),
         })?;
+        self.file_io.mkdirs(&self.tag_directory()).await?;
         let output = self.file_io.new_output(&path)?;
         output.write(bytes::Bytes::from(json)).await
     }
 
     /// Delete a tag file.
     pub async fn delete(&self, tag_name: &str) -> crate::Result<()> {
+        validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         self.file_io.delete_file(&path).await
     }
@@ -217,15 +238,28 @@ impl TagManager {
 const FIELD_TAG_CREATE_TIME: &str = "tagCreateTime";
 const FIELD_TAG_TIME_RETAINED: &str = "tagTimeRetained";
 
-/// Decode a Jackson-serialized `LocalDateTime` into epoch millis, treating the
-/// wall-clock value as UTC.
+fn validate_tag_name(tag_name: &str) -> crate::Result<()> {
+    let invalid = tag_name.trim().is_empty()
+        || tag_name.trim_end() != tag_name
+        || tag_name.contains('/')
+        || tag_name.contains('\\')
+        || tag_name.chars().any(char::is_control);
+    if invalid {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!("Invalid tag name: {tag_name:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// Decode a Jackson-serialized `LocalDateTime`.
 ///
 /// Jackson's `LocalDateTimeSerializer` emits
 /// `[year, month, day, hour, minute, second, nanoOfSecond]` and omits trailing
 /// zero components, so the array may hold as few as five items. Anything that is
 /// not such an array -- or that does not describe a real instant -- yields
 /// `None` so one odd tag file cannot fail the whole listing.
-fn parse_tag_create_time_millis(value: &serde_json::Value) -> Option<i64> {
+fn parse_tag_create_time(value: &serde_json::Value) -> Option<chrono::NaiveDateTime> {
     let items = value.as_array()?;
     if items.len() < 5 || items.len() > 7 {
         return None;
@@ -247,7 +281,7 @@ fn parse_tag_create_time_millis(value: &serde_json::Value) -> Option<i64> {
         u32::try_from(second).ok()?,
         u32::try_from(nano).ok()?,
     )?;
-    Some(date.and_time(time).and_utc().timestamp_millis())
+    Some(date.and_time(time))
 }
 
 #[cfg(test)]
@@ -288,6 +322,55 @@ mod tests {
         let tm = TagManager::new(file_io, "memory:/test_tag_missing".to_string());
         assert!(tm.list_all_names().await.unwrap().is_empty());
         assert!(tm.list_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tag_operations_reject_unsafe_names() {
+        let tm = TagManager::new(test_file_io(), "memory:/warehouse/table".to_string());
+        let snapshot = test_snapshot(1);
+
+        for name in ["", " ", "tag ", "nested/tag", "nested\\tag", "bad\nname"] {
+            assert!(matches!(
+                tm.create(name, &snapshot).await,
+                Err(crate::Error::ConfigInvalid { .. })
+            ));
+            assert!(matches!(
+                tm.tag_exists(name).await,
+                Err(crate::Error::ConfigInvalid { .. })
+            ));
+            assert!(matches!(
+                tm.get(name).await,
+                Err(crate::Error::ConfigInvalid { .. })
+            ));
+            assert!(matches!(
+                tm.delete(name).await,
+                Err(crate::Error::ConfigInvalid { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_leading_whitespace_tag_name_compatibility() {
+        let tm = TagManager::new(test_file_io(), "memory:/warehouse/table".to_string());
+        let snapshot = test_snapshot(1);
+
+        tm.create(" tag", &snapshot).await.unwrap();
+        assert_eq!(tm.get(" tag").await.unwrap(), Some(snapshot));
+        assert_eq!(tm.list_all().await.unwrap().len(), 1);
+        assert_eq!(tm.list_all_with_metadata().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_trailing_whitespace_does_not_alias_tag() {
+        let tm = TagManager::new(test_file_io(), "memory:/warehouse/table".to_string());
+        let snapshot = test_snapshot(1);
+
+        tm.create("tag", &snapshot).await.unwrap();
+        assert!(matches!(
+            tm.delete("tag ").await,
+            Err(crate::Error::ConfigInvalid { .. })
+        ));
+        assert_eq!(tm.get("tag").await.unwrap(), Some(snapshot));
     }
 
     #[tokio::test]

@@ -21,18 +21,20 @@
 
 use std::collections::HashMap;
 
+use crate::api::GetTagResponse;
 use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX};
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
 use crate::io::cache::{create_local_cache, LocalCache};
 use crate::io::FileIO;
 use crate::spec::{
-    CoreOptions, Schema, TableSchema, TableType, INDEX_FILE_IN_DATA_FILE_DIR_OPTION,
+    CoreOptions, Schema, Snapshot, TableSchema, TableType, INDEX_FILE_IN_DATA_FILE_DIR_OPTION,
     TABLE_TYPE_OPTION,
 };
 use crate::table::{ObjectTable, SchemaManager, Table};
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::TimeZone;
 use opendal::raw::get_basename;
 use snafu::OptionExt;
 
@@ -550,6 +552,138 @@ impl Catalog for FileSystemCatalog {
             .map_err(|e| fill_table_name(e, identifier))?;
         self.save_table_schema(&table_path, &new_schema).await
     }
+
+    async fn create_tag(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        let table = self.get_table(identifier).await?;
+        let manager = table.tag_manager();
+        if manager.tag_exists(tag_name).await? {
+            return if ignore_if_exists {
+                Ok(())
+            } else {
+                Err(Error::TagAlreadyExist {
+                    tag_name: tag_name.to_string(),
+                })
+            };
+        }
+
+        let snapshot = resolve_tag_snapshot(&table, snapshot_id).await?;
+        manager.create(tag_name, &snapshot).await
+    }
+
+    async fn get_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<GetTagResponse> {
+        let (snapshot, tag_create_time, tag_time_retained) = self
+            .get_table(identifier)
+            .await?
+            .tag_manager()
+            .get_with_raw_metadata(tag_name)
+            .await?
+            .ok_or_else(|| Error::TagNotExist {
+                tag_name: tag_name.to_string(),
+            })?;
+        Ok(GetTagResponse {
+            tag_name: tag_name.to_string(),
+            snapshot,
+            tag_create_time: tag_create_time
+                .and_then(|value| local_datetime_to_millis(&chrono::Local, value)),
+            tag_time_retained: tag_time_retained.and_then(format_tag_time_retained),
+        })
+    }
+
+    async fn delete_tag(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        let table = self.get_table(identifier).await?;
+        let manager = table.tag_manager();
+        let Some(snapshot) = manager.get(tag_name).await? else {
+            return if ignore_if_not_exists {
+                Ok(())
+            } else {
+                Err(Error::TagNotExist {
+                    tag_name: tag_name.to_string(),
+                })
+            };
+        };
+        match table.snapshot_manager().get_snapshot(snapshot.id()).await {
+            Ok(_) => manager.delete(tag_name).await,
+            Err(Error::SnapshotNotExist { .. }) => Err(Error::Unsupported {
+                message: "deleting a tag after its snapshot expired is not supported by FileSystemCatalog"
+                    .to_string(),
+            }),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+async fn resolve_tag_snapshot(table: &Table, snapshot_id: Option<i64>) -> Result<Snapshot> {
+    let snapshot_manager = table.snapshot_manager();
+    let Some(snapshot_id) = snapshot_id else {
+        return snapshot_manager
+            .get_latest_snapshot()
+            .await?
+            .ok_or_else(|| Error::DataInvalid {
+                message: "Cannot create tag because latest snapshot does not exist".to_string(),
+                source: None,
+            });
+    };
+
+    match snapshot_manager.get_snapshot(snapshot_id).await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(Error::SnapshotNotExist { .. }) => table
+            .tag_manager()
+            .list_all()
+            .await?
+            .into_iter()
+            .map(|(_, snapshot)| snapshot)
+            .find(|snapshot| snapshot.id() == snapshot_id)
+            .ok_or(Error::SnapshotNotExist { snapshot_id }),
+        Err(error) => Err(error),
+    }
+}
+
+fn format_tag_time_retained(seconds: f64) -> Option<String> {
+    let duration = std::time::Duration::try_from_secs_f64(seconds).ok()?;
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = total_seconds % 3600 / 60;
+    let seconds = total_seconds % 60;
+    let nanos = duration.subsec_nanos();
+
+    let mut value = String::from("PT");
+    if hours != 0 {
+        value.push_str(&format!("{hours}H"));
+    }
+    if minutes != 0 {
+        value.push_str(&format!("{minutes}M"));
+    }
+    if seconds != 0 || nanos != 0 || value == "PT" {
+        value.push_str(&seconds.to_string());
+        if nanos != 0 {
+            let fraction = format!("{nanos:09}");
+            value.push('.');
+            value.push_str(fraction.trim_end_matches('0'));
+        }
+        value.push('S');
+    }
+    Some(value)
+}
+
+fn local_datetime_to_millis<Tz: TimeZone>(
+    timezone: &Tz,
+    value: chrono::NaiveDateTime,
+) -> Option<i64> {
+    timezone
+        .from_local_datetime(&value)
+        .earliest()
+        .map(|value| value.timestamp_millis())
 }
 
 /// Options whose value is baked into the on-disk layout, so changing one on a
@@ -904,6 +1038,148 @@ mod tests {
                 .await
                 .unwrap(),
             "the fixture snapshot must be the table's first"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tag_operations() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db1", "t");
+        catalog
+            .create_table(&identifier, testing_schema(), false)
+            .await
+            .unwrap();
+        give_the_table_a_snapshot(&catalog, &identifier).await;
+
+        catalog
+            .create_tag(&identifier, "release-1", Some(1), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .get_tag(&identifier, "release-1")
+                .await
+                .unwrap()
+                .snapshot
+                .id(),
+            1
+        );
+        assert!(matches!(
+            catalog
+                .create_tag(&identifier, "release-1", Some(1), false)
+                .await,
+            Err(Error::TagAlreadyExist { .. })
+        ));
+        catalog
+            .create_tag(&identifier, "release-1", Some(1), true)
+            .await
+            .unwrap();
+
+        catalog
+            .create_tag(&identifier, "latest", None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            catalog
+                .get_tag(&identifier, "latest")
+                .await
+                .unwrap()
+                .snapshot
+                .id(),
+            1
+        );
+        assert!(matches!(
+            catalog
+                .create_tag(&identifier, "missing", Some(2), false)
+                .await,
+            Err(Error::SnapshotNotExist { snapshot_id: 2 })
+        ));
+
+        catalog
+            .delete_tag(&identifier, "release-1", false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.get_tag(&identifier, "release-1").await,
+            Err(Error::TagNotExist { .. })
+        ));
+        assert!(matches!(
+            catalog.delete_tag(&identifier, "release-1", false).await,
+            Err(Error::TagNotExist { .. })
+        ));
+        catalog
+            .delete_tag(&identifier, "release-1", true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_tag_is_unsupported() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db1", "t");
+        catalog
+            .create_table(&identifier, testing_schema(), false)
+            .await
+            .unwrap();
+        give_the_table_a_snapshot(&catalog, &identifier).await;
+        catalog
+            .create_tag(&identifier, "release-1", Some(1), false)
+            .await
+            .unwrap();
+
+        catalog
+            .get_table(&identifier)
+            .await
+            .unwrap()
+            .snapshot_manager()
+            .delete_snapshot(1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog.delete_tag(&identifier, "release-1", false).await,
+            Err(Error::Unsupported { .. })
+        ));
+        assert_eq!(
+            catalog
+                .get_tag(&identifier, "release-1")
+                .await
+                .unwrap()
+                .snapshot
+                .id(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_format_tag_time_retained() {
+        assert_eq!(format_tag_time_retained(0.0).as_deref(), Some("PT0S"));
+        assert_eq!(format_tag_time_retained(90.0).as_deref(), Some("PT1M30S"));
+        assert_eq!(
+            format_tag_time_retained(259_200.0).as_deref(),
+            Some("PT72H")
+        );
+        assert_eq!(format_tag_time_retained(1.5).as_deref(), Some("PT1.5S"));
+    }
+
+    #[test]
+    fn test_tag_create_time_uses_catalog_timezone() {
+        let value = chrono::NaiveDate::from_ymd_opt(2024, 1, 2)
+            .unwrap()
+            .and_hms_nano_opt(3, 4, 5, 123_000_000)
+            .unwrap();
+        let shanghai = chrono::FixedOffset::east_opt(8 * 60 * 60).unwrap();
+
+        assert_eq!(
+            local_datetime_to_millis(&shanghai, value),
+            Some(1_704_135_845_123)
         );
     }
 

@@ -1761,6 +1761,57 @@ async fn test_catalog_alter_table() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn test_catalog_tag_lifecycle() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    ctx.server.add_table("default", "managed_table");
+    let identifier = Identifier::new("default", "managed_table");
+
+    ctx.catalog
+        .create_tag(&identifier, "release-1", Some(1), false)
+        .await
+        .unwrap();
+    let tag = ctx.catalog.get_tag(&identifier, "release-1").await.unwrap();
+    assert_eq!(tag.tag_name, "release-1");
+    assert_eq!(tag.snapshot.id(), 1);
+
+    assert!(matches!(
+        ctx.catalog
+            .create_tag(&identifier, "release-1", Some(1), false)
+            .await,
+        Err(paimon::Error::TagAlreadyExist { .. })
+    ));
+    ctx.catalog
+        .create_tag(&identifier, "release-1", Some(1), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ctx.catalog
+            .create_tag(&identifier, "missing", Some(2), false)
+            .await,
+        Err(paimon::Error::SnapshotNotExist { snapshot_id: 2 })
+    ));
+
+    ctx.catalog
+        .delete_tag(&identifier, "release-1", false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ctx.catalog.get_tag(&identifier, "release-1").await,
+        Err(paimon::Error::TagNotExist { .. })
+    ));
+    assert!(matches!(
+        ctx.catalog
+            .delete_tag(&identifier, "release-1", false)
+            .await,
+        Err(paimon::Error::TagNotExist { .. })
+    ));
+    ctx.catalog
+        .delete_tag(&identifier, "release-1", true)
+        .await
+        .unwrap();
+}
+
 // ==================== Multiple Databases Tests ====================
 
 #[tokio::test]
