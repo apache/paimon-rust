@@ -360,7 +360,7 @@ pub(crate) async fn drop_catalog_managed_partitions(
 
 /// Whether the catalog registered a partition at a location of its own rather than under the
 /// table directory.
-fn has_custom_location(partition: &paimon::spec::Partition) -> bool {
+pub(crate) fn has_custom_location(partition: &paimon::spec::Partition) -> bool {
     partition
         .options
         .as_ref()
@@ -386,9 +386,9 @@ pub(crate) fn ensure_catalog_managed_format_table(
     Ok(())
 }
 
-/// `mutating_operation` names the statement when it changes partitions (ADD or DROP PARTITION),
-/// which refuses a blank string for a string partition column.
-fn parse_format_partition_spec(
+/// `mutating_operation` names the statement when it changes partitions or their statistics (ADD
+/// or DROP PARTITION, ANALYZE TABLE), which refuses a blank string for a string partition column.
+pub(crate) fn parse_format_partition_spec(
     exprs: &[SqlExpr],
     table: &paimon::Table,
     require_complete: bool,

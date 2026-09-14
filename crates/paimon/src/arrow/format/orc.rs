@@ -368,6 +368,29 @@ fn build_range_row_selection(
     )
 }
 
+/// Rows in an ORC file, read from its footer alone.
+pub(crate) async fn read_row_count(
+    reader: Box<dyn FileRead>,
+    file_size: u64,
+) -> crate::Result<i64> {
+    let builder = ArrowReaderBuilder::try_new_async(OrcFileReader::new(file_size, reader))
+        .await
+        .map_err(|error| Error::UnexpectedError {
+            message: format!("Failed to open ORC file: {error}"),
+            source: Some(Box::new(error)),
+        })?;
+    let rows = builder
+        .file_metadata()
+        .stripe_metadatas()
+        .iter()
+        .map(|stripe| stripe.number_of_rows())
+        .sum::<u64>();
+    i64::try_from(rows).map_err(|_| Error::DataInvalid {
+        message: format!("ORC file holds {rows} rows, more than a row count can carry"),
+        source: None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // OrcFileReader — adapts paimon FileRead to orc-rust AsyncChunkReader
 // ---------------------------------------------------------------------------

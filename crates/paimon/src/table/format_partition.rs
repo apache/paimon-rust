@@ -325,7 +325,7 @@ fn format_partition_date(epoch_days: i32) -> Option<String> {
         .map(|date| date.format("%Y-%m-%d").to_string())
 }
 
-fn is_storage_not_found(error: &crate::Error) -> bool {
+pub(crate) fn is_storage_not_found(error: &crate::Error) -> bool {
     matches!(
         error,
         crate::Error::IoUnexpected { source, .. }

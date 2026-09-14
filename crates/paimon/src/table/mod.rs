@@ -44,6 +44,7 @@ mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
 mod format_partition;
+mod format_partition_stats;
 mod format_read_builder;
 mod format_table_read;
 mod format_table_scan;
@@ -134,6 +135,7 @@ pub use de_vector_scan::PreparedVectorSearchFilter;
 pub use format_partition::{
     format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
 };
+pub use format_partition_stats::FormatTablePartitionStatsCollector;
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
