@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogFactory, Options};
 
-use crate::error::{check_non_null, paimon_error, validate_cstr};
-use crate::result::{paimon_result_catalog_new, paimon_result_get_table};
+use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
+use crate::result::{paimon_result_catalog_new, paimon_result_get_table, paimon_result_get_tag};
 use crate::runtime;
-use crate::types::{paimon_catalog, paimon_option, paimon_table};
+use crate::types::{paimon_bytes, paimon_catalog, paimon_identifier, paimon_option, paimon_table};
 
 /// Create a catalog using CatalogFactory with the given options.
 ///
@@ -134,5 +134,130 @@ pub unsafe extern "C" fn paimon_catalog_get_table(
             table: std::ptr::null_mut(),
             error: paimon_error::from_paimon(e),
         },
+    }
+}
+
+/// Create a tag for a snapshot, or the latest snapshot when `snapshot_id` is null.
+///
+/// # Safety
+/// `catalog` and `identifier` must be valid pointers from previous paimon C calls.
+/// `tag_name` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_catalog_create_tag(
+    catalog: *const paimon_catalog,
+    identifier: *const paimon_identifier,
+    tag_name: *const c_char,
+    snapshot_id: *const i64,
+    ignore_if_exists: bool,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(catalog, "catalog") {
+        return error;
+    }
+    if let Err(error) = check_non_null(identifier, "identifier") {
+        return error;
+    }
+    let tag_name = match validate_cstr(tag_name, "tag_name") {
+        Ok(tag_name) => tag_name,
+        Err(error) => return error,
+    };
+
+    let catalog = &*((*catalog).inner as *const Arc<dyn Catalog>);
+    let identifier = &*((*identifier).inner as *const Identifier);
+    let snapshot_id = snapshot_id.as_ref().copied();
+    match runtime().block_on(catalog.create_tag(
+        identifier,
+        &tag_name,
+        snapshot_id,
+        ignore_if_exists,
+    )) {
+        Ok(()) => std::ptr::null_mut(),
+        Err(error) => paimon_error::from_paimon(error),
+    }
+}
+
+/// Get a tag and its snapshot metadata as JSON.
+///
+/// # Safety
+/// `catalog` and `identifier` must be valid pointers from previous paimon C calls.
+/// `tag_name` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_catalog_get_tag(
+    catalog: *const paimon_catalog,
+    identifier: *const paimon_identifier,
+    tag_name: *const c_char,
+) -> paimon_result_get_tag {
+    if let Err(error) = check_non_null(catalog, "catalog") {
+        return paimon_result_get_tag {
+            tag: paimon_bytes::empty(),
+            error,
+        };
+    }
+    if let Err(error) = check_non_null(identifier, "identifier") {
+        return paimon_result_get_tag {
+            tag: paimon_bytes::empty(),
+            error,
+        };
+    }
+    let tag_name = match validate_cstr(tag_name, "tag_name") {
+        Ok(tag_name) => tag_name,
+        Err(error) => {
+            return paimon_result_get_tag {
+                tag: paimon_bytes::empty(),
+                error,
+            }
+        }
+    };
+
+    let catalog = &*((*catalog).inner as *const Arc<dyn Catalog>);
+    let identifier = &*((*identifier).inner as *const Identifier);
+    match runtime().block_on(catalog.get_tag(identifier, &tag_name)) {
+        Ok(tag) => match serde_json::to_vec(&tag) {
+            Ok(tag) => paimon_result_get_tag {
+                tag: paimon_bytes::new(tag),
+                error: std::ptr::null_mut(),
+            },
+            Err(error) => paimon_result_get_tag {
+                tag: paimon_bytes::empty(),
+                error: paimon_error::new(
+                    PaimonErrorCode::Unexpected,
+                    format!("failed to serialize tag metadata: {error}"),
+                ),
+            },
+        },
+        Err(error) => paimon_result_get_tag {
+            tag: paimon_bytes::empty(),
+            error: paimon_error::from_paimon(error),
+        },
+    }
+}
+
+/// Delete a tag.
+///
+/// # Safety
+/// `catalog` and `identifier` must be valid pointers from previous paimon C calls.
+/// `tag_name` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_catalog_delete_tag(
+    catalog: *const paimon_catalog,
+    identifier: *const paimon_identifier,
+    tag_name: *const c_char,
+    ignore_if_not_exists: bool,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(catalog, "catalog") {
+        return error;
+    }
+    if let Err(error) = check_non_null(identifier, "identifier") {
+        return error;
+    }
+    let tag_name = match validate_cstr(tag_name, "tag_name") {
+        Ok(tag_name) => tag_name,
+        Err(error) => return error,
+    };
+
+    let catalog = &*((*catalog).inner as *const Arc<dyn Catalog>);
+    let identifier = &*((*identifier).inner as *const Identifier);
+    match runtime().block_on(catalog.delete_tag(identifier, &tag_name, ignore_if_not_exists)) {
+        Ok(()) => std::ptr::null_mut(),
+        Err(error) => paimon_error::from_paimon(error),
     }
 }

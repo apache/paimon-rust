@@ -41,6 +41,13 @@ pub struct paimon_bytes {
 }
 
 impl paimon_bytes {
+    pub fn empty() -> Self {
+        Self {
+            data: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
+
     pub fn new(v: Vec<u8>) -> Self {
         let boxed = v.into_boxed_slice();
         let len = boxed.len();

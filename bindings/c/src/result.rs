@@ -73,6 +73,18 @@ pub struct paimon_result_get_table {
 }
 
 #[repr(C)]
+pub struct paimon_result_get_tag {
+    pub tag: paimon_bytes,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_latest_snapshot {
+    pub snapshot: paimon_bytes,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
 pub struct paimon_result_new_read {
     pub read: *mut paimon_table_read,
     pub error: *mut paimon_error,

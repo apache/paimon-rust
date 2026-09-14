@@ -292,6 +292,45 @@ catalog, err := paimon.NewCatalog(map[string]string{
 })
 ```
 
+## Managing Tags
+
+Catalog tags pin table snapshots. Pass `nil` to tag the latest snapshot, then
+read the tag to record the snapshot ID:
+
+```go
+id := paimon.NewIdentifier("default", "my_table")
+if err := catalog.CreateTag(id, "dataset-42", nil, false); err != nil {
+    log.Fatal(err)
+}
+tag, err := catalog.GetTag(id, "dataset-42")
+if err != nil {
+    log.Fatal(err)
+}
+log.Printf("pinned snapshot %d", tag.Snapshot.ID)
+```
+
+Use `table.LatestSnapshot()` when the current snapshot must be inspected before
+tagging; it returns `nil` for an empty table.
+
+Read the pinned snapshot with the existing read options:
+
+```go
+builder, err := table.NewReadBuilderWithOptions(map[string]string{
+    "scan.tag-name": "dataset-42",
+})
+```
+
+To tag a specific snapshot, pass its ID:
+
+```go
+snapshotID := int64(123)
+err := catalog.CreateTag(id, "dataset-43", &snapshotID, false)
+```
+
+The final argument to `CreateTag` ignores an existing tag; the final argument
+to `DeleteTag` ignores a missing tag. Creating tags with a retention duration
+is not yet supported.
+
 ## Writing a Table
 
 Use `NewWriteBuilder` for ordinary and fixed-bucket tables. The `arrow.Record`

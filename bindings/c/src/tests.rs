@@ -44,11 +44,14 @@ use paimon::spec::{
     BlobDescriptor, CommitKind, DataType, IntType, Schema, TableSchema, VarCharType,
 };
 use paimon::table::{SnapshotManager, Table};
+use paimon::{Catalog, FileSystemCatalog, Options};
 
 use crate::blob_reader::*;
 use crate::bucket_vector_search_split::*;
+use crate::catalog::*;
 use crate::error::*;
 use crate::file_io::*;
+use crate::identifier::*;
 use crate::table::*;
 use crate::types::*;
 use crate::vector_read::*;
@@ -64,13 +67,16 @@ fn memory_file_io() -> paimon::io::FileIO {
     FileIOBuilder::new("memory").build().unwrap()
 }
 
-fn simple_table_schema() -> TableSchema {
-    let schema = Schema::builder()
+fn simple_schema() -> Schema {
+    Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("name", DataType::VarChar(VarCharType::string_type()))
         .build()
-        .unwrap();
-    TableSchema::new(0, &schema)
+        .unwrap()
+}
+
+fn simple_table_schema() -> TableSchema {
+    TableSchema::new(0, &simple_schema())
 }
 
 fn not_null_table_schema() -> TableSchema {
@@ -98,6 +104,11 @@ fn partitioned_postpone_table_schema() -> TableSchema {
 unsafe fn wrap_table(table: Table) -> *mut paimon_table {
     let inner = Box::into_raw(Box::new(table)) as *mut c_void;
     Box::into_raw(Box::new(paimon_table { inner }))
+}
+
+unsafe fn wrap_catalog(catalog: Arc<dyn Catalog>) -> *mut paimon_catalog {
+    let inner = Box::into_raw(Box::new(catalog)) as *mut c_void;
+    Box::into_raw(Box::new(paimon_catalog { inner }))
 }
 
 unsafe fn unwrap_table(table: *mut paimon_table) {
@@ -950,6 +961,130 @@ fn test_table_from_schema_json_rejects_invalid_identifier() {
         assert!(!result.error.is_null());
         assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
         paimon_error_free(result.error);
+    }
+}
+
+// =========================================================================
+//  Catalog tag tests
+// =========================================================================
+
+#[test]
+fn test_catalog_tag_lifecycle() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut options = Options::new();
+    options.set("warehouse", temp_dir.path().to_string_lossy());
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    let identifier = Identifier::new("default", "test");
+    let table = crate::runtime().block_on(async {
+        catalog
+            .create_database("default", false, HashMap::new())
+            .await
+            .unwrap();
+        catalog
+            .create_table(&identifier, simple_schema(), false)
+            .await
+            .unwrap();
+        catalog.get_table(&identifier).await.unwrap()
+    });
+    unsafe {
+        let empty_table = wrap_table(table.clone());
+        let latest = paimon_table_latest_snapshot(empty_table);
+        assert!(latest.error.is_null());
+        let json = std::slice::from_raw_parts(latest.snapshot.data, latest.snapshot.len);
+        assert!(
+            serde_json::from_slice::<Option<paimon::spec::Snapshot>>(json)
+                .unwrap()
+                .is_none()
+        );
+        paimon_bytes_free(latest.snapshot);
+        paimon_table_free(empty_table);
+    }
+    write_data_rust(&table, &[make_batch(vec![1], vec!["a"])]);
+
+    unsafe {
+        let table = wrap_table(table);
+        let latest_result = paimon_table_latest_snapshot(table);
+        assert!(latest_result.error.is_null());
+        let latest_json =
+            std::slice::from_raw_parts(latest_result.snapshot.data, latest_result.snapshot.len);
+        let latest: Option<paimon::spec::Snapshot> = serde_json::from_slice(latest_json).unwrap();
+        assert_eq!(latest.unwrap().id(), 1);
+        paimon_bytes_free(latest_result.snapshot);
+        paimon_table_free(table);
+
+        let catalog = wrap_catalog(Arc::new(catalog));
+        let database = CString::new("default").unwrap();
+        let object = CString::new("test").unwrap();
+        let identifier = paimon_identifier_new(database.as_ptr(), object.as_ptr());
+        assert!(identifier.error.is_null());
+        let tag_name = CString::new("release-1").unwrap();
+
+        let error = paimon_catalog_create_tag(
+            catalog,
+            identifier.identifier,
+            tag_name.as_ptr(),
+            ptr::null(),
+            false,
+        );
+        assert!(error.is_null());
+
+        let tag_result = paimon_catalog_get_tag(catalog, identifier.identifier, tag_name.as_ptr());
+        assert!(tag_result.error.is_null());
+        let tag_json = std::slice::from_raw_parts(tag_result.tag.data, tag_result.tag.len);
+        let tag: paimon::api::GetTagResponse = serde_json::from_slice(tag_json).unwrap();
+        assert_eq!(tag.tag_name, "release-1");
+        assert_eq!(tag.snapshot.id(), 1);
+
+        let explicit_name = CString::new("release-explicit").unwrap();
+        let snapshot_id = 1;
+        let error = paimon_catalog_create_tag(
+            catalog,
+            identifier.identifier,
+            explicit_name.as_ptr(),
+            &snapshot_id,
+            false,
+        );
+        assert!(error.is_null());
+        let missing_snapshot_id = 2;
+        let missing_snapshot_name = CString::new("missing-snapshot").unwrap();
+        let missing = paimon_catalog_create_tag(
+            catalog,
+            identifier.identifier,
+            missing_snapshot_name.as_ptr(),
+            &missing_snapshot_id,
+            false,
+        );
+        assert_eq!((*missing).code, PaimonErrorCode::NotFound as i32);
+        paimon_error_free(missing);
+
+        let duplicate = paimon_catalog_create_tag(
+            catalog,
+            identifier.identifier,
+            tag_name.as_ptr(),
+            ptr::null(),
+            false,
+        );
+        assert_eq!((*duplicate).code, PaimonErrorCode::AlreadyExists as i32);
+        paimon_error_free(duplicate);
+
+        let error =
+            paimon_catalog_delete_tag(catalog, identifier.identifier, tag_name.as_ptr(), false);
+        assert!(error.is_null());
+        let missing = paimon_catalog_get_tag(catalog, identifier.identifier, tag_name.as_ptr());
+        assert_eq!((*missing.error).code, PaimonErrorCode::NotFound as i32);
+        paimon_error_free(missing.error);
+
+        let error = paimon_catalog_delete_tag(
+            catalog,
+            identifier.identifier,
+            explicit_name.as_ptr(),
+            false,
+        );
+        assert!(error.is_null());
+
+        paimon_bytes_free(tag_result.tag);
+        paimon_identifier_free(identifier.identifier);
+        paimon_catalog_free(catalog);
     }
 }
 
