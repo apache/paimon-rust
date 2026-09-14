@@ -33,6 +33,7 @@ impl ResourcePaths {
     const TABLES: &'static str = "tables";
     const TABLE_DETAILS: &'static str = "table-details";
     const PARTITIONS: &'static str = "partitions";
+    const TAGS: &'static str = "tags";
     const VIEWS: &'static str = "views";
     const FUNCTIONS: &'static str = "functions";
     const PERMISSIONS: &'static str = "permissions";
@@ -211,6 +212,20 @@ impl ResourcePaths {
         )
     }
 
+    /// Get the tags endpoint path for a table.
+    pub fn tags(&self, database_name: &str, table_name: &str) -> String {
+        format!("{}/{}", self.table(database_name, table_name), Self::TAGS)
+    }
+
+    /// Get the endpoint path for a table tag.
+    pub fn tag(&self, database_name: &str, table_name: &str, tag_name: &str) -> String {
+        format!(
+            "{}/{}",
+            self.tags(database_name, table_name),
+            RESTUtil::encode_string(tag_name)
+        )
+    }
+
     /// Get the partitions endpoint path for a table.
     pub fn partitions(&self, database_name: &str, table_name: &str) -> String {
         format!(
@@ -308,6 +323,19 @@ mod tests {
         assert_eq!(
             paths.auth_table("analytics db", "user events"),
             "/v1/catalog/databases/analytics+db/tables/user+events/auth"
+        );
+    }
+
+    #[test]
+    fn test_tag_paths_encode_names() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.tags("analytics db", "events/table"),
+            "/v1/catalog/databases/analytics+db/tables/events%2Ftable/tags"
+        );
+        assert_eq!(
+            paths.tag("analytics db", "events/table", "release/1"),
+            "/v1/catalog/databases/analytics+db/tables/events%2Ftable/tags/release%2F1"
         );
     }
 

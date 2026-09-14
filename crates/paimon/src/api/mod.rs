@@ -33,15 +33,15 @@ mod api_response;
 // Re-export request types
 pub use api_request::{
     AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
-    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateViewRequest,
-    DropPartitionsRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
-    RenameTableRequest, RevokePermissionRequest,
+    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateTagRequest,
+    CreateViewRequest, DropPartitionsRequest, ListPartitionsByFilterRequest,
+    ListPartitionsByNamesRequest, RenameTableRequest, RevokePermissionRequest,
 };
 
 // Re-export response types
 pub use api_response::{
     AuditRESTResponse, AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
-    GetFunctionResponse, GetTableResponse, GetTableTokenResponse, GetViewResponse,
+    GetFunctionResponse, GetTableResponse, GetTableTokenResponse, GetTagResponse, GetViewResponse,
     ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse,
     ListTablesResponse, ListViewsResponse, PagedList,
 };

@@ -35,15 +35,16 @@ use tokio::task::JoinHandle;
 
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse,
-    CreateFunctionRequest, CreatePartitionsRequest, CreateViewRequest, DropPartitionsRequest,
-    ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
-    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsByFilterRequest,
-    ListPartitionsByNamesRequest, ListPartitionsResponse, ListPermissionsResponse,
-    ListTablesResponse, ListViewsResponse, PermissionAssignment, PermissionResource,
-    RenameTableRequest, ResourcePaths, ResourceType, RevokePermissionRequest,
+    CreateFunctionRequest, CreatePartitionsRequest, CreateTagRequest, CreateViewRequest,
+    DropPartitionsRequest, ErrorResponse, GetDatabaseResponse, GetFunctionResponse,
+    GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
+    ListFunctionsResponse, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
+    ListPartitionsResponse, ListPermissionsResponse, ListTablesResponse, ListViewsResponse,
+    PermissionAssignment, PermissionResource, RenameTableRequest, ResourcePaths, ResourceType,
+    RevokePermissionRequest,
 };
 use paimon::catalog::{Function, Identifier};
-use paimon::spec::Partition;
+use paimon::spec::{CommitKind, Partition, Snapshot};
 
 type PartitionPageResponse = (Vec<Partition>, Option<String>);
 type PartitionSpecPageResponse = (Vec<HashMap<String, String>>, Option<String>);
@@ -54,6 +55,7 @@ struct MockState {
     tables: HashMap<String, GetTableResponse>,
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
+    tags: HashMap<String, GetTagResponse>,
     partitions: HashMap<String, Vec<Partition>>,
     partition_page_responses: HashMap<String, Vec<PartitionPageResponse>>,
     partition_list_call_counts: HashMap<String, usize>,
@@ -115,6 +117,39 @@ fn partition_from_spec(spec: HashMap<String, String>) -> Partition {
         updated_by: None,
         options: None,
     }
+}
+
+fn tag_snapshot(id: i64) -> Snapshot {
+    Snapshot::builder()
+        .version(3)
+        .id(id)
+        .schema_id(0)
+        .base_manifest_list("base-list".to_string())
+        .delta_manifest_list("delta-list".to_string())
+        .commit_user("test-user".to_string())
+        .commit_identifier(0)
+        .commit_kind(CommitKind::APPEND)
+        .time_millis(1000)
+        .build()
+}
+
+fn resource_error(
+    status: StatusCode,
+    resource_type: &str,
+    resource_name: &str,
+) -> axum::response::Response {
+    let message = if status == StatusCode::CONFLICT {
+        "Already Exists"
+    } else {
+        "Not Found"
+    };
+    let error = ErrorResponse::new(
+        Some(resource_type.to_string()),
+        Some(resource_name.to_string()),
+        Some(message.to_string()),
+        Some(status.as_u16() as i32),
+    );
+    (status, Json(error)).into_response()
 }
 
 fn paginate<T: Clone>(
@@ -834,6 +869,65 @@ impl RESTServer {
                 Some(404),
             );
             (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    pub async fn create_tag(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<CreateTagRequest>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        if !state.tables.contains_key(&format!("{db}.{table}")) {
+            return resource_error(StatusCode::NOT_FOUND, "table", &table);
+        }
+
+        let key = format!("{db}.{table}.{}", request.tag_name);
+        if state.tags.contains_key(&key) {
+            return resource_error(StatusCode::CONFLICT, "tag", &request.tag_name);
+        }
+        let snapshot_id = request.snapshot_id.unwrap_or(1);
+        if snapshot_id != 1 {
+            return resource_error(StatusCode::NOT_FOUND, "snapshot", &snapshot_id.to_string());
+        }
+        state.tags.insert(
+            key,
+            GetTagResponse {
+                tag_name: request.tag_name,
+                snapshot: tag_snapshot(snapshot_id),
+                tag_create_time: None,
+                tag_time_retained: request.time_retained,
+            },
+        );
+        (StatusCode::OK, Json(json!(""))).into_response()
+    }
+
+    pub async fn get_tag(
+        Path((db, table, tag)): Path<(String, String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let state = state.inner.lock().unwrap();
+        if !state.tables.contains_key(&format!("{db}.{table}")) {
+            return resource_error(StatusCode::NOT_FOUND, "table", &table);
+        }
+        match state.tags.get(&format!("{db}.{table}.{tag}")) {
+            Some(response) => (StatusCode::OK, Json(response.clone())).into_response(),
+            None => resource_error(StatusCode::NOT_FOUND, "tag", &tag),
+        }
+    }
+
+    pub async fn delete_tag(
+        Path((db, table, tag)): Path<(String, String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        if !state.tables.contains_key(&format!("{db}.{table}")) {
+            return resource_error(StatusCode::NOT_FOUND, "table", &table);
+        }
+        if state.tags.remove(&format!("{db}.{table}.{tag}")).is_some() {
+            (StatusCode::OK, Json(json!(""))).into_response()
+        } else {
+            resource_error(StatusCode::NOT_FOUND, "tag", &tag)
         }
     }
 
@@ -1814,6 +1908,14 @@ pub async fn start_mock_server(
             get(RESTServer::get_table)
                 .post(RESTServer::alter_table)
                 .delete(RESTServer::drop_table),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/tags"),
+            post(RESTServer::create_tag),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/tags/:tag"),
+            get(RESTServer::get_tag).delete(RESTServer::delete_tag),
         )
         .route(
             &format!("{prefix}/databases/:db/tables/:table/partitions"),

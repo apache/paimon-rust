@@ -72,6 +72,25 @@ pub struct RenameTableRequest {
     pub destination: Identifier,
 }
 
+/// Request to create a table tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateTagRequest {
+    pub tag_name: String,
+    pub snapshot_id: Option<i64>,
+    pub time_retained: Option<String>,
+}
+
+impl CreateTagRequest {
+    pub fn new(tag_name: String, snapshot_id: Option<i64>) -> Self {
+        Self {
+            tag_name,
+            snapshot_id,
+            time_retained: None,
+        }
+    }
+}
+
 impl RenameTableRequest {
     /// Create a new RenameTableRequest.
     pub fn new(source: Identifier, destination: Identifier) -> Self {
@@ -347,6 +366,19 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"name\":\"test_db\""));
         assert!(json.contains("\"options\""));
+    }
+
+    #[test]
+    fn test_create_tag_request_serialization() {
+        let request = CreateTagRequest::new("release-1".to_string(), Some(42));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "tagName": "release-1",
+                "snapshotId": 42,
+                "timeRetained": null
+            })
+        );
     }
 
     #[test]
