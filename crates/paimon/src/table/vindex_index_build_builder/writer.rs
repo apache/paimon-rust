@@ -97,6 +97,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 if local_ranges.is_empty() {
                     continue;
                 }
+                let scan_ranges = vec![RowRange::new(
+                    shard.row_range_start.max(file_start) - file_start,
+                    shard.row_range_end.min(file_end) - file_start,
+                )];
                 let path = file.data_file_path(&shard.bucket_path);
                 if !path.to_ascii_lowercase().ends_with(".parquet") {
                     usable = false;
@@ -109,7 +113,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     ),
                     source: Some(Box::new(e)),
                 })?;
-                checks.push((path, file_size, local_ranges));
+                checks.push((path, file_size, local_ranges, scan_ranges));
             }
             let found_vector_file = !checks.is_empty();
             if usable && found_vector_file {
@@ -120,11 +124,17 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     .parquet_row_group_parallelism()?;
                 let file_io = self.table.file_io();
                 let mut checks = futures::stream::iter(checks)
-                    .map(|(path, file_size, local_ranges)| async move {
+                    .map(|(path, file_size, local_ranges, scan_ranges)| async move {
                         let input = file_io.new_input(&path)?;
                         let reader = Box::new(input.reader().await?);
-                        has_beneficial_offset_index(reader, file_size, index_column, &local_ranges)
-                            .await
+                        has_beneficial_offset_index(
+                            reader,
+                            file_size,
+                            index_column,
+                            &local_ranges,
+                            &scan_ranges,
+                        )
+                        .await
                     })
                     .buffer_unordered(concurrency);
                 while let Some(result) = checks.next().await {
