@@ -30,9 +30,9 @@ use paimon::Plan;
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
 use crate::file_io::file_io_ref;
 use crate::result::{
-    paimon_result_get_table, paimon_result_new_read, paimon_result_next_batch, paimon_result_plan,
-    paimon_result_predicate, paimon_result_read_builder, paimon_result_record_batch_reader,
-    paimon_result_table_scan,
+    paimon_result_get_table, paimon_result_latest_snapshot, paimon_result_new_read,
+    paimon_result_next_batch, paimon_result_plan, paimon_result_predicate,
+    paimon_result_read_builder, paimon_result_record_batch_reader, paimon_result_table_scan,
 };
 use crate::runtime;
 use crate::types::*;
@@ -334,6 +334,42 @@ pub unsafe extern "C" fn paimon_table_from_schema_json_with_file_io(
 #[no_mangle]
 pub unsafe extern "C" fn paimon_table_free(table: *mut paimon_table) {
     free_table_wrapper(table, |t| t.inner);
+}
+
+/// Return the latest snapshot as JSON, or JSON null when the table is empty.
+///
+/// # Safety
+/// `table` must be a valid pointer from a previous paimon C call.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_latest_snapshot(
+    table: *const paimon_table,
+) -> paimon_result_latest_snapshot {
+    if let Err(error) = check_non_null(table, "table") {
+        return paimon_result_latest_snapshot {
+            snapshot: paimon_bytes::empty(),
+            error,
+        };
+    }
+    let table = &*((*table).inner as *const Table);
+    match runtime().block_on(table.snapshot_manager().get_latest_snapshot()) {
+        Ok(snapshot) => match serde_json::to_vec(&snapshot) {
+            Ok(snapshot) => paimon_result_latest_snapshot {
+                snapshot: paimon_bytes::new(snapshot),
+                error: std::ptr::null_mut(),
+            },
+            Err(error) => paimon_result_latest_snapshot {
+                snapshot: paimon_bytes::empty(),
+                error: paimon_error::new(
+                    PaimonErrorCode::Unexpected,
+                    format!("failed to serialize snapshot metadata: {error}"),
+                ),
+            },
+        },
+        Err(error) => paimon_result_latest_snapshot {
+            snapshot: paimon_bytes::empty(),
+            error: paimon_error::from_paimon(error),
+        },
+    }
 }
 
 /// Time-travel selector option names, in the core's resolution priority order.
