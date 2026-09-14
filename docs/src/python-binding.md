@@ -543,15 +543,3 @@ for batch in read.read(splits):
 for batch in ctx.sql("SELECT id, name FROM paimon.wdb.t ORDER BY id"):
     print(batch)
 ```
-
-### Floating-point primary keys
-
-FLOAT and DOUBLE primary keys distinguish negative and positive zero. NaN signs
-and payloads compare as one key, ordered after finite values, matching Java and
-PyPaimon. This comparison applies to writer sorting and deduplication as well as
-cross-file merging; the original column values are preserved.
-
-Legacy Rust files sorted by raw NaN bits can violate this ordering. Merge reads
-reject non-monotonic floating-point keys, including across record batches, with
-an error requesting a file rewrite. This change does not automatically repair
-those legacy files.

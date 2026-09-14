@@ -34,7 +34,6 @@ use crate::spec::{
     DataType, MergeEngine, PartialUpdateConfig, RowKind, EMPTY_SERIALIZED_ROW,
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
-use crate::table::key_normalization::normalize_float_key;
 use crate::table::prepared_files::PreparedFiles;
 use crate::Result;
 use arrow_array::{Array, BooleanArray, Int64Array, Int8Array, RecordBatch, UInt32Array};
@@ -219,7 +218,7 @@ impl KeyValueFileWriter {
         let mut sort_columns: Vec<SortColumn> = Vec::new();
         for &idx in &self.config.primary_key_indices {
             sort_columns.push(SortColumn {
-                values: normalize_float_key(combined.column(idx)),
+                values: combined.column(idx).clone(),
                 options: Some(SortOptions {
                     descending: false,
                     nulls_first: true,
@@ -726,7 +725,7 @@ impl KeyValueFileWriter {
             .config
             .primary_key_indices
             .iter()
-            .map(|&idx| normalize_float_key(batch.column(idx)))
+            .map(|&idx| batch.column(idx).clone())
             .collect();
         converter
             .convert_columns(&key_columns)

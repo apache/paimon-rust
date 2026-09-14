@@ -584,7 +584,7 @@ async fn empty_position_plans_preserve_selected_snapshot() {
 }
 
 #[tokio::test]
-async fn float_primary_key_plans_merge_signed_zero_and_nan_versions() {
+async fn float_primary_key_plans_merge_signed_zero_versions() {
     use arrow_array::{ArrayRef, Float32Array, Float64Array};
     use paimon::spec::{DoubleType, FloatType};
     for double in [false, true] {
@@ -611,15 +611,11 @@ async fn float_primary_key_plans_merge_signed_zero_and_nan_versions() {
         persist_table_schema(&io, path, table.schema()).await;
         for (floats, keys, values) in [
             (
-                vec![0.0, -0.0, -0.0, f64::NAN, -f64::NAN, 1.0],
-                vec![1, 1, 2, 1, 1, 1],
-                vec![10, 20, 30, 40, 41, 50],
+                vec![0.0, -0.0, -0.0, 1.0],
+                vec![1, 1, 2, 1],
+                vec![10, 20, 30, 50],
             ),
-            (
-                vec![-0.0, -0.0, f64::NAN, 1.0],
-                vec![1, 2, 1, 1],
-                vec![200, 300, 400, 500],
-            ),
+            (vec![-0.0, -0.0, 1.0], vec![1, 2, 1], vec![200, 300, 500]),
         ] {
             let floats: ArrayRef = if double {
                 Arc::new(Float64Array::from(floats))
@@ -639,29 +635,6 @@ async fn float_primary_key_plans_merge_signed_zero_and_nan_versions() {
             )
             .await;
         }
-        let historical =
-            table.copy_with_options(HashMap::from([("scan.snapshot-id".into(), "1".into())]));
-        let first = historical
-            .new_read_builder()
-            .new_scan()
-            .plan()
-            .await
-            .unwrap();
-        assert_eq!(
-            first
-                .splits()
-                .iter()
-                .flat_map(|split| split.data_files())
-                .map(|file| file.row_count)
-                .sum::<i64>(),
-            5,
-            "same-file NaN keys must deduplicate at write time"
-        );
-        assert_eq!(
-            read_column(&historical.new_read_builder(), &first, 2).await,
-            vec![20, 30, 10, 50, 41],
-            "physical file order must put -0 before +0 and all NaNs last, with latest NaN winning"
-        );
         for combined in [false, true] {
             let builder = table.new_read_builder();
             let plan = if combined {
@@ -709,9 +682,7 @@ async fn float_primary_key_plans_merge_signed_zero_and_nan_versions() {
                             .unwrap()
                             .value(i) as f64
                     };
-                    let label = if f.is_nan() {
-                        "NaN".into()
-                    } else if f == 0.0 {
+                    let label = if f == 0.0 {
                         if f.is_sign_negative() {
                             "-0".into()
                         } else {
@@ -730,8 +701,7 @@ async fn float_primary_key_plans_merge_signed_zero_and_nan_versions() {
                     ("+0".into(), 1, 10),
                     ("-0".into(), 1, 200),
                     ("-0".into(), 2, 300),
-                    ("1".into(), 1, 500),
-                    ("NaN".into(), 1, 400)
+                    ("1".into(), 1, 500)
                 ],
                 "double={double}, combined={combined}"
             );
