@@ -596,4 +596,143 @@ mod tests {
         );
         assert_eq!(decoded[0].index_file.external_path, None);
     }
+
+    fn dv_entry(file_name: &str, ranges: &[(&str, i32, i32)]) -> IndexManifestEntry {
+        IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: vec![0, 0, 0, 0],
+            bucket: 0,
+            index_file: IndexFileMeta {
+                index_type: "DELETION_VECTORS".into(),
+                file_name: file_name.into(),
+                file_size: 35,
+                row_count: 1,
+                deletion_vectors_ranges: Some(
+                    ranges
+                        .iter()
+                        .map(|(data_file, offset, length)| {
+                            (
+                                (*data_file).to_string(),
+                                DeletionVectorMeta {
+                                    offset: *offset,
+                                    length: *length,
+                                    cardinality: None,
+                                },
+                            )
+                        })
+                        .collect(),
+                ),
+                external_path: None,
+                global_index_meta: None,
+            },
+        }
+    }
+
+    /// `INDEX_MANIFEST_ENTRY_SCHEMA` with one field removed from the deletion-vector
+    /// item record. Removing `_CARDINALITY` reproduces the shape 0.8.0 through 0.9.x
+    /// wrote, where Java declared the item as `RowType.of(STRING, INT, INT)`.
+    /// Derived from the current schema rather than hand-written so the two cannot
+    /// drift apart.
+    fn schema_without_dv_item_field(removed: &str) -> String {
+        let mut schema: serde_json::Value =
+            serde_json::from_str(INDEX_MANIFEST_ENTRY_SCHEMA).unwrap();
+        let item_fields = schema
+            .get_mut("fields")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|field| {
+                field.get("name").and_then(|name| name.as_str())
+                    == Some("_DELETIONS_VECTORS_RANGES")
+            })
+            .unwrap()
+            .get_mut("type")
+            .unwrap()[1]
+            .get_mut("items")
+            .unwrap()[1]
+            .get_mut("fields")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        let before = item_fields.len();
+        item_fields
+            .retain(|field| field.get("name").and_then(|name| name.as_str()) != Some(removed));
+        assert_eq!(
+            item_fields.len(),
+            before - 1,
+            "field must exist to be removed"
+        );
+        serde_json::to_string(&schema).unwrap()
+    }
+
+    #[test]
+    fn dv_item_record_without_cardinality_field_decodes_as_none() {
+        // Two entries carrying two deletion-vector items each. Reading a
+        // `_CARDINALITY` the writer never wrote steals the *next* item's bytes, so a
+        // single item would only ever run off the end of the block and would prove
+        // nothing about the misalignment.
+        let entries = vec![
+            dv_entry(
+                "idx-0",
+                &[("data-0.parquet", 1, 26), ("data-1.parquet", 27, 30)],
+            ),
+            dv_entry(
+                "idx-1",
+                &[("data-2.parquet", 3, 11), ("data-3.parquet", 14, 19)],
+            ),
+        ];
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            &schema_without_dv_item_field("_CARDINALITY"),
+            &entries,
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .unwrap();
+
+        let decoded = IndexManifest::read_from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, entries);
+        // `IndexMap` compares order-insensitively, but order is exactly what a
+        // misaligned cursor destroys, so pin it separately.
+        let keys: Vec<&str> = decoded[1]
+            .index_file
+            .deletion_vectors_ranges
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["data-2.parquet", "data-3.parquet"]);
+        // The serde reader already read these bytes correctly, because the
+        // deletion-vector helper struct marks `_CARDINALITY` `#[serde(default)]`.
+        // The two readers of one file must not disagree.
+        assert_eq!(
+            crate::spec::from_avro_bytes::<IndexManifestEntry>(&bytes).unwrap(),
+            entries
+        );
+    }
+
+    #[test]
+    fn dv_item_record_without_f0_field_is_rejected() {
+        // `f0` is the map key and Java has always declared it non-null, so a writer
+        // schema without it is not something to guess a default for: every item of
+        // an entry would collapse onto one key. The serde reader rejects such a file
+        // too, because its `f0` has no `#[serde(default)]`.
+        let entries = vec![dv_entry("idx-0", &[("data-0.parquet", 1, 26)])];
+        let bytes = crate::spec::to_avro_bytes_with_compression(
+            &schema_without_dv_item_field("f0"),
+            &entries,
+            crate::spec::DEFAULT_AVRO_COMPRESSION,
+        )
+        .unwrap();
+
+        let err = IndexManifest::read_from_bytes(&bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("_DELETIONS_VECTORS_RANGES item record has no `f0` field"),
+            "{err}"
+        );
+        assert!(crate::spec::from_avro_bytes::<IndexManifestEntry>(&bytes).is_err());
+    }
 }

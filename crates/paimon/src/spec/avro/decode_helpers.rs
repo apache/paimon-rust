@@ -47,6 +47,22 @@ pub(crate) fn read_long_field(cursor: &mut AvroCursor, nullable: bool) -> crate:
     cursor.read_long()
 }
 
+/// Reads a nullable long, preserving the null/present distinction.
+/// Returns `None` for the null branch of a `["null", "long"]` union (a
+/// non-nullable field is always `Some`).
+pub(crate) fn read_optional_long(
+    cursor: &mut AvroCursor,
+    nullable: bool,
+) -> crate::Result<Option<i64>> {
+    if nullable {
+        let idx = cursor.read_union_index()?;
+        if idx == 0 {
+            return Ok(None);
+        }
+    }
+    Ok(Some(cursor.read_long()?))
+}
+
 pub(crate) fn read_bytes_field(cursor: &mut AvroCursor, nullable: bool) -> crate::Result<Vec<u8>> {
     if nullable {
         let idx = cursor.read_union_index()?;

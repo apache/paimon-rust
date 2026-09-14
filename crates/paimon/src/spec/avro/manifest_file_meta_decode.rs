@@ -18,7 +18,8 @@
 use super::cursor::AvroCursor;
 use super::decode::{neg_count_to_usize, AvroRecordDecode};
 use super::decode_helpers::{
-    extract_record_schema, read_bytes_field, read_int_field, read_long_field, read_string_field,
+    extract_record_schema, read_bytes_field, read_int_field, read_long_field, read_optional_long,
+    read_string_field,
 };
 use super::schema::{skip_nullable_field, FieldSchema, WriterSchema};
 use crate::spec::stats::BinaryTableStats;
@@ -92,16 +93,6 @@ fn read_optional_int(cursor: &mut AvroCursor, nullable: bool) -> crate::Result<O
         }
     }
     Ok(Some(cursor.read_int()?))
-}
-
-fn read_optional_long(cursor: &mut AvroCursor, nullable: bool) -> crate::Result<Option<i64>> {
-    if nullable {
-        let idx = cursor.read_union_index()?;
-        if idx == 0 {
-            return Ok(None);
-        }
-    }
-    Ok(Some(cursor.read_long()?))
 }
 
 /// Decode a nullable BinaryTableStats: union ["null", record] or direct record.

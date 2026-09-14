@@ -19,9 +19,9 @@ use super::cursor::AvroCursor;
 use super::decode::{neg_count_to_usize, AvroRecordDecode};
 use super::decode_helpers::{
     extract_record_schema, normalize_partition, read_bytes_field, read_int_field, read_long_field,
-    read_nullable_string_field, read_string_field,
+    read_nullable_string_field, read_optional_long, read_string_field,
 };
-use super::schema::{skip_nullable_field, WriterSchema};
+use super::schema::{skip_nullable_field, FieldSchema, WriterSchema};
 use crate::spec::index_manifest::IndexManifestEntry;
 use crate::spec::manifest_common::FileKind;
 use crate::spec::{DeletionVectorMeta, GlobalIndexMeta, IndexFileMeta};
@@ -64,7 +64,12 @@ impl AvroRecordDecode for IndexManifestEntry {
                 "_FILE_SIZE" => file_size = Some(read_long_field(cursor, field.nullable)?),
                 "_ROW_COUNT" => row_count = Some(read_long_field(cursor, field.nullable)?),
                 "_DELETIONS_VECTORS_RANGES" | "_DELETION_VECTORS_RANGES" => {
-                    deletion_vectors_ranges = decode_nullable_dv_ranges(cursor, field.nullable)?;
+                    deletion_vectors_ranges = decode_nullable_dv_ranges(
+                        cursor,
+                        &field.name,
+                        &field.schema,
+                        field.nullable,
+                    )?;
                 }
                 "_EXTERNAL_PATH" => {
                     external_path = read_nullable_string_field(cursor, field.nullable)?;
@@ -95,8 +100,46 @@ impl AvroRecordDecode for IndexManifestEntry {
     }
 }
 
+/// Peel `array<["null", record]>` down to the item record's writer schema.
+///
+/// `WriterSchema::parse` unwraps a *field*'s nullable union, so the outer
+/// `["null", array]` is already gone, but array items keep theirs — Java builds
+/// the element with `RowType.of`, which is nullable, so the schema here is
+/// `Array(Union([Null, Record]))` and `extract_record_schema` alone cannot reach
+/// the record.
+///
+/// `f0`, `f1` and `f2` hold the data file name, offset and length, and Java has
+/// always declared all three non-null. `f0` is the map key, so defaulting it
+/// would silently collapse every item of an entry onto one key; reject the
+/// schema instead, which is also what the serde reader does with such a file.
+fn dv_item_record_schema<'a>(
+    field_name: &str,
+    schema: &'a FieldSchema,
+) -> crate::Result<&'a WriterSchema> {
+    let err = |detail: String| crate::Error::UnexpectedError {
+        message: format!("avro decode: {field_name} {detail}"),
+        source: None,
+    };
+    let record = match schema {
+        FieldSchema::Array(item) => match item.as_ref() {
+            FieldSchema::Union(branches) => branches.iter().find_map(extract_record_schema),
+            _ => None,
+        },
+        _ => None,
+    }
+    .ok_or_else(|| err("is not an array of nullable records".to_owned()))?;
+    for required in ["f0", "f1", "f2"] {
+        if !record.fields.iter().any(|f| f.name == required) {
+            return Err(err(format!("item record has no `{required}` field")));
+        }
+    }
+    Ok(record)
+}
+
 fn decode_nullable_dv_ranges(
     cursor: &mut AvroCursor,
+    field_name: &str,
+    schema: &FieldSchema,
     nullable: bool,
 ) -> crate::Result<Option<IndexMap<String, DeletionVectorMeta>>> {
     if nullable {
@@ -105,7 +148,13 @@ fn decode_nullable_dv_ranges(
             return Ok(None);
         }
     }
-    // Array of nullable records
+    // `_CARDINALITY` only exists in writer schemas from 1.0.0 on, where Java
+    // pointed this field at `DeletionVectorMeta.SCHEMA` (#4699); 0.8.0 through
+    // 0.9.x declared the item as `RowType.of(STRING, INT, INT)`, i.e. `f0`/`f1`/
+    // `f2` and nothing else. Walk the writer's own field list so an older record
+    // does not consume the next item's bytes, and so a future field appended to
+    // `DeletionVectorMeta.SCHEMA` is skipped rather than misread.
+    let item_schema = dv_item_record_schema(field_name, schema)?;
     let mut map = IndexMap::new();
     loop {
         let count = cursor.read_long()?;
@@ -124,18 +173,21 @@ fn decode_nullable_dv_ranges(
             if item_idx == 0 {
                 continue;
             }
-            // Record fields: f0 (string), f1 (int), f2 (int), _CARDINALITY (nullable long)
-            let f0 = cursor.read_string()?.to_string();
-            let f1 = cursor.read_int()?;
-            let f2 = cursor.read_int()?;
-            let cardinality = {
-                let c_idx = cursor.read_union_index()?;
-                if c_idx == 0 {
-                    None
-                } else {
-                    Some(cursor.read_long()?)
+            // `f0`/`f1`/`f2` are known present — `dv_item_record_schema` rejects
+            // an item record missing any of them — so these defaults never survive.
+            let mut f0 = String::new();
+            let mut f1 = 0;
+            let mut f2 = 0;
+            let mut cardinality = None;
+            for field in &item_schema.fields {
+                match field.name.as_str() {
+                    "f0" => f0 = read_string_field(cursor, field.nullable)?,
+                    "f1" => f1 = read_int_field(cursor, field.nullable)?,
+                    "f2" => f2 = read_int_field(cursor, field.nullable)?,
+                    "_CARDINALITY" => cardinality = read_optional_long(cursor, field.nullable)?,
+                    _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
                 }
-            };
+            }
             map.insert(
                 f0,
                 DeletionVectorMeta {
