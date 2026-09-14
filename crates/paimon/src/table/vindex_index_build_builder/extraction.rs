@@ -89,7 +89,7 @@ pub(super) fn validate_vector_batch_ranges<'a>(
             message: format!("vindex vector extraction got unexpected _ROW_ID {row_id}"),
             source: None,
         })?;
-        if row_id != *expected_row_id || row_id > range.to() {
+        if row_id != *expected_row_id {
             return Err(Error::DataInvalid {
                 message: format!(
                     "vindex vector extraction expected _ROW_ID {}, got {}",

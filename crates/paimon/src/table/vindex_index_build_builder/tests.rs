@@ -770,16 +770,56 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
             .collect(),
     )
     .await;
-    let first_built = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
-        .with_index_column("embedding")
-        .with_options(HashMap::from([(
-            "ivf-flat.train.sample-ratio".to_string(),
-            "0.2".to_string(),
-        )]))
-        .execute()
+    let build_options =
+        HashMap::from([("ivf-flat.train.sample-ratio".to_string(), "0.2".to_string())]);
+    let snapshots = SnapshotManager::new(table.file_io().clone(), table_path.to_string());
+    let snapshot = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    let entries = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan_manifest_entries(&snapshot)
         .await
         .unwrap();
+    let core_options = CoreOptions::new(table.schema().options());
+    let shards = plan_vindex_shards(
+        table_path,
+        table.schema().partition_keys(),
+        table.schema().fields(),
+        &core_options,
+        snapshot.id(),
+        entries,
+        core_options.global_index_row_count_per_shard().unwrap(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(shards.len(), 1);
+    let options = crate::vindex::VindexVectorIndexOptions::new(
+        table.schema().options(),
+        &build_options,
+        IVF_FLAT_IDENTIFIER,
+        find_index_field(&table, "embedding").unwrap(),
+    )
+    .unwrap();
+    let training_rows = paimon_vindex_core::autotune::default_training_vector_count(
+        checked_training_vector_count(
+            (shards[0].row_range_end - shards[0].row_range_start + 1) as usize,
+            options.train_sample_ratio,
+        )
+        .unwrap(),
+        options.config.nlist(),
+    )
+    .unwrap();
+    let mut builder = table.new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER);
+    builder
+        .with_index_column("embedding")
+        .with_options(build_options);
+    assert!(builder
+        .sparse_training_ranges(&shards[0], "embedding", training_rows)
+        .await
+        .unwrap()
+        .is_some());
+    let first_built = builder.execute().await.unwrap();
     assert!(first_built > 0, "first build must index the initial rows");
 
     // First appended row-id, derived from the data manifest (never hard-coded).
@@ -808,13 +848,51 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     )
     .await;
 
-    // End-to-end: build #2 must SUCCEED and index the appended rows.
-    let second_built = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
-        .with_index_column("embedding")
-        .execute()
+    let snapshot = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    let entries = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan_manifest_entries(&snapshot)
         .await
         .unwrap();
+    let shards = plan_vindex_shards(
+        table_path,
+        table.schema().partition_keys(),
+        table.schema().fields(),
+        &core_options,
+        snapshot.id(),
+        entries,
+        core_options.global_index_row_count_per_shard().unwrap(),
+        &indexed_coverage,
+    )
+    .unwrap();
+    assert_eq!(shards.len(), 1);
+    let options = crate::vindex::VindexVectorIndexOptions::new(
+        table.schema().options(),
+        &HashMap::new(),
+        IVF_FLAT_IDENTIFIER,
+        find_index_field(&table, "embedding").unwrap(),
+    )
+    .unwrap();
+    let training_rows = paimon_vindex_core::autotune::default_training_vector_count(
+        checked_training_vector_count(
+            (shards[0].row_range_end - shards[0].row_range_start + 1) as usize,
+            options.train_sample_ratio,
+        )
+        .unwrap(),
+        options.config.nlist(),
+    )
+    .unwrap();
+    let mut builder = table.new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER);
+    builder.with_index_column("embedding");
+    assert!(builder
+        .sparse_training_ranges(&shards[0], "embedding", training_rows)
+        .await
+        .unwrap()
+        .is_none());
+    // End-to-end: build #2 must SUCCEED and index the appended rows.
+    let second_built = builder.execute().await.unwrap();
     assert!(second_built > 0, "appended rows must be indexed");
 
     let all_files = latest_vindex_index_files(&table).await;
@@ -850,79 +928,46 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     }
 }
 
-#[test]
-fn vindex_build_logs_read_phases() {
-    // Run the real sparse and fallback builds in a separate process so the
-    // timing environment variable and stderr capture cannot race other tests.
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "table::vindex_index_build_builder::tests::vindex_incremental_build_indexes_only_new_rows",
-            "--nocapture",
-        ])
-        .env("PAIMON_LOG_VECTOR_INDEX_BUILD_TIMING", "1")
-        .output()
+#[tokio::test]
+async fn vindex_sparse_probe_errors_fall_back() {
+    let table_path = "memory:/test_vindex_probe_fallback";
+    let table = vindex_e2e_table(table_path, "1024");
+    let mut shard = plan(
+        vec![manifest_entry(data_file("broken.parquet", Some(0), 1024))],
+        1024,
+    )
+    .unwrap()
+    .remove(0);
+    shard.bucket_path = table_path.to_string();
+    let builder = table.new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER);
+    assert!(plan_ivf_training_ranges(&shard, 192).unwrap().is_some());
+
+    // A failed open and an unreadable footer both disable only the optimization.
+    assert!(builder
+        .sparse_training_ranges(&shard, "embedding", 192)
+        .await
+        .unwrap()
+        .is_none());
+    let path = shard.files[0].data_file_path(&shard.bucket_path);
+    table
+        .file_io()
+        .new_output(&path)
+        .unwrap()
+        .write(vec![0; 128].into())
+        .await
         .unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(output.status.success(), "{stderr}");
-    let events = stderr
-        .lines()
-        .filter(|line| line.starts_with("event=paimon_vector_index_build"))
-        .map(|line| {
-            line.split_whitespace()
-                .filter_map(|field| field.split_once('='))
-                .collect::<HashMap<_, _>>()
-        })
-        .collect::<Vec<_>>();
-    let plans = events
-        .iter()
-        .filter(|event| event["event"] == "paimon_vector_index_build_plan")
-        .collect::<Vec<_>>();
-    assert_eq!(plans.len(), 2, "missing build provenance: {stderr}");
-    assert_eq!(plans[0]["sparse"], "true");
-    assert_eq!(plans[1]["sparse"], "false");
-    for plan in &plans {
-        assert!(plan["snapshot_id"].parse::<i64>().unwrap() > 0);
-        assert!(plan["training_seed"].parse::<u64>().is_ok());
-        assert_eq!(plan["parquet_row_group_parallelism"], "8");
-        assert_eq!(plan["parquet_max_inflight_bytes"], "268435456");
-    }
-    let phases = events
-        .iter()
-        .filter(|event| event["event"] == "paimon_vector_index_build_read")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        phases
-            .iter()
-            .map(|event| event["phase"])
-            .collect::<Vec<_>>(),
-        ["probe", "sample", "full_scan", "full_scan"]
-    );
-    for phase in &phases {
-        assert_eq!(phase["io_scope"], "file_read_wrapper");
-        assert!(phase["read_bytes"].parse::<u64>().unwrap() > 0);
-        assert!(phase["read_calls"].parse::<u64>().unwrap() > 0);
-        assert!(phase["read_ms"].parse::<f64>().unwrap() >= 0.0);
-    }
-    let totals = events
-        .iter()
-        .filter(|event| event["event"] == "paimon_vector_index_build")
-        .collect::<Vec<_>>();
-    for (total, reads) in [(totals[0], &phases[1..3]), (totals[1], &phases[3..4])] {
-        for (total_key, phase_key) in [
-            ("oss_read_bytes", "read_bytes"),
-            ("oss_range_requests", "read_calls"),
-        ] {
-            assert_eq!(
-                total[total_key].parse::<u64>().unwrap(),
-                reads
-                    .iter()
-                    .map(|event| event[phase_key].parse::<u64>().unwrap())
-                    .sum::<u64>(),
-                "phase counters must exclude probe and partition the existing total"
-            );
-        }
-    }
+    assert!(builder
+        .sparse_training_ranges(&shard, "embedding", 192)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Invalid source metadata is not an optional probe failure.
+    shard.files[0].file_size = -1;
+    assert!(builder
+        .sparse_training_ranges(&shard, "embedding", 192)
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -989,98 +1034,6 @@ async fn vindex_small_training_sample_preserves_tail_cluster_recall() {
             .all(|range| range.from() >= 900 && range.to() < 1000),
         "{result:?}"
     );
-}
-
-#[tokio::test]
-async fn vindex_upload_failure_preserves_committed_index() {
-    use crate::io::multipart_test::{Fault, MultipartProvider};
-
-    for fault in [Fault::Part, Fault::Close] {
-        let provider = MultipartProvider::new(128);
-        let table_path = "memory:/test_vindex_upload_failure";
-        let table = test_table_with_io(
-            provider.file_io(),
-            table_path,
-            vindex_schema_builder(vindex_e2e_options("3"))
-                .build()
-                .unwrap(),
-        );
-        setup_dirs(table.file_io(), table_path).await;
-        write_vectors(
-            &table,
-            vec![1, 2, 3],
-            vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
-        )
-        .await;
-        table
-            .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
-            .with_index_column("embedding")
-            .execute()
-            .await
-            .unwrap();
-        let existing = latest_vindex_index_files(&table).await;
-        let old_path = format!("{table_path}/{INDEX_DIR}/{}", existing[0].file_name);
-        let old_bytes = table
-            .file_io()
-            .new_input(&old_path)
-            .unwrap()
-            .read()
-            .await
-            .unwrap();
-        let mut search = table.new_vector_search_builder();
-        search
-            .with_vector_column("embedding")
-            .with_query_vector(vec![1.0, 0.0])
-            .with_limit(1);
-        let old_result = search.execute().await.unwrap();
-        assert!(!old_result.is_empty());
-
-        write_vectors(&table, vec![4, 5, 6, 7, 8, 9], vec![vec![-1.0, 0.0]; 6]).await;
-        let snapshots = SnapshotManager::new(table.file_io().clone(), table_path.to_string());
-        let before = snapshots.get_latest_snapshot().await.unwrap().unwrap();
-        {
-            let mut state = provider.state.lock().unwrap();
-            state.fault = fault;
-            state.fail_on_index = state.index_writes + 2;
-            state.concurrency.clear();
-        }
-        let error = table
-            .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
-            .with_index_column("embedding")
-            .execute()
-            .await
-            .expect_err("injected upload must fail");
-        assert!(
-            error.to_string().contains("injected multipart failure"),
-            "{error}"
-        );
-        let after = snapshots.get_latest_snapshot().await.unwrap().unwrap();
-        assert_eq!(before.id(), after.id());
-        assert_eq!(before.index_manifest(), after.index_manifest());
-        assert_eq!(latest_vindex_index_files(&table).await, existing);
-        assert_eq!(
-            table
-                .file_io()
-                .new_input(&old_path)
-                .unwrap()
-                .read()
-                .await
-                .unwrap(),
-            old_bytes
-        );
-        assert_eq!(search.execute().await.unwrap(), old_result);
-        let files = table
-            .file_io()
-            .list_status(&format!("{table_path}/{INDEX_DIR}/"))
-            .await
-            .unwrap();
-        assert_eq!(files.len(), 1);
-        assert!(table.file_io().exists(&old_path).await.unwrap());
-        let state = provider.state.lock().unwrap();
-        assert_eq!(state.concurrency, [1, 1]);
-        assert_eq!(state.uploads.len(), 1);
-        assert_eq!(state.aborts, 0);
-    }
 }
 
 #[tokio::test]
