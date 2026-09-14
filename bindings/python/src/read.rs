@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::pyarrow::ToPyArrow;
 use futures::TryStreamExt;
 use paimon::spec::Predicate;
-use paimon::table::{DataSplit, RowRange, Table};
+use paimon::table::{DataSplit, IncrementalScanMode, RowRange, ScanTrace, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -29,6 +29,12 @@ use pyo3::types::{PyBytes, PyDict};
 
 use crate::error::to_py_err;
 use crate::predicate::dict_to_predicate;
+
+/// Explicit planner behavior supported by this runtime, independent of version strings.
+#[pyfunction]
+pub(crate) fn planning_capabilities() -> Vec<&'static str> {
+    vec!["deletion-vector-writer-schema", "legacy-bucket-index-path"]
+}
 
 /// Time-travel selector option names, in the core's resolution priority order.
 const TIME_TRAVEL_SELECTORS: [&str; 5] = [
@@ -233,7 +239,18 @@ impl PyReadBuilder {
             filter: self.filter.clone(),
             row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
+            incremental_range: None,
+            row_position_slice: None,
+            row_position_shard: None,
         }
+    }
+
+    /// Plan APPEND deltas in (start_snapshot_id, end_snapshot_id] as one batch.
+    /// Primary-key versions are grouped across all selected snapshots.
+    fn new_incremental_scan(&self, start_snapshot_id: i64, end_snapshot_id: i64) -> PyTableScan {
+        let mut scan = self.new_scan();
+        scan.incremental_range = Some((start_snapshot_id, end_snapshot_id));
+        scan
     }
 
     fn new_read(&self) -> PyTableRead {
@@ -255,31 +272,158 @@ pub struct PyTableScan {
     filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
+    incremental_range: Option<(i64, i64)>,
+    row_position_slice: Option<(u64, u64)>,
+    row_position_shard: Option<(u64, u64)>,
+}
+
+impl PyTableScan {
+    fn core_scan(&self) -> PyResult<paimon::table::TableScan<'_>> {
+        let mut scan = self.read_builder()?.new_scan();
+        if let Some((start, end)) = self.row_position_slice {
+            scan = scan
+                .with_row_position_slice(start, end)
+                .map_err(to_py_err)?;
+        }
+        if let Some((index, count)) = self.row_position_shard {
+            scan = scan
+                .with_row_position_shard(index, count)
+                .map_err(to_py_err)?;
+        }
+        Ok(scan)
+    }
+
+    fn core_incremental_scan(
+        &self,
+        start: i64,
+        end: i64,
+    ) -> PyResult<paimon::table::IncrementalScan<'_>> {
+        let mut scan =
+            self.read_builder()?
+                .new_incremental_scan(IncrementalScanMode::Delta, start, end);
+        if let Some((start, end)) = self.row_position_slice {
+            scan = scan
+                .with_row_position_slice(start, end)
+                .map_err(to_py_err)?;
+        }
+        if let Some((index, count)) = self.row_position_shard {
+            scan = scan
+                .with_row_position_shard(index, count)
+                .map_err(to_py_err)?;
+        }
+        Ok(scan)
+    }
+
+    fn read_builder(&self) -> PyResult<paimon::table::ReadBuilder<'_>> {
+        let mut builder = self.table.new_read_builder();
+        apply_read_config(
+            &mut builder,
+            &self.projection,
+            self.limit,
+            &self.filter,
+            self.case_sensitive,
+        )?;
+        if let Some(row_ranges) = &self.row_ranges {
+            builder.with_row_ranges(row_ranges.clone());
+        }
+        Ok(builder)
+    }
 }
 
 #[pymethods]
 impl PyTableScan {
+    /// Select a half-open range of Data Evolution row positions.
+    fn with_row_position_slice(
+        mut slf: PyRefMut<'_, Self>,
+        start: u64,
+        end: u64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.core_scan()?
+            .with_row_position_slice(start, end)
+            .map_err(to_py_err)?;
+        slf.row_position_slice = Some((start, end));
+        Ok(slf)
+    }
+
+    /// Select one Data Evolution row-position shard.
+    fn with_row_position_shard(
+        mut slf: PyRefMut<'_, Self>,
+        index: u64,
+        count: u64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.core_scan()?
+            .with_row_position_shard(index, count)
+            .map_err(to_py_err)?;
+        slf.row_position_shard = Some((index, count));
+        Ok(slf)
+    }
+
     fn plan(&self, py: Python<'_>) -> PyResult<PyPlan> {
-        let rt = runtime();
-        let splits = py.detach(|| {
-            rt.block_on(async {
-                let mut builder = self.table.new_read_builder();
-                apply_read_config(
-                    &mut builder,
-                    &self.projection,
-                    self.limit,
-                    &self.filter,
-                    self.case_sensitive,
-                )?;
-                if let Some(row_ranges) = &self.row_ranges {
-                    builder.with_row_ranges(row_ranges.clone());
+        py.detach(|| {
+            runtime().block_on(async {
+                let plan = match self.incremental_range {
+                    Some((start, end)) => {
+                        self.core_incremental_scan(start, end)?
+                            .plan_combined_delta()
+                            .await
+                    }
+                    None => self.core_scan()?.plan().await,
+                };
+                plan.map(PyPlan::from).map_err(to_py_err)
+            })
+        })
+    }
+
+    /// Plan once and return the core metadata-planning counters unchanged.
+    /// Reader-side pruning and residual filtering are outside this trace.
+    fn plan_with_trace<'py>(&self, py: Python<'py>) -> PyResult<(PyPlan, Bound<'py, PyDict>)> {
+        let (plan, trace) = py.detach(|| {
+            runtime().block_on(async {
+                match self.incremental_range {
+                    Some((start, end)) => {
+                        self.core_incremental_scan(start, end)?
+                            .plan_combined_delta_with_trace()
+                            .await
+                    }
+                    None => self.core_scan()?.plan_with_trace().await,
                 }
-                let plan = builder.new_scan().plan().await.map_err(to_py_err)?;
-                Ok::<_, PyErr>(plan.splits().to_vec())
+                .map_err(to_py_err)
             })
         })?;
-        Ok(PyPlan { splits })
+        Ok((PyPlan::from(plan), scan_trace_to_dict(py, &trace)?))
     }
+}
+
+fn scan_trace_to_dict<'py>(py: Python<'py>, trace: &ScanTrace) -> PyResult<Bound<'py, PyDict>> {
+    let value = serde_json::to_value(trace)
+        .map_err(|e| PyValueError::new_err(format!("failed to serialize scan trace: {e}")))?;
+    let serde_json::Value::Object(fields) = value else {
+        return Err(PyValueError::new_err("scan trace must be an object"));
+    };
+    let result = PyDict::new(py);
+    for (name, value) in fields {
+        match value {
+            serde_json::Value::Null => result.set_item(name, py.None())?,
+            serde_json::Value::Bool(value) => result.set_item(name, value)?,
+            serde_json::Value::Number(value) => {
+                if let Some(value) = value.as_i64() {
+                    result.set_item(name, value)?;
+                } else if let Some(value) = value.as_u64() {
+                    result.set_item(name, value)?;
+                } else {
+                    return Err(PyValueError::new_err(format!(
+                        "scan trace field '{name}' must be an integer"
+                    )));
+                }
+            }
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported scan trace value for field '{name}'"
+                )));
+            }
+        }
+    }
+    Ok(result)
 }
 
 #[pyclass(name = "TableRead", module = "pypaimon_rust.datafusion")]
@@ -328,10 +472,26 @@ impl PyTableRead {
 #[pyclass(name = "Plan", module = "pypaimon_rust.datafusion")]
 pub struct PyPlan {
     splits: Vec<DataSplit>,
+    snapshot_id: Option<i64>,
+}
+
+impl From<paimon::table::Plan> for PyPlan {
+    fn from(plan: paimon::table::Plan) -> Self {
+        Self {
+            splits: plan.splits().to_vec(),
+            snapshot_id: plan.snapshot_id(),
+        }
+    }
 }
 
 #[pymethods]
 impl PyPlan {
+    /// Snapshot selected by the scan, even when pruning produces no splits.
+    /// `None` means no snapshot was selected, including snapshot-free format tables.
+    fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
+    }
+
     fn splits(&self) -> Vec<PySplit> {
         self.splits
             .iter()
@@ -397,5 +557,28 @@ impl PySplit {
         Ok(Self {
             inner: Self::from_bytes(state.as_bytes())?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::{PyBool, PyInt};
+
+    #[test]
+    fn scan_trace_preserves_integer_precision_and_optional_fields() {
+        Python::attach(|py| {
+            let mut trace = ScanTrace::default();
+            trace.planned_data_file_bytes = u64::MAX;
+            let dict = scan_trace_to_dict(py, &trace).unwrap();
+            let bytes = dict.get_item("planned_data_file_bytes").unwrap().unwrap();
+            assert!(bytes.is_instance_of::<PyInt>());
+            assert_eq!(bytes.extract::<u64>().unwrap(), u64::MAX);
+            assert!(dict.get_item("snapshot_id").unwrap().unwrap().is_none());
+            assert!(dict.get_item("limit").unwrap().unwrap().is_none());
+            let stopped = dict.get_item("limit_early_stopped").unwrap().unwrap();
+            assert!(stopped.is_instance_of::<PyBool>());
+            assert!(!stopped.extract::<bool>().unwrap());
+        });
     }
 }

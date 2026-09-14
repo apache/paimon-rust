@@ -177,6 +177,66 @@ mod tests {
     use crate::spec::{DeletionVectorMeta, GlobalIndexMeta};
 
     #[test]
+    fn test_deletion_vectors_follow_writer_item_schema() {
+        for nullable_items in [false, true] {
+            for has_cardinality in [false, true] {
+                let mut schema: serde_json::Value =
+                    serde_json::from_str(INDEX_MANIFEST_ENTRY_SCHEMA).unwrap();
+                let items = &mut schema["fields"][8]["type"][1]["items"];
+                let mut record = items[1].clone();
+                if !has_cardinality {
+                    record["fields"].as_array_mut().unwrap().pop();
+                }
+                *items = if nullable_items {
+                    serde_json::json!(["null", record])
+                } else {
+                    record
+                };
+                let entry = IndexManifestEntry {
+                    version: 1,
+                    kind: FileKind::Add,
+                    partition: vec![0; 12],
+                    bucket: 0,
+                    index_file: IndexFileMeta {
+                        index_type: "DELETION_VECTORS".into(),
+                        file_name: "index-0".into(),
+                        file_size: 100,
+                        row_count: 2,
+                        deletion_vectors_ranges: Some(IndexMap::from([
+                            (
+                                "data-00000000-0000-0000-0000-000000000000-0.parquet".into(),
+                                DeletionVectorMeta {
+                                    offset: 1,
+                                    length: 26,
+                                    cardinality: has_cardinality.then_some(3),
+                                },
+                            ),
+                            (
+                                "data-1.parquet".into(),
+                                DeletionVectorMeta {
+                                    offset: 31,
+                                    length: 22,
+                                    cardinality: None,
+                                },
+                            ),
+                        ])),
+                        external_path: Some("s3://bucket/index-0".into()),
+                        global_index_meta: None,
+                    },
+                };
+                // Two entries also catch a cursor shifted past the final DV.
+                let entries = vec![entry.clone(), entry];
+                let bytes = crate::spec::to_avro_bytes(&schema.to_string(), &entries).unwrap();
+                assert_eq!(
+                    IndexManifest::read_from_bytes(&bytes).unwrap(),
+                    entries,
+                    "nullable_items={nullable_items}, has_cardinality={has_cardinality}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_read_index_manifest_file() {
         let workdir =
             std::env::current_dir().unwrap_or_else(|err| panic!("current_dir must exist: {err}"));

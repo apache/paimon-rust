@@ -1295,17 +1295,34 @@ impl Default for DataSplitBuilder {
 
 // ======================= Plan ===============================
 
-/// Read plan: list of splits.
+/// Read plan: splits and the snapshot they were planned from.
 ///
 /// Reference: [org.apache.paimon.table.source.PlanImpl](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/PlanImpl.java)
 #[derive(Debug)]
 pub struct Plan {
     splits: Vec<DataSplit>,
+    snapshot_id: Option<i64>,
 }
 
 impl Plan {
     pub fn new(splits: Vec<DataSplit>) -> Self {
-        Self { splits }
+        Self {
+            splits,
+            snapshot_id: None,
+        }
+    }
+
+    pub(crate) fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Snapshot selected by the scan, even when pruning leaves no splits.
+    ///
+    /// Returns `None` when no snapshot exists or the plan does not come from
+    /// a Paimon snapshot (for example, a format-table scan).
+    pub fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
     }
     pub fn splits(&self) -> &[DataSplit] {
         &self.splits

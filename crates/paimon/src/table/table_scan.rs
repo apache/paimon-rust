@@ -26,6 +26,7 @@ use super::global_index_scanner::RowRangeIndex;
 use super::global_index_types::normalize_queryable_global_index_type;
 use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
+use super::row_position_selection::RowPositionSelection;
 use super::stats_filter::{
     data_evolution_group_matches_predicates, data_file_matches_predicates_for_table,
     data_file_matches_predicates_with_key_stats, group_by_overlapping_row_id, FileStatsRows,
@@ -40,7 +41,7 @@ use crate::spec::{
     SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
-use crate::table::bin_pack::split_for_batch;
+use crate::table::bin_pack::{pack_for_ordered, split_for_batch};
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::merge_tree_split_generator::{
     merge_tree_split_for_batch, KeyComparator, SplitGroup,
@@ -106,6 +107,11 @@ async fn read_manifest_list(
     crate::spec::avro::from_avro_bytes_fast::<crate::spec::ManifestFileMeta>(&bytes)
 }
 
+enum ManifestListSource<'a> {
+    Snapshot(&'a Snapshot),
+    AppendDeltas(&'a [Snapshot]),
+}
+
 /// Reads all manifest entries for a snapshot (base + delta manifest lists, then each manifest file).
 /// Applies filters during concurrent manifest reading to reduce entries early:
 /// - Manifest-file-level partition stats pruning (skip entire manifest files)
@@ -116,7 +122,7 @@ async fn read_manifest_list(
 async fn read_all_manifest_entries(
     file_io: &FileIO,
     table_path: &str,
-    snapshot: &Snapshot,
+    source: ManifestListSource<'_>,
     skip_level_zero: bool,
     scan_all_files: bool,
     has_primary_keys: bool,
@@ -133,10 +139,27 @@ async fn read_all_manifest_entries(
     row_range_index: Option<&RowRangeIndex>,
     trace: Option<&mut ScanTrace>,
 ) -> crate::Result<Vec<ManifestEntry>> {
-    let (mut manifest_files, delta) = futures::try_join!(
-        read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
-        read_manifest_list(file_io, table_path, snapshot.delta_manifest_list()),
-    )?;
+    let (mut manifest_files, delta) = match source {
+        ManifestListSource::Snapshot(snapshot) => futures::try_join!(
+            read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
+            read_manifest_list(file_io, table_path, snapshot.delta_manifest_list()),
+        )?,
+        ManifestListSource::AppendDeltas(snapshots) => {
+            let names = snapshots
+                .iter()
+                .map(|snapshot| snapshot.delta_manifest_list().to_string())
+                .collect::<Vec<_>>();
+            let delta = futures::stream::iter(names)
+                .map(|name| async move { read_manifest_list(file_io, table_path, &name).await })
+                .buffered(64)
+                .try_fold(Vec::new(), |mut files, next| async move {
+                    files.extend(next);
+                    Ok(files)
+                })
+                .await?;
+            (Vec::new(), delta)
+        }
+    };
     let mut trace = trace;
     if let Some(trace) = trace.as_deref_mut() {
         trace.record_manifest_lists(manifest_files.len(), delta.len());
@@ -920,6 +943,48 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Select a half-open range of logical positions in a data-evolution snapshot.
+    /// Positions are assigned before group statistics, projection and deletion vectors.
+    pub fn with_row_position_slice(self, start: u64, end: u64) -> crate::Result<Self> {
+        self.with_row_position_selection(RowPositionSelection::slice(start, end)?)
+    }
+
+    /// Select a balanced contiguous shard of data-evolution row positions.
+    pub fn with_row_position_shard(self, index: u64, count: u64) -> crate::Result<Self> {
+        self.with_row_position_selection(RowPositionSelection::shard(index, count)?)
+    }
+
+    pub(crate) fn has_row_position_selection(&self) -> bool {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.row_position_selection.is_some(),
+            TableScanKind::Format(_) => false,
+        }
+    }
+
+    fn with_row_position_selection(self, selection: RowPositionSelection) -> crate::Result<Self> {
+        match self.0 {
+            TableScanKind::Paimon(mut scan)
+                if scan.table.schema().core_options().data_evolution_enabled() =>
+            {
+                if scan
+                    .row_position_selection
+                    .is_some_and(|previous| previous.is_slice() != selection.is_slice())
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: "row-position slice and shard cannot be used simultaneously"
+                            .into(),
+                        source: None,
+                    });
+                }
+                scan.row_position_selection = Some(selection);
+                Ok(Self(TableScanKind::Paimon(scan)))
+            }
+            _ => Err(crate::Error::Unsupported {
+                message: "row-position selection requires a data-evolution table".into(),
+            }),
+        }
+    }
+
     pub(super) fn with_projected_read_field_ids(
         self,
         projected_read_field_ids: Option<HashSet<i32>>,
@@ -943,6 +1008,19 @@ impl<'a> TableScan<'a> {
         match &self.0 {
             TableScanKind::Paimon(scan) => scan.plan_with_trace().await,
             TableScanKind::Format(scan) => scan.plan_with_trace().await,
+        }
+    }
+
+    pub(crate) async fn plan_snapshot_deltas(
+        &self,
+        snapshots: &[Snapshot],
+        end_snapshot: &Snapshot,
+    ) -> crate::Result<(Plan, ScanTrace)> {
+        match &self.0 {
+            TableScanKind::Paimon(scan) => scan.plan_snapshot_deltas(snapshots, end_snapshot).await,
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "Format tables do not support incremental delta scan".to_string(),
+            }),
         }
     }
 
@@ -1014,6 +1092,7 @@ struct PaimonTableScan<'a> {
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
+    row_position_selection: Option<RowPositionSelection>,
     /// Diff compares complete logical states, so it must not accept physical
     /// row-range pruning from an explicit range or a global-index lookup.
     row_range_optimization_disabled: bool,
@@ -1040,6 +1119,7 @@ impl<'a> PaimonTableScan<'a> {
             bucket_predicate,
             limit,
             row_ranges,
+            row_position_selection: None,
             row_range_optimization_disabled: false,
             scan_all_files: false,
             projected_read_field_ids: None,
@@ -1067,6 +1147,7 @@ impl<'a> PaimonTableScan<'a> {
 
     fn without_row_range_optimization(mut self) -> Self {
         self.row_ranges = None;
+        self.row_position_selection = None;
         self.row_range_optimization_disabled = true;
         self
     }
@@ -1177,13 +1258,13 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         snapshot: &Snapshot,
     ) -> crate::Result<Vec<ManifestEntry>> {
-        self.plan_manifest_entries_with_trace(snapshot, None, None)
+        self.plan_manifest_entries_with_trace(ManifestListSource::Snapshot(snapshot), None, None)
             .await
     }
 
     async fn plan_manifest_entries_with_trace(
         &self,
-        snapshot: &Snapshot,
+        source: ManifestListSource<'_>,
         row_range_index: Option<&RowRangeIndex>,
         trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Vec<ManifestEntry>> {
@@ -1249,7 +1330,7 @@ impl<'a> PaimonTableScan<'a> {
         let entries = read_all_manifest_entries(
             file_io,
             table_path,
-            snapshot,
+            source,
             skip_level_zero,
             self.scan_all_files,
             has_primary_keys,
@@ -1324,6 +1405,13 @@ impl<'a> PaimonTableScan<'a> {
             )? {
                 entries.push(entry);
             }
+        }
+        if deletion_vectors_needed {
+            super::index_file_path::resolve_legacy_deletion_vector_entries(
+                self.table,
+                &mut entries,
+            )
+            .await?;
         }
         Ok(Some(entries))
     }
@@ -1478,6 +1566,32 @@ impl<'a> PaimonTableScan<'a> {
         .await
     }
 
+    /// Plan all selected APPEND deltas together. Entries are merged before
+    /// splitting so versions of a primary key cannot escape into separate plans.
+    async fn plan_snapshot_deltas(
+        &self,
+        snapshots: &[Snapshot],
+        end_snapshot: &Snapshot,
+    ) -> crate::Result<(Plan, ScanTrace)> {
+        self.ensure_query_auth_allowed()?;
+        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
+        let mut trace = ScanTrace {
+            snapshot_id: Some(end_snapshot.id()),
+            limit: self.limit,
+            ..Default::default()
+        };
+        let plan = self
+            .plan_snapshot_from_lists(
+                end_snapshot,
+                ManifestListSource::AppendDeltas(snapshots),
+                data_evolution_read_field_ids.as_ref(),
+                Some(&mut trace),
+            )
+            .await?;
+        trace.planned_data_file_bytes = plan.planned_data_file_bytes();
+        Ok((plan, trace))
+    }
+
     /// Plan data splits from a snapshot's changelog manifest list.
     ///
     /// Reuses the same split-building path as a full snapshot plan, but only
@@ -1486,7 +1600,7 @@ impl<'a> PaimonTableScan<'a> {
     pub(crate) async fn plan_snapshot_changelog(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
         let Some(list_name) = snapshot.changelog_manifest_list() else {
-            return Ok(Plan::new(Vec::new()));
+            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         };
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         self.plan_snapshot_manifest_list(
@@ -1504,7 +1618,7 @@ impl<'a> PaimonTableScan<'a> {
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
     ) -> crate::Result<Plan> {
         if matches!(self.limit, Some(0)) {
-            return Ok(Plan::new(Vec::new()));
+            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         }
         let core_options = CoreOptions::new(self.table.schema().options());
         let data_evolution_enabled = core_options.data_evolution_enabled();
@@ -1521,7 +1635,7 @@ impl<'a> PaimonTableScan<'a> {
             .manifest_row_ranges(snapshot, index_entries.as_deref(), global_index_settings)
             .await?;
         if manifest_row_ranges.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(Plan::new(Vec::new()));
+            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         }
         let row_range_index = if data_evolution_enabled {
             manifest_row_ranges.clone().map(RowRangeIndex::create)
@@ -1747,13 +1861,29 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         snapshot: Snapshot,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
+        trace: Option<&mut ScanTrace>,
+    ) -> crate::Result<Plan> {
+        self.plan_snapshot_from_lists(
+            &snapshot,
+            ManifestListSource::Snapshot(&snapshot),
+            data_evolution_read_field_ids,
+            trace,
+        )
+        .await
+    }
+
+    async fn plan_snapshot_from_lists(
+        &self,
+        snapshot: &Snapshot,
+        source: ManifestListSource<'_>,
+        data_evolution_read_field_ids: Option<&HashSet<i32>>,
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
         if matches!(self.limit, Some(0)) {
             if let Some(trace) = trace {
                 trace.record_final_plan_with_limit(0, 0, 0, 0, true);
             }
-            return Ok(Plan::new(Vec::new()));
+            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         }
         let core_options = CoreOptions::new(self.table.schema().options());
         let data_evolution_enabled = core_options.data_evolution_enabled();
@@ -1761,19 +1891,19 @@ impl<'a> PaimonTableScan<'a> {
             self.global_index_scan_settings(&core_options, data_evolution_enabled)?;
         let index_entries = self
             .read_index_manifest_entries(
-                &snapshot,
+                snapshot,
                 global_index_settings.is_some(),
                 core_options.deletion_vectors_enabled(),
             )
             .await?;
         let manifest_row_ranges = self
-            .manifest_row_ranges(&snapshot, index_entries.as_deref(), global_index_settings)
+            .manifest_row_ranges(snapshot, index_entries.as_deref(), global_index_settings)
             .await?;
         if manifest_row_ranges.as_ref().is_some_and(Vec::is_empty) {
             if let Some(trace) = trace {
                 trace.record_final_plan(0, 0, 0);
             }
-            return Ok(Plan::new(Vec::new()));
+            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         }
         let row_range_index = if data_evolution_enabled {
             manifest_row_ranges.clone().map(RowRangeIndex::create)
@@ -1782,14 +1912,14 @@ impl<'a> PaimonTableScan<'a> {
         };
         let entries = self
             .plan_manifest_entries_with_trace(
-                &snapshot,
+                source,
                 row_range_index.as_ref(),
                 trace.as_deref_mut(),
             )
             .await?;
         let effective_row_ranges = self
             .effective_row_ranges(
-                &snapshot,
+                snapshot,
                 &entries,
                 index_entries.as_deref(),
                 global_index_settings,
@@ -1797,7 +1927,7 @@ impl<'a> PaimonTableScan<'a> {
             )
             .await?;
         self.plan_snapshot_from_entries(
-            snapshot,
+            snapshot.clone(),
             entries,
             data_evolution_read_field_ids,
             index_entries,
@@ -1827,11 +1957,26 @@ impl<'a> PaimonTableScan<'a> {
         let open_file_cost = core_options.source_split_open_file_cost();
         let partition_keys = self.table.schema().partition_keys();
 
+        // Assign row positions using the full candidate file ranges, before
+        // group stats, projection or DVs change visible rows. Intersect explicit
+        // and index-selected ranges only after assigning the positional range.
+        let effective_row_ranges = if let Some(selection) = self.row_position_selection {
+            Some(selection.select(&entries, effective_row_ranges.as_deref())?)
+        } else {
+            effective_row_ranges
+        };
+        if effective_row_ranges.as_ref().is_some_and(Vec::is_empty) {
+            if let Some(trace) = trace {
+                trace.record_final_plan(0, 0, 0);
+            }
+            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
+        }
+
         if entries.is_empty() {
             if let Some(trace) = trace {
                 trace.record_final_plan(0, 0, 0);
             }
-            return Ok(Plan::new(Vec::new()));
+            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         }
 
         // For non-data-evolution tables, cross-schema files were kept (fail-open)
@@ -1880,7 +2025,7 @@ impl<'a> PaimonTableScan<'a> {
             if let Some(trace) = trace {
                 trace.record_final_plan(0, 0, 0);
             }
-            return Ok(Plan::new(Vec::new()));
+            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         } else if let Some(trace) = trace.as_deref_mut() {
             if trace.manifest_entries_after_cross_schema_stats == 0 {
                 trace.manifest_entries_after_cross_schema_stats = entries.len();
@@ -1891,7 +2036,7 @@ impl<'a> PaimonTableScan<'a> {
             if let Some(trace) = trace {
                 trace.record_final_plan_with_limit(0, 0, 0, 0, true);
             }
-            return Ok(Plan::new(Vec::new()));
+            return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         }
 
         // Group by (partition, bucket), decomposing entries to avoid cloning partition.
@@ -2026,30 +2171,56 @@ impl<'a> PaimonTableScan<'a> {
                     row_id_groups
                 };
 
-                let (singles, multis): (Vec<_>, Vec<_>) = row_id_groups
+                if self.row_position_selection.is_some() {
+                    // Positional scans promise row-id order across groups. A
+                    // projected group can become a singleton, so moving all
+                    // multi-file groups first would change which rows a limit
+                    // returns after slicing. Pack complete groups in order.
+                    pack_for_ordered(
+                        row_id_groups,
+                        |group| {
+                            group
+                                .iter()
+                                .map(|file| file.file_size)
+                                .sum::<i64>()
+                                .max(open_file_cost)
+                        },
+                        target_split_size,
+                    )
                     .into_iter()
-                    .partition(|group| group.len() == 1);
+                    .map(|groups| SplitGroup {
+                        raw_convertible: groups.iter().all(|group| group.len() == 1),
+                        files: groups.into_iter().flatten().collect(),
+                    })
+                    .collect()
+                } else {
+                    let (singles, multis): (Vec<_>, Vec<_>) = row_id_groups
+                        .into_iter()
+                        .partition(|group| group.len() == 1);
 
-                let mut result = Vec::new();
-                for group in multis {
-                    // Files sharing a row-id range hold column slices of the
-                    // same logical rows; physical counts overcount them
-                    // (Java DataEvolutionSplitGenerator: not raw convertible).
-                    result.push(SplitGroup {
-                        files: group,
-                        raw_convertible: false,
-                    });
+                    let mut result = Vec::new();
+                    for group in multis {
+                        // Files sharing a row-id range hold column slices of the
+                        // same logical rows; physical counts overcount them
+                        // (Java DataEvolutionSplitGenerator: not raw convertible).
+                        result.push(SplitGroup {
+                            files: group,
+                            raw_convertible: false,
+                        });
+                    }
+
+                    let single_files: Vec<DataFileMeta> = singles.into_iter().flatten().collect();
+                    for file_group in
+                        split_for_batch(single_files, target_split_size, open_file_cost)
+                    {
+                        result.push(SplitGroup {
+                            files: file_group,
+                            raw_convertible: true,
+                        });
+                    }
+
+                    result
                 }
-
-                let single_files: Vec<DataFileMeta> = singles.into_iter().flatten().collect();
-                for file_group in split_for_batch(single_files, target_split_size, open_file_cost) {
-                    result.push(SplitGroup {
-                        files: file_group,
-                        raw_convertible: true,
-                    });
-                }
-
-                result
             } else if let Some(ref comparator) = pk_comparator {
                 // Merge-tree path: keep key-overlapping files in one split and
                 // mark which splits the sort-merge reader can skip (mirrors
@@ -2155,7 +2326,7 @@ impl<'a> PaimonTableScan<'a> {
             );
         }
 
-        Ok(Plan::new(splits))
+        Ok(Plan::new(splits).with_snapshot_id(snapshot_id))
     }
 }
 
@@ -2956,6 +3127,183 @@ mod tests {
         let groups = group_by_overlapping_row_id(files);
         assert_eq!(groups.len(), 1);
         assert_eq!(file_names(&groups), vec![vec!["a", "b"]]);
+    }
+
+    #[tokio::test]
+    async fn test_row_position_selection_keeps_single_before_multi_group() {
+        let schema = two_column_schema(0, "id", "name").copy_with_options(HashMap::from([(
+            "source.split.target-size".to_string(),
+            "1b".to_string(),
+        )]));
+        let table = data_evolution_test_table("memory:/row_position_selection_group_order", schema);
+        setup_scan_trace_dirs(&table).await;
+        TableCommit::new(table.clone(), "row-position-order".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![
+                    make_evo_file_with_cols("early.parquet", 4, 1, 0, &["id", "name"]),
+                    make_evo_file_with_cols("late-old.parquet", 4, 1, 4, &["id", "name"]),
+                    make_evo_file_with_cols("late-new.parquet", 4, 2, 4, &["name"]),
+                ],
+            )])
+            .await
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_limit(1);
+        let plan = reader
+            .new_scan()
+            .with_row_position_slice(2, 6)
+            .unwrap()
+            .plan()
+            .await
+            .unwrap();
+        assert_eq!(plan.splits().len(), 2);
+        assert_eq!(plan.splits()[0].data_files()[0].file_name, "early.parquet");
+        assert_eq!(
+            plan.splits()[0].row_ranges(),
+            Some([RowRange::new(2, 3)].as_slice())
+        );
+        assert_eq!(
+            plan.splits()[1].row_ranges(),
+            Some([RowRange::new(4, 5)].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_position_selection_precedes_group_stats_and_limit() {
+        let table = data_evolution_test_table(
+            "memory:/row_position_selection_before_stats",
+            two_column_schema(0, "id", "name"),
+        );
+        setup_scan_trace_dirs(&table).await;
+        let files = [0, 3]
+            .into_iter()
+            .map(|start| {
+                let mut file =
+                    make_evo_file(&format!("range-{start}.parquet"), 10, 3, 1, Some(start));
+                file.value_stats = BinaryTableStats::new(
+                    two_int_stats_row(Some(start as i32), Some(0)),
+                    two_int_stats_row(Some(start as i32 + 2), Some(0)),
+                    vec![Some(0), Some(0)],
+                );
+                file
+            })
+            .collect();
+        TableCommit::new(table.clone(), "row-position-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                files,
+            )])
+            .await
+            .unwrap();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .greater_or_equal("id", Datum::Int(3))
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_filter(predicate).with_limit(1);
+
+        let (empty, trace) = reader
+            .new_scan()
+            .with_row_position_shard(0, 2)
+            .unwrap()
+            .plan_with_trace()
+            .await
+            .unwrap();
+        assert!(empty.splits().is_empty());
+        assert_eq!(empty.snapshot_id(), Some(1));
+        assert_eq!(trace.data_evolution_groups_pruned_by_stats, 1);
+
+        let plan = reader
+            .new_scan()
+            .with_row_position_shard(1, 2)
+            .unwrap()
+            .plan()
+            .await
+            .unwrap();
+        assert_eq!(plan.splits().len(), 1);
+        assert_eq!(
+            plan.splits()[0].data_files()[0].file_name,
+            "range-3.parquet"
+        );
+        assert_eq!(
+            plan.splits()[0].row_ranges(),
+            Some([RowRange::new(3, 5)].as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_position_selection_intersects_ranges_after_assignment() {
+        let table = data_evolution_test_table(
+            "memory:/row_position_selection_range_intersection",
+            two_column_schema(0, "id", "name"),
+        );
+        setup_scan_trace_dirs(&table).await;
+        TableCommit::new(table.clone(), "row-position-ranges".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![make_evo_file("range.parquet", 10, 6, 1, Some(0))],
+            )])
+            .await
+            .unwrap();
+        let mut reader = table.new_read_builder();
+        reader.with_row_ranges(vec![RowRange::new(4, 4)]);
+        let empty = reader
+            .new_scan()
+            .with_row_position_slice(0, 2)
+            .unwrap()
+            .plan()
+            .await
+            .unwrap();
+        assert!(empty.splits().is_empty());
+        assert_eq!(empty.snapshot_id(), Some(1));
+        let selected = reader
+            .new_scan()
+            .with_row_position_slice(3, 6)
+            .unwrap()
+            .plan()
+            .await
+            .unwrap();
+        assert_eq!(selected.splits().len(), 1);
+        assert_eq!(
+            selected.splits()[0].row_ranges(),
+            Some([RowRange::new(4, 4)].as_slice())
+        );
+    }
+
+    #[test]
+    fn test_row_position_selection_rejects_unsupported_and_mixed_modes() {
+        let append = limit_test_table();
+        assert!(append
+            .new_read_builder()
+            .new_scan()
+            .with_row_position_shard(0, 1)
+            .is_err());
+        let table = data_evolution_test_table(
+            "memory:/row_position_selection_validation",
+            two_column_schema(0, "id", "name"),
+        );
+        let reader = table.new_read_builder();
+        assert!(reader
+            .new_scan()
+            .with_row_position_slice(0, 2)
+            .unwrap()
+            .with_row_position_shard(0, 1)
+            .is_err());
+        assert!(reader
+            .new_scan()
+            .with_row_position_shard(0, 1)
+            .unwrap()
+            .with_row_position_slice(0, 2)
+            .is_err());
+        assert!(reader
+            .new_scan()
+            .with_row_position_shard(0, 1)
+            .unwrap()
+            .with_row_position_shard(1, 2)
+            .is_ok());
     }
 
     #[tokio::test]
@@ -5024,5 +5372,99 @@ mod tests {
         assert!(super::should_use_global_index_row_range_optimization(
             false, true, true, true,
         ));
+    }
+
+    #[tokio::test]
+    async fn test_plan_snapshot_metadata_distinguishes_uncommitted_and_empty_results() {
+        let table = scan_trace_small_split_table("memory:/plan_snapshot_metadata");
+        setup_scan_trace_dirs(&table).await;
+
+        let builder = table.new_read_builder();
+        let plan = builder.new_scan().plan().await.unwrap();
+        assert!(plan.splits().is_empty());
+        assert_eq!(plan.snapshot_id(), None);
+
+        TableCommit::new(table.clone(), "plan-metadata-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![stats_trace_file("metadata.parquet", 1, 1)],
+            )])
+            .await
+            .unwrap();
+
+        let plan = builder.new_scan().plan().await.unwrap();
+        assert_eq!(plan.splits().len(), 1);
+        assert_eq!(plan.snapshot_id(), Some(1));
+        assert_eq!(plan.splits()[0].snapshot_id(), 1);
+
+        let mut limited = table.new_read_builder();
+        limited.with_limit(0);
+        let empty = limited.new_scan().plan().await.unwrap();
+        assert!(empty.splits().is_empty());
+        assert_eq!(empty.snapshot_id(), Some(1));
+        let (empty, trace) = limited.new_scan().plan_with_trace().await.unwrap();
+        assert!(empty.splits().is_empty());
+        assert_eq!(empty.snapshot_id(), trace.snapshot_id);
+        assert_eq!(empty.snapshot_id(), Some(1));
+
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let delta = limited
+            .new_scan()
+            .plan_snapshot_delta(&snapshot)
+            .await
+            .unwrap();
+        assert!(delta.splits().is_empty());
+        assert_eq!(delta.snapshot_id(), Some(1));
+        let changelog = builder
+            .new_scan()
+            .plan_snapshot_changelog(&snapshot)
+            .await
+            .unwrap();
+        assert!(changelog.splits().is_empty());
+        assert_eq!(changelog.snapshot_id(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_plan_snapshot_metadata_preserves_pruned_historical_snapshot() {
+        let table = scan_trace_small_split_table("memory:/plan_historical_snapshot_metadata");
+        setup_scan_trace_dirs(&table).await;
+        for id in 1..=2 {
+            TableCommit::new(table.clone(), "historical-metadata-test".to_string())
+                .commit(vec![CommitMessage::new(
+                    BinaryRowBuilder::new(0).build_serialized(),
+                    0,
+                    vec![stats_trace_file(&format!("metadata-{id}.parquet"), id, id)],
+                )])
+                .await
+                .unwrap();
+        }
+        let table = table.copy_with_options(HashMap::from([(
+            "scan.snapshot-id".to_string(),
+            "1".to_string(),
+        )]));
+        let mut builder = table.new_read_builder();
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("id", Datum::Int(99))
+            .unwrap();
+        builder.with_filter(predicate);
+        let plan = builder.new_scan().plan().await.unwrap();
+        assert!(plan.splits().is_empty());
+        assert_eq!(plan.snapshot_id(), Some(1));
+        let (plan, trace) = builder.new_scan().plan_with_trace().await.unwrap();
+        assert!(plan.splits().is_empty());
+        assert_eq!(plan.snapshot_id(), trace.snapshot_id);
+        assert_eq!(plan.snapshot_id(), Some(1));
+
+        let mut ranges = table.new_read_builder();
+        ranges.with_row_ranges(vec![]);
+        let empty = ranges.new_scan().plan().await.unwrap();
+        assert!(empty.splits().is_empty());
+        assert_eq!(empty.snapshot_id(), Some(1));
     }
 }

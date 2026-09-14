@@ -25,7 +25,7 @@ use std::fmt;
 /// describe pruning at metadata planning time only; reader-side Parquet row
 /// group pruning and DataFusion residual filters are outside this trace.
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ScanTrace {
     pub snapshot_id: Option<i64>,
     pub base_manifest_files: usize,
