@@ -90,10 +90,7 @@ def test_with_row_ranges():
         empty_plan = empty_builder.new_scan().plan()
         assert empty_plan.splits() == []
         assert empty_builder.new_read().read(empty_plan.splits()) == []
-        traced, trace = empty_builder.new_scan().plan_with_trace()
-        assert traced.splits() == []
-        assert trace["snapshot_id"] == traced.snapshot_id() == 1
-        assert trace["final_splits"] == trace["final_files"] == 0
+        assert empty_plan.snapshot_id() == 1
 
         with pytest.raises(ValueError, match="start 2 exceeds end 1"):
             table.new_read_builder().with_row_ranges([(2, 1)])
@@ -127,48 +124,31 @@ def test_plan_without_filter_succeeds():
         assert len(plan.splits()) >= 1
 
 
-def test_plan_with_trace_reports_the_same_filtered_plan():
-    import json
-
+def test_filtered_plan_preserves_snapshot_and_projection():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_string_table(warehouse)
         builder = table.new_read_builder().with_projection(["id"]).with_filter(
             {"method": "startsWith", "field": "name", "literals": ["ap"]})
-        scan = builder.new_scan()
-        plan, trace = scan.plan_with_trace()
-        assert [s.serialize() for s in plan.splits()] == [s.serialize() for s in scan.plan().splits()]
+        plan = builder.new_scan().plan()
+        assert plan.snapshot_id() == 2
+        assert len(plan.splits()) == 1
         assert _read_ids(builder) == [1, 2]
-        assert trace["snapshot_id"] == plan.snapshot_id() == 2
-        assert trace["manifest_entries_read"] == 2
-        assert trace["manifest_entries_pruned_by_data_stats"] == 1
-        assert trace["final_splits"] == len(plan) == 1
-        assert trace["final_files"] == 1
-        assert trace["limit"] is None
-        assert trace["limit_early_stopped"] is False
-        files = [json.loads(s.__reduce__()[1][0])["data_files"][0] for s in plan.splits()]
-        assert trace["planned_data_file_bytes"] == sum(f["_FILE_SIZE"] for f in files)
 
 
-def test_plan_with_trace_preserves_empty_snapshot_and_limit():
+def test_plan_preserves_empty_snapshot_and_zero_limit():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
-        plan, trace = table.new_read_builder().with_limit(0).new_scan().plan_with_trace()
+        plan = table.new_read_builder().with_limit(0).new_scan().plan()
         assert plan.splits() == []
-        assert trace["snapshot_id"] == plan.snapshot_id() == 1
-        assert trace["limit"] == 0
-        assert trace["limit_early_stopped"] is True
-        assert trace["final_splits"] == trace["final_files"] == 0
-        assert trace["planned_data_file_bytes"] == 0
+        assert plan.snapshot_id() == 1
 
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
         ctx.sql("CREATE TABLE paimon.rdb.empty (id INT)")
         empty = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.empty")
-        plan, trace = empty.new_read_builder().new_scan().plan_with_trace()
+        plan = empty.new_read_builder().new_scan().plan()
         assert plan.splits() == []
-        assert trace["snapshot_id"] is plan.snapshot_id() is None
-        assert trace["limit"] is None
-        assert trace["manifest_entries_read"] == trace["final_splits"] == 0
+        assert plan.snapshot_id() is None
 
 
 def test_split_pickle_roundtrip():
@@ -901,11 +881,9 @@ def test_combined_incremental_plan_merges_pk_versions_and_preserves_range():
         table = PaimonCatalog({"warehouse": warehouse}).get_table("incdb.t")
         builder = table.new_read_builder()
         scan = builder.new_incremental_scan(0, 2)
-        plan, trace = scan.plan_with_trace()
-        assert plan.snapshot_id() == trace["snapshot_id"] == 2
-        assert len(plan.splits()) == trace["final_splits"] == 1
-        assert trace["base_manifest_files"] == 0
-        assert trace["delta_manifest_files"] == trace["final_files"] == 2
+        plan = scan.plan()
+        assert plan.snapshot_id() == 2
+        assert len(plan.splits()) == 1
         assert pa.Table.from_batches(builder.new_read().read(plan.splits())).to_pydict() == {
             "id": [1], "value": [20]}
         assert [s.serialize() for s in scan.plan().splits()] == [
@@ -914,10 +892,9 @@ def test_combined_incremental_plan_merges_pk_versions_and_preserves_range():
         assert selected.snapshot_id() == 2
         assert pa.Table.from_batches(builder.new_read().read(selected.splits())).to_pydict() == {
             "id": [1], "value": [20]}
-        empty, empty_trace = builder.new_incremental_scan(2, 2).plan_with_trace()
+        empty = builder.new_incremental_scan(2, 2).plan()
         assert empty.splits() == []
-        assert empty.snapshot_id() == empty_trace["snapshot_id"] == 2
-        assert empty_trace["delta_manifest_files"] == empty_trace["final_files"] == 0
+        assert empty.snapshot_id() == 2
         for start, end in ((-1, 2), (0, 3), (2, 1)):
             with pytest.raises(ValueError, match="out of available range"):
                 builder.new_incremental_scan(start, end).plan()
@@ -952,11 +929,10 @@ def test_row_position_slice_roundtrip_and_shards_read_exact_rows():
         builder = table.new_read_builder().with_projection(["id"])
         scan = builder.new_scan()
         assert scan.with_row_position_slice(2, 5) is scan
-        plan, trace = scan.plan_with_trace()
+        plan = scan.plan()
         restored = [pickle.loads(pickle.dumps(s)) for s in plan.splits()]
         assert pa.Table.from_batches(builder.new_read().read(restored)).column("id").to_pylist() == [2, 3, 4]
-        assert plan.snapshot_id() == trace["snapshot_id"] == 2
-        assert trace["final_splits"] == len(plan.splits())
+        assert plan.snapshot_id() == 2
         for index, expected in enumerate(([0, 1], [2, 3], [4], [5])):
             shard = builder.new_scan().with_row_position_shard(index, 4).plan()
             actual = pa.Table.from_batches(builder.new_read().read(shard.splits()))
@@ -992,15 +968,6 @@ def test_row_position_selection_validates_parameters_and_combinations():
                 getattr(ordinary.new_scan(), method)(0, 1)
 
 
-def test_planning_capabilities_describe_runtime_compatibility():
-    from pypaimon_rust.datafusion import planning_capabilities
-
-    capabilities = planning_capabilities()
-    assert isinstance(capabilities, list)
-    assert all(isinstance(capability, str) for capability in capabilities)
-    assert {"deletion-vector-writer-schema", "legacy-bucket-index-path"} <= set(capabilities)
-
-
 def test_incremental_row_positions_use_combined_delta_batch():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_de_position_table(warehouse)
@@ -1010,8 +977,8 @@ def test_incremental_row_positions_use_combined_delta_batch():
             (builder.new_incremental_scan(1, 2).with_row_position_slice(1, 3), [4, 5]),
             (builder.new_incremental_scan(0, 2).with_row_position_shard(1, 4), [2, 3]),
         ):
-            plan, trace = scan.plan_with_trace()
-            assert plan.snapshot_id() == trace["snapshot_id"] == 2
+            plan = scan.plan()
+            assert plan.snapshot_id() == 2
             restored = [pickle.loads(pickle.dumps(split)) for split in plan.splits()]
             assert pa.Table.from_batches(builder.new_read().read(restored)).column("id").to_pylist() == expected
             assert [s.serialize() for s in scan.plan().splits()] == [s.serialize() for s in plan.splits()]

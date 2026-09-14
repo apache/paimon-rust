@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{DataSplit, Plan, ScanTrace, SnapshotManager, Table, TableScan};
+use super::{DataSplit, Plan, SnapshotManager, Table, TableScan};
 use crate::spec::{CommitKind, CoreOptions};
 
 /// Batch incremental scan mode.
@@ -285,13 +285,6 @@ impl<'a> IncrementalScan<'a> {
     /// Only Delta (or Auto resolving to Delta) is supported. The end snapshot
     /// must exist, and supplies the plan's snapshot metadata and deletion vectors.
     pub async fn plan_combined_delta(&self) -> crate::Result<Plan> {
-        self.plan_combined_delta_with_trace()
-            .await
-            .map(|(plan, _)| plan)
-    }
-
-    /// Return a combined APPEND-delta plan and its raw metadata-planning trace.
-    pub async fn plan_combined_delta_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let mode = self.resolve_mode();
         if mode != IncrementalScanMode::Delta {

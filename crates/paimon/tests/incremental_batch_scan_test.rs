@@ -1029,16 +1029,12 @@ async fn combined_delta_merges_primary_key_versions_and_preserves_delta_api() {
     write_batch(&table, &make_batch(vec![1], vec![20])).await;
 
     let builder = table.new_read_builder();
-    let (plan, trace) = builder
+    let plan = builder
         .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
-        .plan_combined_delta_with_trace()
+        .plan_combined_delta()
         .await
         .unwrap();
     assert_eq!(plan.snapshot_id(), Some(2));
-    assert_eq!(trace.snapshot_id, Some(2));
-    assert_eq!(trace.base_manifest_files, 0);
-    assert_eq!(trace.delta_manifest_files, 2);
-    assert_eq!(trace.final_files, 2);
     assert_eq!(
         plan.splits().len(),
         1,
@@ -1113,13 +1109,12 @@ async fn combined_delta_skips_overwrite_but_retains_endpoint_metadata() {
     let end = table.snapshot_manager().get_snapshot(2).await.unwrap();
     assert_eq!(end.commit_kind(), &paimon::spec::CommitKind::OVERWRITE);
     let builder = table.new_read_builder();
-    let (plan, trace) = builder
+    let plan = builder
         .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
-        .plan_combined_delta_with_trace()
+        .plan_combined_delta()
         .await
         .unwrap();
     assert_eq!(plan.snapshot_id(), Some(2));
-    assert_eq!(trace.delta_manifest_files, 1);
     let batches: Vec<RecordBatch> = builder
         .new_read()
         .unwrap()
@@ -1176,14 +1171,12 @@ async fn combined_delta_merges_add_delete_entries_across_appends() {
         .write(bytes::Bytes::from(serde_json::to_vec(&metadata).unwrap()))
         .await
         .unwrap();
-    let (plan, trace) = table
+    let plan = table
         .new_read_builder()
         .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
-        .plan_combined_delta_with_trace()
+        .plan_combined_delta()
         .await
         .unwrap();
-    assert_eq!(trace.manifest_entries_read, 3);
-    assert_eq!(trace.manifest_entries_after_merge, 1);
     let files: Vec<_> = plan
         .splits()
         .iter()
@@ -1253,9 +1246,8 @@ async fn combined_delta_row_positions_span_appends_before_range_intersection() {
         matches!(scan.plan().await, Err(paimon::Error::Unsupported { .. })),
         "per-commit Delta must not silently renumber the slice per snapshot"
     );
-    let (plan, trace) = scan.plan_combined_delta_with_trace().await.unwrap();
+    let plan = scan.plan_combined_delta().await.unwrap();
     assert_eq!(plan.snapshot_id(), Some(3));
-    assert_eq!(trace.delta_manifest_files, 2);
     let batches: Vec<RecordBatch> = builder
         .new_read()
         .unwrap()

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::pyarrow::ToPyArrow;
 use futures::TryStreamExt;
 use paimon::spec::Predicate;
-use paimon::table::{DataSplit, IncrementalScanMode, RowRange, ScanTrace, Table};
+use paimon::table::{DataSplit, IncrementalScanMode, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -29,12 +29,6 @@ use pyo3::types::{PyBytes, PyDict};
 
 use crate::error::to_py_err;
 use crate::predicate::dict_to_predicate;
-
-/// Explicit planner behavior supported by this runtime, independent of version strings.
-#[pyfunction]
-pub(crate) fn planning_capabilities() -> Vec<&'static str> {
-    vec!["deletion-vector-writer-schema", "legacy-bucket-index-path"]
-}
 
 /// Time-travel selector option names, in the core's resolution priority order.
 const TIME_TRAVEL_SELECTORS: [&str; 5] = [
@@ -373,57 +367,6 @@ impl PyTableScan {
             })
         })
     }
-
-    /// Plan once and return the core metadata-planning counters unchanged.
-    /// Reader-side pruning and residual filtering are outside this trace.
-    fn plan_with_trace<'py>(&self, py: Python<'py>) -> PyResult<(PyPlan, Bound<'py, PyDict>)> {
-        let (plan, trace) = py.detach(|| {
-            runtime().block_on(async {
-                match self.incremental_range {
-                    Some((start, end)) => {
-                        self.core_incremental_scan(start, end)?
-                            .plan_combined_delta_with_trace()
-                            .await
-                    }
-                    None => self.core_scan()?.plan_with_trace().await,
-                }
-                .map_err(to_py_err)
-            })
-        })?;
-        Ok((PyPlan::from(plan), scan_trace_to_dict(py, &trace)?))
-    }
-}
-
-fn scan_trace_to_dict<'py>(py: Python<'py>, trace: &ScanTrace) -> PyResult<Bound<'py, PyDict>> {
-    let value = serde_json::to_value(trace)
-        .map_err(|e| PyValueError::new_err(format!("failed to serialize scan trace: {e}")))?;
-    let serde_json::Value::Object(fields) = value else {
-        return Err(PyValueError::new_err("scan trace must be an object"));
-    };
-    let result = PyDict::new(py);
-    for (name, value) in fields {
-        match value {
-            serde_json::Value::Null => result.set_item(name, py.None())?,
-            serde_json::Value::Bool(value) => result.set_item(name, value)?,
-            serde_json::Value::Number(value) => {
-                if let Some(value) = value.as_i64() {
-                    result.set_item(name, value)?;
-                } else if let Some(value) = value.as_u64() {
-                    result.set_item(name, value)?;
-                } else {
-                    return Err(PyValueError::new_err(format!(
-                        "scan trace field '{name}' must be an integer"
-                    )));
-                }
-            }
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "unsupported scan trace value for field '{name}'"
-                )));
-            }
-        }
-    }
-    Ok(result)
 }
 
 #[pyclass(name = "TableRead", module = "pypaimon_rust.datafusion")]
@@ -557,28 +500,5 @@ impl PySplit {
         Ok(Self {
             inner: Self::from_bytes(state.as_bytes())?,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pyo3::types::{PyBool, PyInt};
-
-    #[test]
-    fn scan_trace_preserves_integer_precision_and_optional_fields() {
-        Python::attach(|py| {
-            let mut trace = ScanTrace::default();
-            trace.planned_data_file_bytes = u64::MAX;
-            let dict = scan_trace_to_dict(py, &trace).unwrap();
-            let bytes = dict.get_item("planned_data_file_bytes").unwrap().unwrap();
-            assert!(bytes.is_instance_of::<PyInt>());
-            assert_eq!(bytes.extract::<u64>().unwrap(), u64::MAX);
-            assert!(dict.get_item("snapshot_id").unwrap().unwrap().is_none());
-            assert!(dict.get_item("limit").unwrap().unwrap().is_none());
-            let stopped = dict.get_item("limit_early_stopped").unwrap().unwrap();
-            assert!(stopped.is_instance_of::<PyBool>());
-            assert!(!stopped.extract::<bool>().unwrap());
-        });
     }
 }

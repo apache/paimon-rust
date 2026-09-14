@@ -112,8 +112,8 @@ def test_branch_partition_statistics_are_isolated(branch_tables):
 def test_branch_incremental_scan_uses_branch_snapshot_bounds(branch_tables):
     _, blue, _ = branch_tables
     builder = blue.new_read_builder()
-    plan, trace = builder.new_incremental_scan(0, 1).plan_with_trace()
-    assert plan.snapshot_id() == trace["snapshot_id"] == 1
+    plan = builder.new_incremental_scan(0, 1).plan()
+    assert plan.snapshot_id() == 1
     assert pa.Table.from_batches(builder.new_read().read(plan.splits())).to_pydict() == {
         "id": [1], "dt": ["blue"]}
     with pytest.raises(ValueError, match="out of available range"):

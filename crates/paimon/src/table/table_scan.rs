@@ -1015,7 +1015,7 @@ impl<'a> TableScan<'a> {
         &self,
         snapshots: &[Snapshot],
         end_snapshot: &Snapshot,
-    ) -> crate::Result<(Plan, ScanTrace)> {
+    ) -> crate::Result<Plan> {
         match &self.0 {
             TableScanKind::Paimon(scan) => scan.plan_snapshot_deltas(snapshots, end_snapshot).await,
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
@@ -1572,24 +1572,16 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         snapshots: &[Snapshot],
         end_snapshot: &Snapshot,
-    ) -> crate::Result<(Plan, ScanTrace)> {
+    ) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let mut trace = ScanTrace {
-            snapshot_id: Some(end_snapshot.id()),
-            limit: self.limit,
-            ..Default::default()
-        };
-        let plan = self
-            .plan_snapshot_from_lists(
-                end_snapshot,
-                ManifestListSource::AppendDeltas(snapshots),
-                data_evolution_read_field_ids.as_ref(),
-                Some(&mut trace),
-            )
-            .await?;
-        trace.planned_data_file_bytes = plan.planned_data_file_bytes();
-        Ok((plan, trace))
+        self.plan_snapshot_from_lists(
+            end_snapshot,
+            ManifestListSource::AppendDeltas(snapshots),
+            data_evolution_read_field_ids.as_ref(),
+            None,
+        )
+        .await
     }
 
     /// Plan data splits from a snapshot's changelog manifest list.

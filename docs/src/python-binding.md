@@ -150,26 +150,10 @@ for batch in batches:
 filters or a zero limit produce no splits. It returns `None` when no snapshot
 exists or the scan is for a format table without Paimon snapshots.
 
-Use `plan_with_trace()` to collect the core planner's metadata counters in the
-same scan:
-
-```python
-plan, trace = rb.new_scan().plan_with_trace()
-print(trace["snapshot_id"], trace["final_splits"], trace["final_files"])
-print(trace["planned_data_file_bytes"])
-```
-
-The trace is a dictionary of the original `ScanTrace` fields. Field names and
-units are preserved: manifest-entry counters count entries, and file and split
-counters count their respective objects. Optional fields such as `snapshot_id`
-and `limit` remain `None` when absent. Counters use Python integers without a
-floating-point conversion. The trace excludes reader-side row-group pruning
-and residual filtering.
-
 Use an explicit snapshot range to plan a single incremental batch:
 
 ```python
-plan, trace = rb.new_incremental_scan(2, 5).plan_with_trace()
+plan = rb.new_incremental_scan(2, 5).plan()
 batches = rb.new_read().read(plan.splits())
 ```
 
@@ -197,18 +181,10 @@ and may also be applied to `new_incremental_scan` results, where positions count
 the combined APPEND-delta batch. The selection is encoded in the returned splits
 and survives serialization.
 
-Adapters can inspect explicitly named runtime guarantees without relying on a
-package version:
-
-```python
-from pypaimon_rust.datafusion import planning_capabilities
-assert "deletion-vector-writer-schema" in planning_capabilities()
-```
-
-The runtime also advertises `legacy-bucket-index-path`, which resolves historical
-bucket-local deletion-vector references from the table's index directory when
-the canonical bucket path is absent. Explicit external paths and existing
-canonical paths retain priority.
+Deletion-vector reads accept both Java and Python Avro array-item schemas.
+Historical Python bucket-local references are resolved from the table's index
+directory when the canonical bucket path is absent. Explicit external paths
+and existing canonical paths retain priority.
 
 Alternatively, read via SQL using `SQLContext`:
 

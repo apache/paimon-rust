@@ -529,7 +529,6 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<PaimonCatalog>()?;
     this.add_class::<crate::table::PyTable>()?;
     this.add_class::<crate::read::PyReadBuilder>()?;
-    this.add_function(wrap_pyfunction!(crate::read::planning_capabilities, &this)?)?;
     this.add_class::<crate::read::PyTableScan>()?;
     this.add_class::<crate::read::PyPlan>()?;
     this.add_class::<crate::read::PyTableRead>()?;
