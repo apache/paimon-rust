@@ -169,6 +169,21 @@ impl DataType {
 
     /// Returns a copy of this type with the given nullability (top-level only).
     /// Corresponds to Java `DataType.copy(boolean nullable)`.
+    /// Compare two types ignoring their top-level nullability.
+    ///
+    /// Mirrors Java `DataType.equalsIgnoreNullable`, which compares
+    /// `this.copy(true)` with `o.copy(true)`: only the outermost nullable flag is
+    /// normalized, so nested fields (ids included) still have to match.
+    pub fn equals_ignore_nullable(&self, other: &DataType) -> bool {
+        match (
+            self.copy_with_nullable(true),
+            other.copy_with_nullable(true),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+
     pub fn copy_with_nullable(&self, nullable: bool) -> Result<Self> {
         Ok(match self {
             DataType::Boolean(_) => DataType::Boolean(BooleanType::with_nullable(nullable)),

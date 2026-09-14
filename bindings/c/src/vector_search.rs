@@ -31,10 +31,14 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 
 use paimon::spec::Predicate;
-use paimon::table::Table;
+use paimon::table::{ArrowRecordBatchStream, Table, VectorSearchBuilder};
+use paimon::vector_search::SearchResult;
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
-use crate::result::{paimon_result_record_batch_reader, paimon_result_vector_search_builder};
+use crate::result::{
+    paimon_result_record_batch_reader, paimon_result_vector_read, paimon_result_vector_scan,
+    paimon_result_vector_search_builder,
+};
 use crate::runtime;
 use crate::types::*;
 
@@ -185,7 +189,10 @@ pub unsafe extern "C" fn paimon_vector_search_builder_with_options(
     std::ptr::null_mut()
 }
 
-/// Set an optional scalar residual filter for a vector-search builder.
+/// Set an optional scalar predicate applied before vector Top-K.
+///
+/// The Rust core resolves the predicate to an allow-list for the selected
+/// primary-key or data-evolution/global-index search path.
 ///
 /// The predicate is consumed (ownership transferred to the builder). Pass null
 /// to clear any previously set filter.
@@ -297,49 +304,130 @@ pub unsafe extern "C" fn paimon_vector_search_builder_free(b: *mut paimon_vector
 pub unsafe extern "C" fn paimon_vector_search_builder_execute_read(
     b: *mut paimon_vector_search_builder,
 ) -> paimon_result_record_batch_reader {
-    if let Err(e) = check_non_null(b, "b") {
-        return paimon_result_record_batch_reader {
-            reader: std::ptr::null_mut(),
-            error: e,
-        };
-    }
-    let state = &*((*b).inner as *const VectorSearchState);
+    let state = match vector_search_state(b) {
+        Ok(state) => state,
+        Err(error) => {
+            return paimon_result_record_batch_reader {
+                reader: std::ptr::null_mut(),
+                error,
+            }
+        }
+    };
+    let builder = configured_builder(state);
+    wrap_vector_stream(runtime().block_on(async {
+        materialize_search_result(builder.execute().await?, state.projection.as_deref()).await
+    }))
+}
 
-    let mut builder = state.table.new_vector_search_builder();
-    if let Some(col) = &state.vector_column {
-        builder.with_vector_column(col);
+pub(crate) async fn materialize_search_result(
+    result: SearchResult,
+    projection: Option<&[String]>,
+) -> paimon::Result<ArrowRecordBatchStream> {
+    let mut reader = result.new_read_builder();
+    if let Some(cols) = projection {
+        let col_refs: Vec<&str> = cols.iter().map(String::as_str).collect();
+        reader.with_projection(&col_refs);
     }
-    if let Some(v) = &state.query_vector {
-        builder.with_query_vector(v.clone());
+    reader.read().await
+}
+
+pub(crate) fn wrap_vector_stream(
+    result: paimon::Result<ArrowRecordBatchStream>,
+) -> paimon_result_record_batch_reader {
+    match result {
+        Ok(stream) => paimon_result_record_batch_reader {
+            reader: Box::into_raw(Box::new(paimon_record_batch_reader {
+                inner: Box::into_raw(Box::new(stream)) as *mut c_void,
+            })),
+            error: std::ptr::null_mut(),
+        },
+        Err(e) => paimon_result_record_batch_reader {
+            reader: std::ptr::null_mut(),
+            error: paimon_error::from_paimon(e),
+        },
+    }
+}
+
+unsafe fn vector_search_state<'a>(
+    builder: *const paimon_vector_search_builder,
+) -> Result<&'a VectorSearchState, *mut paimon_error> {
+    check_non_null(builder, "builder")?;
+    check_non_null((*builder).inner, "builder is not initialized")?;
+    Ok(&*((*builder).inner as *const VectorSearchState))
+}
+
+fn configured_builder(state: &VectorSearchState) -> VectorSearchBuilder<'_> {
+    let mut builder = state.table.new_vector_search_builder();
+    if let Some(column) = &state.vector_column {
+        builder.with_vector_column(column);
+    }
+    if let Some(vector) = &state.query_vector {
+        builder.with_query_vector(vector.clone());
     }
     if let Some(limit) = state.limit {
         builder.with_limit(limit);
     }
-    if !state.options.is_empty() {
-        builder.with_options(state.options.clone());
+    builder.with_options(state.options.clone());
+    if let Some(filter) = &state.filter {
+        builder.with_filter(filter.clone());
     }
-    if let Some(f) = &state.filter {
-        builder.with_filter(f.clone());
-    }
-    if let Some(cols) = &state.projection {
-        let col_refs: Vec<&str> = cols.iter().map(String::as_str).collect();
-        builder.with_projection(&col_refs);
-    }
+    builder
+}
 
-    match runtime().block_on(builder.execute_read()) {
-        Ok(stream) => {
-            let reader = Box::new(stream);
-            let wrapper = Box::new(paimon_record_batch_reader {
-                inner: Box::into_raw(reader) as *mut c_void,
-            });
-            paimon_result_record_batch_reader {
-                reader: Box::into_raw(wrapper),
-                error: std::ptr::null_mut(),
-            }
-        }
-        Err(e) => paimon_result_record_batch_reader {
-            reader: std::ptr::null_mut(),
-            error: paimon_error::from_paimon(e),
+/// Create an owned DE or PK vector scan. The vector column must be configured;
+/// a query vector and limit are not required. Free with paimon_vector_scan_free.
+/// # Safety
+/// builder must be a live vector-search builder handle, or null (error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vector_search_builder_new_scan(
+    builder: *const paimon_vector_search_builder,
+) -> paimon_result_vector_scan {
+    let result = vector_search_state(builder).and_then(|state| {
+        configured_builder(state)
+            .new_scan()
+            .map_err(paimon_error::from_paimon)
+    });
+    match result {
+        Ok(scan) => paimon_result_vector_scan {
+            scan: Box::into_raw(Box::new(paimon_vector_scan {
+                inner: Box::into_raw(Box::new(scan)) as *mut c_void,
+            })),
+            error: std::ptr::null_mut(),
+        },
+        Err(error) => paimon_result_vector_scan {
+            scan: std::ptr::null_mut(),
+            error,
+        },
+    }
+}
+
+/// Create an owned DE or PK reader from configured query parameters and projection.
+/// The builder may then be freed. Free the reader with paimon_vector_read_free.
+/// # Safety
+/// builder must be a live vector-search builder handle, or null (error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_vector_search_builder_new_read(
+    builder: *const paimon_vector_search_builder,
+) -> paimon_result_vector_read {
+    let result = vector_search_state(builder).and_then(|state| {
+        configured_builder(state)
+            .new_read()
+            .map(|read| VectorReadState {
+                read,
+                projection: state.projection.clone(),
+            })
+            .map_err(paimon_error::from_paimon)
+    });
+    match result {
+        Ok(read) => paimon_result_vector_read {
+            read: Box::into_raw(Box::new(paimon_vector_read {
+                inner: Box::into_raw(Box::new(read)) as *mut c_void,
+            })),
+            error: std::ptr::null_mut(),
+        },
+        Err(error) => paimon_result_vector_read {
+            read: std::ptr::null_mut(),
+            error,
         },
     }
 }
@@ -387,3 +475,8 @@ const _: unsafe extern "C" fn(*mut paimon_vector_search_builder) =
 const _: unsafe extern "C" fn(
     *mut paimon_vector_search_builder,
 ) -> paimon_result_record_batch_reader = paimon_vector_search_builder_execute_read;
+
+const _: unsafe extern "C" fn(*const paimon_vector_search_builder) -> paimon_result_vector_scan =
+    paimon_vector_search_builder_new_scan;
+const _: unsafe extern "C" fn(*const paimon_vector_search_builder) -> paimon_result_vector_read =
+    paimon_vector_search_builder_new_read;

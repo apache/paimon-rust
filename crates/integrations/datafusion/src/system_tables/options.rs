@@ -47,7 +47,7 @@ fn options_schema() -> SchemaRef {
 }
 
 #[derive(Debug)]
-struct OptionsTable {
+pub(super) struct OptionsTable {
     table: Table,
 }
 

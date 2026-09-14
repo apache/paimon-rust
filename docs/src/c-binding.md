@@ -332,6 +332,318 @@ and ranges. Combine predicates with `paimon_predicate_and`,
     A predicate that has not been consumed must be released with
     `paimon_predicate_free`.
 
+## Vector Scan, Plan, and Read
+
+DE and primary-key vector searches use the same execution API:
+
+1. Configure a `paimon_vector_search_builder` with the column, query, limit,
+   options, predicate, and output projection.
+2. Call `paimon_vector_search_builder_new_scan` and
+   `paimon_vector_search_builder_new_read` to create independent owned handles.
+   Creating a scan only requires the column; query validation happens when
+   creating the reader.
+3. Call `paimon_vector_scan_plan` to resolve the source snapshot and search work.
+4. Pass the reader and plan to `paimon_vector_read_read`. It returns the usual
+   Arrow record-batch reader with projected columns and `__paimon_search_score`.
+
+`paimon_vector_search_builder_execute_read` remains the convenience operation
+for local planning and reading. A plan can also be reused with different query
+vectors or limits. Its table, column, and pre-filter must match the reader.
+
+For Java-planned PK bucket work, decode each standalone
+`BucketVectorSearchSplit.serialize` buffer using
+`paimon_bucket_vector_search_split_deserialize`, then pass the decoded handles
+to `paimon_vector_scan_plan_from_bucket_splits`. The returned common vector
+plan is consumed by the same `paimon_vector_read_read` API. No table snapshot
+or index manifest is read during this plan construction; supplied files, row
+ranges, and snapshot IDs remain authoritative. Top-K is local to the supplied
+buckets, so a distributed caller merges its per-worker results.
+
+The decoder accepts the versioned `PKVSPLIT` format. It does not accept Java
+`ObjectOutputStream` envelopes or DE `IndexVectorSearchSplit` /
+`RawVectorSearchSplit` object serialization. DE plans are currently obtained
+through `paimon_vector_scan_plan`.
+
+| Owned handle | Release function |
+|--------------|------------------|
+| `paimon_vector_scan` | `paimon_vector_scan_free` |
+| `paimon_vector_read` | `paimon_vector_read_free` |
+| `paimon_vector_plan` | `paimon_vector_plan_free` |
+| `paimon_bucket_vector_search_split` | `paimon_bucket_vector_search_split_free` |
+
+Decoded splits own their data, so input bytes can be released after decoding.
+Plan construction copies the split metadata and leaves input handles intact,
+including on failure. Free split handles after constructing the plan. Scans and
+readers can outlive their builder; plans can outlive their scan. A read borrows
+its plan, and the returned Arrow stream can outlive both the reader and plan.
+
+### Java-planned PK Bucket Splits
+
+Java plans the search once, and the caller sends each worker its assigned
+`BucketVectorSearchSplit` buffers. The native worker follows this flow:
+
+```text
+Java VectorScan.Plan
+  -> BucketVectorSearchSplit.serialize(DataOutputView), one buffer per split
+  -> Application transport
+  -> paimon_bucket_vector_search_split_deserialize, one handle per buffer
+  -> paimon_vector_scan_plan_from_bucket_splits
+  -> paimon_vector_read_read
+  -> paimon_record_batch_reader_next
+  -> Arrow consumer and global Top-K merge
+```
+
+`paimon_vector_search_builder_new_scan` creates the scan configuration; it does
+not scan storage. For this path, construct the plan with
+`paimon_vector_scan_plan_from_bucket_splits`. Calling `paimon_vector_scan_plan`
+or `paimon_vector_search_builder_execute_read` would plan from the table again
+and would not use the worker's assigned Java splits.
+
+#### Serialize on the Java Side
+
+Use the standalone serializer directly with `DataOutputViewStreamWrapper` over
+a byte buffer. A Java object stream adds an envelope that the C decoder does
+not accept. The following helper accepts a builder already configured with the
+vector column and any planning predicates, for example one obtained from
+`table.newVectorSearchBuilder().withVectorColumn("embedding")`:
+
+```java
+import org.apache.paimon.io.DataOutputViewStreamWrapper;
+import org.apache.paimon.table.source.BucketVectorSearchSplit;
+import org.apache.paimon.table.source.VectorScan;
+import org.apache.paimon.table.source.VectorSearchBuilder;
+import org.apache.paimon.table.source.VectorSearchSplit;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
+public final class VectorSplitSerializer {
+    public static List<byte[]> planAndSerialize(VectorSearchBuilder builder)
+            throws IOException {
+        VectorScan.Plan plan = builder.newVectorScan().scan();
+        List<byte[]> buffers = new ArrayList<>();
+        for (VectorSearchSplit split : plan.splits()) {
+            if (!(split instanceof BucketVectorSearchSplit)) {
+                throw new IllegalArgumentException("Expected a PK bucket vector split");
+            }
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            DataOutputViewStreamWrapper out = new DataOutputViewStreamWrapper(bytes);
+            ((BucketVectorSearchSplit) split).serialize(out);
+            out.flush();
+            buffers.add(bytes.toByteArray());
+        }
+        return buffers; // Assign whole buffers to workers.
+    }
+}
+```
+
+Preserve each buffer's length through transport. Decode one complete buffer at
+a time; do not concatenate splits into a single decoder input. The buffer starts
+with the eight bytes `PKVSPLIT`, followed by the big-endian format version
+(currently `1`). Use matching Java and Rust format versions.
+
+Send the table location, branch and resolved Paimon `TableSchema` JSON alongside
+the assigned buffers. The schema must retain its field IDs, primary keys and
+table options, including vector index type, dimension, metric and deletion-vector
+settings. This is Paimon schema JSON (`TableSchema.toString()`), not Arrow schema
+JSON. Supply storage credentials/options separately when constructing the native
+table; they are not merged into the table schema. A worker can use
+`paimon_table_from_schema_json` without opening a catalog, or
+`paimon_table_from_schema_json_with_file_io` with its own cache-enabled FileIO.
+It must be able to access the data, deletion and index files named by the splits.
+
+For example, use the received metadata and worker-local storage options to
+create the table (check `opened.error` before using `opened.table`):
+
+```c
+paimon_result_get_table opened = paimon_table_from_schema_json(
+    table_path, table_schema_json, database, table_name, branch,
+    storage_options, storage_options_len);
+```
+
+Pass `opened.table` to the helper below and release it with `paimon_table_free`
+after use. Pass `NULL, 0` for storage options when none are needed, and `NULL`
+for `branch` only when the Java planner used the default `main` branch.
+
+The split buffers carry planned work, not the query vector, Top-K limit,
+projection, query options or an executable scalar predicate. Send these query
+parameters separately. If a scalar pre-filter is required, reconstruct it with
+the `paimon_predicate_*` APIs and attach it to the native builder before creating
+both scan and reader. Java file pruning and row ranges do not necessarily encode
+the entire residual predicate. Applying that residual only after native Top-K
+can discard winners without retrieving the next matching rows. PK data predicates
+require deletion vectors enabled and merge-on-read disabled.
+
+#### Read the Assigned Splits through C
+
+This C11 helper searches `embedding`, projects `id`, and passes each batch to a
+caller-provided callback. Adjust the column names to the table schema. The caller
+provides a live table handle, a non-empty query of the configured dimension, a
+positive `top_k`, and its assigned buffers as `paimon_byte_slice` values.
+
+The helper borrows the table and buffers and consumes the optional `filter`,
+including on failure. The callback returns zero on success. It must either use
+the batch synchronously or import/move its Arrow contents, marking the source
+structures released according to the Arrow C Data Interface. It must not free
+the Paimon batch container itself; the helper does that after the callback,
+including when the callback fails.
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "paimon.h"
+
+typedef int (*vector_batch_consumer)(void *context, paimon_arrow_batch batch);
+
+#define VECTOR_TRY(expression)                     \
+    do {                                          \
+        error = (expression);                     \
+        if (error != NULL) goto cleanup;           \
+    } while (0)
+
+int read_vector_splits(
+    const paimon_table *table,
+    const paimon_byte_slice *wire_splits, size_t split_count,
+    const float *query, size_t dimension, size_t top_k,
+    paimon_predicate *filter,
+    vector_batch_consumer consume_batch, void *context) {
+    int status = -1;
+    paimon_error *error = NULL;
+    paimon_bucket_vector_search_split **splits = NULL;
+    paimon_vector_search_builder *builder = NULL;
+    paimon_vector_scan *scan = NULL;
+    paimon_vector_plan *plan = NULL;
+    paimon_vector_read *read = NULL;
+    paimon_record_batch_reader *reader = NULL;
+    const char *projection[] = {"id", NULL};
+
+    if (table == NULL || consume_batch == NULL) goto cleanup;
+    if (split_count == 0) {
+        status = 0; // No assigned work; the plan API requires non-empty input.
+        goto cleanup;
+    }
+    if (wire_splits == NULL) goto cleanup;
+    splits = calloc(split_count, sizeof(*splits));
+    if (splits == NULL) goto cleanup;
+
+    for (size_t i = 0; i < split_count; ++i) {
+        paimon_result_bucket_vector_search_split decoded =
+            paimon_bucket_vector_search_split_deserialize(
+                wire_splits[i].data, wire_splits[i].len);
+        splits[i] = decoded.split;
+        VECTOR_TRY(decoded.error);
+    }
+    // All metadata is now owned by split handles; wire buffers can be released.
+
+    paimon_result_vector_search_builder built =
+        paimon_table_new_vector_search_builder(table);
+    builder = built.builder;
+    VECTOR_TRY(built.error);
+    VECTOR_TRY(paimon_vector_search_builder_with_vector_column(builder, "embedding"));
+    VECTOR_TRY(paimon_vector_search_builder_with_query_vector(builder, query, dimension));
+    VECTOR_TRY(paimon_vector_search_builder_with_limit(builder, top_k));
+    VECTOR_TRY(paimon_vector_search_builder_with_projection(builder, projection));
+    VECTOR_TRY(paimon_vector_search_builder_with_filter(builder, filter));
+    filter = NULL; // Ownership transferred to the builder.
+    // Set paimon_vector_search_builder_with_options here if the query needs it.
+
+    paimon_result_vector_scan scanned = paimon_vector_search_builder_new_scan(builder);
+    scan = scanned.scan;
+    VECTOR_TRY(scanned.error);
+    paimon_result_vector_read reading = paimon_vector_search_builder_new_read(builder);
+    read = reading.read;
+    VECTOR_TRY(reading.error);
+
+    paimon_result_vector_plan planned = paimon_vector_scan_plan_from_bucket_splits(
+        scan, (const paimon_bucket_vector_search_split *const *)splits, split_count);
+    plan = planned.plan;
+    VECTOR_TRY(planned.error);
+
+    // Plan construction copied the metadata and did not consume the handles.
+    for (size_t i = 0; i < split_count; ++i) {
+        paimon_bucket_vector_search_split_free(splits[i]);
+        splits[i] = NULL;
+    }
+    paimon_vector_scan_free(scan);
+    scan = NULL;
+    paimon_vector_search_builder_free(builder);
+    builder = NULL;
+
+    paimon_result_record_batch_reader searched = paimon_vector_read_read(read, plan);
+    reader = searched.reader;
+    VECTOR_TRY(searched.error);
+    // The returned stream owns what it needs, independently of these handles.
+    paimon_vector_read_free(read);
+    read = NULL;
+    paimon_vector_plan_free(plan);
+    plan = NULL;
+
+    for (;;) {
+        paimon_result_next_batch next = paimon_record_batch_reader_next(reader);
+        VECTOR_TRY(next.error);
+        if (next.batch.array == NULL && next.batch.schema == NULL) break;
+        int consumed = consume_batch(context, next.batch);
+        paimon_arrow_batch_free(next.batch);
+        if (consumed != 0) goto cleanup;
+    }
+    status = 0;
+
+cleanup:
+    if (error != NULL) {
+        fprintf(stderr, "Paimon error %d: ", error->code);
+        fwrite(error->message.data, 1, error->message.len, stderr);
+        fputc('\n', stderr);
+        paimon_error_free(error);
+    }
+    paimon_record_batch_reader_free(reader);
+    paimon_vector_read_free(read);
+    paimon_vector_plan_free(plan);
+    paimon_vector_scan_free(scan);
+    paimon_vector_search_builder_free(builder);
+    paimon_predicate_free(filter);
+    if (splits != NULL) {
+        for (size_t i = 0; i < split_count; ++i) {
+            paimon_bucket_vector_search_split_free(splits[i]);
+        }
+        free(splits);
+    }
+    return status;
+}
+
+#undef VECTOR_TRY
+```
+
+Compile the helper as C and declare it with C linkage in the native worker.
+When including the generated C header directly from C++, wrap the include
+in `extern "C" { ... }` or generate a C++-compatible C header with
+`cbindgen bindings/c --lang c --cpp-compat --output target/release/paimon.h`.
+Replace the sample stderr reporting with the application's error handling as needed.
+
+Each call returns up to `top_k` rows across all splits supplied to that call,
+in relevance order, with the requested user columns and a `FLOAT32`
+`__paimon_search_score` column. Higher scores rank first, including for L2 (the
+score is `1 / (1 + squared_distance)`, not the raw distance). The caller must merge
+the results from its disjoint assignments and apply the final global Top-K.
+Include the primary-key columns in the projection if the coordinator needs
+them for row identity. This merge retains the configured search mode's ANN/exact
+semantics; it does not make ANN search exact.
+
+All splits in a plan must come from one table, branch and snapshot, with at most
+one split per `(partition, bucket)`. Mixed snapshot IDs and repeated buckets are
+rejected. The caller is responsible for keeping the table/branch metadata paired
+with the buffers and for avoiding duplicate assignments across workers. An empty
+Java plan means no work; skip native plan construction. Supplied file-local row
+ranges remain authoritative and are intersected with any native residual filter.
+
+For repeated queries over the same assignment, retain `paimon_vector_plan` and
+create another reader with the new query/limit instead of decoding again. Readers
+must use the same table, branch, vector column and pre-filter as the plan.
+Changing a builder after `new_read` does not change an already-created reader.
+
 ## Writing and Committing
 
 Writing uses a **write-then-commit** flow:

@@ -31,7 +31,6 @@ use crate::table::ArrowRecordBatchStream;
 use crate::table::RowRange;
 use crate::{DataSplit, Error};
 use arrow_array::{Array, Int64Array, RecordBatch};
-use arrow_cast::cast;
 
 use async_stream::try_stream;
 use futures::StreamExt;
@@ -457,25 +456,31 @@ impl DataFileReader {
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
         let is_row_file = is_row_file(&file_meta);
 
-        // Compute index mapping and determine which columns to read from the file.
-        let (projected_read_fields, index_mapping) = if let Some(ref df) = data_fields {
-            let mapping = create_index_mapping(&read_type, df);
-            let fields_to_read = read_data_fields(df, &read_type)?;
-            (fields_to_read, mapping)
+        // What the reader is asked for.
+        let projected_read_fields: Vec<DataField> = if let Some(ref df) = data_fields {
+            read_data_fields(df, &read_type)?
         } else {
-            (
-                read_type
-                    .iter()
-                    .filter(|field| field.name() != ROW_ID_FIELD_NAME)
-                    .cloned()
-                    .collect(),
-                None,
-            )
+            read_type
+                .iter()
+                .filter(|field| field.name() != ROW_ID_FIELD_NAME)
+                .cloned()
+                .collect()
         };
         let format_read_fields = if is_row_file {
             file_fields.clone()
         } else {
             projected_read_fields
+        };
+        // The decoded batch is described by `format_read_fields`, so map
+        // `read_type` onto *that* list: its entries carry the types the columns
+        // actually come back as, which is what reconciling them needs.
+        let (index_mapping, source_fields) = if data_fields.is_some() {
+            (
+                create_index_mapping(&read_type, &format_read_fields),
+                Some(format_read_fields.clone()),
+            )
+        } else {
+            (None, None)
         };
 
         // Remap predicates from table-level to file-level indices.
@@ -580,49 +585,40 @@ impl DataFileReader {
                         continue;
                     }
 
-                    let source_col = if let Some(ref idx_map) = index_mapping {
+                    // The field the decoded column comes from: through the
+                    // field-ID mapping under schema evolution, else by id against
+                    // the table schema (`read_type` may be a nested projection of
+                    // it; system fields stand for themselves).
+                    let source_field: Option<&DataField> = if let Some(ref idx_map) = index_mapping
+                    {
                         let data_idx = idx_map[i];
                         if data_idx == NULL_FIELD_INDEX {
                             None
                         } else {
-                            let data_field = &data_fields.as_ref().unwrap()[data_idx as usize];
-                            batch_schema
-                                .index_of(data_field.name())
-                                .ok()
-                                .map(|col_idx| batch.column(col_idx))
+                            Some(&source_fields.as_ref().unwrap()[data_idx as usize])
                         }
-                    } else if let Some(ref df) = data_fields {
-                        batch_schema
-                            .index_of(df[i].name())
-                            .ok()
-                            .map(|col_idx| batch.column(col_idx))
+                    } else if let Some(ref df) = source_fields {
+                        Some(&df[i])
                     } else {
+                        Some(
+                            table_fields
+                                .iter()
+                                .find(|f| f.id() == read_type[i].id())
+                                .unwrap_or(&read_type[i]),
+                        )
+                    };
+                    let source_col = source_field.and_then(|f| {
                         batch_schema
-                            .index_of(target_field.name())
+                            .index_of(f.name())
                             .ok()
                             .map(|col_idx| batch.column(col_idx))
-                    };
+                    });
 
-                    match source_col {
-                        Some(col) => {
-                            if col.data_type() == target_field.data_type() {
-                                columns.push(col.clone());
-                            } else {
-                                let casted = cast(col, target_field.data_type()).map_err(|e| {
-                                    Error::UnexpectedError {
-                                        message: format!(
-                                            "Failed to cast column '{}' from {:?} to {:?}: {e}",
-                                            target_field.name(),
-                                            col.data_type(),
-                                            target_field.data_type()
-                                        ),
-                                        source: Some(Box::new(e)),
-                                    }
-                                })?;
-                                columns.push(casted);
-                            }
+                    match (source_col, source_field) {
+                        (Some(col), Some(source_field)) => {
+                            columns.push(reconcile_column(col, source_field, &read_type[i])?);
                         }
-                        None => {
+                        _ => {
                             let null_array = arrow_array::new_null_array(target_field.data_type(), num_rows);
                             columns.push(null_array);
                         }
@@ -726,25 +722,31 @@ impl DataFileReader {
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
         let is_row_file = is_row_file(&file_meta);
 
-        // Compute index mapping and determine which columns to read from the file.
-        let (projected_read_fields, index_mapping) = if let Some(ref df) = data_fields {
-            let mapping = create_index_mapping(&read_type, df);
-            let fields_to_read = read_data_fields(df, &read_type)?;
-            (fields_to_read, mapping)
+        // What the reader is asked for.
+        let projected_read_fields: Vec<DataField> = if let Some(ref df) = data_fields {
+            read_data_fields(df, &read_type)?
         } else {
-            (
-                read_type
-                    .iter()
-                    .filter(|field| field.name() != ROW_ID_FIELD_NAME)
-                    .cloned()
-                    .collect(),
-                None,
-            )
+            read_type
+                .iter()
+                .filter(|field| field.name() != ROW_ID_FIELD_NAME)
+                .cloned()
+                .collect()
         };
         let format_read_fields = if is_row_file {
             file_fields.clone()
         } else {
             projected_read_fields
+        };
+        // The decoded batch is described by `format_read_fields`, so map
+        // `read_type` onto *that* list: its entries carry the types the columns
+        // actually come back as, which is what reconciling them needs.
+        let (index_mapping, source_fields) = if data_fields.is_some() {
+            (
+                create_index_mapping(&read_type, &format_read_fields),
+                Some(format_read_fields.clone()),
+            )
+        } else {
+            (None, None)
         };
 
         // Remap predicates from table-level to file-level indices.
@@ -799,14 +801,42 @@ impl DataFileReader {
                 let result = project_file_batch(
                     &batch,
                     &target_schema,
+                    &read_type,
+                    &table_fields,
                     index_mapping.as_deref(),
-                    data_fields.as_deref(),
+                    source_fields.as_deref(),
                 )?;
                 yield result;
             }
         }
         .boxed())
     }
+}
+
+/// Reconcile one decoded column with the read schema's type for it.
+///
+/// Delegates to [`crate::arrow::nested_evolution::evolve_column`], which returns
+/// the column untouched when the types already agree, walks ROW / ARRAY / MAP to
+/// NULL-fill nested fields the data file predates, and otherwise casts.
+fn reconcile_column(
+    col: &Arc<dyn Array>,
+    source_field: &DataField,
+    target_field: &DataField,
+) -> crate::Result<Arc<dyn Array>> {
+    crate::arrow::nested_evolution::evolve_column(
+        col,
+        source_field.data_type(),
+        target_field.data_type(),
+    )
+    .map_err(|e| Error::UnexpectedError {
+        message: format!(
+            "Failed to reconcile column '{}' read as {:?} with read type {:?}",
+            target_field.name(),
+            col.data_type(),
+            target_field.data_type()
+        ),
+        source: Some(Box::new(e)),
+    })
 }
 
 /// Project one decoded file `batch` onto `target_schema`, resolving each target
@@ -818,56 +848,44 @@ impl DataFileReader {
 fn project_file_batch(
     batch: &RecordBatch,
     target_schema: &Arc<arrow_schema::Schema>,
+    read_type: &[DataField],
+    table_fields: &[DataField],
     index_mapping: Option<&[i32]>,
-    data_fields: Option<&[DataField]>,
+    source_fields: Option<&[DataField]>,
 ) -> crate::Result<RecordBatch> {
     let num_rows = batch.num_rows();
     let batch_schema = batch.schema();
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(target_schema.fields().len());
     for (i, target_field) in target_schema.fields().iter().enumerate() {
-        let source_col = if let Some(idx_map) = index_mapping {
+        let source_field: Option<&DataField> = if let Some(idx_map) = index_mapping {
             let data_idx = idx_map[i];
             if data_idx == NULL_FIELD_INDEX {
                 None
             } else {
-                let data_field = &data_fields.unwrap()[data_idx as usize];
-                batch_schema
-                    .index_of(data_field.name())
-                    .ok()
-                    .map(|col_idx| batch.column(col_idx))
+                Some(&source_fields.unwrap()[data_idx as usize])
             }
-        } else if let Some(df) = data_fields {
-            batch_schema
-                .index_of(df[i].name())
-                .ok()
-                .map(|col_idx| batch.column(col_idx))
+        } else if let Some(df) = source_fields {
+            Some(&df[i])
         } else {
+            Some(
+                table_fields
+                    .iter()
+                    .find(|f| f.id() == read_type[i].id())
+                    .unwrap_or(&read_type[i]),
+            )
+        };
+        let source_col = source_field.and_then(|f| {
             batch_schema
-                .index_of(target_field.name())
+                .index_of(f.name())
                 .ok()
                 .map(|col_idx| batch.column(col_idx))
-        };
+        });
 
-        match source_col {
-            Some(col) => {
-                if col.data_type() == target_field.data_type() {
-                    columns.push(col.clone());
-                } else {
-                    let casted = cast(col, target_field.data_type()).map_err(|e| {
-                        Error::UnexpectedError {
-                            message: format!(
-                                "Failed to cast column '{}' from {:?} to {:?}: {e}",
-                                target_field.name(),
-                                col.data_type(),
-                                target_field.data_type()
-                            ),
-                            source: Some(Box::new(e)),
-                        }
-                    })?;
-                    columns.push(casted);
-                }
+        match (source_col, source_field) {
+            (Some(col), Some(source_field)) => {
+                columns.push(reconcile_column(col, source_field, &read_type[i])?);
             }
-            None => {
+            _ => {
                 columns.push(arrow_array::new_null_array(
                     target_field.data_type(),
                     num_rows,
@@ -943,6 +961,13 @@ fn prune_data_type(read_type: &DataType, data_type: &DataType) -> crate::Result<
                 ))))
             }
         }
+        // ARRAY and MAP are deliberately NOT descended, even though Java's
+        // `pruneDataType` does: the pruned type is also what the Vortex reader is
+        // asked for, and it projects top-level columns only, then reinterprets a
+        // decoded nested struct against the requested Arrow type positionally, so
+        // a container pruned into read order would silently relabel its children.
+        // Nested containers are reconciled after decoding instead, by
+        // `arrow::nested_evolution::evolve_column`, which pairs by field id.
         _ => Ok(Some(data_type.clone())),
     }
 }
@@ -2413,6 +2438,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_file_index_narrowing_integer_schema_changes_preserve_query_results() {
+        use std::collections::HashMap;
+
+        use apache_avro::types::Value;
+        use arrow_array::Int8Array;
+
+        use crate::catalog::Identifier;
+        use crate::spec::TinyIntType;
+        use crate::table::{Table, TableRead};
+
+        let old_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("value", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let current_schema = old_schema
+            .apply_changes(vec![SchemaChange::update_column_type(
+                "value".to_string(),
+                DataType::TinyInt(TinyIntType::new()),
+            )])
+            .unwrap();
+        let avro_schema = apache_avro::Schema::parse_str(
+            r#"{"type":"record","name":"row","fields":[{"name":"value","type":["null","int"]}]}"#,
+        )
+        .unwrap();
+        for (case, values, expected_values) in [
+            ("overflow_only", vec![Some(383)], vec![None]),
+            (
+                "mixed",
+                vec![Some(127), Some(383), None],
+                vec![Some(127), None, None],
+            ),
+        ] {
+            let mut avro_writer = apache_avro::Writer::new(&avro_schema, Vec::new());
+            let mut index_writer = FileIndexerFactory::create_writer(
+                BITMAP_INDEX,
+                old_schema.fields()[0].data_type().clone(),
+                &Options::new(),
+            )
+            .unwrap();
+            for value in &values {
+                let (tag, avro_value) = match value {
+                    Some(value) => (1, Value::Int(*value)),
+                    None => (0, Value::Null),
+                };
+                avro_writer
+                    .append(Value::Record(vec![(
+                        "value".to_string(),
+                        Value::Union(tag, Box::new(avro_value)),
+                    )]))
+                    .unwrap();
+                index_writer.write(value.map(Datum::Int).as_ref()).unwrap();
+            }
+            let data = Bytes::from(avro_writer.into_inner().unwrap());
+            let indexes = HashMap::from([(
+                "value".to_string(),
+                HashMap::from([(
+                    BITMAP_INDEX.to_string(),
+                    Some(index_writer.serialized_bytes().unwrap()),
+                )]),
+            )]);
+            let index = write_column_indexes(&format!("memory:/narrowing_{case}_index"), indexes)
+                .await
+                .unwrap()
+                .to_input_file()
+                .read()
+                .await
+                .unwrap();
+
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let table_path = format!("memory:/file_index_narrowing_{case}");
+            let bucket_path = format!("{table_path}/bucket-0");
+            let file_name = "part-0.avro";
+            file_io
+                .new_output(&format!("{bucket_path}/{file_name}"))
+                .unwrap()
+                .write(data.clone())
+                .await
+                .unwrap();
+            let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+            let schema_path = schema_manager.schema_path(old_schema.id());
+            file_io
+                .mkdirs(schema_path.rsplit_once('/').unwrap().0)
+                .await
+                .unwrap();
+            file_io
+                .new_output(&schema_path)
+                .unwrap()
+                .write(Bytes::from(serde_json::to_vec(&old_schema).unwrap()))
+                .await
+                .unwrap();
+            let mut file = data_file(
+                file_name,
+                data.len() as i64,
+                values.len() as i64,
+                old_schema.id(),
+            );
+            file.embedded_index = Some(index.to_vec());
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(crate::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket_path)
+                .with_total_buckets(1)
+                .with_data_files(vec![file])
+                .build()
+                .unwrap();
+            let table = Table::new(
+                file_io,
+                Identifier::new("default", "narrowing"),
+                table_path,
+                current_schema.clone(),
+                None,
+            );
+            let builder = PredicateBuilder::new(current_schema.fields());
+            for (query, predicate, expected) in [
+                ("all", Predicate::AlwaysTrue, expected_values.clone()),
+                (
+                    "IS NULL",
+                    builder.is_null("value").unwrap(),
+                    expected_values
+                        .iter()
+                        .copied()
+                        .filter(Option::is_none)
+                        .collect(),
+                ),
+                (
+                    "IS NOT NULL",
+                    builder.is_not_null("value").unwrap(),
+                    expected_values
+                        .iter()
+                        .copied()
+                        .filter(Option::is_some)
+                        .collect(),
+                ),
+                (
+                    "= 127",
+                    builder.equal("value", Datum::TinyInt(127)).unwrap(),
+                    expected_values
+                        .iter()
+                        .copied()
+                        .filter(|value| *value == Some(127))
+                        .collect(),
+                ),
+            ] {
+                for enabled in [false, true] {
+                    let table = table.copy_with_options(HashMap::from([(
+                        "file-index.read.enabled".to_string(),
+                        enabled.to_string(),
+                    )]));
+                    let batches = TableRead::new(
+                        &table,
+                        current_schema.fields().to_vec(),
+                        vec![predicate.clone()],
+                    )
+                    .to_arrow(std::slice::from_ref(&split))
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                    let actual = batches
+                        .iter()
+                        .flat_map(|batch| {
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int8Array>()
+                                .unwrap()
+                                .iter()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, expected,
+                        "case={case}, query={query}, enabled={enabled}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_file_index_nested_not_with_added_column_falls_back() {
         let old_schema = TableSchema::new(
             0,
@@ -2860,5 +3068,48 @@ mod vector_parquet_tests {
             .downcast_ref::<Float32Array>()
             .expect("child should be Float32Array");
         assert_eq!(floats2.values(), &[3.0, 4.0]);
+    }
+}
+
+#[cfg(test)]
+mod prune_container_tests {
+    use super::*;
+    use crate::spec::{ArrayType, DataType, MapType, RowType, VarCharType};
+
+    fn f(id: i32, name: &str, dt: DataType) -> DataField {
+        DataField::new(id, name.to_string(), dt)
+    }
+
+    fn str_t() -> DataType {
+        DataType::VarChar(VarCharType::new(50).unwrap())
+    }
+
+    fn row(fields: Vec<DataField>) -> DataType {
+        DataType::Row(RowType::new(fields))
+    }
+
+    #[test]
+    fn keeps_an_array_element_type_verbatim() {
+        // Not descended on purpose — see the comment in `prune_data_type`: the
+        // Vortex reader would relabel a reordered container positionally. The
+        // element is reconciled after decoding instead.
+        let data = DataType::Array(ArrayType::new(row(vec![
+            f(2, "name", str_t()),
+            f(3, "lang", str_t()),
+        ])));
+        let read = DataType::Array(ArrayType::new(row(vec![f(3, "lang", str_t())])));
+
+        assert_eq!(prune_data_type(&read, &data).unwrap().unwrap(), data);
+    }
+
+    #[test]
+    fn keeps_a_map_value_type_verbatim() {
+        let data = DataType::Map(MapType::new(
+            str_t(),
+            row(vec![f(5, "v", str_t()), f(6, "unit", str_t())]),
+        ));
+        let read = DataType::Map(MapType::new(str_t(), row(vec![f(5, "v", str_t())])));
+
+        assert_eq!(prune_data_type(&read, &data).unwrap().unwrap(), data);
     }
 }

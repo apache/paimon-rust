@@ -35,3 +35,25 @@ pub(crate) fn data_invalid(message: impl Into<String>) -> crate::Error {
         source: None,
     }
 }
+
+/// Per-file physical row ranges, matching Java `rowRangesByFile`.
+/// Missing entries impose no restriction; an empty list excludes the file.
+/// Non-empty lists contain sorted, merged, inclusive ranges. Engine-planned
+/// ranges stay compact, and residual predicates produce the same representation.
+pub(crate) type RowRangesByFile = std::collections::HashMap<String, Vec<crate::table::RowRange>>;
+
+/// Test a physical position against sorted, non-overlapping ranges without
+/// expanding them, as in Java's PK vector readers.
+pub(crate) fn contains_row_position(ranges: &[crate::table::RowRange], position: i64) -> bool {
+    ranges
+        .binary_search_by(|range| {
+            if position < range.from() {
+                std::cmp::Ordering::Greater
+            } else if position > range.to() {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}

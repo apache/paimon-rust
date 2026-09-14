@@ -112,6 +112,67 @@ fn trace_manifest_counts(plan_text: &str) -> (usize, usize) {
     (after, before)
 }
 
+/// `NOT IN` must prune a data file whose min and max are both a forbidden
+/// literal, and must not change what the query returns. Each INSERT here writes
+/// one file holding a single distinct value, so `value NOT IN (20)` leaves the
+/// 20-only file with min == max == 20.
+#[tokio::test]
+async fn test_scan_trace_records_not_in_data_stats_pruning() {
+    let (tmp, catalog) = common::create_test_env();
+    let sql_context = common::create_sql_context(catalog.clone()).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("CREATE TABLE paimon.test_db.trace_not_in (id INT, value INT)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for (id, value) in [(1, 10), (2, 20), (3, 30)] {
+        common::exec(
+            &sql_context,
+            &format!("INSERT INTO paimon.test_db.trace_not_in VALUES ({id}, {value})"),
+        )
+        .await;
+    }
+
+    let table = load_table(&catalog, "trace_not_in").await;
+    let fields = table.schema().fields();
+    let pb = PredicateBuilder::new(fields);
+
+    let (_plan, all_trace) = table
+        .new_read_builder()
+        .new_scan()
+        .plan_with_trace()
+        .await
+        .unwrap();
+    assert_eq!(all_trace.final_files, 3);
+
+    let mut reader = table.new_read_builder();
+    reader.with_filter(pb.is_not_in("value", vec![Datum::Int(20)]).unwrap());
+    let (_not_in_plan, not_in_trace) = reader.new_scan().plan_with_trace().await.unwrap();
+
+    assert_eq!(
+        not_in_trace.manifest_entries_pruned_by_data_stats, 1,
+        "the file holding only 20 should be pruned: {not_in_trace:?}"
+    );
+    assert_eq!(not_in_trace.final_files, 2);
+
+    let rows = common::collect_id_value(
+        &sql_context,
+        "SELECT id, value FROM paimon.test_db.trace_not_in WHERE value NOT IN (20) ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows, vec![(1, 10), (3, 30)]);
+    drop(tmp);
+}
+
 #[tokio::test]
 async fn test_scan_trace_records_partition_pruning() {
     let (_tmp, catalog) = setup_trace_table().await;
@@ -300,4 +361,77 @@ async fn test_physical_plan_displays_scan_trace_summary() {
         plan_text.contains("trace=") && plan_text.contains("splits_before_limit="),
         "physical plan should include scan trace summary:\n{plan_text}"
     );
+}
+
+/// Equality-based negative pruning must fail open for FLOAT and DOUBLE. Two
+/// files here are exactly the shapes the writer produces for the two ways the
+/// rule breaks: `[1.0, NaN]` reports `min == max == 1.0` over two rows because
+/// NaN goes into neither min/max nor the null count, and a file holding only
+/// `-0.0` reports `min = -0.0, max = 0.0`, which `Datum` sees as equal to `0.0`
+/// while the row-level filter does not. Pruning either file drops a row the
+/// filter would have returned.
+#[tokio::test]
+async fn test_not_equal_keeps_float_files_with_nan_or_signed_zero() {
+    let (_tmp, catalog) = common::create_test_env();
+    let sql_context = common::create_sql_context(catalog.clone()).await;
+    sql_context
+        .sql("CREATE SCHEMA paimon.test_db")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("CREATE TABLE paimon.test_db.trace_float (id INT, d DOUBLE)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    common::exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.trace_float VALUES \
+         (1, CAST(1.0 AS DOUBLE)), (2, CAST('NaN' AS DOUBLE))",
+    )
+    .await;
+    common::exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.trace_float VALUES (3, CAST(-0.0 AS DOUBLE))",
+    )
+    .await;
+
+    for (sql, expected) in [
+        // The NaN row satisfies `<> 1.0`; pruning the file used to drop it.
+        (
+            "SELECT id FROM paimon.test_db.trace_float WHERE d <> 1.0 ORDER BY id",
+            vec![2, 3],
+        ),
+        // `-0.0` is not `0.0` to the filter, so row 3 survives; rows 1 and 2 are
+        // kept as well because `1.0 <> 0.0` and NaN is not `0.0` either.
+        (
+            "SELECT id FROM paimon.test_db.trace_float WHERE d <> 0.0 ORDER BY id",
+            vec![1, 2, 3],
+        ),
+        (
+            "SELECT id FROM paimon.test_db.trace_float WHERE d NOT IN (1.0, 2.0) ORDER BY id",
+            vec![2, 3],
+        ),
+    ] {
+        let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column_by_name("id")
+                .and_then(|c| {
+                    c.as_any()
+                        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                })
+                .expect("id column");
+            for row in 0..column.len() {
+                ids.push(column.value(row));
+            }
+        }
+        assert_eq!(ids, expected, "wrong rows for `{sql}`");
+    }
 }

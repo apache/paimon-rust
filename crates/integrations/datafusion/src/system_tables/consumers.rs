@@ -51,7 +51,7 @@ fn consumers_schema() -> SchemaRef {
 }
 
 #[derive(Debug)]
-struct ConsumersTable {
+pub(super) struct ConsumersTable {
     table: Table,
 }
 

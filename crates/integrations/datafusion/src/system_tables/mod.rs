@@ -97,6 +97,26 @@ pub(crate) fn is_registered(name: &str) -> bool {
 }
 
 /// Wraps an already-loaded base table as the system table `name`.
+/// Does `provider` serve one of the [`TABLES`] above?
+///
+/// By type, not by the `base$name` spelling — another engine may name a table
+/// with a `$`. Keep in step with `TABLES`: one missing here goes back to
+/// having its time-travel clause silently dropped.
+pub(crate) fn is_system_table_provider(provider: &dyn TableProvider) -> bool {
+    provider.is::<branches::BranchesTable>()
+        || provider.is::<consumers::ConsumersTable>()
+        || provider.is::<files::FilesTable>()
+        || provider.is::<manifests::ManifestsTable>()
+        || provider.is::<options::OptionsTable>()
+        || provider.is::<partitions::PartitionsTable>()
+        || provider.is::<physical_files_size::PhysicalFilesSizeTable>()
+        || provider.is::<referenced_files_size::ReferencedFilesSizeTable>()
+        || provider.is::<schemas::SchemasTable>()
+        || provider.is::<snapshots::SnapshotsTable>()
+        || provider.is::<table_indexes::TableIndexesTable>()
+        || provider.is::<tags::TagsTable>()
+}
+
 fn wrap_to_system_table(name: &str, base_table: Table) -> Option<DFResult<Arc<dyn TableProvider>>> {
     TABLES
         .iter()

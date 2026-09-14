@@ -41,7 +41,13 @@ impl ResourcePaths {
         let base_path = if prefix.is_empty() {
             format!("/{}", Self::V1)
         } else {
-            format!("/{}/{}", Self::V1, prefix.trim_matches('/'))
+            // Encode the prefix, as Java's `ResourcePaths` constructor does: it is
+            // server-supplied, and a raw `/`, `?` or `#` would restructure the URL.
+            format!(
+                "/{}/{}",
+                Self::V1,
+                RESTUtil::encode_string(prefix.trim_matches('/'))
+            )
         };
         ResourcePaths { base_path }
     }
@@ -216,6 +222,27 @@ impl ResourcePaths {
             Self::PARTITIONS
         )
     }
+
+    /// Get the endpoint path for dropping table partitions.
+    pub fn drop_partitions(&self, database_name: &str, table_name: &str) -> String {
+        format!("{}/drop", self.partitions(database_name, table_name))
+    }
+
+    /// Get the endpoint path for looking up table partitions by their specs.
+    pub fn list_partitions_by_names(&self, database_name: &str, table_name: &str) -> String {
+        format!(
+            "{}/list-by-names",
+            self.partitions(database_name, table_name)
+        )
+    }
+
+    /// Get the endpoint path for listing table partitions matching a predicate.
+    pub fn list_partitions_by_filter(&self, database_name: &str, table_name: &str) -> String {
+        format!(
+            "{}/list-by-filter",
+            self.partitions(database_name, table_name)
+        )
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +263,18 @@ mod tests {
         assert_eq!(
             paths.database("test-db"),
             "/v1/my-catalog/databases/test-db"
+        );
+    }
+
+    #[test]
+    fn test_resource_paths_encodes_prefix() {
+        assert_eq!(
+            ResourcePaths::new("clg=paimon").databases(),
+            "/v1/clg%3Dpaimon/databases"
+        );
+        assert_eq!(
+            ResourcePaths::new("clg&paimon").databases(),
+            "/v1/clg%26paimon/databases"
         );
     }
 
@@ -294,6 +333,15 @@ mod tests {
         assert_eq!(
             paths.function("analytics", "rectangle area"),
             "/v1/catalog/databases/analytics/functions/rectangle+area"
+        );
+    }
+
+    #[test]
+    fn test_drop_partitions_path_encodes_names() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.drop_partitions("analytics db", "user events"),
+            "/v1/catalog/databases/analytics+db/tables/user+events/partitions/drop"
         );
     }
 }

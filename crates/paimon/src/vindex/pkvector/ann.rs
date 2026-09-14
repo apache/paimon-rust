@@ -25,6 +25,7 @@ use super::bucket::BucketAnnSegment;
 use super::data_invalid;
 use super::metric::{java_float_compare, VectorSearchMetric};
 use super::result::PkVectorSearchResult;
+use super::{contains_row_position, RowRangesByFile};
 use crate::deletion_vector::DeletionVector;
 use crate::spec::{
     PrimaryKeyIndexSourceFile as PkVectorSourceFile,
@@ -42,21 +43,60 @@ use crate::vindex::range_reader::VindexFileReader;
 /// longer readable in this snapshot). Deletion vectors are applied only to active
 /// sources.
 ///
-/// `residual_ranges` (when `Some`) restricts each source file to the physical row
-/// positions allowed by a residual predicate on the data columns: `key = file
-/// name`, `value = allowed physical positions`. A file with no entry (or an empty
-/// entry) has no allowed rows and contributes nothing. When `residual_ranges` is
-/// `Some`, a mask is always required (the residual can only narrow the live set),
-/// so the result is always `Some`. Mirrors Java `rowRangesByFile`.
+/// The most live row ids one ANN segment's mask may hold.
 ///
-/// Returns `None` only when there is no residual, every source file is active, AND
-/// no deletion vector is relevant — nothing to mask. Otherwise returns the masked
-/// live ids.
+/// Mirrors Java `LuminaVectorGlobalIndexReader.toScopedIds`, which refuses an
+/// include-set above `Integer.MAX_VALUE` before allocating the dense array the
+/// backend is handed. The number is Paimon's own for this exact quantity at this
+/// exact seam, not one picked here.
+///
+/// The limit is on what goes INTO the mask, charged before each insertion, so
+/// nothing is ever allocated for a span that could not be handed over anyway. That
+/// is what makes it a bound rather than a complaint: on the bucket-split route the
+/// source row counts arrive on the wire (`PrimaryKeyIndexSourceMeta` is decoded from
+/// the split's own `GlobalIndexMeta`, and only its sign is checked), and once
+/// anything makes a mask necessary an unrestricted file is inserted wholesale at
+/// whatever size that count claims -- `i64::MAX` never returns.
+///
+/// Because it counts insertions, a segment that CLAIMS an impossible number of rows
+/// but puts few or none in the mask -- all sources inactive, an explicitly empty
+/// selection, a narrow range -- is not turned away. It is marginally stricter than
+/// Java in one direction: Java checks the set after subtracting deletion vectors,
+/// while the allocation being bounded here happens as rows go in.
+const MAX_LIVE_ROW_IDS: u64 = i32::MAX as u64;
+
+/// Charge `rows` against what is left of [`MAX_LIVE_ROW_IDS`], before they are
+/// inserted.
+fn charge_live_rows(remaining: &mut u64, rows: u64) -> crate::Result<()> {
+    *remaining = remaining.checked_sub(rows).ok_or_else(|| {
+        data_invalid(format!(
+            "vector search would filter more than {MAX_LIVE_ROW_IDS} live rows in one \
+             ANN segment"
+        ))
+    })?;
+    Ok(())
+}
+
+/// `row_ranges_by_file` restricts each source file to the rows a pre-filter allows,
+/// keyed by data-file name. A file with **no entry is unrestricted**, an empty
+/// entry excludes it, and a non-empty one limits it — see [`RowRangesByFile`].
+/// Mirrors Java `rowRangesByFile`.
+///
+/// Returns `None` when nothing is restricted, every source file is active, AND no
+/// deletion vector is relevant — nothing to mask, so the ANN backend searches
+/// unfiltered. Otherwise returns the masked live ids.
+///
+/// Java's condition is `allSourcesActive && deletionVectors.isEmpty() &&
+/// rowRangesByFile.isEmpty()`. The selections half is mirrored exactly (whole-map,
+/// not this segment's own files). The deletion-vector half is NOT: ours is
+/// segment-local, so a deletion vector on a file this segment does not index leaves
+/// it unfiltered where Java would mask it. That predates the bucket-split route and
+/// applies to the manifest route too.
 pub(crate) fn build_live_row_ids(
     source_files: &[PkVectorSourceFile],
     active_source_files: &HashSet<String>,
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
-    residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+    row_ranges_by_file: Option<&RowRangesByFile>,
 ) -> crate::Result<Option<roaring::RoaringTreemap>> {
     let all_active = source_files
         .iter()
@@ -64,13 +104,20 @@ pub(crate) fn build_live_row_ids(
     let has_relevant_dv = source_files
         .iter()
         .any(|f| deletion_vectors.contains_key(f.file_name()));
-    if residual_ranges.is_none() && all_active && !has_relevant_dv {
+    // Java's own condition, `rowRangesByFile.isEmpty()`, over the whole bucket-level
+    // map. Narrowing it to "no entry for one of THIS segment's sources" would leave
+    // more segments unfiltered, but it also changes which backend entry point they
+    // take (`search` vs `search_with_filter`), and those can differ in recall. Not
+    // worth diverging for.
+    let nothing_restricted = row_ranges_by_file.is_none_or(RowRangesByFile::is_empty);
+    if nothing_restricted && all_active && !has_relevant_dv {
         return Ok(None);
     }
 
     let mut live = roaring::RoaringTreemap::new();
     let mut deleted = roaring::RoaringTreemap::new();
     let mut file_offset: u64 = 0;
+    let mut budget = MAX_LIVE_ROW_IDS;
     for source_file in source_files {
         let row_count = u64::try_from(source_file.row_count())
             .map_err(|_| data_invalid("vector source row count must not be negative"))?;
@@ -79,41 +126,41 @@ pub(crate) fn build_live_row_ids(
             .ok_or_else(|| data_invalid("vector source row counts overflow u64"))?;
         let active = active_source_files.contains(source_file.file_name());
         if active && row_count > 0 {
-            match residual_ranges {
-                // No residual: the whole active file range is live.
+            match row_ranges_by_file.and_then(|selections| selections.get(source_file.file_name()))
+            {
+                // Unrestricted: the whole active file range is live. This is the
+                // no-entry case Java spells as `rowRanges == null`.
                 None => {
+                    charge_live_rows(&mut budget, row_count)?;
                     live.insert_range(file_offset..end);
                 }
-                // Residual present: only allowed physical positions of this file
-                // become live, mapped into global ordinal space (position +
-                // file_offset). A missing/empty entry allows no rows.
+                // Restricted to intervals. Added interval-wise, never position-wise:
+                // these bounds ride in on an engine-supplied split, so walking them
+                // would be unbounded work driven by untrusted numbers. Mirrors Java
+                // `live.addRange(range.addOffset(fileOffset))`.
                 Some(ranges) => {
-                    if let Some(allowed) = ranges.get(source_file.file_name()) {
-                        // A producer that restricts only some files leaves the rest
-                        // unrestricted, and an adapter has to spell that out as an
-                        // explicit whole-file allow-list. Insert it as one range
-                        // rather than walking every position, which would cost one
-                        // insert per row of the file. `len` plus a maximum of
-                        // `row_count - 1` can only describe the full set, and it
-                        // subsumes the per-position bound check below.
-                        if allowed.len() == row_count && allowed.max() == Some(row_count - 1) {
-                            live.insert_range(file_offset..end);
-                        } else {
-                            for position in allowed.iter() {
-                                if position >= row_count {
-                                    return Err(data_invalid(format!(
-                                        "residual position {position} is out of range for source file {} ({} rows)",
-                                        source_file.file_name(),
-                                        row_count
-                                    )));
-                                }
-                                let global =
-                                    file_offset.checked_add(position).ok_or_else(|| {
-                                        data_invalid("vector residual position overflows u64")
-                                    })?;
-                                live.insert(global);
-                            }
+                    for range in ranges {
+                        // Java checks each range against the SOURCE file's row count.
+                        // On the bucket-split route that count came off the wire as
+                        // well (`PrimaryKeyIndexSourceMeta` is decoded from the
+                        // split's own `GlobalIndexMeta`), so this rejects a range
+                        // that disagrees with its own segment -- it is not a
+                        // resource bound.
+                        let from = u64::try_from(range.from()).map_err(|_| {
+                            data_invalid("vector pre-filter range bound must not be negative")
+                        })?;
+                        let to = u64::try_from(range.to()).map_err(|_| {
+                            data_invalid("vector pre-filter range bound must not be negative")
+                        })?;
+                        if to >= row_count {
+                            return Err(data_invalid(format!(
+                                "pre-filter range [{from}, {to}] is out of range for source file {} ({} rows)",
+                                source_file.file_name(),
+                                row_count
+                            )));
                         }
+                        charge_live_rows(&mut budget, to - from + 1)?;
+                        live.insert_range((file_offset + from)..=(file_offset + to));
                     }
                 }
             }
@@ -121,6 +168,18 @@ pub(crate) fn build_live_row_ids(
         if active {
             if let Some(dv) = deletion_vectors.get(source_file.file_name()) {
                 for position in dv.iter() {
+                    // Bound the position against ITS OWN source file, as the residual
+                    // path above already does. Source files share one ordinal space
+                    // (`global = file_offset + position`), so a position past this
+                    // file's rows does not fall out of the mask -- it lands inside the
+                    // NEXT source file's range and deletes one of that file's rows.
+                    if position >= row_count {
+                        return Err(data_invalid(format!(
+                            "deleted position {position} is out of range for source file {} ({} rows)",
+                            source_file.file_name(),
+                            row_count
+                        )));
+                    }
                     let global = file_offset.checked_add(position).ok_or_else(|| {
                         data_invalid("vector source deleted position overflows u64")
                     })?;
@@ -144,7 +203,7 @@ pub(crate) fn map_ann_results(
     source_meta: &PkVectorSourceMeta,
     active_source_files: &HashSet<String>,
     deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
-    residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+    row_ranges_by_file: Option<&RowRangesByFile>,
     metric: VectorSearchMetric,
 ) -> crate::Result<Vec<PkVectorSearchResult>> {
     let mut results = Vec::with_capacity(scored.len());
@@ -166,11 +225,13 @@ pub(crate) fn map_ann_results(
                 )));
             }
         }
-        if let Some(ranges) = residual_ranges {
-            let allowed = ranges.get(&data_file_name).is_some_and(|r| r.contains(pos));
-            if !allowed {
+        // A file with no entry is unrestricted, so only an entry can reject.
+        if let Some(selection) =
+            row_ranges_by_file.and_then(|selections| selections.get(&data_file_name))
+        {
+            if !contains_row_position(selection, row_position) {
                 return Err(data_invalid(format!(
-                    "ANN segment returned row position {row_position} in {data_file_name} outside the residual pre-filter"
+                    "ANN segment returned row position {row_position} in {data_file_name} outside the row selection for that file"
                 )));
             }
         }
@@ -214,8 +275,8 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
 
     /// Search one ANN segment for a batch of query vectors, returning one
     /// BEST_FIRST result list per query (outer index aligned to `queries`). The
-    /// live-row mask (residual ∩ DV) is query-independent, so it is built once and
-    /// shared across all queries; only the per-query scores differ. Buffered callers
+    /// live-row mask (selections ∩ DV) is query-independent, so it is built once and
+    /// then cloned into each query; only the per-query scores differ. Buffered callers
     /// pass the bytes from `load_segment` by value so they cannot outlive the leaf.
     #[allow(clippy::too_many_arguments)]
     fn search_batch(
@@ -228,7 +289,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>>;
 
     #[allow(clippy::too_many_arguments)]
@@ -242,7 +303,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
         match segment_source {
             AnnSegmentSource::Buffered(bytes) => self.search_batch(
@@ -254,7 +315,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
                 active_source_files,
                 deletion_vectors,
                 search_options,
-                residual_ranges,
+                row_ranges_by_file,
             ),
             AnnSegmentSource::Vindex(_) => Err(data_invalid(
                 "ANN searcher does not support a range-backed segment source",
@@ -276,7 +337,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<PkVectorSearchResult>> {
         let mut results = self.search_batch(
             segment,
@@ -287,7 +348,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
             active_source_files,
             deletion_vectors,
             search_options,
-            residual_ranges,
+            row_ranges_by_file,
         )?;
         if results.len() != 1 {
             return Err(data_invalid(format!(
@@ -309,7 +370,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<PkVectorSearchResult>> {
         let mut results = self.search_batch_source(
             segment,
@@ -320,7 +381,7 @@ pub(crate) trait PkVectorAnnSearcher: Send + Sync {
             active_source_files,
             deletion_vectors,
             search_options,
-            residual_ranges,
+            row_ranges_by_file,
         )?;
         if results.len() != 1 {
             return Err(data_invalid(format!(
@@ -452,7 +513,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
         self.search_batch_source(
             segment,
@@ -463,7 +524,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
             active_source_files,
             deletion_vectors,
             search_options,
-            residual_ranges,
+            row_ranges_by_file,
         )
     }
 
@@ -477,20 +538,23 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
         active_source_files: &HashSet<String>,
         deletion_vectors: &HashMap<String, Arc<DeletionVector>>,
         search_options: &HashMap<String, String>,
-        residual_ranges: Option<&HashMap<String, roaring::RoaringTreemap>>,
+        row_ranges_by_file: Option<&RowRangesByFile>,
     ) -> crate::Result<Vec<Vec<PkVectorSearchResult>>> {
         if limit == 0 {
             return Err(data_invalid("vector search limit must be positive"));
         }
         let source_files = segment.source_meta.source_files();
         // The live-row mask depends only on the segment's sources, the active set,
-        // the deletion vectors, and the residual — none of which vary by query —
-        // so it is built once and shared across every query's search.
+        // the deletion vectors, and the selections — none of which vary by query —
+        // so it is BUILT once, then cloned into each query's search. Handing every
+        // query one `Arc` instead would save those clones, but it also moves a
+        // filtered search from Lumina's per-query scalar calls onto its native batch
+        // call; worth doing, not here.
         let live = build_live_row_ids(
             source_files,
             active_source_files,
             deletion_vectors,
-            residual_ranges,
+            row_ranges_by_file,
         )?;
         let mut searches = Vec::with_capacity(queries.len());
         for query in queries {
@@ -519,7 +583,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
                         &segment.source_meta,
                         active_source_files,
                         deletion_vectors,
-                        residual_ranges,
+                        row_ranges_by_file,
                         metric,
                     )?
                 }
@@ -534,6 +598,7 @@ impl PkVectorAnnSearcher for VindexAnnSearcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::RowRange;
     use roaring::RoaringBitmap;
 
     /// A trivial loader returning empty bytes — the synthetic scorers below ignore
@@ -564,6 +629,22 @@ mod tests {
         Arc::new(DeletionVector::from_bitmap(bitmap))
     }
 
+    /// Build the merged ranges a residual predicate hands to the search.
+    fn positions(at: &[u64]) -> Vec<RowRange> {
+        crate::table::merge_row_ranges(
+            at.iter()
+                .map(|&p| RowRange::new(p as i64, p as i64))
+                .collect(),
+        )
+    }
+
+    fn ranges(bounds: &[(i64, i64)]) -> Vec<RowRange> {
+        bounds
+            .iter()
+            .map(|&(from, to)| RowRange::new(from, to))
+            .collect()
+    }
+
     fn active_set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|n| (*n).to_string()).collect()
     }
@@ -582,6 +663,50 @@ mod tests {
         assert!(build_live_row_ids(&files, &active, &dvs, None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn an_empty_selection_map_leaves_the_ann_search_unfiltered() {
+        // The no-pre-filter shape: a Java split that narrowed nothing. Java returns
+        // null here (`rowRangesByFile.isEmpty()`), and the ANN backend then searches
+        // without a filter. Handing it an all-permitting mask instead costs an
+        // 8-byte id per live row and takes the filtered code path.
+        let files = [PkVectorSourceFile::new("f0".into(), 3).unwrap()];
+        let selections = HashMap::new();
+        assert!(
+            build_live_row_ids(
+                &files,
+                &active_set(&["f0"]),
+                &HashMap::new(),
+                Some(&selections)
+            )
+            .unwrap()
+            .is_none(),
+            "nothing is restricted, so nothing should be masked"
+        );
+    }
+
+    #[test]
+    fn a_source_file_no_one_restricted_stays_whole() {
+        // Java reads a missing entry as "every row of this file" and records one only
+        // for a file its pre-filter narrowed. f1 is narrowed, f0 is not, so f0 must
+        // stay whole rather than drop out of the search.
+        let files = vec![
+            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+        ];
+        let mut selections = HashMap::new();
+        selections.insert("f1".to_string(), positions(&[1]));
+        let live = build_live_row_ids(
+            &files,
+            &active_set(&["f0", "f1"]),
+            &HashMap::new(),
+            Some(&selections),
+        )
+        .unwrap()
+        .unwrap();
+        // f0 global 0,1,2 all live; f1 global 3,4 restricted to position 1 -> 4.
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 1, 2, 4]);
     }
 
     #[test]
@@ -710,7 +835,8 @@ mod tests {
                 move |_segment: &BucketAnnSegment, _bytes: Bytes, searches: &[VectorSearch]| {
                     let search = &searches[0];
                     *scorer_limit.lock().unwrap() = search.limit;
-                    *scorer_has_filter.lock().unwrap() = search.include_row_ids.is_some();
+                    *scorer_has_filter.lock().unwrap() =
+                        search.effective_include_row_ids().is_some();
                     let mut scores = HashMap::new();
                     scores.insert(3u64, 0.5f32); // -> (f1, 0)
                     scores.insert(0u64, 0.25f32); // -> (f0, 0), l2 dist 3.0
@@ -825,20 +951,14 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    fn treemap(positions: &[u64]) -> roaring::RoaringTreemap {
-        let mut t = roaring::RoaringTreemap::new();
-        for &p in positions {
-            t.insert(p);
-        }
-        t
-    }
-
     #[test]
     fn test_build_live_row_ids_residual_intersects_with_active_and_dv() {
         // f0 rows 0..3 (global 0,1,2), f1 rows 0..2 (global 3,4). Both active.
-        // dv on f0 deletes pos1 (global 1). residual allows f0={0,1}, f1 has no
-        // entry (empty allow). Result: f0 keeps {0} (1 is residual-allowed but
-        // deleted, 2 not residual-allowed); f1 contributes nothing.
+        // dv on f0 deletes pos1 (global 1). residual allows f0={0,1}; f1 has no
+        // entry, which is "unrestricted", so it keeps both its rows. Result: f0
+        // keeps {0} (1 is residual-allowed but deleted, 2 not residual-allowed),
+        // f1 keeps globals 3 and 4. (In production the residual producer registers
+        // every active file, so an absent one does not arise there.)
         let files = vec![
             PkVectorSourceFile::new("f0".into(), 3).unwrap(),
             PkVectorSourceFile::new("f1".into(), 2).unwrap(),
@@ -846,11 +966,11 @@ mod tests {
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1]));
         let mut residual = HashMap::new();
-        residual.insert("f0".to_string(), treemap(&[0, 1]));
+        residual.insert("f0".to_string(), positions(&[0, 1]));
         let live = build_live_row_ids(&files, &active_set(&["f0", "f1"]), &dvs, Some(&residual))
             .unwrap()
             .unwrap();
-        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0]);
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 3, 4]);
     }
 
     #[test]
@@ -864,8 +984,8 @@ mod tests {
         ];
         let active = active_set(&["f0", "f1"]);
         let mut residual = HashMap::new();
-        residual.insert("f0".to_string(), treemap(&[0, 1, 2]));
-        residual.insert("f1".to_string(), treemap(&[0, 1]));
+        residual.insert("f0".to_string(), positions(&[0, 1, 2]));
+        residual.insert("f1".to_string(), positions(&[0, 1]));
 
         let spelled_out = build_live_row_ids(&files, &active, &HashMap::new(), Some(&residual))
             .unwrap()
@@ -884,11 +1004,43 @@ mod tests {
         let mut dvs = HashMap::new();
         dvs.insert("f0".to_string(), dv(&[1]));
         let mut residual = HashMap::new();
-        residual.insert("f0".to_string(), treemap(&[0, 1, 2]));
+        residual.insert("f0".to_string(), positions(&[0, 1, 2]));
         let live = build_live_row_ids(&files, &active_set(&["f0"]), &dvs, Some(&residual))
             .unwrap()
             .unwrap();
         assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 2]);
+    }
+
+    #[test]
+    fn a_deletion_vector_position_past_its_own_file_is_refused() {
+        // f0 holds 3 rows (global 0,1,2) and f1 holds 2 (global 3,4). A deletion
+        // vector on f0 naming position 3 has no row of f0 to delete; without the
+        // bound it becomes global 0 + 3 = 3, which is f1's FIRST row. The mask would
+        // come back well-formed, having silently dropped a row of a different file.
+        let files = vec![
+            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+        ];
+        let mut dvs = HashMap::new();
+        dvs.insert("f0".to_string(), dv(&[3]));
+        let error = build_live_row_ids(&files, &active_set(&["f0", "f1"]), &dvs, None)
+            .map(|_| ())
+            .expect_err("a position past f0's rows names no row of f0");
+        assert!(
+            error
+                .to_string()
+                .contains("out of range for source file f0"),
+            "{error}"
+        );
+
+        // The last VALID position of f0 still deletes f0's own row, and f1 is
+        // untouched -- the bound is `>= row_count`, not one row tighter.
+        let mut dvs = HashMap::new();
+        dvs.insert("f0".to_string(), dv(&[2]));
+        let live = build_live_row_ids(&files, &active_set(&["f0", "f1"]), &dvs, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 1, 3, 4]);
     }
 
     #[test]
@@ -900,8 +1052,8 @@ mod tests {
             PkVectorSourceFile::new("f1".into(), 2).unwrap(),
         ];
         let mut residual = HashMap::new();
-        residual.insert("f0".to_string(), treemap(&[2]));
-        residual.insert("f1".to_string(), treemap(&[1]));
+        residual.insert("f0".to_string(), positions(&[2]));
+        residual.insert("f1".to_string(), positions(&[1]));
         let live = build_live_row_ids(
             &files,
             &active_set(&["f0", "f1"]),
@@ -919,7 +1071,7 @@ mod tests {
         // present, a mask is always required.
         let files = [PkVectorSourceFile::new("f0".into(), 3).unwrap()];
         let mut residual = HashMap::new();
-        residual.insert("f0".to_string(), treemap(&[0, 2]));
+        residual.insert("f0".to_string(), positions(&[0, 2]));
         let live = build_live_row_ids(
             &files,
             &active_set(&["f0"]),
@@ -937,7 +1089,7 @@ mod tests {
         // naming position 3 is out of range and must fail loud, not be skipped.
         let files = source_meta(&[("f0", 3)]);
         let mut residual = HashMap::new();
-        residual.insert("f0".to_string(), treemap(&[0, 3]));
+        residual.insert("f0".to_string(), positions(&[0, 3]));
         let err = build_live_row_ids(
             files.source_files(),
             &active_set(&["f0"]),
@@ -949,12 +1101,34 @@ mod tests {
     }
 
     #[test]
+    fn map_ann_results_accepts_a_hit_in_a_file_no_one_restricted() {
+        // The tri-state on the validation side: the map restricts f0, says nothing
+        // about f1, and a hit in f1 must be accepted. Reading f1's absence as "no
+        // rows" would turn every hit in an unrestricted sibling into an error.
+        let meta = source_meta(&[("f0", 3), ("f1", 5)]);
+        let mut selections = HashMap::new();
+        selections.insert("f0".to_string(), ranges(&[(0, 0)]));
+        let results = map_ann_results(
+            &[(3, 0.5)], // ordinal 3 -> (f1, 0)
+            &meta,
+            &active_set(&["f0", "f1"]),
+            &HashMap::new(),
+            Some(&selections),
+            VectorSearchMetric::L2,
+        )
+        .expect("a hit in an unrestricted file is allowed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].data_file_name, "f1");
+        assert_eq!(results[0].row_position, 0);
+    }
+
+    #[test]
     fn test_map_ann_results_rejects_hit_outside_residual_allow_list() {
         // ordinal 1 -> (f0, 1). Residual allows only {0} in f0, so a hit at position 1
         // (e.g. an ANN reader that ignored include_row_ids) must fail loud.
         let meta = source_meta(&[("f0", 3)]);
         let mut residual = HashMap::new();
-        residual.insert("f0".to_string(), treemap(&[0]));
+        residual.insert("f0".to_string(), positions(&[0]));
         let err = map_ann_results(
             &[(1u64, 0.5)],
             &meta,
@@ -964,7 +1138,7 @@ mod tests {
             VectorSearchMetric::L2,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("residual"));
+        assert!(err.to_string().contains("outside the row selection"));
     }
 
     #[test]
@@ -979,8 +1153,7 @@ mod tests {
             Box::new(
                 move |_segment: &BucketAnnSegment, _bytes: Bytes, searches: &[VectorSearch]| {
                     *scorer_rows.lock().unwrap() = searches[0]
-                        .include_row_ids
-                        .as_ref()
+                        .effective_include_row_ids()
                         .map(|t| t.iter().collect::<Vec<u64>>());
                     Ok(vec![None; searches.len()])
                 },
@@ -988,7 +1161,7 @@ mod tests {
         );
         let segment = BucketAnnSegment::for_test(source_meta(&[("f0", 3)]));
         let mut residual = HashMap::new();
-        residual.insert("f0".to_string(), treemap(&[0, 2]));
+        residual.insert("f0".to_string(), positions(&[0, 2]));
         searcher
             .search(
                 &segment,
@@ -1003,6 +1176,248 @@ mod tests {
             )
             .unwrap();
         assert_eq!(seen_rows.lock().unwrap().clone(), Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn the_no_prefilter_shape_reaches_the_backend_with_no_filter_at_all() {
+        // The backend-facing half of the no-pre-filter case. `include_row_ids` is
+        // what Lumina turns into a Vec<u64> of every live id and a filtered search;
+        // for a query that filters nothing it must stay unset, exactly as on the
+        // manifest route.
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let scorer_seen = Arc::clone(&seen);
+        let searcher = vindex_searcher(
+            "embedding",
+            Box::new(
+                move |_segment: &BucketAnnSegment, _bytes: Bytes, searches: &[VectorSearch]| {
+                    *scorer_seen.lock().unwrap() =
+                        Some(searches[0].effective_include_row_ids().is_some());
+                    Ok(vec![None; searches.len()])
+                },
+            ),
+        );
+        let segment = BucketAnnSegment::for_test(source_meta(&[("f0", 3)]));
+        let no_prefilter: RowRangesByFile = HashMap::new();
+        searcher
+            .search(
+                &segment,
+                Bytes::new(),
+                &[0.0, 0.0],
+                VectorSearchMetric::L2,
+                2,
+                &active_set(&["f0"]),
+                &HashMap::new(),
+                &HashMap::new(),
+                Some(&no_prefilter),
+            )
+            .unwrap();
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(false),
+            "a split that narrowed nothing must not take the filtered ANN path"
+        );
+    }
+
+    #[test]
+    fn a_range_past_the_source_row_count_is_rejected() {
+        // The range bounds ride in on an engine-supplied split. Java checks each one
+        // against the SOURCE file's row count, so a range that disagrees with its own
+        // segment is rejected. On this route that count came off the wire as well, so
+        // this is a consistency check between the split's own two numbers -- NOT a
+        // bound on how much the insert can allocate.
+        let files = [PkVectorSourceFile::new("f0".into(), 3).unwrap()];
+        let mut selections = HashMap::new();
+        selections.insert("f0".to_string(), ranges(&[(0, 1 << 40)]));
+        let error = build_live_row_ids(
+            &files,
+            &active_set(&["f0"]),
+            &HashMap::new(),
+            Some(&selections),
+        )
+        .map(|_| ())
+        .expect_err("a range beyond the source file cannot be inserted");
+        assert!(error.to_string().contains("out of range"), "{error}");
+    }
+
+    #[test]
+    fn a_live_set_beyond_what_the_backend_can_filter_is_rejected() {
+        // A mask is necessary (one sibling is restricted), so `huge` is inserted
+        // wholesale at whatever its wire-supplied row count claims. Without a limit
+        // on what gets inserted this OOM-kills the process.
+        let files = vec![
+            PkVectorSourceFile::new("huge".into(), i64::MAX).unwrap(),
+            PkVectorSourceFile::new("small".into(), 1).unwrap(),
+        ];
+        let mut selections = HashMap::new();
+        selections.insert("small".to_string(), ranges(&[(0, 0)]));
+        let error = build_live_row_ids(
+            &files,
+            &active_set(&["huge", "small"]),
+            &HashMap::new(),
+            Some(&selections),
+        )
+        .map(|_| ())
+        .expect_err("more live rows than the backend can be handed");
+        assert!(error.to_string().contains("more than"), "{error}");
+    }
+
+    #[test]
+    fn a_deletion_vector_alone_also_reaches_the_live_row_limit() {
+        // Same exposure with no pre-filter at all: one deletion vector on one of
+        // this segment's own sources is enough to make a mask necessary.
+        let files = vec![PkVectorSourceFile::new("huge".into(), i64::MAX).unwrap()];
+        let mut dvs = HashMap::new();
+        dvs.insert("huge".to_string(), dv(&[0]));
+        let error = build_live_row_ids(&files, &active_set(&["huge"]), &dvs, None)
+            .map(|_| ())
+            .expect_err("more live rows than the backend can be handed");
+        assert!(error.to_string().contains("more than"), "{error}");
+    }
+
+    #[test]
+    fn a_huge_claim_with_nothing_live_is_not_rejected() {
+        // The limit is on rows actually put in the mask, not on what the metadata
+        // claims. These three all claim more rows than any backend could filter and
+        // all leave the mask empty, so none of them may be turned away.
+        let huge = vec![PkVectorSourceFile::new("huge".into(), i64::MAX).unwrap()];
+
+        // Explicitly excluded.
+        let mut excluded = HashMap::new();
+        excluded.insert("huge".to_string(), ranges(&[]));
+        let live = build_live_row_ids(
+            &huge,
+            &active_set(&["huge"]),
+            &HashMap::new(),
+            Some(&excluded),
+        )
+        .expect("an excluded file puts nothing in the mask")
+        .expect("a selection was present");
+        assert!(live.is_empty());
+
+        // Inactive: its whole ordinal range is masked out anyway.
+        let live = build_live_row_ids(&huge, &active_set(&[]), &HashMap::new(), None)
+            .expect("an inactive source puts nothing in the mask")
+            .expect("a source was inactive");
+        assert!(live.is_empty());
+
+        // Narrowly restricted: two rows out of an impossible claim.
+        let mut narrow = HashMap::new();
+        narrow.insert("huge".to_string(), ranges(&[(0, 1)]));
+        let live = build_live_row_ids(
+            &huge,
+            &active_set(&["huge"]),
+            &HashMap::new(),
+            Some(&narrow),
+        )
+        .expect("a narrow selection puts two rows in the mask")
+        .expect("a selection was present");
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn the_live_row_limit_is_javas_dense_filter_limit() {
+        // Java rejects an include-set above `Integer.MAX_VALUE` before it allocates
+        // the dense array (`LuminaVectorGlobalIndexReader.toScopedIds`). Exactly that
+        // many rows is what a backend can still be handed; one more is not.
+        let at_limit = vec![PkVectorSourceFile::new("f0".into(), i32::MAX as i64).unwrap()];
+        let mut dvs = HashMap::new();
+        dvs.insert("f0".to_string(), dv(&[0]));
+        assert!(
+            build_live_row_ids(&at_limit, &active_set(&["f0"]), &dvs, None).is_ok(),
+            "exactly the limit is allowed"
+        );
+
+        // One row past it, even though the deletion vector would bring the FINAL set
+        // back under: the charge is on insertion, because that is where the
+        // allocation happens.
+        let over = vec![PkVectorSourceFile::new("f0".into(), i32::MAX as i64 + 1).unwrap()];
+        assert!(
+            build_live_row_ids(&over, &active_set(&["f0"]), &dvs, None).is_err(),
+            "one row past the limit is not"
+        );
+    }
+
+    #[test]
+    fn an_oversized_range_selection_is_charged() {
+        // The range charge site, distinct from the unrestricted one: the file is
+        // restricted, so it never reaches the whole-file insert.
+        let files = vec![PkVectorSourceFile::new("f0".into(), i32::MAX as i64 + 1).unwrap()];
+        let mut selections = HashMap::new();
+        selections.insert("f0".to_string(), ranges(&[(0, i32::MAX as i64)]));
+        let error = build_live_row_ids(
+            &files,
+            &active_set(&["f0"]),
+            &HashMap::new(),
+            Some(&selections),
+        )
+        .map(|_| ())
+        .expect_err("a range this wide cannot be filtered");
+        assert!(error.to_string().contains("more than"), "{error}");
+    }
+
+    #[test]
+    fn the_live_row_budget_is_shared_across_ranges() {
+        // Each range fits individually; their combined size exceeds the mask
+        // budget. Keep the first range tiny so the rejected test allocates little.
+        let files = vec![PkVectorSourceFile::new("f0".into(), i32::MAX as i64 + 2).unwrap()];
+        let selections = HashMap::from([(
+            "f0".to_string(),
+            ranges(&[(0, 0), (2, i32::MAX as i64 + 1)]),
+        )]);
+        let error = build_live_row_ids(
+            &files,
+            &active_set(&["f0"]),
+            &HashMap::new(),
+            Some(&selections),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("more than"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_range_list_excludes_the_source_file() {
+        // Java's empty `List<Range>`: present and permitting nothing, the opposite of
+        // absent.
+        let files = vec![
+            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+        ];
+        let mut selections = HashMap::new();
+        selections.insert("f0".to_string(), ranges(&[]));
+        let live = build_live_row_ids(
+            &files,
+            &active_set(&["f0", "f1"]),
+            &HashMap::new(),
+            Some(&selections),
+        )
+        .unwrap()
+        .unwrap();
+        // f0 contributes nothing; f1 is unlisted, so both its rows stay live.
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![3, 4]);
+    }
+
+    #[test]
+    fn range_selections_map_onto_their_source_file_offset() {
+        // f0 rows global 0,1,2; f1 rows global 3,4. f1 restricted to [1, 1]. This
+        // pins the offset arithmetic, not the interval-wise insertion -- a
+        // per-position loop would produce the same bitmap.
+        let files = vec![
+            PkVectorSourceFile::new("f0".into(), 3).unwrap(),
+            PkVectorSourceFile::new("f1".into(), 2).unwrap(),
+        ];
+        let mut selections = HashMap::new();
+        selections.insert("f0".to_string(), ranges(&[(0, 0), (2, 2)]));
+        selections.insert("f1".to_string(), ranges(&[(1, 1)]));
+        let live = build_live_row_ids(
+            &files,
+            &active_set(&["f0", "f1"]),
+            &HashMap::new(),
+            Some(&selections),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(live.iter().collect::<Vec<u64>>(), vec![0, 2, 4]);
     }
 
     #[test]
@@ -1061,7 +1476,7 @@ mod tests {
     #[test]
     fn test_search_batch_returns_independent_per_query_results() {
         // Two queries route to different synthetic scores; each result list is
-        // mapped from that query's own scores, with a shared live-row mask.
+        // mapped from that query's own scores, over the same live-row mask.
         let searcher = vindex_searcher(
             "embedding",
             Box::new(

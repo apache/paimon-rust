@@ -226,7 +226,7 @@ impl DataFilePkVectorReaderFactory {
 /// Extract one batch's vector column into `out`, one entry per row (NULL row =
 /// `None`). The column must be a `FixedSizeList`/`List` of `Float32`; every
 /// non-null row's child slice must have exactly `dimension` elements. Mirrors
-/// the layout handling in `vector_search_builder`.
+/// the layout handling in `de_vector_read`.
 pub(crate) fn append_batch_vectors(
     batch: &arrow_array::RecordBatch,
     field_name: &str,

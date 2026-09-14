@@ -65,7 +65,7 @@ fn snapshots_schema() -> SchemaRef {
 }
 
 #[derive(Debug)]
-struct SnapshotsTable {
+pub(super) struct SnapshotsTable {
     table: Table,
 }
 

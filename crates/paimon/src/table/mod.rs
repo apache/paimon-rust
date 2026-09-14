@@ -19,6 +19,7 @@
 
 pub(crate) mod aggregator;
 mod audit_log_table;
+mod batch_vector_search_builder;
 pub(crate) mod bin_pack;
 mod bitmap_global_index_format;
 mod bitmap_global_index_reader;
@@ -39,7 +40,11 @@ mod data_evolution_reader;
 pub mod data_evolution_writer;
 mod data_file_reader;
 mod data_file_writer;
+mod de_vector_read;
+mod de_vector_scan;
 mod dedicated_format_file_writer;
+mod format_partition;
+mod format_partition_stats;
 mod format_read_builder;
 mod format_table_read;
 mod format_table_scan;
@@ -76,7 +81,9 @@ mod pk_vector_data_file_reader;
 mod pk_vector_indexed_split_read;
 mod pk_vector_orchestrator;
 mod pk_vector_position_read;
+mod pk_vector_read;
 mod pk_vector_scan;
+mod pk_vector_search_params;
 mod postpone_bucket_plan;
 mod postpone_file_writer;
 mod postpone_fixed_bucket_router;
@@ -104,19 +111,31 @@ mod table_update;
 pub(crate) mod table_write;
 mod tag_manager;
 pub(crate) mod time_travel;
+mod vector_read;
+mod vector_scan;
 mod vector_search_builder;
+mod vector_search_common;
+pub(crate) mod vector_search_result;
+#[cfg(test)]
+mod vector_search_test_utils;
 mod vindex_index_build_builder;
 mod write_builder;
 
 use crate::Result;
 use arrow_array::RecordBatch;
 pub use audit_log_table::AuditLogTable;
+pub use batch_vector_search_builder::BatchVectorSearchBuilder;
 pub use blob_resolver::{BlobReader, BlobStream};
 pub use branch_manager::BranchManager;
 pub use commit_message::CommitMessage;
 pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
+pub use de_vector_scan::PreparedVectorSearchFilter;
+pub use format_partition::{
+    format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
+};
+pub use format_partition_stats::FormatTablePartitionStatsCollector;
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
@@ -157,9 +176,9 @@ pub use table_scan::TableScan;
 pub use table_update::TableUpdate;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
-pub use vector_search_builder::{
-    BatchVectorSearchBuilder, PreparedVectorSearchFilter, VectorSearchBuilder,
-};
+pub use vector_read::{BatchVectorRead, VectorRead};
+pub use vector_scan::{VectorScan, VectorScanPlan};
+pub use vector_search_builder::VectorSearchBuilder;
 pub use vindex_index_build_builder::VindexIndexBuildBuilder;
 pub use write_builder::WriteBuilder;
 
@@ -342,6 +361,15 @@ impl Table {
         CoreOptions::new(self.schema.options()).is_format_table()
     }
 
+    /// Whether this table uses catalog-managed Format Table partitions: a Format Table loaded
+    /// from a REST catalog with `metastore.partitioned-table=true`.
+    pub fn has_catalog_managed_partitions(&self) -> bool {
+        let options = CoreOptions::new(self.schema.options());
+        self.rest_env.is_some()
+            && options.is_format_table()
+            && options.partitioned_table_in_metastore()
+    }
+
     /// Create a read builder for scan/read.
     ///
     /// Reference: [pypaimon FileStoreTable.new_read_builder](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/table/file_store_table.py).
@@ -513,6 +541,60 @@ impl Table {
         self.copy_with_time_travel_mode(extra, true).await
     }
 
+    /// Refuse dynamic options that would change where a Format Table loaded from a REST catalog
+    /// takes its partitions from, or, when the catalog manages them, how they are read.
+    ///
+    /// Mirrors Java `FormatTable.copy`. Java also fixes a Format Table's type, location and
+    /// format when the table is loaded; this table reads them from its options, so changing
+    /// them is refused here too.
+    fn ensure_format_table_partition_options_unchanged(
+        &self,
+        extra: &HashMap<String, String>,
+    ) -> Result<()> {
+        let current = CoreOptions::new(self.schema.options());
+        if self.rest_env.is_none() || !current.is_format_table() {
+            return Ok(());
+        }
+        let mut merged_options = self.schema.options().clone();
+        merged_options.extend(
+            extra
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        let merged = CoreOptions::new(&merged_options);
+        let managed = current.partitioned_table_in_metastore();
+        let changed = if merged.partitioned_table_in_metastore() != managed {
+            Some("metastore.partitioned-table")
+        } else if !managed {
+            None
+        } else if !merged.is_format_table() {
+            Some("type")
+        } else if merged.format_table_partition_only_value_in_path()
+            != current.format_table_partition_only_value_in_path()
+        {
+            Some("format-table.partition-path-only-value")
+        } else if merged.format_table_implementation_is_engine() {
+            Some("format-table.implementation")
+        } else if merged.path() != current.path() {
+            Some("path")
+        } else if merged.file_format() != current.file_format() {
+            Some("file.format")
+        } else {
+            None
+        };
+        match changed {
+            Some(key) => Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Dynamic option '{key}' cannot change where Format Table {} takes its \
+                     partitions from, or how it reads them",
+                    self.identifier.full_name()
+                ),
+                source: None,
+            }),
+            None => Ok(()),
+        }
+    }
+
     async fn copy_with_time_travel_mode(
         &self,
         extra: HashMap<String, String>,
@@ -521,6 +603,7 @@ impl Table {
         // Resolution reads Paimon snapshot paths, so refuse before any IO.
         CoreOptions::new(self.schema.options())
             .ensure_type_paimon_served(&self.identifier.full_name())?;
+        self.ensure_format_table_partition_options_unchanged(&extra)?;
         let mut table = self.copy_with_options(extra);
         // Reject unimplemented scan options on the merged view before any IO, so
         // both table-level and per-read options are covered.

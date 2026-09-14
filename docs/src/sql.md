@@ -40,7 +40,7 @@ Mosaic support is always available and currently read-only. SQL queries can read
 SQL support has two layers:
 
 - DataFusion provides the parser, query planner, optimizer, execution engine, expressions, scalar functions, aggregate functions, and window functions. SQL statements that `SQLContext` does not intercept are delegated to DataFusion. This includes the DataFusion SQL surface for `SELECT` queries, CTEs (including recursive CTEs), subqueries, joins including `LATERAL` joins, SQL lambda functions, grouping, `HAVING`, window clauses, `QUALIFY`, set operations, `ORDER BY`, `LIMIT`/`OFFSET`, `EXPLAIN`, information-schema commands such as `SHOW TABLES`, `DESCRIBE`, `COPY`, and ordinary `INSERT`.
-- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... DROP PARTITION`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
+- Paimon-specific table management and row-level writes are implemented by `SQLContext`. This includes Paimon `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE TEMPORARY TABLE`, `CREATE TEMPORARY VIEW`, REST Catalog persistent `CREATE VIEW`, `DROP VIEW`, and `CREATE FUNCTION`, `DROP TEMPORARY TABLE` / `VIEW`, `INSERT OVERWRITE ... PARTITION`, `UPDATE`, `DELETE`, `MERGE INTO`, `TRUNCATE TABLE`, `ALTER TABLE ... ADD PARTITION`, `ALTER TABLE ... DROP PARTITION`, `SHOW PARTITIONS`, `MSCK REPAIR TABLE`, `ANALYZE TABLE`, `CALL sys.*`, Paimon time travel, and `SET` / `RESET 'paimon.*'`.
 
 Not every DataFusion DDL/DML statement maps to a Paimon table operation. For Paimon catalogs, `CREATE EXTERNAL TABLE`, `LOCATION`, `CREATE MATERIALIZED VIEW`, and persistent `CREATE TABLE AS SELECT` are rejected or not implemented. Persistent `CREATE FUNCTION` is supported only for the REST Catalog SQL scalar form documented below. DataFusion `COPY` can export query results to files; it does not create or commit Paimon table files.
 
@@ -898,6 +898,128 @@ Multiple partition key-value pairs can be specified:
 ALTER TABLE paimon.my_db.events DROP PARTITION (dt = '2024-01-01', region = 'us');
 ```
 
+## Format Table Partitions
+
+A `type=format-table` table loaded from a REST Catalog can have its partitions managed
+by the catalog instead of discovered from the directory layout. The catalog registration
+is then the authoritative partition set: it decides what a scan reads, and a directory
+nobody registered is not part of the table.
+
+A table opts in with `'metastore.partitioned-table' = 'true'`. The statements below apply
+only to such a table — a partitioned internal Format Table, loaded from a REST Catalog,
+with a non-`engine` `format-table.implementation`.
+
+A partition the catalog holds at a custom location (the partition option `path`) is not
+read from that location yet: a scan that reaches it fails rather than reading the table
+directory in its place.
+
+### SHOW PARTITIONS
+
+```sql
+SHOW PARTITIONS paimon.my_db.events;
+SHOW PARTITIONS paimon.my_db.events PARTITION (dt = '2024-01-01');
+```
+
+Partition names are returned in the escaped `key=value/...` form, sorted. The optional
+`PARTITION` clause keeps only the partitions matching the given values; it may fix any
+subset of the partition keys.
+
+### ADD PARTITION
+
+```sql
+ALTER TABLE paimon.my_db.events ADD PARTITION (dt = '2024-01-01', region = 'us');
+ALTER TABLE paimon.my_db.events ADD IF NOT EXISTS PARTITION (dt = '2024-01-01')
+                                                 PARTITION (dt = '2024-01-02');
+```
+
+Every specification must fix all partition keys. A value is read with its column type the
+way Paimon reads partition strings, so `month = '01'` and `month = 01` both register the INT
+value `1`, and a BOOLEAN column accepts `t`, `true`, `y`, `yes` and `1` or their false
+counterparts. The partitions are registered with the catalog first and their directories
+are created afterwards, so a failure to create a directory leaves the registration in place
+and re-running the statement with `IF NOT EXISTS` completes it. Without `IF NOT EXISTS`, an
+already registered partition is an error. A custom `LOCATION` is not supported: the
+directory always follows the table's partition layout.
+
+### DROP PARTITION
+
+```sql
+ALTER TABLE paimon.my_db.events DROP PARTITION (dt = '2024-01-01', region = 'us');
+ALTER TABLE paimon.my_db.events DROP IF EXISTS PARTITION (dt = '2024-01-01');
+```
+
+A specification that fixes only some of the partition keys drops every registered
+partition it matches, and the fixed keys need not be a leading prefix — on a
+`(dt, region)` table, `DROP PARTITION (region = 'us')` drops the `us` partition of every
+date. A specification that fixes all keys names one partition, so a missing one is an
+error unless `IF EXISTS` is given; a partial one describes a set that is allowed to come
+out empty.
+
+One statement may carry several specifications, each `DROP PARTITION` in its own clause:
+
+```sql
+ALTER TABLE paimon.my_db.events DROP PARTITION (dt = '2024-01-01'),
+                                DROP PARTITION (dt = '2024-01-02');
+```
+
+The catalog registration is removed first, then the directory is deleted by the client —
+the catalog never deletes data. If the deletion fails the partition is already invisible
+and the directory may survive; repair the file system and remove it there rather than
+re-registering it. A partition at a custom location is only unregistered; its directory
+is left where it is.
+
+### MSCK REPAIR TABLE
+
+Reconcile the catalog registrations with the directories that actually exist:
+
+```sql
+MSCK REPAIR TABLE paimon.my_db.events;                  -- same as ADD PARTITIONS
+MSCK REPAIR TABLE paimon.my_db.events ADD PARTITIONS;   -- register discovered directories
+MSCK REPAIR TABLE paimon.my_db.events DROP PARTITIONS;  -- unregister vanished directories
+MSCK REPAIR TABLE paimon.my_db.events SYNC PARTITIONS;  -- both
+```
+
+Repair is metadata-only: it never deletes data. Directory discovery and the catalog
+listing both complete before any change is made, so a listing failure cannot turn a
+truncated view of the table into a `DROP` diff. There is no dry-run and no scope
+argument — repair always covers the whole table. A partition at a custom location is
+never unregistered by repair.
+
+### ANALYZE TABLE
+
+Measure what the registered partitions hold and report it to the catalog:
+
+```sql
+ANALYZE TABLE paimon.my_db.events COMPUTE STATISTICS NOSCAN;  -- files, size, last file time
+ANALYZE TABLE paimon.my_db.events COMPUTE STATISTICS;         -- also row counts
+ANALYZE TABLE paimon.my_db.events PARTITION (dt = '2024-01-01') COMPUTE STATISTICS;
+```
+
+Each partition is measured through the listing a scan uses, so it counts exactly the files
+a query reads and leaves staging entries such as `_temporary` out. `NOSCAN` stops at the
+listing: it reports the file count, the total size and the latest file modification time.
+Without `NOSCAN` the row count is also read from each file's footer, which Parquet and ORC
+keep; for other formats it stays unknown. A footer that cannot be read leaves the row count
+of its partition unknown rather than short, and a partition without files holds exactly
+zero rows. A field the statement does not measure, such as the row count under `NOSCAN`,
+is reported as unknown (`-1`).
+
+The measurement replaces the statistics the catalog holds for each partition; it never
+adds or removes a partition. `PARTITION (...)` must give values for a leading run of the
+partition keys and selects every registered partition under them: on a `(dt, region)`
+table, `PARTITION (dt = '2024-01-01')` measures every region of that date, while
+`PARTITION (region = 'us')` is rejected. It is an error when no registered partition
+matches. A selected partition at a custom location fails the statement, and
+`FOR COLUMNS` is not supported.
+
+A listing failure fails the statement before anything is reported.
+`format-table.statistics.parallelism` (default 8) bounds the storage requests in flight,
+listings and footer reads alike. Set it for the session:
+
+```sql
+SET 'paimon.format-table.statistics.parallelism' = '16';
+```
+
 ## Procedures
 
 Use `CALL` to invoke built-in procedures. All procedures are under the `sys` namespace.
@@ -1532,6 +1654,7 @@ Lumina index behavior is configured via table options prefixed with `lumina.`:
 | `lumina.distance.metric` | Distance metric (`inner_product`, `cosine`, `l2`) |
 | `lumina.index.type` | Index type (default: `diskann`) |
 | `lumina.encoding.type` | Encoding type (default: `pq`) |
+| `lumina.search.max-filter-bytes` | Maximum memory used by each active Lumina reader to expand a filtered row-id set (default: `64 MiB`, or 8,388,608 row ids). Queries exceeding it fail with an error; increase it explicitly as a table or vector-search option for unusually large index segments. This Rust-side safety option is not passed to the native Lumina library. |
 
 ### Lumina Environment
 

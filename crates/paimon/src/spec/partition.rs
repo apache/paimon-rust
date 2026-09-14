@@ -26,9 +26,15 @@ use std::collections::HashMap;
 #[serde(rename_all = "camelCase")]
 pub struct Partition {
     pub spec: HashMap<String, String>,
+    /// Statistics are optional on the wire: one the catalog leaves out was never reported, so it
+    /// reads as [`Self::UNKNOWN`] rather than as an exact zero.
+    #[serde(default = "unknown_statistic")]
     pub record_count: i64,
+    #[serde(default = "unknown_statistic")]
     pub file_size_in_bytes: i64,
+    #[serde(default = "unknown_statistic")]
     pub file_count: i64,
+    #[serde(default = "unknown_statistic")]
     pub last_file_creation_time: i64,
     #[serde(default)]
     pub total_buckets: i32,
@@ -65,6 +71,10 @@ impl Partition {
     pub fn is_known(value: i64) -> bool {
         value >= 0
     }
+}
+
+fn unknown_statistic() -> i64 {
+    Partition::UNKNOWN
 }
 
 #[cfg(test)]
@@ -128,6 +138,30 @@ mod tests {
         }"#;
         let decoded: Partition = serde_json::from_str(json).unwrap();
         assert_eq!(decoded.spec.get("dt"), Some(&"2024-01-01".to_string()));
+    }
+
+    #[test]
+    fn test_absent_statistics_decode_as_unknown_and_zero_stays_exact() {
+        let absent: Partition =
+            serde_json::from_str(r#"{"spec": {"pt": "1"}, "done": true}"#).unwrap();
+        for value in [
+            absent.record_count,
+            absent.file_size_in_bytes,
+            absent.file_count,
+            absent.last_file_creation_time,
+        ] {
+            assert_eq!(value, Partition::UNKNOWN);
+        }
+
+        let zero: Partition = serde_json::from_str(
+            r#"{"spec": {"pt": "1"}, "recordCount": 0, "fileSizeInBytes": 0,
+                "fileCount": 0, "lastFileCreationTime": 0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (zero.record_count, zero.file_size_in_bytes, zero.file_count),
+            (0, 0, 0)
+        );
     }
 
     #[test]
