@@ -15,18 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! End-to-end acceptance gate for BATCH primary-key vector search.
-//!
-//! Builds a complete, self-contained primary-key vector table entirely from Rust
-//! (mirroring `pk_vector_baseline_test`), then reads it back through the public
-//! batch surface `new_batch_vector_search_builder().execute_read()` and asserts:
-//!   - batch-of-one == the single-query `execute_read`;
-//!   - an N-query batch yields one stream per query, each matching the
-//!     corresponding independent single-query read (arity + order + independence);
-//!   - an empty snapshot yields N empty streams (arity preserved);
-//!   - the PK batch `execute()` (scored) fails loud, directing to `execute_read`;
-//!   - a shared residual filter reshapes every query's rows with no cross-query
-//!     bleed.
+//! Batch PK search returns one snapshot-scoped result per query, in input order.
+//! These fixtures compare positions and projected result reads against independent
+//! single queries, including empty results and residual-filtered queries.
 
 use std::collections::HashMap;
 
@@ -382,15 +373,14 @@ async fn drain_ids_and_scores(stream: ArrowRecordBatchStream) -> (Vec<i32>, Vec<
     (ids, scores)
 }
 
-/// Single-query `execute_read` into `(id, score)` tuples.
+/// Single-query `SearchResultReadBuilder::read` into `(id, score)` tuples.
 async fn single_read(table: &Table, query: Vec<f32>, limit: usize) -> (Vec<i32>, Vec<f32>) {
     let mut builder = table.new_vector_search_builder();
     builder
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query)
         .with_limit(limit);
-    let stream = builder
-        .execute_read()
+    let stream = async { builder.execute().await?.new_read_builder().read().await }
         .await
         .expect("single-query read failed");
     drain_ids_and_scores(stream).await
@@ -419,15 +409,16 @@ async fn batch_of_one_equals_single_read() {
     let (single_ids, single_scores) = single_read(&table, query.clone(), 3).await;
 
     let mut builder = table.new_batch_vector_search_builder();
-    let mut streams = builder
+    let mut results = builder
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vectors(vec![query])
         .with_limit(3)
-        .execute_read()
+        .execute()
         .await
         .expect("batch-of-one read failed");
-    assert_eq!(streams.len(), 1, "batch-of-one yields exactly one stream");
-    let (batch_ids, batch_scores) = drain_ids_and_scores(streams.remove(0)).await;
+    assert_eq!(results.len(), 1, "batch-of-one yields exactly one stream");
+    let (batch_ids, batch_scores) =
+        drain_ids_and_scores(results.remove(0).new_read_builder().read().await.unwrap()).await;
 
     assert_eq!(batch_ids, single_ids);
     assert_eq!(batch_scores.len(), single_scores.len());
@@ -454,21 +445,22 @@ async fn n_query_batch_matches_n_independent_single_reads() {
     }
 
     let mut builder = table.new_batch_vector_search_builder();
-    let streams = builder
+    let results = builder
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vectors(queries.clone())
         .with_limit(3)
-        .execute_read()
+        .execute()
         .await
         .expect("batch read failed");
     assert_eq!(
-        streams.len(),
+        results.len(),
         queries.len(),
         "one stream per query, in input order"
     );
 
-    for (i, stream) in streams.into_iter().enumerate() {
-        let (ids, scores) = drain_ids_and_scores(stream).await;
+    for (i, result) in results.into_iter().enumerate() {
+        let (ids, scores) =
+            drain_ids_and_scores(result.new_read_builder().read().await.unwrap()).await;
         let (want_ids, want_scores) = &expected[i];
         assert_eq!(&ids, want_ids, "query {i} rows must match its single read");
         assert_eq!(scores.len(), want_scores.len());
@@ -483,7 +475,7 @@ async fn n_query_batch_matches_n_independent_single_reads() {
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn empty_snapshot_yields_n_empty_streams() {
+async fn empty_snapshot_yields_n_empty_results() {
     let (_tmp, table) = build_empty_table().await;
     let queries = vec![
         vec![1.0, 0.0, 0.0, 0.0],
@@ -492,41 +484,67 @@ async fn empty_snapshot_yields_n_empty_streams() {
     ];
 
     let mut builder = table.new_batch_vector_search_builder();
-    let streams = builder
+    let results = builder
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vectors(queries.clone())
         .with_limit(3)
-        .execute_read()
+        .execute()
         .await
         .expect("empty-snapshot batch read failed");
     assert_eq!(
-        streams.len(),
+        results.len(),
         queries.len(),
         "arity preserved: one empty stream per query"
     );
-    for stream in streams {
-        let (ids, _scores) = drain_ids_and_scores(stream).await;
+    for result in results {
+        let (ids, _scores) =
+            drain_ids_and_scores(result.new_read_builder().read().await.unwrap()).await;
         assert!(ids.is_empty(), "no-hit query must yield an empty stream");
     }
 }
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn pk_batch_execute_scored_fails_loud() {
+async fn pk_batch_execute_returns_positions_and_reads_without_replanning() {
     let vectors = fixture();
     let (_tmp, table) = build_table(&vectors).await;
-    let err = table
+    let mut results = table
         .new_batch_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vectors(vec![vec![10.0, 0.0, 0.0, 0.0]])
         .with_limit(3)
         .execute()
         .await
-        .expect_err("PK batch execute() must fail loud");
-    assert!(
-        format!("{err:?}").contains("execute_read"),
-        "PK batch execute() should point at execute_read, got: {err:?}"
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    let result = results.remove(0);
+    assert_eq!(result.snapshot_id(), Some(1));
+    assert!(result.row_ids().is_err());
+    let positions = result.positions().unwrap();
+    assert_eq!(
+        positions.iter().map(|p| p.row_position).collect::<Vec<_>>(),
+        vec![5, 1, 3]
     );
+    let expected_scores = positions.iter().map(|p| p.score).collect::<Vec<_>>();
+
+    // Search has finished. Removing the manifest makes replanning impossible,
+    // while the retained file positions still allow a projected read.
+    let manager = table.snapshot_manager();
+    let snapshot = manager.get_snapshot(1).await.unwrap();
+    table
+        .file_io()
+        .delete_file(&manager.manifest_path(snapshot.index_manifest().unwrap()))
+        .await
+        .unwrap();
+    let stream = result
+        .new_read_builder()
+        .with_projection(&["id"])
+        .read()
+        .await
+        .unwrap();
+    let (ids, scores) = drain_ids_and_scores(stream).await;
+    assert_eq!(ids, vec![5, 1, 3]);
+    assert_eq!(scores, expected_scores);
 }
 
 /// A shared residual filter reshapes every query's rows (excluding low ids) with
@@ -574,18 +592,19 @@ async fn shared_residual_filter_applies_per_query_without_bleed() {
     );
 
     let mut builder = table.new_batch_vector_search_builder();
-    let streams = builder
+    let results = builder
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vectors(queries.clone())
         .with_limit(3)
         .with_filter(build_filter())
-        .execute_read()
+        .execute()
         .await
         .expect("residual batch read failed");
-    assert_eq!(streams.len(), queries.len());
+    assert_eq!(results.len(), queries.len());
 
-    for (i, stream) in streams.into_iter().enumerate() {
-        let (ids, _scores) = drain_ids_and_scores(stream).await;
+    for (i, result) in results.into_iter().enumerate() {
+        let (ids, _scores) =
+            drain_ids_and_scores(result.new_read_builder().read().await.unwrap()).await;
         for &id in &ids {
             assert!(
                 id >= threshold,
@@ -596,14 +615,12 @@ async fn shared_residual_filter_applies_per_query_without_bleed() {
     }
 }
 
-/// A table with no primary-key vector index is not a valid target for the batch
-/// materialized read: it produces scored global row ids, not physical rows. The
-/// batch `execute_read` must reject it up front rather than silently route it
-/// through the primary-key materialization path.
+/// A table without a PK-vector index uses DE results, including the shared
+/// result-reading API for an empty snapshot.
 // Gated off Windows for the same `file://` tempdir reason as `pk_vector_baseline_test`.
 #[cfg(not(windows))]
 #[tokio::test]
-async fn batch_execute_read_on_non_pk_vector_table_fails_loud() {
+async fn batch_empty_de_result_can_be_read() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let location = format!("file://{}", tmp.path().display());
     let file_io = FileIOBuilder::new("file").build().unwrap();
@@ -638,16 +655,13 @@ async fn batch_execute_read_on_non_pk_vector_table_fails_loud() {
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vectors(vec![vec![1.0, 0.0, 0.0, 0.0]])
         .with_limit(3)
-        .execute_read()
-        .await;
-    let err = match result {
-        Ok(_) => panic!("batch execute_read on a non-PK-vector table must fail loud"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string().contains("primary-key vector path"),
-        "expected a message directing to the primary-key vector path, got: {err}"
-    );
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert!(result[0].row_ids().unwrap().is_empty());
+    let (ids, _) = drain_ids_and_scores(result[0].new_read_builder().read().await.unwrap()).await;
+    assert!(ids.is_empty());
 }
 
 /// A malformed query (wrong dimension) must fail loud even when the plan is
@@ -666,7 +680,7 @@ async fn empty_snapshot_still_rejects_malformed_query() {
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vectors(queries)
         .with_limit(3)
-        .execute_read()
+        .execute()
         .await;
     let err = match result {
         Ok(_) => panic!("a wrong-dimension query must fail loud even on an empty snapshot"),
@@ -693,7 +707,7 @@ async fn empty_array_snapshot_still_rejects_non_finite_query() {
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vectors(queries)
         .with_limit(3)
-        .execute_read()
+        .execute()
         .await;
     let err = match result {
         Ok(_) => panic!("a NaN query must fail loud for ARRAY<FLOAT> even on an empty snapshot"),
@@ -719,7 +733,7 @@ async fn empty_snapshot_still_rejects_zero_limit() {
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vectors(vec![vec![1.0, 0.0, 0.0, 0.0]])
         .with_limit(0)
-        .execute_read()
+        .execute()
         .await;
     let err = match result {
         Ok(_) => panic!("a zero limit must fail loud even on an empty snapshot"),

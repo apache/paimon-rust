@@ -183,6 +183,7 @@ impl RESTEnv {
             ),
             source: None,
         })?;
+        validate_catalog_managed_format_table(identifier, &table_schema, is_external)?;
 
         let uuid = response.id.ok_or_else(|| Error::DataInvalid {
             message: format!(
@@ -312,6 +313,42 @@ impl RESTEnv {
             self.uuid.clone(),
         ))
     }
+}
+
+/// Refuse a Format Table that asks for catalog-managed partitions it cannot have: an engine
+/// implementation reads the table directory itself, and only an internal table's partitions
+/// belong to the catalog.
+///
+/// Mirrors Java `CatalogUtils.validateCatalogManagedFormatTablePartitions`.
+fn validate_catalog_managed_format_table(
+    identifier: &Identifier,
+    table_schema: &TableSchema,
+    is_external: bool,
+) -> Result<()> {
+    let options = CoreOptions::new(table_schema.options());
+    if !options.is_format_table() || !options.partitioned_table_in_metastore() {
+        return Ok(());
+    }
+    if options.format_table_implementation_is_engine() {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Format Table {} cannot set metastore.partitioned-table=true when \
+                 format-table.implementation=engine",
+                identifier.full_name()
+            ),
+            source: None,
+        });
+    }
+    if is_external {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Catalog-managed partitions require an internal Format Table, but {} is external",
+                identifier.full_name()
+            ),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {

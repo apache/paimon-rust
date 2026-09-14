@@ -54,7 +54,7 @@ fn output_schema() -> SchemaRef {
 }
 
 #[derive(Debug)]
-struct PhysicalFilesSizeTable {
+pub(super) struct PhysicalFilesSizeTable {
     table: Table,
 }
 

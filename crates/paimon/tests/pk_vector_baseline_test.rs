@@ -21,8 +21,8 @@
 //! entirely from Rust — data file, a real vindex IVF-flat ANN index segment, and
 //! the snapshot/manifest/index-manifest metadata — then reads it back through the
 //! public `new_vector_search_builder()` API and asserts both the search result
-//! (`execute_scored()` -> `row_ids`/`scores`) and the materialized rows
-//! (`execute_read()` -> Arrow batches, best-first order, `__paimon_search_score`).
+//! (`execute()` -> physical positions and scores) and the materialized rows
+//! (result reader -> Arrow batches, best-first order, `__paimon_search_score`).
 //!
 //! Why Rust-built rather than a committed cross-language fixture: the Java
 //! primary-key vector ANN segment is an opaque native Lumina format that cannot
@@ -452,7 +452,7 @@ async fn build_table_with_first_row_id(
     (tmp, table)
 }
 
-/// Run `execute_read()` and flatten the stream into per-row `(id, score)` tuples
+/// Run `new_read_builder().read()` and flatten the stream into per-row `(id, score)` tuples
 /// in emission order (best-first), returning the collected batches too for
 /// schema / row-content assertions.
 async fn read_id_and_scores(
@@ -466,11 +466,13 @@ async fn read_id_and_scores(
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query)
         .with_limit(limit);
+    let result = builder.execute().await.unwrap();
+    let mut reader = result.new_read_builder();
     if let Some(cols) = projection {
-        builder.with_projection(cols);
+        reader.with_projection(cols);
     }
-    let batches = builder
-        .execute_read()
+    let batches = reader
+        .read()
         .await
         .expect("primary-key vector read failed")
         .try_collect::<Vec<_>>()
@@ -585,23 +587,36 @@ async fn pk_vector_end_to_end_returns_expected_row_ids_and_scores() {
     let expected_row_ids: Vec<u64> = expected.iter().map(|(id, _)| *id).collect();
     let expected_scores: Vec<f32> = expected.iter().map(|(_, d)| l2_score(*d)).collect();
 
-    // A primary-key vector table exposes no global row ids, so the search-only
-    // `execute_scored()` path is unsupported and must fail loud, directing callers
-    // to the materialized `execute_read()` path exercised below.
-    let scored_err = table
+    // Search-only PK results preserve local positions and metric scores.
+    let scored = table
         .new_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.to_vec())
         .with_limit(3)
-        .execute_scored()
+        .execute()
         .await
-        .expect_err("primary-key execute_scored must fail loud");
-    assert!(
-        format!("{scored_err:?}").contains("execute_read"),
-        "primary-key execute_scored should point at execute_read, got: {scored_err:?}"
+        .unwrap();
+    assert!(scored.row_ids().is_err());
+    assert_eq!(
+        scored
+            .positions()
+            .unwrap()
+            .iter()
+            .map(|p| p.row_position as u64)
+            .collect::<Vec<_>>(),
+        expected_row_ids
+    );
+    assert_eq!(
+        scored
+            .positions()
+            .unwrap()
+            .iter()
+            .map(|p| p.score)
+            .collect::<Vec<_>>(),
+        expected_scores
     );
 
-    // Search-and-read: execute_read() materializes the matching rows best-first
+    // Search-and-read: the result reader materializes the matching rows best-first
     // with a `__paimon_search_score` column, hiding `_ROW_ID`/`_PKEY_VECTOR_POSITION`.
     // Projection ['id'] excludes the vector column.
     let (ids, scores, batches) = read_id_and_scores(&table, query.to_vec(), 3, Some(&["id"])).await;
@@ -775,7 +790,7 @@ async fn assert_discriminating_local_read(first_row_id: Option<i64>) {
 // Gated off Windows for the same `file://` tempdir reason as the tests above.
 #[cfg(not(windows))]
 #[tokio::test]
-async fn execute_read_without_first_row_id_selects_local_positions() {
+async fn result_read_without_first_row_id_selects_local_positions() {
     assert_discriminating_local_read(None).await;
 }
 
@@ -788,7 +803,7 @@ async fn execute_read_without_first_row_id_selects_local_positions() {
 // Gated off Windows for the same `file://` tempdir reason as the tests above.
 #[cfg(not(windows))]
 #[tokio::test]
-async fn execute_read_ignores_nonzero_first_row_id() {
+async fn result_read_ignores_nonzero_first_row_id() {
     assert_discriminating_local_read(Some(100)).await;
 }
 
@@ -823,7 +838,7 @@ fn fixture_residual() -> ([f32; DIM], Vec<[f32; DIM]>) {
     (query, vectors)
 }
 
-/// Run `execute_read()` with a residual `filter` attached via `with_filter` and
+/// Run `new_read_builder().read()` with a residual `filter` attached via `with_filter` and
 /// flatten the stream into per-row `(id, score)` tuples in emission order
 /// (best-first), returning the collected batches too for schema / row-content
 /// assertions. Mirrors `read_id_and_scores` but exercises the residual path.
@@ -840,8 +855,7 @@ async fn read_id_and_scores_filtered(
         .with_query_vector(query)
         .with_limit(limit)
         .with_filter(filter);
-    let batches = builder
-        .execute_read()
+    let batches = async { builder.execute().await?.new_read_builder().read().await }
         .await
         .expect("primary-key vector residual read failed")
         .try_collect::<Vec<_>>()
@@ -924,34 +938,44 @@ async fn pk_vector_residual_filter_excludes_non_matching_rows() {
         .greater_or_equal("id", Datum::Int(residual_threshold as i32))
         .expect("build residual predicate on id");
 
-    // A primary-key vector table exposes no global row ids, so `execute_scored()`
-    // is unsupported on this path — with or without a residual filter — and must
-    // fail loud, directing callers to the materialized `execute_read()` used below.
-    let unfiltered_err = table
+    let unfiltered_result = table
         .new_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.to_vec())
         .with_limit(3)
-        .execute_scored()
+        .execute()
         .await
-        .expect_err("primary-key execute_scored must fail loud");
-    assert!(
-        format!("{unfiltered_err:?}").contains("execute_read"),
-        "got: {unfiltered_err:?}"
+        .unwrap();
+    assert_eq!(
+        unfiltered_result
+            .positions()
+            .unwrap()
+            .iter()
+            .map(|p| p.row_position)
+            .collect::<Vec<_>>(),
+        unfiltered_ids
+            .iter()
+            .map(|id| *id as i64)
+            .collect::<Vec<_>>()
     );
 
-    let residual_scored_err = table
+    let residual_result = table
         .new_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.to_vec())
         .with_limit(3)
         .with_filter(residual.clone())
-        .execute_scored()
+        .execute()
         .await
-        .expect_err("primary-key execute_scored must fail loud with a residual too");
-    assert!(
-        format!("{residual_scored_err:?}").contains("execute_read"),
-        "got: {residual_scored_err:?}"
+        .unwrap();
+    assert_eq!(
+        residual_result
+            .positions()
+            .unwrap()
+            .iter()
+            .map(|p| p.row_position)
+            .collect::<Vec<_>>(),
+        expected_ids.iter().map(|id| *id as i64).collect::<Vec<_>>()
     );
 
     // Search-and-read with the residual: default projection materializes id +
@@ -1118,7 +1142,7 @@ async fn write_schema_and_data(
     )
 }
 
-/// Read `execute_read()` into `(id, score)` tuples (best-first) plus the batches,
+/// Read `new_read_builder().read()` into `(id, score)` tuples (best-first) plus the batches,
 /// mirroring [`read_id_and_scores`] but with caller-supplied query options so the
 /// refine factor can be requested.
 async fn read_id_and_scores_with_options(
@@ -1133,8 +1157,7 @@ async fn read_id_and_scores_with_options(
         .with_query_vector(query)
         .with_limit(limit)
         .with_options(options);
-    let batches = builder
-        .execute_read()
+    let batches = async { builder.execute().await?.new_read_builder().read().await }
         .await
         .expect("primary-key vector rerank read failed")
         .try_collect::<Vec<_>>()
@@ -1374,7 +1397,7 @@ async fn pk_vector_refine_factor_with_no_indexed_candidates_is_noop() {
         .unwrap();
 
     // A positive refine factor is set, but with no indexed candidates the rerank is
-    // gated off: execute_read must not error, and returns the exact-fallback rows.
+    // gated off: result_read must not error, and returns the exact-fallback rows.
     let (ids, scores, batches) =
         read_id_and_scores_with_options(&table, query.to_vec(), k, refine_factor_option(2)).await;
     assert_eq!(
@@ -1437,7 +1460,7 @@ async fn pk_vector_invalid_refine_factor_fails_loud_on_empty_table() {
             .with_query_vector(vec![0.0f32; DIM])
             .with_limit(3)
             .with_options(HashMap::from([(refine_key.clone(), "abc".to_string())]));
-        let err = match builder.execute_read().await {
+        let err = match async { builder.execute().await?.new_read_builder().read().await }.await {
             Ok(_) => panic!("a non-integer refine factor must fail loud on an empty table"),
             Err(e) => e,
         };
@@ -1460,7 +1483,7 @@ async fn pk_vector_invalid_refine_factor_fails_loud_on_empty_table() {
             .with_query_vector(vec![0.0f32; DIM])
             .with_limit(3)
             .with_options(HashMap::from([(refine_key.clone(), "0".to_string())]));
-        let err = match builder.execute_read().await {
+        let err = match async { builder.execute().await?.new_read_builder().read().await }.await {
             Ok(_) => panic!("a zero refine factor must fail loud on an empty table"),
             Err(e) => e,
         };
@@ -1482,7 +1505,7 @@ async fn pk_vector_invalid_refine_factor_fails_loud_on_empty_table() {
             .with_vector_column(VECTOR_COLUMN)
             .with_query_vector(vec![0.0f32; DIM])
             .with_limit(3);
-        let err = match builder.execute_read().await {
+        let err = match async { builder.execute().await?.new_read_builder().read().await }.await {
             Ok(_) => panic!("a non-integer table refine factor must fail loud on an empty table"),
             Err(e) => e,
         };

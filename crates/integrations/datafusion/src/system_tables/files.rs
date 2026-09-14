@@ -84,7 +84,7 @@ fn files_schema() -> SchemaRef {
 }
 
 #[derive(Debug)]
-struct FilesTable {
+pub(super) struct FilesTable {
     table: Table,
 }
 

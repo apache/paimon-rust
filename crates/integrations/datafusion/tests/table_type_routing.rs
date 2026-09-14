@@ -648,6 +648,113 @@ async fn object_and_lance_tables_route_to_engines() {
 }
 
 #[tokio::test]
+async fn an_unsupported_time_travel_clause_on_a_paimon_table_is_rejected() {
+    use datafusion::prelude::SessionContext;
+    use paimon_datafusion::PaimonCatalogProvider;
+
+    let paimon_dir = TempDir::new().unwrap();
+    let warehouse = format!("file://{}", paimon_dir.path().display());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    fs_catalog
+        .create_database(DB, false, HashMap::new())
+        .await
+        .unwrap();
+    let plain = PaimonSchema::builder()
+        .column(
+            "id",
+            paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+        )
+        .build()
+        .unwrap();
+    fs_catalog
+        .create_table(&Identifier::new(DB, "pt"), plain, false)
+        .await
+        .unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        CATALOG,
+        Arc::new(PaimonCatalogProvider::new(
+            Some(CATALOG.to_string()),
+            fs_catalog,
+            Default::default(),
+            Default::default(),
+            None,
+        )),
+    );
+    paimon_datafusion::register_catalog_table_engine(
+        &ctx,
+        CATALOG,
+        TableType::IcebergTable,
+        Arc::new(FakeEngineResolver),
+    )
+    .unwrap();
+    for dialect in ["databricks", "mssql", "bigquery", "snowflake"] {
+        ctx.sql(&format!("SET datafusion.sql_parser.dialect = '{dialect}'"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        let run = |sql: String| {
+            let ctx = &ctx;
+            async move {
+                match ctx.sql(&sql).await {
+                    Err(err) => Err(err.to_string()),
+                    Ok(df) => df.collect().await.map(|_| ()).map_err(|e| e.to_string()),
+                }
+            }
+        };
+        let ts = "2020-01-01 00:00:00";
+        let system_time = run(format!(
+            "SELECT * FROM {CATALOG}.{DB}.pt FOR SYSTEM_TIME AS OF '{ts}'"
+        ))
+        .await;
+        let timestamp = run(format!(
+            "SELECT * FROM {CATALOG}.{DB}.pt TIMESTAMP AS OF '{ts}'"
+        ))
+        .await;
+        assert_eq!(
+            system_time, timestamp,
+            "[{dialect}] the two spellings diverged"
+        );
+
+        let Err(msg) = run(format!("SELECT * FROM {CATALOG}.{DB}.pt AT('{ts}')")).await else {
+            panic!("[{dialect}] a historical clause must not answer with current rows");
+        };
+        assert!(
+            msg.contains("this time-travel syntax is not supported"),
+            "[{dialect}] {msg}"
+        );
+
+        let err = ctx
+            .sql(&format!("SELECT * FROM {CATALOG}.{DB}.pt VERSION AS OF 1"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("[{dialect}] snapshot 1 does not exist in this fixture"));
+        assert!(err.to_string().contains("Snapshot 1"), "[{dialect}] {err}");
+
+        let Err(msg) = run(format!(
+            "SELECT * FROM {CATALOG}.{DB}.\"pt$schemas\" VERSION AS OF 1"
+        ))
+        .await
+        else {
+            panic!("[{dialect}] a system table answered a historical clause with current rows");
+        };
+        assert!(
+            msg.contains("time travel is not supported for"),
+            "[{dialect}] {msg}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn time_travel_on_routed_tables_is_rejected() {
     let env = setup().await;
     env.ctx
@@ -1251,4 +1358,85 @@ async fn a_rejected_external_table_does_not_pollute_the_blob_registry() {
         registry.resolve(&format!("{location}/blob/x")).is_none(),
         "a rejected table must leave no registration behind"
     );
+}
+
+#[derive(Debug)]
+struct ForeignRelationPlanner;
+
+impl datafusion::logical_expr::planner::RelationPlanner for ForeignRelationPlanner {
+    fn plan_relation(
+        &self,
+        relation: datafusion::sql::sqlparser::ast::TableFactor,
+        _context: &mut dyn datafusion::logical_expr::planner::RelationPlannerContext,
+    ) -> DFResult<datafusion::logical_expr::planner::RelationPlanning> {
+        use datafusion::sql::sqlparser::ast::TableFactor;
+        if matches!(
+            relation,
+            TableFactor::Table {
+                version: Some(_),
+                ..
+            }
+        ) {
+            return Err(DataFusionError::Plan("foreign planner reached".into()));
+        }
+        Ok(datafusion::logical_expr::planner::RelationPlanning::Original(Box::new(relation)))
+    }
+}
+
+#[tokio::test]
+async fn a_foreign_provider_keeps_its_own_version_clause() {
+    use datafusion::prelude::SessionContext;
+
+    let ctx = SessionContext::new();
+    for name in ["foreign_table", "foreign$history", "foreign$schemas"] {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as _],
+        )
+        .unwrap();
+        ctx.register_table(
+            datafusion::common::TableReference::bare(name),
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+    }
+    ctx.register_relation_planner(Arc::new(ForeignRelationPlanner))
+        .unwrap();
+    ctx.register_relation_planner(Arc::new(paimon_datafusion::PaimonRelationPlanner::new()))
+        .unwrap();
+    ctx.sql("SET datafusion.sql_parser.dialect = 'databricks'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    for table in [
+        "foreign_table",
+        "\"foreign$history\"",
+        "\"foreign$schemas\"",
+    ] {
+        for clause in [
+            "FOR SYSTEM_TIME AS OF CURRENT_TIMESTAMP() - INTERVAL '1' DAY",
+            "TIMESTAMP AS OF '2020-01-01T00:00:00Z'",
+            "VERSION AS OF 1",
+        ] {
+            let err = ctx
+                .sql(&format!("SELECT * FROM {table} {clause}"))
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("[{table} {clause}] expected the foreign planner to claim it")
+                });
+            assert!(
+                err.to_string().contains("foreign planner reached"),
+                "[{table} {clause}] Paimon took a clause that is not its own: {err}"
+            );
+        }
+    }
 }

@@ -1,0 +1,30 @@
+{
+  "version" : 3,
+  "id" : 0,
+  "fields" : [ {
+    "id" : 0,
+    "name" : "id",
+    "type" : "INT NOT NULL"
+  }, {
+    "id" : 1,
+    "name" : "embedding",
+    "type" : {
+      "type" : "VECTOR",
+      "element" : "FLOAT",
+      "length" : 2
+    }
+  } ],
+  "highestFieldId" : 1,
+  "partitionKeys" : [ ],
+  "primaryKeys" : [ "id" ],
+  "options" : {
+    "bucket" : "1",
+    "merge-engine" : "deduplicate",
+    "fields.embedding.pk-vector.distance.metric" : "l2",
+    "fields.embedding.pk-vector.index.type" : "ivf-flat",
+    "deletion-vectors.enabled" : "true",
+    "pk-vector.index.columns" : "embedding",
+    "fields.embedding.pk-vector.index.options.nlist" : "1"
+  },
+  "timeMillis" : 1788269662962
+}

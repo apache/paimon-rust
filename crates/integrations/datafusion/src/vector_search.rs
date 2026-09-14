@@ -403,7 +403,10 @@ impl VectorSearchExec {
                 builder.with_prepared_filter(prepared.clone());
             }
             let mut results = builder.execute().await.map_err(to_datafusion_error)?;
-            Ok::<_, DataFusionError>(results.remove(0))
+            results
+                .remove(0)
+                .into_row_ids()
+                .map_err(to_datafusion_error)
         })
         .await?;
 

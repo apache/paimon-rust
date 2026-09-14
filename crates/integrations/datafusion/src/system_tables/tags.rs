@@ -62,7 +62,7 @@ fn tags_schema() -> SchemaRef {
 }
 
 #[derive(Debug)]
-struct TagsTable {
+pub(super) struct TagsTable {
     table: Table,
 }
 

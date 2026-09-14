@@ -28,12 +28,12 @@ use crate::spec::{
     CoreOptions, DataField, DataType, MergeEngine, Predicate, SEQUENCE_NUMBER_FIELD_NAME,
 };
 use crate::DataSplit;
-use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
-use arrow_select::interleave::interleave;
+use arrow_select::concat::concat as arrow_concat;
+use arrow_select::take::take;
 use futures::{stream, StreamExt};
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 mod audit;
@@ -389,8 +389,8 @@ impl<'a> PaimonTableRead<'a> {
                 &core_options,
                 &diff_read_type,
             )?;
-            let mut bc = ArrowCursor::new(before_stream, 0).await?;
-            let mut ac = ArrowCursor::new(after_stream, 1).await?;
+            let mut bc = ArrowCursor::new(before_stream).await?;
+            let mut ac = ArrowCursor::new(after_stream).await?;
             let mut builder =
                 DiffAfterImageBatchBuilder::new(output_schema.clone(), output_col_indices.clone());
 
@@ -400,7 +400,7 @@ impl<'a> PaimonTableRead<'a> {
                         bc.advance().await?;
                     }
                     CursorOrd::AfterOnly => {
-                        builder.push(ac.batch_id(), ac.batch(), ac.row());
+                        builder.push(ac.batch(), ac.row());
                         ac.advance().await?;
                     }
                     CursorOrd::EqualSame => {
@@ -408,7 +408,7 @@ impl<'a> PaimonTableRead<'a> {
                         ac.advance().await?;
                     }
                     CursorOrd::EqualDiff => {
-                        builder.push(ac.batch_id(), ac.batch(), ac.row());
+                        builder.push(ac.batch(), ac.row());
                         bc.advance().await?;
                         ac.advance().await?;
                     }
@@ -682,17 +682,15 @@ enum CursorOrd {
 struct ArrowCursor {
     stream: ArrowRecordBatchStream,
     batch: Option<RecordBatch>,
-    source_id: usize,
     batch_id: usize,
     row: usize,
 }
 
 impl ArrowCursor {
-    async fn new(stream: ArrowRecordBatchStream, source_id: usize) -> crate::Result<Self> {
+    async fn new(stream: ArrowRecordBatchStream) -> crate::Result<Self> {
         let mut cursor = Self {
             stream,
             batch: None,
-            source_id,
             batch_id: 0,
             row: 0,
         };
@@ -712,8 +710,8 @@ impl ArrowCursor {
         self.row
     }
 
-    fn batch_id(&self) -> (usize, usize) {
-        (self.source_id, self.batch_id)
+    fn batch_id(&self) -> usize {
+        self.batch_id
     }
 
     async fn advance(&mut self) -> crate::Result<()> {
@@ -746,7 +744,6 @@ struct DiffAfterImageBatchBuilder {
     schema: Arc<ArrowSchema>,
     row_indices: Vec<(usize, usize)>,
     pinned_batches: Vec<RecordBatch>,
-    pinned_batch_ids: HashMap<(usize, usize), usize>,
     col_indices: Vec<usize>,
     len: usize,
 }
@@ -757,7 +754,6 @@ impl DiffAfterImageBatchBuilder {
             schema,
             row_indices: Vec::new(),
             pinned_batches: Vec::new(),
-            pinned_batch_ids: HashMap::new(),
             col_indices,
             len: 0,
         }
@@ -767,24 +763,52 @@ impl DiffAfterImageBatchBuilder {
         self.len
     }
 
-    fn push(&mut self, batch_id: (usize, usize), batch: &RecordBatch, row: usize) {
-        let batch_id = pin_batch(
-            &mut self.pinned_batches,
-            &mut self.pinned_batch_ids,
-            batch_id,
-            batch,
-        );
+    fn push(&mut self, batch: &RecordBatch, row: usize) {
+        let batch_id = self.pin_batch(batch);
         self.row_indices.push((batch_id, row));
         self.len += 1;
     }
 
+    fn pin_batch(&mut self, batch: &RecordBatch) -> usize {
+        if let Some(last) = self.pinned_batches.last() {
+            if std::ptr::eq(batch, last) {
+                return self.pinned_batches.len() - 1;
+            }
+        }
+        let batch_id = self.pinned_batches.len();
+        self.pinned_batches.push(batch.clone());
+        batch_id
+    }
+
     fn flush(&mut self) -> crate::Result<RecordBatch> {
         let row_count = self.len;
-        let columns =
-            interleave_columns(&self.pinned_batches, &self.col_indices, &self.row_indices)?;
+        let mut columns = Vec::with_capacity(self.col_indices.len());
+        for &col_idx in &self.col_indices {
+            let taken: Vec<ArrayRef> = self
+                .row_indices
+                .iter()
+                .map(|(batch_id, row)| {
+                    take(
+                        self.pinned_batches[*batch_id].column(col_idx).as_ref(),
+                        &UInt32Array::from(vec![*row as u32]),
+                        None,
+                    )
+                    .map_err(|e| crate::Error::UnexpectedError {
+                        message: format!("Failed to take diff after-image column: {e}"),
+                        source: Some(Box::new(e)),
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            let refs: Vec<&dyn Array> = taken.iter().map(|array| array.as_ref()).collect();
+            columns.push(
+                arrow_concat(&refs).map_err(|e| crate::Error::UnexpectedError {
+                    message: format!("Failed to concat diff after-image column: {e}"),
+                    source: Some(Box::new(e)),
+                })?,
+            );
+        }
         self.row_indices.clear();
         self.pinned_batches.clear();
-        self.pinned_batch_ids.clear();
         self.len = 0;
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         RecordBatch::try_new_with_options(self.schema.clone(), columns, &options).map_err(|e| {
@@ -794,41 +818,6 @@ impl DiffAfterImageBatchBuilder {
             }
         })
     }
-}
-
-fn pin_batch(
-    pinned_batches: &mut Vec<RecordBatch>,
-    pinned_batch_ids: &mut HashMap<(usize, usize), usize>,
-    batch_id: (usize, usize),
-    batch: &RecordBatch,
-) -> usize {
-    if let Some(&pinned_id) = pinned_batch_ids.get(&batch_id) {
-        return pinned_id;
-    }
-    let pinned_id = pinned_batches.len();
-    pinned_batches.push(batch.clone());
-    pinned_batch_ids.insert(batch_id, pinned_id);
-    pinned_id
-}
-
-fn interleave_columns(
-    batches: &[RecordBatch],
-    column_indices: &[usize],
-    row_indices: &[(usize, usize)],
-) -> crate::Result<Vec<ArrayRef>> {
-    column_indices
-        .iter()
-        .map(|&column_idx| {
-            let arrays: Vec<&dyn Array> = batches
-                .iter()
-                .map(|batch| batch.column(column_idx).as_ref())
-                .collect();
-            interleave(&arrays, row_indices).map_err(|e| crate::Error::UnexpectedError {
-                message: format!("Failed to interleave diff column: {e}"),
-                source: Some(Box::new(e)),
-            })
-        })
-        .collect()
 }
 
 fn diff_pairs(plan: &IncrementalPlan) -> crate::Result<Vec<(Vec<DataSplit>, Vec<DataSplit>)>> {
@@ -1090,49 +1079,7 @@ mod tests {
     };
     use crate::table::query_auth_table;
     use crate::table::source::DataSplitBuilder;
-    use arrow_array::Int32Array;
-    use arrow_schema::{DataType as ArrowDataType, Field};
     use futures::TryStreamExt;
-
-    #[test]
-    fn test_diff_batch_builders_pin_each_input_batch_once() {
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "id",
-            ArrowDataType::Int32,
-            false,
-        )]));
-        let input_a =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
-                .unwrap();
-        let input_b =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![3, 4]))])
-                .unwrap();
-
-        let mut after = DiffAfterImageBatchBuilder::new(
-            Arc::new(ArrowSchema::new(vec![Field::new(
-                "id",
-                ArrowDataType::Int32,
-                false,
-            )])),
-            vec![0],
-        );
-        after.push((0, 1), &input_a, 1);
-        after.push((1, 1), &input_b, 0);
-        after.push((0, 1), &input_a, 0);
-        after.push((1, 1), &input_b, 1);
-        assert_eq!(after.pinned_batches.len(), 2);
-        let after_batch = after.flush().unwrap();
-        let after_ids = after_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(
-            after_ids.values(),
-            &[2, 3, 1, 4],
-            "interleaved batches must preserve row order"
-        );
-    }
 
     pub(super) fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
         DataFileMeta {

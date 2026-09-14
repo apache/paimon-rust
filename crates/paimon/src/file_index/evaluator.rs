@@ -186,7 +186,9 @@ fn devolve_literals(
     if same_type_ignoring_nullability(table_type, data_type) {
         return Some(literals.to_vec());
     }
-    if !is_integer_type(table_type) || !is_integer_type(data_type) {
+    // Narrowing can turn non-null file values into NULL, so reject it even for
+    // predicates without literals, such as IS NULL and IS NOT NULL.
+    if integer_width(table_type)? <= integer_width(data_type)? {
         return None;
     }
     literals
@@ -208,11 +210,14 @@ fn same_type_ignoring_nullability(left: &DataType, right: &DataType) -> bool {
     }
 }
 
-fn is_integer_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::TinyInt(_) | DataType::SmallInt(_) | DataType::Int(_) | DataType::BigInt(_)
-    )
+fn integer_width(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::TinyInt(_) => Some(8),
+        DataType::SmallInt(_) => Some(16),
+        DataType::Int(_) => Some(32),
+        DataType::BigInt(_) => Some(64),
+        _ => None,
+    }
 }
 
 fn integer_value(data_type: &DataType, datum: &Datum) -> Option<i64> {
@@ -262,7 +267,8 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{
-        BigIntType, FloatType, IntType, PredicateBuilder, PredicateOperator, VarCharType,
+        BigIntType, FloatType, IntType, PredicateBuilder, PredicateOperator, SmallIntType,
+        TinyIntType, VarCharType,
     };
 
     fn field(id: i32, name: &str, data_type: DataType) -> DataField {
@@ -335,6 +341,122 @@ mod tests {
                 && index == expected_index
                 && literals == vec![Datum::Int(expected_literal)]
         ));
+    }
+
+    #[test]
+    fn test_devolve_literals_preserves_safe_integer_schema_changes() {
+        let types = [
+            (
+                DataType::TinyInt(TinyIntType::new()),
+                i64::from(i8::MIN),
+                i64::from(i8::MAX),
+            ),
+            (
+                DataType::SmallInt(SmallIntType::new()),
+                i64::from(i16::MIN),
+                i64::from(i16::MAX),
+            ),
+            (
+                DataType::Int(IntType::new()),
+                i64::from(i32::MIN),
+                i64::from(i32::MAX),
+            ),
+            (DataType::BigInt(BigIntType::new()), i64::MIN, i64::MAX),
+        ];
+        for (data_index, (data_type, min, max)) in types.iter().enumerate() {
+            let literals = vec![
+                integer_datum(data_type, *min).unwrap(),
+                integer_datum(data_type, *max).unwrap(),
+            ];
+            for table_nullable in [false, true] {
+                for data_nullable in [false, true] {
+                    let table_type = data_type.copy_with_nullable(table_nullable).unwrap();
+                    let data_type = data_type.copy_with_nullable(data_nullable).unwrap();
+                    assert_eq!(
+                        devolve_literals(&table_type, &data_type, &literals),
+                        Some(literals.clone())
+                    );
+                    assert_eq!(devolve_literals(&table_type, &data_type, &[]), Some(vec![]));
+                }
+            }
+            for (table_type, _, _) in &types[data_index + 1..] {
+                let table_literals = vec![
+                    integer_datum(table_type, *min).unwrap(),
+                    integer_datum(table_type, *max).unwrap(),
+                ];
+                assert_eq!(
+                    devolve_literals(table_type, data_type, &table_literals),
+                    Some(literals.clone())
+                );
+                assert_eq!(devolve_literals(table_type, data_type, &[]), Some(vec![]));
+                for overflow in [min - 1, max + 1] {
+                    let mut mixed_literals = table_literals.clone();
+                    mixed_literals.push(integer_datum(table_type, overflow).unwrap());
+                    assert_eq!(
+                        devolve_literals(table_type, data_type, &mixed_literals),
+                        None
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_remap_predicate_falls_back_for_narrowing_integer_schema_changes() {
+        let types = [
+            (DataType::TinyInt(TinyIntType::new()), Datum::TinyInt(127)),
+            (
+                DataType::SmallInt(SmallIntType::new()),
+                Datum::SmallInt(127),
+            ),
+            (DataType::Int(IntType::new()), Datum::Int(127)),
+            (DataType::BigInt(BigIntType::new()), Datum::Long(127)),
+        ];
+        for (table_index, (table_type, literal)) in types.iter().enumerate() {
+            let table_fields = vec![field(0, "value", table_type.clone())];
+            let builder = PredicateBuilder::new(&table_fields);
+            for (data_type, _) in &types[table_index + 1..] {
+                let data_fields = vec![field(0, "value", data_type.clone())];
+                for predicate in [
+                    builder.equal("value", literal.clone()).unwrap(),
+                    builder.is_null("value").unwrap(),
+                    builder.is_not_null("value").unwrap(),
+                ] {
+                    assert!(
+                        remap_predicate(&table_fields, &data_fields, &predicate).is_none(),
+                        "{data_type:?} -> {table_type:?}: {predicate:?} must fall back"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_remap_narrowing_predicate_keeps_safe_and_child_but_rejects_or_and_not() {
+        let table_fields = vec![
+            field(0, "id", DataType::Int(IntType::new())),
+            field(1, "value", DataType::TinyInt(TinyIntType::new())),
+        ];
+        let data_fields = vec![
+            table_fields[0].clone(),
+            field(1, "value", DataType::Int(IntType::new())),
+        ];
+        let builder = PredicateBuilder::new(&table_fields);
+        let safe = builder.equal("id", Datum::Int(1)).unwrap();
+        let narrowing = builder.is_null("value").unwrap();
+        let combined = Predicate::and(vec![safe.clone(), narrowing.clone()]);
+
+        assert_eq!(
+            remap_predicate(&table_fields, &data_fields, &combined),
+            Some(safe.clone())
+        );
+        for predicate in [
+            Predicate::or(vec![safe, narrowing.clone()]),
+            Predicate::negate(narrowing),
+            Predicate::negate(combined),
+        ] {
+            assert!(remap_predicate(&table_fields, &data_fields, &predicate).is_none());
+        }
     }
 
     #[test]

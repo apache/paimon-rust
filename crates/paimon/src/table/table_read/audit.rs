@@ -18,9 +18,9 @@
 //! Audit row kinds, projection and current/incremental read policy.
 
 use super::{
-    cursor_cmp, diff_pairs, ensure_diff_supported_read_type, interleave_columns, pin_batch,
-    primary_key_indices, value_indices_for_diff, ArrowCursor, CursorOrd, PaimonTableRead,
-    TableRead, TableReadKind, DIFF_BATCH_SIZE, MAX_MERGE_INPUT_STREAMS,
+    cursor_cmp, diff_pairs, ensure_diff_supported_read_type, primary_key_indices,
+    value_indices_for_diff, ArrowCursor, CursorOrd, PaimonTableRead, TableRead, TableReadKind,
+    DIFF_BATCH_SIZE, MAX_MERGE_INPUT_STREAMS,
 };
 use crate::arrow::build_target_arrow_schema;
 use crate::spec::{
@@ -37,6 +37,7 @@ use arrow_array::{
     builder::StringBuilder, Array, ArrayRef, RecordBatch, RecordBatchOptions, StringArray,
 };
 use arrow_schema::Schema as ArrowSchema;
+use arrow_select::interleave::interleave;
 use futures::{stream, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -399,8 +400,8 @@ impl<'a> AuditLogRead<'a> {
                 pair_read.read_pk_sorted_for_diff_with_type(&before, &core_options, &diff_read_type)?;
             let after_stream =
                 pair_read.read_pk_sorted_for_diff_with_type(&after, &core_options, &diff_read_type)?;
-            let mut bc = ArrowCursor::new(before_stream, 0).await?;
-            let mut ac = ArrowCursor::new(after_stream, 1).await?;
+            let mut bc = ArrowCursor::new(before_stream).await?;
+            let mut ac = ArrowCursor::new(after_stream).await?;
             let mut data_col_indices: Option<Vec<usize>> = None;
             let mut builder = AuditBatchBuilder::new(audit_schema.clone());
 
@@ -419,11 +420,11 @@ impl<'a> AuditLogRead<'a> {
                 }
                 match cursor_cmp(&bc, &ac, &key_indices, &value_indices)? {
                     CursorOrd::BeforeOnly => {
-                        builder.push("-D", bc.batch_id(), bc.batch(), bc.row());
+                        builder.push("-D", (0, bc.batch_id()), bc.batch(), bc.row());
                         bc.advance().await?;
                     }
                     CursorOrd::AfterOnly => {
-                        builder.push("+I", ac.batch_id(), ac.batch(), ac.row());
+                        builder.push("+I", (1, ac.batch_id()), ac.batch(), ac.row());
                         ac.advance().await?;
                     }
                     CursorOrd::EqualSame => {
@@ -431,8 +432,8 @@ impl<'a> AuditLogRead<'a> {
                         ac.advance().await?;
                     }
                     CursorOrd::EqualDiff => {
-                        builder.push("-U", bc.batch_id(), bc.batch(), bc.row());
-                        builder.push("+U", ac.batch_id(), ac.batch(), ac.row());
+                        builder.push("-U", (0, bc.batch_id()), bc.batch(), bc.row());
+                        builder.push("+U", (1, ac.batch_id()), ac.batch(), ac.row());
                         bc.advance().await?;
                         ac.advance().await?;
                     }
@@ -793,6 +794,41 @@ impl AuditBatchBuilder {
             }
         })
     }
+}
+
+fn pin_batch(
+    pinned_batches: &mut Vec<RecordBatch>,
+    pinned_batch_ids: &mut HashMap<(usize, usize), usize>,
+    batch_id: (usize, usize),
+    batch: &RecordBatch,
+) -> usize {
+    if let Some(&pinned_id) = pinned_batch_ids.get(&batch_id) {
+        return pinned_id;
+    }
+    let pinned_id = pinned_batches.len();
+    pinned_batches.push(batch.clone());
+    pinned_batch_ids.insert(batch_id, pinned_id);
+    pinned_id
+}
+
+fn interleave_columns(
+    batches: &[RecordBatch],
+    column_indices: &[usize],
+    row_indices: &[(usize, usize)],
+) -> crate::Result<Vec<ArrayRef>> {
+    column_indices
+        .iter()
+        .map(|&column_idx| {
+            let arrays: Vec<&dyn Array> = batches
+                .iter()
+                .map(|batch| batch.column(column_idx).as_ref())
+                .collect();
+            interleave(&arrays, row_indices).map_err(|e| crate::Error::UnexpectedError {
+                message: format!("Failed to interleave diff column: {e}"),
+                source: Some(Box::new(e)),
+            })
+        })
+        .collect()
 }
 
 fn diff_output_col_indices(

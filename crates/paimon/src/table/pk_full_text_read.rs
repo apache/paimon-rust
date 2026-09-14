@@ -34,7 +34,7 @@ use crate::table::pk_full_text_bucket_search::search_bucket;
 use crate::table::pk_full_text_scan::{PrimaryKeyFullTextScanPlan, PrimaryKeyFullTextSearchSplit};
 use crate::table::pk_vector_indexed_split_read::{PkVectorIndexedSplit, PkVectorIndexedSplitRead};
 use crate::table::source::DataSplitBuilder;
-use crate::table::vector_search_builder::{
+use crate::table::vector_search_common::{
     collect_ranked_rows, reorder_and_strip_position, RankedRow,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange};

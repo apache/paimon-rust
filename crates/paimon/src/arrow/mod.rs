@@ -17,6 +17,7 @@
 
 pub(crate) mod filtering;
 pub(crate) mod format;
+pub(crate) mod nested_evolution;
 mod parquet_read_budget;
 pub(crate) mod residual;
 mod row_filter;
