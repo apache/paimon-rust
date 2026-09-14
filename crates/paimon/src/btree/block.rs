@@ -85,7 +85,7 @@ pub(crate) fn compress_block(
         return Ok((Cow::Borrowed(data), BlockCompressionType::None));
     }
 
-    let mut encoded = Vec::with_capacity(13 + data.len());
+    let mut encoded = Vec::with_capacity(5);
     encode_var_int(&mut encoded, block_length(data.len())?)?;
     append_codec_envelope(&mut encoded, data, compression_type, compression_level)?;
     Ok(retain_if_smaller(encoded, data, compression_type))
@@ -104,7 +104,7 @@ pub(crate) fn compress_codec_block(
         return Ok((Cow::Borrowed(data), BlockCompressionType::None));
     }
 
-    let mut encoded = Vec::with_capacity(8 + data.len());
+    let mut encoded = Vec::new();
     append_codec_envelope(&mut encoded, data, compression_type, compression_level)?;
     Ok(retain_if_smaller(encoded, data, compression_type))
 }
@@ -135,6 +135,7 @@ fn append_codec_envelope(
         compression_type,
         BlockCompressionType::Lz4 | BlockCompressionType::Lzo
     ) {
+        encoded.reserve(8 + payload.len());
         encoded.extend_from_slice(
             &i32::try_from(payload.len())
                 .map_err(|_| {
@@ -146,6 +147,8 @@ fn append_codec_envelope(
                 .to_le_bytes(),
         );
         encoded.extend_from_slice(&block_length(data.len())?.to_le_bytes());
+    } else {
+        encoded.reserve(payload.len());
     }
     encoded.extend_from_slice(&payload);
     Ok(())
