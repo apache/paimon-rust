@@ -20,7 +20,7 @@ use super::extraction::{
     validate_vector_batch_ranges,
 };
 use super::planning::{ivf_training_seed, plan_ivf_training_ranges, VindexIndexShard};
-use super::timing::{log_read_phase, vector_index_build_timing_enabled, VectorIndexBuildTiming};
+use super::timing::{vector_index_build_timing_enabled, VectorIndexBuildTiming};
 use super::validation::{
     checked_i64, checked_row_count, checked_std_vector_bytes, checked_training_sample_index,
     checked_training_vector_count, checked_vector_bytes,
@@ -53,62 +53,24 @@ pub(super) struct BuiltIndexFile {
 }
 
 impl<'a> VindexIndexBuildBuilder<'a> {
-    pub(super) async fn build_index_file(
+    /// Plans sparse training reads, falling back when the optional file probe fails.
+    pub(super) async fn sparse_training_ranges(
         &self,
         shard: &VindexIndexShard,
         index_column: &str,
-        dimension: i32,
-        index_field_id: i32,
-        options: &VindexVectorIndexOptions,
-        index_meta: Vec<u8>,
-    ) -> Result<BuiltIndexFile> {
-        let timing_enabled = vector_index_build_timing_enabled();
-        let total_start = timing_enabled.then(Instant::now);
-        let mut source_batch_wait = Duration::ZERO;
-        let mut raw_temp_write = Duration::ZERO;
-        let read_timing = timing_enabled.then(|| Arc::new(DataFileReadTiming::default()));
-        let parquet_read_budget = if timing_enabled {
-            let budget = configured_parquet_read_budget(self.table)?;
-            budget.enable_diagnostics();
-            Some(budget)
-        } else {
-            None
-        };
-        let mut batch_count = 0usize;
+        training_rows_retained: usize,
+    ) -> Result<Option<Vec<RowRange>>> {
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
         let row_count_usize = usize::try_from(row_count).map_err(|e| Error::DataInvalid {
             message: format!("Invalid vindex row count: {row_count}"),
             source: Some(Box::new(e)),
         })?;
-        let dimension_usize = usize::try_from(dimension).map_err(|e| Error::DataInvalid {
-            message: format!("Invalid vindex dimension: {dimension}"),
-            source: Some(Box::new(e)),
-        })?;
-        if dimension_usize == 0 {
-            return Err(Error::DataInvalid {
-                message: "vindex vector dimension must be positive".to_string(),
-                source: None,
-            });
-        }
-        let expected_bytes = checked_vector_bytes(row_count_usize, dimension_usize)?;
-        let training_vector_count =
-            checked_training_vector_count(row_count_usize, options.train_sample_ratio)?;
-        let training_rows_retained = if self.index_type == DISKANN_IDENTIFIER {
-            0
-        } else {
-            // This only gates sparse reads; errors must preserve the full-scan fallback.
-            default_training_vector_count(training_vector_count, options.config.nlist())
-                .unwrap_or(0)
-        };
         let mut sparse_ranges =
             if training_rows_retained > 0 && training_rows_retained < row_count_usize {
                 plan_ivf_training_ranges(shard, training_rows_retained)?
             } else {
                 None
             };
-        let capability_start = (timing_enabled && sparse_ranges.is_some()).then(Instant::now);
-        let capability_read_timing =
-            capability_start.map(|_| Arc::new(DataFileReadTiming::default()));
         if let Some(ranges) = sparse_ranges.as_ref() {
             let mut checks = Vec::new();
             let mut usable = true;
@@ -157,27 +119,31 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     .core_options()
                     .parquet_row_group_parallelism()?;
                 let file_io = self.table.file_io();
-                let timing = capability_read_timing.as_ref();
                 let mut checks = futures::stream::iter(checks)
                     .map(|(path, file_size, local_ranges)| async move {
                         let input = file_io.new_input(&path)?;
-                        let open_start = timing.map(|_| Instant::now());
                         let reader = Box::new(input.reader().await?);
-                        if let (Some(timing), Some(start)) = (timing, open_start) {
-                            timing.add_file_read(start.elapsed());
-                        }
-                        let reader = match timing {
-                            Some(timing) => timing.wrap_reader(reader),
-                            None => reader,
-                        };
                         has_beneficial_offset_index(reader, file_size, index_column, &local_ranges)
                             .await
                     })
                     .buffer_unordered(concurrency);
-                while let Some(file_usable) = checks.try_next().await? {
-                    if !file_usable {
-                        usable = false;
-                        break;
+                while let Some(result) = checks.next().await {
+                    match result {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            usable = false;
+                            break;
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "vindex sparse training probe failed for column '{}' in shard [{}, {}]; falling back to a full scan: {}",
+                                index_column,
+                                shard.row_range_start,
+                                shard.row_range_end,
+                                error,
+                            );
+                            return Ok(None);
+                        }
                     }
                 }
             }
@@ -191,10 +157,61 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 sparse_ranges = None;
             }
         }
-        let capability_check = capability_start.map_or(Duration::ZERO, |start| start.elapsed());
-        if let Some(timing) = capability_read_timing.as_ref() {
-            log_read_phase("probe", shard, timing, Default::default());
+        Ok(sparse_ranges)
+    }
+
+    pub(super) async fn build_index_file(
+        &self,
+        shard: &VindexIndexShard,
+        index_column: &str,
+        dimension: i32,
+        index_field_id: i32,
+        options: &VindexVectorIndexOptions,
+        index_meta: Vec<u8>,
+    ) -> Result<BuiltIndexFile> {
+        let timing_enabled = vector_index_build_timing_enabled();
+        let total_start = timing_enabled.then(Instant::now);
+        let mut source_batch_wait = Duration::ZERO;
+        let mut raw_temp_write = Duration::ZERO;
+        let read_timing = timing_enabled.then(|| Arc::new(DataFileReadTiming::default()));
+        let parquet_read_budget = if timing_enabled {
+            let budget = configured_parquet_read_budget(self.table)?;
+            budget.enable_diagnostics();
+            Some(budget)
+        } else {
+            None
+        };
+        let mut batch_count = 0usize;
+        let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
+        let row_count_usize = usize::try_from(row_count).map_err(|e| Error::DataInvalid {
+            message: format!("Invalid vindex row count: {row_count}"),
+            source: Some(Box::new(e)),
+        })?;
+        let dimension_usize = usize::try_from(dimension).map_err(|e| Error::DataInvalid {
+            message: format!("Invalid vindex dimension: {dimension}"),
+            source: Some(Box::new(e)),
+        })?;
+        if dimension_usize == 0 {
+            return Err(Error::DataInvalid {
+                message: "vindex vector dimension must be positive".to_string(),
+                source: None,
+            });
         }
+        let expected_bytes = checked_vector_bytes(row_count_usize, dimension_usize)?;
+        let training_vector_count =
+            checked_training_vector_count(row_count_usize, options.train_sample_ratio)?;
+        let training_rows_retained = if self.index_type == DISKANN_IDENTIFIER {
+            0
+        } else {
+            // This only gates sparse reads; errors must preserve the full-scan fallback.
+            default_training_vector_count(training_vector_count, options.config.nlist())
+                .unwrap_or(0)
+        };
+        let capability_start = timing_enabled.then(Instant::now);
+        let sparse_ranges = self
+            .sparse_training_ranges(shard, index_column, training_rows_retained)
+            .await?;
+        let capability_check = capability_start.map_or(Duration::ZERO, |start| start.elapsed());
         if let Some(budget) = parquet_read_budget.as_ref() {
             eprintln!(
                 "event=paimon_vector_index_build_plan snapshot_id={} row_range_start={} row_range_end={} source_bucket={} sparse={} training_seed={} training_range_count={} parquet_row_group_parallelism={} parquet_max_inflight_bytes={}",
@@ -217,19 +234,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             })?;
         let mut sample_read = Duration::ZERO;
         let mut full_scan_add = Duration::ZERO;
-        let mut pipeline_blocked = Duration::ZERO;
-        let mut producer_blocked = Duration::ZERO;
-        let mut consumer_validate_add = Duration::ZERO;
-        let mut batch_bytes_min = 0usize;
-        let mut batch_bytes_max = 0usize;
-        let mut batch_bytes_total = 0usize;
-        let mut peak_ready_batches = 0usize;
         let raw_temp_reread;
         let index_add;
         let train_finish;
         let mut bytes_written = 0usize;
         let training_rows_seen;
-        let mut sample_io = Default::default();
 
         let writer = if let Some(ranges) = sparse_ranges {
             let sample_start = timing_enabled.then(Instant::now);
@@ -283,9 +292,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             }
             training_rows_seen = rows_seen;
             sample_read = sample_start.map_or(Duration::ZERO, |start| start.elapsed());
-            if let Some(timing) = read_timing.as_ref() {
-                sample_io = log_read_phase("sample", shard, timing, Default::default());
-            }
 
             let train_start = timing_enabled.then(Instant::now);
             let training = tokio::task::spawn_blocking(move || trainer.finish())
@@ -332,24 +338,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 let mut expected_row_id = row_range_start;
                 let mut rows_added = 0usize;
                 let mut batches_added = 0usize;
-                let mut blocked = Duration::ZERO;
-                let mut validate_add = Duration::ZERO;
-                let mut batch_bytes_min = usize::MAX;
-                let mut batch_bytes_max = 0usize;
-                let mut batch_bytes_total = 0usize;
                 let mut ids = Vec::new();
-                loop {
-                    let wait_start = timing_enabled.then(Instant::now);
-                    let batch = receiver.blocking_recv();
-                    if let Some(start) = wait_start {
-                        blocked = blocked.saturating_add(start.elapsed());
-                    }
-                    let Some(batch) = batch else { break };
-                    let validate_add_start = timing_enabled.then(Instant::now);
-                    let batch_bytes = batch.get_array_memory_size();
-                    batch_bytes_min = batch_bytes_min.min(batch_bytes);
-                    batch_bytes_max = batch_bytes_max.max(batch_bytes);
-                    batch_bytes_total = batch_bytes_total.saturating_add(batch_bytes);
+                while let Some(batch) = receiver.blocking_recv() {
                     let vectors = validate_vector_batch(
                         &batch,
                         &index_column,
@@ -375,27 +365,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                             message: format!("Failed to add vectors to vindex index: {e}"),
                             source: Some(Box::new(e)),
                         })?;
-                    if let Some(start) = validate_add_start {
-                        validate_add = validate_add.saturating_add(start.elapsed());
-                    }
                     rows_added = batch_end;
                     batches_added += 1;
                 }
-                Ok((
-                    writer,
-                    rows_added,
-                    expected_row_id,
-                    batches_added,
-                    blocked,
-                    validate_add,
-                    if batches_added == 0 {
-                        0
-                    } else {
-                        batch_bytes_min
-                    },
-                    batch_bytes_max,
-                    batch_bytes_total,
-                ))
+                Ok((writer, rows_added, expected_row_id, batches_added))
             });
 
             let mut producer_error = None;
@@ -413,33 +386,17 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                         break;
                     }
                 };
-                let send_start = timing_enabled.then(Instant::now);
-                let send_result = sender.send(batch).await;
-                if let Some(start) = send_start {
-                    producer_blocked = producer_blocked.saturating_add(start.elapsed());
-                }
-                if send_result.is_err() {
+                if sender.send(batch).await.is_err() {
                     break;
                 }
-                peak_ready_batches = peak_ready_batches
-                    .max(READ_ADD_QUEUE_CAPACITY.saturating_sub(sender.capacity()));
             }
             drop(sender);
             let consumer_result = consumer.await;
-            let (
-                writer,
-                rows_added,
-                next_row_id,
-                batches_added,
-                blocked,
-                validate_add,
-                min_bytes,
-                max_bytes,
-                total_bytes,
-            ) = consumer_result.map_err(|e| Error::UnexpectedError {
-                message: format!("vindex add task failed: {e}"),
-                source: None,
-            })??;
+            let (writer, rows_added, next_row_id, batches_added) =
+                consumer_result.map_err(|e| Error::UnexpectedError {
+                    message: format!("vindex add task failed: {e}"),
+                    source: None,
+                })??;
             if let Some(error) = producer_error {
                 return Err(error);
             }
@@ -452,11 +409,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 });
             }
             batch_count = batches_added;
-            pipeline_blocked = blocked;
-            consumer_validate_add = validate_add;
-            batch_bytes_min = min_bytes;
-            batch_bytes_max = max_bytes;
-            batch_bytes_total = total_bytes;
             full_scan_add = full_scan_start.map_or(Duration::ZERO, |start| start.elapsed());
             raw_temp_reread = Duration::ZERO;
             index_add = Duration::ZERO;
@@ -703,10 +655,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             result.0
         };
 
-        if let Some(timing) = read_timing.as_ref() {
-            log_read_phase("full_scan", shard, timing, sample_io);
-        }
-
         let serialize_upload_start = timing_enabled.then(Instant::now);
         self.table
             .file_io()
@@ -783,9 +731,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             .map_or((Duration::ZERO, Duration::ZERO), |timing| {
                 (timing.file_read(), timing.parquet_decode())
             });
-        let (oss_read_bytes, oss_range_requests) = read_timing
-            .as_ref()
-            .map_or((0, 0), |timing| timing.file_io());
         let (file_schema_open, first_batch_wait, remaining_batch_wait) = read_timing
             .as_ref()
             .map_or((Duration::ZERO, Duration::ZERO, Duration::ZERO), |timing| {
@@ -798,8 +743,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             total_without_commit: start.elapsed(),
             source_batch_wait,
             oss_read,
-            oss_read_bytes,
-            oss_range_requests,
             parquet_decode,
             file_schema_open,
             first_batch_wait,
@@ -816,18 +759,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             raw_temp_reread,
             index_add,
             full_scan_add,
-            pipeline_blocked,
-            producer_blocked,
-            consumer_validate_add,
             serialize_upload,
             rows: row_count_usize,
             training_rows_seen,
             training_rows_retained,
             batch_count,
-            batch_bytes_min,
-            batch_bytes_max,
-            batch_bytes_total,
-            peak_ready_batches,
             raw_temp_bytes: bytes_written,
             index_bytes: status.size,
             data_file_count: shard.files.len(),
