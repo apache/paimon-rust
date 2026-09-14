@@ -439,6 +439,12 @@ fn plan_from_bucket_splits(
             "bucket-split planning requires at least one bucket split",
         ));
     }
+    // Sync, so the split's marker stands in for asking the server, as in `to_arrow`.
+    if splits.iter().any(|s| s.data_split().query_auth_required()) {
+        return Err(crate::table::query_auth::unsupported(
+            "an engine-planned vector split of such a table carries no authorization",
+        ));
+    }
 
     let mut snapshot_id: Option<i64> = None;
     let mut seen_buckets: HashSet<BucketKey> = HashSet::new();
@@ -1320,6 +1326,29 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_marked_engine_split_is_refused() {
+        let data_split = DataSplitBuilder::new()
+            .with_snapshot(11)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(vec![dfm("d0", 5, 5, Some(1))])
+            .build()
+            .unwrap()
+            .planned(None);
+        let split = BucketVectorSearchSplit::new_for_test(data_split, vec![], Default::default());
+        let Err(err) = plan_from_bucket_splits("ivf-pq", 2, None, "/tbl", false, vec![split])
+        else {
+            panic!("a marked split must not plan")
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
+            "{err:?}"
+        );
     }
 
     #[test]
