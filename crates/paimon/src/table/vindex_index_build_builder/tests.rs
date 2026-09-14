@@ -195,7 +195,15 @@ fn test_ivf_training_ranges_fall_back_for_a_single_range_sample() {
     .unwrap()
     .remove(0);
 
-    assert!(plan_ivf_training_ranges(&shard, 128).unwrap().is_none());
+    for rows in [1, 127, 128] {
+        assert!(plan_ivf_training_ranges(&shard, rows).unwrap().is_none());
+    }
+    let ranges = plan_ivf_training_ranges(&shard, 129).unwrap().unwrap();
+    assert_eq!(ranges.iter().map(RowRange::count).sum::<i64>(), 129);
+    assert!(ranges
+        .iter()
+        .all(|range| range.from() >= 100 && range.to() < 1_100));
+    assert!(ranges.windows(2).all(|pair| pair[0].to() < pair[1].from()));
 }
 
 #[test]
@@ -915,6 +923,72 @@ fn vindex_build_logs_read_phases() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn vindex_small_training_sample_preserves_tail_cluster_recall() {
+    let table_path = "memory:/test_vindex_small_sample_recall";
+    let mut options = table_options("1000");
+    for (key, value) in [
+        ("ivf-sq.dimension", "1"),
+        ("ivf-sq.nlist", "1"),
+        ("ivf-sq.metric", "l2"),
+        ("ivf-sq.train.sample-ratio", "0.1"),
+    ] {
+        options.insert(key.to_string(), value.to_string());
+    }
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        table_path,
+        vindex_schema_builder(options).build().unwrap(),
+    );
+    setup_dirs(table.file_io(), table_path).await;
+    write_vectors(
+        &table,
+        (0..1000).collect(),
+        (0..1000)
+            .map(|id| {
+                vec![if id < 450 {
+                    0.0
+                } else if id < 900 {
+                    1.0
+                } else {
+                    100.0
+                }]
+            })
+            .collect(),
+    )
+    .await;
+    assert_eq!(
+        table
+            .new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![100.0])
+        .with_limit(10)
+        .with_options(HashMap::from([(
+            "ivf-sq.nprobe".to_string(),
+            "1".to_string(),
+        )]))
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.iter().map(RowRange::count).sum::<i64>(), 10);
+    // Equal-distance IDs need not have a stable order; all hits must be in the tail cluster.
+    assert!(
+        result
+            .iter()
+            .all(|range| range.from() >= 900 && range.to() < 1000),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]

@@ -171,7 +171,9 @@ fn metadata_has_beneficial_offset_index(
             selected_bytes = total;
         }
     }
-    checked && selected_bytes < full_bytes
+    // Sparse training is followed by a full scan, so require it to skip at
+    // least half of the projected bytes instead of accepting marginal savings.
+    checked && selected_bytes <= full_bytes / 2
 }
 
 enum ParquetRowGroupMessage {
@@ -3088,6 +3090,22 @@ mod tests {
         let projected_bytes = super::projected_row_group_bytes(&row_group, &projection);
 
         assert_eq!(projected_bytes, 308 * MIB as u64);
+        let budget = ParquetReadBudget::new(8, 256 * MIB as u64).unwrap();
+        budget.enable_diagnostics();
+        let permit = budget.acquire(projected_bytes).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), budget.acquire(1))
+                .await
+                .is_err()
+        );
+        drop(permit);
+        let permit = tokio::time::timeout(Duration::from_secs(1), budget.acquire(projected_bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.diagnostics().peak_inflight, 1);
+        drop(permit);
+        assert_eq!(budget.diagnostics().current_inflight, 0);
     }
 
     #[tokio::test]
@@ -3694,8 +3712,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_sparse_row_selection_requires_offset_index_and_page_savings() {
+        let bytes = write_multi_row_group_parquet(10, 30, EnabledStatistics::Chunk, false).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        assert!(
+            !metadata_has_beneficial_offset_index(&metadata, "value", &[RowRange::new(0, 19)]),
+            "reading two of three row groups is not sufficiently sparse"
+        );
+
         let bytes = write_multi_page_parquet(10, 80).await;
         let metadata = load_metadata_with_page_index(&bytes, true);
+        assert!(!metadata_has_beneficial_offset_index(
+            &metadata,
+            "value",
+            &[RowRange::new(0, 69)]
+        ));
         assert!(!metadata_has_beneficial_offset_index(
             &metadata,
             "value",
@@ -3812,6 +3842,26 @@ mod tests {
     struct TrackingFileRead {
         data: Bytes,
         ranges: Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
+        resident_bytes: Arc<AtomicUsize>,
+        peak_resident_bytes: Arc<AtomicUsize>,
+    }
+
+    struct TrackedReadBuffer {
+        data: Box<[u8]>,
+        resident_bytes: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for TrackedReadBuffer {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+
+    impl Drop for TrackedReadBuffer {
+        fn drop(&mut self) {
+            self.resident_bytes
+                .fetch_sub(self.data.len(), AtomicOrdering::SeqCst);
+        }
     }
 
     impl TrackingFileRead {
@@ -3819,6 +3869,8 @@ mod tests {
             Self {
                 data,
                 ranges: Arc::new(std::sync::Mutex::new(Vec::new())),
+                resident_bytes: Arc::new(AtomicUsize::new(0)),
+                peak_resident_bytes: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -3840,7 +3892,135 @@ mod tests {
     impl crate::io::FileRead for TrackingFileRead {
         async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
             self.ranges.lock().unwrap().push(range.clone());
-            Ok(self.data.slice(range.start as usize..range.end as usize))
+            // Count each source allocation until its last slice is dropped, not slice lengths.
+            let data = self.data[range.start as usize..range.end as usize]
+                .to_vec()
+                .into_boxed_slice();
+            let current = self
+                .resident_bytes
+                .fetch_add(data.len(), AtomicOrdering::SeqCst)
+                + data.len();
+            self.peak_resident_bytes
+                .fetch_max(current, AtomicOrdering::SeqCst);
+            Ok(Bytes::from_owner(TrackedReadBuffer {
+                data,
+                resident_bytes: Arc::clone(&self.resident_bytes),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sparse_read_buffer_owners_and_cancellation() {
+        use crate::io::FileRead;
+        use rand::{RngCore, SeedableRng};
+
+        const MIB: usize = 1024 * 1024;
+        const GROUP_ROWS: usize = 2 * MIB;
+        const PAGE_ROWS: usize = 64 * 1024;
+        const BUDGET: usize = 20 * MIB;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(GROUP_ROWS))
+            .set_data_page_size_limit(usize::MAX)
+            .set_data_page_row_count_limit(PAGE_ROWS)
+            .set_write_batch_size(PAGE_ROWS)
+            .set_dictionary_enabled(false)
+            .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+            .build();
+        let mut data = Vec::new();
+        let mut writer =
+            AsyncArrowWriter::try_new(&mut data, Arc::clone(&schema), Some(props)).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..4 {
+            let values = Int32Array::from_iter_values((0..GROUP_ROWS).map(|row| {
+                if row / PAGE_ROWS % 2 == 0 {
+                    0
+                } else {
+                    rng.next_u32() as i32
+                }
+            }));
+            writer
+                .write(&RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).unwrap())
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap();
+        let metadata = load_metadata_with_page_index(&data, true);
+        assert_eq!(metadata.num_row_groups(), 4);
+        let pages = metadata.offset_index().unwrap()[0][0].page_locations();
+        assert!(
+            pages[1].compressed_page_size > pages[0].compressed_page_size * 100,
+            "adjacent equal-row-count pages must have very different compression ratios"
+        );
+        let projection = super::ProjectionMask::all();
+        let projected = super::projected_row_group_bytes(&metadata.row_groups()[0], &projection);
+        assert!(projected > 8 * MIB as u64 && projected < 9 * MIB as u64);
+
+        let data = Bytes::from(data);
+        let tracker = TrackingFileRead::new(data.clone());
+        let buffer = tracker.read(0..1024).await.unwrap();
+        let slice = buffer.slice(0..1);
+        drop(buffer);
+        assert_eq!(tracker.resident_bytes.load(AtomicOrdering::SeqCst), 1024);
+        drop(slice);
+        assert_eq!(tracker.resident_bytes.load(AtomicOrdering::SeqCst), 0);
+
+        let ranges = (0..4)
+            .flat_map(|group| {
+                (1..GROUP_ROWS / PAGE_ROWS).step_by(2).map(move |page| {
+                    let start = (group * GROUP_ROWS + page * PAGE_ROWS) as i64;
+                    RowRange::new(start, start + 255)
+                })
+            })
+            .collect::<Vec<_>>();
+        for cancel in [false, true] {
+            let tracker = TrackingFileRead::new(data.clone());
+            let budget = Arc::new(ParquetReadBudget::new(8, BUDGET as u64).unwrap());
+            budget.enable_diagnostics();
+            let mut stream = ParquetFormatReader::with_read_budget(Arc::clone(&budget))
+                .read_batch_stream(
+                    Box::new(tracker.clone()),
+                    data.len() as u64,
+                    &[int_field("id")],
+                    None,
+                    Some(128),
+                    Some(ranges.clone()),
+                )
+                .await
+                .unwrap();
+            let mut rows = stream.try_next().await.unwrap().unwrap().num_rows();
+            if !cancel {
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    rows += batch.num_rows();
+                }
+                assert_eq!(rows as i64, ranges.iter().map(RowRange::count).sum::<i64>());
+            }
+            drop(stream);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while budget.diagnostics().current_inflight != 0
+                    || tracker.resident_bytes.load(AtomicOrdering::SeqCst) != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all buffer owners and row-group permits must be released");
+            let peak = tracker.peak_resident_bytes.load(AtomicOrdering::SeqCst);
+            assert!(
+                peak > MIB && peak <= BUDGET,
+                "resident source buffers: {peak}"
+            );
+            assert_eq!(budget.diagnostics().peak_inflight, 2);
+            let _permit =
+                tokio::time::timeout(Duration::from_secs(1), budget.acquire(BUDGET as u64))
+                    .await
+                    .unwrap()
+                    .unwrap();
         }
     }
 
