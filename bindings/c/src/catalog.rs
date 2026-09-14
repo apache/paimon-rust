@@ -142,6 +142,7 @@ pub unsafe extern "C" fn paimon_catalog_get_table(
 /// # Safety
 /// `catalog` and `identifier` must be valid pointers from previous paimon C calls.
 /// `tag_name` must be a valid null-terminated C string.
+/// If non-null, `snapshot_id` must point to a valid `i64`.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_catalog_create_tag(
     catalog: *const paimon_catalog,
@@ -241,7 +242,6 @@ pub unsafe extern "C" fn paimon_catalog_delete_tag(
     catalog: *const paimon_catalog,
     identifier: *const paimon_identifier,
     tag_name: *const c_char,
-    ignore_if_not_exists: bool,
 ) -> *mut paimon_error {
     if let Err(error) = check_non_null(catalog, "catalog") {
         return error;
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn paimon_catalog_delete_tag(
 
     let catalog = &*((*catalog).inner as *const Arc<dyn Catalog>);
     let identifier = &*((*identifier).inner as *const Identifier);
-    match runtime().block_on(catalog.delete_tag(identifier, &tag_name, ignore_if_not_exists)) {
+    match runtime().block_on(catalog.delete_tag(identifier, &tag_name, false)) {
         Ok(()) => std::ptr::null_mut(),
         Err(error) => paimon_error::from_paimon(error),
     }

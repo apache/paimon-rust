@@ -1067,19 +1067,18 @@ fn test_catalog_tag_lifecycle() {
         assert_eq!((*duplicate).code, PaimonErrorCode::AlreadyExists as i32);
         paimon_error_free(duplicate);
 
-        let error =
-            paimon_catalog_delete_tag(catalog, identifier.identifier, tag_name.as_ptr(), false);
+        let error = paimon_catalog_delete_tag(catalog, identifier.identifier, tag_name.as_ptr());
         assert!(error.is_null());
         let missing = paimon_catalog_get_tag(catalog, identifier.identifier, tag_name.as_ptr());
         assert_eq!((*missing.error).code, PaimonErrorCode::NotFound as i32);
         paimon_error_free(missing.error);
 
-        let error = paimon_catalog_delete_tag(
-            catalog,
-            identifier.identifier,
-            explicit_name.as_ptr(),
-            false,
-        );
+        let missing = paimon_catalog_delete_tag(catalog, identifier.identifier, tag_name.as_ptr());
+        assert_eq!((*missing).code, PaimonErrorCode::NotFound as i32);
+        paimon_error_free(missing);
+
+        let error =
+            paimon_catalog_delete_tag(catalog, identifier.identifier, explicit_name.as_ptr());
         assert!(error.is_null());
 
         paimon_bytes_free(tag_result.tag);

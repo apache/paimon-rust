@@ -327,9 +327,8 @@ snapshotID := int64(123)
 err := catalog.CreateTag(id, "dataset-43", &snapshotID, false)
 ```
 
-The final argument to `CreateTag` ignores an existing tag; the final argument
-to `DeleteTag` ignores a missing tag. Creating tags with a retention duration
-is not yet supported.
+The final argument to `CreateTag` ignores an existing tag. Creating tags with
+a retention duration is not yet supported.
 
 ## Writing a Table
 

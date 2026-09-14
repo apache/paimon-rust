@@ -60,7 +60,7 @@ func TestCatalogTagLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tag.Name != "release-1" || tag.Snapshot.ID != 1 {
+	if tag.TagName != "release-1" || tag.Snapshot.ID != 1 {
 		t.Fatalf("unexpected tag: %#v", tag)
 	}
 	if tag.Snapshot.CommitKind != paimon.CommitKindAppend {
@@ -88,17 +88,18 @@ func TestCatalogTagLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := catalog.DeleteTag(id, "release-1", false); err != nil {
+	if err := catalog.DeleteTag(id, "release-1"); err != nil {
 		t.Fatal(err)
 	}
 	_, err = catalog.GetTag(id, "release-1")
 	if !errors.As(err, &paimonErr) || paimonErr.Code() != paimon.CodeNotFound {
 		t.Fatalf("missing tag error = %v", err)
 	}
-	if err := catalog.DeleteTag(id, "release-1", true); err != nil {
-		t.Fatal(err)
+	err = catalog.DeleteTag(id, "release-1")
+	if !errors.As(err, &paimonErr) || paimonErr.Code() != paimon.CodeNotFound {
+		t.Fatalf("delete missing tag error = %v", err)
 	}
-	if err := catalog.DeleteTag(id, "release-explicit", false); err != nil {
+	if err := catalog.DeleteTag(id, "release-explicit"); err != nil {
 		t.Fatal(err)
 	}
 

@@ -40,34 +40,19 @@ const (
 
 // Snapshot describes a Paimon table snapshot.
 type Snapshot struct {
-	Version                   int32             `json:"version"`
-	ID                        int64             `json:"id"`
-	SchemaID                  int64             `json:"schemaId"`
-	BaseManifestList          string            `json:"baseManifestList"`
-	DeltaManifestList         string            `json:"deltaManifestList"`
-	ChangelogManifestList     *string           `json:"changelogManifestList,omitempty"`
-	ChangelogManifestListSize *int64            `json:"changelogManifestListSize,omitempty"`
-	IndexManifest             *string           `json:"indexManifest,omitempty"`
-	CommitUser                string            `json:"commitUser"`
-	CommitIdentifier          int64             `json:"commitIdentifier"`
-	CommitKind                CommitKind        `json:"commitKind"`
-	TimeMillis                int64             `json:"timeMillis"`
-	LogOffsets                map[int32]int64   `json:"logOffsets,omitempty"`
-	TotalRecordCount          *int64            `json:"totalRecordCount,omitempty"`
-	DeltaRecordCount          *int64            `json:"deltaRecordCount,omitempty"`
-	ChangelogRecordCount      *int64            `json:"changelogRecordCount,omitempty"`
-	Watermark                 *int64            `json:"watermark,omitempty"`
-	Statistics                *string           `json:"statistics,omitempty"`
-	Properties                map[string]string `json:"properties,omitempty"`
-	NextRowID                 *int64            `json:"nextRowId,omitempty"`
+	ID               int64      `json:"id"`
+	CommitKind       CommitKind `json:"commitKind"`
+	TimeMillis       int64      `json:"timeMillis"`
+	TotalRecordCount *int64     `json:"totalRecordCount,omitempty"`
+	DeltaRecordCount *int64     `json:"deltaRecordCount,omitempty"`
 }
 
-// Tag describes a named table snapshot.
-type Tag struct {
-	Name             string   `json:"tagName"`
-	Snapshot         Snapshot `json:"snapshot"`
-	CreateTimeMillis *int64   `json:"tagCreateTime,omitempty"`
-	TimeRetained     *string  `json:"tagTimeRetained,omitempty"`
+// GetTagResponse contains a tag and its snapshot metadata.
+type GetTagResponse struct {
+	TagName         string   `json:"tagName"`
+	Snapshot        Snapshot `json:"snapshot"`
+	TagCreateTime   *int64   `json:"tagCreateTime,omitempty"`
+	TagTimeRetained *string  `json:"tagTimeRetained,omitempty"`
 }
 
 // LatestSnapshot returns the latest snapshot, or nil when the table is empty.
@@ -103,20 +88,20 @@ func (c *Catalog) CreateTag(
 }
 
 // GetTag returns a tag and its snapshot metadata.
-func (c *Catalog) GetTag(id Identifier, tagName string) (Tag, error) {
+func (c *Catalog) GetTag(id Identifier, tagName string) (GetTagResponse, error) {
 	if c.inner == nil {
-		return Tag{}, ErrClosed
+		return GetTagResponse{}, ErrClosed
 	}
 	cID, err := c.newIdentifier(id)
 	if err != nil {
-		return Tag{}, err
+		return GetTagResponse{}, err
 	}
 	defer ffiIdentifierFree.symbol(c.ctx)(cID)
 	return ffiCatalogGetTag.symbol(c.ctx)(c.inner, cID, tagName)
 }
 
 // DeleteTag deletes a tag.
-func (c *Catalog) DeleteTag(id Identifier, tagName string, ignoreIfNotExists bool) error {
+func (c *Catalog) DeleteTag(id Identifier, tagName string) error {
 	if c.inner == nil {
 		return ErrClosed
 	}
@@ -125,7 +110,7 @@ func (c *Catalog) DeleteTag(id Identifier, tagName string, ignoreIfNotExists boo
 		return err
 	}
 	defer ffiIdentifierFree.symbol(c.ctx)(cID)
-	return ffiCatalogDeleteTag.symbol(c.ctx)(c.inner, cID, tagName, ignoreIfNotExists)
+	return ffiCatalogDeleteTag.symbol(c.ctx)(c.inner, cID, tagName)
 }
 
 var ffiCatalogCreateTag = newFFI(ffiOpts{
@@ -207,11 +192,11 @@ var ffiCatalogGetTag = newFFI(ffiOpts{
 	*paimonCatalog,
 	*paimonIdentifier,
 	string,
-) (Tag, error) {
-	return func(catalog *paimonCatalog, id *paimonIdentifier, tagName string) (Tag, error) {
+) (GetTagResponse, error) {
+	return func(catalog *paimonCatalog, id *paimonIdentifier, tagName string) (GetTagResponse, error) {
 		tagNamePtr, err := bytePtrFromString(tagName)
 		if err != nil {
-			return Tag{}, err
+			return GetTagResponse{}, err
 		}
 		var result resultGetTag
 		ffiCall(
@@ -222,12 +207,12 @@ var ffiCatalogGetTag = newFFI(ffiOpts{
 		)
 		runtime.KeepAlive(tagNamePtr)
 		if result.error != nil {
-			return Tag{}, parseError(ctx, result.error)
+			return GetTagResponse{}, parseError(ctx, result.error)
 		}
 		defer ffiBytesFree.symbol(ctx)(result.tag)
-		var tag Tag
+		var tag GetTagResponse
 		if err := json.Unmarshal(parseBytes(result.tag), &tag); err != nil {
-			return Tag{}, err
+			return GetTagResponse{}, err
 		}
 		return tag, nil
 	}
@@ -240,27 +225,20 @@ var ffiCatalogDeleteTag = newFFI(ffiOpts{
 		&ffi.TypePointer,
 		&ffi.TypePointer,
 		&ffi.TypePointer,
-		&ffi.TypeUint8,
 	},
 }, func(ctx context.Context, ffiCall ffiCall) func(
 	*paimonCatalog,
 	*paimonIdentifier,
 	string,
-	bool,
 ) error {
 	return func(
 		catalog *paimonCatalog,
 		id *paimonIdentifier,
 		tagName string,
-		ignoreIfNotExists bool,
 	) error {
 		tagNamePtr, err := bytePtrFromString(tagName)
 		if err != nil {
 			return err
-		}
-		ignore := uint8(0)
-		if ignoreIfNotExists {
-			ignore = 1
 		}
 		var ffiError *paimonError
 		ffiCall(
@@ -268,7 +246,6 @@ var ffiCatalogDeleteTag = newFFI(ffiOpts{
 			unsafe.Pointer(&catalog),
 			unsafe.Pointer(&id),
 			unsafe.Pointer(&tagNamePtr),
-			unsafe.Pointer(&ignore),
 		)
 		runtime.KeepAlive(tagNamePtr)
 		return parseError(ctx, ffiError)
