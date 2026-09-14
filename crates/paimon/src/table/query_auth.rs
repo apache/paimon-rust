@@ -97,16 +97,18 @@ pub(crate) async fn reject_unauthorized_stats(
 }
 
 /// Whether `narrow` reads nothing `wide` does not have: nested children are
-/// matched by name and must be contained in turn, so a projection of a `ROW`
-/// passes and an extra child does not. Descriptions are not columns and are
-/// ignored.
+/// matched by id and name and must be contained in turn, so a projection of a
+/// `ROW` passes while an extra child, or one re-added under a new id, does
+/// not. Descriptions are not columns and are ignored.
 fn contains(wide: &crate::spec::DataType, narrow: &crate::spec::DataType) -> bool {
     use crate::spec::DataType;
     match (wide, narrow) {
         (DataType::Row(w), DataType::Row(n)) => n.fields().iter().all(|nf| {
-            w.fields()
-                .iter()
-                .any(|wf| wf.name() == nf.name() && contains(wf.data_type(), nf.data_type()))
+            w.fields().iter().any(|wf| {
+                wf.id() == nf.id()
+                    && wf.name() == nf.name()
+                    && contains(wf.data_type(), nf.data_type())
+            })
         }),
         (DataType::Array(w), DataType::Array(n)) => contains(w.element_type(), n.element_type()),
         (DataType::Multiset(w), DataType::Multiset(n)) => {
@@ -425,6 +427,10 @@ mod tests {
         ));
         // And so would a child under another name.
         assert!(!super::contains(&wide, &row(vec![child("c", None)])));
+        // Or the same name and type re-added under a new id: older files still
+        // resolve the old id.
+        let readded = DataField::new(9, "a".to_string(), int());
+        assert!(!super::contains(&wide, &row(vec![readded])));
     }
 
     #[test]

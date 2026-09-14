@@ -205,12 +205,9 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        // Refused before anything is submitted, so the prepared files — index
-        // shards included — are safe to remove rather than leave orphaned.
-        if let Err(error) = self.table.ensure_read_authorized_live("a commit").await {
-            let _ = self.abort(&commit_messages).await;
-            return Err(error);
-        }
+        // A refusal here must not clean up: a retry with an identifier that
+        // already committed names files a snapshot references.
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -342,12 +339,9 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        // Refused before anything is submitted, so the prepared files — index
-        // shards included — are safe to remove rather than leave orphaned.
-        if let Err(error) = self.table.ensure_read_authorized_live("a commit").await {
-            let _ = self.abort(&commit_messages).await;
-            return Err(error);
-        }
+        // A refusal here must not clean up: a retry with an identifier that
+        // already committed names files a snapshot references.
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -5539,17 +5533,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_refused_commit_removes_the_prepared_index_files() {
+    async fn test_a_refused_retry_keeps_the_files_its_identifier_committed() {
         let file_io = test_file_io();
-        let table_path = "memory:/test_refused_commit_index_cleanup";
+        let table_path = "memory:/test_refused_retry_keeps_committed_files";
         setup_dirs(&file_io, table_path).await;
-        let table = test_table_with_options(
-            &file_io,
-            table_path,
-            HashMap::from([("query-auth.enabled".to_string(), "true".to_string())]),
-        );
-        let commit = TableCommit::new(table, "test-user".to_string());
-
         let index_path = format!("{table_path}/index/bucket-index");
         file_io
             .mkdirs(&format!("{table_path}/index/"))
@@ -5571,11 +5558,25 @@ mod tests {
             external_path: None,
             global_index_meta: None,
         }];
+        setup_commit(&file_io, table_path)
+            .commit_with_identifier(vec![message.clone()], 7)
+            .await
+            .unwrap();
 
-        assert!(commit.commit(vec![message]).await.is_err());
+        // The option arrives between the commit and its retry.
+        let guarded = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([("query-auth.enabled".to_string(), "true".to_string())]),
+        );
+        let retry = TableCommit::new(guarded, "test-user".to_string());
+        assert!(retry
+            .filter_and_commit_with_identifier(vec![message], 7)
+            .await
+            .is_err());
         assert!(
-            !file_io.exists(&index_path).await.unwrap(),
-            "a commit refused before submission must not leave its index files behind"
+            file_io.exists(&index_path).await.unwrap(),
+            "a refused retry must not delete files the first commit's snapshot references"
         );
     }
 
