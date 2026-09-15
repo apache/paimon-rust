@@ -83,6 +83,7 @@ impl TableProvider for TagsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        super::ensure_scan_authorized(&self.table).await?;
         let tm = self.table.tag_manager();
         let tags =
             crate::runtime::await_with_runtime(async move { tm.list_all_with_metadata().await })

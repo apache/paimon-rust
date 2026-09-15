@@ -114,6 +114,8 @@ impl<'a> BatchVectorSearchBuilder<'a> {
             self.filter.as_ref(),
             self.include_row_ids.as_ref(),
             self.prepared_filter.as_ref(),
+            // Nothing delegates to the batch builder, so it always asks.
+            false,
         )
     }
 
@@ -151,8 +153,13 @@ impl<'a> BatchVectorSearchBuilder<'a> {
 
     /// Search every query against one plan, including empty per-query results.
     pub async fn execute(&self) -> crate::Result<Vec<SearchResult>> {
+        // Before any validation or fast path, and once: the scan is told so.
+        self.table
+            .ensure_read_authorized_live("a vector search")
+            .await?;
         let read = self.new_read()?;
-        read.read(self.new_scan()?.plan().await?).await
+        let scan = self.new_scan()?.assume_authorized();
+        read.read(scan.plan().await?).await
     }
 
     fn column(&self) -> crate::Result<&str> {

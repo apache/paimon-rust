@@ -205,7 +205,9 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        // A refusal here must not clean up: a retry with an identifier that
+        // already committed names files a snapshot references.
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -252,7 +254,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -337,7 +339,9 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        // A refusal here must not clean up: a retry with an identifier that
+        // already committed names files a snapshot references.
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -593,7 +597,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         if partitions.is_empty() {
@@ -674,7 +678,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_read_authorized_live("a commit").await?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         self.try_commit(
@@ -5525,6 +5529,54 @@ mod tests {
         assert!(
             !file_io.exists(&index_path).await.unwrap(),
             "abort must remove newly written index files"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_retry_keeps_the_files_its_identifier_committed() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_refused_retry_keeps_committed_files";
+        setup_dirs(&file_io, table_path).await;
+        let index_path = format!("{table_path}/index/bucket-index");
+        file_io
+            .mkdirs(&format!("{table_path}/index/"))
+            .await
+            .unwrap();
+        file_io
+            .new_output(&index_path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"index"))
+            .await
+            .unwrap();
+        let mut message = CommitMessage::new(vec![], 0, vec![]);
+        message.new_index_files = vec![IndexFileMeta {
+            index_type: "HASH".to_string(),
+            file_name: "bucket-index".to_string(),
+            file_size: 5,
+            row_count: 1,
+            deletion_vectors_ranges: None,
+            external_path: None,
+            global_index_meta: None,
+        }];
+        setup_commit(&file_io, table_path)
+            .commit_with_identifier(vec![message.clone()], 7)
+            .await
+            .unwrap();
+
+        // The option arrives between the commit and its retry.
+        let guarded = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([("query-auth.enabled".to_string(), "true".to_string())]),
+        );
+        let retry = TableCommit::new(guarded, "test-user".to_string());
+        assert!(retry
+            .filter_and_commit_with_identifier(vec![message], 7)
+            .await
+            .is_err());
+        assert!(
+            file_io.exists(&index_path).await.unwrap(),
+            "a refused retry must not delete files the first commit's snapshot references"
         );
     }
 
