@@ -1008,38 +1008,45 @@ async fn time_travel_schema_evolution() {
 
 #[tokio::test]
 async fn test_time_travel_conflicting_selectors_fail() {
-    // When both scan.version and scan.timestamp-millis are set on the same
-    // provider, Paimon rejects the combination at scan time.
-    let provider = create_provider_with_options(
-        "time_travel_table",
-        HashMap::from([
-            ("scan.version".to_string(), "1".to_string()),
-            ("scan.timestamp-millis".to_string(), "1234".to_string()),
-        ]),
-    )
-    .await;
+    // Java resolves scan.version before validating conflicts with other selectors.
+    for (version, selector) in [
+        ("snapshot1", "scan.tag-name"),
+        ("1", "scan.snapshot-id"),
+        ("watermark-1", "scan.watermark"),
+    ] {
+        let provider = create_provider_with_options(
+            "time_travel_table",
+            HashMap::from([
+                ("scan.version".to_string(), version.to_string()),
+                ("scan.timestamp-millis".to_string(), "1234".to_string()),
+            ]),
+        )
+        .await;
 
-    let ctx = create_context().await;
-    ctx.register_temp_table("paimon.default.time_travel_table", Arc::new(provider))
-        .expect("Failed to register temp table");
+        let ctx = create_context().await;
+        ctx.register_temp_table("paimon.default.time_travel_table", Arc::new(provider))
+            .expect("Failed to register temp table");
 
-    let err = ctx
-        .sql("SELECT id, name FROM paimon.default.time_travel_table")
-        .await
-        .expect("query should parse")
-        .collect()
-        .await
-        .expect_err("conflicting time-travel selectors should fail");
+        let err = ctx
+            .sql("SELECT id, name FROM paimon.default.time_travel_table")
+            .await
+            .expect("query should parse")
+            .collect()
+            .await
+            .expect_err("conflicting time-travel selectors should fail");
 
-    let message = err.to_string();
-    assert!(
-        message.contains("Only one time-travel selector may be set"),
-        "unexpected conflict error: {message}"
-    );
-    assert!(
-        message.contains("scan.version"),
-        "conflict error should mention scan.version: {message}"
-    );
+        let message = err.to_string();
+        assert!(
+            message.contains("Only one time-travel selector may be set"),
+            "unexpected conflict error for version {version}: {message}"
+        );
+        for key in [selector, "scan.timestamp-millis"] {
+            assert!(
+                message.contains(key),
+                "conflict error should mention {key}: {message}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

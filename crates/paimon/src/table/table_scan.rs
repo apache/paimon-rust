@@ -1189,8 +1189,9 @@ impl<'a> PaimonTableScan<'a> {
     /// Plan the full scan: resolve snapshot (via options or latest), then read manifests and build DataSplits.
     ///
     /// Time travel is resolved from table options:
-    /// - only one of `scan.version`, `scan.timestamp-millis`, `scan.watermark`,
-    ///   `scan.snapshot-id`, `scan.tag-name` may be set
+    /// - `scan.version` is resolved first, overwriting the same selector kind;
+    ///   only one of `scan.timestamp-millis`, `scan.watermark`, `scan.snapshot-id`,
+    ///   `scan.tag-name` may remain after resolution
     /// - `scan.version` → tag name (if exists) → `watermark-<value>` → snapshot
     ///   id (if parseable) → error (ambiguous by design, like SQL `VERSION AS OF`)
     /// - `scan.snapshot-id` → snapshot id only (never a tag lookup)
