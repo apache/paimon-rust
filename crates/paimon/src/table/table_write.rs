@@ -34,6 +34,7 @@ use crate::table::bucket_assigner_dynamic::DynamicBucketAssigner;
 use crate::table::bucket_assigner_fixed::FixedBucketAssigner;
 use crate::table::bucket_function::validate_bucket_function;
 use crate::table::commit_message::CommitMessage;
+use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
@@ -148,6 +149,7 @@ pub struct TableWrite {
     has_dedicated_vector_fields: bool,
     row_kind_generator: Option<RowKindGenerator>,
     row_kind_filter: Option<RowKindFilter>,
+    file_index_options: Option<Arc<FileIndexOptions>>,
 }
 
 impl TableWrite {
@@ -374,6 +376,19 @@ impl TableWrite {
                 .iter()
                 .any(|f| matches!(f.data_type(), DataType::Vector(_)));
 
+        let file_index_options = FileIndexOptions::parse(schema.options(), schema.fields())?;
+        if file_index_options.is_some()
+            && (has_primary_keys
+                || has_blob_fields
+                || has_dedicated_vector_fields
+                || !blob_view_fields.is_empty()
+                || core_options.data_evolution_enabled())
+        {
+            return Err(crate::Error::Unsupported {
+                message: "FileIndex generation supports ordinary append writes only; primary-key, data-evolution and dedicated Blob/Vector writes are not supported".to_string(),
+            });
+        }
+
         Ok(Self {
             table: table.clone(),
             write_schema,
@@ -408,6 +423,7 @@ impl TableWrite {
             has_dedicated_vector_fields,
             row_kind_generator,
             row_kind_filter,
+            file_index_options: file_index_options.map(Arc::new),
         })
     }
 
@@ -801,12 +817,26 @@ impl TableWrite {
         bucket: i32,
         batch: RecordBatch,
     ) -> Result<()> {
-        let key = (partition_bytes, bucket);
-        if !self.partition_writers.contains_key(&key) {
-            self.create_writer(key.0.clone(), key.1).await?;
+        let result = async {
+            let key = (partition_bytes, bucket);
+            if !self.partition_writers.contains_key(&key) {
+                self.create_writer(key.0.clone(), key.1).await?;
+            }
+            self.partition_writers
+                .get_mut(&key)
+                .unwrap()
+                .write(&batch)
+                .await
         }
-        let writer = self.partition_writers.get_mut(&key).unwrap();
-        writer.write(&batch).await
+        .await;
+        if result.is_err() && self.file_index_options.is_some() {
+            for (_, writer) in self.partition_writers.drain() {
+                if let FileWriter::Append(mut writer) = writer {
+                    writer.abort().await;
+                }
+            }
+        }
+        result
     }
 
     /// Write multiple Arrow RecordBatches.
@@ -820,6 +850,9 @@ impl TableWrite {
     /// Close all writers and collect CommitMessages for use with TableCommit.
     /// Writers are cleared after this call, allowing the TableWrite to be reused.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
+        if self.file_index_options.is_some() {
+            return self.prepare_indexed_append_commit().await;
+        }
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
             self.partition_writers.drain().collect();
 
@@ -859,6 +892,37 @@ impl TableWrite {
                 msg.new_index_files = idx_files;
                 messages.push(msg);
             }
+        }
+        Ok(messages)
+    }
+
+    async fn prepare_indexed_append_commit(&mut self) -> Result<Vec<CommitMessage>> {
+        let closes =
+            self.partition_writers
+                .drain()
+                .map(|((partition, bucket), writer)| async move {
+                    (partition, bucket, writer.prepare_commit().await)
+                });
+        // Do not cancel another partition's close when one fails: its completed
+        // files must remain reachable for abort cleanup.
+        let results = futures::future::join_all(closes).await;
+        let mut messages = Vec::new();
+        let mut error = None;
+        for (partition, bucket, result) in results {
+            match result {
+                Ok(files) if !files.data_files.is_empty() => {
+                    messages.push(CommitMessage::new(partition, bucket, files.data_files));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    error.get_or_insert(err);
+                }
+            }
+        }
+        if let Some(error) = error {
+            let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
+            let _ = commit.abort(&messages).await;
+            return Err(error);
         }
         Ok(messages)
     }
@@ -919,23 +983,26 @@ impl TableWrite {
                 ),
             )))
         } else {
-            Ok(FileWriter::Append(DataFileWriter::new(
-                self.table.file_io().clone(),
-                self.table.location().to_string(),
-                partition_path,
-                bucket,
-                self.schema_id,
-                self.target_file_size,
-                self.file_compression.clone(),
-                self.file_compression_zstd_level,
-                self.write_buffer_size,
-                self.file_format.clone(),
-                self.table.schema().fields().to_vec(),
-                self.table.schema().options().clone(),
-                Some(0),
-                None,
-                None,
-            )))
+            Ok(FileWriter::Append(
+                DataFileWriter::new(
+                    self.table.file_io().clone(),
+                    self.table.location().to_string(),
+                    partition_path,
+                    bucket,
+                    self.schema_id,
+                    self.target_file_size,
+                    self.file_compression.clone(),
+                    self.file_compression_zstd_level,
+                    self.write_buffer_size,
+                    self.file_format.clone(),
+                    self.table.schema().fields().to_vec(),
+                    self.table.schema().options().clone(),
+                    Some(0),
+                    None,
+                    None,
+                )
+                .with_file_index(self.file_index_options.clone()),
+            ))
         }
     }
 

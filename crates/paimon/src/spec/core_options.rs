@@ -674,6 +674,16 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    /// Maximum complete FileIndex size stored in the manifest. Default is 500 bytes.
+    pub(crate) fn file_index_in_manifest_threshold(&self) -> crate::Result<i64> {
+        match self.options.get("file-index.in-manifest-threshold") {
+            None => Ok(500),
+            Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!("Invalid file-index.in-manifest-threshold: {raw}"),
+            }),
+        }
+    }
+
     /// Whether raw data-file reads use FileIndex pruning. Default is true.
     pub fn file_index_read_enabled(&self) -> bool {
         self.options

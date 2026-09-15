@@ -237,6 +237,14 @@ pub async fn write_column_indexes(
 ) -> crate::Result<OutputFile> {
     let file_io = FileIO::from_path(path)?.build()?;
     let output = file_io.new_output(path)?;
+    output.write(serialize_column_indexes(indexes)?).await?;
+    Ok(output)
+}
+
+/// Serialize the complete container, including its header, for either storage form.
+pub(crate) fn serialize_column_indexes(
+    indexes: HashMap<String, HashMap<String, Option<Bytes>>>,
+) -> crate::Result<Bytes> {
     let mut body_info: HashMap<String, HashMap<String, IndexInfo>> = HashMap::new();
     let mut total_data_size = 0usize;
 
@@ -304,11 +312,8 @@ pub async fn write_column_indexes(
     head_buffer.put_i32(0);
     debug_assert_eq!(head_buffer.len(), head_length);
 
-    let mut writer = output.writer().await?;
-    writer.write(head_buffer.freeze()).await?;
-    writer.write(body.freeze()).await?;
-    writer.close().await?;
-    Ok(output)
+    head_buffer.extend_from_slice(&body);
+    Ok(head_buffer.freeze())
 }
 
 fn calculate_head_length(
