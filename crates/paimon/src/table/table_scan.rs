@@ -724,8 +724,10 @@ fn should_skip_level_zero_for_scan(
         return false;
     }
 
-    (deletion_vectors_enabled && !deletion_vectors_merge_on_read)
-        || merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
+    if deletion_vectors_enabled {
+        return !deletion_vectors_merge_on_read;
+    }
+    merge_engine.is_ok_and(|e| e == crate::spec::MergeEngine::FirstRow)
 }
 
 fn is_system_field_id(field_id: i32) -> bool {
@@ -1301,7 +1303,6 @@ impl<'a> PaimonTableScan<'a> {
         let data_evolution_enabled = core_options.data_evolution_enabled();
 
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
-        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
 
         // Skip level-0 files for PK tables when:
         // - DV mode: level-0 files are unmerged, DV handles dedup at higher levels
@@ -1312,13 +1313,7 @@ impl<'a> PaimonTableScan<'a> {
         //
         // Non-read paths (overwrite, truncate, writer restore) set scan_all_files=true
         // to see all files including level-0, matching Java's CommitScanner behavior.
-        let skip_level_zero = should_skip_level_zero_for_scan(
-            self.scan_all_files || self.is_streaming(),
-            has_primary_keys,
-            deletion_vectors_enabled,
-            core_options.deletion_vectors_merge_on_read(),
-            core_options.merge_engine(),
-        );
+        let skip_level_zero = self.skip_level_zero();
 
         let partition_fields = self.table.schema().partition_fields();
 
@@ -1535,31 +1530,12 @@ impl<'a> PaimonTableScan<'a> {
     /// are still enforced exactly by the post-merge residual filter in
     /// `KeyValueFileReader`.
     ///
-    /// Exempt (full predicates kept):
-    /// - Deletion-vector tables without merge-on-read: they read raw with
-    ///   per-row masks, stats are a superset of live rows, full pruning stays
-    ///   safe. With merge-on-read enabled, visible L0 versions require the
-    ///   same key-only pruning rule as an ordinary PK merge read.
-    /// - `merge-engine=first-row`: planned with `skip_level_zero` and read
-    ///   via `DataFileReader` (see `TableRead::to_arrow`), no merge on the
-    ///   read path — pruning a file drops exactly the rows the raw path's
-    ///   exact residual filter would drop anyway. If first-row ever gains a
-    ///   merge read path, this exemption must be revisited.
+    /// Full predicates are safe for materialized first-row / deletion-vector
+    /// files. First-row all-files scans and incremental scans retain every
+    /// version before the reader applies its residual filter.
     fn stats_pruning_predicates(&self) -> Vec<Predicate> {
         let has_primary_keys = !self.table.schema().primary_keys().is_empty();
-        let core_options = CoreOptions::new(self.table.schema().options());
-        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
-        let deletion_vectors_merge_on_read = core_options.deletion_vectors_merge_on_read();
-        // An unknown merge engine stays conservative (key-only pruning); the
-        // read side fails on it anyway before returning rows.
-        let first_row = matches!(
-            core_options.merge_engine(),
-            Ok(crate::spec::MergeEngine::FirstRow)
-        );
-        if has_primary_keys
-            && (self.is_streaming()
-                || ((!deletion_vectors_enabled || deletion_vectors_merge_on_read) && !first_row))
-        {
+        if has_primary_keys && self.requires_key_merge() {
             retain_primary_key_conjuncts(
                 &self.data_predicates,
                 self.table.schema().fields(),
@@ -1568,6 +1544,28 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             self.data_predicates.clone()
         }
+    }
+
+    fn requires_key_merge(&self) -> bool {
+        let options = self.table.schema().core_options();
+        self.is_streaming()
+            || match options.merge_engine() {
+                Ok(crate::spec::MergeEngine::FirstRow) => !self.skip_level_zero(),
+                _ => {
+                    !options.deletion_vectors_enabled() || options.deletion_vectors_merge_on_read()
+                }
+            }
+    }
+
+    fn skip_level_zero(&self) -> bool {
+        let options = self.table.schema().core_options();
+        should_skip_level_zero_for_scan(
+            self.scan_all_files || self.is_streaming(),
+            !self.table.schema().primary_keys().is_empty(),
+            options.deletion_vectors_enabled(),
+            options.deletion_vectors_merge_on_read(),
+            options.merge_engine(),
+        )
     }
 
     /// Project file-safe predicates onto trimmed primary-key columns while
@@ -2096,17 +2094,10 @@ impl<'a> PaimonTableScan<'a> {
         // sort-merge reader sees every version of a key. The comparator decodes
         // the trimmed-PK min/max keys written by the kv writer.
         //
-        // Deletion-vector tables without merge-on-read and first-row tables read
-        // without merging (stale rows are masked by DVs / level-0 is skipped),
-        // so they keep plain size-based packing. DV merge-on-read includes L0
-        // files and must preserve overlapping key ranges just like ordinary MOR.
-        let use_key_interval_packing = self.is_streaming()
-            || (!core_options.deletion_vectors_enabled()
-                || core_options.deletion_vectors_merge_on_read())
-                && !matches!(
-                    core_options.merge_engine(),
-                    Ok(crate::spec::MergeEngine::FirstRow)
-                );
+        // Materialized first-row / DV data keeps size-based packing. First-row
+        // all-files scans and incremental scans retain L0 and must keep
+        // overlapping versions together.
+        let use_key_interval_packing = self.requires_key_merge();
         let pk_comparator = if use_key_interval_packing {
             KeyComparator::from_table_schema(self.table.schema())
         } else {
@@ -2275,9 +2266,7 @@ impl<'a> PaimonTableScan<'a> {
                 // Java MergeTreeSplitGenerator#splitForBatch). Only engines
                 // whose writer deduplicates at flush guarantee a file never
                 // holds two rows of one key, so only they may mark groups raw
-                // convertible; see merge_tree_split_for_batch. (First-row
-                // tables do not take this path today, but its writer dedups
-                // too, so keep the gate accurate.)
+                // convertible; see merge_tree_split_for_batch.
                 let file_keys_unique = matches!(
                     core_options.merge_engine(),
                     Ok(crate::spec::MergeEngine::Deduplicate)
@@ -3144,6 +3133,25 @@ mod tests {
             false,
             false,
             Ok(crate::spec::MergeEngine::FirstRow),
+        ));
+    }
+
+    #[test]
+    fn test_first_row_dv_merge_on_read_keeps_level_zero() {
+        // Java permits first-row DVs in pk-clustering-override tables.
+        assert!(!should_skip_level_zero_for_scan(
+            false,
+            true,
+            true,
+            true,
+            Ok(crate::spec::MergeEngine::FirstRow)
+        ));
+        assert!(should_skip_level_zero_for_scan(
+            false,
+            true,
+            true,
+            false,
+            Ok(crate::spec::MergeEngine::FirstRow)
         ));
     }
 

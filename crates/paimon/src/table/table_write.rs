@@ -21,6 +21,7 @@
 //! and [pypaimon FileStoreWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/file_store_write.py)
 
 use crate::arrow::build_target_arrow_schema;
+use crate::arrow::partition::partition_array;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
@@ -684,7 +685,39 @@ impl TableWrite {
             }
             for (key, row_indices) in delete_groups {
                 let sub_batch = take_rows(batch, &row_indices)?;
-                let delete_batch = Self::add_value_kind_column(&sub_batch, 1)?;
+                // Java DeleteExistingProcessor emits the incoming values with
+                // the old partition and DELETE kind. Routing the file alone
+                // leaves incorrect physical values and partition statistics.
+                let partition = BinaryRow::from_serialized_bytes(&key.0)?;
+                let mut columns = sub_batch.columns().to_vec();
+                for (partition_index, field) in
+                    self.table.schema().partition_fields().iter().enumerate()
+                {
+                    let column_index =
+                        sub_batch.schema().index_of(field.name()).map_err(|error| {
+                            crate::Error::DataInvalid {
+                                message: format!(
+                                    "Missing partition field '{}': {error}",
+                                    field.name()
+                                ),
+                                source: Some(Box::new(error)),
+                            }
+                        })?;
+                    columns[column_index] = partition_array(
+                        &partition,
+                        partition_index,
+                        field.data_type(),
+                        sub_batch.num_rows(),
+                    )?;
+                }
+                let sub_batch =
+                    RecordBatch::try_new(sub_batch.schema(), columns).map_err(|error| {
+                        crate::Error::DataInvalid {
+                            message: format!("Failed to restore old partition for delete: {error}"),
+                            source: Some(Box::new(error)),
+                        }
+                    })?;
+                let delete_batch = Self::add_value_kind_column(&sub_batch, 3)?;
                 result.push((key, delete_batch));
             }
         }

@@ -27,14 +27,14 @@
 
 use super::data_file_reader::DataFileReader;
 use super::sort_merge::{
-    AggregateMergeFunction, DeduplicateMergeFunction, MergeFunction, PartialUpdateMergeFunction,
-    SortMergeReaderBuilder,
+    AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, MergeFunction,
+    PartialUpdateMergeFunction, SortMergeReaderBuilder,
 };
 use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::io::FileIO;
 use crate::spec::{
-    BigIntType, DataField, DataFileMeta, DataType as PaimonDataType, MergeEngine,
+    BigIntType, CoreOptions, DataField, DataFileMeta, DataType as PaimonDataType, MergeEngine,
     PartialUpdateConfig, Predicate, TinyIntType, SEQUENCE_NUMBER_FIELD_ID,
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
@@ -297,9 +297,9 @@ impl KeyValueFileReader {
                     &config.primary_keys,
                 )?))
             }
-            MergeEngine::FirstRow => Err(Error::Unsupported {
-                message: "KeyValueFileReader does not support merge-engine=first-row; first-row reads should use the non-KV path".to_string(),
-            }),
+            MergeEngine::FirstRow => Ok(Box::new(FirstRowMergeFunction {
+                ignore_delete: CoreOptions::new(&config.table_options).ignore_delete(),
+            })),
             MergeEngine::Aggregation => Ok(Box::new(AggregateMergeFunction::new(
                 &config.table_options,
                 &config.table_name,
