@@ -29,13 +29,27 @@
 //! - `CALL sys.drop_global_index(table => '...', index_column => '...', index_type => 'btree')` (also 'bitmap', 'multivalue', 'fm', 'lumina', or a vindex type such as 'ivf-pq')
 //! - `CALL sys.create_lumina_index(table => '...', index_column => '...')`
 //!
+//! REST management procedures (REST catalogs only, mirroring Java's
+//! `RESTCatalog.permissionManagement()` / `policyManagement()`):
+//! - `CALL sys.grant_permission(resource_type => '...', access => '...', principal => '...'[, database, table, function, view, expire_time, column_names, excluded_column_names])`
+//! - `CALL sys.revoke_permission(resource_type => '...', access => '...', principal => '...'[, database, table, function, view])`
+//! - `CALL sys.list_permissions(resource_type => '...'[, database, table, function, view, principal, access, max_results, page_token])`
+//! - `CALL sys.create_policy(database => '...', table => '...', policy_type => '...', principal => '...'[, predicate_json, on_column, transform_json])`
+//! - `CALL sys.drop_policy(database => '...', table => '...', policy_type => '...', principal => '...'[, column, if_exists])`
+//! - `CALL sys.list_policies(database => '...', table => '...'[, policy_type, principal, column, max_results, page_token])`
+//!
 //! The `index_type` argument of the three global index procedures is
 //! case-insensitive and surrounding whitespace is ignored.
+//!
+//! `column_names` and `excluded_column_names` are comma-separated lists, not SQL arrays:
+//! `column_names => 'id, region'`. Java's Spark procedures take `ARRAY<STRING>` there, but a
+//! DataFusion CALL argument is always a scalar, so this crate uses the same comma convention as
+//! `delete_tag`'s `tag` argument.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::StringArray;
+use datafusion::arrow::array::{ArrayRef, StringArray};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -44,7 +58,11 @@ use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator,
     FunctionArguments, ObjectName, Value as SqlValue,
 };
-use paimon::catalog::{Catalog, Identifier};
+use paimon::api::{
+    ColumnMask, DataPolicy, ListPermissionsRequest, ListPoliciesRequest, PermissionAssignment,
+    PermissionColumns, PermissionResource, PolicyType, ResourceType, RowFilter,
+};
+use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::lumina::LUMINA_IDENTIFIER;
 use paimon::spec::Snapshot;
 use paimon::table::{
@@ -141,6 +159,71 @@ async fn earlier_or_equal_from_all(
     }
 }
 
+/// The parameter names Java declares for each management procedure, in Java's order.
+fn management_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
+    Some(match proc_name {
+        "grant_permission" => &[
+            "resource_type",
+            "access",
+            "principal",
+            "database",
+            "table",
+            "function",
+            "view",
+            "expire_time",
+            "column_names",
+            "excluded_column_names",
+        ],
+        "revoke_permission" => &[
+            "resource_type",
+            "access",
+            "principal",
+            "database",
+            "table",
+            "function",
+            "view",
+        ],
+        "list_permissions" => &[
+            "resource_type",
+            "database",
+            "table",
+            "function",
+            "view",
+            "principal",
+            "access",
+            "max_results",
+            "page_token",
+        ],
+        "create_policy" => &[
+            "database",
+            "table",
+            "policy_type",
+            "principal",
+            "predicate_json",
+            "on_column",
+            "transform_json",
+        ],
+        "drop_policy" => &[
+            "database",
+            "table",
+            "policy_type",
+            "principal",
+            "column",
+            "if_exists",
+        ],
+        "list_policies" => &[
+            "database",
+            "table",
+            "policy_type",
+            "principal",
+            "column",
+            "max_results",
+            "page_token",
+        ],
+        _ => return None,
+    })
+}
+
 pub async fn execute_call(
     ctx: &SessionContext,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
@@ -153,6 +236,17 @@ pub async fn execute_call(
         .get(catalog_name)
         .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
     let args = extract_named_args(&func.args)?;
+
+    // Java rejects an argument name no parameter declares, so a typo cannot be dropped in
+    // silence. `expiretime => ...` on a grant would otherwise send a permanent one.
+    if let Some(declared) = management_parameters(&proc_name) {
+        if let Some(unknown) = args.keys().find(|key| !declared.contains(&key.as_str())) {
+            return Err(DataFusionError::Plan(format!(
+                "Argument {unknown} is unknown. Expected one of [{}].",
+                declared.join(", ")
+            )));
+        }
+    }
 
     match proc_name.as_str() {
         "create_tag" => proc_create_tag(ctx, catalog, catalog_name, &args).await,
@@ -167,6 +261,12 @@ pub async fn execute_call(
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
         "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
+        "grant_permission" => proc_grant_permission(ctx, catalog, catalog_name, &args).await,
+        "revoke_permission" => proc_revoke_permission(ctx, catalog, catalog_name, &args).await,
+        "list_permissions" => proc_list_permissions(ctx, catalog, catalog_name, &args).await,
+        "create_policy" => proc_create_policy(ctx, catalog, catalog_name, &args).await,
+        "drop_policy" => proc_drop_policy(ctx, catalog, catalog_name, &args).await,
+        "list_policies" => proc_list_policies(ctx, catalog, catalog_name, &args).await,
         _ => Err(DataFusionError::Plan(format!(
             "Unknown procedure: {proc_name}"
         ))),
@@ -210,7 +310,14 @@ fn extract_named_args(args: &FunctionArguments) -> DFResult<HashMap<String, Stri
                 operator: FunctionArgOperator::RightArrow,
             } => {
                 let value = expr_to_string(expr)?;
-                map.insert(name.value.to_lowercase(), value);
+                let name = name.value.to_lowercase();
+                // Java `PaimonProcedureResolver.buildNameToArgumentMap` rejects a repeat
+                // rather than letting the last one win.
+                if map.insert(name.clone(), value).is_some() {
+                    return Err(DataFusionError::Plan(format!(
+                        "Procedure argument {name} is duplicated."
+                    )));
+                }
             }
             _ => return Err(DataFusionError::Plan(
                 "CALL procedures require named arguments with '=>' syntax, e.g. table => 'db.t'"
@@ -654,6 +761,432 @@ fn parse_key_value_options(options: &str) -> DFResult<HashMap<String, String>> {
         parsed.insert(key.to_string(), value.trim().to_string());
     }
     Ok(parsed)
+}
+
+// ==================== REST management procedures (Java #9410) ====================
+//
+// Parameter names follow Java's; divergences are called out where they occur.
+
+/// The REST catalog behind `catalog`, which is where permission and policy management lives.
+/// Java does the same check with `DelegateCatalog.rootCatalog(...) instanceof RESTCatalog`.
+fn rest_catalog<'a>(
+    catalog: &'a Arc<dyn Catalog>,
+    catalog_name: &str,
+) -> DFResult<&'a RESTCatalog> {
+    catalog
+        .as_any()
+        .and_then(|any| any.downcast_ref::<RESTCatalog>())
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Catalog '{catalog_name}' does not support permission or policy management."
+            ))
+        })
+}
+
+/// Java's blankness, which is `String.trim()`: only `<= U+0020` counts. `str::trim` would also
+/// strip the rest of Unicode whitespace and disagree on a non-breaking space. (`listagg.rs` has
+/// a third variant using `Character.isWhitespace`; none of the three are interchangeable.)
+fn is_blank(value: &str) -> bool {
+    value.chars().all(|ch| ch <= ' ')
+}
+
+/// Java `emptyToNull`: a blank value is absent.
+fn opt_arg<'a>(args: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    args.get(name)
+        .map(String::as_str)
+        .filter(|value| !is_blank(value))
+}
+
+/// Java `BasePermissionProcedure.enumValue`.
+/// The values Java prints in `Invalid <arg> '<value>'. Expected one of <values>.`
+trait ProcedureEnum: std::str::FromStr<Err = paimon::Error> + Sized {
+    fn allowed() -> Vec<&'static str>;
+}
+
+impl ProcedureEnum for ResourceType {
+    fn allowed() -> Vec<&'static str> {
+        ResourceType::VALUES
+            .iter()
+            .map(ResourceType::as_str)
+            .collect()
+    }
+}
+
+impl ProcedureEnum for PolicyType {
+    fn allowed() -> Vec<&'static str> {
+        vec![
+            PolicyType::RowFilter.as_str(),
+            PolicyType::ColumnMasking.as_str(),
+        ]
+    }
+}
+
+fn enum_arg<T>(args: &HashMap<String, String>, name: &str) -> DFResult<T>
+where
+    T: ProcedureEnum,
+{
+    let value = require_arg(args, name)?;
+    // Java neither trims nor accepts blank, so ' TABLE ' must stay an error here too.
+    if is_blank(value) {
+        return Err(DataFusionError::Plan(format!("{name} cannot be empty.")));
+    }
+    value.parse().map_err(|_| {
+        DataFusionError::Plan(format!(
+            "Invalid {name} '{value}'. Expected one of [{}].",
+            T::allowed().join(", ")
+        ))
+    })
+}
+
+/// Same as [`enum_arg`], but the argument may be absent or blank.
+fn opt_enum_arg<T>(args: &HashMap<String, String>, name: &str) -> DFResult<Option<T>>
+where
+    T: ProcedureEnum,
+{
+    match opt_arg(args, name) {
+        None => Ok(None),
+        Some(_) => enum_arg(args, name).map(Some),
+    }
+}
+
+/// Comma-separated, like `delete_tag`'s `tag`. Java declares `ARRAY<STRING>`, but a
+/// DataFusion CALL argument is always a scalar.
+fn comma_list(args: &HashMap<String, String>, name: &str) -> Option<Vec<String>> {
+    args.get(name).map(|raw| {
+        raw.split(',')
+            // Java's trim, as everywhere else here: a non-breaking space is part of the name.
+            .map(|value| value.trim_matches(|ch| ch <= ' '))
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+fn bool_arg(args: &HashMap<String, String>, name: &str) -> DFResult<bool> {
+    // Java's `ProcedureParameter.optional(..., BooleanType)` leaves a missing value as false.
+    match args.get(name) {
+        None => Ok(false),
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(DataFusionError::Plan(format!(
+                "Invalid {name} '{value}'. Expected 'true' or 'false'"
+            ))),
+        },
+    }
+}
+
+fn max_results_arg(args: &HashMap<String, String>) -> DFResult<Option<u32>> {
+    args.get("max_results")
+        .map(|value| {
+            value
+                .trim()
+                .parse()
+                .map_err(|_| DataFusionError::Plan(format!("Invalid max_results: '{value}'")))
+        })
+        .transpose()
+}
+
+/// `resource_type` plus whichever locators it needs (Java `BasePermissionProcedure.resource`).
+fn permission_resource(args: &HashMap<String, String>) -> DFResult<PermissionResource> {
+    PermissionResource::new(
+        enum_arg::<ResourceType>(args, "resource_type")?,
+        opt_arg(args, "database"),
+        opt_arg(args, "table"),
+        opt_arg(args, "function"),
+        opt_arg(args, "view"),
+    )
+    .map_err(to_datafusion_error)
+}
+
+/// The `TABLE` resource a policy hangs off (Java `BasePolicyProcedure.tableResource`).
+fn policy_table_resource(args: &HashMap<String, String>) -> DFResult<PermissionResource> {
+    PermissionResource::new(
+        ResourceType::Table,
+        Some(require_arg(args, "database")?),
+        Some(require_arg(args, "table")?),
+        None,
+        None,
+    )
+    .map_err(to_datafusion_error)
+}
+
+/// Java hands both lists to `PermissionColumns` and lets it reject having both; each Rust
+/// constructor takes one list, so that case is rejected here instead.
+fn permission_columns(args: &HashMap<String, String>) -> DFResult<Option<PermissionColumns>> {
+    match (
+        comma_list(args, "column_names"),
+        comma_list(args, "excluded_column_names"),
+    ) {
+        (None, None) => Ok(None),
+        (Some(names), None) => PermissionColumns::names(names)
+            .map(Some)
+            .map_err(to_datafusion_error),
+        (None, Some(excluded)) => PermissionColumns::excluded(excluded)
+            .map(Some)
+            .map_err(to_datafusion_error),
+        (Some(_), Some(_)) => Err(DataFusionError::Plan(
+            "columns must contain exactly one of column_names or excluded_column_names."
+                .to_string(),
+        )),
+    }
+}
+
+fn utf8_result(
+    ctx: &SessionContext,
+    fields: &[(&str, bool)],
+    rows: Vec<Vec<Option<String>>>,
+) -> DFResult<DataFrame> {
+    debug_assert!(
+        rows.iter().all(|row| row.len() == fields.len()),
+        "every row must have one cell per declared column"
+    );
+    let schema = Arc::new(Schema::new(
+        fields
+            .iter()
+            .map(|(name, nullable)| Field::new(*name, ArrowDataType::Utf8, *nullable))
+            .collect::<Vec<_>>(),
+    ));
+    let columns = (0..fields.len())
+        .map(|column| {
+            Arc::new(
+                rows.iter()
+                    .map(|row| row[column].clone())
+                    .collect::<StringArray>(),
+            ) as ArrayRef
+        })
+        .collect::<Vec<_>>();
+    ctx.read_batch(RecordBatch::try_new(schema, columns)?)
+}
+
+fn joined(values: Option<&[String]>) -> Option<String> {
+    values.map(|values| values.join(","))
+}
+
+async fn proc_grant_permission(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let rest = rest_catalog(catalog, catalog_name)?;
+    let assignment = PermissionAssignment::new(
+        permission_resource(args)?,
+        require_arg(args, "access")?,
+        require_arg(args, "principal")?,
+        permission_columns(args)?,
+        opt_arg(args, "expire_time"),
+    )
+    .map_err(to_datafusion_error)?;
+    rest.grant_permission(&assignment)
+        .await
+        .map_err(to_datafusion_error)?;
+    // Java returns boolean `true`; every write procedure here answers `ok_result` instead.
+    ok_result(ctx)
+}
+
+async fn proc_revoke_permission(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let rest = rest_catalog(catalog, catalog_name)?;
+    rest.revoke_permission(
+        &permission_resource(args)?,
+        require_arg(args, "access")?,
+        require_arg(args, "principal")?,
+    )
+    .await
+    .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_list_permissions(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let rest = rest_catalog(catalog, catalog_name)?;
+    let request = ListPermissionsRequest {
+        resource: permission_resource(args)?,
+        principal: opt_arg(args, "principal").map(str::to_string),
+        access: opt_arg(args, "access").map(str::to_string),
+        max_results: max_results_arg(args)?,
+        page_token: opt_arg(args, "page_token").map(str::to_string),
+    };
+    let page = rest
+        .list_permissions_paged(&request)
+        .await
+        .map_err(to_datafusion_error)?;
+
+    // Java parity, quirk included: `next_page_token` repeats on every row, so an empty page
+    // returns zero rows and loses it. See `ListPermissionsProcedure.call`.
+    let rows = page
+        .elements
+        .iter()
+        .map(|assignment| {
+            let resource = assignment.resource();
+            let columns = assignment.columns();
+            vec![
+                Some(resource.resource_type().to_string()),
+                resource.database_name().map(str::to_string),
+                resource.table_name().map(str::to_string),
+                resource.function_name().map(str::to_string),
+                resource.view_name().map(str::to_string),
+                Some(assignment.access().to_string()),
+                Some(assignment.principal().to_string()),
+                // Comma-joined, matching how `column_names` is passed in.
+                joined(columns.and_then(PermissionColumns::column_names)),
+                joined(columns.and_then(PermissionColumns::excluded_column_names)),
+                assignment.expire_time().map(str::to_string),
+                page.next_page_token.clone(),
+            ]
+        })
+        .collect();
+
+    utf8_result(
+        ctx,
+        &[
+            ("resource_type", false),
+            ("database", true),
+            ("table", true),
+            ("function", true),
+            ("view", true),
+            ("access", false),
+            ("principal", false),
+            ("column_names", true),
+            ("excluded_column_names", true),
+            ("expire_time", true),
+            ("next_page_token", true),
+        ],
+        rows,
+    )
+}
+
+async fn proc_create_policy(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let rest = rest_catalog(catalog, catalog_name)?;
+    let resource = policy_table_resource(args)?;
+    let principal = require_arg(args, "principal")?;
+    let predicate = opt_arg(args, "predicate_json");
+    let on_column = opt_arg(args, "on_column");
+    let transform = opt_arg(args, "transform_json");
+
+    // Java `BasePolicyProcedure.policy`: each policy type rejects the other's fields.
+    let policy = match enum_arg::<PolicyType>(args, "policy_type")? {
+        PolicyType::RowFilter => {
+            for (value, name) in [(on_column, "on_column"), (transform, "transform_json")] {
+                if value.is_some() {
+                    return Err(DataFusionError::Plan(format!(
+                        "ROW_FILTER policy cannot specify {name}."
+                    )));
+                }
+            }
+            let row_filter =
+                RowFilter::new(predicate.unwrap_or_default()).map_err(to_datafusion_error)?;
+            DataPolicy::new_row_filter(resource, row_filter, principal)
+        }
+        PolicyType::ColumnMasking => {
+            if predicate.is_some() {
+                return Err(DataFusionError::Plan(
+                    "COLUMN_MASKING policy cannot specify predicate_json.".to_string(),
+                ));
+            }
+            let column_mask =
+                ColumnMask::new(on_column.unwrap_or_default(), transform.unwrap_or_default())
+                    .map_err(to_datafusion_error)?;
+            DataPolicy::new_column_mask(resource, column_mask, principal)
+        }
+    }
+    .map_err(to_datafusion_error)?;
+
+    rest.create_policy(&policy)
+        .await
+        .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_drop_policy(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let rest = rest_catalog(catalog, catalog_name)?;
+    rest.drop_policy(
+        &policy_table_resource(args)?,
+        enum_arg::<PolicyType>(args, "policy_type")?,
+        require_arg(args, "principal")?,
+        opt_arg(args, "column"),
+        bool_arg(args, "if_exists")?,
+    )
+    .await
+    .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_list_policies(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let rest = rest_catalog(catalog, catalog_name)?;
+    let request = ListPoliciesRequest {
+        resource: policy_table_resource(args)?,
+        policy_type: opt_enum_arg(args, "policy_type")?,
+        principal: opt_arg(args, "principal").map(str::to_string),
+        column: opt_arg(args, "column").map(str::to_string),
+        max_results: max_results_arg(args)?,
+        page_token: opt_arg(args, "page_token").map(str::to_string),
+    };
+    let page = rest
+        .list_policies_paged(&request)
+        .await
+        .map_err(to_datafusion_error)?;
+
+    // Same Java pagination quirk as `list_permissions`.
+    let rows = page
+        .elements
+        .iter()
+        .map(|policy| {
+            let resource = policy.resource();
+            let column_mask = policy.column_mask();
+            vec![
+                resource.database_name().map(str::to_string),
+                resource.table_name().map(str::to_string),
+                Some(policy.policy_type().to_string()),
+                Some(policy.principal().to_string()),
+                policy
+                    .row_filter()
+                    .map(|filter| filter.predicate().to_string()),
+                column_mask.map(|mask| mask.on_column().to_string()),
+                column_mask.map(|mask| mask.transform().to_string()),
+                page.next_page_token.clone(),
+            ]
+        })
+        .collect();
+
+    utf8_result(
+        ctx,
+        &[
+            ("database", false),
+            ("table", false),
+            ("policy_type", false),
+            ("principal", false),
+            ("predicate_json", true),
+            ("on_column", true),
+            ("transform_json", true),
+            ("next_page_token", true),
+        ],
+        rows,
+    )
 }
 
 fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
