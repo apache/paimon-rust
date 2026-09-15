@@ -2372,7 +2372,9 @@ Rust currently supports `merge-engine=aggregation` in basic mode only. It works
 with fixed buckets and ordinary dynamic buckets (`'bucket' = '-1'`) when the
 primary key includes all partition columns. It supports per-field aggregate
 functions such as `sum`, `min`, `max`, value functions, boolean functions, and
-`listagg`, plus `fields.default-aggregate-function`.
+`listagg`, plus `fields.default-aggregate-function`. Each write-buffer flush
+aggregates duplicate primary keys before writing data files, so a file contains
+at most one row per key. Input changelog files retain the original rows.
 
 Sequence fields are always merged with `last_value`. Defining
 `fields.<sequence-field>.aggregate-function` is rejected, matching Java schema

@@ -2270,10 +2270,9 @@ mod tests {
         assert!(!names.contains(&"banana".to_string()));
     }
 
-    /// Aggregation (sum): inputs 10 + 20 merge to 30. `value = 30` must match
-    /// the merged row (a pre-merge filter would drop both inputs);
-    /// `value = 10` must match nothing (a pre-merge filter would keep the
-    /// 10-input and leak it).
+    /// Each flush aggregates its duplicate keys first (30 and 9); the read
+    /// merges both files to 39. `value = 39` must match the merged row, while
+    /// `value = 10` must not leak an input row.
     #[tokio::test]
     async fn kv_read_aggregation_filters_on_merged_value() {
         let file_io = test_file_io();
@@ -2288,17 +2287,17 @@ mod tests {
             ],
         );
 
-        write_commit(&table, &int_batch(vec![1], vec![Some(10)])).await;
-        write_commit(&table, &int_batch(vec![1], vec![Some(20)])).await;
+        write_commit(&table, &int_batch(vec![1, 1], vec![Some(10), Some(20)])).await;
+        write_commit(&table, &int_batch(vec![1, 1], vec![Some(4), Some(5)])).await;
 
         let fields = table.schema().fields().to_vec();
 
         let match_merged = PredicateBuilder::new(&fields)
-            .equal("value", Datum::Int(30))
+            .equal("value", Datum::Int(39))
             .unwrap();
         let batches = read_rows(&table, None, Some(match_merged)).await;
         assert_eq!(int_column(&batches, "id"), vec![1]);
-        assert_eq!(int_column(&batches, "value"), vec![30]);
+        assert_eq!(int_column(&batches, "value"), vec![39]);
 
         let match_input = PredicateBuilder::new(&fields)
             .equal("value", Datum::Int(10))

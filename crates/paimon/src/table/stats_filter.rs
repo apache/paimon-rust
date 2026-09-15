@@ -355,14 +355,66 @@ fn extract_stats_datum(row: &BinaryRow, index: usize, data_type: &DataType) -> O
 ///
 /// In data evolution mode, a logical row can be spread across multiple files with
 /// different column sets. After `group_by_overlapping_row_id`, each group contains
-/// files covering the same row ID range. Stats for each field come from the file
-/// with the highest `max_sequence_number` that actually contains that field.
+/// files with overlapping row ID ranges. A field can use stats only from a
+/// unique latest provider covering the entire group, interpreted by field ID
+/// in that provider's schema.
 ///
 /// Reference: [DataEvolutionFileStoreScan.evolutionStats](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/operation/DataEvolutionFileStoreScan.java)
+pub(super) async fn data_evolution_group_matches_predicates_for_table(
+    table: &Table,
+    group: &[DataFileMeta],
+    predicates: &[Predicate],
+    schema_cache: &mut HashMap<i64, Option<Arc<ResolvedStatsSchema>>>,
+) -> bool {
+    if has_always_false(predicates, &[]) {
+        return false;
+    }
+    if predicates
+        .iter()
+        .all(|p| matches!(p, Predicate::AlwaysTrue))
+    {
+        return true;
+    }
+    let mut schemas = Vec::with_capacity(group.len());
+    for file in group {
+        let Some(schema) = resolve_stats_schema(table, file.schema_id, schema_cache).await else {
+            // Unknown file schemas cannot establish either field absence or stats layout.
+            return true;
+        };
+        schemas.push(schema);
+    }
+    data_evolution_group_matches_resolved_predicates(
+        group,
+        predicates,
+        table.schema().fields(),
+        &schemas,
+    )
+}
+
+#[cfg(test)]
 pub(super) fn data_evolution_group_matches_predicates(
     group: &[DataFileMeta],
     predicates: &[Predicate],
     table_fields: &[DataField],
+) -> bool {
+    let schema = Arc::new(ResolvedStatsSchema {
+        file_fields: table_fields.to_vec(),
+        field_mapping: identity_field_mapping(table_fields.len()),
+        key_fields: Vec::new(),
+    });
+    data_evolution_group_matches_resolved_predicates(
+        group,
+        predicates,
+        table_fields,
+        &vec![schema; group.len()],
+    )
+}
+
+fn data_evolution_group_matches_resolved_predicates(
+    group: &[DataFileMeta],
+    predicates: &[Predicate],
+    table_fields: &[DataField],
+    schemas: &[Arc<ResolvedStatsSchema>],
 ) -> bool {
     if predicates.is_empty() || group.is_empty() {
         return true;
@@ -381,42 +433,78 @@ pub(super) fn data_evolution_group_matches_predicates(
         return true;
     }
 
-    // Sort files by max_sequence_number descending so the highest-seq file wins per field.
-    let mut sorted_files: Vec<&DataFileMeta> = group.iter().collect();
-    sorted_files.sort_by_key(|f| std::cmp::Reverse(f.max_sequence_number));
-
-    // For each table field, find which file (index in sorted_files) provides it.
-    // Use file_data_columns (based on write_cols) to determine which file contains
-    // the field, not file_stats_columns (based on value_stats_cols) which only
-    // indicates stats coverage.
-    let field_sources: Vec<Option<(usize, usize)>> = {
-        let per_file_columns: Vec<Vec<&str>> = sorted_files
-            .iter()
-            .map(|file| file_data_columns(file, table_fields))
-            .collect();
-        table_fields
-            .iter()
-            .enumerate()
-            .map(|(field_idx, field)| {
-                for (file_idx, cols) in per_file_columns.iter().enumerate() {
-                    if cols.iter().any(|c| *c == field.name()) {
-                        return Some((file_idx, field_idx));
-                    }
-                }
-                None
-            })
-            .collect()
+    let ranges: Option<Vec<_>> = group
+        .iter()
+        .map(|file| {
+            let start = file.first_row_id?;
+            let end = start.checked_add(file.row_count)?;
+            (end > start).then_some((start, end))
+        })
+        .collect();
+    let Some(ranges) = ranges else {
+        return true;
+    };
+    let start = ranges.iter().map(|range| range.0).min().unwrap();
+    let end = ranges.iter().map(|range| range.1).max().unwrap();
+    let Some(row_count) = end.checked_sub(start) else {
+        return true;
     };
 
-    // Build per-file stats without arity validation — data evolution files
-    // may have fewer columns than the current table schema.
+    // Resolve providers by field ID in each file's schema, then choose the latest
+    // provider. Column names in write_cols/value_stats_cols belong to that schema.
+    let mut sorted_files: Vec<_> = group.iter().zip(schemas).collect();
+    sorted_files.sort_by_key(|(file, _)| std::cmp::Reverse(file.max_sequence_number));
+    let per_file_columns: Vec<_> = sorted_files
+        .iter()
+        .map(|(file, schema)| file_data_columns(file, &schema.file_fields))
+        .collect();
+    let mut field_sources = vec![None; table_fields.len()];
+    let mut usable_provider = vec![false; table_fields.len()];
+    for field_idx in 0..table_fields.len() {
+        let mut providers =
+            sorted_files
+                .iter()
+                .enumerate()
+                .filter_map(|(file_idx, (file, schema))| {
+                    let old_idx = schema.field_mapping[field_idx]?;
+                    per_file_columns[file_idx]
+                        .contains(&schema.file_fields[old_idx].name())
+                        .then_some((file_idx, *file))
+                });
+        if let Some((file_idx, file)) = providers.next() {
+            field_sources[field_idx] = Some((file_idx, field_idx));
+            let tied = providers
+                .next()
+                .is_some_and(|(_, next)| next.max_sequence_number == file.max_sequence_number);
+            usable_provider[field_idx] =
+                !tied && file.first_row_id == Some(start) && file.row_count == row_count;
+        }
+    }
+
     let file_stats: Vec<FileStatsRows> = sorted_files
         .iter()
-        .map(|file| FileStatsRows::from_data_file(file, table_fields))
+        .map(|(file, schema)| {
+            let mut stats = FileStatsRows::from_data_file(file, &schema.file_fields);
+            let mapping = table_fields
+                .iter()
+                .enumerate()
+                .map(|(idx, field)| {
+                    let old_idx = schema.field_mapping[idx]?;
+                    // Java ignores stats for changed types. Keep the field's provider
+                    // but mark its stats unknown, rather than treating it as absent/null.
+                    if !usable_provider[idx]
+                        || schema.file_fields[old_idx].data_type() != field.data_type()
+                        || !valid_evolution_stats(&stats, old_idx, field.data_type(), row_count)
+                    {
+                        return None;
+                    }
+                    stats.stats_index(old_idx)
+                })
+                .collect();
+            stats.stats_col_mapping = Some(mapping);
+            stats
+        })
         .collect();
-
-    // row_count is the max across the group (overlapping row ranges).
-    let row_count = group.iter().map(|f| f.row_count).max().unwrap_or(0);
 
     predicates.iter().all(|predicate| {
         data_evolution_predicate_may_match(
@@ -427,6 +515,45 @@ pub(super) fn data_evolution_group_matches_predicates(
             row_count,
         )
     })
+}
+
+/// Java DataEvolutionFileStoreScan.isValidStats: inconsistent statistics must
+/// not become evidence that an entire row-id group can be dropped.
+fn valid_evolution_stats(
+    stats: &FileStatsRows,
+    index: usize,
+    data_type: &DataType,
+    row_count: i64,
+) -> bool {
+    let Some(stats_index) = stats.stats_index(index) else {
+        return false;
+    };
+    if [&stats.min_values, &stats.max_values].iter().any(|row| {
+        row.as_ref().is_none_or(|row| {
+            stats_index >= row.arity() as usize
+                || row.data().len() < BinaryRow::cal_fix_part_size_in_bytes(row.arity()) as usize
+        })
+    }) {
+        return false;
+    }
+    let nulls = stats.null_count(index);
+    if nulls.is_some_and(|count| count < 0 || count > row_count) {
+        return false;
+    }
+    match (
+        stats.min_value(index, data_type),
+        stats.max_value(index, data_type),
+    ) {
+        (None, None) => true,
+        (Some(min), Some(max)) => {
+            nulls != Some(row_count)
+                && matches!(
+                    min.partial_cmp(&max),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                )
+        }
+        _ => false,
+    }
 }
 
 /// Resolve which columns a file actually contains (for field source resolution).

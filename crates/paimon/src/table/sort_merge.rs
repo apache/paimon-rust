@@ -604,16 +604,17 @@ impl AggregateMergeFunction {
             aggregators: Mutex::new(aggregators),
         })
     }
-}
 
-impl MergeFunction for AggregateMergeFunction {
-    fn merge(
+    /// Aggregate a key group already ordered by user sequence and auto sequence.
+    /// The write buffer uses its sorted order directly; the merge reader sorts
+    /// references from its input streams before sharing the same implementation.
+    pub(super) fn merge_ordered(
         &self,
-        rows: &[MergeRow],
+        rows: &[&MergeRow],
         batch_buffer: &[BufferedBatch],
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
-    ) -> crate::Result<MergeResult> {
+    ) -> crate::Result<RecordBatch> {
         if rows.is_empty() {
             return Err(Error::UnexpectedError {
                 message: "merge called with empty rows".to_string(),
@@ -631,15 +632,6 @@ impl MergeFunction for AggregateMergeFunction {
             }
         }
 
-        // Sort row indices by user sequence (if configured), then system
-        // sequence, so per-field aggregators see the canonical "ascending
-        // sequence" order documented in their contracts.
-        let mut ordered_row_indices: Vec<usize> = (0..rows.len()).collect();
-        ordered_row_indices.sort_by(|&lhs_idx, &rhs_idx| {
-            compare_sequence_order(&rows[lhs_idx], &rows[rhs_idx])
-                .then_with(|| lhs_idx.cmp(&rhs_idx))
-        });
-
         let mut aggregators = self
             .aggregators
             .lock()
@@ -653,8 +645,7 @@ impl MergeFunction for AggregateMergeFunction {
             }
         }
 
-        for &row_idx in &ordered_row_indices {
-            let row = &rows[row_idx];
+        for row in rows {
             for (col_idx, slot) in aggregators.iter_mut().enumerate() {
                 if let Some(agg) = slot.as_mut() {
                     let source_array = batch_buffer[row.batch_idx]
@@ -667,7 +658,7 @@ impl MergeFunction for AggregateMergeFunction {
         // Use the last sorted row to source primary-key column values: every
         // row in the group shares the same PK by construction, so any row
         // works; picking the last one keeps the slice cheap to compute.
-        let pk_source = &rows[*ordered_row_indices.last().unwrap()];
+        let pk_source = rows.last().unwrap();
 
         let output_columns: Vec<ArrayRef> = aggregators
             .iter()
@@ -716,7 +707,28 @@ impl MergeFunction for AggregateMergeFunction {
             }
         })?;
 
-        Ok(MergeResult::MaterializedRow(batch))
+        Ok(batch)
+    }
+}
+
+impl MergeFunction for AggregateMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        let mut ordered: Vec<_> = rows.iter().collect();
+        // Stable sorting keeps input order for equal sequences.
+        ordered.sort_by(|lhs, rhs| compare_sequence_order(lhs, rhs));
+        self.merge_ordered(
+            &ordered,
+            batch_buffer,
+            source_output_col_indices,
+            output_schema,
+        )
+        .map(MergeResult::MaterializedRow)
     }
 }
 
