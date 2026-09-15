@@ -1828,6 +1828,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_an_audit_log_read_refuses_a_query_auth_table() {
+        let table = query_auth_table();
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let audit =
+            AuditLogRead::new(read).expect("the decision is per split, not at construction");
+        // An empty split list reads as empty; a split without a grant does not.
+        let Err(err) = audit.to_arrow(&[split_with_grant(None)]) else {
+            panic!("an audit read must refuse a query-auth.enabled table")
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("query-auth.enabled")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn test_an_audit_log_read_checks_marked_splits_on_a_primary_key_table() {
+        // The primary-key path builds its readers itself, so it must not skip
+        // the split-carried decision `PaimonTableRead::to_arrow` makes.
+        let table = file_index_table("memory:/table_read_audit_marked_split", None, true);
+        let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
+        let audit = AuditLogRead::new(read).unwrap();
+        let Err(err) = audit.to_arrow(&[split_with_grant(None)]) else {
+            panic!("a marked split without a grant must be refused")
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("query-auth.enabled")),
+            "{err:?}"
+        );
+    }
+
     fn stale_handle(name: &str, options: &[(&str, &str)]) -> Table {
         let mut builder = crate::spec::Schema::builder().column(
             "id",
