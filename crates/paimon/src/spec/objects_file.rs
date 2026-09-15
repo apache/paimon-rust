@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use apache_avro::{from_value, to_value, Codec, Reader, Schema, Writer, ZstandardSettings};
+use apache_avro::{
+    from_value, to_value, Codec, DeflateSettings, Reader, Schema, Writer, ZstandardSettings,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -71,6 +73,16 @@ pub(crate) fn avro_codec(compression: &str) -> crate::Result<Codec> {
         "zstd" | "zstandard" => Ok(Codec::Zstandard(ZstandardSettings::default())),
         "null" | "none" | "uncompressed" => Ok(Codec::Null),
         "snappy" => Ok(Codec::Snappy),
+        // Ask for level 6, matching Avro Java's `Deflater.DEFAULT_COMPRESSION`.
+        // `DeflateSettings::default()` looks like the obvious choice and is not:
+        // apache-avro's `DefaultCompression` is `-1`, `compression_level()` casts it
+        // `as u8` to 255, and miniz_oxide clamps that to 10 search probes — 6.7x the
+        // CPU of level 6 at our 16 KB block size, for byte-identical output.
+        // miniz_oxide's probe count is not zlib's level algorithm, so this is
+        // comparable effort rather than byte-identical output to Java.
+        "deflate" => Ok(Codec::Deflate(DeflateSettings::new(
+            miniz_oxide::deflate::CompressionLevel::DefaultLevel,
+        ))),
         other => Err(crate::Error::Unsupported {
             message: format!("Unsupported Avro compression: {other}"),
         }),
@@ -89,6 +101,54 @@ mod tests {
     use crate::spec::{DataFileMeta, IndexManifestEntry, ManifestFileMeta};
     use apache_avro::types::Value;
     use chrono::{DateTime, Utc};
+
+    #[test]
+    fn test_avro_codec_accepts_deflate_and_still_rejects_the_rest() {
+        // Java's `CodecFactory.fromString` also takes bzip2 and xz; each would be a new
+        // dependency with no evidence of use, so they stay rejected here. We are also
+        // laxer than Java on case and on the `zstd`/`none`/`uncompressed` aliases —
+        // pre-existing and deliberate, since these are Paimon option names rather than
+        // Avro header names.
+        assert!(matches!(avro_codec("deflate").unwrap(), Codec::Deflate(_)));
+        assert!(matches!(avro_codec("DEFLATE").unwrap(), Codec::Deflate(_)));
+        let error = avro_codec("bzip2").unwrap_err().to_string();
+        assert!(
+            error.contains("Unsupported Avro compression: bzip2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_every_writable_compression_round_trips_through_the_ocf_reader() {
+        // The invariant this whole change exists to restore: whatever `avro_codec`
+        // accepts must produce a header `parse_ocf` accepts. The two whitelists live in
+        // different string domains (Paimon option names vs Avro header names), so
+        // nothing but a loop keeps them composable.
+        let metas = vec![ManifestFileMeta::new(
+            "manifest-test-0".to_string(),
+            1024,
+            5,
+            2,
+            BinaryTableStats::new(vec![0, 0, 0, 2], vec![0, 0, 0, 3], vec![Some(1)]),
+            0,
+        )];
+        for compression in [
+            "zstd",
+            "zstandard",
+            "null",
+            "none",
+            "uncompressed",
+            "snappy",
+            "deflate",
+        ] {
+            let bytes =
+                to_avro_bytes_with_compression(MANIFEST_FILE_META_SCHEMA, &metas, compression)
+                    .unwrap();
+            let decoded = from_avro_bytes_fast::<ManifestFileMeta>(&bytes)
+                .unwrap_or_else(|error| panic!("{compression}: {error}"));
+            assert_eq!(decoded, metas, "{compression}");
+        }
+    }
 
     // Check the record decoded from the OCF writer schema, including fields whose
     // values were omitted by serde and filled from Avro defaults.

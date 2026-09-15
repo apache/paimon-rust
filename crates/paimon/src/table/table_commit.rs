@@ -5839,6 +5839,81 @@ mod tests {
         assert_eq!(stats.null_counts(), &vec![Some(1)]);
     }
 
+    /// `manifest.compression` comes from the persisted table schema, so a table
+    /// created by Java with `deflate` makes every paimon-rust process both write and
+    /// read that codec. The second commit is the load-bearing half: it makes the
+    /// commit path *read back* the first snapshot's manifest list and manifest files,
+    /// which is exactly what fails on such a table today.
+    #[tokio::test]
+    async fn test_deflate_manifest_compression_round_trips() {
+        use crate::spec::avro::ocf::{parse_ocf, OcfCodec};
+
+        let file_io = test_file_io();
+        let table_path = "memory:/test_manifest_deflate";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([("manifest.compression".to_string(), "deflate".to_string())]),
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 3)],
+            )])
+            .await
+            .unwrap();
+        // Reads the previous snapshot's manifests through the production commit path.
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-1.parquet", 4)],
+            )])
+            .await
+            .unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        assert_eq!(snapshot.id(), 2);
+        let manifest_dir = format!("{table_path}/manifest");
+        let mut names = Vec::new();
+        // The base list carries what snapshot 1 wrote and the commit path just read
+        // back; the delta list is what this commit wrote.
+        for list_name in [
+            snapshot.base_manifest_list(),
+            snapshot.delta_manifest_list(),
+        ] {
+            let list_path = format!("{manifest_dir}/{list_name}");
+            let list_bytes = file_io.new_input(&list_path).unwrap().read().await.unwrap();
+            let (header, blocks) = parse_ocf(&list_bytes).unwrap();
+            assert_eq!(header.codec, OcfCodec::Deflate, "{list_path}");
+            assert!(blocks.iter().map(|block| block.object_count).sum::<usize>() > 0);
+
+            for meta in ManifestList::read(&file_io, &list_path).await.unwrap() {
+                let manifest_path = format!("{manifest_dir}/{}", meta.file_name());
+                let manifest_bytes = file_io
+                    .new_input(&manifest_path)
+                    .unwrap()
+                    .read()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    parse_ocf(&manifest_bytes).unwrap().0.codec,
+                    OcfCodec::Deflate,
+                    "{manifest_path}"
+                );
+                for entry in Manifest::read(&file_io, &manifest_path).await.unwrap() {
+                    names.push(entry.file().file_name.clone());
+                }
+            }
+        }
+        names.sort();
+        assert_eq!(names, ["data-0.parquet", "data-1.parquet"]);
+    }
+
     #[tokio::test]
     async fn test_manifest_files_roll_by_target_size_and_preserve_entries() {
         let file_io = test_file_io();
