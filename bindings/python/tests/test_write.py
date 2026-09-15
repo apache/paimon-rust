@@ -15,8 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import json
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pyarrow as pa
 import pytest
@@ -281,3 +282,34 @@ def test_timestamp_partition_writes_and_reads_use_java_paths(tmp_path, legacy, p
     assert sum(split.row_count() for split in plan.splits()) == 2
     rows = pa.Table.from_batches(ctx.sql("SELECT id, ts FROM paimon.wdb.t")).sort_by("id")
     assert rows.to_pydict() == {"id": [1, 2], "ts": [value, value]}
+
+
+@pytest.mark.parametrize("precision,unit,micros,fraction", [(3, "ms", 120000, "120"), (6, "us", 120100, "120100")])
+def test_ltz_schema_alias_write_roundtrip(tmp_path, precision, unit, micros, fraction):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.wdb")
+    ctx.sql(
+        "CREATE TABLE paimon.wdb.t (id INT, ts TIMESTAMP({}) WITH TIME ZONE) PARTITIONED BY (ts) "
+        "WITH ('partition.legacy-name' = 'true')".format(precision)
+    )
+    # PyPaimon persists this alias; reloading must retain its timezone semantics.
+    schema_path = next(tmp_path.rglob("schema-0"))
+    schema = json.loads(schema_path.read_text())
+    schema["fields"][1]["type"] = "TIMESTAMP_LTZ({})".format(precision)
+    schema_path.write_text(json.dumps(schema))
+    table = _get_table(str(tmp_path))
+    assert "LocalZonedTimestamp" in table.schema().fields()[1].field_type()
+    value = datetime(2026, 9, 15, 20, 0, 0, micros, tzinfo=timezone.utc)
+    arrow_schema = pa.schema([("id", pa.int32()), ("ts", pa.timestamp(unit, tz="UTC"))])
+    builder = table.new_write_builder()
+    write = builder.new_write()
+    write.write_arrow(pa.record_batch([[1], [value]], schema=arrow_schema))
+    builder.new_commit().commit(write.prepare_commit())
+    files = list(tmp_path.rglob("data-*.parquet"))
+    assert len(files) == 1
+    assert files[0].parent.parent.name == "ts=2026-09-15T20%3A00%3A00." + fraction
+    table = _get_table(str(tmp_path))
+    assert sum(split.row_count() for split in table.new_read_builder().new_scan().plan().splits()) == 1
+    rows = pa.Table.from_batches(ctx.sql("SELECT id, ts FROM paimon.wdb.t"))
+    assert rows.to_pydict() == {"id": [1], "ts": [value]}
