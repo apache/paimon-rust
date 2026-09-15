@@ -310,6 +310,62 @@ mod tests {
     }
 
     #[test]
+    fn test_global_index_records_allow_reordered_and_unknown_fields() {
+        // Sibling of the deletion-vector test above, for the other nested record in
+        // the same entry. `_GLOBAL_INDEX` has already grown once (`_SOURCE_META`), and
+        // Java documents the record as appendable, so the decoder must not depend on
+        // field order.
+        let mut schema: serde_json::Value =
+            serde_json::from_str(INDEX_MANIFEST_ENTRY_SCHEMA).unwrap();
+        assert_eq!(schema["fields"][10]["name"], "_GLOBAL_INDEX");
+        let fields = schema["fields"][10]["type"][1]["fields"]
+            .as_array_mut()
+            .unwrap();
+        assert_eq!(
+            fields.len(),
+            6,
+            "a seventh field means someone must confirm the walk handles it"
+        );
+        fields.reverse();
+        fields.insert(
+            1,
+            serde_json::json!({"name": "future", "type": ["null", "bytes"], "default": null}),
+        );
+
+        let entry = global_index_entry(Some(vec![4, 5, 6]));
+        let schema = Schema::parse_str(&schema.to_string()).unwrap();
+        let original =
+            crate::spec::to_avro_bytes(INDEX_MANIFEST_ENTRY_SCHEMA, std::slice::from_ref(&entry))
+                .unwrap();
+        let mut value = apache_avro::Reader::new(original.as_slice())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let Value::Record(fields) = &mut value else {
+            panic!("record");
+        };
+        let (_, global_index) = fields
+            .iter_mut()
+            .find(|(name, _)| name == "_GLOBAL_INDEX")
+            .unwrap();
+        let Value::Union(_, global_index) = global_index else {
+            panic!("nullable global index");
+        };
+        let Value::Record(fields) = global_index.as_mut() else {
+            panic!("global index record");
+        };
+        fields.push((
+            "future".into(),
+            Value::Union(1, Box::new(Value::Bytes(vec![9, 9]))),
+        ));
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        writer.append(value.resolve(&schema).unwrap()).unwrap();
+        let bytes = writer.into_inner().unwrap();
+        assert_eq!(IndexManifest::read_from_bytes(&bytes).unwrap(), vec![entry]);
+    }
+
+    #[test]
     fn test_read_index_manifest_file() {
         let workdir =
             std::env::current_dir().unwrap_or_else(|err| panic!("current_dir must exist: {err}"));
