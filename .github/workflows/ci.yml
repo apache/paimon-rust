@@ -267,11 +267,13 @@ jobs:
           --features fulltext,vortex
           -- --ignored --exact
 
+      # The test filter selects tests, not targets, so without `--test` cargo links all 26
+      # integration binaries with `vortex` enabled just to run one ignored test in one of them.
       - name: DataFusion Lumina Build Query E2E Test
         if: matrix.suite == 'lumina'
         run: >
           cargo test --locked -p paimon-datafusion
-          --features vortex
+          --features vortex --test read_tables
           vector_search_tests::test_lumina_build_then_vector_search_query
           -- --ignored --exact
 
