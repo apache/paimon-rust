@@ -35,7 +35,9 @@
 //! [`committed_index_file_path`].
 
 use crate::io::FileIO;
-use crate::spec::{bucket_path, BinaryRow, IndexFileMeta, IndexManifestEntry, PartitionComputer};
+use crate::spec::{
+    bucket_path, bucket_path_under, BinaryRow, IndexFileMeta, IndexManifestEntry, PartitionComputer,
+};
 use crate::table::Table;
 
 const INDEX_DIR: &str = "index";
@@ -80,13 +82,14 @@ impl IndexFileLocation<'_> {
         }
     }
 
-    /// Older Python DV writers ignored the bucket-directory option. Resolve
-    /// their existing files without changing the manifest or masking missing
-    /// canonical files with a path that does not exist either.
+    /// Prefer Java's existing DV path, then preserve Rust's bucket layout and
+    /// the table/index layout used by older Python writers. Explicit paths are
+    /// authoritative, including when their target is missing.
     async fn resolve_legacy_deletion_vector(
         &self,
         file_io: &FileIO,
         file: &mut IndexFileMeta,
+        java_bucket_path: Option<&str>,
     ) -> crate::Result<()> {
         let Self::BucketLocal {
             table_path,
@@ -98,6 +101,15 @@ impl IndexFileLocation<'_> {
         };
         if file.index_type != "DELETION_VECTORS" || file.external_path.is_some() {
             return Ok(());
+        }
+        // Java timestamp fractions may differ from directories already written by Rust.
+        // Resolve each DV independently so files from both writers can coexist in a bucket.
+        if let Some(java_bucket_path) = java_bucket_path {
+            let java_path = format!("{java_bucket_path}/{}", file.file_name);
+            if file_io.exists(&java_path).await? {
+                file.external_path = Some(java_path);
+                return Ok(());
+            }
         }
         let canonical_path = self.resolve(&file.file_name, None);
         if !file_io.exists(&canonical_path).await? {
@@ -155,12 +167,23 @@ pub(crate) async fn resolve_legacy_deletion_vector_entries(
             &partition,
             entry.bucket,
         )?;
+        let java_bucket_path = partition_computer
+            .as_ref()
+            .map(|computer| {
+                computer
+                    .generate_java_partition_path(&partition)
+                    .map(|path| bucket_path_under(table_path, &path, entry.bucket))
+            })
+            .transpose()?;
+        let java_bucket_path = java_bucket_path
+            .as_deref()
+            .filter(|path| *path != bucket_path);
         IndexFileLocation::BucketLocal {
             table_path,
             bucket_path: &bucket_path,
             index_file_in_data_file_dir: true,
         }
-        .resolve_legacy_deletion_vector(table.file_io(), &mut entry.index_file)
+        .resolve_legacy_deletion_vector(table.file_io(), &mut entry.index_file, java_bucket_path)
         .await?;
     }
     Ok(())
@@ -312,6 +335,123 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn java_timestamp_dvs_preserve_mixed_rust_paths_and_explicit_precedence() {
+        use crate::catalog::Identifier;
+        use crate::io::FileIOBuilder;
+        use crate::spec::{
+            BinaryRowBuilder, DataType, FileKind, Schema, TableSchema, TimestampType,
+        };
+        for (legacy, millis, rust_partition, java_partition) in [
+            (
+                false,
+                0,
+                "ts=1970-01-01 00%3A00%3A00/",
+                "ts=1970-01-01 00%3A00%3A00.000/",
+            ),
+            (
+                true,
+                100,
+                "ts=1970-01-01T00%3A00%3A00.1/",
+                "ts=1970-01-01T00%3A00%3A00.100/",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let table_path = dir.path().to_str().unwrap();
+            let schema = Schema::builder()
+                .column("ts", DataType::Timestamp(TimestampType::new(3).unwrap()))
+                .partition_keys(vec!["ts".to_string()])
+                .option("partition.legacy-name", legacy.to_string())
+                .option("index-file-in-data-file-dir", "true")
+                .build()
+                .unwrap();
+            let schema = TableSchema::new(0, &schema);
+            let file_io = FileIOBuilder::new("file").build().unwrap();
+            let table = Table::new(
+                file_io,
+                Identifier::new("db", "t"),
+                table_path.to_string(),
+                schema,
+                None,
+            );
+            let rust_bucket = bucket_path_under(table_path, rust_partition, 7);
+            let java_bucket = bucket_path_under(table_path, java_partition, 7);
+            let table_index = format!("{table_path}/index");
+            for path in [&rust_bucket, &java_bucket, &table_index] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            for (parent, name, bytes) in [
+                (&java_bucket, "idx-java", b"Java".as_slice()),
+                (&rust_bucket, "idx-java", b"wrong Rust copy".as_slice()),
+                (&table_index, "idx-java", b"wrong table copy".as_slice()),
+                (&rust_bucket, "idx-rust", b"Rust".as_slice()),
+                (&table_index, "idx-rust", b"wrong table copy".as_slice()),
+                (&table_index, "idx-table", b"table".as_slice()),
+                (&java_bucket, "idx-explicit", b"wrong Java copy".as_slice()),
+                (&rust_bucket, "idx-explicit", b"wrong Rust copy".as_slice()),
+                (&table_index, "idx-explicit", b"wrong table copy".as_slice()),
+            ] {
+                std::fs::write(format!("{parent}/{name}"), bytes).unwrap();
+            }
+            let mut row = BinaryRowBuilder::new(1);
+            row.write_timestamp_compact(0, millis);
+            let partition = row.build_serialized();
+            let mut entries: Vec<_> = [
+                "idx-java",
+                "idx-rust",
+                "idx-table",
+                "idx-explicit",
+                "idx-missing",
+            ]
+            .into_iter()
+            .map(|name| {
+                let mut file = committed_file(None);
+                file.file_name = name.to_string();
+                file.index_type = "DELETION_VECTORS".to_string();
+                IndexManifestEntry {
+                    version: 1,
+                    kind: FileKind::Add,
+                    partition: partition.clone(),
+                    bucket: 7,
+                    index_file: file,
+                }
+            })
+            .collect();
+            let explicit = format!("{table_path}/missing-explicit/idx-explicit");
+            entries[3].index_file.external_path = Some(explicit.clone());
+            resolve_legacy_deletion_vector_entries(&table, &mut entries)
+                .await
+                .unwrap();
+            assert_eq!(
+                entries[0].index_file.external_path,
+                Some(format!("{java_bucket}/idx-java"))
+            );
+            assert_eq!(entries[1].index_file.external_path, None);
+            assert_eq!(
+                entries[2].index_file.external_path,
+                Some(format!("{table_index}/idx-table"))
+            );
+            assert_eq!(entries[3].index_file.external_path, Some(explicit.clone()));
+            assert_eq!(entries[4].index_file.external_path, None);
+            let location = IndexFileLocation::BucketLocal {
+                table_path,
+                bucket_path: &rust_bucket,
+                index_file_in_data_file_dir: true,
+            };
+            for (entry, expected) in
+                entries
+                    .iter()
+                    .take(3)
+                    .zip([b"Java".as_slice(), b"Rust", b"table"])
+            {
+                let file = &entry.index_file;
+                let path = location.resolve(&file.file_name, file.external_path.as_deref());
+                assert_eq!(std::fs::read(path).unwrap(), expected);
+            }
+            assert!(!table.file_io().exists(&explicit).await.unwrap());
+        }
+    }
+
     /// A committed index file with the given `_GLOBAL_INDEX` and `_SOURCE_META`.
     fn committed_file(global_index_meta: Option<Option<Vec<u8>>>) -> IndexFileMeta {
         IndexFileMeta {
@@ -361,7 +501,7 @@ mod tests {
         // Missing files retain the canonical path and therefore fail on read.
         let mut missing = original.clone();
         location
-            .resolve_legacy_deletion_vector(&file_io, &mut missing)
+            .resolve_legacy_deletion_vector(&file_io, &mut missing, None)
             .await
             .unwrap();
         assert_eq!(missing.external_path, None);
@@ -369,7 +509,7 @@ mod tests {
         std::fs::write(&legacy_path, b"legacy DV").unwrap();
         let mut legacy = original.clone();
         location
-            .resolve_legacy_deletion_vector(&file_io, &mut legacy)
+            .resolve_legacy_deletion_vector(&file_io, &mut legacy, None)
             .await
             .unwrap();
         assert_eq!(legacy.external_path.as_deref(), Some(legacy_path.as_str()));
@@ -377,7 +517,7 @@ mod tests {
         std::fs::write(&canonical_path, b"canonical DV").unwrap();
         let mut canonical = original.clone();
         location
-            .resolve_legacy_deletion_vector(&file_io, &mut canonical)
+            .resolve_legacy_deletion_vector(&file_io, &mut canonical, None)
             .await
             .unwrap();
         assert_eq!(canonical.external_path, None);
@@ -389,7 +529,7 @@ mod tests {
         // An explicit path is never substituted, even when the target is absent.
         original.external_path = Some(external_path.clone());
         location
-            .resolve_legacy_deletion_vector(&file_io, &mut original)
+            .resolve_legacy_deletion_vector(&file_io, &mut original, None)
             .await
             .unwrap();
         assert_eq!(original.external_path, Some(external_path));
@@ -397,7 +537,7 @@ mod tests {
         std::fs::remove_file(&canonical_path).unwrap();
         let mut other_index = committed_file(None);
         location
-            .resolve_legacy_deletion_vector(&file_io, &mut other_index)
+            .resolve_legacy_deletion_vector(&file_io, &mut other_index, None)
             .await
             .unwrap();
         assert_eq!(other_index.external_path, None);

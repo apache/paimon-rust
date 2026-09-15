@@ -113,6 +113,14 @@ impl PartitionComputer {
         &self,
         row: &BinaryRow,
     ) -> crate::Result<Vec<(String, String)>> {
+        self.generate_part_values_with_timestamp_format(row, false)
+    }
+
+    fn generate_part_values_with_timestamp_format(
+        &self,
+        row: &BinaryRow,
+        java_timestamps: bool,
+    ) -> crate::Result<Vec<(String, String)>> {
         self.validate_row(row)?;
 
         self.partition_keys
@@ -126,6 +134,7 @@ impl PartitionComputer {
                     field.data_type(),
                     &self.default_partition_name,
                     self.legacy_partition_name,
+                    java_timestamps,
                 )?;
                 Ok((key.clone(), value))
             })
@@ -143,6 +152,16 @@ impl PartitionComputer {
 
         let part_values = self.generate_part_values(row)?;
         Ok(assemble_partition_path(&part_values))
+    }
+
+    /// Java's partition path, used to locate Java-written bucket-local deletion vectors.
+    /// The default path retains Rust's existing timestamp directories for stored data.
+    pub(crate) fn generate_java_partition_path(&self, row: &BinaryRow) -> crate::Result<String> {
+        if self.partition_keys.is_empty() {
+            return Ok(String::new());
+        }
+        let values = self.generate_part_values_with_timestamp_format(row, true)?;
+        Ok(assemble_partition_path(&values))
     }
 
     /// Validate that the `BinaryRow` is compatible with this computer's partition keys.
@@ -224,6 +243,7 @@ fn format_partition_value(
     data_type: &DataType,
     default_partition_name: &str,
     legacy: bool,
+    java_timestamps: bool,
 ) -> crate::Result<String> {
     if row.is_null_at(pos) {
         return Ok(default_partition_name.to_string());
@@ -261,7 +281,9 @@ fn format_partition_value(
         DataType::Timestamp(t) => {
             let (millis, nano_of_milli) = row.get_timestamp_raw(pos, t.precision())?;
             let dt = millis_to_naive_datetime(millis, nano_of_milli);
-            if legacy {
+            if !java_timestamps {
+                format_timestamp_rust(dt, t.precision(), legacy)
+            } else if legacy {
                 format_timestamp_legacy(dt)
             } else {
                 format_timestamp_non_legacy(dt, t.precision())
@@ -270,16 +292,19 @@ fn format_partition_value(
 
         DataType::LocalZonedTimestamp(t) => {
             let (millis, nano_of_milli) = row.get_timestamp_raw(pos, t.precision())?;
-            if legacy {
-                // Legacy: Timestamp.toString() → toLocalDateTime().toString(),
-                // which does NOT apply timezone conversion.
-                let dt = millis_to_naive_datetime(millis, nano_of_milli);
+            let dt = if legacy {
+                // Legacy Timestamp.toString() does not apply timezone conversion.
+                millis_to_naive_datetime(millis, nano_of_milli)
+            } else {
+                // Non-legacy TimestampToStringCastRule applies TimeZone.getDefault().
+                epoch_millis_to_local_datetime(millis, nano_of_milli)
+            };
+            if !java_timestamps {
+                format_timestamp_rust(dt, t.precision(), legacy)
+            } else if legacy {
                 format_timestamp_legacy(dt)
             } else {
-                // Non-legacy: convert to local timezone, mirroring Java
-                // TimestampToStringCastRule which applies TimeZone.getDefault().
-                let local_dt = epoch_millis_to_local_datetime(millis, nano_of_milli);
-                format_timestamp_non_legacy(local_dt, t.precision())
+                format_timestamp_non_legacy(dt, t.precision())
             }
         }
 
@@ -442,11 +467,27 @@ fn epoch_millis_to_local_datetime(millis: i64, nano_of_milli: i32) -> NaiveDateT
     dt.naive_local()
 }
 
+/// Preserve timestamp directory names already written by Rust.
+fn format_timestamp_rust(dt: NaiveDateTime, precision: u32, legacy: bool) -> String {
+    if legacy {
+        let text = format_timestamp_legacy(dt);
+        if dt.nanosecond() == 0 {
+            text
+        } else {
+            text.trim_end_matches('0').to_string()
+        }
+    } else if precision == 0 || dt.nanosecond() == 0 {
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        format_timestamp_non_legacy(dt, precision)
+    }
+}
+
 /// Format a timestamp using Java `LocalDateTime.toString()` semantics (legacy mode).
 ///
 /// - Omits seconds if seconds == 0 and nanos == 0: `2024-01-01T12:34`
 /// - Omits fractional part if nanos == 0: `2024-01-01T12:34:56`
-/// - Appends minimal fractional digits (strips trailing zeros): `2024-01-01T12:34:56.123`
+/// - Uses 3, 6, or 9 fractional digits: `2024-01-01T12:34:56.100`
 fn format_timestamp_legacy(dt: NaiveDateTime) -> String {
     let nano = dt.nanosecond();
     let sec = dt.second();
@@ -460,9 +501,15 @@ fn format_timestamp_legacy(dt: NaiveDateTime) -> String {
     let mut result = format!("{date_hour_min}:{sec:02}");
     if nano > 0 {
         let frac = format!("{nano:09}");
-        let trimmed = frac.trim_end_matches('0');
+        let digits = if nano.is_multiple_of(1_000_000) {
+            3
+        } else if nano.is_multiple_of(1_000) {
+            6
+        } else {
+            9
+        };
         result.push('.');
-        result.push_str(trimmed);
+        result.push_str(&frac[..digits]);
     }
     result
 }
@@ -470,16 +517,12 @@ fn format_timestamp_legacy(dt: NaiveDateTime) -> String {
 /// Format a timestamp using non-legacy `DateTimeUtils.formatTimestamp()` semantics.
 ///
 /// Always uses space separator: `yyyy-MM-dd HH:mm:ss[.fraction]`.
-/// Fraction: pad nano to 9 digits, strip trailing zeros down to at most `precision` digits.
+/// Fraction: pad nano to 9 digits, strip trailing zeros while keeping at least `precision` digits.
 fn format_timestamp_non_legacy(dt: NaiveDateTime, precision: u32) -> String {
     let nano = dt.nanosecond();
     let ymdhms = dt.format("%Y-%m-%d %H:%M:%S").to_string();
 
-    if precision == 0 || nano == 0 {
-        return ymdhms;
-    }
-
-    // Pad nano to 9 digits, then strip trailing zeros but keep at least up to `precision` digits.
+    // Whole seconds keep the declared precision; nonzero fractions are never truncated.
     let nano_str = format!("{nano:09}");
     let mut fraction = &nano_str[..];
 
@@ -930,12 +973,22 @@ mod tests {
             .and_hms_opt(12, 34, 56)
             .unwrap();
         assert_eq!(format_timestamp_legacy(dt2), "2024-01-01T12:34:56");
-        // 3. nano>0: include fraction with trailing zero stripping
-        let dt3 = NaiveDate::from_ymd_opt(2024, 1, 1)
-            .unwrap()
-            .and_hms_nano_opt(12, 34, 56, 123_000_000)
-            .unwrap();
-        assert_eq!(format_timestamp_legacy(dt3), "2024-01-01T12:34:56.123");
+        // Java LocalDateTime.toString() emits fractions in groups of three digits.
+        for (nanos, expected) in [
+            (100_000_000, "2024-01-01T12:34:56.100"),
+            (120_000_000, "2024-01-01T12:34:56.120"),
+            (123_000_000, "2024-01-01T12:34:56.123"),
+            (123_400_000, "2024-01-01T12:34:56.123400"),
+            (123_456_000, "2024-01-01T12:34:56.123456"),
+            (123_456_700, "2024-01-01T12:34:56.123456700"),
+            (1, "2024-01-01T12:34:56.000000001"),
+        ] {
+            let dt = NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_nano_opt(12, 34, 56, nanos)
+                .unwrap();
+            assert_eq!(format_timestamp_legacy(dt), expected);
+        }
     }
 
     #[test]
@@ -944,8 +997,11 @@ mod tests {
             .unwrap()
             .and_hms_nano_opt(12, 0, 0, 123_000_000)
             .unwrap();
-        // precision=0 → no fraction
-        assert_eq!(format_timestamp_non_legacy(dt, 0), "2024-01-01 12:00:00");
+        // Precision is a minimum fraction width, not a truncation boundary.
+        assert_eq!(
+            format_timestamp_non_legacy(dt, 0),
+            "2024-01-01 12:00:00.123"
+        );
         // precision=3 → strip trailing zeros down to 3 digits
         assert_eq!(
             format_timestamp_non_legacy(dt, 3),
@@ -956,6 +1012,120 @@ mod tests {
             format_timestamp_non_legacy(dt, 9),
             "2024-01-01 12:00:00.123000000"
         );
+    }
+
+    #[test]
+    fn test_timestamp_non_legacy_whole_seconds_keep_declared_precision() {
+        let dt = NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        for (precision, expected) in [
+            (0, "2024-01-01 12:00:00"),
+            (1, "2024-01-01 12:00:00.0"),
+            (3, "2024-01-01 12:00:00.000"),
+            (6, "2024-01-01 12:00:00.000000"),
+            (9, "2024-01-01 12:00:00.000000000"),
+        ] {
+            assert_eq!(format_timestamp_non_legacy(dt, precision), expected);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_non_legacy_preserves_significant_fraction_digits() {
+        for (nanos, precision, expected) in [
+            (120_000_000, 0, "2024-01-01 12:00:00.12"),
+            (120_000_000, 3, "2024-01-01 12:00:00.120"),
+            (123_456_700, 0, "2024-01-01 12:00:00.1234567"),
+            (123_456_700, 3, "2024-01-01 12:00:00.1234567"),
+            (123_456_700, 9, "2024-01-01 12:00:00.123456700"),
+        ] {
+            let dt = NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_nano_opt(12, 0, 0, nanos)
+                .unwrap();
+            assert_eq!(format_timestamp_non_legacy(dt, precision), expected);
+        }
+    }
+
+    #[test]
+    fn test_java_timestamp_paths_do_not_change_existing_rust_directories() {
+        for (nanos, precision, legacy, rust_path, java_path) in [
+            (
+                0,
+                0,
+                false,
+                "ts=2024-01-01 12%3A34%3A00/",
+                "ts=2024-01-01 12%3A34%3A00/",
+            ),
+            (
+                0,
+                3,
+                false,
+                "ts=2024-01-01 12%3A34%3A00/",
+                "ts=2024-01-01 12%3A34%3A00.000/",
+            ),
+            (
+                120_000_000,
+                0,
+                false,
+                "ts=2024-01-01 12%3A34%3A00/",
+                "ts=2024-01-01 12%3A34%3A00.12/",
+            ),
+            (
+                100_000_000,
+                3,
+                true,
+                "ts=2024-01-01T12%3A34%3A00.1/",
+                "ts=2024-01-01T12%3A34%3A00.100/",
+            ),
+            (
+                123_400_000,
+                6,
+                true,
+                "ts=2024-01-01T12%3A34%3A00.1234/",
+                "ts=2024-01-01T12%3A34%3A00.123400/",
+            ),
+            (
+                123_456_700,
+                9,
+                true,
+                "ts=2024-01-01T12%3A34%3A00.1234567/",
+                "ts=2024-01-01T12%3A34%3A00.123456700/",
+            ),
+        ] {
+            let dt = NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_nano_opt(12, 34, 0, nanos)
+                .unwrap();
+            let fields = vec![make_field(
+                "ts",
+                DataType::Timestamp(TimestampType::new(precision).unwrap()),
+            )];
+            let computer = PartitionComputer::new(
+                &["ts".to_string()],
+                &fields,
+                TEST_DEFAULT_PARTITION_NAME,
+                legacy,
+            )
+            .unwrap();
+            let mut builder = crate::spec::BinaryRowBuilder::new(1);
+            if precision <= 3 {
+                builder.write_timestamp_compact(0, dt.and_utc().timestamp_millis());
+            } else {
+                builder.write_timestamp_non_compact(
+                    0,
+                    dt.and_utc().timestamp_millis(),
+                    (nanos % 1_000_000) as i32,
+                );
+            }
+            let row = builder.build();
+            assert_eq!(computer.generate_partition_path(&row).unwrap(), rust_path);
+            assert_eq!(
+                computer.generate_java_partition_path(&row).unwrap(),
+                java_path
+            );
+        }
     }
 
     #[test]
