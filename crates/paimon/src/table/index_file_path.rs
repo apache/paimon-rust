@@ -312,6 +312,94 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn timestamp_dvs_use_canonical_paths_and_explicit_precedence() {
+        use crate::catalog::Identifier;
+        use crate::io::FileIOBuilder;
+        use crate::spec::{
+            bucket_path_under, BinaryRowBuilder, DataType, FileKind, Schema, TableSchema,
+            TimestampType,
+        };
+        for (legacy, millis, java_partition) in [
+            (false, 0, "ts=1970-01-01 00%3A00%3A00.000/"),
+            (true, 100, "ts=1970-01-01T00%3A00%3A00.100/"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let table_path = dir.path().to_str().unwrap();
+            let schema = Schema::builder()
+                .column("ts", DataType::Timestamp(TimestampType::new(3).unwrap()))
+                .partition_keys(vec!["ts".to_string()])
+                .option("partition.legacy-name", legacy.to_string())
+                .option("index-file-in-data-file-dir", "true")
+                .build()
+                .unwrap();
+            let schema = TableSchema::new(0, &schema);
+            let file_io = FileIOBuilder::new("file").build().unwrap();
+            let table = Table::new(
+                file_io,
+                Identifier::new("db", "t"),
+                table_path.to_string(),
+                schema,
+                None,
+            );
+            let java_bucket = bucket_path_under(table_path, java_partition, 7);
+            let table_index = format!("{table_path}/index");
+            for path in [&java_bucket, &table_index] {
+                std::fs::create_dir_all(path).unwrap();
+            }
+            for (parent, name, bytes) in [
+                (&java_bucket, "idx-java", b"Java".as_slice()),
+                (&table_index, "idx-java", b"wrong table copy".as_slice()),
+                (&table_index, "idx-table", b"table".as_slice()),
+                (&java_bucket, "idx-explicit", b"wrong Java copy".as_slice()),
+                (&table_index, "idx-explicit", b"wrong table copy".as_slice()),
+            ] {
+                std::fs::write(format!("{parent}/{name}"), bytes).unwrap();
+            }
+            let mut row = BinaryRowBuilder::new(1);
+            row.write_timestamp_compact(0, millis);
+            let partition = row.build_serialized();
+            let mut entries: Vec<_> = ["idx-java", "idx-table", "idx-explicit", "idx-missing"]
+                .into_iter()
+                .map(|name| {
+                    let mut file = committed_file(None);
+                    file.file_name = name.to_string();
+                    file.index_type = "DELETION_VECTORS".to_string();
+                    IndexManifestEntry {
+                        version: 1,
+                        kind: FileKind::Add,
+                        partition: partition.clone(),
+                        bucket: 7,
+                        index_file: file,
+                    }
+                })
+                .collect();
+            let explicit = format!("{table_path}/missing-explicit/idx-explicit");
+            entries[2].index_file.external_path = Some(explicit.clone());
+            resolve_legacy_deletion_vector_entries(&table, &mut entries)
+                .await
+                .unwrap();
+            assert_eq!(entries[0].index_file.external_path, None);
+            assert_eq!(
+                entries[1].index_file.external_path,
+                Some(format!("{table_index}/idx-table"))
+            );
+            assert_eq!(entries[2].index_file.external_path, Some(explicit.clone()));
+            assert_eq!(entries[3].index_file.external_path, None);
+            let location = IndexFileLocation::BucketLocal {
+                table_path,
+                bucket_path: &java_bucket,
+                index_file_in_data_file_dir: true,
+            };
+            for (entry, expected) in entries.iter().take(2).zip([b"Java".as_slice(), b"table"]) {
+                let file = &entry.index_file;
+                let path = location.resolve(&file.file_name, file.external_path.as_deref());
+                assert_eq!(std::fs::read(path).unwrap(), expected);
+            }
+            assert!(!table.file_io().exists(&explicit).await.unwrap());
+        }
+    }
+
     /// A committed index file with the given `_GLOBAL_INDEX` and `_SOURCE_META`.
     fn committed_file(global_index_meta: Option<Option<Vec<u8>>>) -> IndexFileMeta {
         IndexFileMeta {
