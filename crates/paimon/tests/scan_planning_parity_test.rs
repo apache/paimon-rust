@@ -368,7 +368,7 @@ async fn position_selection_precedes_deletions_and_preserves_historical_reads() 
 }
 
 #[tokio::test]
-async fn combined_delta_uses_window_end_deletion_vectors_after_repeated_deletes() {
+async fn combined_delta_preserves_events_across_repeated_endpoint_deletes() {
     for bucket_local in ["false", "true"] {
         let table = evolution_table_with_options(
             "memory:/planning_parity/delta_dv",
@@ -382,7 +382,7 @@ async fn combined_delta_uses_window_end_deletion_vectors_after_repeated_deletes(
         append_ids(&table, 3, 6).await;
         delete_ids(&table, &[1, 4]).await;
         delete_ids(&table, &[5]).await;
-        for (end, expected) in [(2, vec![3, 4, 5]), (3, vec![3, 5]), (4, vec![3])] {
+        for end in [2, 3, 4] {
             let plan = table
                 .new_read_builder()
                 .new_incremental_scan(IncrementalScanMode::Delta, 1, end)
@@ -390,8 +390,11 @@ async fn combined_delta_uses_window_end_deletion_vectors_after_repeated_deletes(
                 .await
                 .unwrap();
             assert_eq!(plan.snapshot_id(), Some(end));
-            assert!(plan.splits().iter().all(|s| s.snapshot_id() == end));
-            assert_eq!(read_ids(&table, &plan).await, expected);
+            assert!(plan.splits().iter().all(|s| s.snapshot_id() == end
+                && s.is_streaming()
+                && s.data_deletion_files().is_none()));
+            // Endpoint deletes affect snapshot state, not historical APPEND events.
+            assert_eq!(read_ids(&table, &plan).await, vec![3, 4, 5]);
         }
         let mut builder = table.new_read_builder();
         builder.with_limit(1);
@@ -402,7 +405,10 @@ async fn combined_delta_uses_window_end_deletion_vectors_after_repeated_deletes(
             .plan_combined_delta()
             .await
             .unwrap();
-        assert_eq!(read_column(&builder, &plan, 0).await, vec![5]);
+        // The limit is a planning hint; both selected positions belong to one group.
+        assert_eq!(read_column(&builder, &plan, 0).await, vec![4, 5]);
+        let current = table.new_read_builder().new_scan().plan().await.unwrap();
+        assert_eq!(read_ids(&table, &current).await, vec![0, 2, 3]);
     }
 }
 
@@ -473,23 +479,16 @@ async fn branch_snapshot_and_combined_delta_use_independent_snapshot_histories()
         .unwrap();
     let branch = table.copy_with_branch("audit").await.unwrap();
     append_ids(&table, 10, 11).await;
-    let overwrite = table.new_write_builder().with_overwrite();
-    let mut writer = overwrite.new_write().unwrap();
-    writer
-        .write_arrow_batch(&make_batch(vec![20], vec![200]))
-        .await
-        .unwrap();
-    overwrite
-        .new_commit()
-        .overwrite(writer.prepare_commit().await.unwrap(), None)
-        .await
-        .unwrap();
-    // Rust intentionally refuses branch writes. Use real data/manifests from
-    // another commit to model an independent APPEND at branch snapshot 2.
+    append_ids(&table, 20, 21).await;
+    // Rust intentionally refuses branch writes. Reuse a real APPEND delta for
+    // branch snapshot 2, with only the fork's snapshot-1 files as its base.
+    // Relabeling an OVERWRITE would leave DELETE entries in the delta manifest.
     let mut metadata =
         serde_json::to_value(table.snapshot_manager().get_snapshot(3).await.unwrap()).unwrap();
+    assert_eq!(metadata["commitKind"], serde_json::json!("APPEND"));
     metadata["id"] = serde_json::json!(2);
-    metadata["commitKind"] = serde_json::json!("APPEND");
+    metadata["baseManifestList"] = serde_json::json!(snapshot.delta_manifest_list());
+    metadata["totalRecordCount"] = serde_json::json!(2);
     table
         .file_io()
         .new_output(&branch.snapshot_manager().snapshot_path(2))
@@ -509,7 +508,7 @@ async fn branch_snapshot_and_combined_delta_use_independent_snapshot_histories()
     }
     let plan = branch.new_read_builder().new_scan().plan().await.unwrap();
     assert_eq!(plan.snapshot_id(), Some(2));
-    assert_eq!(read_ids(&branch, &plan).await, vec![20]);
+    assert_eq!(read_ids(&branch, &plan).await, vec![0, 20]);
     assert!(branch
         .new_read_builder()
         .new_incremental_scan(IncrementalScanMode::Delta, 1, 3)
@@ -519,7 +518,7 @@ async fn branch_snapshot_and_combined_delta_use_independent_snapshot_histories()
 }
 
 #[tokio::test]
-async fn combined_delta_value_filter_does_not_resurrect_old_primary_key_versions() {
+async fn combined_delta_value_filter_keeps_matching_historical_primary_key_events() {
     let path = "memory:/planning_parity/pk_filter";
     let (io, table) = memory_table(
         path,
@@ -540,7 +539,10 @@ async fn combined_delta_value_filter_does_not_resurrect_old_primary_key_versions
         .plan_combined_delta()
         .await
         .unwrap();
-    assert_eq!(read_column(&builder, &plan, 0).await, vec![2]);
+    assert_eq!(read_column(&builder, &plan, 0).await, vec![1, 2]);
+    // Snapshot reads still merge versions before applying the value predicate.
+    let current = builder.new_scan().plan().await.unwrap();
+    assert_eq!(read_column(&builder, &current, 0).await, vec![2]);
 }
 
 #[tokio::test]
@@ -584,7 +586,7 @@ async fn empty_position_plans_preserve_selected_snapshot() {
 }
 
 #[tokio::test]
-async fn float_primary_key_plans_merge_signed_zero_versions() {
+async fn float_primary_key_snapshot_merges_versions_while_delta_keeps_events() {
     use arrow_array::{ArrayRef, Float32Array, Float64Array};
     use paimon::spec::{DoubleType, FloatType};
     for double in [false, true] {
@@ -695,16 +697,25 @@ async fn float_primary_key_plans_merge_signed_zero_versions() {
                 }
             }
             actual.sort();
-            assert_eq!(
-                actual,
+            let expected = if combined {
+                vec![
+                    ("+0".into(), 1, 10),
+                    ("-0".into(), 1, 20),
+                    ("-0".into(), 1, 200),
+                    ("-0".into(), 2, 30),
+                    ("-0".into(), 2, 300),
+                    ("1".into(), 1, 50),
+                    ("1".into(), 1, 500),
+                ]
+            } else {
                 vec![
                     ("+0".into(), 1, 10),
                     ("-0".into(), 1, 200),
                     ("-0".into(), 2, 300),
-                    ("1".into(), 1, 500)
-                ],
-                "double={double}, combined={combined}"
-            );
+                    ("1".into(), 1, 500),
+                ]
+            };
+            assert_eq!(actual, expected, "double={double}, combined={combined}");
         }
     }
 }
@@ -844,7 +855,7 @@ async fn python_dv_manifest_layout_resolves_legacy_canonical_and_external_files(
 }
 
 #[tokio::test]
-async fn multiple_dv_index_files_in_one_bucket_keep_all_deletions() {
+async fn multiple_dv_index_files_apply_to_snapshot_but_not_delta_events() {
     let table = evolution_table_with_options(
         "memory:/planning_parity/multiple_dvs",
         &[("deletion-vectors.enabled", "true")],
@@ -884,6 +895,15 @@ async fn multiple_dv_index_files_in_one_bucket_keep_all_deletions() {
         } else {
             builder.new_scan().plan().await.unwrap()
         };
-        assert_eq!(read_ids(&table, &plan).await, vec![0, 2, 3, 5]);
+        let expected = if combined {
+            assert!(plan
+                .splits()
+                .iter()
+                .all(|s| s.is_streaming() && s.data_deletion_files().is_none()));
+            vec![0, 1, 2, 3, 4, 5]
+        } else {
+            vec![0, 2, 3, 5]
+        };
+        assert_eq!(read_ids(&table, &plan).await, expected);
     }
 }

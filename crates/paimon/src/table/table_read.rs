@@ -757,6 +757,19 @@ impl<'a> PaimonTableRead<'a> {
         data_splits: &[DataSplit],
         core_options: &CoreOptions,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        if data_splits.iter().any(DataSplit::is_streaming) {
+            let streams = data_splits
+                .iter()
+                .map(|split| {
+                    if split.is_streaming() {
+                        self.read_raw(std::slice::from_ref(split))
+                    } else {
+                        self.read_pk(std::slice::from_ref(split), core_options)
+                    }
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            return Ok(Box::pin(futures::stream::select_all(streams)));
+        }
         let merge_engine = core_options.merge_engine()?;
         let dv_enabled = core_options.deletion_vectors_enabled();
         if matches!(

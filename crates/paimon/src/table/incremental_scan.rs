@@ -277,13 +277,14 @@ impl<'a> IncrementalScan<'a> {
         }
     }
 
-    /// Plan APPEND deltas as one batch, merging their manifest entries and
-    /// overlapping primary-key files across the whole snapshot range.
+    /// Plan APPEND deltas with batch split packing and streaming read semantics.
+    /// Each physical change is retained, including repeated keys and retracts.
     ///
     /// Unlike [`Self::plan`], this returns an ordinary [`Plan`] for a normal
     /// table reader. It does not preserve a separate result for each commit.
     /// Only Delta (or Auto resolving to Delta) is supported. The end snapshot
-    /// must exist, and supplies the plan's snapshot metadata and deletion vectors.
+    /// must exist and supplies snapshot metadata. Snapshot deletion vectors and
+    /// automatic global-index pruning do not apply to these historical events.
     pub async fn plan_combined_delta(&self) -> crate::Result<Plan> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let mode = self.resolve_mode();

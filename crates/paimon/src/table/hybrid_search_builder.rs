@@ -539,7 +539,7 @@ impl<'a> HybridSearchBuilder<'a> {
         let core = CoreOptions::new(self.table.schema().options());
         // Already targeting a fixed snapshot (resolved travel copy or a selector
         // that resolves deterministically): every route agrees without pinning.
-        if self.table.has_resolved_travel_snapshot() || core.try_time_travel_selector()?.is_some() {
+        if self.table.has_resolved_travel_snapshot() || core.has_time_travel_selector() {
             return Ok(None);
         }
         // Read-latest: pin the current latest snapshot once so a concurrent commit

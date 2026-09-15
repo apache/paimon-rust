@@ -1017,10 +1017,9 @@ async fn diff_rejects_bucket_rescale_between_snapshots() {
     );
 }
 
-/// An ordinary incremental batch must merge overlapping PK files across commits;
-/// the existing per-commit Delta API must still expose both versions.
+/// Java packs incremental batch files together but reads every physical event.
 #[tokio::test]
-async fn combined_delta_merges_primary_key_versions_and_preserves_delta_api() {
+async fn combined_delta_preserves_primary_key_versions_and_delta_api() {
     let path = "memory:/incremental_batch/combined_pk";
     let (file_io, table) = memory_table(path, pk_schema(&[("changelog-producer", "none")]));
     setup_dirs(&file_io, path).await;
@@ -1038,10 +1037,12 @@ async fn combined_delta_merges_primary_key_versions_and_preserves_delta_api() {
     assert_eq!(
         plan.splits().len(),
         1,
-        "overlapping PK files need one merge reader"
+        "combined delta retains Java batch split packing"
     );
     assert_eq!(plan.splits()[0].data_files().len(), 2);
     assert!(plan.splits().iter().all(|split| split.snapshot_id() == 2));
+    assert!(plan.splits().iter().all(|split| split.is_streaming()));
+    assert!(!plan.splits()[0].raw_convertible());
     let batches: Vec<RecordBatch> = builder
         .new_read()
         .unwrap()
@@ -1050,7 +1051,7 @@ async fn combined_delta_merges_primary_key_versions_and_preserves_delta_api() {
         .try_collect()
         .await
         .unwrap();
-    assert_eq!(collect_pairs(&batches), vec![(1, 20)]);
+    assert_eq!(collect_pairs(&batches), vec![(1, 10), (1, 20)]);
     assert_eq!(
         read_incremental_pairs(&table, IncrementalScanMode::Delta, 0, 2).await,
         vec![(1, 10), (1, 20)]
@@ -1135,7 +1136,7 @@ async fn combined_delta_skips_overwrite_but_retains_endpoint_metadata() {
 }
 
 #[tokio::test]
-async fn combined_delta_merges_add_delete_entries_across_appends() {
+async fn combined_delta_rejects_manifest_deletes_in_append_snapshots() {
     let path = "memory:/incremental_batch/combined_rewrite";
     let (file_io, table) = memory_table(path, pk_schema(&[]));
     setup_dirs(&file_io, path).await;
@@ -1155,12 +1156,11 @@ async fn combined_delta_merges_add_delete_entries_across_appends() {
         .await
         .unwrap();
     let mut messages = second.prepare_commit().await.unwrap();
-    let new_name = messages[0].new_files[0].file_name.clone();
     messages[0].deleted_files.push(old_file);
     builder.new_commit().commit(messages).await.unwrap();
     // The Rust rewrite writer labels deletions OVERWRITE. Construct an APPEND
     // metadata fixture over its real ADD/DELETE manifests to exercise the batch
-    // planner's entry cancellation independently of that writer policy.
+    // planner's Java ADD-only validation independently of that writer policy.
     let manager = table.snapshot_manager();
     let snapshot = manager.get_snapshot(2).await.unwrap();
     let mut metadata = serde_json::to_value(snapshot).unwrap();
@@ -1171,19 +1171,12 @@ async fn combined_delta_merges_add_delete_entries_across_appends() {
         .write(bytes::Bytes::from(serde_json::to_vec(&metadata).unwrap()))
         .await
         .unwrap();
-    let plan = table
+    let result = table
         .new_read_builder()
         .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
         .plan_combined_delta()
-        .await
-        .unwrap();
-    let files: Vec<_> = plan
-        .splits()
-        .iter()
-        .flat_map(|split| split.data_files())
-        .map(|file| file.file_name.as_str())
-        .collect();
-    assert_eq!(files, vec![new_name.as_str()]);
+        .await;
+    assert!(matches!(result, Err(paimon::Error::DataInvalid { .. })));
 }
 
 #[tokio::test]
@@ -1376,7 +1369,7 @@ async fn combined_delta_preserves_partition_filter_and_projection_across_appends
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
-    assert_eq!(collect_pairs(&batches), vec![(1, 99)]);
+    assert_eq!(collect_pairs(&batches), vec![(1, 10), (1, 99)]);
 }
 
 #[tokio::test]
@@ -1442,4 +1435,161 @@ async fn combined_delta_rejects_missing_history_and_auto_changelog() {
         .await
         .unwrap();
     assert_eq!(collect_pairs(&batches), vec![(3, 30)]);
+}
+
+/// Every merge engine must expose L0 events, even when ordinary DV/first-row
+/// batch reads hide them. Residual value filters must precede the row limit.
+#[tokio::test]
+async fn delta_event_reads_ignore_batch_merge_engine_and_endpoint_indexes() {
+    use paimon::spec::{Datum, PredicateBuilder};
+    for engine in ["deduplicate", "partial-update", "aggregation", "first-row"] {
+        for dv in ["false", "true"] {
+            if dv == "true" && engine != "deduplicate" {
+                continue; // Only deduplicate supports deletion vectors.
+            }
+            let path = format!("memory:/incremental_batch/events_{engine}_{dv}");
+            let mut options = vec![
+                ("merge-engine", engine),
+                ("deletion-vectors.enabled", dv),
+                ("source.split.target-size", "1b"),
+            ];
+            if engine == "aggregation" {
+                options.push(("fields.value.aggregate-function", "sum"));
+            }
+            let (io, table) = memory_table(&path, pk_schema(&options));
+            setup_dirs(&io, &path).await;
+            persist_table_schema(&io, &path, table.schema()).await;
+            write_batch(&table, &make_batch(vec![1], vec![10])).await;
+            write_batch(&table, &make_batch(vec![1], vec![20])).await;
+            // A latest-state index must not even be opened for event reads.
+            let manager = table.snapshot_manager();
+            let mut metadata =
+                serde_json::to_value(manager.get_snapshot(2).await.unwrap()).unwrap();
+            metadata["indexManifest"] = serde_json::json!("missing-endpoint-index");
+            io.new_output(&manager.snapshot_path(2))
+                .unwrap()
+                .write(bytes::Bytes::from(serde_json::to_vec(&metadata).unwrap()))
+                .await
+                .unwrap();
+            for selected in [None, Some(10), Some(20)] {
+                let mut builder = table.new_read_builder();
+                if let Some(value) = selected {
+                    builder.with_filter(
+                        PredicateBuilder::new(table.schema().fields())
+                            .equal("value", Datum::Int(value))
+                            .unwrap(),
+                    );
+                    builder.with_limit(1);
+                }
+                let plan = builder
+                    .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
+                    .plan_combined_delta()
+                    .await
+                    .unwrap();
+                assert!(plan
+                    .splits()
+                    .iter()
+                    .all(|s| s.is_streaming() && s.data_deletion_files().is_none()));
+                let batches = builder
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(plan.splits())
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let expected = selected.map_or_else(|| vec![(1, 10), (1, 20)], |v| vec![(1, v)]);
+                assert_eq!(collect_pairs(&batches), expected, "{engine}, dv={dv}");
+                // The separate per-commit API follows the same no-DV event contract.
+                let per_commit = builder
+                    .new_incremental_scan(IncrementalScanMode::Delta, 0, 2)
+                    .plan()
+                    .await
+                    .unwrap();
+                assert!(per_commit
+                    .data_splits()
+                    .iter()
+                    .all(|s| s.is_streaming() && s.data_deletion_files().is_none()));
+                let events = builder
+                    .new_read()
+                    .unwrap()
+                    .to_incremental_arrow(&per_commit)
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    collect_pairs(&events),
+                    expected,
+                    "per-commit {engine}, dv={dv}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn delta_keeps_physical_retractions_and_changelog_row_kinds() {
+    use arrow_array::StringArray;
+    let path = "memory:/incremental_batch/retracts";
+    let (io, table) = memory_table(path, pk_schema(&[("changelog-producer", "input")]));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    for (value, kind) in [(10, 0), (10, 1), (20, 2), (20, 3)] {
+        write_batch(
+            &table,
+            &make_batch_with_kinds(vec![1], vec![value], vec![kind]),
+        )
+        .await;
+    }
+    let builder = table.new_read_builder();
+    let combined = builder
+        .new_incremental_scan(IncrementalScanMode::Delta, 0, 4)
+        .plan_combined_delta()
+        .await
+        .unwrap();
+    let batches = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(combined.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_pairs(&batches),
+        vec![(1, 10), (1, 10), (1, 20), (1, 20)]
+    );
+    for mode in [IncrementalScanMode::Delta, IncrementalScanMode::Changelog] {
+        let plan = builder
+            .new_incremental_scan(mode, 0, 4)
+            .plan()
+            .await
+            .unwrap();
+        assert!(plan.data_splits().iter().all(|s| s.is_streaming()));
+        let batches = builder
+            .new_read()
+            .unwrap()
+            .to_audit_log_arrow(&plan)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut kinds: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        kinds.sort();
+        assert_eq!(kinds, vec!["+I", "+U", "-D", "-U"]);
+    }
+    assert!(read_current_pairs(&table).await.is_empty());
 }
