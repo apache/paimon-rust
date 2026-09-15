@@ -57,6 +57,10 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[path = "audit_log_table/scan.rs"]
+mod audit;
+pub use audit::AuditLogScan;
+
 /// Path segment for manifest directory under table.
 const MANIFEST_DIR: &str = "manifest";
 /// Path segment for index directory under table.
@@ -2585,7 +2589,7 @@ mod tests {
         );
     }
 
-    fn data_evolution_test_table(table_path: &str, schema: TableSchema) -> Table {
+    pub(super) fn data_evolution_test_table(table_path: &str, schema: TableSchema) -> Table {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let schema = schema.copy_with_options(HashMap::from([(
             "data-evolution.enabled".to_string(),
@@ -2600,7 +2604,7 @@ mod tests {
         )
     }
 
-    fn two_column_schema(id: i64, left: &str, right: &str) -> TableSchema {
+    pub(super) fn two_column_schema(id: i64, left: &str, right: &str) -> TableSchema {
         TableSchema::new(
             id,
             &PaimonSchema::builder()
@@ -2801,7 +2805,7 @@ mod tests {
         ]))
     }
 
-    async fn setup_scan_trace_dirs(table: &Table) {
+    pub(super) async fn setup_scan_trace_dirs(table: &Table) {
         table
             .file_io()
             .mkdirs(&format!("{}/snapshot/", table.location()))
@@ -3879,7 +3883,7 @@ mod tests {
         );
     }
 
-    fn pk_stats_gate_table(table_path: &str) -> Table {
+    pub(super) fn pk_stats_gate_table(table_path: &str) -> Table {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let schema = PaimonSchema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -3948,7 +3952,11 @@ mod tests {
         builder.build_serialized()
     }
 
-    fn pk_stats_file(name: &str, id_range: (i32, i32), value_range: (i32, i32)) -> DataFileMeta {
+    pub(super) fn pk_stats_file(
+        name: &str,
+        id_range: (i32, i32),
+        value_range: (i32, i32),
+    ) -> DataFileMeta {
         let mut file = test_data_file_meta(
             two_int_stats_row(Some(id_range.0), Some(value_range.0)),
             two_int_stats_row(Some(id_range.1), Some(value_range.1)),

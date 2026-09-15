@@ -53,7 +53,7 @@ use paimon::arrow::ParquetReadBudget;
 use paimon::spec::{
     CoreOptions, DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator,
 };
-use paimon::table::{ScanTrace, Table};
+use paimon::table::{ArrowRecordBatchStream, ScanTrace, Table, TableRead};
 use paimon::DataSplit;
 
 use crate::error::to_datafusion_error;
@@ -996,6 +996,92 @@ impl PaimonTableScan {
             .map(|(accumulator, field)| accumulator.finish(field.data_type(), exact_null_counts))
             .collect()
     }
+
+    pub(crate) fn execute_with(
+        &self,
+        partition: usize,
+        read_splits: impl FnOnce(TableRead<'_>, &[DataSplit]) -> paimon::Result<ArrowRecordBatchStream>
+            + Send
+            + 'static,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let splits = Arc::clone(self.planned_partitions.get(partition).ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(format!(
+                "PaimonTableScan: partition index {partition} out of range (total {})",
+                self.planned_partitions.len()
+            ))
+        })?);
+
+        let table = self.table.clone();
+        let schema = self.schema();
+        let read_type = self.read_type.clone();
+        let pushed_predicate = self.pushed_predicate.clone();
+        let case_sensitive = self.case_sensitive;
+        let runtime_filters = self.runtime_filters.clone();
+        let decoder_filters = self.decoder_filters.clone();
+        let parquet_read_budget = Arc::clone(&self.parquet_read_budget);
+
+        let fut = async move {
+            let mut read_builder = table.new_read_builder();
+            let runtime_filter_plan = partition_runtime_decoder_filters(
+                &decoder_filters,
+                table.schema().fields(),
+                case_sensitive,
+            );
+            let mut paimon_predicates = pushed_predicate.into_iter().collect::<Vec<_>>();
+            paimon_predicates.extend(runtime_filter_plan.paimon_predicates);
+
+            read_builder.with_case_sensitive(case_sensitive);
+            read_builder.with_read_type(read_type);
+            if !paimon_predicates.is_empty() {
+                read_builder.with_filter(Predicate::and(paimon_predicates));
+            }
+            read_builder.with_parquet_read_budget(parquet_read_budget);
+
+            let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
+            if !runtime_filter_plan.datafusion_filters.is_empty() {
+                let predicate = conjunction(runtime_filter_plan.datafusion_filters);
+                read = read.with_row_filter_factory(Arc::new(DataFusionRowFilterFactory::new(
+                    predicate,
+                    Arc::clone(&schema),
+                )));
+            }
+            let stream = read_splits(read, &splits).map_err(to_datafusion_error)?;
+            let batch_schema = Arc::clone(&schema);
+            let stream = stream.map(move |result| {
+                let mut batch = result
+                    .map_err(to_datafusion_error)
+                    .and_then(|batch| to_datafusion_batch(batch, &batch_schema))?;
+                // The decoder hook is an optimization and may be unavailable
+                // for a file/path. Retain every original live expression as
+                // the exact fallback; evaluating it on decoder survivors is
+                // idempotent.
+                for filter in &runtime_filters {
+                    let predicate = filter.evaluate(&batch)?.into_array(batch.num_rows())?;
+                    let predicate = predicate
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| {
+                            datafusion::error::DataFusionError::Execution(format!(
+                                "Paimon runtime filter must return Boolean, got {}",
+                                predicate.data_type()
+                            ))
+                        })?;
+                    batch = filter_record_batch(&batch, predicate)?;
+                }
+                Ok(batch)
+            });
+
+            Ok::<_, datafusion::error::DataFusionError>(RecordBatchStreamAdapter::new(
+                schema,
+                Box::pin(stream),
+            ))
+        };
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            futures::stream::once(fut).try_flatten(),
+        )))
+    }
 }
 
 impl ExecutionPlan for PaimonTableScan {
@@ -1088,83 +1174,7 @@ impl ExecutionPlan for PaimonTableScan {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let splits = Arc::clone(self.planned_partitions.get(partition).ok_or_else(|| {
-            datafusion::error::DataFusionError::Internal(format!(
-                "PaimonTableScan: partition index {partition} out of range (total {})",
-                self.planned_partitions.len()
-            ))
-        })?);
-
-        let table = self.table.clone();
-        let schema = self.schema();
-        let read_type = self.read_type.clone();
-        let pushed_predicate = self.pushed_predicate.clone();
-        let case_sensitive = self.case_sensitive;
-        let runtime_filters = self.runtime_filters.clone();
-        let decoder_filters = self.decoder_filters.clone();
-        let parquet_read_budget = Arc::clone(&self.parquet_read_budget);
-
-        let fut = async move {
-            let mut read_builder = table.new_read_builder();
-            let runtime_filter_plan = partition_runtime_decoder_filters(
-                &decoder_filters,
-                table.schema().fields(),
-                case_sensitive,
-            );
-            let mut paimon_predicates = pushed_predicate.into_iter().collect::<Vec<_>>();
-            paimon_predicates.extend(runtime_filter_plan.paimon_predicates);
-
-            read_builder.with_case_sensitive(case_sensitive);
-            read_builder.with_read_type(read_type);
-            if !paimon_predicates.is_empty() {
-                read_builder.with_filter(Predicate::and(paimon_predicates));
-            }
-            read_builder.with_parquet_read_budget(parquet_read_budget);
-
-            let mut read = read_builder.new_read().map_err(to_datafusion_error)?;
-            if !runtime_filter_plan.datafusion_filters.is_empty() {
-                let predicate = conjunction(runtime_filter_plan.datafusion_filters);
-                read = read.with_row_filter_factory(Arc::new(DataFusionRowFilterFactory::new(
-                    predicate,
-                    Arc::clone(&schema),
-                )));
-            }
-            let stream = read.to_arrow(&splits).map_err(to_datafusion_error)?;
-            let batch_schema = Arc::clone(&schema);
-            let stream = stream.map(move |result| {
-                let mut batch = result
-                    .map_err(to_datafusion_error)
-                    .and_then(|batch| to_datafusion_batch(batch, &batch_schema))?;
-                // The decoder hook is an optimization and may be unavailable
-                // for a file/path. Retain every original live expression as
-                // the exact fallback; evaluating it on decoder survivors is
-                // idempotent.
-                for filter in &runtime_filters {
-                    let predicate = filter.evaluate(&batch)?.into_array(batch.num_rows())?;
-                    let predicate = predicate
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or_else(|| {
-                            datafusion::error::DataFusionError::Execution(format!(
-                                "Paimon runtime filter must return Boolean, got {}",
-                                predicate.data_type()
-                            ))
-                        })?;
-                    batch = filter_record_batch(&batch, predicate)?;
-                }
-                Ok(batch)
-            });
-
-            Ok::<_, datafusion::error::DataFusionError>(RecordBatchStreamAdapter::new(
-                schema,
-                Box::pin(stream),
-            ))
-        };
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.schema(),
-            futures::stream::once(fut).try_flatten(),
-        )))
+        self.execute_with(partition, |read, splits| read.to_arrow(splits))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {

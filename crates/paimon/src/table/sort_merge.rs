@@ -141,7 +141,7 @@ pub(crate) trait MergeFunction: Send + Sync {
 /// Filters out DELETE and UPDATE_BEFORE rows.
 pub(crate) struct DeduplicateMergeFunction;
 
-fn compare_sequence_order(lhs: &MergeRow, rhs: &MergeRow) -> Ordering {
+pub(super) fn compare_sequence_order(lhs: &MergeRow, rhs: &MergeRow) -> Ordering {
     match (lhs.user_sequences.is_empty(), rhs.user_sequences.is_empty()) {
         (false, false) => lhs
             .user_sequences

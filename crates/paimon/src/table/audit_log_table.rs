@@ -16,11 +16,13 @@
 // under the License.
 
 use super::incremental_scan::{IncrementalPlan, IncrementalScan, IncrementalScanMode};
-use super::{ArrowRecordBatchStream, Table};
+use super::{ArrowRecordBatchStream, AuditLogRead, AuditLogScan, Table};
 use crate::spec::{
     BigIntType, DataField, DataType, VarCharType, ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME,
     SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
 };
+
+pub(super) mod merge;
 
 /// Wrapper that exposes table rows with a leading `rowkind` audit column.
 ///
@@ -78,6 +80,21 @@ impl AuditLogTable {
         end_inclusive: i64,
     ) -> IncrementalScan<'_> {
         IncrementalScan::for_table(&self.wrapped, mode, start_exclusive, end_inclusive)
+    }
+
+    /// Plan a current-state audit read for [`Self::new_read`].
+    pub fn new_scan(&self) -> AuditLogScan<'_> {
+        self.wrapped.new_read_builder().new_audit_scan()
+    }
+
+    /// Creates an audit reader using the table's configured fields and options.
+    pub fn new_read(&self) -> crate::Result<AuditLogRead<'_>> {
+        AuditLogRead::new(
+            self.wrapped
+                .new_read_builder()
+                .with_read_type(self.fields()?)
+                .new_read()?,
+        )
     }
 
     pub fn to_arrow(&self, plan: &IncrementalPlan) -> crate::Result<ArrowRecordBatchStream> {
