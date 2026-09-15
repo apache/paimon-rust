@@ -1627,8 +1627,9 @@ RESET 'paimon.diskann.l_search';
 Query options are index-family specific and non-applicable options are ignored:
 IVF readers consume only `ivf.nprobe`, while DiskANN readers consume only
 `diskann.l_search`. Setting both options is allowed; each index uses its own.
-When the applicable option is omitted, the reader automatically selects and,
-when necessary, progressively expands the search width.
+When the applicable option is omitted, both index families select a search
+width automatically. IVF searches may progressively expand `nprobe` when the
+initial width underfills the requested top-k.
 
 `vindex.reader.memory-budget-bytes` sets the per-Reader resident-data and cache
 budget (default 4 GiB). It is distinct from the DiskANN build option

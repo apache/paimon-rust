@@ -489,7 +489,9 @@ fn prepare_search_with_shared_filter(
             None => VectorSearchParams::automatic(top_k),
         },
         _ => match options.get(NPROBE_PARAMETER) {
-            Some(_) => VectorSearchParams::new(top_k, int_parameter(options, NPROBE_PARAMETER, 0)?),
+            Some(value) => {
+                VectorSearchParams::new(top_k, parse_int_parameter(NPROBE_PARAMETER, value)?)
+            }
             None => VectorSearchParams::automatic(top_k),
         },
     };
@@ -837,17 +839,21 @@ fn int_parameter(
     default_value: usize,
 ) -> crate::Result<usize> {
     match options.get(key) {
-        Some(value) => value
-            .parse::<usize>()
-            .map_err(|_| crate::Error::DataInvalid {
-                message: format!(
-                    "Invalid value for '{}': {}. Must be a non-negative integer.",
-                    key, value
-                ),
-                source: None,
-            }),
+        Some(value) => parse_int_parameter(key, value),
         None => Ok(default_value),
     }
+}
+
+fn parse_int_parameter(key: &str, value: &str) -> crate::Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|_| crate::Error::DataInvalid {
+            message: format!(
+                "Invalid value for '{}': {}. Must be a non-negative integer.",
+                key, value
+            ),
+            source: None,
+        })
 }
 
 #[cfg(test)]
@@ -1206,12 +1212,22 @@ mod tests {
 
     #[test]
     fn test_int_parameter() {
+        const FALLBACK: usize = 7;
+
         let mut options = HashMap::new();
         options.insert(NPROBE_PARAMETER.to_string(), "32".to_string());
 
-        assert_eq!(int_parameter(&options, NPROBE_PARAMETER, 16).unwrap(), 32);
+        assert_eq!(
+            int_parameter(&options, NPROBE_PARAMETER, FALLBACK).unwrap(),
+            32
+        );
         options.insert(NPROBE_PARAMETER.to_string(), "abc".to_string());
-        assert!(int_parameter(&options, NPROBE_PARAMETER, 16).is_err());
+        assert!(int_parameter(&options, NPROBE_PARAMETER, FALLBACK).is_err());
+        options.remove(NPROBE_PARAMETER);
+        assert_eq!(
+            int_parameter(&options, NPROBE_PARAMETER, FALLBACK).unwrap(),
+            FALLBACK
+        );
     }
 
     #[test]
