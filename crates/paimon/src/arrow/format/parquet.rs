@@ -170,8 +170,9 @@ impl ParquetFormatWriter {
         write_fields: Option<&[DataField]>,
         format_options: &HashMap<String, String>,
     ) -> crate::Result<Self> {
+        // Reject a bad codec before allocating the writer.
+        let codec = parse_compression(compression, zstd_level)?;
         let async_write = output.async_writer().await?;
-        let codec = parse_compression(compression, zstd_level);
         let inner = create_parquet_arrow_writer(async_write, schema.clone(), codec)?;
         let core_options = CoreOptions::new(format_options);
         let stats_modes = write_fields
@@ -201,18 +202,59 @@ fn create_parquet_arrow_writer(
     })
 }
 
+/// Every `file.compression` value a parquet write accepts.
+///
+/// `brotli` and `lzo` are left out on purpose, although parquet names both codecs:
+/// `BrotliCodec` and `LzoCodec` are third-party classes absent from parquet-java and
+/// Hadoop alike, so neither can be read back. `lzo` has no encoder in arrow-rs either,
+/// and mapping it would panic in the column writer rather than fail here.
+fn supported_compressions() -> Vec<&'static str> {
+    vec![
+        "none",
+        "uncompressed",
+        "snappy",
+        "gzip",
+        "gz",
+        "lz4",
+        "lz4_raw",
+        "zstd",
+    ]
+}
+
 /// Map Paimon `file.compression` value to parquet [`Compression`].
-fn parse_compression(codec: &str, zstd_level: i32) -> Compression {
+///
+/// An unrecognized value is rejected instead of falling back to `UNCOMPRESSED`: no
+/// later stage on the plain-parquet path re-checks it, so the fallback wrote raw pages
+/// and recorded codec id 0 in the footer, leaving a typo indistinguishable from
+/// `file.compression=none` in the finished file. Java rejects the same value at the
+/// same point, when the per-file writer is built (`RowDataParquetBuilder#createWriter`
+/// -> `CompressionCodecName#fromConf`).
+///
+/// The value is deliberately not trimmed, unlike the sibling block-compression options:
+/// Java's `valueOf` rejects `"zstd "`, so trimming would accept a spelling that fails
+/// on the Java side of the same table.
+fn parse_compression(codec: &str, zstd_level: i32) -> crate::Result<Compression> {
     match codec.to_ascii_lowercase().as_str() {
         "zstd" => {
             let level = ZstdLevel::try_new(zstd_level).unwrap_or_default();
-            Compression::ZSTD(level)
+            Ok(Compression::ZSTD(level))
         }
-        "lz4" => Compression::LZ4_RAW,
-        "snappy" => Compression::SNAPPY,
-        "gzip" | "gz" => Compression::GZIP(Default::default()),
-        "none" | "uncompressed" => Compression::UNCOMPRESSED,
-        _ => Compression::UNCOMPRESSED,
+        // Java splits these: `lz4` selects the Hadoop framing (thrift codec id 5) and
+        // `lz4_raw` the bare blocks (id 7). Both remain readable on either side, and
+        // LZ4_RAW is the encoding parquet recommends, so the two spellings share it.
+        "lz4" | "lz4_raw" => Ok(Compression::LZ4_RAW),
+        "snappy" => Ok(Compression::SNAPPY),
+        // `gz` is an alias this writer has always taken; Java's `valueOf` knows `gzip`
+        // only, so it is the one accepted spelling Java would refuse.
+        "gzip" | "gz" => Ok(Compression::GZIP(Default::default())),
+        "none" | "uncompressed" => Ok(Compression::UNCOMPRESSED),
+        _ => Err(Error::DataInvalid {
+            message: format!(
+                "Option 'file.compression' must be one of {}, got: {codec:?}",
+                supported_compressions().join(", ")
+            ),
+            source: None,
+        }),
     }
 }
 
@@ -2248,8 +2290,8 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 mod tests {
     use super::build_parquet_row_filter;
     use super::{
-        forward_row_group_batches, FilePredicates, ParquetFormatReader, ParquetFormatWriter,
-        ParquetRowGroupMessage,
+        forward_row_group_batches, parse_compression, supported_compressions, FilePredicates,
+        ParquetFormatReader, ParquetFormatWriter, ParquetRowGroupMessage,
     };
     use super::{
         AsyncArrowWriter, Bytes, PageIndexPolicy, ParquetMetaDataReader, Predicate,
@@ -2273,6 +2315,7 @@ mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::{StreamExt, TryStreamExt};
+    use parquet::basic::{Compression, GzipLevel, ZstdLevel};
     use parquet::file::properties::EnabledStatistics;
     use parquet::file::statistics::Statistics as ParquetStatistics;
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
@@ -4713,5 +4756,107 @@ mod tests {
             .downcast_ref::<MapArray>()
             .unwrap();
         assert_int64_map_rows(tags, &[rows[1].clone(), rows[3].clone()]);
+    }
+
+    #[test]
+    fn test_parse_compression_maps_every_supported_spelling() {
+        for codec in ["none", "NONE", "uncompressed"] {
+            let compression = parse_compression(codec, 1).unwrap();
+            assert_eq!(compression, Compression::UNCOMPRESSED, "codec: {codec}");
+        }
+        for codec in ["snappy", "Snappy"] {
+            let compression = parse_compression(codec, 1).unwrap();
+            assert_eq!(compression, Compression::SNAPPY, "codec: {codec}");
+        }
+        for codec in ["gzip", "gz", "GZip"] {
+            let compression = parse_compression(codec, 1).unwrap();
+            let expected = Compression::GZIP(GzipLevel::default());
+            assert_eq!(compression, expected, "codec: {codec}");
+        }
+        for codec in ["lz4", "lz4_raw", "LZ4_Raw"] {
+            let compression = parse_compression(codec, 1).unwrap();
+            assert_eq!(compression, Compression::LZ4_RAW, "codec: {codec}");
+        }
+        let compression = parse_compression("ZSTD", 1).unwrap();
+        let expected = Compression::ZSTD(ZstdLevel::try_new(1).unwrap());
+        assert_eq!(compression, expected);
+
+        // Every name the error advertises has to be a name this writer accepts.
+        for codec in supported_compressions() {
+            assert!(
+                parse_compression(codec, 1).is_ok(),
+                "{codec} is listed as supported but rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_compression_threads_the_zstd_level() {
+        let compression = parse_compression("zstd", 9).unwrap();
+        let expected = Compression::ZSTD(ZstdLevel::try_new(9).unwrap());
+        assert_eq!(compression, expected);
+
+        // An out-of-range level still falls back to arrow-rs' default instead of
+        // erroring: `1..=22` is a parquet implementation detail, not a Paimon contract,
+        // and `file.compression.zstd-level` carries no range check of its own on the
+        // Java side. Pinned so the omission stays deliberate.
+        let compression = parse_compression("zstd", 99).unwrap();
+        assert_eq!(compression, Compression::ZSTD(ZstdLevel::default()));
+    }
+
+    #[test]
+    fn test_parse_compression_rejects_unknown_codecs_and_names_the_accepted_ones() {
+        // `brotli` and `lzo` are parquet codecs with no Java implementation to read them
+        // back, `zstandard` and `deflate` are the Avro spellings, and `zstd ` is the
+        // untrimmed typo this rejection exists for.
+        for codec in [
+            "gzip2",
+            "",
+            "brotli",
+            "lzo",
+            "zstandard",
+            "deflate",
+            "zstd ",
+        ] {
+            let err = match parse_compression(codec, 1) {
+                Ok(compression) => panic!("{codec:?} parsed as {compression:?}"),
+                Err(err) => err,
+            };
+            let Error::DataInvalid { message, .. } = err else {
+                panic!("expected DataInvalid for {codec:?}, got {err:?}");
+            };
+            assert!(
+                message.contains(&format!("{codec:?}")),
+                "error does not quote the rejected value: {message}"
+            );
+            for supported in supported_compressions() {
+                assert!(
+                    message.contains(supported),
+                    "{supported} missing from compression error: {message}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_format_writer_rejects_an_unknown_compression() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let output = file_io
+            .new_output("memory:/bad-compression/data.parquet")
+            .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+
+        let err = match create_format_writer(&output, schema, "gzip2", 1, None, None, None).await {
+            Ok(_) => panic!("gzip2 is not a parquet compression codec"),
+            Err(err) => err,
+        };
+        let Error::DataInvalid { message, .. } = err else {
+            panic!("expected DataInvalid, got {err:?}");
+        };
+        assert!(message.contains("file.compression"), "message: {message}");
     }
 }
