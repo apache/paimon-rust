@@ -28,7 +28,7 @@ use super::kv_file_reader::retain_primary_key_conjuncts;
 use super::partition_filter::PartitionFilter;
 use super::row_position_selection::RowPositionSelection;
 use super::stats_filter::{
-    data_evolution_group_matches_predicates, data_file_matches_predicates_for_table,
+    data_evolution_group_matches_predicates_for_table, data_file_matches_predicates_for_table,
     data_file_matches_predicates_with_key_stats, group_by_overlapping_row_id, FileStatsRows,
     ResolvedStatsSchema,
 };
@@ -2037,6 +2037,7 @@ impl<'a> PaimonTableScan<'a> {
 
         // Group by (partition, bucket), decomposing entries to avoid cloning partition.
         let groups = group_data_files_by_partition_bucket(entries);
+        let mut stats_schema_cache = HashMap::new();
 
         let snapshot_id = snapshot.id();
         let base_path = table_path.trim_end_matches('/');
@@ -2126,16 +2127,19 @@ impl<'a> PaimonTableScan<'a> {
                     row_id_groups
                 } else {
                     let before = row_id_groups.len();
-                    let groups = row_id_groups
-                        .into_iter()
-                        .filter(|group| {
-                            data_evolution_group_matches_predicates(
-                                group,
-                                &self.data_predicates,
-                                self.table.schema().fields(),
-                            )
-                        })
-                        .collect::<Vec<_>>();
+                    let mut groups = Vec::with_capacity(before);
+                    for group in row_id_groups {
+                        if data_evolution_group_matches_predicates_for_table(
+                            self.table,
+                            &group,
+                            &self.data_predicates,
+                            &mut stats_schema_cache,
+                        )
+                        .await
+                        {
+                            groups.push(group);
+                        }
+                    }
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.data_evolution_groups_pruned_by_stats += before - groups.len();
                     }
@@ -3603,6 +3607,291 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_data_evolution_stats_use_file_schema_after_evolution() {
+        let old_schema = TableSchema::new(
+            0,
+            &PaimonSchema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("a", DataType::Int(IntType::new()))
+                .column("b", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let cases = [
+            (
+                "drop",
+                vec![SchemaChange::drop_column("a".into())],
+                "b",
+                Datum::Int(20),
+            ),
+            (
+                "reorder",
+                vec![SchemaChange::update_column_position(
+                    ColumnMove::move_first("b".into()),
+                )],
+                "b",
+                Datum::Int(20),
+            ),
+            (
+                "rename",
+                vec![SchemaChange::rename_column("b".into(), "renamed".into())],
+                "renamed",
+                Datum::Int(20),
+            ),
+            (
+                "widen",
+                vec![SchemaChange::update_column_type(
+                    "a".into(),
+                    DataType::Double(crate::spec::DoubleType::new()),
+                )],
+                "a",
+                Datum::Double(10.0),
+            ),
+        ];
+        for (name, changes, field, literal) in cases {
+            let schema = old_schema.apply_changes(changes).unwrap();
+            let table = data_evolution_test_table(&format!("memory:/de_stats_{name}"), schema);
+            write_schema_file(&table, &old_schema).await;
+            for dense in [false, true] {
+                let mut file = make_evo_file("old.parquet", 10, 1, 1, Some(0));
+                let mut stats = BinaryRowBuilder::new(if dense { 2 } else { 3 });
+                if dense {
+                    stats.write_int(0, 10);
+                    stats.write_int(1, 20);
+                    file.write_cols = Some(vec!["a".into(), "b".into()]);
+                    file.value_stats_cols = Some(vec!["a".into(), "b".into()]);
+                } else {
+                    stats.write_int(0, 1);
+                    stats.write_int(1, 10);
+                    stats.write_int(2, 20);
+                }
+                let stats = stats.build_serialized();
+                file.value_stats = BinaryTableStats::new(
+                    stats.clone(),
+                    stats,
+                    vec![Some(0); if dense { 2 } else { 3 }],
+                );
+                let entries = vec![ManifestEntry::new(
+                    FileKind::Add,
+                    BinaryRowBuilder::new(0).build_serialized(),
+                    0,
+                    -1,
+                    file,
+                    0,
+                )];
+                let pb = PredicateBuilder::new(table.schema().fields());
+                for (predicate, expected) in [
+                    (pb.equal(field, literal.clone()).unwrap(), 1),
+                    // Type changes cannot reuse old stats; matching unchanged
+                    // fields can still reject this file after rename/reorder.
+                    (
+                        pb.equal(
+                            field,
+                            match literal {
+                                Datum::Double(_) => Datum::Double(999.0),
+                                _ => Datum::Int(999),
+                            },
+                        )
+                        .unwrap(),
+                        usize::from(name == "widen"),
+                    ),
+                ] {
+                    let scan =
+                        PaimonTableScan::new(&table, None, vec![predicate], None, None, None);
+                    let plan = scan
+                        .plan_snapshot_from_entries(
+                            diff_snapshot_with_schema(7, table.schema().id()),
+                            entries.clone(),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(plan.splits().len(), expected, "{name}, dense={dense}");
+                    assert_eq!(plan.snapshot_id(), Some(7));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_data_evolution_stats_require_unique_full_range_provider() {
+        let table = data_evolution_test_table(
+            "memory:/de_stats_providers",
+            two_column_schema(0, "id", "value"),
+        );
+        let pb = PredicateBuilder::new(table.schema().fields());
+        let make_file = |name: &str, first, count, seq, value| {
+            let mut file = make_evo_file(name, 10, count, seq, Some(first));
+            file.write_cols = Some(vec!["id".into()]);
+            let mut row = BinaryRowBuilder::new(1);
+            row.write_int(0, value);
+            let row = row.build_serialized();
+            file.value_stats = BinaryTableStats::new(row.clone(), row, vec![Some(0)]);
+            file
+        };
+        for (name, files) in [
+            (
+                "partial",
+                vec![make_file("old", 0, 10, 1, 5), make_file("new", 0, 5, 2, 20)],
+            ),
+            (
+                "tied",
+                vec![
+                    make_file("left", 0, 10, 2, 20),
+                    make_file("right", 0, 10, 2, 5),
+                ],
+            ),
+            (
+                "chain",
+                vec![
+                    make_file("left", 0, 5, 1, 20),
+                    make_file("right", 4, 6, 2, 20),
+                ],
+            ),
+        ] {
+            for reverse in [false, true] {
+                let mut files = files.clone();
+                if reverse {
+                    files.reverse();
+                }
+                let entries: Vec<_> = files
+                    .into_iter()
+                    .map(|file| {
+                        ManifestEntry::new(
+                            FileKind::Add,
+                            BinaryRowBuilder::new(0).build_serialized(),
+                            0,
+                            -1,
+                            file,
+                            0,
+                        )
+                    })
+                    .collect();
+                for predicate in [
+                    pb.equal("id", Datum::Int(5)).unwrap(),
+                    pb.is_null("id").unwrap(),
+                ] {
+                    let plan =
+                        PaimonTableScan::new(&table, None, vec![predicate], None, None, None)
+                            .plan_snapshot_from_entries(
+                                diff_snapshot_with_schema(7, 0),
+                                entries.clone(),
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                    assert_eq!(plan.splits().len(), 1, "{name}, reverse={reverse}");
+                    assert_eq!(plan.splits()[0].data_files().len(), 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_data_evolution_stats_reject_inconsistent_field_stats() {
+        let fields = vec![DataField::new(
+            0,
+            "id".into(),
+            DataType::Int(IntType::new()),
+        )];
+        let predicate = PredicateBuilder::new(&fields)
+            .equal("id", Datum::Int(5))
+            .unwrap();
+        for (min, max, nulls) in [
+            (Some(10), Some(10), -1),
+            (Some(10), Some(10), 11),
+            (None, Some(10), 0),
+            (Some(10), None, 0),
+            (Some(10), Some(1), 0),
+            (Some(10), Some(10), 10),
+        ] {
+            let stats_row = |value: Option<i32>| {
+                let mut row = BinaryRowBuilder::new(1);
+                if let Some(value) = value {
+                    row.write_int(0, value);
+                } else {
+                    row.set_null_at(0);
+                }
+                row.build_serialized()
+            };
+            let mut file = make_evo_file("invalid", 10, 10, 1, Some(0));
+            file.value_stats =
+                BinaryTableStats::new(stats_row(min), stats_row(max), vec![Some(nulls)]);
+            assert!(
+                data_evolution_group_matches_predicates(
+                    &[file],
+                    std::slice::from_ref(&predicate),
+                    &fields
+                ),
+                "{min:?}, {max:?}, {nulls}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_data_evolution_stats_distinguish_readded_fields_and_unknown_schemas() {
+        let old_schema = two_column_schema(0, "id", "value");
+        let schema = old_schema
+            .apply_changes(vec![
+                SchemaChange::drop_column("value".into()),
+                SchemaChange::add_column("value".into(), DataType::Int(IntType::new())),
+            ])
+            .unwrap();
+        let table = data_evolution_test_table("memory:/de_stats_readd", schema);
+        write_schema_file(&table, &old_schema).await;
+        let pb = PredicateBuilder::new(table.schema().fields());
+        for file_schema_id in [0, 99] {
+            let mut file = make_evo_file("old.parquet", 10, 1, 1, Some(0));
+            file.schema_id = file_schema_id;
+            // The old name exists, but it is not the re-added field's ID.
+            file.write_cols = Some(vec!["value".into()]);
+            for (predicate, expected) in [
+                (
+                    pb.equal("value", Datum::Int(20)).unwrap(),
+                    usize::from(file_schema_id == 99),
+                ),
+                (pb.is_null("value").unwrap(), 1),
+                (
+                    pb.is_not_null("value").unwrap(),
+                    usize::from(file_schema_id == 99),
+                ),
+                (Predicate::AlwaysFalse, 0),
+            ] {
+                let entries = vec![ManifestEntry::new(
+                    FileKind::Add,
+                    BinaryRowBuilder::new(0).build_serialized(),
+                    0,
+                    -1,
+                    file.clone(),
+                    0,
+                )];
+                let plan = PaimonTableScan::new(&table, None, vec![predicate], None, None, None)
+                    .plan_snapshot_from_entries(
+                        diff_snapshot_with_schema(7, table.schema().id()),
+                        entries,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    plan.splits().len(),
+                    expected,
+                    "file schema {file_schema_id}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_data_evolution_pruning_matches_renamed_columns_by_field_id() {
         let schema_v0 = two_column_schema(0, "id", "old_name");
         let schema_v1 = two_column_schema(1, "id", "new_name");
@@ -4519,12 +4808,13 @@ mod tests {
     #[test]
     fn test_data_evolution_group_matches_or_prunes_when_no_child_matches() {
         let fields = int_field();
-        let file = test_data_file_meta(
+        let mut file = test_data_file_meta(
             int_stats_row(Some(10)),
             int_stats_row(Some(20)),
             vec![Some(0)],
             5,
         );
+        file.first_row_id = Some(0);
         let pb = PredicateBuilder::new(&fields);
         let predicate = Predicate::or(vec![
             pb.less_than("id", Datum::Int(5)).unwrap(),
@@ -4541,12 +4831,13 @@ mod tests {
     #[test]
     fn test_data_evolution_group_matches_or_keeps_when_any_child_matches() {
         let fields = int_field();
-        let file = test_data_file_meta(
+        let mut file = test_data_file_meta(
             int_stats_row(Some(10)),
             int_stats_row(Some(20)),
             vec![Some(0)],
             5,
         );
+        file.first_row_id = Some(0);
         let pb = PredicateBuilder::new(&fields);
         let predicate = Predicate::or(vec![
             pb.less_than("id", Datum::Int(15)).unwrap(),
@@ -4563,12 +4854,13 @@ mod tests {
     #[test]
     fn test_data_evolution_group_is_not_pruned_by_a_row_id_predicate() {
         let fields = int_field();
-        let file = test_data_file_meta(
+        let mut file = test_data_file_meta(
             int_stats_row(Some(10)),
             int_stats_row(Some(20)),
             vec![Some(0)],
             5,
         );
+        file.first_row_id = Some(0);
         let row_id =
             crate::spec::row_id_leaf(crate::spec::PredicateOperator::GtEq, vec![Datum::Long(100)]);
 
@@ -4587,12 +4879,13 @@ mod tests {
     #[test]
     fn test_data_evolution_group_matches_not_prunes_when_inner_must_match() {
         let fields = int_field();
-        let file = test_data_file_meta(
+        let mut file = test_data_file_meta(
             int_stats_row(Some(10)),
             int_stats_row(Some(10)),
             vec![Some(0)],
             5,
         );
+        file.first_row_id = Some(0);
         let predicate = Predicate::negate(
             PredicateBuilder::new(&fields)
                 .equal("id", Datum::Int(10))

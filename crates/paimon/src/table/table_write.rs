@@ -1002,6 +1002,7 @@ impl TableWrite {
                 changelog_file_prefix: self.changelog_file_prefix.clone(),
                 changelog_file_compression: self.changelog_file_compression.clone(),
                 changelog_file_format: self.changelog_file_format.clone(),
+                primary_keys: self.table.schema().primary_keys().to_vec(),
                 primary_key_indices: self.primary_key_indices.clone(),
                 primary_key_types: self.primary_key_types.clone(),
                 sequence_field_indices: self.sequence_field_indices.clone(),

@@ -26,6 +26,7 @@
 //!
 //! Reference: [org.apache.paimon.io.KeyValueDataFileWriterImpl](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/io/KeyValueDataFileWriterImpl.java)
 
+use crate::arrow::arrow_fields_to_paimon;
 use crate::arrow::format::create_format_writer;
 use crate::io::FileIO;
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
@@ -35,6 +36,7 @@ use crate::spec::{
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::prepared_files::PreparedFiles;
+use crate::table::sort_merge::{AggregateMergeFunction, BufferedBatch, MergeRow};
 use crate::Result;
 use arrow_array::{Array, BooleanArray, Int64Array, Int8Array, RecordBatch, UInt32Array};
 use arrow_ord::sort::{lexsort_to_indices, SortColumn, SortOptions};
@@ -79,7 +81,9 @@ pub(crate) struct KeyValueWriteConfig {
     pub changelog_file_prefix: String,
     pub changelog_file_compression: String,
     pub changelog_file_format: String,
-    /// Primary key column indices in the user schema.
+    /// Full primary keys, including partition columns which must not be aggregated.
+    pub primary_keys: Vec<String>,
+    /// Trimmed primary key column indices in the user schema.
     pub primary_key_indices: Vec<usize>,
     /// Paimon DataTypes for each primary key column (same order as primary_key_indices).
     pub primary_key_types: Vec<DataType>,
@@ -255,7 +259,7 @@ impl KeyValueFileWriter {
         //   Deduplicate   → keep last row per key group (highest seq)
         //   FirstRow      → keep first row per key group (lowest seq)
         //   PartialUpdate → per column, keep the latest non-null value
-        //   Aggregation   → keep all rows for read-side field-wise merge
+        //   Aggregation   → apply per-field aggregators in sequence order
         let (data_batch, data_seq, data_indices) = match self.config.merge_engine {
             MergeEngine::PartialUpdate => {
                 let (merged, merged_seq) =
@@ -264,7 +268,14 @@ impl KeyValueFileWriter {
                     UInt32Array::from_iter_values(0..u32::try_from(merged.num_rows()).unwrap());
                 (merged, merged_seq, identity)
             }
-            MergeEngine::Deduplicate | MergeEngine::FirstRow | MergeEngine::Aggregation => {
+            MergeEngine::Aggregation => {
+                let (merged, merged_seq) =
+                    self.merge_aggregation_rows(&combined, seq_array.as_ref(), &sorted_indices)?;
+                let identity =
+                    UInt32Array::from_iter_values(0..u32::try_from(merged.num_rows()).unwrap());
+                (merged, merged_seq, identity)
+            }
+            MergeEngine::Deduplicate | MergeEngine::FirstRow => {
                 let selected = self.select_flush_indices(&combined, &sorted_indices)?;
                 (
                     combined.clone(),
@@ -281,6 +292,16 @@ impl KeyValueFileWriter {
             None
         };
 
+        // Java derives file sequence bounds from emitted rows; allocation still
+        // advances over all buffered inputs, including rows folded away.
+        let output_sequences = data_seq.as_any().downcast_ref::<Int64Array>().unwrap();
+        let (min_output_seq, max_output_seq) = data_indices
+            .values()
+            .iter()
+            .map(|&idx| output_sequences.value(idx as usize))
+            .fold((i64::MAX, i64::MIN), |(min, max), seq| {
+                (min.min(seq), max.max(seq))
+            });
         let data_file = self
             .write_indexed_file(
                 &data_batch,
@@ -291,8 +312,8 @@ impl KeyValueFileWriter {
                     file_ordinal: self.written_files.len(),
                     file_format: &self.config.file_format,
                     file_compression: &self.config.file_compression,
-                    min_sequence_number: start_seq,
-                    max_sequence_number: end_seq,
+                    min_sequence_number: min_output_seq,
+                    max_sequence_number: max_output_seq,
                     delete_row_count: data_delete_row_count,
                 },
             )
@@ -587,12 +608,106 @@ impl KeyValueFileWriter {
             MergeEngine::PartialUpdate => {
                 unreachable!("partial-update merges rows at flush via merge_partial_update_rows")
             }
-            // Aggregation keeps every row on flush and performs the per-field
-            // merge on the read side.
-            MergeEngine::Aggregation => Ok((0..sorted_indices.len())
-                .map(|idx| sorted_indices.value(idx))
-                .collect()),
+            MergeEngine::Aggregation => {
+                unreachable!("aggregation merges rows at flush via merge_aggregation_rows")
+            }
         }
+    }
+
+    fn merge_aggregation_rows(
+        &self,
+        batch: &RecordBatch,
+        seq_array: &dyn Array,
+        sorted_indices: &UInt32Array,
+    ) -> Result<(RecordBatch, Arc<dyn Array>)> {
+        let schema = batch.schema();
+        let value_kind_idx = schema
+            .fields()
+            .iter()
+            .position(|field| field.name() == VALUE_KIND_FIELD_NAME);
+        let value_kinds = value_kind_idx
+            .map(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: "_VALUE_KIND column must be Int8".into(),
+                        source: None,
+                    })
+            })
+            .transpose()?;
+        let output_indices: Vec<_> = (0..batch.num_columns())
+            .filter(|idx| Some(*idx) != value_kind_idx)
+            .collect();
+        let output_fields: Vec<_> = output_indices
+            .iter()
+            .map(|&idx| schema.field(idx).clone())
+            .collect();
+        let output_schema = Arc::new(ArrowSchema::new(output_fields.clone()));
+        let sequence_fields: Vec<_> = self
+            .config
+            .sequence_field_indices
+            .iter()
+            .map(|&idx| schema.field(idx).name().clone())
+            .collect();
+        let merge = AggregateMergeFunction::new(
+            &self.config.table_options,
+            &self.config.table_name,
+            &arrow_fields_to_paimon(&output_fields)?,
+            &self.config.primary_keys,
+            &sequence_fields,
+        )?;
+        let rows: Vec<_> = sorted_indices
+            .values()
+            .iter()
+            .map(|&idx| MergeRow {
+                batch_idx: 0,
+                row_idx: idx as usize,
+                // Ordering is already established by the write buffer's Arrow sort.
+                sequence_number: 0,
+                user_sequences: Vec::new(),
+                value_kind: value_kinds
+                    .filter(|kinds| kinds.is_valid(idx as usize))
+                    .map_or(0, |kinds| kinds.value(idx as usize)),
+            })
+            .collect();
+        let key_rows = self.convert_key_rows(batch)?;
+        let buffers = [BufferedBatch::Source(batch.clone())];
+        let mut merged = Vec::new();
+        let mut last_indices = Vec::new();
+        let mut start = 0;
+        while start < rows.len() {
+            let mut end = start + 1;
+            while end < rows.len()
+                && key_rows.row(rows[end].row_idx) == key_rows.row(rows[start].row_idx)
+            {
+                end += 1;
+            }
+            let group = rows[start..end].iter().collect::<Vec<_>>();
+            merged.push(merge.merge_ordered(&group, &buffers, &output_indices, &output_schema)?);
+            // Java retains the last row in sequence-field order, which need not
+            // have the largest arrival sequence number.
+            last_indices.push(sorted_indices.value(end - 1));
+            start = end;
+        }
+        let arrow_error = |e: arrow_schema::ArrowError| crate::Error::DataInvalid {
+            message: format!("Failed to build merged aggregation batch: {e}"),
+            source: Some(Box::new(e)),
+        };
+        let merged =
+            arrow_select::concat::concat_batches(&output_schema, &merged).map_err(arrow_error)?;
+        let merged = if let Some(idx) = value_kind_idx {
+            let mut columns = merged.columns().to_vec();
+            columns.insert(idx, Arc::new(Int8Array::from(vec![0; merged.num_rows()])));
+            RecordBatch::try_new(schema, columns).map_err(arrow_error)?
+        } else {
+            merged
+        };
+        let merged_seq =
+            arrow_select::take::take(seq_array, &UInt32Array::from(last_indices), None)
+                .map_err(arrow_error)?;
+        Ok((merged, merged_seq))
     }
 
     /// Merge same-key rows at flush for the partial-update engine, mirroring
@@ -836,7 +951,7 @@ mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
     use crate::spec::IntType;
-    use arrow_array::{Int32Array, UInt32Array};
+    use arrow_array::{Int32Array, RecordBatchReader, StringArray, UInt32Array};
     use std::collections::HashMap;
 
     fn test_write_config(merge_engine: MergeEngine) -> KeyValueWriteConfig {
@@ -866,6 +981,7 @@ mod tests {
             changelog_file_prefix: "changelog-".to_string(),
             changelog_file_compression: "none".to_string(),
             changelog_file_format: "parquet".to_string(),
+            primary_keys: vec!["id".into()],
             primary_key_indices: vec![0],
             primary_key_types: vec![DataType::Int(IntType::new())],
             sequence_field_indices: vec![1],
@@ -1349,33 +1465,247 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_select_flush_indices_keeps_all_rows_for_aggregation_engine() {
+    #[tokio::test]
+    async fn test_flush_aggregation_merges_same_key_across_buffered_batches() {
         let schema = Arc::new(ArrowSchema::new(vec![
-            Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
-            Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let mut config = test_write_config(MergeEngine::Aggregation);
+        config.sequence_field_indices.clear();
+        config.write_buffer_size = i64::MAX;
+        config
+            .table_options
+            .insert("fields.value.aggregate-function".into(), "sum".into());
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let mut writer = KeyValueFileWriter::new(io.clone(), config, 7).unwrap();
+        for value in [10, 20] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1])),
+                    Arc::new(Int32Array::from(vec![value])),
+                ],
+            )
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+        }
+        let prepared = writer.prepare_commit().await.unwrap();
+        assert_eq!(prepared.data_files.len(), 1);
+        let file = &prepared.data_files[0];
+        assert_eq!(file.row_count, 1);
+        assert_eq!((file.min_sequence_number, file.max_sequence_number), (8, 8));
+        let physical = read_kv_file(&io, file).await;
+        assert_eq!(physical.num_rows(), 1);
+        assert_eq!(
+            physical
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
+            &[30]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_aggregation_sequence_partition_keys_and_input_changelog() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("p", ArrowDataType::Int32, false),
+            ArrowField::new("seq", ArrowDataType::Int64, true),
+            ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ArrowField::new("amount", ArrowDataType::Int32, true),
+            ArrowField::new("label", ArrowDataType::Utf8, true),
+            ArrowField::new("note", ArrowDataType::Utf8, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(Int32Array::from(vec![1, 1])) as Arc<dyn arrow_array::Array>,
-                Arc::new(Int64Array::from(vec![10, 20])) as Arc<dyn arrow_array::Array>,
+                Arc::new(Int32Array::from(vec![2, 1, 1, 1, 2])),
+                Arc::new(Int32Array::from(vec![7; 5])),
+                Arc::new(Int64Array::from(vec![
+                    Some(30),
+                    Some(20),
+                    Some(10),
+                    Some(20),
+                    None,
+                ])),
+                Arc::new(Int8Array::from(vec![0, 2, 0, 2, 0])),
+                Arc::new(Int32Array::from(vec![None, Some(10), Some(20), None, None])),
+                Arc::new(StringArray::from(vec![
+                    "two", "later", "early", "tie", "low",
+                ])),
+                Arc::new(StringArray::from(vec![
+                    None,
+                    Some("kept"),
+                    None,
+                    None,
+                    None,
+                ])),
             ],
         )
         .unwrap();
-        let sorted_indices = UInt32Array::from(vec![0, 1]);
-        let writer = KeyValueFileWriter::new(
-            FileIOBuilder::new("memory").build().unwrap(),
-            test_write_config(MergeEngine::Aggregation),
-            0,
-        )
-        .unwrap();
-
-        let selected = writer
-            .select_flush_indices(&batch, &sorted_indices)
+        let mut config = test_write_config(MergeEngine::Aggregation);
+        // Only id participates in within-partition grouping, but p is also a
+        // primary key and must not be summed by the default aggregator.
+        config.primary_keys = vec!["id".into(), "p".into()];
+        config.sequence_field_indices = vec![2];
+        config.write_buffer_size = i64::MAX;
+        config.input_changelog = true;
+        for (key, value) in [
+            ("fields.default-aggregate-function", "sum"),
+            ("fields.label.aggregate-function", "listagg"),
+            ("fields.note.aggregate-function", "last_non_null_value"),
+        ] {
+            config.table_options.insert(key.into(), value.into());
+        }
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let mut writer = KeyValueFileWriter::new(io.clone(), config, 7).unwrap();
+        writer.write(&batch.slice(0, 2)).await.unwrap();
+        writer.write(&batch.slice(2, 3)).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+        let file = &prepared.data_files[0];
+        assert_eq!(file.row_count, 2);
+        assert_eq!(
+            (file.min_sequence_number, file.max_sequence_number),
+            (7, 10)
+        );
+        assert_eq!(file.delete_row_count, Some(0));
+        let physical = read_kv_file(&io, file).await;
+        let i32_values = |name| {
+            physical
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        let i64_values = |name| {
+            physical
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(i32_values("id"), vec![Some(1), Some(2)]);
+        assert_eq!(i32_values("p"), vec![Some(7), Some(7)]);
+        assert_eq!(i32_values("amount"), vec![Some(30), None]);
+        assert_eq!(i64_values("seq"), vec![Some(20), Some(30)]);
+        assert_eq!(
+            i64_values(SEQUENCE_NUMBER_FIELD_NAME),
+            vec![Some(10), Some(7)]
+        );
+        let labels = physical
+            .column_by_name("label")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
             .unwrap();
+        assert_eq!(
+            labels.iter().collect::<Vec<_>>(),
+            vec![Some("early,later,tie"), Some("low,two")]
+        );
+        let notes = physical
+            .column_by_name("note")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(notes.iter().collect::<Vec<_>>(), vec![Some("kept"), None]);
+        assert_eq!(
+            physical
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .values(),
+            &[0, 0]
+        );
+        let changelog = &prepared.changelog_files[0];
+        assert_eq!(changelog.row_count, 5);
+        let changelog = read_kv_file(&io, changelog).await;
+        assert_eq!(
+            changelog
+                .column_by_name("amount")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(20), Some(10), None, None, None]
+        );
+        assert_eq!(
+            changelog
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .values(),
+            &[0, 2, 2, 0, 0]
+        );
+        // Sequence allocation advances over all consumed input, not output rows.
+        writer.write(&batch.slice(1, 1)).await.unwrap();
+        let next = writer.prepare_commit().await.unwrap();
+        assert_eq!(
+            (
+                next.data_files[0].min_sequence_number,
+                next.data_files[0].max_sequence_number
+            ),
+            (12, 12)
+        );
+    }
 
-        assert_eq!(selected, vec![0, 1]);
+    #[tokio::test]
+    async fn test_flush_aggregation_rejects_retract_before_writing_files() {
+        for kind in [1, 3] {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("seq", ArrowDataType::Int64, false),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(Int64Array::from(vec![10, 20])),
+                    Arc::new(Int8Array::from(vec![0, kind])),
+                ],
+            )
+            .unwrap();
+            let mut writer = KeyValueFileWriter::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                test_write_config(MergeEngine::Aggregation),
+                0,
+            )
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            let err = writer.prepare_commit().await.err().unwrap();
+            assert!(
+                matches!(err, crate::Error::Unsupported { message } if message.contains("DELETE or UPDATE_BEFORE"))
+            );
+            assert!(writer.written_files.is_empty());
+            assert!(writer.written_changelog_files.is_empty());
+        }
+    }
+
+    async fn read_kv_file(io: &FileIO, file: &DataFileMeta) -> RecordBatch {
+        let path = format!("memory:/kv-test/bucket-0/{}", file.file_name);
+        let data = io.new_input(&path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(data, 1024).unwrap();
+        let schema = reader.schema();
+        let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
+        arrow_select::concat::concat_batches(&schema, &batches).unwrap()
     }
 
     #[test]
