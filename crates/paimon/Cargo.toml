@@ -103,6 +103,7 @@ roaring = "0.11"
 crc32fast = "1"
 zstd = "0.13"
 snap = "1"
+miniz_oxide = "0.8"
 lz4_flex = "0.13"
 lzokay-native = { version = "0.1", default-features = false, features = ["decompress"] }
 arrow-array = { workspace = true }

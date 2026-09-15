@@ -34,6 +34,7 @@ pub struct OcfHeader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OcfCodec {
     Null,
+    Deflate,
     Snappy,
     Zstandard,
 }
@@ -101,6 +102,24 @@ impl<'a> OcfBlockIter<'a> {
     fn decompress(&mut self, data: &'a [u8]) -> crate::Result<Cow<'a, [u8]>> {
         match self.codec {
             OcfCodec::Null => Ok(Cow::Borrowed(data)),
+            OcfCodec::Deflate => {
+                // Avro's `deflate` block is *raw* RFC 1951 — no zlib header, no
+                // adler32, because Avro Java deflates with `nowrap=true`. This is the
+                // same entry point apache-avro uses for `Codec::Deflate`, so a file
+                // this reader accepts is one `apache_avro::Reader` accepts too. It is
+                // also the strict choice: `flate2`'s `read_to_end` returns the partial
+                // output for a truncated stream, while this errors.
+                if data.is_empty() {
+                    return Ok(Cow::Borrowed(data));
+                }
+                let decompressed = miniz_oxide::inflate::decompress_to_vec(data).map_err(|e| {
+                    Error::UnexpectedError {
+                        message: format!("avro ocf: deflate decompression failed: {:?}", e.status),
+                        source: None,
+                    }
+                })?;
+                Ok(Cow::Owned(decompressed))
+            }
             OcfCodec::Snappy => {
                 if data.len() < 4 {
                     return Err(Error::UnexpectedError {
@@ -121,7 +140,7 @@ impl<'a> OcfBlockIter<'a> {
                 if actual_crc != expected_crc {
                     return Err(Error::UnexpectedError {
                         message: format!(
-                            "avro ocf: snappy CRC32C mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"
+                            "avro ocf: snappy CRC32 mismatch: expected {expected_crc:#010x}, got {actual_crc:#010x}"
                         ),
                         source: None,
                     });
@@ -164,6 +183,7 @@ pub fn parse_ocf_streaming(bytes: &[u8]) -> crate::Result<(OcfHeader, OcfBlockIt
 
     let codec = match meta.get("avro.codec").map(|s| s.as_str()) {
         None | Some("null") => OcfCodec::Null,
+        Some("deflate") => OcfCodec::Deflate,
         Some("snappy") => OcfCodec::Snappy,
         Some("zstandard") => OcfCodec::Zstandard,
         Some(other) => {
@@ -295,5 +315,118 @@ mod tests {
         assert_eq!(header.codec, OcfCodec::Snappy);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].object_count, 1);
+    }
+
+    #[test]
+    fn test_parse_ocf_deflate() {
+        use apache_avro::{Codec, DeflateSettings, Schema, Writer};
+
+        let schema = Schema::parse_str(
+            r#"{"type": "record", "name": "test", "fields": [{"name": "x", "type": "long"}]}"#,
+        )
+        .unwrap();
+        let mut writer = Writer::with_codec(
+            &schema,
+            Vec::new(),
+            Codec::Deflate(DeflateSettings::default()),
+        );
+        let mut record = apache_avro::types::Record::new(&schema).unwrap();
+        record.put("x", 24680i64);
+        writer.append(record).unwrap();
+        let bytes = writer.into_inner().unwrap();
+
+        let (header, blocks) = parse_ocf(&bytes).unwrap();
+        assert_eq!(header.codec, OcfCodec::Deflate);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].object_count, 1);
+    }
+
+    /// Avro zigzag varint, so the fixture below owes nothing to any encoder we ship.
+    fn avro_long(value: i64) -> Vec<u8> {
+        let mut zigzag = ((value << 1) ^ (value >> 63)) as u64;
+        let mut out = Vec::new();
+        loop {
+            if zigzag & !0x7f == 0 {
+                out.push(zigzag as u8);
+                return out;
+            }
+            out.push((zigzag as u8 & 0x7f) | 0x80);
+            zigzag >>= 7;
+        }
+    }
+
+    fn avro_bytes(value: &[u8]) -> Vec<u8> {
+        let mut out = avro_long(value.len() as i64);
+        out.extend_from_slice(value);
+        out
+    }
+
+    /// A *stored* (BTYPE=00) final deflate block: raw RFC 1951, no zlib wrapper.
+    fn raw_deflate_stored(payload: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(payload.len()).expect("fixture block fits in a stored block");
+        let mut out = vec![0x01];
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn test_parse_ocf_deflate_accepts_a_hand_built_raw_stream() {
+        // Built byte by byte, without any Rust deflate implementation, so it pins the
+        // on-disk contract rather than a round trip through one crate: Avro's deflate
+        // is raw RFC 1951, and a zlib reader would reject exactly this input.
+        const SCHEMA: &str =
+            r#"{"type":"record","name":"test","fields":[{"name":"x","type":"long"}]}"#;
+        let sync = [7u8; SYNC_MARKER_LEN];
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(AVRO_MAGIC);
+        bytes.extend_from_slice(&avro_long(2)); // header map entry count
+        bytes.extend_from_slice(&avro_bytes(b"avro.schema"));
+        bytes.extend_from_slice(&avro_bytes(SCHEMA.as_bytes()));
+        bytes.extend_from_slice(&avro_bytes(b"avro.codec"));
+        bytes.extend_from_slice(&avro_bytes(b"deflate"));
+        bytes.extend_from_slice(&avro_long(0)); // end of map
+        bytes.extend_from_slice(&sync);
+
+        // One block holding two records: x = 1, x = -2.
+        let mut body = avro_long(1);
+        body.extend_from_slice(&avro_long(-2));
+        let block = raw_deflate_stored(&body);
+        bytes.extend_from_slice(&avro_long(2)); // object count
+        bytes.extend_from_slice(&avro_long(block.len() as i64));
+        bytes.extend_from_slice(&block);
+        bytes.extend_from_slice(&sync);
+
+        let (header, blocks) = parse_ocf(&bytes).unwrap();
+        assert_eq!(header.codec, OcfCodec::Deflate);
+        assert_eq!(header.schema_json, SCHEMA);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].object_count, 2);
+        // The decompressed body must be the exact bytes we wrapped.
+        assert_eq!(blocks[0].data.as_ref(), body.as_slice());
+    }
+
+    #[test]
+    fn test_parse_ocf_still_rejects_codecs_we_do_not_implement() {
+        // Java's `CodecFactory` also accepts bzip2 and xz; we do not, and the
+        // whitelist must keep saying so rather than becoming permissive.
+        let sync = [0u8; SYNC_MARKER_LEN];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(AVRO_MAGIC);
+        bytes.extend_from_slice(&avro_long(2));
+        bytes.extend_from_slice(&avro_bytes(b"avro.schema"));
+        bytes.extend_from_slice(&avro_bytes(br#"{"type":"null"}"#));
+        bytes.extend_from_slice(&avro_bytes(b"avro.codec"));
+        bytes.extend_from_slice(&avro_bytes(b"bzip2"));
+        bytes.extend_from_slice(&avro_long(0));
+        bytes.extend_from_slice(&sync);
+
+        let error = match parse_ocf(&bytes) {
+            Ok(_) => panic!("bzip2 is not implemented here and must not be accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unsupported codec: bzip2"), "{error}");
     }
 }

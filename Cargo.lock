@@ -4676,6 +4676,7 @@ dependencies = [
  "lz4_flex 0.13.1",
  "lzokay-native",
  "md-5 0.10.6",
+ "miniz_oxide",
  "opendal-core",
  "opendal-http-transport-reqwest",
  "opendal-layer-retry",
