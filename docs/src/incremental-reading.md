@@ -56,7 +56,12 @@ let batches = reader
     .await?;
 ```
 
-`Delta` and `Changelog` return rows from their planned files. `Diff` returns
+`Delta` and `Changelog` retain physical events from their planned files, including
+repeated keys and retracts, without snapshot deletion vectors or automatic
+global-index pruning. Their `DataSplit::is_streaming()` flag also preserves this
+contract when passed to the ordinary `TableRead::to_arrow` reader. Combined delta
+planning (`plan_combined_delta`) packs the entire window using Java batch split
+rules while retaining these event semantics. `Diff` returns
 after-image rows for inserted or updated keys and omits deleted keys. Projection
 and filters configured on the read builder are applied to the output; `Diff`
 still compares complete rows before applying projection.

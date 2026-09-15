@@ -135,12 +135,14 @@ impl PyReadBuilder {
         // conflict error via its Java-parity silent fallback, so the strict
         // gate below would otherwise misattribute the failure to a single
         // selector. Surface the real conflict, listing the keys the user set.
+        // scan.version must first be adapted by the core: Java allows it to
+        // overwrite a selector of the same kind after resolving tag precedence.
         let present: Vec<&str> = TIME_TRAVEL_SELECTORS
             .iter()
             .copied()
             .filter(|name| opts.contains_key(*name))
             .collect();
-        if present.len() > 1 {
+        if present.len() > 1 && !opts.contains_key("scan.version") {
             return Err(PyValueError::new_err(format!(
                 "Only one time-travel selector may be set, found: {}",
                 present.join(", ")
@@ -472,10 +474,26 @@ impl PySplit {
         self.inner.row_count()
     }
 
-    /// Serialize this planned split to the Java `SplitSerializer` (v1) binary, so pypaimon (or
-    /// any Paimon reader) can rebuild it without re-planning. A split carrying row ranges is
-    /// serialized as an `IndexedSplit`.
-    fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+    /// Whether the split must be read as physical change events.
+    fn is_streaming(&self) -> bool {
+        self.inner.is_streaming()
+    }
+
+    /// Serialize to Java SplitSerializer v1, using IndexedSplit for row ranges.
+    /// Streaming export requires a decoder that preserves change-event semantics.
+    #[pyo3(signature = (*, allow_streaming=false))]
+    fn serialize<'py>(
+        &self,
+        py: Python<'py>,
+        allow_streaming: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        // Older Python decoders silently discard the streaming byte. Require
+        // acknowledgement before exporting events through that shared codec.
+        if self.inner.is_streaming() && !allow_streaming {
+            return Err(PyValueError::new_err(
+                "Streaming splits require a stream-aware decoder; pass allow_streaming=True",
+            ));
+        }
         let bytes = self.inner.serialize_split_v1().map_err(to_py_err)?;
         Ok(PyBytes::new(py, &bytes))
     }

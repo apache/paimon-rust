@@ -694,6 +694,24 @@ def test_time_travel_by_tag_name():
         assert _rows(builder.new_read().read(splits)) == 1
 
 
+def test_scan_version_adapts_before_binding_selector_validation():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = _make_two_snapshot_table(warehouse)
+        ctx.sql("CALL sys.create_tag(table => 'tdb.t', tag => 'v1', snapshot_id => 1)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        for version, key in [("1", "scan.snapshot-id"), ("v1", "scan.tag-name")]:
+            builder = table.new_read_builder({"scan.version": version, key: "invalid"})
+            plan = builder.new_scan().plan()
+            assert plan.snapshot_id() == 1
+            assert pa.Table.from_batches(builder.new_read().read(plan.splits())).to_pydict() == {
+                "id": [1], "name": ["a"]}
+        for opts in [
+                {"scan.version": "1", "scan.tag-name": "v1"},
+                {"scan.version": "v1", "scan.snapshot-id": "1"}]:
+            with pytest.raises(ValueError, match="did not resolve"):
+                table.new_read_builder(opts)
+
+
 def test_time_travel_unresolved_snapshot_raises():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_two_snapshot_table(warehouse)
@@ -869,7 +887,7 @@ def test_split_serialize_encodes_deletions_and_external_path():
         assert b"s3://ext/data-0.parquet" in data  # external path
 
 
-def test_combined_incremental_plan_merges_pk_versions_and_preserves_range():
+def test_combined_incremental_plan_preserves_pk_events_and_range():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
         ctx.register_catalog("paimon", {"warehouse": warehouse})
@@ -885,9 +903,17 @@ def test_combined_incremental_plan_merges_pk_versions_and_preserves_range():
         assert plan.snapshot_id() == 2
         assert len(plan.splits()) == 1
         assert pa.Table.from_batches(builder.new_read().read(plan.splits())).to_pydict() == {
-            "id": [1], "value": [20]}
-        assert [s.serialize() for s in scan.plan().splits()] == [
-            s.serialize() for s in plan.splits()]
+            "id": [1, 1], "value": [10, 20]}
+        assert [s.serialize(allow_streaming=True) for s in scan.plan().splits()] == [
+            s.serialize(allow_streaming=True) for s in plan.splits()]
+        assert all(s.is_streaming() for s in plan.splits())
+        with pytest.raises(ValueError, match="stream-aware decoder"):
+            plan.splits()[0].serialize()
+        import pickle
+        restored = pickle.loads(pickle.dumps(plan.splits()[0]))
+        assert restored.is_streaming()
+        assert restored.serialize(allow_streaming=True) == (
+            plan.splits()[0].serialize(allow_streaming=True))
         selected = builder.new_incremental_scan(1, 2).plan()
         assert selected.snapshot_id() == 2
         assert pa.Table.from_batches(builder.new_read().read(selected.splits())).to_pydict() == {
@@ -981,7 +1007,8 @@ def test_incremental_row_positions_use_combined_delta_batch():
             assert plan.snapshot_id() == 2
             restored = [pickle.loads(pickle.dumps(split)) for split in plan.splits()]
             assert pa.Table.from_batches(builder.new_read().read(restored)).column("id").to_pylist() == expected
-            assert [s.serialize() for s in scan.plan().splits()] == [s.serialize() for s in plan.splits()]
+            assert [s.serialize(allow_streaming=True) for s in scan.plan().splits()] == [
+                s.serialize(allow_streaming=True) for s in plan.splits()]
         builder.with_row_ranges([(1, 3)]).with_limit(2)
         plan = builder.new_incremental_scan(0, 2).with_row_position_slice(2, 5).plan()
         assert pa.Table.from_batches(builder.new_read().read(plan.splits())).column("id").to_pylist() == [2, 3]

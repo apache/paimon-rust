@@ -111,6 +111,22 @@ async fn read_manifest_list(
     crate::spec::avro::from_avro_bytes_fast::<crate::spec::ManifestFileMeta>(&bytes)
 }
 
+fn validate_incremental_entries(entries: &[ManifestEntry]) -> crate::Result<()> {
+    if entries.iter().any(|entry| *entry.kind() != FileKind::Add) {
+        return Err(crate::Error::DataInvalid {
+            message: "Incremental delta manifests must contain only ADD entries".into(),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IncrementalSplitMode {
+    Batch,
+    Streaming,
+}
+
 enum ManifestListSource<'a> {
     Snapshot(&'a Snapshot),
     AppendDeltas(&'a [Snapshot]),
@@ -143,6 +159,7 @@ async fn read_all_manifest_entries(
     row_range_index: Option<&RowRangeIndex>,
     trace: Option<&mut ScanTrace>,
 ) -> crate::Result<Vec<ManifestEntry>> {
+    let incremental = matches!(&source, ManifestListSource::AppendDeltas(_));
     let (mut manifest_files, delta) = match source {
         ManifestListSource::Snapshot(snapshot) => futures::try_join!(
             read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
@@ -300,7 +317,12 @@ async fn read_all_manifest_entries(
             },
         )
         .await?;
-    let mut all_entries = merge_manifest_entries(all_entries);
+    let mut all_entries = if incremental {
+        validate_incremental_entries(&all_entries)?;
+        all_entries
+    } else {
+        merge_manifest_entries(all_entries)
+    };
     let manifest_entries_after_merge = all_entries.len();
     if let Some(index) = row_range_index {
         let before = all_entries.len();
@@ -1098,10 +1120,15 @@ struct PaimonTableScan<'a> {
     /// Used by non-read paths (overwrite, truncate, writer restore) that need
     /// the complete file set. Normal read scans leave this as `false`.
     scan_all_files: bool,
+    incremental_split_mode: Option<IncrementalSplitMode>,
     projected_read_field_ids: Option<HashSet<i32>>,
 }
 
 impl<'a> PaimonTableScan<'a> {
+    fn is_streaming(&self) -> bool {
+        self.incremental_split_mode.is_some()
+    }
+
     pub(crate) fn new(
         table: &'a Table,
         partition_filter: Option<PartitionFilter>,
@@ -1120,6 +1147,7 @@ impl<'a> PaimonTableScan<'a> {
             row_position_selection: None,
             row_range_optimization_disabled: false,
             scan_all_files: false,
+            incremental_split_mode: None,
             projected_read_field_ids: None,
         }
     }
@@ -1284,7 +1312,7 @@ impl<'a> PaimonTableScan<'a> {
         // Non-read paths (overwrite, truncate, writer restore) set scan_all_files=true
         // to see all files including level-0, matching Java's CommitScanner behavior.
         let skip_level_zero = should_skip_level_zero_for_scan(
-            self.scan_all_files,
+            self.scan_all_files || self.is_streaming(),
             has_primary_keys,
             deletion_vectors_enabled,
             core_options.deletion_vectors_merge_on_read(),
@@ -1358,12 +1386,14 @@ impl<'a> PaimonTableScan<'a> {
         core_options: &CoreOptions,
         data_evolution_enabled: bool,
     ) -> crate::Result<Option<GlobalIndexScanSettings>> {
-        if should_use_global_index_row_range_optimization(
-            self.row_range_optimization_disabled,
-            data_evolution_enabled,
-            core_options.global_index_enabled(),
-            !self.data_predicates.is_empty(),
-        ) {
+        if !self.is_streaming()
+            && should_use_global_index_row_range_optimization(
+                self.row_range_optimization_disabled,
+                data_evolution_enabled,
+                core_options.global_index_enabled(),
+                !self.data_predicates.is_empty(),
+            )
+        {
             Ok(Some(GlobalIndexScanSettings {
                 search_mode: core_options.scalar_index_search_mode()?,
                 thread_num: core_options.global_index_thread_num()?,
@@ -1526,8 +1556,8 @@ impl<'a> PaimonTableScan<'a> {
             Ok(crate::spec::MergeEngine::FirstRow)
         );
         if has_primary_keys
-            && (!deletion_vectors_enabled || deletion_vectors_merge_on_read)
-            && !first_row
+            && (self.is_streaming()
+                || ((!deletion_vectors_enabled || deletion_vectors_merge_on_read) && !first_row))
         {
             retain_primary_key_conjuncts(
                 &self.data_predicates,
@@ -1556,7 +1586,9 @@ impl<'a> PaimonTableScan<'a> {
     pub(crate) async fn plan_snapshot_delta(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        self.plan_snapshot_manifest_list(
+        let mut scan = self.clone();
+        scan.incremental_split_mode = Some(IncrementalSplitMode::Streaming);
+        scan.plan_snapshot_manifest_list(
             snapshot,
             snapshot.delta_manifest_list(),
             data_evolution_read_field_ids.as_ref(),
@@ -1573,7 +1605,9 @@ impl<'a> PaimonTableScan<'a> {
     ) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        self.plan_snapshot_from_lists(
+        let mut scan = self.clone();
+        scan.incremental_split_mode = Some(IncrementalSplitMode::Batch);
+        scan.plan_snapshot_from_lists(
             end_snapshot,
             ManifestListSource::AppendDeltas(snapshots),
             data_evolution_read_field_ids.as_ref(),
@@ -1593,7 +1627,9 @@ impl<'a> PaimonTableScan<'a> {
             return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         };
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        self.plan_snapshot_manifest_list(
+        let mut scan = self.clone();
+        scan.incremental_split_mode = Some(IncrementalSplitMode::Streaming);
+        scan.plan_snapshot_manifest_list(
             snapshot,
             list_name,
             data_evolution_read_field_ids.as_ref(),
@@ -1618,7 +1654,7 @@ impl<'a> PaimonTableScan<'a> {
             .read_index_manifest_entries(
                 snapshot,
                 global_index_settings.is_some(),
-                core_options.deletion_vectors_enabled(),
+                core_options.deletion_vectors_enabled() && !self.is_streaming(),
             )
             .await?;
         let manifest_row_ranges = self
@@ -1841,7 +1877,7 @@ impl<'a> PaimonTableScan<'a> {
             )?;
             entries.extend(manifest_entries);
         }
-        let entries = merge_manifest_entries(entries);
+        validate_incremental_entries(&entries)?;
         let entries = if let Some(index) = row_range_index {
             retain_manifest_entry_row_ranges(entries, index)
         } else {
@@ -1886,7 +1922,7 @@ impl<'a> PaimonTableScan<'a> {
             .read_index_manifest_entries(
                 snapshot,
                 global_index_settings.is_some(),
-                core_options.deletion_vectors_enabled(),
+                core_options.deletion_vectors_enabled() && !self.is_streaming(),
             )
             .await?;
         let manifest_row_ranges = self
@@ -1948,7 +1984,8 @@ impl<'a> PaimonTableScan<'a> {
         let schema_manager = self.table.schema_manager();
         let core_options = CoreOptions::new(self.table.schema().options());
         let data_evolution_enabled = core_options.data_evolution_enabled();
-        let deletion_vectors_enabled = core_options.deletion_vectors_enabled();
+        let deletion_vectors_enabled =
+            core_options.deletion_vectors_enabled() && !self.is_streaming();
         let target_split_size = core_options.source_split_target_size();
         let open_file_cost = core_options.source_split_open_file_cost();
         let partition_keys = self.table.schema().partition_keys();
@@ -2062,13 +2099,14 @@ impl<'a> PaimonTableScan<'a> {
         // without merging (stale rows are masked by DVs / level-0 is skipped),
         // so they keep plain size-based packing. DV merge-on-read includes L0
         // files and must preserve overlapping key ranges just like ordinary MOR.
-        let read_merges_overlapping_keys = (!core_options.deletion_vectors_enabled()
-            || core_options.deletion_vectors_merge_on_read())
-            && !matches!(
-                core_options.merge_engine(),
-                Ok(crate::spec::MergeEngine::FirstRow)
-            );
-        let pk_comparator = if read_merges_overlapping_keys {
+        let use_key_interval_packing = self.is_streaming()
+            || (!core_options.deletion_vectors_enabled()
+                || core_options.deletion_vectors_merge_on_read())
+                && !matches!(
+                    core_options.merge_engine(),
+                    Ok(crate::spec::MergeEngine::FirstRow)
+                );
+        let pk_comparator = if use_key_interval_packing {
             KeyComparator::from_table_schema(self.table.schema())
         } else {
             None
@@ -2114,7 +2152,16 @@ impl<'a> PaimonTableScan<'a> {
                 .and_then(|map| map.get(&PartitionBucket::new(partition, bucket)));
 
             // Data-evolution reads merge overlapping row-id groups column-wise.
-            let file_groups: Vec<SplitGroup> = if data_evolution_enabled {
+            let file_groups: Vec<SplitGroup> = if self.incremental_split_mode
+                == Some(IncrementalSplitMode::Streaming)
+                && !data_evolution_enabled
+                && (!self.table.schema().primary_keys().is_empty() || core_options.bucket() >= 0)
+            {
+                vec![SplitGroup {
+                    files: data_files,
+                    raw_convertible: true,
+                }]
+            } else if data_evolution_enabled {
                 let (row_id_groups, groups_pruned_by_row_ranges) =
                     data_evolution_row_range_groups(data_files, effective_row_ranges.as_deref())?;
                 if let Some(trace) = trace.as_deref_mut() {
@@ -2284,7 +2331,8 @@ impl<'a> PaimonTableScan<'a> {
                     .with_bucket_path(bucket_path.clone())
                     .with_total_buckets(total_buckets)
                     .with_data_files(file_group)
-                    .with_raw_convertible(raw_convertible);
+                    .with_raw_convertible(raw_convertible)
+                    .with_streaming(self.is_streaming());
                 if let Some(files) = data_deletion_files {
                     builder = builder.with_data_deletion_files(files);
                 }
@@ -3475,7 +3523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_snapshot_delta_row_range_pruning_does_not_resurrect_deleted_witness() {
+    async fn test_snapshot_delta_rejects_manifest_deletes_before_row_range_pruning() {
         let table_path = "memory:/de_delta_row_range_netting";
         let table = data_evolution_test_table(table_path, two_column_schema(0, "id", "payload"));
         setup_scan_trace_dirs(&table).await;
@@ -3507,19 +3555,14 @@ mod tests {
             .unwrap();
         let mut read_builder = table.new_read_builder();
         read_builder.with_row_ranges(vec![RowRange::new(120, 129)]);
-        let plan = read_builder
+        let error = read_builder
             .new_scan()
             .plan_snapshot_delta(&snapshot)
             .await
-            .unwrap();
-
-        assert_eq!(
-            plan.splits()
-                .iter()
-                .flat_map(|split| split.data_files())
-                .map(|file| file.file_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["anchor.parquet"]
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::DataInvalid { ref message, .. }
+            if message.contains("only ADD"))
         );
     }
 

@@ -35,6 +35,35 @@ pub(crate) async fn travel_to_snapshot(
     tag_manager: &TagManager,
     options: &HashMap<String, String>,
 ) -> crate::Result<Option<Snapshot>> {
+    // Java adapts scan.version before checking mutually exclusive selectors.
+    // It overwrites the same selector kind, but preserves conflicts with others.
+    let mut adapted;
+    let options = if let Some(version) = options.get("scan.version") {
+        adapted = options.clone();
+        adapted.remove("scan.version");
+        let (key, value) = if tag_manager.tag_exists(version).await? {
+            ("scan.tag-name", version.clone())
+        } else if let Some(watermark) = version.strip_prefix(WATERMARK_PREFIX) {
+            let value = watermark.parse::<i64>().map_err(|e| Error::DataInvalid {
+                message: format!("scan.version '{version}' has an invalid watermark value."),
+                source: Some(Box::new(e)),
+            })?;
+            ("scan.watermark", value.to_string())
+        } else if !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()) {
+            ("scan.snapshot-id", version.clone())
+        } else {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "scan.version '{version}' is not a valid tag name or snapshot id."
+                ),
+                source: None,
+            });
+        };
+        adapted.insert(key.to_string(), value);
+        &adapted
+    } else {
+        options
+    };
     let core_options = CoreOptions::new(options);
 
     match core_options.try_time_travel_selector()? {
@@ -50,33 +79,7 @@ pub(crate) async fn travel_to_snapshot(
         Some(TimeTravelSelector::Watermark(w)) => {
             resolve_watermark(snapshot_manager, w).await.map(Some)
         }
-        Some(TimeTravelSelector::Version {
-            value: v,
-            option_name,
-        }) => {
-            // Match Java TimeTravelUtil.adaptScanVersion: tag first, then the
-            // `watermark-<value>` prefix, then snapshot id.
-            if tag_manager.tag_exists(v).await? {
-                resolve_tag(tag_manager, v).await.map(Some)
-            } else if let Some(raw_watermark) = v.strip_prefix(WATERMARK_PREFIX) {
-                let watermark = raw_watermark
-                    .parse::<i64>()
-                    .map_err(|e| Error::DataInvalid {
-                        message: format!("{option_name} '{v}' has an invalid watermark value."),
-                        source: Some(Box::new(e)),
-                    })?;
-                resolve_watermark(snapshot_manager, watermark)
-                    .await
-                    .map(Some)
-            } else if let Ok(id) = v.parse::<i64>() {
-                snapshot_manager.get_snapshot(id).await.map(Some)
-            } else {
-                Err(Error::DataInvalid {
-                    message: format!("{option_name} '{v}' is not a valid tag name or snapshot id."),
-                    source: None,
-                })
-            }
-        }
+        Some(TimeTravelSelector::Version { .. }) => unreachable!("scan.version was adapted above"),
         Some(TimeTravelSelector::SnapshotId {
             value: v,
             option_name,
@@ -619,6 +622,38 @@ mod tests {
                 if message.contains("invalid watermark value")),
             "expected watermark parse error, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn scan_version_overwrites_same_selector_before_validation() {
+        let (io, path) = setup_watermark_table().await;
+        let table = make_table(&io, &path, schema_v0());
+        let sm = table.snapshot_manager();
+        let tm = table.tag_manager();
+        tm.create("before", &sm.get_snapshot(1).await.unwrap())
+            .await
+            .unwrap();
+        for (version, key, expected) in [
+            ("1", "scan.snapshot-id", 1),
+            ("before", "scan.tag-name", 1),
+            ("watermark-150", "scan.watermark", 3),
+        ] {
+            let opts = options(&[("scan.version", version), (key, "invalid-overridden-value")]);
+            let snapshot = super::travel_to_snapshot(&sm, &tm, &opts)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.id(), expected);
+            assert_eq!(opts[key], "invalid-overridden-value");
+            let traveled = table.copy_with_time_travel(opts).await.unwrap();
+            assert_eq!(traveled.travel_snapshot().map(|s| s.id()), Some(expected));
+        }
+        for opts in [
+            options(&[("scan.version", "1"), ("scan.tag-name", "before")]),
+            options(&[("scan.version", "before"), ("scan.snapshot-id", "1")]),
+        ] {
+            assert!(super::travel_to_snapshot(&sm, &tm, &opts).await.is_err());
+        }
     }
 
     #[tokio::test]

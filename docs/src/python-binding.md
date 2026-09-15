@@ -158,12 +158,18 @@ batches = rb.new_read().read(plan.splits())
 ```
 
 The range is `(start_snapshot_id, end_snapshot_id]`. Only APPEND snapshots
-contribute delta manifests. Their entries are merged together before building
-splits, so overlapping primary-key versions across those snapshots use one merge
-reader. This is an ordinary batch `Plan`, not a per-commit changelog. The end
-snapshot must exist and supplies snapshot metadata and deletion vectors, even
-when the range produces no splits. Existing builder filters, projections, and
-limits also apply.
+contribute delta manifests. Files use Java batch split packing, with streaming
+read semantics: repeated primary keys and physical retracts remain separate
+rows. Readers do not merge these events into the window's final table state.
+The end snapshot must exist and supplies snapshot metadata, including for empty
+results. Snapshot deletion vectors and automatic global indexes are not applied
+to historical events. Builder filters, projections, and limits still apply.
+
+`split.is_streaming()` identifies this read contract. Exporting its Java binary
+encoding requires `split.serialize(allow_streaming=True)` and a decoder that
+preserves the streaming flag. Calling `serialize()` without this acknowledgement
+rejects streaming splits, protecting older Python decoders that discard the flag.
+Batch splits continue to support `serialize()` without arguments.
 
 For Data Evolution tables, select half-open row positions or one balanced shard
 on a scan:
