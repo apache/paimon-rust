@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! REST management API model: permission assignments and (later) data policies.
+//! REST management API model: permission assignments and data policies.
 //!
-//! Mirrors Java `org.apache.paimon.management`, whose request-side constructors store a
-//! corrected value rather than only checking it; `Deserialize` does neither, so a server may
-//! list values a client could not have sent. The send paths therefore run `canonicalized` on
-//! the types whose Java constructor corrects, `validate` on the types whose Java constructor
-//! only checks, and send what comes back.
+//! Mirrors Java `org.apache.paimon.management`. The three policy types deserialize through
+//! their constructors, as Java does with `@JsonCreator`, so they cannot hold a value a client
+//! could not have sent. The permission types follow Java the other way: its `@JsonCreator`
+//! there is the non-validating constructor, so `Deserialize` is derived and the send paths run
+//! `canonicalized` or `validate` instead.
 
 use std::fmt;
 use std::str::FromStr;
@@ -214,6 +214,15 @@ impl PermissionResource {
             None,
             Some(view.into()),
         )
+    }
+
+    pub fn validate_policy_attachment(&self) -> Result<()> {
+        if self.resource_type != ResourceType::Table {
+            return Err(bad_request(
+                "Policies can currently be attached only to TABLE resources.",
+            ));
+        }
+        Ok(())
     }
 
     pub fn new(
@@ -658,6 +667,322 @@ impl ListPermissionsRequest {
                 "access",
                 PermissionAccess::canonicalize_for(resource_type, access)?,
             ));
+        }
+        if let Some(max_results) = self.max_results {
+            validate_max_results(max_results)?;
+            params.push(("maxResults", max_results.to_string()));
+        }
+        if let Some(page_token) = self.page_token.as_deref().filter(|value| !value.is_empty()) {
+            params.push(("pageToken", page_token.to_string()));
+        }
+        Ok(params)
+    }
+}
+
+/// The kind of a data policy (Java `PolicyType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicyType {
+    RowFilter,
+    ColumnMasking,
+}
+
+impl PolicyType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PolicyType::RowFilter => "ROW_FILTER",
+            PolicyType::ColumnMasking => "COLUMN_MASKING",
+        }
+    }
+}
+
+impl fmt::Display for PolicyType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PolicyType {
+    type Err = Error;
+
+    /// Case-insensitive, like Java `PolicyType.fromString`.
+    fn from_str(value: &str) -> Result<Self> {
+        [PolicyType::RowFilter, PolicyType::ColumnMasking]
+            .into_iter()
+            .find(|policy_type| policy_type.as_str() == value.to_uppercase())
+            .ok_or_else(|| bad_request(format!("Unknown policy type '{value}'.")))
+    }
+}
+
+impl Serialize for PolicyType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Largest serialized predicate or transform a policy may carry, in UTF-8 bytes.
+const MAX_POLICY_PAYLOAD_BYTES: usize = 60 * 1024;
+
+fn check_payload(value: &str, field: &str) -> Result<()> {
+    if is_blank(value) {
+        return Err(bad_request(format!("{field} cannot be empty.")));
+    }
+    if value.len() > MAX_POLICY_PAYLOAD_BYTES {
+        return Err(bad_request(format!(
+            "{field} must not exceed {MAX_POLICY_PAYLOAD_BYTES} UTF-8 bytes."
+        )));
+    }
+    Ok(())
+}
+
+/// A serialized Paimon `Predicate` applied to every scan of the table (Java `RowFilter`).
+/// Same JSON as one entry of `AuthTableQueryResponse::filter`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RowFilter {
+    predicate: String,
+}
+
+impl RowFilter {
+    pub const MAX_PREDICATE_BYTES: usize = MAX_POLICY_PAYLOAD_BYTES;
+
+    pub fn new(predicate: impl Into<String>) -> Result<Self> {
+        let predicate = predicate.into();
+        check_payload(&predicate, "predicate")?;
+        Ok(Self { predicate })
+    }
+
+    pub fn predicate(&self) -> &str {
+        &self.predicate
+    }
+}
+
+/// A serialized Paimon `Transform` whose result replaces `on_column` (Java `ColumnMask`).
+/// Same JSON as one value of `AuthTableQueryResponse::column_masking`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnMask {
+    on_column: String,
+    transform: String,
+}
+
+impl ColumnMask {
+    pub const MAX_TRANSFORM_BYTES: usize = MAX_POLICY_PAYLOAD_BYTES;
+
+    pub fn new(on_column: impl Into<String>, transform: impl Into<String>) -> Result<Self> {
+        let on_column = on_column.into();
+        if is_blank(&on_column) {
+            return Err(bad_request("onColumn cannot be empty."));
+        }
+        let transform = transform.into();
+        check_payload(&transform, "transform")?;
+        Ok(Self {
+            on_column,
+            transform,
+        })
+    }
+
+    pub fn on_column(&self) -> &str {
+        &self.on_column
+    }
+
+    pub fn transform(&self) -> &str {
+        &self.transform
+    }
+}
+
+/// One row filter or one column mask attached to a table for one principal
+/// (Java `DataPolicy`). A row filter is identified by `(table, principal)`, a column mask by
+/// `(table, principal, on_column)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataPolicy {
+    resource: PermissionResource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    row_filter: Option<RowFilter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    column_mask: Option<ColumnMask>,
+    principal: String,
+}
+
+impl DataPolicy {
+    /// Java `DataPolicy.rowFilter`. The `new_` prefix is forced: `row_filter` is the getter.
+    pub fn new_row_filter(
+        resource: PermissionResource,
+        row_filter: RowFilter,
+        principal: &str,
+    ) -> Result<Self> {
+        Self::new(resource, Some(row_filter), None, principal)
+    }
+
+    /// Java `DataPolicy.columnMask`.
+    pub fn new_column_mask(
+        resource: PermissionResource,
+        column_mask: ColumnMask,
+        principal: &str,
+    ) -> Result<Self> {
+        Self::new(resource, None, Some(column_mask), principal)
+    }
+
+    pub fn new(
+        resource: PermissionResource,
+        row_filter: Option<RowFilter>,
+        column_mask: Option<ColumnMask>,
+        principal: &str,
+    ) -> Result<Self> {
+        Self {
+            resource,
+            row_filter,
+            column_mask,
+            principal: principal.to_string(),
+        }
+        .canonicalized()
+    }
+
+    /// A policy corrects nothing of its own; only its resource can need canonicalizing.
+    fn canonicalized(mut self) -> Result<Self> {
+        self.resource.validate_policy_attachment()?;
+        self.resource = self.resource.canonicalized()?;
+        PermissionAssignment::validate_principal(&self.principal)?;
+        if self.row_filter.is_none() == self.column_mask.is_none() {
+            return Err(bad_request(
+                "A policy must contain exactly one of rowFilter and columnMask.",
+            ));
+        }
+        Ok(self)
+    }
+
+    pub fn policy_type(&self) -> PolicyType {
+        if self.row_filter.is_some() {
+            PolicyType::RowFilter
+        } else {
+            PolicyType::ColumnMasking
+        }
+    }
+
+    pub fn resource(&self) -> &PermissionResource {
+        &self.resource
+    }
+
+    pub fn row_filter(&self) -> Option<&RowFilter> {
+        self.row_filter.as_ref()
+    }
+
+    pub fn column_mask(&self) -> Option<&ColumnMask> {
+        self.column_mask.as_ref()
+    }
+
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+}
+
+// The three policy types deserialize through their constructors, so a value arriving from the
+// wire has passed the same checks as one built locally. Java gets this from `@JsonCreator`.
+
+impl<'de> Deserialize<'de> for RowFilter {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            predicate: String,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        Self::new(repr.predicate).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for ColumnMask {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Repr {
+            on_column: String,
+            transform: String,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        Self::new(repr.on_column, repr.transform).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for DataPolicy {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Repr {
+            resource: PermissionResource,
+            #[serde(default)]
+            row_filter: Option<RowFilter>,
+            #[serde(default)]
+            column_mask: Option<ColumnMask>,
+            principal: String,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        Self::new(
+            repr.resource,
+            repr.row_filter,
+            repr.column_mask,
+            &repr.principal,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Filters for `GET .../tables/{table}/policies` (Java `ListPoliciesRequest`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPoliciesRequest {
+    /// The table the policies are attached to; must be a `TABLE` resource.
+    pub resource: PermissionResource,
+    pub policy_type: Option<PolicyType>,
+    pub principal: Option<String>,
+    /// Only masks on this column; requires `policy_type == Some(PolicyType::ColumnMasking)`.
+    pub column: Option<String>,
+    pub max_results: Option<u32>,
+    pub page_token: Option<String>,
+}
+
+impl ListPoliciesRequest {
+    pub fn new(resource: PermissionResource) -> Self {
+        Self {
+            resource,
+            policy_type: None,
+            principal: None,
+            column: None,
+            max_results: None,
+            page_token: None,
+        }
+    }
+
+    /// The validated query string as `(name, value)` pairs, in the order Java sends them.
+    pub fn query_params(&self) -> Result<Vec<(&'static str, String)>> {
+        self.resource.validate_policy_attachment()?;
+        let mut params = Vec::new();
+        if let Some(policy_type) = self.policy_type {
+            params.push(("type", policy_type.to_string()));
+        }
+        if let Some(principal) = self.principal.as_deref().filter(|value| !is_blank(value)) {
+            PermissionAssignment::validate_principal(principal)?;
+            params.push(("principal", principal.to_string()));
+        }
+        if let Some(column) = self.column.as_deref().filter(|value| !is_blank(value)) {
+            if self.policy_type != Some(PolicyType::ColumnMasking) {
+                return Err(bad_request("column filter requires type COLUMN_MASKING."));
+            }
+            params.push(("column", column.to_string()));
         }
         if let Some(max_results) = self.max_results {
             validate_max_results(max_results)?;
@@ -1294,5 +1619,204 @@ mod tests {
                 ("principal", "\u{2003}".to_string()),
             ]
         );
+    }
+
+    const PREDICATE_JSON: &str = r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"region","type":"STRING"}},"function":"EQUAL","literals":["APAC"]}"#;
+    const TRANSFORM_JSON: &str =
+        r#"{"name":"CONCAT","inputs":[{"index":0,"name":"region","type":"STRING"},"****"]}"#;
+
+    #[test]
+    fn test_policy_type_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&PolicyType::RowFilter).unwrap(),
+            r#""ROW_FILTER""#
+        );
+        assert_eq!(
+            serde_json::from_str::<PolicyType>(r#""column_masking""#).unwrap(),
+            PolicyType::ColumnMasking
+        );
+        assert!("MASK".parse::<PolicyType>().is_err());
+        assert_eq!(PolicyType::ColumnMasking.to_string(), "COLUMN_MASKING");
+    }
+
+    #[test]
+    fn test_policies_round_trip_java_wire_json() {
+        let mask = DataPolicy::new_column_mask(
+            table_resource(),
+            ColumnMask::new("email", TRANSFORM_JSON).unwrap(),
+            "analyst",
+        )
+        .unwrap();
+        let json = serde_json::to_string(&mask).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"resource":{{"type":"TABLE","database":"sales","table":"orders"}},"columnMask":{{"onColumn":"email","transform":{}}},"principal":"analyst"}}"#,
+                serde_json::to_string(TRANSFORM_JSON).unwrap()
+            )
+        );
+        let round_trip: DataPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, mask);
+        assert_eq!(round_trip.policy_type(), PolicyType::ColumnMasking);
+        assert_eq!(round_trip.column_mask().unwrap().on_column(), "email");
+        assert_eq!(
+            round_trip.column_mask().unwrap().transform(),
+            TRANSFORM_JSON
+        );
+        assert!(round_trip.row_filter().is_none());
+
+        let filter = DataPolicy::new_row_filter(
+            table_resource(),
+            RowFilter::new(PREDICATE_JSON).unwrap(),
+            "analyst",
+        )
+        .unwrap();
+        let round_trip: DataPolicy =
+            serde_json::from_str(&serde_json::to_string(&filter).unwrap()).unwrap();
+        assert_eq!(round_trip.policy_type(), PolicyType::RowFilter);
+        assert_eq!(round_trip.row_filter().unwrap().predicate(), PREDICATE_JSON);
+        assert!(round_trip.column_mask().is_none());
+        assert_eq!(round_trip.principal(), "analyst");
+        assert_eq!(round_trip.resource(), &table_resource());
+    }
+
+    #[test]
+    fn test_policy_validation_and_payload_bounds() {
+        let message = |error: Error| error.to_string();
+        assert!(message(RowFilter::new(" ").unwrap_err()).contains("predicate cannot be empty"));
+        assert!(message(ColumnMask::new("email", " ").unwrap_err())
+            .contains("transform cannot be empty"));
+        assert!(message(ColumnMask::new(" ", TRANSFORM_JSON).unwrap_err())
+            .contains("onColumn cannot be empty"));
+        assert!(message(
+            DataPolicy::new_column_mask(
+                PermissionResource::catalog(),
+                ColumnMask::new("email", TRANSFORM_JSON).unwrap(),
+                "analyst"
+            )
+            .unwrap_err()
+        )
+        .contains("only to TABLE"));
+        assert!(message(
+            DataPolicy::new_row_filter(
+                table_resource(),
+                RowFilter::new(PREDICATE_JSON).unwrap(),
+                " "
+            )
+            .unwrap_err()
+        )
+        .contains("principal cannot be empty"));
+        assert!(message(
+            RowFilter::new("p".repeat(RowFilter::MAX_PREDICATE_BYTES + 1)).unwrap_err()
+        )
+        .contains("UTF-8 bytes"));
+        assert!(RowFilter::new("p".repeat(RowFilter::MAX_PREDICATE_BYTES)).is_ok());
+        assert!(message(
+            ColumnMask::new("email", "t".repeat(ColumnMask::MAX_TRANSFORM_BYTES + 1)).unwrap_err()
+        )
+        .contains("UTF-8 bytes"));
+        assert!(PermissionResource::column("sales", "orders")
+            .validate_policy_attachment()
+            .is_err());
+        assert!(table_resource().validate_policy_attachment().is_ok());
+    }
+
+    #[test]
+    fn test_policy_deserialization_runs_the_same_checks_as_the_constructors() {
+        let rejected = |json: &str| {
+            serde_json::from_str::<DataPolicy>(json)
+                .unwrap_err()
+                .to_string()
+        };
+        let policy = |definition: &str| -> String {
+            rejected(&format!(
+                r#"{{"resource":{{"type":"TABLE","database":"sales","table":"orders"}},{definition}"principal":"analyst"}}"#
+            ))
+        };
+        assert!(serde_json::from_str::<RowFilter>(r#"{"predicate":"   "}"#)
+            .unwrap_err()
+            .to_string()
+            .contains("predicate cannot be empty"));
+        assert!(serde_json::from_value::<RowFilter>(
+            serde_json::json!({"predicate": "p".repeat(RowFilter::MAX_PREDICATE_BYTES + 1)})
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("UTF-8 bytes"));
+        assert!(
+            serde_json::from_str::<ColumnMask>(r#"{"onColumn":"  ","transform":"  "}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("onColumn cannot be empty")
+        );
+        assert!(policy(r#""rowFilter":{"predicate":"  "},"#).contains("predicate cannot be empty"));
+        assert!(
+            policy(r#""columnMask":{"onColumn":"email","transform":" "},"#)
+                .contains("transform cannot be empty")
+        );
+        for definition in [
+            "",
+            r#""rowFilter":{"predicate":"{}"},"columnMask":{"onColumn":"email","transform":"{}"},"#,
+        ] {
+            assert!(policy(definition).contains("exactly one"));
+        }
+        assert!(rejected(
+            r#"{"resource":{"type":"TABLE","database":"sales","table":"orders"},"rowFilter":{"predicate":"{}"},"principal":" "}"#
+        )
+        .contains("principal cannot be empty"));
+        assert!(rejected(
+            r#"{"resource":{"type":"TABLE","database":"sales","table":""},"rowFilter":{"predicate":"{}"},"principal":"analyst"}"#
+        )
+        .contains("table is required for TABLE"));
+
+        // A blank locator that canonicalizing can drop is corrected, not rejected, on the way in.
+        let corrected: DataPolicy = serde_json::from_str(
+            r#"{"resource":{"type":"TABLE","database":"sales","table":"orders","view":""},"rowFilter":{"predicate":"{}"},"principal":"analyst"}"#,
+        )
+        .unwrap();
+        assert_eq!(corrected.resource(), &table_resource());
+    }
+
+    #[test]
+    fn test_list_policies_request_query_params() {
+        let mut request = ListPoliciesRequest::new(table_resource());
+        request.policy_type = Some(PolicyType::ColumnMasking);
+        request.principal = Some("analyst".to_string());
+        request.column = Some("email".to_string());
+        request.max_results = Some(25);
+        request.page_token = Some(" \t".to_string());
+        assert_eq!(
+            request.query_params().unwrap(),
+            vec![
+                ("type", "COLUMN_MASKING".to_string()),
+                ("principal", "analyst".to_string()),
+                ("column", "email".to_string()),
+                ("maxResults", "25".to_string()),
+                ("pageToken", " \t".to_string()),
+            ]
+        );
+        assert!(ListPoliciesRequest::new(table_resource())
+            .query_params()
+            .unwrap()
+            .is_empty());
+        let mut request = ListPoliciesRequest::new(table_resource());
+        request.column = Some("email".to_string());
+        assert!(request
+            .query_params()
+            .unwrap_err()
+            .to_string()
+            .contains("COLUMN_MASKING"));
+        let mut request = ListPoliciesRequest::new(table_resource());
+        request.max_results = Some(1001);
+        assert!(request
+            .query_params()
+            .unwrap_err()
+            .to_string()
+            .contains("1000"));
+        assert!(ListPoliciesRequest::new(PermissionResource::catalog())
+            .query_params()
+            .unwrap_err()
+            .to_string()
+            .contains("only to TABLE"));
     }
 }

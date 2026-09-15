@@ -36,12 +36,12 @@ use tokio::task::JoinHandle;
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse,
     CreateFunctionRequest, CreatePartitionsRequest, CreateTagRequest, CreateViewRequest,
-    DropPartitionsRequest, ErrorResponse, GetDatabaseResponse, GetFunctionResponse,
-    GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
+    DataPolicy, DropPartitionsRequest, DropPolicyRequest, ErrorResponse, GetDatabaseResponse,
+    GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
     ListFunctionsResponse, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
-    ListPartitionsResponse, ListPermissionsResponse, ListTablesResponse, ListViewsResponse,
-    PermissionAssignment, PermissionResource, RenameTableRequest, ResourcePaths, ResourceType,
-    RevokePermissionRequest,
+    ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse, ListTablesResponse,
+    ListViewsResponse, PermissionAssignment, PermissionResource, PolicyRequest, PolicyType,
+    RenameTableRequest, ResourcePaths, ResourceType, RevokePermissionRequest,
 };
 use paimon::catalog::{Function, Identifier};
 use paimon::spec::{CommitKind, Partition, Snapshot};
@@ -78,6 +78,13 @@ struct MockState {
     grant_permission_bodies: Vec<serde_json::Value>,
     revoke_permission_bodies: Vec<serde_json::Value>,
     grant_permission_error_status: Option<StatusCode>,
+    /// Policies per `"{db}.{table}"`.
+    policies: HashMap<String, Vec<DataPolicy>>,
+    list_policies_queries: Vec<HashMap<String, String>>,
+    create_policy_bodies: Vec<serde_json::Value>,
+    drop_policy_bodies: Vec<serde_json::Value>,
+    create_policy_error: Option<ErrorResponse>,
+    drop_policy_error: Option<ErrorResponse>,
     /// ECS metadata role name (for token loader testing)
     ecs_role_name: Option<String>,
     /// ECS metadata token (for token loader testing)
@@ -1366,6 +1373,173 @@ impl RESTServer {
         StatusCode::OK.into_response()
     }
 
+    // ==================== Policy management ====================
+
+    fn policy_identity(policy: &DataPolicy) -> (PolicyType, String, Option<String>) {
+        (
+            policy.policy_type(),
+            policy.principal().to_string(),
+            policy
+                .column_mask()
+                .map(|mask| mask.on_column().to_string()),
+        )
+    }
+
+    fn policy_error(error: ErrorResponse) -> axum::response::Response {
+        let status = StatusCode::from_u16(error.code.unwrap_or(500) as u16)
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, Json(error)).into_response()
+    }
+
+    fn table_not_found(table: &str) -> axum::response::Response {
+        Self::policy_error(ErrorResponse::new(
+            Some("TABLE".to_string()),
+            Some(table.to_string()),
+            Some("Table not found".to_string()),
+            Some(404),
+        ))
+    }
+
+    /// Handle GET .../tables/{table}/policies - policies on the table, filtered by identity parts.
+    pub async fn list_policies(
+        Path((db, table)): Path<(String, String)>,
+        Query(params): Query<HashMap<String, String>>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.list_policies_queries.push(params.clone());
+        let key = format!("{db}.{table}");
+        if !inner.tables.contains_key(&key) {
+            return Self::table_not_found(&table);
+        }
+        let matching: Vec<DataPolicy> = inner
+            .policies
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|policy| {
+                params
+                    .get("type")
+                    .is_none_or(|t| t == policy.policy_type().as_str())
+            })
+            .filter(|policy| {
+                params
+                    .get("principal")
+                    .is_none_or(|p| p == policy.principal())
+            })
+            .filter(|policy| {
+                params.get("column").is_none_or(|column| {
+                    policy
+                        .column_mask()
+                        .is_some_and(|mask| mask.on_column() == column)
+                })
+            })
+            .collect();
+        let page_size = params
+            .get("maxResults")
+            .and_then(|value| value.parse().ok());
+        let (policies, next_page_token) = paginate(matching, &params, page_size);
+        (
+            StatusCode::OK,
+            Json(ListPoliciesResponse::new(policies, next_page_token)),
+        )
+            .into_response()
+    }
+
+    /// Handle POST .../tables/{table}/policies - 404 TABLE for an unknown table, 409 POLICY
+    /// for a second policy with the same identity.
+    pub async fn create_policy(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.create_policy_bodies.push(body.clone());
+        if let Some(error) = inner.create_policy_error.clone() {
+            return Self::policy_error(error);
+        }
+        let request: PolicyRequest = match serde_json::from_value(body) {
+            Ok(request) => request,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        let key = format!("{db}.{table}");
+        if !inner.tables.contains_key(&key) {
+            return Self::table_not_found(&table);
+        }
+        let resource = PermissionResource::table(db, table);
+        let policy = match (request.row_filter, request.column_mask) {
+            (Some(row_filter), None) => {
+                DataPolicy::new_row_filter(resource, row_filter, &request.principal)
+            }
+            (None, Some(column_mask)) => {
+                DataPolicy::new_column_mask(resource, column_mask, &request.principal)
+            }
+            _ => return Self::bad_request("exactly one of rowFilter and columnMask".to_string()),
+        };
+        let policy = match policy {
+            Ok(policy) => policy,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        let existing = inner.policies.entry(key).or_default();
+        if existing
+            .iter()
+            .any(|candidate| Self::policy_identity(candidate) == Self::policy_identity(&policy))
+        {
+            let (policy_type, principal, column) = Self::policy_identity(&policy);
+            let name = match column {
+                Some(column) => format!("{policy_type}:{principal}:{column}"),
+                None => format!("{policy_type}:{principal}"),
+            };
+            return Self::policy_error(ErrorResponse::new(
+                Some(ErrorResponse::RESOURCE_TYPE_POLICY.to_string()),
+                Some(name),
+                Some("Policy already exists.".to_string()),
+                Some(409),
+            ));
+        }
+        existing.push(policy);
+        StatusCode::OK.into_response()
+    }
+
+    /// Handle POST .../tables/{table}/policies/drop - 404 POLICY when the identity is absent.
+    pub async fn drop_policy(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.drop_policy_bodies.push(body.clone());
+        if let Some(error) = inner.drop_policy_error.clone() {
+            return Self::policy_error(error);
+        }
+        let request: DropPolicyRequest = match serde_json::from_value(body) {
+            Ok(request) => request,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        let key = format!("{db}.{table}");
+        if !inner.tables.contains_key(&key) {
+            return Self::table_not_found(&table);
+        }
+        let identity = (
+            request.policy_type,
+            request.principal.clone(),
+            request.column.clone(),
+        );
+        let policies = inner.policies.entry(key).or_default();
+        let before = policies.len();
+        policies.retain(|policy| Self::policy_identity(policy) != identity);
+        if policies.len() == before {
+            return Self::policy_error(ErrorResponse::new(
+                Some(ErrorResponse::RESOURCE_TYPE_POLICY.to_string()),
+                Some(format!("{}:{}", request.policy_type, request.principal)),
+                Some("Policy does not exist.".to_string()),
+                Some(404),
+            ));
+        }
+        StatusCode::OK.into_response()
+    }
+
     /// Handle POST /rename-table - rename a table.
     pub async fn rename_table(
         Extension(state): Extension<Arc<RESTServer>>,
@@ -1782,6 +1956,41 @@ impl RESTServer {
         self.inner.lock().unwrap().grant_permission_error_status = status;
     }
 
+    /// Every query string received by `GET .../tables/{table}/policies`.
+    pub fn list_policies_queries(&self) -> Vec<HashMap<String, String>> {
+        self.inner.lock().unwrap().list_policies_queries.clone()
+    }
+
+    /// Raw JSON bodies received by `POST .../tables/{table}/policies`.
+    pub fn create_policy_bodies(&self) -> Vec<serde_json::Value> {
+        self.inner.lock().unwrap().create_policy_bodies.clone()
+    }
+
+    /// Raw JSON bodies received by `POST .../tables/{table}/policies/drop`.
+    pub fn drop_policy_bodies(&self) -> Vec<serde_json::Value> {
+        self.inner.lock().unwrap().drop_policy_bodies.clone()
+    }
+
+    pub fn table_policies(&self, database: &str, table: &str) -> Vec<DataPolicy> {
+        self.inner
+            .lock()
+            .unwrap()
+            .policies
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Make every create-policy call answer with `error` (status from its `code`).
+    pub fn set_create_policy_error(&self, error: Option<ErrorResponse>) {
+        self.inner.lock().unwrap().create_policy_error = error;
+    }
+
+    /// Make every drop-policy call answer with `error` (status from its `code`).
+    pub fn set_drop_policy_error(&self, error: Option<ErrorResponse>) {
+        self.inner.lock().unwrap().drop_policy_error = error;
+    }
+
     /// Return all create-partitions calls received by the server.
     pub fn create_partitions_calls(&self) -> Vec<(String, String, CreatePartitionsRequest)> {
         self.inner.lock().unwrap().create_partitions_calls.clone()
@@ -1964,6 +2173,14 @@ pub async fn start_mock_server(
         .route(
             &format!("{prefix}/permissions/revoke"),
             post(RESTServer::revoke_permission),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/policies"),
+            get(RESTServer::list_policies).post(RESTServer::create_policy),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/policies/drop"),
+            post(RESTServer::drop_policy),
         )
         // ECS metadata endpoints (for token loader testing)
         .route(

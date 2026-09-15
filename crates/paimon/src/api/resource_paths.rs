@@ -37,6 +37,7 @@ impl ResourcePaths {
     const VIEWS: &'static str = "views";
     const FUNCTIONS: &'static str = "functions";
     const PERMISSIONS: &'static str = "permissions";
+    const POLICIES: &'static str = "policies";
 
     /// Create a new ResourcePaths with the given prefix.
     pub fn new(prefix: &str) -> Self {
@@ -274,6 +275,20 @@ impl ResourcePaths {
     pub fn revoke_permission(&self) -> String {
         format!("{}/revoke", self.permissions())
     }
+
+    /// Get the policy collection nested below its table (`.../tables/{table}/policies`).
+    pub fn policies(&self, database_name: &str, table_name: &str) -> String {
+        format!(
+            "{}/{}",
+            self.table(database_name, table_name),
+            Self::POLICIES
+        )
+    }
+
+    /// Get the action endpoint that drops one policy from its table.
+    pub fn drop_policy(&self, database_name: &str, table_name: &str) -> String {
+        format!("{}/drop", self.policies(database_name, table_name))
+    }
 }
 
 #[cfg(test)]
@@ -395,5 +410,18 @@ mod tests {
         assert_eq!(paths.permissions(), "/v1/catalog/permissions");
         assert_eq!(paths.grant_permission(), "/v1/catalog/permissions/grant");
         assert_eq!(paths.revoke_permission(), "/v1/catalog/permissions/revoke");
+    }
+
+    #[test]
+    fn test_policy_paths_nest_under_the_table_and_encode_names() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.policies("sales db", "orders/all"),
+            "/v1/catalog/databases/sales+db/tables/orders%2Fall/policies"
+        );
+        assert_eq!(
+            paths.drop_policy("sales db", "orders/all"),
+            "/v1/catalog/databases/sales+db/tables/orders%2Fall/policies/drop"
+        );
     }
 }

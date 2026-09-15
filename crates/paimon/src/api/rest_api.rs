@@ -31,18 +31,22 @@ use crate::Result;
 use super::api_request::{
     AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
     CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateTagRequest,
-    CreateViewRequest, DropPartitionsRequest, ListPartitionsByFilterRequest,
-    ListPartitionsByNamesRequest, RenameTableRequest, RevokePermissionRequest,
+    CreateViewRequest, DropPartitionsRequest, DropPolicyRequest, ListPartitionsByFilterRequest,
+    ListPartitionsByNamesRequest, PolicyRequest, RenameTableRequest, RevokePermissionRequest,
 };
 use super::api_response::{
-    AuthTableQueryResponse, ConfigResponse, GetDatabaseResponse, GetFunctionResponse,
-    GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
-    ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse, ListTablesResponse,
-    ListViewsResponse, PagedList,
+    AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
+    GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
+    ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse,
+    ListTablesResponse, ListViewsResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
-use super::management::{ListPermissionsRequest, PermissionAssignment, PermissionResource};
+use super::management::{
+    bad_request, DataPolicy, ListPermissionsRequest, ListPoliciesRequest, PermissionAssignment,
+    PermissionResource, PolicyType,
+};
 use super::resource_paths::ResourcePaths;
+use super::rest_error::RestError;
 use super::rest_util::RESTUtil;
 
 /// Validate that a string is not empty after trimming.
@@ -74,6 +78,18 @@ fn validate_non_empty_multi(values: &[(&str, &str)]) -> Result<()> {
         validate_non_empty(value, field_name)?;
     }
     Ok(())
+}
+
+/// The canonical `(database, table)` of a policy resource, shared by all three calls.
+fn policy_table(resource: PermissionResource) -> Result<(String, String)> {
+    resource.validate_policy_attachment()?;
+    let resource = resource.canonicalized()?;
+    match (resource.database_name(), resource.table_name()) {
+        (Some(database), Some(table)) => Ok((database.to_string(), table.to_string())),
+        _ => Err(bad_request(
+            "A TABLE resource needs both database and table.",
+        )),
+    }
 }
 
 /// REST API wrapper for Paimon catalog operations.
@@ -935,6 +951,67 @@ impl RESTApi {
         let _response: serde_json::Value =
             self.client.delete(&path, None::<&[(&str, &str)]>).await?;
         Ok(())
+    }
+
+    // ==================== Policy Management ====================
+    //
+    // Experimental REST management API (Java `RESTPolicyManagement`).
+
+    pub async fn list_policies_paged(
+        &self,
+        request: &ListPoliciesRequest,
+    ) -> Result<PagedList<DataPolicy>> {
+        let params = request.query_params()?;
+        let (database, table) = policy_table(request.resource.clone())?;
+        let path = self.resource_paths.policies(&database, &table);
+        let response: ListPoliciesResponse = if params.is_empty() {
+            self.client.get(&path, None::<&[(&str, &str)]>).await?
+        } else {
+            self.client.get(&path, Some(&params)).await?
+        };
+        Ok(PagedList::new(response.policies, response.next_page_token))
+    }
+
+    /// Create a policy on its table. A policy with the same identity surfaces as
+    /// `RestError::AlreadyExists` whose `resource_type` is `POLICY`.
+    pub async fn create_policy(&self, policy: &DataPolicy) -> Result<()> {
+        let (database, table) = policy_table(policy.resource().clone())?;
+        let request = PolicyRequest::from(policy);
+        let path = self.resource_paths.policies(&database, &table);
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
+
+    /// Drop one policy by identity. `ignore_if_not_exists` swallows a 404 on the policy only:
+    /// a 404 on the table still surfaces.
+    pub async fn drop_policy(
+        &self,
+        resource: &PermissionResource,
+        policy_type: PolicyType,
+        principal: &str,
+        column: Option<&str>,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        let (database, table) = policy_table(resource.clone())?;
+        let request = DropPolicyRequest::new(policy_type, principal, column)?;
+        let path = self.resource_paths.drop_policy(&database, &table);
+        match self
+            .client
+            .post::<serde_json::Value, _>(&path, &request)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(crate::Error::RestApi {
+                source:
+                    RestError::NoSuchResource {
+                        resource_type: Some(resource_type),
+                        ..
+                    },
+            }) if ignore_if_not_exists && resource_type == ErrorResponse::RESOURCE_TYPE_POLICY => {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     // ==================== Commit Operations ====================
