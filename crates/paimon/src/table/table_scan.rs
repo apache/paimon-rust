@@ -637,29 +637,23 @@ impl LimitPushdownAccumulator {
     }
 }
 
-type PartitionDataFileGroups = IndexMap<Vec<u8>, IndexMap<i32, (i32, Vec<DataFileMeta>)>>;
+type PartitionDataFileGroups = IndexMap<(Vec<u8>, i32), (i32, Vec<DataFileMeta>)>;
 type BucketDataFileGroup = ((Vec<u8>, i32), (i32, Vec<DataFileMeta>));
 
 fn group_data_files_by_partition_bucket(entries: Vec<ManifestEntry>) -> Vec<BucketDataFileGroup> {
-    let mut partitions = PartitionDataFileGroups::new();
+    // Preserve the first occurrence of each pair across partitions. Nesting by
+    // partition moves later buckets ahead of intervening groups and changes
+    // the physical row positions used by append slices and shards.
+    let mut groups = PartitionDataFileGroups::new();
     for entry in entries {
         let (partition, bucket, total_buckets, file) = entry.into_parts();
-        partitions
-            .entry(partition)
-            .or_default()
-            .entry(bucket)
+        groups
+            .entry((partition, bucket))
             .or_insert_with(|| (total_buckets, Vec::new()))
             .1
             .push(file);
     }
-
-    let mut groups = Vec::new();
-    for (partition, buckets) in partitions {
-        for (bucket, files) in buckets {
-            groups.push(((partition.clone(), bucket), files));
-        }
-    }
-    groups
+    groups.into_iter().collect()
 }
 
 #[derive(Clone, Copy)]
@@ -2662,10 +2656,77 @@ mod tests {
             ordered,
             vec![
                 (b"b".as_slice(), 1, vec!["b-1.parquet", "b-1-next.parquet"]),
-                (b"b".as_slice(), 0, vec!["b-0.parquet"]),
                 (b"a".as_slice(), 0, vec!["a.parquet"]),
+                (b"b".as_slice(), 0, vec!["b-0.parquet"]),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_append_plan_keeps_interleaved_partition_bucket_order() {
+        let schema = PaimonSchema::builder()
+            .column("p", DataType::VarChar(VarCharType::default()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["p"])
+            .option("bucket", "2")
+            .option("source.split.target-size", "1b")
+            .option("source.split.open-file-cost", "1b")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("test_db", "interleaved_groups"),
+            "memory:/interleaved_groups".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let entry = |partition: &str, bucket: i32, name: &str| {
+            let mut row = BinaryRowBuilder::new(1);
+            row.write_string(0, partition);
+            ManifestEntry::new(
+                FileKind::Add,
+                row.build_serialized(),
+                bucket,
+                2,
+                make_evo_file(name, 1, 1, 1, None),
+                2,
+            )
+        };
+        let entries = vec![
+            entry("b", 1, "b-1.parquet"),
+            entry("a", 0, "a-0.parquet"),
+            entry("b", 0, "b-0.parquet"),
+            entry("b", 1, "b-1-next.parquet"),
+        ];
+        for limit in [None, Some(3)] {
+            let scan = PaimonTableScan::new(&table, None, Vec::new(), None, limit, None);
+            let plan = scan
+                .plan_snapshot_from_entries(
+                    diff_snapshot(7),
+                    entries.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let names = plan
+                .splits()
+                .iter()
+                .flat_map(|split| split.data_files())
+                .map(|file| file.file_name.as_str())
+                .collect::<Vec<_>>();
+            let expected = [
+                "b-1.parquet",
+                "b-1-next.parquet",
+                "a-0.parquet",
+                "b-0.parquet",
+            ];
+            assert_eq!(names, expected[..limit.unwrap_or(4)]);
+            assert_eq!(plan.snapshot_id(), Some(7));
+            assert!(plan.splits().iter().all(|split| split.total_buckets() == 2));
+        }
     }
 
     #[test]
