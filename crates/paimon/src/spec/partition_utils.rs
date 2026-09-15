@@ -113,14 +113,6 @@ impl PartitionComputer {
         &self,
         row: &BinaryRow,
     ) -> crate::Result<Vec<(String, String)>> {
-        self.generate_part_values_with_timestamp_format(row, false)
-    }
-
-    fn generate_part_values_with_timestamp_format(
-        &self,
-        row: &BinaryRow,
-        java_timestamps: bool,
-    ) -> crate::Result<Vec<(String, String)>> {
         self.validate_row(row)?;
 
         self.partition_keys
@@ -134,7 +126,6 @@ impl PartitionComputer {
                     field.data_type(),
                     &self.default_partition_name,
                     self.legacy_partition_name,
-                    java_timestamps,
                 )?;
                 Ok((key.clone(), value))
             })
@@ -152,16 +143,6 @@ impl PartitionComputer {
 
         let part_values = self.generate_part_values(row)?;
         Ok(assemble_partition_path(&part_values))
-    }
-
-    /// Java's partition path, used to locate Java-written bucket-local deletion vectors.
-    /// The default path retains Rust's existing timestamp directories for stored data.
-    pub(crate) fn generate_java_partition_path(&self, row: &BinaryRow) -> crate::Result<String> {
-        if self.partition_keys.is_empty() {
-            return Ok(String::new());
-        }
-        let values = self.generate_part_values_with_timestamp_format(row, true)?;
-        Ok(assemble_partition_path(&values))
     }
 
     /// Validate that the `BinaryRow` is compatible with this computer's partition keys.
@@ -243,7 +224,6 @@ fn format_partition_value(
     data_type: &DataType,
     default_partition_name: &str,
     legacy: bool,
-    java_timestamps: bool,
 ) -> crate::Result<String> {
     if row.is_null_at(pos) {
         return Ok(default_partition_name.to_string());
@@ -281,9 +261,7 @@ fn format_partition_value(
         DataType::Timestamp(t) => {
             let (millis, nano_of_milli) = row.get_timestamp_raw(pos, t.precision())?;
             let dt = millis_to_naive_datetime(millis, nano_of_milli);
-            if !java_timestamps {
-                format_timestamp_rust(dt, t.precision(), legacy)
-            } else if legacy {
+            if legacy {
                 format_timestamp_legacy(dt)
             } else {
                 format_timestamp_non_legacy(dt, t.precision())
@@ -299,9 +277,7 @@ fn format_partition_value(
                 // Non-legacy TimestampToStringCastRule applies TimeZone.getDefault().
                 epoch_millis_to_local_datetime(millis, nano_of_milli)
             };
-            if !java_timestamps {
-                format_timestamp_rust(dt, t.precision(), legacy)
-            } else if legacy {
+            if legacy {
                 format_timestamp_legacy(dt)
             } else {
                 format_timestamp_non_legacy(dt, t.precision())
@@ -465,22 +441,6 @@ fn epoch_millis_to_local_datetime(millis: i64, nano_of_milli: i32) -> NaiveDateT
         .single()
         .unwrap_or_else(|| Local.timestamp_opt(0, 0).unwrap());
     dt.naive_local()
-}
-
-/// Preserve timestamp directory names already written by Rust.
-fn format_timestamp_rust(dt: NaiveDateTime, precision: u32, legacy: bool) -> String {
-    if legacy {
-        let text = format_timestamp_legacy(dt);
-        if dt.nanosecond() == 0 {
-            text
-        } else {
-            text.trim_end_matches('0').to_string()
-        }
-    } else if precision == 0 || dt.nanosecond() == 0 {
-        dt.format("%Y-%m-%d %H:%M:%S").to_string()
-    } else {
-        format_timestamp_non_legacy(dt, precision)
-    }
 }
 
 /// Format a timestamp using Java `LocalDateTime.toString()` semantics (legacy mode).
@@ -1049,48 +1009,17 @@ mod tests {
     }
 
     #[test]
-    fn test_java_timestamp_paths_do_not_change_existing_rust_directories() {
-        for (nanos, precision, legacy, rust_path, java_path) in [
-            (
-                0,
-                0,
-                false,
-                "ts=2024-01-01 12%3A34%3A00/",
-                "ts=2024-01-01 12%3A34%3A00/",
-            ),
-            (
-                0,
-                3,
-                false,
-                "ts=2024-01-01 12%3A34%3A00/",
-                "ts=2024-01-01 12%3A34%3A00.000/",
-            ),
-            (
-                120_000_000,
-                0,
-                false,
-                "ts=2024-01-01 12%3A34%3A00/",
-                "ts=2024-01-01 12%3A34%3A00.12/",
-            ),
-            (
-                100_000_000,
-                3,
-                true,
-                "ts=2024-01-01T12%3A34%3A00.1/",
-                "ts=2024-01-01T12%3A34%3A00.100/",
-            ),
-            (
-                123_400_000,
-                6,
-                true,
-                "ts=2024-01-01T12%3A34%3A00.1234/",
-                "ts=2024-01-01T12%3A34%3A00.123400/",
-            ),
+    fn test_timestamp_partition_paths_match_java() {
+        for (nanos, precision, legacy, expected) in [
+            (0, 0, false, "ts=2024-01-01 12%3A34%3A00/"),
+            (0, 3, false, "ts=2024-01-01 12%3A34%3A00.000/"),
+            (120_000_000, 0, false, "ts=2024-01-01 12%3A34%3A00.12/"),
+            (100_000_000, 3, true, "ts=2024-01-01T12%3A34%3A00.100/"),
+            (123_400_000, 6, true, "ts=2024-01-01T12%3A34%3A00.123400/"),
             (
                 123_456_700,
                 9,
                 true,
-                "ts=2024-01-01T12%3A34%3A00.1234567/",
                 "ts=2024-01-01T12%3A34%3A00.123456700/",
             ),
         ] {
@@ -1120,11 +1049,7 @@ mod tests {
                 );
             }
             let row = builder.build();
-            assert_eq!(computer.generate_partition_path(&row).unwrap(), rust_path);
-            assert_eq!(
-                computer.generate_java_partition_path(&row).unwrap(),
-                java_path
-            );
+            assert_eq!(computer.generate_partition_path(&row).unwrap(), expected);
         }
     }
 

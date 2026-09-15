@@ -16,6 +16,7 @@
 # under the License.
 
 import tempfile
+from datetime import datetime
 
 import pyarrow as pa
 import pytest
@@ -248,3 +249,35 @@ def test_abort_different_builder_same_table_raises():
         messages = write.prepare_commit()
         with pytest.raises(ValueError):
             table.new_write_builder().new_commit().abort(messages)
+
+
+@pytest.mark.parametrize("legacy,precision,unit,value,directory", [
+    (False, 3, "ms", datetime(2026, 9, 15, 12), "ts=2026-09-15 12%3A00%3A00.000"),
+    (False, 6, "us", datetime(2026, 9, 15, 12), "ts=2026-09-15 12%3A00%3A00.000000"),
+    (False, 3, "ms", datetime(2026, 9, 15, 12, 0, 0, 120000), "ts=2026-09-15 12%3A00%3A00.120"),
+    (True, 3, "ms", datetime(2026, 9, 15, 12, 0, 0, 100000), "ts=2026-09-15T12%3A00%3A00.100"),
+    (True, 6, "us", datetime(2026, 9, 15, 12, 0, 0, 120100), "ts=2026-09-15T12%3A00%3A00.120100"),
+])
+def test_timestamp_partition_writes_and_reads_use_java_paths(tmp_path, legacy, precision, unit, value, directory):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.wdb")
+    ctx.sql(
+        "CREATE TABLE paimon.wdb.t (id INT, ts TIMESTAMP({})) PARTITIONED BY (ts) "
+        "WITH ('partition.legacy-name' = '{}')".format(precision, str(legacy).lower())
+    )
+    schema = pa.schema([("id", pa.int32()), ("ts", pa.timestamp(unit))])
+    for row_id in [1, 2]:
+        table = _get_table(str(tmp_path))
+        builder = table.new_write_builder()
+        write = builder.new_write()
+        write.write_arrow(pa.record_batch([[row_id], [value]], schema=schema))
+        builder.new_commit().commit(write.prepare_commit())
+    files = list(tmp_path.rglob("data-*.parquet"))
+    assert len(files) == 2
+    assert all(file.parent.parent.name == directory for file in files)
+    table = _get_table(str(tmp_path))
+    plan = table.new_read_builder().new_scan().plan()
+    assert sum(split.row_count() for split in plan.splits()) == 2
+    rows = pa.Table.from_batches(ctx.sql("SELECT id, ts FROM paimon.wdb.t")).sort_by("id")
+    assert rows.to_pydict() == {"id": [1, 2], "ts": [value, value]}
