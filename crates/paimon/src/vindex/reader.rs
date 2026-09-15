@@ -739,10 +739,15 @@ fn native_batch_query_working_set_bytes(
         .dimension
         .saturating_mul(std::mem::size_of::<f32>() * 2);
     let centroid_products = metadata.nlist.saturating_mul(std::mem::size_of::<f32>());
-    let probe_results = prepared
-        .params
-        .configured_ivf_nprobe()
-        .unwrap_or(0)
+    let ivf_nprobe = prepared.params.configured_ivf_nprobe().unwrap_or_else(|| {
+        // Automatic IVF search can progressively expand across every list.
+        if metadata.index_type == IndexType::DiskAnn {
+            0
+        } else {
+            metadata.nlist
+        }
+    });
+    let probe_results = ivf_nprobe
         .min(metadata.nlist)
         .saturating_mul(std::mem::size_of::<usize>() + std::mem::size_of::<f32>());
     let top_k_results = prepared.params.top_k.saturating_mul(
@@ -1094,6 +1099,34 @@ mod tests {
                     <= NATIVE_BATCH_PROCESS_WORKING_SET_BYTES
             );
         }
+    }
+
+    #[test]
+    fn automatic_ivf_batch_reserves_progressive_probe_memory() {
+        let metadata = VectorIndexMetadata {
+            index_type: IndexType::IvfFlat,
+            dimension: 128,
+            nlist: 256,
+            metric: MetricType::L2,
+            total_vectors: 8192,
+            pq_m: None,
+            pq_bits: None,
+            rq_bits: None,
+            diskann: None,
+        };
+        let automatic = PreparedSearch {
+            params: VectorSearchParams::automatic(10),
+            filter_bytes: None,
+        };
+        let widest_explicit = PreparedSearch {
+            params: VectorSearchParams::new(10, metadata.nlist),
+            filter_bytes: None,
+        };
+
+        assert_eq!(
+            native_batch_query_working_set_bytes(&metadata, &automatic),
+            native_batch_query_working_set_bytes(&metadata, &widest_explicit),
+        );
     }
 
     #[test]
