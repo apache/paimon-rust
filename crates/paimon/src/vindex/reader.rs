@@ -29,7 +29,6 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const DEFAULT_NPROBE: usize = 16;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
 // Matches Java's NativeVectorGlobalIndexReader; l_search is intentionally snake_case.
 const L_SEARCH_PARAMETER: &str = "diskann.l_search";
@@ -244,7 +243,7 @@ impl VindexVectorGlobalIndexReader {
                 .options
                 .get(NPROBE_PARAMETER)
                 .cloned()
-                .unwrap_or_else(|| DEFAULT_NPROBE.to_string());
+                .unwrap_or_else(|| "auto".to_string());
             log::debug!(
                 target: "paimon::vector_search",
                 "event=paimon_vindex_reader file={} nq={} nprobe={} batch_index_parallelism={} memory_budget_bytes={} max_chunk_size={} native_chunk_count={} native_chunk_queries={} scalar_chunk_count={} total_ms={:.3} vindex_open_ms={:.3} metadata_ms={:.3} optimize_ms={:.3} native_search_wall_ms={:.3} unattributed_ms={:.3}",
@@ -489,10 +488,12 @@ fn prepare_search_with_shared_filter(
             }
             None => VectorSearchParams::automatic(top_k),
         },
-        _ => VectorSearchParams::new(
-            top_k,
-            int_parameter(options, NPROBE_PARAMETER, DEFAULT_NPROBE)?,
-        ),
+        _ => match options.get(NPROBE_PARAMETER) {
+            Some(value) => {
+                VectorSearchParams::new(top_k, parse_int_parameter(NPROBE_PARAMETER, value)?)
+            }
+            None => VectorSearchParams::automatic(top_k),
+        },
     };
 
     let filter_bytes = if let Some(include_ids) = vector_search.effective_include_row_ids() {
@@ -738,10 +739,15 @@ fn native_batch_query_working_set_bytes(
         .dimension
         .saturating_mul(std::mem::size_of::<f32>() * 2);
     let centroid_products = metadata.nlist.saturating_mul(std::mem::size_of::<f32>());
-    let probe_results = prepared
-        .params
-        .configured_ivf_nprobe()
-        .unwrap_or(0)
+    let ivf_nprobe = prepared.params.configured_ivf_nprobe().unwrap_or_else(|| {
+        // Automatic IVF search can progressively expand across every list.
+        if metadata.index_type == IndexType::DiskAnn {
+            0
+        } else {
+            metadata.nlist
+        }
+    });
+    let probe_results = ivf_nprobe
         .min(metadata.nlist)
         .saturating_mul(std::mem::size_of::<usize>() + std::mem::size_of::<f32>());
     let top_k_results = prepared.params.top_k.saturating_mul(
@@ -838,17 +844,21 @@ fn int_parameter(
     default_value: usize,
 ) -> crate::Result<usize> {
     match options.get(key) {
-        Some(value) => value
-            .parse::<usize>()
-            .map_err(|_| crate::Error::DataInvalid {
-                message: format!(
-                    "Invalid value for '{}': {}. Must be a non-negative integer.",
-                    key, value
-                ),
-                source: None,
-            }),
+        Some(value) => parse_int_parameter(key, value),
         None => Ok(default_value),
     }
+}
+
+fn parse_int_parameter(key: &str, value: &str) -> crate::Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|_| crate::Error::DataInvalid {
+            message: format!(
+                "Invalid value for '{}': {}. Must be a non-negative integer.",
+                key, value
+            ),
+            source: None,
+        })
 }
 
 #[cfg(test)]
@@ -1092,6 +1102,34 @@ mod tests {
     }
 
     #[test]
+    fn automatic_ivf_batch_reserves_progressive_probe_memory() {
+        let metadata = VectorIndexMetadata {
+            index_type: IndexType::IvfFlat,
+            dimension: 128,
+            nlist: 256,
+            metric: MetricType::L2,
+            total_vectors: 8192,
+            pq_m: None,
+            pq_bits: None,
+            rq_bits: None,
+            diskann: None,
+        };
+        let automatic = PreparedSearch {
+            params: VectorSearchParams::automatic(10),
+            filter_bytes: None,
+        };
+        let widest_explicit = PreparedSearch {
+            params: VectorSearchParams::new(10, metadata.nlist),
+            filter_bytes: None,
+        };
+
+        assert_eq!(
+            native_batch_query_working_set_bytes(&metadata, &automatic),
+            native_batch_query_working_set_bytes(&metadata, &widest_explicit),
+        );
+    }
+
+    #[test]
     fn native_batch_chunk_reservation_tracks_actual_chunk() {
         let metadata = VectorIndexMetadata {
             index_type: paimon_vindex_core::index::IndexType::IvfFlat,
@@ -1207,15 +1245,22 @@ mod tests {
 
     #[test]
     fn test_int_parameter() {
+        const FALLBACK: usize = 7;
+
         let mut options = HashMap::new();
         options.insert(NPROBE_PARAMETER.to_string(), "32".to_string());
 
         assert_eq!(
-            int_parameter(&options, NPROBE_PARAMETER, DEFAULT_NPROBE).unwrap(),
+            int_parameter(&options, NPROBE_PARAMETER, FALLBACK).unwrap(),
             32
         );
         options.insert(NPROBE_PARAMETER.to_string(), "abc".to_string());
-        assert!(int_parameter(&options, NPROBE_PARAMETER, DEFAULT_NPROBE).is_err());
+        assert!(int_parameter(&options, NPROBE_PARAMETER, FALLBACK).is_err());
+        options.remove(NPROBE_PARAMETER);
+        assert_eq!(
+            int_parameter(&options, NPROBE_PARAMETER, FALLBACK).unwrap(),
+            FALLBACK
+        );
     }
 
     #[test]
@@ -1295,6 +1340,42 @@ mod tests {
             paimon_vindex_core::index::SearchWidth::IvfNProbe
         );
         assert_eq!(ivf.params.width, 4);
+    }
+
+    #[test]
+    fn prepare_ivf_search_uses_automatic_or_explicit_nprobe() {
+        let metadata = VectorIndexMetadata {
+            index_type: IndexType::IvfFlat,
+            dimension: TEST_DIMENSION,
+            nlist: 128,
+            metric: MetricType::L2,
+            total_vectors: 10_000,
+            pq_m: None,
+            pq_bits: None,
+            rq_bits: None,
+            diskann: None,
+        };
+
+        let automatic = prepare_search(&metadata, &HashMap::new(), &query())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            automatic.params.search_width,
+            paimon_vindex_core::index::SearchWidth::Auto
+        );
+
+        let explicit = prepare_search(
+            &metadata,
+            &HashMap::from([("ivf.nprobe".to_string(), "32".to_string())]),
+            &query(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            explicit.params.search_width,
+            paimon_vindex_core::index::SearchWidth::IvfNProbe
+        );
+        assert_eq!(explicit.params.width, 32);
     }
 
     #[test]

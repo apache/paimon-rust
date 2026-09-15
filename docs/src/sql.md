@@ -1613,7 +1613,7 @@ With Paimon's `SQLContext`, set query-time vindex options for the session before
 calling `vector_search`, then reset them when they are no longer needed:
 
 ```sql
--- IVF only; defaults to 16.
+-- IVF only; omit it to use the automatic search width.
 SET 'paimon.ivf.nprobe' = '32';
 SELECT * FROM vector_search('paimon.my_db.items', 'embedding', '[1.0, 0.0, 0.0, 0.0]', 10);
 RESET 'paimon.ivf.nprobe';
@@ -1627,6 +1627,9 @@ RESET 'paimon.diskann.l_search';
 Query options are index-family specific and non-applicable options are ignored:
 IVF readers consume only `ivf.nprobe`, while DiskANN readers consume only
 `diskann.l_search`. Setting both options is allowed; each index uses its own.
+When the applicable option is omitted, both index families select a search
+width automatically. IVF searches may progressively expand `nprobe` when the
+initial width underfills the requested top-k.
 
 `vindex.reader.memory-budget-bytes` sets the per-Reader resident-data and cache
 budget (default 4 GiB). It is distinct from the DiskANN build option
