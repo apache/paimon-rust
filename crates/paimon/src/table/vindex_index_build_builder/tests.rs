@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::extraction::validate_vector_batch;
-use super::planning::{plan_vindex_shards, VindexIndexShard};
+use super::extraction::{validate_vector_batch, validate_vector_batch_ranges};
+use super::planning::{plan_ivf_training_ranges, plan_vindex_shards, VindexIndexShard};
 use super::validation::{
     checked_training_sample_index, checked_training_vector_count, checked_vector_bytes,
     find_index_field, validate_vector_field,
@@ -144,6 +144,130 @@ fn test_planner_splits_single_file_across_shards() {
 }
 
 #[test]
+fn test_ivf_training_ranges_are_bounded_and_exact() {
+    let shard = plan(
+        vec![manifest_entry(data_file("a", Some(100), 1_000))],
+        1_000,
+    )
+    .unwrap()
+    .remove(0);
+
+    for training_rows in [129, 200, 899] {
+        let ranges = plan_ivf_training_ranges(&shard, training_rows)
+            .unwrap()
+            .expect("sparse ranges expected");
+
+        assert!(ranges.len() <= 64);
+        assert_eq!(
+            ranges.iter().map(RowRange::count).sum::<i64>(),
+            training_rows as i64
+        );
+        assert!(ranges.windows(2).all(|pair| pair[0].to() < pair[1].from()));
+        assert!(ranges.first().unwrap().from() >= shard.row_range_start);
+        assert!(ranges.last().unwrap().to() <= shard.row_range_end);
+        assert_eq!(
+            ranges,
+            plan_ivf_training_ranges(&shard, training_rows)
+                .unwrap()
+                .expect("sparse ranges expected")
+        );
+    }
+
+    let ranges = plan_ivf_training_ranges(&shard, 200)
+        .unwrap()
+        .expect("sparse ranges expected");
+    let mut other_snapshot = shard.clone();
+    other_snapshot.snapshot_id += 1;
+    assert_ne!(
+        ranges,
+        plan_ivf_training_ranges(&other_snapshot, 200)
+            .unwrap()
+            .expect("sparse ranges expected")
+    );
+}
+
+#[test]
+fn test_ivf_training_ranges_fall_back_for_a_single_range_sample() {
+    let shard = plan(
+        vec![manifest_entry(data_file("a", Some(100), 1_000))],
+        1_000,
+    )
+    .unwrap()
+    .remove(0);
+
+    for rows in [1, 127, 128] {
+        assert!(plan_ivf_training_ranges(&shard, rows).unwrap().is_none());
+    }
+    let ranges = plan_ivf_training_ranges(&shard, 129).unwrap().unwrap();
+    assert_eq!(ranges.iter().map(RowRange::count).sum::<i64>(), 129);
+    assert!(ranges
+        .iter()
+        .all(|range| range.from() >= 100 && range.to() < 1_100));
+    assert!(ranges.windows(2).all(|pair| pair[0].to() < pair[1].from()));
+}
+
+#[test]
+fn test_ivf_training_ranges_keep_segments_short() {
+    let shard = plan(
+        vec![manifest_entry(data_file("a", Some(0), 1_000_000))],
+        1_000_000,
+    )
+    .unwrap()
+    .remove(0);
+
+    let ranges = plan_ivf_training_ranges(&shard, 65_536)
+        .unwrap()
+        .expect("sparse ranges expected");
+
+    assert_eq!(ranges.len(), 512);
+    assert!(ranges.iter().all(|range| range.count() <= 128));
+    assert_eq!(ranges.iter().map(RowRange::count).sum::<i64>(), 65_536);
+}
+
+#[test]
+fn test_ivf_training_ranges_scale_to_keep_segments_short() {
+    let shard = plan(
+        vec![manifest_entry(data_file("a", Some(0), 2_000_000))],
+        2_000_000,
+    )
+    .unwrap()
+    .remove(0);
+
+    let ranges = plan_ivf_training_ranges(&shard, 262_144)
+        .unwrap()
+        .expect("sparse ranges expected");
+
+    assert_eq!(ranges.len(), 2_048);
+    assert!(ranges.iter().all(|range| range.count() <= 128));
+    assert_eq!(ranges.iter().map(RowRange::count).sum::<i64>(), 262_144);
+}
+
+#[test]
+fn test_ivf_training_ranges_fall_back_above_range_limit() {
+    let shard = plan(
+        vec![manifest_entry(data_file("a", Some(0), 2_000_000))],
+        2_000_000,
+    )
+    .unwrap()
+    .remove(0);
+
+    assert!(plan_ivf_training_ranges(&shard, 524_289).unwrap().is_none());
+}
+
+#[test]
+fn test_ivf_training_ranges_cover_full_shard_without_empty_sentinel() {
+    let shard = plan(vec![manifest_entry(data_file("a", Some(0), 1_000))], 1_000)
+        .unwrap()
+        .remove(0);
+
+    let ranges = plan_ivf_training_ranges(&shard, 1_000)
+        .unwrap()
+        .expect("full range expected");
+
+    assert_eq!(ranges, vec![RowRange::new(0, 999)]);
+}
+
+#[test]
 fn test_planner_rejects_missing_first_row_id() {
     let err = plan(vec![manifest_entry(data_file("a", None, 5))], 10)
         .expect_err("missing first_row_id should fail");
@@ -250,6 +374,70 @@ fn test_extract_vectors_accepts_list_float32_and_row_ids() {
     let vectors = extract_vectors_from_batches(&[batch], "embedding", 2, 10, 2).unwrap();
 
     assert_eq!(vectors, vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn test_sparse_vector_validation_accepts_gaps_across_batches() {
+    let ranges = vec![RowRange::new(10, 11), RowRange::new(15, 16)];
+    let batches = [
+        vector_batch(
+            vec![
+                Some(vec![Some(1.0), Some(2.0)]),
+                Some(vec![Some(3.0), Some(4.0)]),
+            ],
+            vec![Some(10), Some(11)],
+        ),
+        vector_batch(
+            vec![
+                Some(vec![Some(5.0), Some(6.0)]),
+                Some(vec![Some(7.0), Some(8.0)]),
+            ],
+            vec![Some(15), Some(16)],
+        ),
+    ];
+    let mut range_index = 0;
+    let mut expected_row_id = ranges[0].from();
+
+    for batch in &batches {
+        validate_vector_batch_ranges(
+            batch,
+            "embedding",
+            2,
+            &ranges,
+            &mut range_index,
+            &mut expected_row_id,
+        )
+        .unwrap();
+    }
+
+    assert_eq!(range_index, ranges.len());
+    assert_eq!(expected_row_id, 17);
+}
+
+#[test]
+fn test_sparse_vector_validation_rejects_bad_row_ids() {
+    let ranges = vec![RowRange::new(10, 11), RowRange::new(15, 16)];
+    for row_ids in [
+        vec![Some(10), Some(10)],
+        vec![Some(10), Some(15)],
+        vec![Some(9), Some(10)],
+        vec![Some(10), Some(11), Some(16), Some(15)],
+        vec![Some(10), Some(11), Some(15), Some(16), Some(17)],
+    ] {
+        let rows = row_ids.len();
+        let batch = vector_batch(vec![Some(vec![Some(1.0), Some(2.0)]); rows], row_ids);
+        let mut range_index = 0;
+        let mut expected_row_id = ranges[0].from();
+        assert!(validate_vector_batch_ranges(
+            &batch,
+            "embedding",
+            2,
+            &ranges,
+            &mut range_index,
+            &mut expected_row_id,
+        )
+        .is_err());
+    }
 }
 
 #[test]
@@ -559,26 +747,79 @@ async fn vindex_second_build_without_new_data_is_noop() {
 #[tokio::test]
 async fn vindex_incremental_build_indexes_only_new_rows() {
     let table_path = "memory:/test_vindex_incremental";
-    let table = vindex_e2e_table(table_path, "10");
+    let mut options = vindex_e2e_options("2048");
+    options.insert("ivf-flat.dimension".to_string(), "4096".to_string());
+    options.insert("ivf-flat.nlist".to_string(), "3".to_string());
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        table_path,
+        vindex_schema_builder(options).build().unwrap(),
+    );
     setup_dirs(table.file_io(), table_path).await;
 
     // Build #1 over the initial batch via a real end-to-end build.
     write_vectors(
         &table,
-        vec![1, 2, 3],
-        vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
+        (0..1024).collect(),
+        (0..1024)
+            .map(|id| {
+                (0..4096)
+                    .map(|component| (id * 4096 + component) as f32)
+                    .collect()
+            })
+            .collect(),
     )
     .await;
-    let first_built = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
-        .with_index_column("embedding")
-        .with_options(HashMap::from([(
-            "ivf-flat.train.sample-ratio".to_string(),
-            "0.9".to_string(),
-        )]))
-        .execute()
+    let build_options =
+        HashMap::from([("ivf-flat.train.sample-ratio".to_string(), "0.2".to_string())]);
+    let snapshots = SnapshotManager::new(table.file_io().clone(), table_path.to_string());
+    let snapshot = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    let entries = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan_manifest_entries(&snapshot)
         .await
         .unwrap();
+    let core_options = CoreOptions::new(table.schema().options());
+    let shards = plan_vindex_shards(
+        table_path,
+        table.schema().partition_keys(),
+        table.schema().fields(),
+        &core_options,
+        snapshot.id(),
+        entries,
+        core_options.global_index_row_count_per_shard().unwrap(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(shards.len(), 1);
+    let options = crate::vindex::VindexVectorIndexOptions::new(
+        table.schema().options(),
+        &build_options,
+        IVF_FLAT_IDENTIFIER,
+        find_index_field(&table, "embedding").unwrap(),
+    )
+    .unwrap();
+    let training_rows = paimon_vindex_core::autotune::default_training_vector_count(
+        checked_training_vector_count(
+            (shards[0].row_range_end - shards[0].row_range_start + 1) as usize,
+            options.train_sample_ratio,
+        )
+        .unwrap(),
+        options.config.nlist(),
+    )
+    .unwrap();
+    let mut builder = table.new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER);
+    builder
+        .with_index_column("embedding")
+        .with_options(build_options);
+    assert!(builder
+        .sparse_training_ranges(&shards[0], "embedding", training_rows)
+        .await
+        .unwrap()
+        .is_some());
+    let first_built = builder.execute().await.unwrap();
     assert!(first_built > 0, "first build must index the initial rows");
 
     // First appended row-id, derived from the data manifest (never hard-coded).
@@ -596,18 +837,62 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     // Append a second batch (new row-ids [n..]).
     write_vectors(
         &table,
-        vec![4, 5, 6],
-        vec![vec![2.0, 0.0], vec![0.0, 2.0], vec![2.0, 2.0]],
+        vec![1024, 1025, 1026],
+        (1024..1027)
+            .map(|id| {
+                (0..4096)
+                    .map(|component| (id * 4096 + component) as f32)
+                    .collect()
+            })
+            .collect(),
     )
     .await;
 
-    // End-to-end: build #2 must SUCCEED and index the appended rows.
-    let second_built = table
-        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
-        .with_index_column("embedding")
-        .execute()
+    let snapshot = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    let entries = table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan_manifest_entries(&snapshot)
         .await
         .unwrap();
+    let shards = plan_vindex_shards(
+        table_path,
+        table.schema().partition_keys(),
+        table.schema().fields(),
+        &core_options,
+        snapshot.id(),
+        entries,
+        core_options.global_index_row_count_per_shard().unwrap(),
+        &indexed_coverage,
+    )
+    .unwrap();
+    assert_eq!(shards.len(), 1);
+    let options = crate::vindex::VindexVectorIndexOptions::new(
+        table.schema().options(),
+        &HashMap::new(),
+        IVF_FLAT_IDENTIFIER,
+        find_index_field(&table, "embedding").unwrap(),
+    )
+    .unwrap();
+    let training_rows = paimon_vindex_core::autotune::default_training_vector_count(
+        checked_training_vector_count(
+            (shards[0].row_range_end - shards[0].row_range_start + 1) as usize,
+            options.train_sample_ratio,
+        )
+        .unwrap(),
+        options.config.nlist(),
+    )
+    .unwrap();
+    let mut builder = table.new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER);
+    builder.with_index_column("embedding");
+    assert!(builder
+        .sparse_training_ranges(&shards[0], "embedding", training_rows)
+        .await
+        .unwrap()
+        .is_none());
+    // End-to-end: build #2 must SUCCEED and index the appended rows.
+    let second_built = builder.execute().await.unwrap();
     assert!(second_built > 0, "appended rows must be indexed");
 
     let all_files = latest_vindex_index_files(&table).await;
@@ -641,6 +926,113 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
             meta.row_range_end
         );
     }
+}
+
+#[tokio::test]
+async fn vindex_sparse_probe_errors_fall_back() {
+    let table_path = "memory:/test_vindex_probe_fallback";
+    let table = vindex_e2e_table(table_path, "1024");
+    let mut shard = plan(
+        vec![manifest_entry(data_file("broken.parquet", Some(0), 1024))],
+        1024,
+    )
+    .unwrap()
+    .remove(0);
+    shard.bucket_path = table_path.to_string();
+    let builder = table.new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER);
+    assert!(plan_ivf_training_ranges(&shard, 192).unwrap().is_some());
+
+    // A failed open and an unreadable footer both disable only the optimization.
+    assert!(builder
+        .sparse_training_ranges(&shard, "embedding", 192)
+        .await
+        .unwrap()
+        .is_none());
+    let path = shard.files[0].data_file_path(&shard.bucket_path);
+    table
+        .file_io()
+        .new_output(&path)
+        .unwrap()
+        .write(vec![0; 128].into())
+        .await
+        .unwrap();
+    assert!(builder
+        .sparse_training_ranges(&shard, "embedding", 192)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Invalid source metadata is not an optional probe failure.
+    shard.files[0].file_size = -1;
+    assert!(builder
+        .sparse_training_ranges(&shard, "embedding", 192)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn vindex_small_training_sample_preserves_tail_cluster_recall() {
+    let table_path = "memory:/test_vindex_small_sample_recall";
+    let mut options = table_options("1000");
+    for (key, value) in [
+        ("ivf-sq.dimension", "1"),
+        ("ivf-sq.nlist", "1"),
+        ("ivf-sq.metric", "l2"),
+        ("ivf-sq.train.sample-ratio", "0.1"),
+    ] {
+        options.insert(key.to_string(), value.to_string());
+    }
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        table_path,
+        vindex_schema_builder(options).build().unwrap(),
+    );
+    setup_dirs(table.file_io(), table_path).await;
+    write_vectors(
+        &table,
+        (0..1000).collect(),
+        (0..1000)
+            .map(|id| {
+                vec![if id < 450 {
+                    0.0
+                } else if id < 900 {
+                    1.0
+                } else {
+                    100.0
+                }]
+            })
+            .collect(),
+    )
+    .await;
+    assert_eq!(
+        table
+            .new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![100.0])
+        .with_limit(10)
+        .with_options(HashMap::from([(
+            "ivf-sq.nprobe".to_string(),
+            "1".to_string(),
+        )]))
+        .execute()
+        .await
+        .unwrap();
+    let row_ids = &result.row_ids().unwrap().row_ids;
+    assert_eq!(row_ids.len(), 10);
+    // Equal-distance IDs need not have a stable order; all hits must be in the tail cluster.
+    assert!(
+        row_ids.iter().all(|id| (900..1000).contains(id)),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]

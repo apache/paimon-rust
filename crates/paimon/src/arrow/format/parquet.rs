@@ -67,6 +67,125 @@ impl ParquetFormatReader {
     }
 }
 
+pub(crate) async fn has_beneficial_offset_index(
+    reader: Box<dyn FileRead>,
+    file_size: u64,
+    column_name: &str,
+    sample_ranges: &[RowRange],
+    scan_ranges: &[RowRange],
+) -> crate::Result<bool> {
+    let options = ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional);
+    let mut reader = ArrowFileReader::new(file_size, reader.into());
+    let metadata = reader.get_metadata(Some(&options)).await?;
+    Ok(metadata_has_beneficial_offset_index(
+        &metadata,
+        column_name,
+        sample_ranges,
+        scan_ranges,
+    ))
+}
+
+fn metadata_has_beneficial_offset_index(
+    metadata: &ParquetMetaData,
+    column_name: &str,
+    sample_ranges: &[RowRange],
+    scan_ranges: &[RowRange],
+) -> bool {
+    let columns = metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            column
+                .path()
+                .parts()
+                .first()
+                .is_some_and(|part| part == column_name)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let Some(offset_index) = metadata.offset_index() else {
+        return false;
+    };
+    if columns.is_empty() || offset_index.len() != metadata.row_groups().len() {
+        return false;
+    }
+    let mut sample_selection = build_row_ranges_selection(metadata.row_groups(), sample_ranges);
+    let mut scan_selection = build_row_ranges_selection(metadata.row_groups(), scan_ranges);
+    let mut checked = false;
+    let mut sample_bytes = 0u64;
+    let mut scan_bytes = 0u64;
+    for (row_group, indexes) in metadata.row_groups().iter().zip(offset_index) {
+        let Ok(row_count) = usize::try_from(row_group.num_rows()) else {
+            return false;
+        };
+        let sample_row_group_selection = sample_selection.split_off(row_count);
+        let scan_row_group_selection = scan_selection.split_off(row_count);
+        let sample_selected = sample_row_group_selection.selects_any();
+        let scan_selected = scan_row_group_selection.selects_any();
+        checked |= sample_selected;
+        if !sample_selected && !scan_selected {
+            continue;
+        }
+        let mut sample_byte_ranges = Vec::new();
+        let mut scan_byte_ranges = Vec::new();
+        for index in &columns {
+            let column = row_group.column(*index);
+            let Some(page_locations) = indexes.get(*index).map(|index| index.page_locations())
+            else {
+                return false;
+            };
+            let Some(first_page) = page_locations.first() else {
+                return false;
+            };
+            let Ok(column_start) = u64::try_from(
+                column
+                    .dictionary_page_offset()
+                    .unwrap_or_else(|| column.data_page_offset()),
+            ) else {
+                return false;
+            };
+            let Ok(first_page_offset) = u64::try_from(first_page.offset) else {
+                return false;
+            };
+            for (selection, selected_ranges) in [
+                (&sample_row_group_selection, &mut sample_byte_ranges),
+                (&scan_row_group_selection, &mut scan_byte_ranges),
+            ] {
+                if !selection.selects_any() {
+                    continue;
+                }
+                if column_start < first_page_offset {
+                    selected_ranges.push(column_start..first_page_offset);
+                }
+                selected_ranges.extend(selection.scan_ranges(page_locations));
+            }
+        }
+        for (selected_ranges, total_bytes) in [
+            (sample_byte_ranges, &mut sample_bytes),
+            (scan_byte_ranges, &mut scan_bytes),
+        ] {
+            let Some(group_bytes) = merge_byte_ranges(&selected_ranges, RANGE_COALESCE_BYTES)
+                .into_iter()
+                .try_fold(0u64, |total, range| {
+                    total.checked_add(range.end.checked_sub(range.start)?)
+                })
+            else {
+                return false;
+            };
+            let Some(total) = total_bytes.checked_add(group_bytes) else {
+                return false;
+            };
+            *total_bytes = total;
+        }
+    }
+    // Sparse training is followed by a full scan, so require it to skip at
+    // least half of the projected bytes instead of accepting marginal savings.
+    checked && sample_bytes <= scan_bytes / 2
+}
+
 enum ParquetRowGroupMessage {
     Batch(RecordBatch),
     Error(Error),
@@ -487,12 +606,12 @@ impl FormatFileReader for ParquetFormatReader {
         // predicate-free path and run a bounded number concurrently.
         //
         // Row-group receivers are consumed in order and buffer one batch each,
-        // preserving positional `_ROW_ID`, sort order, and batch backpressure. Reads
-        // with predicates or an explicit row selection retain the original
-        // single-stream path until their selections are split per row group.
-        let read_budget = self.read_budget.as_ref().filter(|_| {
-            preds.is_empty() && row_filter_factory.is_none() && row_selection.is_none()
-        });
+        // preserving positional `_ROW_ID`, sort order, and batch backpressure.
+        // Reads with predicates retain the original single-stream path.
+        let read_budget = self
+            .read_budget
+            .as_ref()
+            .filter(|_| preds.is_empty() && row_filter_factory.is_none());
         let row_group_parallelism = read_budget
             .map(|budget| {
                 budget
@@ -500,39 +619,50 @@ impl FormatFileReader for ParquetFormatReader {
                     .min(batch_stream_builder.metadata().num_row_groups())
             })
             .unwrap_or(1);
-        let projected_bytes = self
+        let selected_row_groups = self
             .read_budget
             .as_ref()
             .filter(|budget| row_group_parallelism > 1 || budget.diagnostics_enabled())
             .map(|budget| {
-                let mut diagnostic_selection = combined_selection;
-                let projected_bytes = batch_stream_builder
+                let mut row_group_selection = combined_selection;
+                let selected_row_groups = batch_stream_builder
                     .metadata()
                     .row_groups()
                     .iter()
-                    .filter(|row_group| {
-                        diagnostic_selection.as_mut().is_none_or(|selection| {
-                            selection
-                                .split_off(row_group.num_rows() as usize)
-                                .selects_any()
-                        })
+                    .enumerate()
+                    .filter_map(|(row_group_index, row_group)| {
+                        let selection = row_group_selection
+                            .as_mut()
+                            .map(|selection| selection.split_off(row_group.num_rows() as usize));
+                        if selection
+                            .as_ref()
+                            .is_some_and(|selection| !selection.selects_any())
+                        {
+                            return None;
+                        }
+                        let projected_bytes = projected_row_group_bytes(row_group, &mask);
+                        Some((row_group_index, selection, projected_bytes))
                     })
-                    .map(|row_group| projected_row_group_bytes(row_group, &mask))
+                    .collect::<Vec<_>>();
+                let projected_bytes = selected_row_groups
+                    .iter()
+                    .map(|(_, _, projected_bytes)| *projected_bytes)
                     .collect::<Vec<_>>();
                 budget.record_projected_row_groups(&projected_bytes);
-                projected_bytes
+                selected_row_groups
             });
         if row_group_parallelism > 1 {
-            let row_group_count = batch_stream_builder.metadata().num_row_groups();
+            let selected_row_groups =
+                selected_row_groups.expect("parallel row-group reads need a selection plan");
+            let row_group_count = selected_row_groups.len();
             let reader_metadata = ArrowReaderMetadata::try_new(
                 batch_stream_builder.metadata().clone(),
                 ArrowReaderOptions::new(),
             )?;
-            let projected_bytes = projected_bytes.expect("parallel row-group reads need sizes");
             let read_budget = Arc::clone(read_budget.expect("checked above"));
             let (row_group_tx, mut row_group_rx) = mpsc::channel(row_group_parallelism);
             tokio::spawn(async move {
-                for (row_group_index, projected_bytes) in projected_bytes.into_iter().enumerate() {
+                for (row_group_index, selection, projected_bytes) in selected_row_groups {
                     let Ok(slot) = row_group_tx.reserve().await else {
                         return;
                     };
@@ -557,6 +687,7 @@ impl FormatFileReader for ParquetFormatReader {
                         row_group_mask,
                         row_group_index,
                         batch_size,
+                        selection,
                         permit,
                         batch_tx,
                     ));
@@ -660,6 +791,7 @@ async fn read_row_group(
     projection: ProjectionMask,
     row_group_index: usize,
     batch_size: Option<usize>,
+    selection: Option<RowSelection>,
     _permit: ParquetReadPermit,
     sender: mpsc::Sender<ParquetRowGroupMessage>,
 ) {
@@ -669,6 +801,9 @@ async fn read_row_group(
     )
     .with_projection(projection)
     .with_row_groups(vec![row_group_index]);
+    if let Some(selection) = selection {
+        builder = builder.with_row_selection(selection);
+    }
     if let Some(size) = batch_size {
         builder = builder.with_batch_size(size);
     }
@@ -2248,8 +2383,8 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 mod tests {
     use super::build_parquet_row_filter;
     use super::{
-        forward_row_group_batches, FilePredicates, ParquetFormatReader, ParquetFormatWriter,
-        ParquetRowGroupMessage,
+        forward_row_group_batches, metadata_has_beneficial_offset_index, FilePredicates,
+        ParquetFormatReader, ParquetFormatWriter, ParquetRowGroupMessage,
     };
     use super::{
         AsyncArrowWriter, Bytes, PageIndexPolicy, ParquetMetaDataReader, Predicate,
@@ -2833,6 +2968,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sparse_row_groups_preserve_selection_order_and_budget() {
+        let data = write_multi_row_group_parquet(64, 384, EnabledStatistics::Chunk, false).await;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let file_reader = ConcurrentTrackingFileRead {
+            data: Bytes::from(data),
+            in_flight,
+            max_in_flight,
+        };
+        let file_size = file_reader.data.len() as u64;
+        let ranges = vec![
+            RowRange::new(60, 68),
+            RowRange::new(130, 135),
+            RowRange::new(258, 263),
+            RowRange::new(380, 383),
+        ];
+        let budget = Arc::new(ParquetReadBudget::new(2, 256 * 1024 * 1024).unwrap());
+        budget.enable_diagnostics();
+
+        let batches = ParquetFormatReader::with_read_budget(Arc::clone(&budget))
+            .read_batch_stream(
+                Box::new(file_reader),
+                file_size,
+                &[int_field("id")],
+                None,
+                Some(32),
+                Some(ranges.clone()),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected = ranges
+            .iter()
+            .flat_map(|range| range.from() as i32..=range.to() as i32)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        let diagnostics = budget.diagnostics();
+        assert_eq!(diagnostics.row_group_count, 5);
+        assert_eq!(diagnostics.peak_inflight, 2);
+        assert_eq!(diagnostics.current_inflight, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sparse_page_budget_charges_full_projected_row_group() {
+        const MIB: i64 = 1024 * 1024;
+
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        let offset_index = &metadata.offset_index().unwrap()[0];
+        let page_locations = offset_index[0].page_locations();
+        let compressed_bytes = page_locations
+            .iter()
+            .map(|page| i64::from(page.compressed_page_size))
+            .sum();
+        let mut row_group = metadata.row_groups()[0].clone();
+        let column = row_group
+            .column(0)
+            .clone()
+            .into_builder()
+            .set_total_compressed_size(compressed_bytes)
+            .set_total_uncompressed_size(308 * MIB)
+            .set_data_page_offset(page_locations[0].offset)
+            .set_dictionary_page_offset(None)
+            .build()
+            .unwrap();
+        row_group.columns_mut()[0] = column;
+
+        let projection = super::ProjectionMask::roots(row_group.schema_descr(), [0]);
+        let projected_bytes = super::projected_row_group_bytes(&row_group, &projection);
+
+        assert_eq!(projected_bytes, 308 * MIB as u64);
+        let budget = ParquetReadBudget::new(8, 256 * MIB as u64).unwrap();
+        budget.enable_diagnostics();
+        let permit = budget.acquire(projected_bytes).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), budget.acquire(1))
+                .await
+                .is_err()
+        );
+        drop(permit);
+        let permit = tokio::time::timeout(Duration::from_secs(1), budget.acquire(projected_bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.diagnostics().peak_inflight, 1);
+        drop(permit);
+        assert_eq!(budget.diagnostics().current_inflight, 0);
+    }
+
+    #[tokio::test]
     async fn test_parquet_read_budget_is_shared_across_readers() {
         const ROWS: i32 = 256;
         let schema = writer_arrow_schema();
@@ -2921,7 +3163,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parquet_diagnostics_include_reads_with_row_selection() {
-        let data = write_multi_row_group_parquet(32, 64, EnabledStatistics::Chunk).await;
+        let data = write_multi_row_group_parquet(32, 64, EnabledStatistics::Chunk, false).await;
         let budget = Arc::new(ParquetReadBudget::new(8, 256 * 1024 * 1024).unwrap());
         budget.enable_diagnostics();
         let file_size = data.len() as u64;
@@ -2945,7 +3187,7 @@ mod tests {
         let diagnostics = budget.diagnostics();
         assert_eq!(diagnostics.row_group_count, 1);
         assert!(diagnostics.projected_bytes_total > 0);
-        assert_eq!(diagnostics.peak_inflight, 0);
+        assert_eq!(diagnostics.peak_inflight, 1);
     }
 
     #[tokio::test]
@@ -3384,11 +3626,13 @@ mod tests {
         row_group_rows: usize,
         total_rows: i32,
         statistics: EnabledStatistics,
+        offset_index_disabled: bool,
     ) -> Vec<u8> {
         let schema = writer_arrow_schema();
         let props = parquet::file::properties::WriterProperties::builder()
             .set_max_row_group_row_count(Some(row_group_rows))
             .set_statistics_enabled(statistics)
+            .set_offset_index_disabled(offset_index_disabled)
             .build();
         let mut buf = Vec::new();
         let mut writer = AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
@@ -3404,7 +3648,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_row_group_selection_in_uses_min_max_without_page_index() {
-        let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk).await;
+        let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, false).await;
         let metadata = load_metadata_with_page_index(&bytes, false);
         assert_eq!(metadata.row_groups().len(), 2);
         assert!(metadata.column_index().is_none());
@@ -3433,18 +3677,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sparse_row_selection_requires_offset_index_and_page_savings() {
+        let bytes = write_multi_row_group_parquet(10, 30, EnabledStatistics::Chunk, false).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        assert!(
+            !metadata_has_beneficial_offset_index(
+                &metadata,
+                "value",
+                &[RowRange::new(0, 19)],
+                &[RowRange::new(0, 29)],
+            ),
+            "reading two of three row groups is not sufficiently sparse"
+        );
+
+        let bytes = write_multi_page_parquet(10, 80).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        assert!(
+            !metadata_has_beneficial_offset_index(
+                &metadata,
+                "value",
+                &[RowRange::new(20, 38)],
+                &[RowRange::new(20, 39)],
+            ),
+            "near-full reads within one shard must not use the whole file as the baseline"
+        );
+        assert!(!metadata_has_beneficial_offset_index(
+            &metadata,
+            "value",
+            &[RowRange::new(0, 69)],
+            &[RowRange::new(0, 79)],
+        ));
+        assert!(!metadata_has_beneficial_offset_index(
+            &metadata,
+            "value",
+            &[RowRange::new(0, 0), RowRange::new(79, 79)],
+            &[RowRange::new(0, 79)],
+        ));
+
+        let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, false).await;
+        let metadata = load_metadata_with_page_index(&bytes, true);
+
+        assert!(!metadata_has_beneficial_offset_index(
+            &metadata,
+            "value",
+            &[RowRange::new(0, 19)],
+            &[RowRange::new(0, 19)],
+        ));
+        let sparse_ranges = [RowRange::new(0, 0)];
+        assert!(metadata_has_beneficial_offset_index(
+            &metadata,
+            "value",
+            &sparse_ranges,
+            &[RowRange::new(0, 19)],
+        ));
+        assert!(!metadata_has_beneficial_offset_index(
+            &metadata,
+            "missing",
+            &sparse_ranges,
+            &[RowRange::new(0, 19)],
+        ));
+        let bytes_without_index =
+            write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, true).await;
+        let metadata_without_index = load_metadata_with_page_index(&bytes_without_index, true);
+        assert!(!metadata_has_beneficial_offset_index(
+            &metadata_without_index,
+            "value",
+            &sparse_ranges,
+            &[RowRange::new(0, 19)],
+        ));
+    }
+
+    #[tokio::test]
     async fn test_row_group_selection_in_fails_open_on_unusable_stats() {
         let fields = vec![int_field("id"), int_field("value")];
         let predicates = vec![id_leaf(PredicateOperator::In, vec![Datum::Int(100)])];
 
-        let bytes = write_multi_row_group_parquet(10, 10, EnabledStatistics::None).await;
+        let bytes = write_multi_row_group_parquet(10, 10, EnabledStatistics::None, false).await;
         let metadata = load_metadata_with_page_index(&bytes, false);
         let selection =
             super::build_predicate_row_selection(metadata.row_groups(), &predicates, &fields)
                 .unwrap();
         assert!(selection.is_none(), "missing stats must fail open");
 
-        let bytes = write_multi_row_group_parquet(10, 10, EnabledStatistics::Chunk).await;
+        let bytes = write_multi_row_group_parquet(10, 10, EnabledStatistics::Chunk, false).await;
         let metadata = load_metadata_with_page_index(&bytes, false);
         let mut damaged_row_group = metadata.row_groups()[0].clone();
         let damaged_id_column = damaged_row_group
@@ -3513,6 +3828,26 @@ mod tests {
     struct TrackingFileRead {
         data: Bytes,
         ranges: Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
+        resident_bytes: Arc<AtomicUsize>,
+        peak_resident_bytes: Arc<AtomicUsize>,
+    }
+
+    struct TrackedReadBuffer {
+        data: Box<[u8]>,
+        resident_bytes: Arc<AtomicUsize>,
+    }
+
+    impl AsRef<[u8]> for TrackedReadBuffer {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+
+    impl Drop for TrackedReadBuffer {
+        fn drop(&mut self) {
+            self.resident_bytes
+                .fetch_sub(self.data.len(), AtomicOrdering::SeqCst);
+        }
     }
 
     impl TrackingFileRead {
@@ -3520,6 +3855,8 @@ mod tests {
             Self {
                 data,
                 ranges: Arc::new(std::sync::Mutex::new(Vec::new())),
+                resident_bytes: Arc::new(AtomicUsize::new(0)),
+                peak_resident_bytes: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -3541,7 +3878,135 @@ mod tests {
     impl crate::io::FileRead for TrackingFileRead {
         async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
             self.ranges.lock().unwrap().push(range.clone());
-            Ok(self.data.slice(range.start as usize..range.end as usize))
+            // Count each source allocation until its last slice is dropped, not slice lengths.
+            let data = self.data[range.start as usize..range.end as usize]
+                .to_vec()
+                .into_boxed_slice();
+            let current = self
+                .resident_bytes
+                .fetch_add(data.len(), AtomicOrdering::SeqCst)
+                + data.len();
+            self.peak_resident_bytes
+                .fetch_max(current, AtomicOrdering::SeqCst);
+            Ok(Bytes::from_owner(TrackedReadBuffer {
+                data,
+                resident_bytes: Arc::clone(&self.resident_bytes),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sparse_read_buffer_owners_and_cancellation() {
+        use crate::io::FileRead;
+        use rand::{RngCore, SeedableRng};
+
+        const MIB: usize = 1024 * 1024;
+        const GROUP_ROWS: usize = 2 * MIB;
+        const PAGE_ROWS: usize = 64 * 1024;
+        const BUDGET: usize = 20 * MIB;
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(GROUP_ROWS))
+            .set_data_page_size_limit(usize::MAX)
+            .set_data_page_row_count_limit(PAGE_ROWS)
+            .set_write_batch_size(PAGE_ROWS)
+            .set_dictionary_enabled(false)
+            .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+            .build();
+        let mut data = Vec::new();
+        let mut writer =
+            AsyncArrowWriter::try_new(&mut data, Arc::clone(&schema), Some(props)).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..4 {
+            let values = Int32Array::from_iter_values((0..GROUP_ROWS).map(|row| {
+                if (row / PAGE_ROWS).is_multiple_of(2) {
+                    0
+                } else {
+                    rng.next_u32() as i32
+                }
+            }));
+            writer
+                .write(&RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)]).unwrap())
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap();
+        let metadata = load_metadata_with_page_index(&data, true);
+        assert_eq!(metadata.num_row_groups(), 4);
+        let pages = metadata.offset_index().unwrap()[0][0].page_locations();
+        assert!(
+            pages[1].compressed_page_size > pages[0].compressed_page_size * 100,
+            "adjacent equal-row-count pages must have very different compression ratios"
+        );
+        let projection = super::ProjectionMask::all();
+        let projected = super::projected_row_group_bytes(&metadata.row_groups()[0], &projection);
+        assert!(projected > 8 * MIB as u64 && projected < 9 * MIB as u64);
+
+        let data = Bytes::from(data);
+        let tracker = TrackingFileRead::new(data.clone());
+        let buffer = tracker.read(0..1024).await.unwrap();
+        let slice = buffer.slice(0..1);
+        drop(buffer);
+        assert_eq!(tracker.resident_bytes.load(AtomicOrdering::SeqCst), 1024);
+        drop(slice);
+        assert_eq!(tracker.resident_bytes.load(AtomicOrdering::SeqCst), 0);
+
+        let ranges = (0..4)
+            .flat_map(|group| {
+                (1..GROUP_ROWS / PAGE_ROWS).step_by(2).map(move |page| {
+                    let start = (group * GROUP_ROWS + page * PAGE_ROWS) as i64;
+                    RowRange::new(start, start + 255)
+                })
+            })
+            .collect::<Vec<_>>();
+        for cancel in [false, true] {
+            let tracker = TrackingFileRead::new(data.clone());
+            let budget = Arc::new(ParquetReadBudget::new(8, BUDGET as u64).unwrap());
+            budget.enable_diagnostics();
+            let mut stream = ParquetFormatReader::with_read_budget(Arc::clone(&budget))
+                .read_batch_stream(
+                    Box::new(tracker.clone()),
+                    data.len() as u64,
+                    &[int_field("id")],
+                    None,
+                    Some(128),
+                    Some(ranges.clone()),
+                )
+                .await
+                .unwrap();
+            let mut rows = stream.try_next().await.unwrap().unwrap().num_rows();
+            if !cancel {
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    rows += batch.num_rows();
+                }
+                assert_eq!(rows as i64, ranges.iter().map(RowRange::count).sum::<i64>());
+            }
+            drop(stream);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while budget.diagnostics().current_inflight != 0
+                    || tracker.resident_bytes.load(AtomicOrdering::SeqCst) != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all buffer owners and row-group permits must be released");
+            let peak = tracker.peak_resident_bytes.load(AtomicOrdering::SeqCst);
+            assert!(
+                peak > MIB && peak <= BUDGET,
+                "resident source buffers: {peak}"
+            );
+            assert_eq!(budget.diagnostics().peak_inflight, 2);
+            let _permit =
+                tokio::time::timeout(Duration::from_secs(1), budget.acquire(BUDGET as u64))
+                    .await
+                    .unwrap()
+                    .unwrap();
         }
     }
 
