@@ -111,6 +111,7 @@ func (tr *TableRead) NewRecordBatchReader(splits []DataSplit) (*RecordBatchReade
 type RecordBatchReader struct {
 	ctx       context.Context
 	lib       *libRef
+	mu        sync.Mutex
 	readers   []*paimonRecordBatchReader
 	current   int
 	closeOnce sync.Once
@@ -119,8 +120,12 @@ type RecordBatchReader struct {
 // NextRecord returns the next Arrow record, or io.EOF when iteration is
 // complete. The underlying C batch is imported via the Arrow C Data Interface
 // and released automatically — the caller only needs to call Release on the
-// returned arrow.Record when done.
+// returned arrow.Record when done. Calls on one reader are serialized; use
+// separate readers for parallel reads.
 func (r *RecordBatchReader) NextRecord() (arrow.Record, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if r.readers == nil {
 		return nil, ErrClosed
 	}
@@ -158,8 +163,12 @@ func (r *RecordBatchReader) next() (*arrowBatch, error) {
 	return nil, io.EOF
 }
 
-// Close releases the underlying C record batch readers. Safe to call multiple times.
+// Close releases the underlying C record batch readers. Safe to call multiple times
+// and concurrently with NextRecord.
 func (r *RecordBatchReader) Close() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	r.closeOnce.Do(func() {
 		freeFn := ffiRecordBatchReaderFree.symbol(r.ctx)
 		for _, rd := range r.readers {
