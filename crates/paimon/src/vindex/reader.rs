@@ -29,7 +29,6 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-const DEFAULT_NPROBE: usize = 16;
 const NPROBE_PARAMETER: &str = "ivf.nprobe";
 // Matches Java's NativeVectorGlobalIndexReader; l_search is intentionally snake_case.
 const L_SEARCH_PARAMETER: &str = "diskann.l_search";
@@ -244,7 +243,7 @@ impl VindexVectorGlobalIndexReader {
                 .options
                 .get(NPROBE_PARAMETER)
                 .cloned()
-                .unwrap_or_else(|| DEFAULT_NPROBE.to_string());
+                .unwrap_or_else(|| "auto".to_string());
             log::debug!(
                 target: "paimon::vector_search",
                 "event=paimon_vindex_reader file={} nq={} nprobe={} batch_index_parallelism={} memory_budget_bytes={} max_chunk_size={} native_chunk_count={} native_chunk_queries={} scalar_chunk_count={} total_ms={:.3} vindex_open_ms={:.3} metadata_ms={:.3} optimize_ms={:.3} native_search_wall_ms={:.3} unattributed_ms={:.3}",
@@ -489,10 +488,10 @@ fn prepare_search_with_shared_filter(
             }
             None => VectorSearchParams::automatic(top_k),
         },
-        _ => VectorSearchParams::new(
-            top_k,
-            int_parameter(options, NPROBE_PARAMETER, DEFAULT_NPROBE)?,
-        ),
+        _ => match options.get(NPROBE_PARAMETER) {
+            Some(_) => VectorSearchParams::new(top_k, int_parameter(options, NPROBE_PARAMETER, 0)?),
+            None => VectorSearchParams::automatic(top_k),
+        },
     };
 
     let filter_bytes = if let Some(include_ids) = vector_search.effective_include_row_ids() {
@@ -1210,12 +1209,9 @@ mod tests {
         let mut options = HashMap::new();
         options.insert(NPROBE_PARAMETER.to_string(), "32".to_string());
 
-        assert_eq!(
-            int_parameter(&options, NPROBE_PARAMETER, DEFAULT_NPROBE).unwrap(),
-            32
-        );
+        assert_eq!(int_parameter(&options, NPROBE_PARAMETER, 16).unwrap(), 32);
         options.insert(NPROBE_PARAMETER.to_string(), "abc".to_string());
-        assert!(int_parameter(&options, NPROBE_PARAMETER, DEFAULT_NPROBE).is_err());
+        assert!(int_parameter(&options, NPROBE_PARAMETER, 16).is_err());
     }
 
     #[test]
@@ -1295,6 +1291,42 @@ mod tests {
             paimon_vindex_core::index::SearchWidth::IvfNProbe
         );
         assert_eq!(ivf.params.width, 4);
+    }
+
+    #[test]
+    fn prepare_ivf_search_uses_automatic_or_explicit_nprobe() {
+        let metadata = VectorIndexMetadata {
+            index_type: IndexType::IvfFlat,
+            dimension: TEST_DIMENSION,
+            nlist: 128,
+            metric: MetricType::L2,
+            total_vectors: 10_000,
+            pq_m: None,
+            pq_bits: None,
+            rq_bits: None,
+            diskann: None,
+        };
+
+        let automatic = prepare_search(&metadata, &HashMap::new(), &query())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            automatic.params.search_width,
+            paimon_vindex_core::index::SearchWidth::Auto
+        );
+
+        let explicit = prepare_search(
+            &metadata,
+            &HashMap::from([("ivf.nprobe".to_string(), "32".to_string())]),
+            &query(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            explicit.params.search_width,
+            paimon_vindex_core::index::SearchWidth::IvfNProbe
+        );
+        assert_eq!(explicit.params.width, 32);
     }
 
     #[test]
