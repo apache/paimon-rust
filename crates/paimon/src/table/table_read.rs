@@ -727,12 +727,15 @@ impl<'a> PaimonTableRead<'a> {
         let merge_engine = core_options.merge_engine()?;
 
         // Route supported PK merge engines through the split-aware reader.
-        // Deduplicate may mix raw and KV splits. Partial-update and aggregation
+        // Deduplicate and first-row may mix raw and KV splits. Partial-update and aggregation
         // use KV reads normally, but fully materialized DV plans can read raw.
         if has_primary_keys
             && matches!(
                 merge_engine,
-                MergeEngine::Deduplicate | MergeEngine::PartialUpdate | MergeEngine::Aggregation
+                MergeEngine::Deduplicate
+                    | MergeEngine::FirstRow
+                    | MergeEngine::PartialUpdate
+                    | MergeEngine::Aggregation
             )
         {
             return self.read_pk(data_splits, &core_options);
@@ -745,7 +748,7 @@ impl<'a> PaimonTableRead<'a> {
         }
     }
 
-    /// Read PK table. For `Deduplicate`, splits marked raw convertible by scan
+    /// Read PK table. For `Deduplicate` and `FirstRow`, raw-convertible splits from scan
     /// planning (mirrors Java `DataSplit#convertToRawFiles`) use the faster
     /// DataFileReader; the rest go through KeyValueFileReader for sort-merge
     /// dedup. A fully materialized deletion-vector plan for `PartialUpdate` or

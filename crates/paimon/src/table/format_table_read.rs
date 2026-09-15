@@ -21,15 +21,11 @@ use super::data_file_reader::DataFileReader;
 use super::read_builder::split_scan_predicates;
 use super::table_read::configured_parquet_read_budget;
 use super::{ArrowRecordBatchStream, Table};
-use crate::arrow::{build_target_arrow_schema, paimon_type_to_arrow, ParquetReadBudget};
-use crate::spec::{extract_datum, BinaryRow, DataField, DataType, Datum, Predicate};
+use crate::arrow::partition::partition_array;
+use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
+use crate::spec::{DataField, Predicate};
 use crate::{DataSplit, Error};
-use arrow_array::{
-    new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, RecordBatchOptions, StringArray,
-    Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray,
-};
+use arrow_array::{RecordBatch, RecordBatchOptions};
 use async_stream::try_stream;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -276,120 +272,6 @@ fn project_format_batch(
         message: format!("Failed to build format table RecordBatch: {e}"),
         source: Some(Box::new(e)),
     })
-}
-
-fn partition_array(
-    partition: &BinaryRow,
-    partition_index: usize,
-    data_type: &DataType,
-    num_rows: usize,
-) -> crate::Result<ArrayRef> {
-    let arrow_type = paimon_type_to_arrow(data_type)?;
-    if partition.arity() <= partition_index as i32 || partition.is_null_at(partition_index) {
-        return Ok(new_null_array(&arrow_type, num_rows));
-    }
-
-    let datum = extract_datum(partition, partition_index, data_type)?;
-    let Some(datum) = datum else {
-        return Ok(new_null_array(&arrow_type, num_rows));
-    };
-
-    Ok(match (datum, data_type) {
-        (Datum::Bool(value), DataType::Boolean(_)) => {
-            Arc::new(BooleanArray::from(vec![Some(value); num_rows]))
-        }
-        (Datum::TinyInt(value), DataType::TinyInt(_)) => {
-            Arc::new(Int8Array::from(vec![Some(value); num_rows]))
-        }
-        (Datum::SmallInt(value), DataType::SmallInt(_)) => {
-            Arc::new(Int16Array::from(vec![Some(value); num_rows]))
-        }
-        (Datum::Int(value), DataType::Int(_)) => {
-            Arc::new(Int32Array::from(vec![Some(value); num_rows]))
-        }
-        (Datum::Long(value), DataType::BigInt(_)) => {
-            Arc::new(Int64Array::from(vec![Some(value); num_rows]))
-        }
-        (Datum::Float(value), DataType::Float(_)) => {
-            Arc::new(Float32Array::from(vec![Some(value); num_rows]))
-        }
-        (Datum::Double(value), DataType::Double(_)) => {
-            Arc::new(Float64Array::from(vec![Some(value); num_rows]))
-        }
-        (Datum::String(value), DataType::Char(_) | DataType::VarChar(_)) => {
-            let values = std::iter::repeat_with(|| Some(value.as_str()))
-                .take(num_rows)
-                .collect::<Vec<_>>();
-            Arc::new(StringArray::from(values))
-        }
-        (Datum::Bytes(value), DataType::Binary(_) | DataType::VarBinary(_)) => {
-            let values = std::iter::repeat_with(|| Some(value.as_slice()))
-                .take(num_rows)
-                .collect::<Vec<_>>();
-            Arc::new(BinaryArray::from(values))
-        }
-        (Datum::Date(value), DataType::Date(_)) => {
-            Arc::new(Date32Array::from(vec![Some(value); num_rows]))
-        }
-        (Datum::Time(value), DataType::Time(_)) => {
-            Arc::new(Time32MillisecondArray::from(vec![Some(value); num_rows]))
-        }
-        (Datum::Timestamp { millis, nanos }, DataType::Timestamp(ts)) => {
-            timestamp_array(millis, nanos, ts.precision(), None, num_rows)?
-        }
-        (Datum::LocalZonedTimestamp { millis, nanos }, DataType::LocalZonedTimestamp(ts)) => {
-            timestamp_array(millis, nanos, ts.precision(), Some("UTC"), num_rows)?
-        }
-        (_, other) => {
-            return Err(Error::Unsupported {
-                message: format!(
-                    "Format table partition column type '{other:?}' is not supported by the Rust reader yet"
-                ),
-            });
-        }
-    })
-}
-
-fn timestamp_array(
-    millis: i64,
-    nanos: i32,
-    precision: u32,
-    timezone: Option<&'static str>,
-    num_rows: usize,
-) -> crate::Result<ArrayRef> {
-    let array: ArrayRef = match precision {
-        0..=3 => {
-            let array = TimestampMillisecondArray::from(vec![Some(millis); num_rows]);
-            match timezone {
-                Some(tz) => Arc::new(array.with_timezone(tz)),
-                None => Arc::new(array),
-            }
-        }
-        4..=6 => {
-            let value = millis * 1_000 + (nanos as i64) / 1_000;
-            let array = TimestampMicrosecondArray::from(vec![Some(value); num_rows]);
-            match timezone {
-                Some(tz) => Arc::new(array.with_timezone(tz)),
-                None => Arc::new(array),
-            }
-        }
-        7..=9 => {
-            let value = millis * 1_000_000 + (nanos as i64);
-            let array = TimestampNanosecondArray::from(vec![Some(value); num_rows]);
-            match timezone {
-                Some(tz) => Arc::new(array.with_timezone(tz)),
-                None => Arc::new(array),
-            }
-        }
-        _ => {
-            return Err(Error::Unsupported {
-                message: format!(
-                    "Unsupported timestamp precision for format table partition: {precision}"
-                ),
-            });
-        }
-    };
-    Ok(array)
 }
 
 fn apply_limit(batch: RecordBatch, remaining: &mut Option<usize>) -> Option<RecordBatch> {

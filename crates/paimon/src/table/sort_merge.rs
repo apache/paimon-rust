@@ -182,6 +182,44 @@ impl MergeFunction for DeduplicateMergeFunction {
     }
 }
 
+/// First-row merge: keep the earliest sequence, retaining the first input on ties.
+/// Java rejects retracts even when an earlier add has already been selected.
+pub(crate) struct FirstRowMergeFunction {
+    pub ignore_delete: bool,
+}
+
+impl MergeFunction for FirstRowMergeFunction {
+    fn merge(
+        &self,
+        rows: &[MergeRow],
+        _batch_buffer: &[BufferedBatch],
+        _source_output_col_indices: &[usize],
+        _output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
+        let mut first: Option<&MergeRow> = None;
+        for row in rows {
+            if !RowKind::from_value(row.value_kind)?.is_add() {
+                if self.ignore_delete {
+                    continue;
+                }
+                return Err(Error::Unsupported {
+                    message: "merge-engine=first-row does not support DELETE or UPDATE_BEFORE rows; set ignore-delete=true to ignore them".to_string(),
+                });
+            }
+            if first.is_none_or(|best| row.sequence_number < best.sequence_number) {
+                first = Some(row);
+            }
+        }
+        Ok(match first {
+            Some(row) => MergeResult::SourceRow {
+                batch_idx: row.batch_idx,
+                row_idx: row.row_idx,
+            },
+            None => MergeResult::Omit,
+        })
+    }
+}
+
 /// Partial-update merge: for each non-key column, keep the latest non-null
 /// value or apply its configured field aggregator.
 ///
@@ -1304,6 +1342,74 @@ mod tests {
     use futures::TryStreamExt;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn first_row_merge_keeps_earliest_sequence_and_first_tie() {
+        let rows: Vec<_> = [30, 10, 10, 20]
+            .into_iter()
+            .enumerate()
+            .map(|(row_idx, sequence_number)| MergeRow {
+                batch_idx: 0,
+                row_idx,
+                sequence_number,
+                value_kind: 0,
+                user_sequences: vec![],
+            })
+            .collect();
+        let result = FirstRowMergeFunction {
+            ignore_delete: false,
+        }
+        .merge(&rows, &[], &[], &make_output_schema())
+        .unwrap();
+        assert!(matches!(
+            result,
+            MergeResult::SourceRow {
+                batch_idx: 0,
+                row_idx: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn first_row_merge_validates_every_retract_and_honors_ignore_delete() {
+        for kind in [1, 3] {
+            let mut rows = vec![
+                MergeRow {
+                    batch_idx: 0,
+                    row_idx: 0,
+                    sequence_number: 1,
+                    value_kind: 0,
+                    user_sequences: vec![],
+                },
+                MergeRow {
+                    batch_idx: 0,
+                    row_idx: 1,
+                    sequence_number: 2,
+                    value_kind: kind,
+                    user_sequences: vec![],
+                },
+            ];
+            let merge = FirstRowMergeFunction {
+                ignore_delete: false,
+            };
+            assert!(matches!(
+                merge.merge(&rows, &[], &[], &make_output_schema()),
+                Err(Error::Unsupported { .. })
+            ));
+            let merge = FirstRowMergeFunction {
+                ignore_delete: true,
+            };
+            assert!(matches!(
+                merge.merge(&rows, &[], &[], &make_output_schema()).unwrap(),
+                MergeResult::SourceRow { row_idx: 0, .. }
+            ));
+            rows.remove(0);
+            assert!(matches!(
+                merge.merge(&rows, &[], &[], &make_output_schema()).unwrap(),
+                MergeResult::Omit
+            ));
+        }
+    }
 
     fn make_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
