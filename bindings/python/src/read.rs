@@ -480,20 +480,8 @@ impl PySplit {
     }
 
     /// Serialize to Java SplitSerializer v1, using IndexedSplit for row ranges.
-    /// Streaming export requires a decoder that preserves change-event semantics.
-    #[pyo3(signature = (*, allow_streaming=false))]
-    fn serialize<'py>(
-        &self,
-        py: Python<'py>,
-        allow_streaming: bool,
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        // Older Python decoders silently discard the streaming byte. Require
-        // acknowledgement before exporting events through that shared codec.
-        if self.inner.is_streaming() && !allow_streaming {
-            return Err(PyValueError::new_err(
-                "Streaming splits require a stream-aware decoder; pass allow_streaming=True",
-            ));
-        }
+    /// Preserves the streaming flag for physical change-event reads.
+    fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = self.inner.serialize_split_v1().map_err(to_py_err)?;
         Ok(PyBytes::new(py, &bytes))
     }

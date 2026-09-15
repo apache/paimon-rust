@@ -904,16 +904,15 @@ def test_combined_incremental_plan_preserves_pk_events_and_range():
         assert len(plan.splits()) == 1
         assert pa.Table.from_batches(builder.new_read().read(plan.splits())).to_pydict() == {
             "id": [1, 1], "value": [10, 20]}
-        assert [s.serialize(allow_streaming=True) for s in scan.plan().splits()] == [
-            s.serialize(allow_streaming=True) for s in plan.splits()]
+        assert [s.serialize() for s in scan.plan().splits()] == [
+            s.serialize() for s in plan.splits()]
         assert all(s.is_streaming() for s in plan.splits())
-        with pytest.raises(ValueError, match="stream-aware decoder"):
-            plan.splits()[0].serialize()
+        assert plan.splits()[0].serialize()[-2] == 1  # Java isStreaming flag
         import pickle
         restored = pickle.loads(pickle.dumps(plan.splits()[0]))
         assert restored.is_streaming()
-        assert restored.serialize(allow_streaming=True) == (
-            plan.splits()[0].serialize(allow_streaming=True))
+        assert restored.serialize() == (
+            plan.splits()[0].serialize())
         selected = builder.new_incremental_scan(1, 2).plan()
         assert selected.snapshot_id() == 2
         assert pa.Table.from_batches(builder.new_read().read(selected.splits())).to_pydict() == {
@@ -1007,8 +1006,8 @@ def test_incremental_row_positions_use_combined_delta_batch():
             assert plan.snapshot_id() == 2
             restored = [pickle.loads(pickle.dumps(split)) for split in plan.splits()]
             assert pa.Table.from_batches(builder.new_read().read(restored)).column("id").to_pylist() == expected
-            assert [s.serialize(allow_streaming=True) for s in scan.plan().splits()] == [
-                s.serialize(allow_streaming=True) for s in plan.splits()]
+            assert [s.serialize() for s in scan.plan().splits()] == [
+                s.serialize() for s in plan.splits()]
         builder.with_row_ranges([(1, 3)]).with_limit(2)
         plan = builder.new_incremental_scan(0, 2).with_row_position_slice(2, 5).plan()
         assert pa.Table.from_batches(builder.new_read().read(plan.splits())).column("id").to_pylist() == [2, 3]

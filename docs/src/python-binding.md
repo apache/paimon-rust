@@ -165,11 +165,9 @@ The end snapshot must exist and supplies snapshot metadata, including for empty
 results. Snapshot deletion vectors and automatic global indexes are not applied
 to historical events. Builder filters, projections, and limits still apply.
 
-`split.is_streaming()` identifies this read contract. Exporting its Java binary
-encoding requires `split.serialize(allow_streaming=True)` and a decoder that
-preserves the streaming flag. Calling `serialize()` without this acknowledgement
-rejects streaming splits, protecting older Python decoders that discard the flag.
-Batch splits continue to support `serialize()` without arguments.
+`split.is_streaming()` identifies this read contract. `split.serialize()` exports
+both batch and streaming splits to Java binary encoding, preserving the streaming
+flag.
 
 For Data Evolution tables, select half-open row positions or one balanced shard
 on a scan:
