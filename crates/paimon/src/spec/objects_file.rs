@@ -199,6 +199,7 @@ mod tests {
                 "_MAX_LEVEL",
                 "_MIN_ROW_ID",
                 "_MAX_ROW_ID",
+                "_TOTAL_BUCKETS",
                 "_EXTRA_FILES",
             ],
         );
@@ -229,6 +230,7 @@ mod tests {
             None,
             Some(100),
             Some(199),
+            Some(8),
             Some(vec!["manifest-row-tracking-0.idx".to_string()]),
         )];
         let bytes = to_avro_bytes(MANIFEST_FILE_META_SCHEMA, &original).unwrap();
@@ -236,6 +238,7 @@ mod tests {
         assert_eq!(original, decoded);
         assert_eq!(decoded[0].min_row_id(), Some(100));
         assert_eq!(decoded[0].max_row_id(), Some(199));
+        assert_eq!(decoded[0].total_buckets(), Some(8));
         assert_eq!(
             decoded[0].extra_files(),
             Some(["manifest-row-tracking-0.idx".to_string()].as_slice())

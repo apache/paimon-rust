@@ -40,6 +40,7 @@ impl AvroRecordDecode for ManifestFileMeta {
         let mut max_level: Option<i32> = None;
         let mut min_row_id: Option<i64> = None;
         let mut max_row_id: Option<i64> = None;
+        let mut total_buckets: Option<i32> = None;
         let mut extra_files: Option<Vec<String>> = None;
 
         for field in &writer_schema.fields {
@@ -64,6 +65,7 @@ impl AvroRecordDecode for ManifestFileMeta {
                 "_MAX_LEVEL" => max_level = read_optional_int(cursor, field.nullable)?,
                 "_MIN_ROW_ID" => min_row_id = read_optional_long(cursor, field.nullable)?,
                 "_MAX_ROW_ID" => max_row_id = read_optional_long(cursor, field.nullable)?,
+                "_TOTAL_BUCKETS" => total_buckets = read_optional_int(cursor, field.nullable)?,
                 "_EXTRA_FILES" => {
                     extra_files = decode_nullable_string_array(cursor, field.nullable)?
                 }
@@ -85,6 +87,7 @@ impl AvroRecordDecode for ManifestFileMeta {
             max_level,
             min_row_id,
             max_row_id,
+            total_buckets,
             extra_files,
         ))
     }

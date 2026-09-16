@@ -104,6 +104,16 @@ pub struct ManifestFileMeta {
     )]
     max_row_id: Option<i64>,
 
+    /// Common positive bucket count for every entry in this manifest. `None`
+    /// means that the writer could not prove a single usable value, so readers
+    /// must not use it for manifest-level bucket pruning.
+    #[serde(
+        rename = "_TOTAL_BUCKETS",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    total_buckets: Option<i32>,
+
     /// Files owned by this manifest and sharing its lifecycle.
     ///
     /// `None` preserves the distinction between legacy manifest lists (where the
@@ -195,6 +205,12 @@ impl ManifestFileMeta {
         self.max_row_id
     }
 
+    /// Get the common positive bucket count for entries in this manifest.
+    #[inline]
+    pub fn total_buckets(&self) -> Option<i32> {
+        self.total_buckets
+    }
+
     /// Get files owned by this manifest, if the metadata was recorded.
     #[inline]
     pub fn extra_files(&self) -> Option<&[String]> {
@@ -231,6 +247,15 @@ impl ManifestFileMeta {
         self
     }
 
+    /// Attach a common positive bucket count aggregated from every manifest
+    /// entry. Invalid or mixed values must be represented as `None`.
+    #[inline]
+    #[must_use]
+    pub fn with_total_buckets(mut self, total_buckets: Option<i32>) -> Self {
+        self.total_buckets = total_buckets.filter(|value| *value > 0);
+        self
+    }
+
     /// Attach files whose lifecycle is owned by this manifest.
     #[inline]
     #[must_use]
@@ -262,6 +287,7 @@ impl ManifestFileMeta {
             max_level: None,
             min_row_id: None,
             max_row_id: None,
+            total_buckets: None,
             extra_files: None,
         }
     }
@@ -282,6 +308,7 @@ impl ManifestFileMeta {
         max_level: Option<i32>,
         min_row_id: Option<i64>,
         max_row_id: Option<i64>,
+        total_buckets: Option<i32>,
         extra_files: Option<Vec<String>>,
     ) -> ManifestFileMeta {
         Self {
@@ -298,6 +325,7 @@ impl ManifestFileMeta {
             max_level,
             min_row_id,
             max_row_id,
+            total_buckets,
             extra_files,
         }
     }
@@ -330,6 +358,7 @@ pub const MANIFEST_FILE_META_SCHEMA: &str = r#"["null", {
         {"name": "_MAX_LEVEL", "type": ["null", "int"], "default": null},
         {"name": "_MIN_ROW_ID", "type": ["null", "long"], "default": null},
         {"name": "_MAX_ROW_ID", "type": ["null", "long"], "default": null},
+        {"name": "_TOTAL_BUCKETS", "type": ["null", "int"], "default": null},
         {"name": "_EXTRA_FILES", "type": ["null", {"type": "array", "items": "string"}], "default": null}
     ]
 }]"#;

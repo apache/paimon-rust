@@ -212,6 +212,14 @@ async fn read_all_manifest_entries(
         trace.manifest_files_after_partition_pruning = manifest_files.len();
     }
 
+    retain_manifest_buckets(
+        &mut manifest_files,
+        has_primary_keys && !scan_all_files,
+        bucket_predicate,
+        bucket_key_fields,
+        bucket_function_type,
+    );
+
     if let Some(index) = row_range_index {
         let before = manifest_files.len();
         retain_manifest_row_ranges(&mut manifest_files, index);
@@ -362,6 +370,58 @@ fn retain_manifest_row_ranges(
     row_range_index: &RowRangeIndex,
 ) {
     manifests.retain(|manifest| manifest_file_overlaps_row_range_index(manifest, row_range_index));
+}
+
+/// Conservatively prune manifests using their bucket envelope and a common
+/// positive `_TOTAL_BUCKETS` value. Missing, invalid, mixed, or legacy metadata
+/// always fails open. Tight envelopes become especially effective when
+/// manifests are bucket-sorted.
+fn retain_manifest_buckets(
+    manifests: &mut Vec<crate::spec::ManifestFileMeta>,
+    only_real_buckets: bool,
+    bucket_predicate: Option<&Predicate>,
+    bucket_key_fields: &[DataField],
+    bucket_function_type: BucketFunctionType,
+) {
+    let mut target_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+    manifests.retain(|manifest| {
+        let (Some(min_bucket), Some(max_bucket)) = (manifest.min_bucket(), manifest.max_bucket())
+        else {
+            return true;
+        };
+        if min_bucket > max_bucket {
+            return true;
+        }
+        if only_real_buckets && max_bucket < 0 {
+            return false;
+        }
+
+        let Some(predicate) = bucket_predicate else {
+            return true;
+        };
+        let Some(total_buckets) = manifest.total_buckets().filter(|value| *value > 0) else {
+            return true;
+        };
+        // A mixed range containing the unassigned bucket is not a safe
+        // representation of the real-bucket subset.
+        if min_bucket < 0 {
+            return true;
+        }
+
+        let targets = target_cache.entry(total_buckets).or_insert_with(|| {
+            compute_target_buckets(
+                predicate,
+                bucket_key_fields,
+                bucket_function_type,
+                total_buckets,
+            )
+        });
+        targets.as_ref().is_none_or(|targets| {
+            targets
+                .iter()
+                .any(|bucket| *bucket >= min_bucket && *bucket <= max_bucket)
+        })
+    });
 }
 
 fn data_file_overlaps_row_range_index(
@@ -1830,6 +1890,14 @@ impl<'a> PaimonTableScan<'a> {
         };
         let bucket_function_type = core_options.bucket_function_type()?;
 
+        retain_manifest_buckets(
+            &mut manifest_metas,
+            has_primary_keys && !self.scan_all_files,
+            self.bucket_predicate.as_ref(),
+            &bucket_key_fields,
+            bucket_function_type,
+        );
+
         let base_path = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
         let shared_cache = SharedSchemaCache::new();
         let partition_filter = self.partition_filter.as_ref();
@@ -2394,10 +2462,10 @@ mod tests {
         data_evolution_row_range_groups, data_file_overlaps_row_range_index,
         group_data_files_by_partition_bucket, manifest_file_overlaps_row_range_index,
         prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
-        retain_index_manifest_entry_for_scan, retain_manifest_entry_row_ranges,
-        retain_manifest_row_ranges, scan_predicate_field_ids, should_skip_level_zero_for_scan,
-        split_row_ranges_for_files, LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex,
-        TableScan,
+        retain_index_manifest_entry_for_scan, retain_manifest_buckets,
+        retain_manifest_entry_row_ranges, retain_manifest_row_ranges, scan_predicate_field_ids,
+        should_skip_level_zero_for_scan, split_row_ranges_for_files, LimitPushdownAccumulator,
+        PaimonTableScan, RowRangeIndex, TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
@@ -2498,6 +2566,48 @@ mod tests {
             &make_evo_file("overflow", 1, 2, 0, Some(i64::MAX)),
             &index
         ));
+    }
+
+    #[test]
+    fn test_manifest_bucket_pruning_is_exact_and_fails_open() {
+        let fields = int_field();
+        let predicate = PredicateBuilder::new(&fields)
+            .equal("id", Datum::Int(42))
+            .unwrap();
+        let target = *compute_target_buckets(&predicate, &fields, BucketFunctionType::Default, 8)
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap();
+        let other = (target + 1) % 8;
+        let stats = BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new());
+        let manifest = |name: &str, bucket: i32, total_buckets| {
+            ManifestFileMeta::new(name.to_string(), 1, 1, 0, stats.clone(), 0)
+                .with_bucket_level_stats(Some(bucket), Some(bucket), Some(0), Some(0))
+                .with_total_buckets(total_buckets)
+        };
+        let mut manifests = vec![
+            manifest("target", target, Some(8)),
+            manifest("other", other, Some(8)),
+            manifest("legacy", other, None),
+            manifest("unassigned", -1, Some(8)),
+        ];
+
+        retain_manifest_buckets(
+            &mut manifests,
+            true,
+            Some(&predicate),
+            &fields,
+            BucketFunctionType::Default,
+        );
+
+        assert_eq!(
+            manifests
+                .iter()
+                .map(ManifestFileMeta::file_name)
+                .collect::<Vec<_>>(),
+            vec!["target", "legacy"]
+        );
     }
 
     #[test]
