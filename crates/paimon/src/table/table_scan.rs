@@ -404,7 +404,7 @@ fn retain_manifest_buckets(
         };
         // A mixed range containing the unassigned bucket is not a safe
         // representation of the real-bucket subset.
-        if min_bucket < 0 {
+        if min_bucket < 0 || max_bucket >= total_buckets {
             return true;
         }
 
@@ -2591,6 +2591,8 @@ mod tests {
             manifest("other", other, Some(8)),
             manifest("legacy", other, None),
             manifest("unassigned", -1, Some(8)),
+            manifest("at-total", 8, Some(8)),
+            manifest("above-total", 9, Some(8)),
         ];
 
         retain_manifest_buckets(
@@ -2606,7 +2608,7 @@ mod tests {
                 .iter()
                 .map(ManifestFileMeta::file_name)
                 .collect::<Vec<_>>(),
-            vec!["target", "legacy"]
+            vec!["target", "legacy", "at-total", "above-total"]
         );
     }
 
