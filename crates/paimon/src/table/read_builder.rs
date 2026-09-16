@@ -509,6 +509,16 @@ impl<'a> PaimonReadBuilder<'a> {
             .schema
             .core_options()
             .ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        // A handle no catalog minted a session for can never hold a grant, so
+        // it is refused here too: bindings skip `to_arrow` for an empty split
+        // list.
+        if self.table.schema.core_options().query_auth_enabled()
+            && self.table.query_auth_session().is_none()
+        {
+            return Err(super::query_auth::unsupported(
+                "this table handle was assembled rather than loaded",
+            ));
+        }
         let read_type = match self.resolve_read_type()? {
             None => self.table.schema.fields().to_vec(),
             Some(fields) => fields,
@@ -715,6 +725,19 @@ pub(super) fn is_system_projection_field(field_id: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn test_new_read_refuses_an_assembled_query_auth_handle_but_not_a_loaded_one() {
+        let assembled = crate::table::query_auth_table();
+        let err = assembled.new_read_builder().new_read().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("query-auth.enabled")),
+            "{err:?}"
+        );
+        let loaded = crate::table::rest_query_auth_table().await;
+        assert!(loaded.new_read_builder().new_read().is_ok());
+    }
+
     use super::{PaimonReadBuilder, ReadBuilder, ReadBuilderKind};
     use crate::table::TableRead;
     mod test_utils {
@@ -950,8 +973,11 @@ mod tests {
     #[test]
     fn test_read_fails_closed_when_query_auth_enabled() {
         let table = query_auth_table();
-        let read = table.new_read_builder().new_read().unwrap();
-        let err = ungranted_read_error(&read);
+        // An assembled handle is refused at construction; a loaded one at the read.
+        let err = match table.new_read_builder().new_read() {
+            Err(err) => err,
+            Ok(read) => ungranted_read_error(&read),
+        };
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "reading a query-auth.enabled table without a grant must fail closed"
@@ -981,8 +1007,11 @@ mod tests {
             "query-auth.enabled".to_string(),
             "false".to_string(),
         )]));
-        let read = table.new_read_builder().new_read().unwrap();
-        let err = ungranted_read_error(&read);
+        // An assembled handle is refused at construction; a loaded one at the read.
+        let err = match table.new_read_builder().new_read() {
+            Err(err) => err,
+            Ok(read) => ungranted_read_error(&read),
+        };
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "a dynamic override must not disable query-auth"

@@ -400,9 +400,18 @@ impl Table {
     /// flag), a travelled or branch view, or a `$branch_x` / `$files` name
     /// whose managers read the base table's own files.
     pub(crate) fn reads_another_schema(&self) -> Result<bool> {
-        let travels = CoreOptions::new(self.schema.options())
-            .try_time_travel_selector()?
-            .is_some();
+        // Presence only: which selector, and whether the set is consistent, is
+        // for planning to decide after it has adapted `scan.version`.
+        let options = self.schema.options();
+        let travels = [
+            SCAN_SNAPSHOT_ID_OPTION,
+            SCAN_TAG_NAME_OPTION,
+            SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_VERSION_OPTION,
+            SCAN_WATERMARK_OPTION,
+        ]
+        .iter()
+        .any(|key| options.contains_key(*key));
         let decorated = self.identifier.branch_name()?.is_some()
             || self.identifier.system_table_name()?.is_some();
         Ok(travels || self.time_traveled || self.branch_reference || decorated)

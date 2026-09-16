@@ -221,6 +221,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_conflicting_selector_pair_is_planning_business_not_authorization() {
+        // `scan.version` is adapted before the one-selector rule is checked, so
+        // an ordinary table must reach planning rather than fail here.
+        let table = crate::table::Table::new(
+            crate::io::FileIOBuilder::new("file").build().unwrap(),
+            crate::catalog::Identifier::new("default", "plain"),
+            "/tmp/test-plain-selector".to_string(),
+            crate::spec::TableSchema::new(
+                0,
+                &crate::spec::Schema::builder()
+                    .column(
+                        "id",
+                        crate::spec::DataType::Int(crate::spec::IntType::new()),
+                    )
+                    .build()
+                    .unwrap(),
+            ),
+            None,
+        )
+        .copy_with_options(std::collections::HashMap::from([
+            ("scan.version".to_string(), "1".to_string()),
+            ("scan.snapshot-id".to_string(), "invalid".to_string()),
+        ]));
+        assert!(table.reads_another_schema().unwrap());
+        assert!(table.authorize_read(false).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn test_a_grant_does_not_cross_into_a_travelled_or_branch_view() {
         let table = crate::table::rest_query_auth_table().await;
         let grant = super::QueryAuthGrant::new(

@@ -760,6 +760,13 @@ impl<'a> PaimonTableRead<'a> {
         if !required {
             return Ok(());
         }
+        // Only the catalog mints a session, so a handle without one can never
+        // hold a grant — refused before the splits are even looked at.
+        if self.table.query_auth_session().is_none() {
+            return Err(super::query_auth::unsupported(
+                "this table handle was assembled rather than loaded",
+            ));
+        }
         // The read's own scope: a caller can plan clean, then read differently.
         let mut filter_columns = std::collections::HashSet::new();
         for predicate in &self.data_predicates {
@@ -1860,6 +1867,26 @@ mod tests {
                 if message.contains("query-auth.enabled")),
             "{err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_an_assembled_query_auth_handle_refuses_even_an_empty_read() {
+        // A handle no catalog minted a session for cannot be authorized, so an
+        // empty split list is not an empty result but a refusal.
+        let table = query_auth_table();
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        let Err(err) = read.to_arrow(&[]) else {
+            panic!("an assembled query-auth handle must refuse")
+        };
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("query-auth.enabled")),
+            "{err:?}"
+        );
+        // A loaded handle with an empty plan still reads as empty.
+        let loaded = crate::table::rest_query_auth_table().await;
+        let read = TableRead::new(&loaded, loaded.schema.fields().to_vec(), Vec::new());
+        assert!(read.to_arrow(&[]).is_ok());
     }
 
     fn stale_handle(name: &str, options: &[(&str, &str)]) -> Table {
