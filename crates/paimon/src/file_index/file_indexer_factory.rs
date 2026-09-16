@@ -23,16 +23,23 @@ use crate::file_index::bitmap::BitmapFileIndexReader;
 use crate::file_index::bloom_filter::{BloomFilterReader, BloomFilterWriter};
 use crate::file_index::file_index_reader::FileIndexReader;
 use crate::file_index::file_index_writer::FileIndexWriter;
+use crate::file_index::range_bitmap::RangeBitmapFileIndexReader;
 use crate::spec::DataType;
 use crate::{Error, Result};
 
 pub(crate) const BITMAP_INDEX: &str = "bitmap";
 pub(crate) const BLOOM_FILTER_INDEX: &str = "bloom-filter";
+pub(crate) const RANGE_BITMAP_INDEX: &str = "range-bitmap";
+
+struct FailOpenFileIndexReader;
+
+impl FileIndexReader for FailOpenFileIndexReader {}
 
 #[derive(Clone, Copy)]
 enum BuiltinFileIndexer {
     Bitmap,
     BloomFilter,
+    RangeBitmap,
 }
 
 impl BuiltinFileIndexer {
@@ -40,6 +47,7 @@ impl BuiltinFileIndexer {
         match identifier {
             BITMAP_INDEX => Ok(Self::Bitmap),
             BLOOM_FILTER_INDEX => Ok(Self::BloomFilter),
+            RANGE_BITMAP_INDEX => Ok(Self::RangeBitmap),
             _ => Err(Error::Unsupported {
                 message: format!("Unknown file index identifier: {identifier}"),
             }),
@@ -52,7 +60,10 @@ pub(crate) struct FileIndexerFactory;
 
 impl FileIndexerFactory {
     pub(crate) fn is_supported(identifier: &str) -> bool {
-        matches!(identifier, BITMAP_INDEX | BLOOM_FILTER_INDEX)
+        matches!(
+            identifier,
+            BITMAP_INDEX | BLOOM_FILTER_INDEX | RANGE_BITMAP_INDEX
+        )
     }
 
     pub(crate) fn create_writer(
@@ -67,6 +78,9 @@ impl FileIndexerFactory {
             BuiltinFileIndexer::BloomFilter => {
                 Ok(Box::new(BloomFilterWriter::try_new(data_type, options)?))
             }
+            BuiltinFileIndexer::RangeBitmap => Err(Error::Unsupported {
+                message: "Writing range-bitmap indexes is not supported yet".to_string(),
+            }),
         }
     }
 
@@ -81,6 +95,19 @@ impl FileIndexerFactory {
             )?)),
             BuiltinFileIndexer::BloomFilter => {
                 Ok(Box::new(BloomFilterReader::try_new(data_type, serialized)?))
+            }
+            BuiltinFileIndexer::RangeBitmap => {
+                // File indexes are optional accelerators. Rust used to ignore
+                // range-bitmap payloads entirely, so a payload written by a
+                // newer Java version or damaged in storage must conservatively
+                // disable pruning instead of turning a readable data file into
+                // a query failure.
+                Ok(
+                    match RangeBitmapFileIndexReader::try_new(data_type, serialized) {
+                        Ok(reader) => Box::new(reader),
+                        Err(_) => Box::new(FailOpenFileIndexReader),
+                    },
+                )
             }
         }
     }
@@ -147,6 +174,11 @@ mod tests {
 
     #[test]
     fn test_unknown_identifier_is_rejected() {
+        assert!(FileIndexerFactory::is_supported(RANGE_BITMAP_INDEX));
+        assert!(matches!(
+            FileIndexerFactory::create_writer(RANGE_BITMAP_INDEX, int_type(), &Options::new()),
+            Err(Error::Unsupported { .. })
+        ));
         assert!(matches!(
             FileIndexerFactory::create_writer("unknown", int_type(), &Options::new()),
             Err(Error::Unsupported { .. })
