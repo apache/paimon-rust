@@ -115,8 +115,11 @@ impl FileIndexerFactory {
 
 #[cfg(test)]
 mod tests {
+    use bytes::{BufMut, BytesMut};
+
     use super::*;
-    use crate::spec::{BinaryType, BooleanType, Datum, IntType};
+    use crate::file_index::file_index_result::FileIndexResult;
+    use crate::spec::{BinaryType, BooleanType, Datum, IntType, PredicateOperator};
 
     fn int_type() -> DataType {
         DataType::Int(IntType::new())
@@ -201,5 +204,77 @@ mod tests {
             ));
             assert!(writer.empty(), "{identifier}");
         }
+    }
+
+    #[test]
+    fn test_range_bitmap_huge_cardinality_fails_open() {
+        let mut dictionary = BytesMut::new();
+        dictionary.put_i32(13);
+        dictionary.put_u8(1);
+        dictionary.put_i32(0);
+        dictionary.put_i32(0);
+        dictionary.put_i32(0);
+
+        let mut serialized = BytesMut::new();
+        serialized.put_i32(21);
+        serialized.put_u8(1);
+        serialized.put_i32(i32::MAX);
+        serialized.put_i32(i32::MAX);
+        serialized.put_i32(0);
+        serialized.put_i32(0);
+        serialized.put_i32(dictionary.len() as i32);
+        serialized.extend_from_slice(&dictionary);
+        let serialized = serialized.freeze();
+
+        assert!(matches!(
+            RangeBitmapFileIndexReader::try_new(int_type(), serialized.clone()),
+            Err(Error::FileIndexFormatInvalid { .. })
+        ));
+
+        let reader =
+            FileIndexerFactory::create_reader(RANGE_BITMAP_INDEX, int_type(), serialized).unwrap();
+        assert_eq!(
+            FileIndexResult::Remain,
+            reader.evaluate("a", 0, &int_type(), PredicateOperator::Eq, &[Datum::Int(0)])
+        );
+    }
+
+    #[test]
+    fn test_range_bitmap_malformed_bsi_fails_open() {
+        // Java V1 index for [1, 3, 5, 7, 9, null, null, 10]. Change its
+        // declared slice count from three to one while leaving the BSI header
+        // and payload otherwise intact.
+        let mut serialized = hex::decode(concat!(
+            "00000015010000000800000006000000010000000a000000420000000d010000",
+            "0001000000040000001900000000010000000100000000000000000000000500",
+            "00001400000004000000030000000500000007000000090000000a0000002201",
+            "030000001300000018000000000000001600000016000000140000002a000000",
+            "143b3000000100000500020000000400070000003a3000000100000000000200",
+            "100000000100030007003a300000010000000000010010000000020003003a30",
+            "000001000000000001001000000004000700"
+        ))
+        .unwrap();
+        let outer_header_length = i32::from_be_bytes(serialized[0..4].try_into().unwrap()) as usize;
+        let dictionary_length_offset = 4 + outer_header_length - 4;
+        let dictionary_length = i32::from_be_bytes(
+            serialized[dictionary_length_offset..dictionary_length_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let bsi_offset = 4 + outer_header_length + dictionary_length;
+        serialized[bsi_offset + 5] = 1;
+        let serialized = Bytes::from(serialized);
+
+        assert!(matches!(
+            RangeBitmapFileIndexReader::try_new(int_type(), serialized.clone()),
+            Err(Error::FileIndexFormatInvalid { .. })
+        ));
+
+        let reader =
+            FileIndexerFactory::create_reader(RANGE_BITMAP_INDEX, int_type(), serialized).unwrap();
+        assert_eq!(
+            FileIndexResult::Remain,
+            reader.evaluate("a", 0, &int_type(), PredicateOperator::Eq, &[Datum::Int(1)])
+        );
     }
 }

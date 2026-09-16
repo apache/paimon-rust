@@ -479,7 +479,24 @@ fn parse_dictionary(
         ));
     }
 
-    let mut values = Vec::with_capacity(cardinality);
+    // Every dictionary value needs at least one byte in the serialized
+    // dictionary (fixed-width values store that byte directly, while strings
+    // need a length or offset). Reject an impossible cardinality before using
+    // the untrusted header value as an allocation size. `try_reserve_exact`
+    // then turns a genuine allocation failure into the same fail-open format
+    // error as any other malformed index.
+    if cardinality > serialized.len() {
+        return Err(format_invalid(format!(
+            "range bitmap cardinality {cardinality} exceeds dictionary payload size {}",
+            serialized.len()
+        )));
+    }
+    let mut values = Vec::new();
+    values.try_reserve_exact(cardinality).map_err(|error| {
+        format_invalid(format!(
+            "failed to allocate range bitmap dictionary for {cardinality} values: {error}"
+        ))
+    })?;
     let mut expected_key_offset = 0usize;
     for index in 0..chunk_count {
         let start = offsets[index];
@@ -643,6 +660,19 @@ impl BitSliceIndex {
                 "invalid BSI slice count: {slice_count}"
             )));
         }
+        if cardinality > 0 {
+            // Java's writer constructs the BSI for codes in
+            // [0, cardinality - 1] and always emits at least one slice. An
+            // undersized BSI silently aliases dictionary codes, while an
+            // oversized one can introduce codes the dictionary cannot resolve.
+            let max_code = cardinality - 1;
+            let required_slice_count = ((usize::BITS - max_code.leading_zeros()) as usize).max(1);
+            if slice_count != required_slice_count {
+                return Err(format_invalid(format!(
+                    "BSI slice count {slice_count} does not match the {required_slice_count} slices required for dictionary cardinality {cardinality}"
+                )));
+            }
+        }
         let existing_length = header.read_count("BSI existence bitmap length")?;
         let indexes_length = header.read_count("BSI indexes length")?;
         let expected_indexes_length = slice_count
@@ -708,7 +738,17 @@ impl BitSliceIndex {
                 slice_bytes.len()
             )));
         }
-        Ok(Self { existing, slices })
+        let bsi = Self { existing, slices };
+        if cardinality > 0 {
+            let invalid_codes = bsi.gte(cardinality);
+            if !invalid_codes.is_empty() {
+                return Err(format_invalid(format!(
+                    "BSI contains {} rows with codes outside dictionary cardinality {cardinality}",
+                    invalid_codes.len()
+                )));
+            }
+        }
+        Ok(bsi)
     }
 
     fn eq(&self, code: usize) -> RoaringBitmap {
@@ -1054,6 +1094,78 @@ mod tests {
         serialized.freeze()
     }
 
+    fn int_index_with_bsi_slices(
+        dictionary_values: &[i32],
+        existing_rows: &[u32],
+        slices: &[&[u32]],
+    ) -> Bytes {
+        assert!(!dictionary_values.is_empty());
+        let bitmap_bytes = |positions: &[u32]| {
+            let bitmap = positions.iter().copied().collect::<RoaringBitmap>();
+            let mut bytes = Vec::new();
+            bitmap.serialize_into(&mut bytes).unwrap();
+            bytes
+        };
+
+        // One fixed-width dictionary chunk. The first value lives in the
+        // chunk and the rest in the keys area.
+        let mut chunk = BytesMut::new();
+        chunk.put_u8(VERSION_1);
+        chunk.put_i32(dictionary_values[0]);
+        chunk.put_i32(0);
+        chunk.put_i32(0);
+        chunk.put_i32((dictionary_values.len() - 1) as i32);
+        chunk.put_i32(((dictionary_values.len() - 1) * 4) as i32);
+        chunk.put_i32(4);
+
+        let mut dictionary = BytesMut::new();
+        dictionary.put_i32(13);
+        dictionary.put_u8(VERSION_1);
+        dictionary.put_i32(1);
+        dictionary.put_i32(4);
+        dictionary.put_i32(chunk.len() as i32);
+        dictionary.put_i32(0);
+        dictionary.extend_from_slice(&chunk);
+        for value in &dictionary_values[1..] {
+            dictionary.put_i32(*value);
+        }
+
+        let existing = bitmap_bytes(existing_rows);
+        let encoded_slices = slices
+            .iter()
+            .map(|positions| bitmap_bytes(positions))
+            .collect::<Vec<_>>();
+        let indexes_length = slices.len() * 8;
+        let mut bsi = BytesMut::new();
+        bsi.put_i32((1 + 1 + 4 + 4 + indexes_length) as i32);
+        bsi.put_u8(VERSION_1);
+        bsi.put_u8(slices.len() as u8);
+        bsi.put_i32(existing.len() as i32);
+        bsi.put_i32(indexes_length as i32);
+        let mut offset = 0usize;
+        for slice in &encoded_slices {
+            bsi.put_i32(offset as i32);
+            bsi.put_i32(slice.len() as i32);
+            offset += slice.len();
+        }
+        bsi.extend_from_slice(&existing);
+        for slice in encoded_slices {
+            bsi.extend_from_slice(&slice);
+        }
+
+        let mut serialized = BytesMut::new();
+        serialized.put_i32(21);
+        serialized.put_u8(VERSION_1);
+        serialized.put_i32(existing_rows.iter().copied().max().map_or(0, |max| max + 1) as i32);
+        serialized.put_i32(dictionary_values.len() as i32);
+        serialized.put_i32(dictionary_values[0]);
+        serialized.put_i32(*dictionary_values.last().unwrap());
+        serialized.put_i32(dictionary.len() as i32);
+        serialized.extend_from_slice(&dictionary);
+        serialized.extend_from_slice(&bsi);
+        serialized.freeze()
+    }
+
     #[test]
     fn test_java_int_v1_predicates() {
         let reader = reader(Bytes::from(hex::decode(JAVA_INT_V1).unwrap()));
@@ -1206,5 +1318,35 @@ mod tests {
             RangeBitmapFileIndexReader::try_new(int_type(), Bytes::from(bytes)),
             Err(Error::FileIndexFormatInvalid { .. })
         ));
+    }
+
+    #[test]
+    fn test_bsi_slice_width_must_match_dictionary_cardinality() {
+        let bytes = int_index_with_bsi_slices(&[1, 2, 3], &[0, 1, 2], &[&[1]]);
+        assert!(matches!(
+            RangeBitmapFileIndexReader::try_new(int_type(), bytes),
+            Err(Error::FileIndexFormatInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn test_bsi_codes_must_fit_dictionary_cardinality() {
+        // Row 2 has both bits set, encoding code 3 for a three-value
+        // dictionary whose valid codes are 0, 1, and 2.
+        let bytes = int_index_with_bsi_slices(&[1, 2, 3], &[0, 1, 2], &[&[1, 2], &[2]]);
+        assert!(matches!(
+            RangeBitmapFileIndexReader::try_new(int_type(), bytes),
+            Err(Error::FileIndexFormatInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn test_single_value_dictionary_keeps_one_slice() {
+        let bytes = int_index_with_bsi_slices(&[7], &[0, 1, 2], &[&[]]);
+        let reader = reader(bytes);
+        assert_eq!(
+            evaluate(&reader, PredicateOperator::Eq, &[Datum::Int(7)]),
+            selection([0, 1, 2])
+        );
     }
 }
