@@ -118,3 +118,41 @@ def test_branch_incremental_scan_uses_branch_snapshot_bounds(branch_tables):
         "id": [1], "dt": ["blue"]}
     with pytest.raises(ValueError, match="out of available range"):
         builder.new_incremental_scan(0, 2).plan()
+
+
+@pytest.mark.parametrize("branch", [None, "blue", "empty"])
+def test_tuple_identifier_preserves_dots_and_branch(branch_tables, branch):
+    main, _, _ = branch_tables
+    root = Path(main.location())
+    warehouse = root.parent.parent
+    database = warehouse / "namespace.database.db"
+    root.parent.rename(database)
+    (database / "t").rename(database / "table.with.dots")
+    catalog = PaimonCatalog({"warehouse": str(warehouse)})
+    name = "table.with.dots" + ("$branch_" + branch if branch else "")
+    table = catalog.get_table(("namespace.database", name))
+    assert table.branch() == (branch or "main")
+    assert table.location() == str(database / "table.with.dots")
+    builder = table.new_read_builder()
+    plan = builder.new_scan().plan()
+    assert plan.snapshot_id() == {None: 2, "blue": 1, "empty": None}[branch]
+    if branch != "empty":
+        rows = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert sorted(rows.column("id").to_pylist()) == ([1] if branch else [1, 2])
+
+
+@pytest.mark.parametrize("identifier", [
+    ("", "t"), ("db", ""), ("db", "t$snapshots"), ("db", "t$branch_../escape"),
+    ("db", "t$branch_"), ("db",), ("db", "t", "extra"),
+])
+def test_tuple_identifier_validation(tmp_path, identifier):
+    catalog = PaimonCatalog({"warehouse": str(tmp_path)})
+    with pytest.raises(ValueError):
+        catalog.get_table(identifier)
+
+
+@pytest.mark.parametrize("identifier", [("db", 1), None, 1])
+def test_invalid_identifier_types(tmp_path, identifier):
+    catalog = PaimonCatalog({"warehouse": str(tmp_path)})
+    with pytest.raises(TypeError):
+        catalog.get_table(identifier)

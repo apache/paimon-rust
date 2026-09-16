@@ -327,7 +327,8 @@ impl Table {
     }
 
     pub fn snapshot_manager(&self) -> SnapshotManager {
-        let manager = SnapshotManager::new(self.file_io.clone(), self.location.clone());
+        let manager = SnapshotManager::new(self.file_io.clone(), self.location.clone())
+            .with_rest_env(self.rest_env.clone());
         if self.is_main_branch() {
             manager
         } else {
@@ -469,6 +470,34 @@ impl Table {
                 self.travel_snapshot.clone()
             },
         }
+    }
+
+    /// Replace the complete schema with one already resolved by an external caller.
+    ///
+    /// Like `from_resolved_schema`, this preserves field IDs and options exactly
+    /// and does not perform time travel. Unlike that constructor, it retains the
+    /// FileIO provider, REST environment and identity of this table. The branch
+    /// selects its metadata namespace without loading a different schema.
+    /// Any cached time-travel resolution is discarded: subsequent scans resolve
+    /// the supplied options without replacing the supplied fields.
+    pub fn copy_with_resolved_schema(&self, schema: TableSchema, branch: &str) -> Result<Self> {
+        schema.validate_resolved_structure()?;
+        validate_branch_name(branch)?;
+        let schema_manager = SchemaManager::new(self.file_io.clone(), self.location.clone());
+        let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
+            schema_manager
+        } else {
+            schema_manager.with_branch(branch)
+        };
+        Ok(Self {
+            schema,
+            schema_manager,
+            branch: branch.to_string(),
+            branch_reference: self.branch_reference || branch != DEFAULT_MAIN_BRANCH,
+            time_traveled: false,
+            travel_snapshot: None,
+            ..self.clone()
+        })
     }
 
     /// Create a read-only copy pinned to an already resolved snapshot.

@@ -114,6 +114,23 @@ impl AuditRESTResponse {
     }
 }
 
+/// Latest snapshot and table statistics returned by a REST catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableSnapshot {
+    pub snapshot: Snapshot,
+    pub record_count: Option<i64>,
+    pub file_size_in_bytes: Option<i64>,
+    pub file_count: Option<i64>,
+    pub last_file_creation_time: Option<i64>,
+}
+
+/// Response for loading the latest catalog snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetTableSnapshotResponse {
+    pub snapshot: Option<TableSnapshot>,
+}
+
 /// Response for getting a table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

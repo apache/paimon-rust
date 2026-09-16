@@ -286,6 +286,50 @@ mod tests {
         (file_io, table_path.to_string())
     }
 
+    #[tokio::test]
+    async fn externally_resolved_schema_replaces_cached_time_travel() {
+        let (io, path) = setup_evolved_table().await;
+        let latest = latest_table(&io, &path);
+        let historical = latest
+            .copy_with_time_travel(options(&[("scan.snapshot-id", "1")]))
+            .await
+            .unwrap();
+        assert_eq!(historical.travel_snapshot().unwrap().id(), 1);
+        assert_eq!(historical.schema().id(), 0);
+        // The external caller deliberately keeps the old fields while removing
+        // the snapshot selector, as Java copyWithoutTimeTravel can do.
+        let resolved = historical
+            .copy_with_resolved_schema(schema_v0(), "main")
+            .unwrap();
+        assert_eq!(
+            super::resolve_snapshot(&resolved)
+                .await
+                .unwrap()
+                .unwrap()
+                .id(),
+            2
+        );
+        assert_eq!(resolved.schema().id(), 0);
+        assert_eq!(historical.travel_snapshot().unwrap().id(), 1);
+        let selected = resolved
+            .copy_with_resolved_schema(
+                schema_v0().copy_with_options(options(&[("scan.snapshot-id", "1")])),
+                "main",
+            )
+            .unwrap();
+        assert_eq!(
+            super::resolve_snapshot(&selected)
+                .await
+                .unwrap()
+                .unwrap()
+                .id(),
+            1
+        );
+        assert!(resolved
+            .copy_with_resolved_schema(schema_v0(), "../invalid")
+            .is_err());
+    }
+
     fn latest_table(file_io: &FileIO, table_path: &str) -> Table {
         make_table(file_io, table_path, schema_v1())
     }

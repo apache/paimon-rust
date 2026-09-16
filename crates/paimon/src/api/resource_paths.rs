@@ -116,6 +116,11 @@ impl ResourcePaths {
         )
     }
 
+    /// Get the latest table snapshot endpoint path, including an optional branch suffix.
+    pub fn table_snapshot(&self, database_name: &str, table_name: &str) -> String {
+        format!("{}/snapshot", self.table(database_name, table_name))
+    }
+
     /// Get the views endpoint path for a database.
     pub fn views(&self, database_name: &str) -> String {
         format!(

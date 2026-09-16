@@ -41,9 +41,10 @@ pub use api_request::{
 // Re-export response types
 pub use api_response::{
     AuditRESTResponse, AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
-    GetFunctionResponse, GetTableResponse, GetTableTokenResponse, GetTagResponse, GetViewResponse,
-    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse,
-    ListPoliciesResponse, ListTablesResponse, ListViewsResponse, PagedList,
+    GetFunctionResponse, GetTableResponse, GetTableSnapshotResponse, GetTableTokenResponse,
+    GetTagResponse, GetViewResponse, ListDatabasesResponse, ListFunctionsResponse,
+    ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse, ListTablesResponse,
+    ListViewsResponse, PagedList, TableSnapshot,
 };
 
 // Re-export management types

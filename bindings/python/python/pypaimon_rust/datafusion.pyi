@@ -16,7 +16,7 @@
 # under the License.
 
 from os import PathLike
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, TypeAlias, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, TypeAlias, Union
 
 import pyarrow
 
@@ -109,6 +109,23 @@ class PartitionStat:
     def total_size_bytes(self) -> int: ...
 
 class Table:
+    @staticmethod
+    def from_resolved_schema(
+        location: str, schema_json: str, *, database: str = "default",
+        table: str = "table", branch: str = "main",
+        options: Optional[Dict[str, str]] = None,
+    ) -> "Table":
+        """Preserve a resolved Java-format TableSchema; options configures FileIO.
+
+        No catalog lookup or schema time-travel resolution is performed. Snapshot
+        selection still uses the supplied schema's options. Use a catalog when
+        REST authorization or credential refresh is required.
+        """
+        ...
+    def copy_with_resolved_schema(self, schema_json: str, *, branch: Optional[str] = None) -> "Table":
+        """Replace all fields/options, preserving FileIO, REST context and branch."""
+        ...
+
     def identifier(self) -> str: ...
     def branch(self) -> str: ...
     def location(self) -> str: ...
@@ -170,7 +187,7 @@ class PaimonCatalog:
     def __datafusion_catalog_provider__(self, session: Any) -> object: ...
     def list_databases(self) -> List[str]: ...
     def list_tables(self, database_name: str) -> List[str]: ...
-    def get_table(self, identifier: str) -> Table: ...
+    def get_table(self, identifier: Union[str, Tuple[str, str]]) -> Table: ...
 
 class PythonScalarUDF:
     def __init__(
