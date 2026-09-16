@@ -103,6 +103,17 @@ pub struct ManifestFileMeta {
         skip_serializing_if = "Option::is_none"
     )]
     max_row_id: Option<i64>,
+
+    /// Files owned by this manifest and sharing its lifecycle.
+    ///
+    /// `None` preserves the distinction between legacy manifest lists (where the
+    /// field is absent) and an explicitly empty list written by a newer writer.
+    #[serde(
+        rename = "_EXTRA_FILES",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    extra_files: Option<Vec<String>>,
 }
 
 impl ManifestFileMeta {
@@ -184,6 +195,12 @@ impl ManifestFileMeta {
         self.max_row_id
     }
 
+    /// Get files owned by this manifest, if the metadata was recorded.
+    #[inline]
+    pub fn extra_files(&self) -> Option<&[String]> {
+        self.extra_files.as_deref()
+    }
+
     /// Attach bucket / level statistics aggregated from manifest entries.
     ///
     /// Use this in writers that have access to the entries that the manifest covers.
@@ -214,6 +231,14 @@ impl ManifestFileMeta {
         self
     }
 
+    /// Attach files whose lifecycle is owned by this manifest.
+    #[inline]
+    #[must_use]
+    pub fn with_extra_files(mut self, extra_files: Option<Vec<String>>) -> Self {
+        self.extra_files = extra_files;
+        self
+    }
+
     #[inline]
     pub fn new(
         file_name: String,
@@ -237,6 +262,7 @@ impl ManifestFileMeta {
             max_level: None,
             min_row_id: None,
             max_row_id: None,
+            extra_files: None,
         }
     }
 
@@ -256,6 +282,7 @@ impl ManifestFileMeta {
         max_level: Option<i32>,
         min_row_id: Option<i64>,
         max_row_id: Option<i64>,
+        extra_files: Option<Vec<String>>,
     ) -> ManifestFileMeta {
         Self {
             version,
@@ -271,6 +298,7 @@ impl ManifestFileMeta {
             max_level,
             min_row_id,
             max_row_id,
+            extra_files,
         }
     }
 }
@@ -301,7 +329,8 @@ pub const MANIFEST_FILE_META_SCHEMA: &str = r#"["null", {
         {"name": "_MIN_LEVEL", "type": ["null", "int"], "default": null},
         {"name": "_MAX_LEVEL", "type": ["null", "int"], "default": null},
         {"name": "_MIN_ROW_ID", "type": ["null", "long"], "default": null},
-        {"name": "_MAX_ROW_ID", "type": ["null", "long"], "default": null}
+        {"name": "_MAX_ROW_ID", "type": ["null", "long"], "default": null},
+        {"name": "_EXTRA_FILES", "type": ["null", {"type": "array", "items": "string"}], "default": null}
     ]
 }]"#;
 
