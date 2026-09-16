@@ -18,17 +18,24 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 const BYTE_PERMIT_UNIT: u64 = 1024 * 1024;
 const DEFAULT_PARALLELISM: usize = 8;
 const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Shared resource budget for concurrent Parquet row-group reads.
+/// Scan-shared resource budgets for concurrent Parquet and Mosaic row-group reads.
+///
+/// The public name is retained for API compatibility with callers that inject a
+/// Parquet budget; the same scan object now also carries Mosaic's concurrency
+/// semaphore so all files in that scan share one cap.
 #[derive(Debug)]
 pub struct ParquetReadBudget {
     parallelism: usize,
     row_groups: Arc<Semaphore>,
+    mosaic_row_groups: Arc<Semaphore>,
+    #[cfg(test)]
+    mosaic_diagnostics: Arc<MosaicReadDiagnostics>,
     bytes: Arc<Semaphore>,
     byte_permits: u32,
     max_inflight_bytes: u64,
@@ -43,6 +50,13 @@ struct ParquetReadDiagnostics {
     projected_bytes_min: AtomicU64,
     projected_bytes_max: AtomicU64,
     projected_bytes_total: AtomicU64,
+    current_inflight: AtomicUsize,
+    peak_inflight: AtomicUsize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct MosaicReadDiagnostics {
     current_inflight: AtomicUsize,
     peak_inflight: AtomicUsize,
 }
@@ -73,6 +87,15 @@ pub(crate) struct ParquetReadDiagnosticsSnapshot {
 
 impl ParquetReadBudget {
     pub fn new(parallelism: usize, max_inflight_bytes: u64) -> crate::Result<Self> {
+        Self::new_with_mosaic_parallelism(parallelism, max_inflight_bytes, 8)
+    }
+
+    /// Create scan-shared row-group budgets for Parquet and Mosaic readers.
+    pub fn new_with_mosaic_parallelism(
+        parallelism: usize,
+        max_inflight_bytes: u64,
+        mosaic_parallelism: usize,
+    ) -> crate::Result<Self> {
         if parallelism == 0 || parallelism > Semaphore::MAX_PERMITS {
             return Err(crate::Error::DataInvalid {
                 message: format!(
@@ -88,6 +111,15 @@ impl ParquetReadBudget {
                 source: None,
             });
         }
+        if mosaic_parallelism == 0 || mosaic_parallelism > Semaphore::MAX_PERMITS {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Mosaic row-group parallelism must be between 1 and {}, got {mosaic_parallelism}",
+                    Semaphore::MAX_PERMITS
+                ),
+                source: None,
+            });
+        }
         let max_byte_permits = Semaphore::MAX_PERMITS.min(u32::MAX as usize) as u32;
         let byte_permits = max_inflight_bytes
             .div_ceil(BYTE_PERMIT_UNIT)
@@ -96,6 +128,9 @@ impl ParquetReadBudget {
         Ok(Self {
             parallelism,
             row_groups: Arc::new(Semaphore::new(parallelism)),
+            mosaic_row_groups: Arc::new(Semaphore::new(mosaic_parallelism)),
+            #[cfg(test)]
+            mosaic_diagnostics: Arc::new(MosaicReadDiagnostics::default()),
             bytes: Arc::new(Semaphore::new(byte_permits as usize)),
             byte_permits,
             max_inflight_bytes,
@@ -209,6 +244,53 @@ impl ParquetReadBudget {
             diagnostics,
         })
     }
+
+    pub(crate) async fn acquire_mosaic(&self) -> crate::Result<MosaicReadPermit> {
+        let row_group = Arc::clone(&self.mosaic_row_groups)
+            .acquire_owned()
+            .await
+            .map_err(|error| crate::Error::UnexpectedError {
+                message: "Mosaic row-group read budget was closed".to_string(),
+                source: Some(Box::new(error)),
+            })?;
+        Ok(self.mosaic_permit(row_group))
+    }
+
+    pub(crate) fn try_acquire_mosaic(&self) -> crate::Result<Option<MosaicReadPermit>> {
+        match Arc::clone(&self.mosaic_row_groups).try_acquire_owned() {
+            Ok(row_group) => Ok(Some(self.mosaic_permit(row_group))),
+            Err(TryAcquireError::NoPermits) => Ok(None),
+            Err(error) => Err(crate::Error::UnexpectedError {
+                message: "Mosaic row-group read budget was closed".to_string(),
+                source: Some(Box::new(error)),
+            }),
+        }
+    }
+
+    fn mosaic_permit(&self, row_group: OwnedSemaphorePermit) -> MosaicReadPermit {
+        #[cfg(test)]
+        let diagnostics = {
+            let current = self
+                .mosaic_diagnostics
+                .current_inflight
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            self.mosaic_diagnostics
+                .peak_inflight
+                .fetch_max(current, Ordering::SeqCst);
+            Arc::clone(&self.mosaic_diagnostics)
+        };
+        MosaicReadPermit {
+            _row_group: row_group,
+            #[cfg(test)]
+            diagnostics,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mosaic_peak_inflight(&self) -> usize {
+        self.mosaic_diagnostics.peak_inflight.load(Ordering::SeqCst)
+    }
 }
 
 impl Default for ParquetReadBudget {
@@ -223,6 +305,22 @@ pub(crate) struct ParquetReadPermit {
     _row_group: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
     diagnostics: Option<Arc<ParquetReadDiagnostics>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct MosaicReadPermit {
+    _row_group: OwnedSemaphorePermit,
+    #[cfg(test)]
+    diagnostics: Arc<MosaicReadDiagnostics>,
+}
+
+#[cfg(test)]
+impl Drop for MosaicReadPermit {
+    fn drop(&mut self) {
+        self.diagnostics
+            .current_inflight
+            .fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Drop for ParquetReadPermit {

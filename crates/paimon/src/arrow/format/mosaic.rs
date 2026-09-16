@@ -20,7 +20,9 @@ use crate::arrow::build_target_arrow_schema;
 use crate::arrow::filtering::{
     predicates_may_match_with_schema, remap_predicates_to_file, StatsAccessor,
 };
+use crate::arrow::parquet_read_budget::MosaicReadPermit;
 use crate::arrow::residual::{filter_record_batch_by_predicates, widen_scan_fields};
+use crate::arrow::ParquetReadBudget;
 use crate::io::FileRead;
 use crate::spec::{DataField, DataType as PaimonDataType, Datum, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};
@@ -31,6 +33,7 @@ use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
+use crossbeam_channel::{Receiver, Sender};
 use futures::{SinkExt, StreamExt};
 use paimon_mosaic_core::reader::{InputFile, MosaicReader, ReaderAccess};
 use paimon_mosaic_core::schema::MosaicSchema;
@@ -39,13 +42,29 @@ use paimon_mosaic_core::values::Value as MosaicValue;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::ops::Range;
-use std::sync::Arc;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-pub(crate) struct MosaicFormatReader;
+pub(crate) struct MosaicFormatReader {
+    read_budget: Arc<ParquetReadBudget>,
+}
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
 const DEFAULT_PREFETCH_ROW_GROUPS: usize = 8;
 const DEFAULT_PREFETCH_MAX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EXECUTOR_WORKERS: usize = 32;
+
+impl MosaicFormatReader {
+    pub(crate) fn with_read_budget(read_budget: Arc<ParquetReadBudget>) -> Self {
+        Self { read_budget }
+    }
+}
+
+impl Default for MosaicFormatReader {
+    fn default() -> Self {
+        Self::with_read_budget(Arc::new(ParquetReadBudget::default()))
+    }
+}
 
 #[async_trait]
 impl FormatFileReader for MosaicFormatReader {
@@ -74,6 +93,7 @@ impl FormatFileReader for MosaicFormatReader {
             file_fields: predicates.file_fields.clone(),
         });
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
+        let read_budget = Arc::clone(&self.read_budget);
 
         let (mut batch_tx, mut batch_rx) = futures::channel::mpsc::channel(1);
         let read_task = tokio::task::spawn_blocking(move || {
@@ -88,6 +108,7 @@ impl FormatFileReader for MosaicFormatReader {
                     handle,
                     prefetch_row_groups: DEFAULT_PREFETCH_ROW_GROUPS,
                     prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
+                    read_budget,
                 },
                 |batch| futures::executor::block_on(batch_tx.send(Ok(batch))).is_ok(),
             );
@@ -98,7 +119,12 @@ impl FormatFileReader for MosaicFormatReader {
 
         Ok(try_stream! {
             while let Some(batch) = batch_rx.next().await {
-                yield batch?;
+                let BudgetedBatch { batch, permit } = batch?;
+                yield batch;
+                // Keep both the byte and row-group permits while the decoded
+                // batch is queued or yielded. Advancing or dropping the
+                // stream releases them.
+                drop(permit);
             }
             read_task.await.map_err(|e| Error::DataInvalid {
                 message: format!("Mosaic read task failed: {e}"),
@@ -119,23 +145,238 @@ struct MosaicReadRequest {
     handle: tokio::runtime::Handle,
     prefetch_row_groups: usize,
     prefetch_max_bytes: usize,
+    read_budget: Arc<ParquetReadBudget>,
 }
 
 struct PlannedRowGroup {
     index: usize,
     rows: usize,
     selected_slices: Option<Vec<(usize, usize)>>,
-    estimated_bytes: usize,
+    budget: RowGroupBudget,
 }
 
 struct PendingRowGroup {
-    estimated_bytes: usize,
-    handle: std::thread::JoinHandle<crate::Result<RecordBatch>>,
+    permit: MosaicPrefetchPermit,
+    task: MosaicTask<RecordBatch>,
+}
+
+struct BudgetedBatch {
+    batch: RecordBatch,
+    permit: Option<Arc<MosaicPrefetchPermit>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowGroupBudget {
+    Bytes(usize),
+    /// Mosaic 0.2 does not expose projected physical sizes. Variable-width
+    /// and nested projections therefore run one row group at a time.
+    Exclusive,
+}
+
+#[derive(Default)]
+struct ByteBudgetState {
+    bytes: usize,
+    groups: usize,
+    exclusive: bool,
+}
+
+struct MosaicByteBudgetInner {
+    max_bytes: usize,
+    max_groups: usize,
+    state: Mutex<ByteBudgetState>,
+    released: Condvar,
+}
+
+#[derive(Clone)]
+struct MosaicByteBudget {
+    inner: Arc<MosaicByteBudgetInner>,
+}
+
+impl MosaicByteBudget {
+    fn new(max_bytes: usize, max_groups: usize) -> Self {
+        Self {
+            inner: Arc::new(MosaicByteBudgetInner {
+                max_bytes,
+                max_groups,
+                state: Mutex::new(ByteBudgetState::default()),
+                released: Condvar::new(),
+            }),
+        }
+    }
+
+    fn try_acquire(&self, requirement: RowGroupBudget) -> Option<MosaicBytePermit> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.can_acquire(&state, requirement) {
+            return None;
+        }
+        Self::charge(&mut state, requirement);
+        Some(MosaicBytePermit {
+            inner: Arc::clone(&self.inner),
+            requirement,
+        })
+    }
+
+    fn acquire(&self, requirement: RowGroupBudget) -> MosaicBytePermit {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !self.can_acquire(&state, requirement) {
+            state = self
+                .inner
+                .released
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        Self::charge(&mut state, requirement);
+        MosaicBytePermit {
+            inner: Arc::clone(&self.inner),
+            requirement,
+        }
+    }
+
+    fn can_acquire(&self, state: &ByteBudgetState, requirement: RowGroupBudget) -> bool {
+        if state.groups >= self.inner.max_groups || state.exclusive {
+            return false;
+        }
+        match requirement {
+            RowGroupBudget::Exclusive => state.groups == 0,
+            RowGroupBudget::Bytes(bytes) => {
+                // An oversized head group may consume the whole budget so the
+                // reader always makes progress, but it cannot overlap peers.
+                state.groups == 0 || state.bytes.saturating_add(bytes) <= self.inner.max_bytes
+            }
+        }
+    }
+
+    fn charge(state: &mut ByteBudgetState, requirement: RowGroupBudget) {
+        state.groups += 1;
+        match requirement {
+            RowGroupBudget::Bytes(bytes) => state.bytes = state.bytes.saturating_add(bytes),
+            RowGroupBudget::Exclusive => state.exclusive = true,
+        }
+    }
+}
+
+struct MosaicBytePermit {
+    inner: Arc<MosaicByteBudgetInner>,
+    requirement: RowGroupBudget,
+}
+
+impl Drop for MosaicBytePermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.groups -= 1;
+        match self.requirement {
+            RowGroupBudget::Bytes(bytes) => state.bytes = state.bytes.saturating_sub(bytes),
+            RowGroupBudget::Exclusive => state.exclusive = false,
+        }
+        self.inner.released.notify_all();
+    }
+}
+
+struct MosaicPrefetchPermit {
+    _bytes: MosaicBytePermit,
+    _row_group: MosaicReadPermit,
+}
+
+type MosaicJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct MosaicExecutor {
+    sender: Sender<MosaicJob>,
+}
+
+struct MosaicTask<T> {
+    receiver: Receiver<crate::Result<T>>,
+}
+
+impl MosaicExecutor {
+    fn new() -> crate::Result<Self> {
+        let workers = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get().saturating_mul(2))
+            .unwrap_or(DEFAULT_PREFETCH_ROW_GROUPS)
+            .clamp(DEFAULT_PREFETCH_ROW_GROUPS, MAX_EXECUTOR_WORKERS);
+        let (sender, receiver): (Sender<MosaicJob>, Receiver<MosaicJob>) =
+            crossbeam_channel::bounded(workers.saturating_mul(2));
+        for worker in 0..workers {
+            let receiver = receiver.clone();
+            std::thread::Builder::new()
+                .name(format!("paimon-mosaic-{worker}"))
+                .spawn(move || {
+                    while let Ok(job) = receiver.recv() {
+                        job();
+                    }
+                })
+                .map_err(|error| Error::UnexpectedError {
+                    message: "failed to start Mosaic row-group executor".to_string(),
+                    source: Some(Box::new(error)),
+                })?;
+        }
+        Ok(Self { sender })
+    }
+
+    fn submit<T, F>(&self, task: F) -> crate::Result<MosaicTask<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> crate::Result<T> + Send + 'static,
+    {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        self.sender
+            .send(Box::new(move || {
+                let result = match catch_unwind(AssertUnwindSafe(task)) {
+                    Ok(result) => result,
+                    Err(panic) => Err(Error::UnexpectedError {
+                        message: format!(
+                            "Mosaic row-group prefetch task panicked: {}",
+                            panic_payload_message(panic)
+                        ),
+                        source: None,
+                    }),
+                };
+                let _ = sender.send(result);
+            }))
+            .map_err(|_| Error::UnexpectedError {
+                message: "Mosaic row-group executor stopped before accepting a task".to_string(),
+                source: None,
+            })?;
+        Ok(MosaicTask { receiver })
+    }
+}
+
+impl<T> MosaicTask<T> {
+    fn join(self) -> crate::Result<T> {
+        self.receiver
+            .recv()
+            .map_err(|error| Error::UnexpectedError {
+                message: "Mosaic row-group executor dropped a task result".to_string(),
+                source: Some(Box::new(error)),
+            })?
+    }
+}
+
+fn mosaic_executor() -> crate::Result<&'static MosaicExecutor> {
+    static EXECUTOR: OnceLock<Result<MosaicExecutor, String>> = OnceLock::new();
+    match EXECUTOR.get_or_init(|| MosaicExecutor::new().map_err(|error| error.to_string())) {
+        Ok(executor) => Ok(executor),
+        Err(message) => Err(Error::UnexpectedError {
+            message: message.clone(),
+            source: None,
+        }),
+    }
 }
 
 fn read_mosaic_batches_blocking(
     request: MosaicReadRequest,
-    mut send_batch: impl FnMut(RecordBatch) -> bool,
+    mut send_batch: impl FnMut(BudgetedBatch) -> bool,
 ) -> crate::Result<()> {
     let MosaicReadRequest {
         reader,
@@ -147,9 +388,10 @@ fn read_mosaic_batches_blocking(
         handle,
         prefetch_row_groups,
         prefetch_max_bytes,
+        read_budget,
     } = request;
     let mosaic_reader = Arc::new(
-        MosaicReader::new(FileReadInputFile::new(reader, handle), file_size)
+        MosaicReader::new(FileReadInputFile::new(reader, handle.clone()), file_size)
             .map_err(mosaic_read_error)?,
     );
 
@@ -191,7 +433,6 @@ fn read_mosaic_batches_blocking(
         build_file_column_indices(mosaic_reader.schema(), &predicates.file_fields)
     });
 
-    let estimated_row_bytes = estimated_row_bytes(&existing_scan_fields);
     let mut planned = VecDeque::new();
     let mut row_group_start = 0usize;
     for row_group_index in 0..mosaic_reader.num_row_groups() {
@@ -238,7 +479,7 @@ fn read_mosaic_batches_blocking(
             index: row_group_index,
             rows: row_group_rows,
             selected_slices,
-            estimated_bytes: row_group_rows.saturating_mul(estimated_row_bytes),
+            budget: projected_row_group_budget(&existing_scan_fields, row_group_rows),
         });
     }
 
@@ -254,7 +495,7 @@ fn read_mosaic_batches_blocking(
                 read_planned_row_group(&mosaic_reader, &plan, &projected_names, &read_schema)?
             };
             let batch = apply_mosaic_residual(batch, predicates.as_ref(), &existing_scan_fields)?;
-            if !send_mosaic_batch_chunks(batch, batch_size, &mut send_batch) {
+            if !send_mosaic_batch_chunks(batch, batch_size, None, &mut send_batch) {
                 return Ok(());
             }
         }
@@ -262,45 +503,83 @@ fn read_mosaic_batches_blocking(
     }
 
     let projected_names = Arc::new(projected_names);
+    let executor = mosaic_executor()?;
     let mut pending = VecDeque::<PendingRowGroup>::new();
-    let mut pending_bytes = 0usize;
+    let byte_budget = MosaicByteBudget::new(prefetch_max_bytes, prefetch_row_groups);
     let mut outcome = Ok(());
 
-    while !planned.is_empty() || !pending.is_empty() {
-        while pending.len() < prefetch_row_groups {
-            let Some(next) = planned.front() else {
+    'read: while !planned.is_empty() || !pending.is_empty() {
+        while let Some(next) = planned.front() {
+            let Some(bytes) = byte_budget.try_acquire(next.budget) else {
                 break;
             };
-            // Always allow the head row group so a too-small budget cannot
-            // deadlock progress. Every additional prefetched group must fit.
-            if !pending.is_empty()
-                && pending_bytes.saturating_add(next.estimated_bytes) > prefetch_max_bytes
-            {
-                break;
-            }
+            let row_group = match read_budget.try_acquire_mosaic() {
+                Ok(Some(permit)) => permit,
+                Ok(None) => {
+                    drop(bytes);
+                    break;
+                }
+                Err(error) => {
+                    outcome = Err(error);
+                    break 'read;
+                }
+            };
             let plan = planned.pop_front().unwrap();
-            let estimated_bytes = plan.estimated_bytes;
+            let permit = MosaicPrefetchPermit {
+                _bytes: bytes,
+                _row_group: row_group,
+            };
             let reader = Arc::clone(&mosaic_reader);
             let names = Arc::clone(&projected_names);
             let schema = Arc::clone(&read_schema);
-            let handle =
-                std::thread::spawn(move || read_planned_row_group(&reader, &plan, &names, &schema));
-            pending_bytes = pending_bytes.saturating_add(estimated_bytes);
-            pending.push_back(PendingRowGroup {
-                estimated_bytes,
-                handle,
-            });
+            let task = match executor
+                .submit(move || read_planned_row_group(&reader, &plan, &names, &schema))
+            {
+                Ok(task) => task,
+                Err(error) => {
+                    outcome = Err(error);
+                    break 'read;
+                }
+            };
+            pending.push_back(PendingRowGroup { permit, task });
         }
 
-        let Some(next) = pending.pop_front() else {
-            outcome = Err(Error::UnexpectedError {
-                message: "Mosaic row-group prefetch made no progress".to_string(),
-                source: None,
-            });
-            break;
-        };
-        pending_bytes = pending_bytes.saturating_sub(next.estimated_bytes);
-        let batch = match join_prefetched_row_group(next.handle) {
+        if pending.is_empty() {
+            let Some(next) = planned.front() else {
+                break;
+            };
+            // Earlier decoded batches can still own the budget downstream.
+            // With no task left to join, wait for their permits to be released.
+            let bytes = byte_budget.acquire(next.budget);
+            let row_group = match handle.block_on(read_budget.acquire_mosaic()) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    outcome = Err(error);
+                    break 'read;
+                }
+            };
+            let permit = MosaicPrefetchPermit {
+                _bytes: bytes,
+                _row_group: row_group,
+            };
+            let plan = planned.pop_front().unwrap();
+            let reader = Arc::clone(&mosaic_reader);
+            let names = Arc::clone(&projected_names);
+            let schema = Arc::clone(&read_schema);
+            let task = match executor
+                .submit(move || read_planned_row_group(&reader, &plan, &names, &schema))
+            {
+                Ok(task) => task,
+                Err(error) => {
+                    outcome = Err(error);
+                    break 'read;
+                }
+            };
+            pending.push_back(PendingRowGroup { permit, task });
+        }
+
+        let PendingRowGroup { permit, task } = pending.pop_front().unwrap();
+        let batch = match task.join() {
             Ok(batch) => batch,
             Err(error) => {
                 outcome = Err(error);
@@ -314,7 +593,7 @@ fn read_mosaic_batches_blocking(
                 break;
             }
         };
-        if !send_mosaic_batch_chunks(batch, batch_size, &mut send_batch) {
+        if !send_mosaic_batch_chunks(batch, batch_size, Some(Arc::new(permit)), &mut send_batch) {
             planned.clear();
             break;
         }
@@ -324,7 +603,7 @@ fn read_mosaic_batches_blocking(
     // work alive after cancellation or an error. Join every scheduled task
     // before returning; preserve the first user-visible failure.
     while let Some(next) = pending.pop_front() {
-        if let Err(error) = join_prefetched_row_group(next.handle) {
+        if let Err(error) = next.task.join() {
             if outcome.is_ok() {
                 outcome = Err(error);
             }
@@ -348,18 +627,6 @@ fn read_planned_row_group(
         .map_err(mosaic_read_error)?;
     let batch = row_group_reader.read_columns().map_err(mosaic_read_error)?;
     take_row_slices(batch, plan.selected_slices.as_deref(), read_schema)
-}
-
-fn join_prefetched_row_group(
-    handle: std::thread::JoinHandle<crate::Result<RecordBatch>>,
-) -> crate::Result<RecordBatch> {
-    handle.join().map_err(|panic| Error::UnexpectedError {
-        message: format!(
-            "Mosaic row-group prefetch task panicked: {}",
-            panic_payload_message(panic)
-        ),
-        source: None,
-    })?
 }
 
 fn panic_payload_message(panic: Box<dyn std::any::Any + Send>) -> String {
@@ -388,34 +655,44 @@ fn apply_mosaic_residual(
 fn send_mosaic_batch_chunks(
     batch: RecordBatch,
     batch_size: usize,
-    send_batch: &mut impl FnMut(RecordBatch) -> bool,
+    permit: Option<Arc<MosaicPrefetchPermit>>,
+    send_batch: &mut impl FnMut(BudgetedBatch) -> bool,
 ) -> bool {
-    split_batch(batch, batch_size).into_iter().all(send_batch)
+    split_batch(batch, batch_size).into_iter().all(|batch| {
+        send_batch(BudgetedBatch {
+            batch,
+            permit: permit.clone(),
+        })
+    })
 }
 
-fn estimated_row_bytes(fields: &[DataField]) -> usize {
-    fields
-        .iter()
-        .map(|field| match field.data_type() {
-            PaimonDataType::Boolean(_) | PaimonDataType::TinyInt(_) => 2,
-            PaimonDataType::SmallInt(_) => 3,
-            PaimonDataType::Int(_)
-            | PaimonDataType::Float(_)
-            | PaimonDataType::Date(_)
-            | PaimonDataType::Time(_) => 5,
-            PaimonDataType::BigInt(_)
-            | PaimonDataType::Double(_)
-            | PaimonDataType::Timestamp(_)
-            | PaimonDataType::LocalZonedTimestamp(_) => 9,
-            PaimonDataType::Decimal(_) => 17,
-            PaimonDataType::Char(_)
-            | PaimonDataType::VarChar(_)
-            | PaimonDataType::Binary(_)
-            | PaimonDataType::VarBinary(_) => 40,
-            _ => 128,
-        })
-        .sum::<usize>()
-        .max(1)
+fn projected_row_group_budget(fields: &[DataField], rows: usize) -> RowGroupBudget {
+    let Some(row_bytes) = fields.iter().try_fold(0usize, |total, field| {
+        fixed_width_row_bytes(field.data_type()).map(|bytes| total.saturating_add(bytes))
+    }) else {
+        return RowGroupBudget::Exclusive;
+    };
+    RowGroupBudget::Bytes(rows.saturating_mul(row_bytes.max(1)))
+}
+
+fn fixed_width_row_bytes(data_type: &PaimonDataType) -> Option<usize> {
+    // One byte per row for validity is deliberately conservative (Arrow uses
+    // one bit). These are upper bounds for decoded fixed-width array buffers,
+    // unlike a guessed average for variable-width values.
+    match data_type {
+        PaimonDataType::Boolean(_) | PaimonDataType::TinyInt(_) => Some(2),
+        PaimonDataType::SmallInt(_) => Some(3),
+        PaimonDataType::Int(_)
+        | PaimonDataType::Float(_)
+        | PaimonDataType::Date(_)
+        | PaimonDataType::Time(_) => Some(5),
+        PaimonDataType::BigInt(_)
+        | PaimonDataType::Double(_)
+        | PaimonDataType::Timestamp(_)
+        | PaimonDataType::LocalZonedTimestamp(_) => Some(9),
+        PaimonDataType::Decimal(_) => Some(17),
+        _ => None,
+    }
 }
 
 struct MosaicRowGroupStats<'a> {
@@ -1060,7 +1337,7 @@ mod tests {
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<Vec<RecordBatch>> {
         let file_size = data.len() as u64;
-        MosaicFormatReader
+        MosaicFormatReader::default()
             .read_batch_stream(
                 Box::new(TestFileRead { data }),
                 file_size,
@@ -1082,7 +1359,7 @@ mod tests {
     ) -> crate::Result<Vec<Range<u64>>> {
         let file_size = data.len() as u64;
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let _: Vec<RecordBatch> = MosaicFormatReader
+        let _: Vec<RecordBatch> = MosaicFormatReader::default()
             .read_batch_stream(
                 Box::new(TrackingFileRead {
                     data,
@@ -1108,7 +1385,7 @@ mod tests {
     ) -> crate::Result<Vec<Range<u64>>> {
         let file_size = data.len() as u64;
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let _: Vec<RecordBatch> = MosaicFormatReader
+        let _: Vec<RecordBatch> = MosaicFormatReader::default()
             .read_batch_stream(
                 Box::new(TrackingFileRead {
                     data,
@@ -1166,19 +1443,27 @@ mod tests {
 
     async fn read_with_prefetch_tracking(
         data: Bytes,
+        fields: Vec<DataField>,
         prefetch_row_groups: usize,
         prefetch_max_bytes: usize,
     ) -> (Vec<RecordBatch>, usize) {
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let file_size = data.len() as u64;
-        let fields = vec![data_fields()[0].clone()];
         let read = ConcurrentTrackingFileRead {
             data,
             active,
             max_active: Arc::clone(&max_active),
         };
         let handle = tokio::runtime::Handle::current();
+        let read_budget = Arc::new(
+            ParquetReadBudget::new_with_mosaic_parallelism(
+                8,
+                256 * 1024 * 1024,
+                prefetch_row_groups.max(1),
+            )
+            .unwrap(),
+        );
         let batches = tokio::task::spawn_blocking(move || {
             let mut batches = Vec::new();
             read_mosaic_batches_blocking(
@@ -1192,8 +1477,9 @@ mod tests {
                     handle,
                     prefetch_row_groups,
                     prefetch_max_bytes,
+                    read_budget,
                 },
-                |batch| {
+                |BudgetedBatch { batch, .. }| {
                     batches.push(batch);
                     true
                 },
@@ -1280,7 +1566,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_prefetch_overlaps_row_group_reads_and_preserves_order() {
         let data = multi_row_group_mosaic(Vec::new());
-        let (batches, max_active) = read_with_prefetch_tracking(data, 3, usize::MAX).await;
+        let fields = vec![data_fields()[0].clone()];
+        let (batches, max_active) = read_with_prefetch_tracking(data, fields, 3, usize::MAX).await;
 
         assert_eq!(collect_i32_column(&batches, 0), vec![1, 2, 10, 11, 20, 21]);
         assert!(
@@ -1292,12 +1579,106 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_prefetch_byte_budget_limits_groups_ahead() {
         let data = multi_row_group_mosaic(Vec::new());
-        let (batches, max_active) = read_with_prefetch_tracking(data, 3, 1).await;
+        let fields = vec![data_fields()[0].clone()];
+        let (batches, max_active) = read_with_prefetch_tracking(data, fields, 3, 1).await;
 
         assert_eq!(collect_i32_column(&batches, 0), vec![1, 2, 10, 11, 20, 21]);
         assert_eq!(
             max_active, 1,
             "a one-byte budget should admit only the mandatory head group"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_prefetch_byte_budget_is_cumulative() {
+        let data = multi_row_group_mosaic(Vec::new());
+        let fields = vec![data_fields()[0].clone()];
+        // Each two-row Int group is conservatively charged 10 bytes, so this
+        // admits two groups but not all three.
+        let (batches, max_active) = read_with_prefetch_tracking(data, fields, 3, 20).await;
+
+        assert_eq!(collect_i32_column(&batches, 0), vec![1, 2, 10, 11, 20, 21]);
+        assert_eq!(max_active, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_variable_width_prefetch_is_exclusive() {
+        let data = multi_row_group_mosaic(Vec::new());
+        let fields = vec![data_fields()[1].clone()];
+        let (batches, max_active) = read_with_prefetch_tracking(data, fields, 3, usize::MAX).await;
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 6);
+        assert_eq!(
+            max_active, 1,
+            "variable-width row groups must not use a fixed per-row guess"
+        );
+    }
+
+    #[test]
+    fn test_fixed_width_budget_is_cumulative_and_oversized_head_progresses() {
+        assert_eq!(
+            projected_row_group_budget(&[data_fields()[0].clone()], 2),
+            RowGroupBudget::Bytes(10)
+        );
+        assert_eq!(
+            projected_row_group_budget(&[data_fields()[1].clone()], 2),
+            RowGroupBudget::Exclusive
+        );
+
+        let budget = MosaicByteBudget::new(20, 8);
+        let first = budget.try_acquire(RowGroupBudget::Bytes(10)).unwrap();
+        let second = budget.try_acquire(RowGroupBudget::Bytes(10)).unwrap();
+        assert!(budget.try_acquire(RowGroupBudget::Bytes(10)).is_none());
+        drop(first);
+        let third = budget.try_acquire(RowGroupBudget::Bytes(10)).unwrap();
+        drop((second, third));
+
+        let oversized = budget.try_acquire(RowGroupBudget::Bytes(21)).unwrap();
+        assert!(budget.try_acquire(RowGroupBudget::Bytes(1)).is_none());
+        drop(oversized);
+        assert!(budget.try_acquire(RowGroupBudget::Bytes(1)).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_prefetch_budget_is_shared_across_files() {
+        let data = multi_row_group_mosaic(Vec::new());
+        let fields = vec![data_fields()[0].clone()];
+        let budget = Arc::new(
+            ParquetReadBudget::new_with_mosaic_parallelism(8, 256 * 1024 * 1024, 2).unwrap(),
+        );
+
+        let read_file = |data: Bytes| {
+            let fields = fields.clone();
+            let budget = Arc::clone(&budget);
+            async move {
+                MosaicFormatReader::with_read_budget(budget)
+                    .read_batch_stream(
+                        Box::new(ConcurrentTrackingFileRead {
+                            data: data.clone(),
+                            active: Arc::new(AtomicUsize::new(0)),
+                            max_active: Arc::new(AtomicUsize::new(0)),
+                        }),
+                        data.len() as u64,
+                        &fields,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await
+            }
+        };
+
+        let (first, second) = tokio::join!(read_file(data.clone()), read_file(data));
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(collect_i32_column(&first, 0), vec![1, 2, 10, 11, 20, 21]);
+        assert_eq!(collect_i32_column(&second, 0), vec![1, 2, 10, 11, 20, 21]);
+        assert_eq!(
+            budget.mosaic_peak_inflight(),
+            2,
+            "concurrent files must share the scan-level Mosaic task cap"
         );
     }
 
@@ -1351,7 +1732,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         assert!(file_size > 64 * 1024);
 
-        let batches = MosaicFormatReader
+        let batches = MosaicFormatReader::default()
             .read_batch_stream(
                 Box::new(TrackingFileRead {
                     data,
@@ -1407,7 +1788,7 @@ mod tests {
             .unwrap();
 
         let batches = runtime.block_on(async move {
-            MosaicFormatReader
+            MosaicFormatReader::default()
                 .read_batch_stream(
                     Box::new(RuntimeThreadFileRead {
                         data,

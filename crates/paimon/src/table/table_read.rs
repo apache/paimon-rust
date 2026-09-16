@@ -63,9 +63,10 @@ pub(super) fn configured_parquet_read_budget(
     table: &Table,
 ) -> crate::Result<Arc<ParquetReadBudget>> {
     let options = table.schema().core_options();
-    Ok(Arc::new(ParquetReadBudget::new(
+    Ok(Arc::new(ParquetReadBudget::new_with_mosaic_parallelism(
         options.parquet_row_group_parallelism()?,
         options.parquet_row_group_max_inflight_bytes()?,
+        options.mosaic_row_group_parallelism()?,
     )?))
 }
 
