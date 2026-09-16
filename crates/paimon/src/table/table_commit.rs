@@ -906,13 +906,32 @@ impl TableCommit {
         let delta_manifest_list_path = format!("{manifest_dir}/{delta_manifest_list_name}");
         let changelog_manifest_list_path = format!("{manifest_dir}/{changelog_manifest_list_name}");
 
+        // Compute metadata before the owned entries are moved into manifest
+        // writing. Sorting consumes the vectors so it does not need to clone
+        // every ManifestEntry and its heap-backed fields.
+        let mut delta_record_count: i64 = 0;
+        for entry in &resolved.entries {
+            match entry.kind() {
+                FileKind::Add => delta_record_count += entry.file().row_count,
+                FileKind::Delete => delta_record_count -= entry.file().row_count,
+            }
+        }
+        let statistics = self.generate_partition_statistics(&resolved.entries)?;
+        let changelog_record_count = (!resolved.changelog_entries.is_empty()).then(|| {
+            resolved
+                .changelog_entries
+                .iter()
+                .map(|entry| entry.file().row_count)
+                .sum()
+        });
+
         // Write delta manifest files, rolling by target size.
         let new_manifest_file_metas = self
             .write_manifest_files(
                 file_io,
                 &manifest_dir,
                 &new_manifest_prefix,
-                &resolved.entries,
+                resolved.entries,
             )
             .await?;
 
@@ -926,7 +945,7 @@ impl TableCommit {
         .await?;
 
         let (changelog_record_count, changelog_manifest_list_size) =
-            if resolved.changelog_entries.is_empty() {
+            if changelog_record_count.is_none() {
                 (None, None)
             } else {
                 let changelog_manifest_file_metas = self
@@ -934,7 +953,7 @@ impl TableCommit {
                         file_io,
                         &manifest_dir,
                         &changelog_manifest_prefix,
-                        &resolved.changelog_entries,
+                        resolved.changelog_entries,
                     )
                     .await?;
                 ManifestList::write_with_compression(
@@ -945,16 +964,7 @@ impl TableCommit {
                 )
                 .await?;
                 let status = file_io.get_status(&changelog_manifest_list_path).await?;
-                (
-                    Some(
-                        resolved
-                            .changelog_entries
-                            .iter()
-                            .map(|entry| entry.file().row_count)
-                            .sum(),
-                    ),
-                    Some(status.size as i64),
-                )
+                (changelog_record_count, Some(status.size as i64))
             };
 
         // Read existing manifests (base + delta from previous snapshot) and write base manifest list
@@ -986,14 +996,6 @@ impl TableCommit {
         )
         .await?;
 
-        // Calculate delta record count
-        let mut delta_record_count: i64 = 0;
-        for entry in &resolved.entries {
-            match entry.kind() {
-                FileKind::Add => delta_record_count += entry.file().row_count,
-                FileKind::Delete => delta_record_count -= entry.file().row_count,
-            }
-        }
         total_record_count += delta_record_count;
 
         let snapshot = Snapshot::builder()
@@ -1014,8 +1016,6 @@ impl TableCommit {
             .next_row_id(next_row_id)
             .index_manifest(resolved.index_manifest_name)
             .build();
-
-        let statistics = self.generate_partition_statistics(&resolved.entries)?;
 
         if self.snapshot_commit.commit(&snapshot, &statistics).await? {
             Ok(CommitAttemptResult::Success)
@@ -1057,7 +1057,7 @@ impl TableCommit {
         file_io: &FileIO,
         manifest_dir: &str,
         name_prefix: &str,
-        entries: &[ManifestEntry],
+        entries: Vec<ManifestEntry>,
     ) -> Result<Vec<ManifestFileMeta>> {
         if entries.is_empty() {
             return Ok(vec![]);
@@ -1067,18 +1067,16 @@ impl TableCommit {
         // postponed bucket tables when manifest sorting is enabled. Data
         // evolution keeps its row-id-oriented layout and is intentionally not
         // reordered here.
-        let mut sorted_entries = None;
-        if self.manifest_sort_enabled
+        let entries = if self.manifest_sort_enabled
             && (self.total_buckets > 0 || self.total_buckets == POSTPONE_BUCKET)
             && !self.data_evolution_enabled
         {
-            let mut owned = entries.to_vec();
             let partition_fields = self.table.schema().partition_fields();
             let partition_sort_type = partition_fields.first().map(|field| field.data_type());
-            sort_manifest_entries_bucket_first(&mut owned, partition_sort_type)?;
-            sorted_entries = Some(owned);
-        }
-        let entries = sorted_entries.as_deref().unwrap_or(entries);
+            sort_manifest_entries_bucket_first(entries, partition_sort_type)?
+        } else {
+            entries
+        };
 
         let target_size = self.manifest_target_size.max(1) as usize;
         let mut result = Vec::new();
@@ -1217,7 +1215,7 @@ impl TableCommit {
 
         let manifest_prefix = format!("manifest-{}", uuid::Uuid::new_v4());
         let merged_metas = self
-            .write_manifest_files(file_io, manifest_dir, &manifest_prefix, &merged_entries)
+            .write_manifest_files(file_io, manifest_dir, &manifest_prefix, merged_entries)
             .await?;
         result.extend(merged_metas.clone());
         new_files.extend(merged_metas);
@@ -2952,12 +2950,11 @@ impl TableCommit {
 }
 
 fn sort_manifest_entries_bucket_first(
-    entries: &mut [ManifestEntry],
+    entries: Vec<ManifestEntry>,
     partition_sort_type: Option<&DataType>,
-) -> Result<()> {
+) -> Result<Vec<ManifestEntry>> {
     let mut keyed = entries
-        .iter()
-        .cloned()
+        .into_iter()
         .map(|entry| {
             let partition_key = match partition_sort_type {
                 Some(data_type) if !entry.partition().is_empty() => {
@@ -2977,10 +2974,7 @@ fn sort_manifest_entries_bucket_first(
             .then_with(|| file_kind_order(left.kind()).cmp(&file_kind_order(right.kind())))
             .then_with(|| left.file().file_name.cmp(&right.file().file_name))
     });
-    for (target, (entry, _)) in entries.iter_mut().zip(keyed) {
-        *target = entry;
-    }
-    Ok(())
+    Ok(keyed.into_iter().map(|(entry, _)| entry).collect())
 }
 
 fn compare_partition_sort_keys(left: &Option<Datum>, right: &Option<Datum>) -> std::cmp::Ordering {
@@ -3381,7 +3375,7 @@ mod tests {
 
     #[test]
     fn test_manifest_entries_sort_bucket_first() {
-        let mut entries = vec![
+        let entries = vec![
             ManifestEntry::new(
                 FileKind::Delete,
                 vec![2],
@@ -3416,7 +3410,7 @@ mod tests {
             ),
         ];
 
-        sort_manifest_entries_bucket_first(&mut entries, None).unwrap();
+        let entries = sort_manifest_entries_bucket_first(entries, None).unwrap();
 
         assert_eq!(
             entries
@@ -6116,7 +6110,7 @@ mod tests {
 
         let manifest_dir = format!("{table_path}/manifest");
         let metas = commit
-            .write_manifest_files(&file_io, &manifest_dir, "manifest-test", &entries)
+            .write_manifest_files(&file_io, &manifest_dir, "manifest-test", entries)
             .await
             .unwrap();
         assert_eq!(metas.len(), 1);
