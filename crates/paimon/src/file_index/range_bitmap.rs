@@ -866,6 +866,18 @@ impl RangeBitmapFileIndexReader {
         selected
     }
 
+    fn include_nan_rows(&self, mut selected: RoaringBitmap) -> RoaringBitmap {
+        let nan = match self.codec {
+            RangeValueCodec::Float => Some(RangeValue::Float(JavaFloat::new(f32::NAN))),
+            RangeValueCodec::Double => Some(RangeValue::Double(JavaDouble::new(f64::NAN))),
+            _ => None,
+        };
+        if let Some(nan) = nan {
+            selected |= self.eq(&nan);
+        }
+        selected
+    }
+
     fn eq(&self, value: &RangeValue) -> RoaringBitmap {
         self.dictionary
             .binary_search(value)
@@ -933,21 +945,42 @@ impl RangeBitmapFileIndexReader {
             PredicateOperator::In => self.literals_bitmap(literals, false)?,
             PredicateOperator::NotIn => self.not(&self.literals_bitmap(literals, true)?),
             PredicateOperator::Lt if literals.len() == 1 => {
-                self.lt(&self.codec.value(&literals[0])?)
+                let value = self.codec.value(&literals[0])?;
+                if value.is_nan() {
+                    return Ok(FileIndexResult::Remain);
+                }
+                self.include_nan_rows(self.lt(&value))
             }
             PredicateOperator::LtEq if literals.len() == 1 => {
-                self.lte(&self.codec.value(&literals[0])?)
+                let value = self.codec.value(&literals[0])?;
+                if value.is_nan() {
+                    return Ok(FileIndexResult::Remain);
+                }
+                self.include_nan_rows(self.lte(&value))
             }
             PredicateOperator::Gt if literals.len() == 1 => {
-                self.gt(&self.codec.value(&literals[0])?)
+                let value = self.codec.value(&literals[0])?;
+                if value.is_nan() {
+                    return Ok(FileIndexResult::Remain);
+                }
+                self.include_nan_rows(self.gt(&value))
             }
             PredicateOperator::GtEq if literals.len() == 1 => {
-                self.gte(&self.codec.value(&literals[0])?)
+                let value = self.codec.value(&literals[0])?;
+                if value.is_nan() {
+                    return Ok(FileIndexResult::Remain);
+                }
+                self.include_nan_rows(self.gte(&value))
             }
             PredicateOperator::Between if literals.len() == 2 => {
-                let mut selected = self.gte(&self.codec.value(&literals[0])?);
-                selected &= self.lte(&self.codec.value(&literals[1])?);
-                selected
+                let lower = self.codec.value(&literals[0])?;
+                let upper = self.codec.value(&literals[1])?;
+                if lower.is_nan() || upper.is_nan() {
+                    return Ok(FileIndexResult::Remain);
+                }
+                let mut selected = self.gte(&lower);
+                selected &= self.lte(&upper);
+                self.include_nan_rows(selected)
             }
             _ => return Ok(FileIndexResult::Remain),
         };
@@ -1303,31 +1336,49 @@ mod tests {
             reader.try_evaluate(&data_type, operator, literals).unwrap()
         };
 
-        let values: ArrayRef = Arc::new(Float32Array::from(vec![
-            Some(-0.0),
-            Some(0.0),
-            Some(1.5),
-            Some(f32::NAN),
-            None,
-        ]));
-        for zero in [Datum::Float(-0.0), Datum::Float(0.0)] {
-            for operator in [
-                PredicateOperator::Eq,
-                PredicateOperator::NotEq,
-                PredicateOperator::Lt,
-                PredicateOperator::LtEq,
-                PredicateOperator::Gt,
-                PredicateOperator::GtEq,
-                PredicateOperator::In,
-                PredicateOperator::NotIn,
+        // Java canonicalizes every NaN written into the dictionary, so the same
+        // payload can represent either NaN sign in the original rows.
+        let possible_values: [ArrayRef; 2] = [
+            Arc::new(Float32Array::from(vec![
+                Some(-0.0),
+                Some(0.0),
+                Some(1.5),
+                Some(f32::NAN),
+                None,
+            ])),
+            Arc::new(Float32Array::from(vec![
+                Some(-0.0),
+                Some(0.0),
+                Some(1.5),
+                Some(f32::from_bits(0xffc0_0000)),
+                None,
+            ])),
+        ];
+        for values in &possible_values {
+            for literal in [
+                Datum::Float(-0.0),
+                Datum::Float(0.0),
+                Datum::Float(f32::NAN),
+                Datum::Float(f32::from_bits(0xffc0_0000)),
             ] {
-                assert_covers_residual(
-                    &reader,
-                    &values,
-                    &data_type,
-                    operator,
-                    std::slice::from_ref(&zero),
-                );
+                for operator in [
+                    PredicateOperator::Eq,
+                    PredicateOperator::NotEq,
+                    PredicateOperator::Lt,
+                    PredicateOperator::LtEq,
+                    PredicateOperator::Gt,
+                    PredicateOperator::GtEq,
+                    PredicateOperator::In,
+                    PredicateOperator::NotIn,
+                ] {
+                    assert_covers_residual(
+                        &reader,
+                        values,
+                        &data_type,
+                        operator,
+                        std::slice::from_ref(&literal),
+                    );
+                }
             }
         }
         assert_eq!(
