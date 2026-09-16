@@ -237,3 +237,35 @@ async fn materialized_dv_files_use_raw_size_packing_across_levels() {
         }
     }
 }
+
+#[tokio::test]
+async fn first_row_dv_merge_on_read_merges_l0_before_value_filtering() {
+    let table = table_with_versions("memory:/first_row/dv_l0", false).await;
+    let table = table.copy_with_options(
+        [
+            ("deletion-vectors.enabled", "true"),
+            ("deletion-vectors.merge-on-read", "true"),
+            ("pk-clustering-override", "true"),
+            ("clustering.columns", "value"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    );
+    for (value, expected) in [(10, vec![(1, 10)]), (99, vec![])] {
+        let mut builder = table.new_read_builder();
+        builder.with_filter(
+            PredicateBuilder::new(table.schema().fields())
+                .equal("value", Datum::Int(value))
+                .unwrap(),
+        );
+        let plan = builder.new_scan().plan().await.unwrap();
+        assert_eq!(plan.snapshot_id(), Some(2));
+        assert_eq!(plan.splits().len(), 1);
+        let split = &plan.splits()[0];
+        assert!(!split.raw_convertible());
+        assert_eq!(split.data_files().len(), 2);
+        assert!(split.data_files().iter().all(|file| file.level == 0));
+        assert_eq!(rows(&builder, &plan).await, expected);
+    }
+}

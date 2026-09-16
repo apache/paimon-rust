@@ -120,6 +120,10 @@ Snapshot selectors in the schema's options still select the requested snapshot.
 Passing options to `new_read_builder(options)` instead uses the normal schema
 and snapshot time-travel resolution.
 
+For names containing dots, use `catalog.get_table(("namespace.database", "table.with.dots"))`
+to preserve the database and table components. Both string and tuple identifiers
+support `$branch_<name>` on the table component and reject system-table suffixes.
+
 For REST tables, first use `PaimonCatalog.get_table()`, then
 `table.copy_with_resolved_schema(schema_json, branch=None)`. This replaces the
 complete fields/options while retaining the table location, identity, FileIO

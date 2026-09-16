@@ -16,7 +16,7 @@
 # under the License.
 
 from os import PathLike
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, TypeAlias, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, TypeAlias, Union
 
 import pyarrow
 
@@ -187,7 +187,7 @@ class PaimonCatalog:
     def __datafusion_catalog_provider__(self, session: Any) -> object: ...
     def list_databases(self) -> List[str]: ...
     def list_tables(self, database_name: str) -> List[str]: ...
-    def get_table(self, identifier: str) -> Table: ...
+    def get_table(self, identifier: Union[str, Tuple[str, str]]) -> Table: ...
 
 class PythonScalarUDF:
     def __init__(
