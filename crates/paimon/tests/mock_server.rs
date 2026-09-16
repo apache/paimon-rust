@@ -769,6 +769,43 @@ impl RESTServer {
         (StatusCode::OK, Json(serde_json::json!(""))).into_response()
     }
 
+    /// Load the snapshot from the same filesystem fixtures used by table reads.
+    pub async fn load_snapshot(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let identifier = Identifier::new(&db, &table);
+        let parsed = identifier.parsed_object_name().unwrap();
+        let key = format!("{db}.{}", parsed.table());
+        let response = state.inner.lock().unwrap().tables.get(&key).cloned();
+        let Some(response) = response else {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        };
+        let location = response.path.unwrap();
+        let file_io = paimon::io::FileIO::from_path(&location)
+            .unwrap()
+            .build()
+            .unwrap();
+        let manager = paimon::table::SnapshotManager::new(file_io, location)
+            .with_branch(parsed.branch_or_default());
+        match manager.get_latest_snapshot().await {
+            Ok(snapshot) => (
+                StatusCode::OK,
+                Json(json!({
+                    "snapshot": snapshot.map(|snapshot| json!({"snapshot": snapshot}))
+                })),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "code": 500, "message": error.to_string()
+                })),
+            )
+                .into_response(),
+        }
+    }
+
     /// Handle GET /databases/:db/tables/:table - get a specific table.
     pub async fn get_table(
         Path((db, table)): Path<(String, String)>,
@@ -2097,6 +2134,10 @@ pub async fn start_mock_server(
     let app = Router::new()
         // Config endpoint (for RESTApi initialization)
         .route("/v1/config", get(RESTServer::get_config))
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/snapshot"),
+            get(RESTServer::load_snapshot),
+        )
         // Database routes
         .route(
             &format!("{prefix}/databases"),

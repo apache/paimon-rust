@@ -393,6 +393,23 @@ impl RESTApi {
         self.client.get(&path, None::<&[(&str, &str)]>).await
     }
 
+    /// Load the latest snapshot and statistics from the catalog.
+    pub async fn load_snapshot(
+        &self,
+        identifier: &Identifier,
+    ) -> Result<Option<super::TableSnapshot>> {
+        validate_non_empty_multi(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+        ])?;
+        let path = self
+            .resource_paths
+            .table_snapshot(identifier.database(), identifier.object());
+        let response: super::GetTableSnapshotResponse =
+            self.client.get(&path, None::<&[(&str, &str)]>).await?;
+        Ok(response.snapshot)
+    }
+
     /// Rename a table.
     pub async fn rename_table(&self, source: &Identifier, destination: &Identifier) -> Result<()> {
         validate_non_empty_multi(&[

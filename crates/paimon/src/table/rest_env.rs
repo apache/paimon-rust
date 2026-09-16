@@ -305,6 +305,27 @@ impl RESTEnv {
         builder.build()
     }
 
+    /// Load the authoritative latest snapshot, scoped to this table's branch.
+    pub(crate) async fn load_snapshot(
+        &self,
+        branch: &str,
+    ) -> Result<Option<crate::spec::Snapshot>> {
+        let object = self.identifier.parsed_object_name()?.table().to_string();
+        let object = if branch == crate::catalog::DEFAULT_MAIN_BRANCH {
+            object
+        } else {
+            format!("{object}$branch_{branch}")
+        };
+        let identifier = Identifier::new(self.identifier.database(), object);
+        match self.api.load_snapshot(&identifier).await {
+            Ok(snapshot) => Ok(snapshot.map(|snapshot| snapshot.snapshot)),
+            Err(Error::RestApi {
+                source: RestError::NoSuchResource { resource_type, .. },
+            }) if resource_type.as_deref() == Some("SNAPSHOT") => Ok(None),
+            Err(error) => Err(map_rest_error_for_table(error, &identifier)),
+        }
+    }
+
     /// Create a `RESTSnapshotCommit` from this environment.
     pub fn snapshot_commit(&self) -> Arc<dyn SnapshotCommit> {
         Arc::new(RESTSnapshotCommit::new(

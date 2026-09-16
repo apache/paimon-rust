@@ -52,8 +52,9 @@ use serde_json::json;
 
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse, CreateTableRequest,
-    ErrorResponse, GetDatabaseResponse, GetTableResponse, ListDatabasesResponse,
-    ListPartitionsResponse, ListTablesResponse, RESTUtil, RenameTableRequest, ResourcePaths,
+    ErrorResponse, GetDatabaseResponse, GetTableResponse, GetTableSnapshotResponse,
+    ListDatabasesResponse, ListPartitionsResponse, ListTablesResponse, RESTUtil,
+    RenameTableRequest, ResourcePaths, TableSnapshot,
 };
 use paimon::catalog::{list_partitions_from_file_system, Catalog, Identifier};
 use paimon::common::{CatalogOptions, Options};
@@ -164,6 +165,10 @@ fn build_router(prefix: &str, state: Arc<AppState>) -> Router {
         .route(
             &format!("{base}/databases/:db/tables/:table"),
             get(get_table).post(alter_table).delete(drop_table),
+        )
+        .route(
+            &format!("{base}/databases/:db/tables/:table/snapshot"),
+            get(load_snapshot),
         )
         .route(&format!("{base}/tables/rename"), post(rename_table))
         .route(
@@ -519,6 +524,44 @@ async fn commit(
     match manager.commit_snapshot(&request.snapshot).await {
         Ok(success) => (StatusCode::OK, Json(json!({ "success": success }))).into_response(),
         Err(e) => error_response(e),
+    }
+}
+
+/// Load the latest snapshot from the filesystem catalog, respecting branch suffixes.
+async fn load_snapshot(path: RestPath, Extension(state): Extension<Arc<AppState>>) -> Response {
+    let identifier = Identifier::new(path.get("db"), path.get("table"));
+    let parsed = match identifier.parsed_object_name() {
+        Ok(parsed) if parsed.system_table().is_none() => parsed,
+        Ok(_) => {
+            return error_response(Error::Unsupported {
+                message: "System tables do not expose a table snapshot".to_string(),
+            })
+        }
+        Err(error) => return error_response(error),
+    };
+    let base = Identifier::new(identifier.database(), parsed.table());
+    let table = match state.catalog.get_table(&base).await {
+        Ok(table) => table,
+        Err(error) => return error_response(error),
+    };
+    let manager = table
+        .snapshot_manager()
+        .with_branch(parsed.branch_or_default());
+    match manager.get_latest_snapshot().await {
+        Ok(snapshot) => {
+            let response = GetTableSnapshotResponse {
+                snapshot: snapshot.map(|snapshot| TableSnapshot {
+                    record_count: snapshot.total_record_count(),
+                    snapshot,
+                    // The snapshot alone does not contain these statistics.
+                    file_size_in_bytes: None,
+                    file_count: None,
+                    last_file_creation_time: None,
+                }),
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(error) => error_response(error),
     }
 }
 

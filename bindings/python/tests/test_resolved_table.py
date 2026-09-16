@@ -152,3 +152,45 @@ def test_resolved_schema_keeps_query_authorization_guard(resolved_source):
         builder.new_scan().plan()
     with pytest.raises(NotImplementedError, match="query-auth"):
         builder.new_read().read([])
+
+
+def test_catalog_schema_copy_replaces_options_and_keeps_branch(resolved_source):
+    root, schema = resolved_source
+    original = Table.from_resolved_schema(str(root), json.dumps(schema))
+    schema["options"]["scan.snapshot-id"] = "1"
+    historical = original.copy_with_resolved_schema(json.dumps(schema))
+    assert _read(historical) == (1, [{"id": 1, "name": "a"}])
+    schema["options"].pop("scan.snapshot-id")
+    schema["fields"][1]["name"] = "renamed"
+    schema["id"] = 1
+    resolved = historical.copy_with_resolved_schema(json.dumps(schema))
+    assert _read(resolved, {"method": "equal", "field": "renamed", "literals": ["b"]}) == (
+        2, [{"id": 2, "renamed": "b"}])
+    assert _read(historical)[0] == 1
+    branch_root = root / "branch" / "branch-dev"
+    (branch_root / "snapshot").mkdir(parents=True)
+    shutil.copy(root / "snapshot" / "snapshot-1", branch_root / "snapshot" / "snapshot-1")
+    # No branch schema file: the catalog has already provided the complete schema.
+    branch = resolved.copy_with_resolved_schema(json.dumps(schema), branch="dev")
+    assert branch.branch() == "dev"
+    assert branch.new_read_builder().new_scan().plan().snapshot_id() == 1
+    assert branch.copy_with_resolved_schema(json.dumps(schema)).branch() == "dev"
+    assert branch.copy_with_resolved_schema(json.dumps(schema), branch="main").latest_snapshot().id() == 2
+
+
+@pytest.mark.parametrize("schema_json", ["{", "{}"])
+def test_catalog_schema_copy_rejects_invalid_json(resolved_source, schema_json):
+    root, schema = resolved_source
+    table = Table.from_resolved_schema(str(root), json.dumps(schema))
+    with pytest.raises(ValueError, match="Invalid table schema JSON"):
+        table.copy_with_resolved_schema(schema_json)
+
+
+def test_catalog_schema_copy_validates_branch_and_structure(resolved_source):
+    root, schema = resolved_source
+    table = Table.from_resolved_schema(str(root), json.dumps(schema))
+    with pytest.raises(ValueError):
+        table.copy_with_resolved_schema(json.dumps(schema), branch="../escape")
+    schema["fields"][1]["id"] = schema["fields"][0]["id"]
+    with pytest.raises(ValueError):
+        table.copy_with_resolved_schema(json.dumps(schema))
