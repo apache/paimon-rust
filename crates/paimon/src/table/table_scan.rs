@@ -2260,6 +2260,26 @@ impl<'a> PaimonTableScan<'a> {
 
                     result
                 }
+            } else if pk_comparator.is_some()
+                && (deletion_vectors_enabled
+                    || matches!(
+                        core_options.merge_engine(),
+                        Ok(crate::spec::MergeEngine::FirstRow)
+                    ))
+                && data_files.iter().all(|file| {
+                    file.level != 0 && file.delete_row_count.is_none_or(|count| count == 0)
+                })
+            {
+                // Java MergeTreeSplitGenerator packs materialized DV/first-row
+                // files by size even across levels. Clustered files need not be
+                // sorted by PK, so marking them as merge-required is unsafe.
+                split_for_batch(data_files, target_split_size, open_file_cost)
+                    .into_iter()
+                    .map(|files| SplitGroup {
+                        files,
+                        raw_convertible: true,
+                    })
+                    .collect()
             } else if let Some(ref comparator) = pk_comparator {
                 // Merge-tree path: keep key-overlapping files in one split and
                 // mark which splits the sort-merge reader can skip (mirrors

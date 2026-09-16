@@ -160,3 +160,80 @@ async fn first_row_incremental_preserves_events_instead_of_merging() {
         vec![(1, 10), (1, 99), (2, 20), (3, 30)]
     );
 }
+
+#[tokio::test]
+async fn materialized_dv_files_use_raw_size_packing_across_levels() {
+    for engine in ["deduplicate", "first-row"] {
+        for merge_on_read in ["false", "true"] {
+            for (target_size, expected_splits) in [("1b", 2), ("1mb", 1)] {
+                let path =
+                    format!("memory:/materialized_dv/{engine}/{merge_on_read}/{target_size}");
+                // Model Java-created clustering metadata. Rust's create-time
+                // validation still rejects first-row DVs; resolved table reads
+                // must nevertheless support this Java-valid combination.
+                let schema = pk_schema(&[("merge-engine", engine)]);
+                let options = [
+                    ("merge-engine", engine),
+                    ("deletion-vectors.enabled", "true"),
+                    ("deletion-vectors.merge-on-read", merge_on_read),
+                    ("pk-clustering-override", "true"),
+                    ("clustering.columns", "value"),
+                    ("source.split.target-size", target_size),
+                    ("source.split.open-file-cost", "1b"),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()));
+                let schema = schema.copy_with_options(options.collect());
+                let (io, table) = memory_table(&path, schema);
+                setup_dirs(&io, &path).await;
+                persist_table_schema(&io, &path, table.schema()).await;
+                // Materialized files can have overlapping min/max keys across
+                // levels without sharing a live key (e.g. clustered output).
+                for (level, ids, values) in
+                    [(1, vec![1, 3], vec![10, 30]), (2, vec![2, 4], vec![20, 40])]
+                {
+                    let builder = table.new_write_builder();
+                    let mut writer = builder.new_write().unwrap();
+                    writer
+                        .write_arrow_batch(&make_batch(ids, values))
+                        .await
+                        .unwrap();
+                    let mut messages = writer.prepare_commit().await.unwrap();
+                    for message in &mut messages {
+                        for file in &mut message.new_files {
+                            file.level = level;
+                        }
+                    }
+                    builder.new_commit().commit(messages).await.unwrap();
+                }
+                let builder = table.new_read_builder();
+                let plan = builder.new_scan().plan().await.unwrap();
+                assert_eq!(plan.splits().len(), expected_splits, "{path}");
+                assert!(
+                    plan.splits().iter().all(|split| split.raw_convertible()),
+                    "{path}"
+                );
+                assert_eq!(
+                    rows(&builder, &plan).await,
+                    vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+                );
+
+                // Adding overlapping L0 must still keep every key version in
+                // one merge split, even when the size target is one byte.
+                write_batch(&table, &make_batch(vec![1, 5], vec![99, 50])).await;
+                let builder = table.new_read_builder();
+                let plan = builder.new_scan().plan().await.unwrap();
+                let mut expected = vec![(1, 10), (2, 20), (3, 30), (4, 40)];
+                if merge_on_read == "true" {
+                    assert_eq!(plan.splits().len(), 1, "{path}");
+                    assert!(!plan.splits()[0].raw_convertible(), "{path}");
+                    if engine == "deduplicate" {
+                        expected[0].1 = 99;
+                    }
+                    expected.push((5, 50));
+                }
+                assert_eq!(rows(&builder, &plan).await, expected, "{path}");
+            }
+        }
+    }
+}

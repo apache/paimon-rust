@@ -107,6 +107,20 @@ print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
 
+### Tables resolved outside the Rust catalog
+
+`Table.from_resolved_schema(location, schema_json, *, database="default",
+table="table", branch="main", options=None)` accepts a Java-format TableSchema
+JSON document. It preserves the supplied fields, field IDs and complete table
+options, including removed options, without reloading a catalog schema.
+`options` configures FileIO; `branch` selects the snapshot/schema/tag namespace.
+
+Use `new_read_builder()` without extra options to keep that resolved schema.
+Snapshot selectors in the schema's options still select the requested snapshot.
+Passing options to `new_read_builder(options)` instead uses the normal schema
+and snapshot time-travel resolution. REST authorization and refreshing catalog
+credentials require `PaimonCatalog.get_table()`.
+
 ## Setup
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/):

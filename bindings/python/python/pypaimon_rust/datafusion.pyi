@@ -109,6 +109,19 @@ class PartitionStat:
     def total_size_bytes(self) -> int: ...
 
 class Table:
+    @staticmethod
+    def from_resolved_schema(
+        location: str, schema_json: str, *, database: str = "default",
+        table: str = "table", branch: str = "main",
+        options: Optional[Dict[str, str]] = None,
+    ) -> "Table":
+        """Preserve a resolved Java-format TableSchema; options configures FileIO.
+
+        No catalog lookup or schema time-travel resolution is performed. Snapshot
+        selection still uses the supplied schema's options. Use a catalog when
+        REST authorization or credential refresh is required.
+        """
+        ...
     def identifier(self) -> str: ...
     def branch(self) -> str: ...
     def location(self) -> str: ...
