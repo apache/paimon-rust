@@ -116,6 +116,7 @@ pub struct TableCommit {
     manifest_compression: String,
     manifest_target_size: i64,
     manifest_merge_min_count: usize,
+    manifest_sort_enabled: bool,
     row_tracking_enabled: bool,
     data_evolution_enabled: bool,
     partition_default_name: String,
@@ -140,6 +141,7 @@ impl TableCommit {
         let manifest_compression = core_options.manifest_compression().to_string();
         let manifest_target_size = core_options.manifest_target_size();
         let manifest_merge_min_count = core_options.manifest_merge_min_count();
+        let manifest_sort_enabled = core_options.manifest_sort_enabled();
         let row_tracking_enabled = core_options.row_tracking_enabled();
         let data_evolution_enabled = core_options.data_evolution_enabled();
         let partition_default_name = core_options.partition_default_name().to_string();
@@ -156,6 +158,7 @@ impl TableCommit {
             manifest_compression,
             manifest_target_size,
             manifest_merge_min_count,
+            manifest_sort_enabled,
             row_tracking_enabled,
             data_evolution_enabled,
             partition_default_name,
@@ -1059,6 +1062,23 @@ impl TableCommit {
         if entries.is_empty() {
             return Ok(vec![]);
         }
+
+        // Java's bucket-first manifest layout is selected for fixed and
+        // postponed bucket tables when manifest sorting is enabled. Data
+        // evolution keeps its row-id-oriented layout and is intentionally not
+        // reordered here.
+        let mut sorted_entries = None;
+        if self.manifest_sort_enabled
+            && (self.total_buckets > 0 || self.total_buckets == POSTPONE_BUCKET)
+            && !self.data_evolution_enabled
+        {
+            let mut owned = entries.to_vec();
+            let partition_fields = self.table.schema().partition_fields();
+            let partition_sort_type = partition_fields.first().map(|field| field.data_type());
+            sort_manifest_entries_bucket_first(&mut owned, partition_sort_type)?;
+            sorted_entries = Some(owned);
+        }
+        let entries = sorted_entries.as_deref().unwrap_or(entries);
 
         let target_size = self.manifest_target_size.max(1) as usize;
         let mut result = Vec::new();
@@ -2931,6 +2951,54 @@ impl TableCommit {
     }
 }
 
+fn sort_manifest_entries_bucket_first(
+    entries: &mut [ManifestEntry],
+    partition_sort_type: Option<&DataType>,
+) -> Result<()> {
+    let mut keyed = entries
+        .iter()
+        .cloned()
+        .map(|entry| {
+            let partition_key = match partition_sort_type {
+                Some(data_type) if !entry.partition().is_empty() => {
+                    let row = BinaryRow::from_serialized_bytes(entry.partition())?;
+                    extract_datum(&row, 0, data_type)?
+                }
+                _ => None,
+            };
+            Ok((entry, partition_key))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    keyed.sort_by(|(left, left_partition), (right, right_partition)| {
+        left.bucket()
+            .cmp(&right.bucket())
+            .then_with(|| compare_partition_sort_keys(left_partition, right_partition))
+            .then_with(|| file_kind_order(left.kind()).cmp(&file_kind_order(right.kind())))
+            .then_with(|| left.file().file_name.cmp(&right.file().file_name))
+    });
+    for (target, (entry, _)) in entries.iter_mut().zip(keyed) {
+        *target = entry;
+    }
+    Ok(())
+}
+
+fn compare_partition_sort_keys(left: &Option<Datum>, right: &Option<Datum>) -> std::cmp::Ordering {
+    match (left, right) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left), Some(right)) => left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal),
+    }
+}
+
+fn file_kind_order(kind: &FileKind) -> u8 {
+    match kind {
+        FileKind::Add => 0,
+        FileKind::Delete => 1,
+    }
+}
+
 /// Serialized BinaryRow for partition stats; unlike `datums_to_binary_row`, returns a
 /// valid arity-N row even when every datum is `None` (the all-null case must still
 /// decode on the Java side).
@@ -3309,6 +3377,84 @@ mod tests {
             value_stats_cols: None,
             column_max_sequence_numbers: None,
         }
+    }
+
+    #[test]
+    fn test_manifest_entries_sort_bucket_first() {
+        let mut entries = vec![
+            ManifestEntry::new(
+                FileKind::Delete,
+                vec![2],
+                1,
+                4,
+                test_data_file("delete-bucket-1.parquet", 1),
+                2,
+            ),
+            ManifestEntry::new(
+                FileKind::Add,
+                vec![2],
+                0,
+                4,
+                test_data_file("add-partition-2.parquet", 1),
+                2,
+            ),
+            ManifestEntry::new(
+                FileKind::Delete,
+                vec![1],
+                0,
+                4,
+                test_data_file("delete-partition-1.parquet", 1),
+                2,
+            ),
+            ManifestEntry::new(
+                FileKind::Add,
+                vec![1],
+                0,
+                4,
+                test_data_file("add-partition-1.parquet", 1),
+                2,
+            ),
+        ];
+
+        sort_manifest_entries_bucket_first(&mut entries, None).unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (
+                    entry.bucket(),
+                    entry.partition().to_vec(),
+                    *entry.kind(),
+                    entry.file().file_name.clone(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    0,
+                    vec![1],
+                    FileKind::Add,
+                    "add-partition-1.parquet".to_string(),
+                ),
+                (
+                    0,
+                    vec![2],
+                    FileKind::Add,
+                    "add-partition-2.parquet".to_string(),
+                ),
+                (
+                    0,
+                    vec![1],
+                    FileKind::Delete,
+                    "delete-partition-1.parquet".to_string(),
+                ),
+                (
+                    1,
+                    vec![2],
+                    FileKind::Delete,
+                    "delete-bucket-1.parquet".to_string(),
+                ),
+            ]
+        );
     }
 
     fn test_global_index_file(
@@ -5924,6 +6070,76 @@ mod tests {
         assert_eq!(file_names.len(), 2500);
         assert!(file_names.contains("data-0000.parquet"));
         assert!(file_names.contains("data-2499.parquet"));
+    }
+
+    #[tokio::test]
+    async fn test_manifest_sort_option_writes_bucket_first() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_manifest_bucket_sort";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([
+                ("bucket".to_string(), "2".to_string()),
+                ("manifest-sort.enabled".to_string(), "true".to_string()),
+            ]),
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
+        let entries = vec![
+            ManifestEntry::new(
+                FileKind::Add,
+                vec![],
+                1,
+                2,
+                test_data_file("bucket-1.parquet", 1),
+                2,
+            ),
+            ManifestEntry::new(
+                FileKind::Add,
+                vec![],
+                0,
+                2,
+                test_data_file("bucket-0-b.parquet", 1),
+                2,
+            ),
+            ManifestEntry::new(
+                FileKind::Add,
+                vec![],
+                0,
+                2,
+                test_data_file("bucket-0-a.parquet", 1),
+                2,
+            ),
+        ];
+
+        let manifest_dir = format!("{table_path}/manifest");
+        let metas = commit
+            .write_manifest_files(&file_io, &manifest_dir, "manifest-test", &entries)
+            .await
+            .unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].min_bucket(), Some(0));
+        assert_eq!(metas[0].max_bucket(), Some(1));
+
+        let written = Manifest::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", metas[0].file_name()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            written
+                .iter()
+                .map(|entry| (entry.bucket(), entry.file().file_name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "bucket-0-a.parquet"),
+                (0, "bucket-0-b.parquet"),
+                (1, "bucket-1.parquet"),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -88,6 +88,7 @@ const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
 const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
 const MANIFEST_MERGE_MIN_COUNT_OPTION: &str = "manifest.merge-min-count";
+const MANIFEST_SORT_ENABLED_OPTION: &str = "manifest-sort.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
@@ -1163,6 +1164,14 @@ impl<'a> CoreOptions<'a> {
             .and_then(|v| v.parse().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_MANIFEST_MERGE_MIN_COUNT)
+    }
+
+    /// Whether manifest compaction writes entries in a pruning-friendly sort
+    /// order. Disabled by default, matching Java Paimon.
+    pub fn manifest_sort_enabled(&self) -> bool {
+        self.options
+            .get(MANIFEST_SORT_ENABLED_OPTION)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
     }
 
     /// Number of buckets for the table. Default is -1 (dynamic bucket).
@@ -2562,6 +2571,7 @@ mod tests {
         assert_eq!(core.manifest_compression(), "zstd");
         assert_eq!(core.manifest_target_size(), 8 * 1024 * 1024);
         assert_eq!(core.manifest_merge_min_count(), 30);
+        assert!(!core.manifest_sort_enabled());
     }
 
     #[test]
@@ -2579,6 +2589,7 @@ mod tests {
             ),
             (MANIFEST_COMPRESSION_OPTION.to_string(), "null".to_string()),
             (MANIFEST_MERGE_MIN_COUNT_OPTION.to_string(), "3".to_string()),
+            (MANIFEST_SORT_ENABLED_OPTION.to_string(), "true".to_string()),
         ]);
         let core = CoreOptions::new(&options);
         assert_eq!(core.bucket(), 4);
@@ -2590,6 +2601,7 @@ mod tests {
         assert_eq!(core.manifest_compression(), "null");
         assert_eq!(core.manifest_target_size(), 1024);
         assert_eq!(core.manifest_merge_min_count(), 3);
+        assert!(core.manifest_sort_enabled());
     }
 
     #[test]
