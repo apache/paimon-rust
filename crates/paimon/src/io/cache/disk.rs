@@ -243,7 +243,13 @@ impl DiskCache {
                 return;
             }
         };
-        if let Err(error) = temporary_file.write_all(&encoded).await {
+        let write_result = async {
+            temporary_file.write_all(&encoded).await?;
+            // Tokio may return from write_all before the blocking write completes.
+            temporary_file.flush().await
+        }
+        .await;
+        if let Err(error) = write_result {
             log::debug!(
                 "Failed to write local cache temporary block '{}': {error}",
                 temporary.display()
@@ -846,6 +852,11 @@ mod tests {
 
         let cache = DiskCache::new(directory.path(), None).unwrap();
         cache.put_block(&key, payload.clone()).await;
+        // Check publication without scheduling another Tokio filesystem operation.
+        assert_eq!(
+            std::fs::read(directory.path().join(key.cache_relative_path())).unwrap(),
+            encode_block(&key, &payload)
+        );
         assert_eq!(cache.get_block(&key).await, Some(payload.clone()));
         drop(cache);
 
