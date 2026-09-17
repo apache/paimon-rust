@@ -104,6 +104,13 @@ pub struct ManifestFileMeta {
     )]
     max_row_id: Option<i64>,
 
+    /// Common positive bucket count recorded by an external manifest writer.
+    ///
+    /// Rust consumes this field for manifest pruning but intentionally does not
+    /// serialize it into manifest lists.
+    #[serde(rename = "_TOTAL_BUCKETS", default, skip_serializing)]
+    total_buckets: Option<i32>,
+
     /// Files owned by this manifest and sharing its lifecycle.
     ///
     /// `None` preserves the distinction between legacy manifest lists (where the
@@ -195,6 +202,12 @@ impl ManifestFileMeta {
         self.max_row_id
     }
 
+    /// Get the common positive bucket count for entries in this manifest.
+    #[inline]
+    pub fn total_buckets(&self) -> Option<i32> {
+        self.total_buckets
+    }
+
     /// Get files owned by this manifest, if the metadata was recorded.
     #[inline]
     pub fn extra_files(&self) -> Option<&[String]> {
@@ -231,6 +244,15 @@ impl ManifestFileMeta {
         self
     }
 
+    /// Attach external manifest metadata in read-path tests.
+    #[cfg(test)]
+    #[inline]
+    #[must_use]
+    pub(crate) fn with_total_buckets(mut self, total_buckets: Option<i32>) -> Self {
+        self.total_buckets = total_buckets.filter(|value| *value > 0);
+        self
+    }
+
     /// Attach files whose lifecycle is owned by this manifest.
     #[inline]
     #[must_use]
@@ -262,6 +284,7 @@ impl ManifestFileMeta {
             max_level: None,
             min_row_id: None,
             max_row_id: None,
+            total_buckets: None,
             extra_files: None,
         }
     }
@@ -282,6 +305,7 @@ impl ManifestFileMeta {
         max_level: Option<i32>,
         min_row_id: Option<i64>,
         max_row_id: Option<i64>,
+        total_buckets: Option<i32>,
         extra_files: Option<Vec<String>>,
     ) -> ManifestFileMeta {
         Self {
@@ -298,6 +322,7 @@ impl ManifestFileMeta {
             max_level,
             min_row_id,
             max_row_id,
+            total_buckets,
             extra_files,
         }
     }
