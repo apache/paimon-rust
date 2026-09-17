@@ -199,6 +199,7 @@ mod tests {
                 "_MAX_LEVEL",
                 "_MIN_ROW_ID",
                 "_MAX_ROW_ID",
+                "_EXTRA_FILES",
             ],
         );
         assert_record_field_order(
@@ -228,12 +229,74 @@ mod tests {
             None,
             Some(100),
             Some(199),
+            None,
+            Some(vec!["manifest-row-tracking-0.idx".to_string()]),
         )];
         let bytes = to_avro_bytes(MANIFEST_FILE_META_SCHEMA, &original).unwrap();
         let decoded = from_avro_bytes::<ManifestFileMeta>(&bytes).unwrap();
         assert_eq!(original, decoded);
         assert_eq!(decoded[0].min_row_id(), Some(100));
         assert_eq!(decoded[0].max_row_id(), Some(199));
+        assert_eq!(
+            decoded[0].extra_files(),
+            Some(["manifest-row-tracking-0.idx".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn test_read_manifest_file_meta_total_buckets_without_writing_it() {
+        assert!(!MANIFEST_FILE_META_SCHEMA.contains("_TOTAL_BUCKETS"));
+
+        let original = vec![ManifestFileMeta::new(
+            "manifest-java-0".to_string(),
+            1024,
+            5,
+            0,
+            BinaryTableStats::empty(),
+            0,
+        )
+        .with_bucket_level_stats(Some(2), Some(2), Some(0), Some(0))];
+        let bytes = to_avro_bytes(MANIFEST_FILE_META_SCHEMA, &original).unwrap();
+        let mut value = Reader::new(bytes.as_slice())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let fields = match &mut value {
+            Value::Union(_, record) => match record.as_mut() {
+                Value::Record(fields) => fields,
+                other => panic!("Expected an Avro record, got {other:?}"),
+            },
+            other => panic!("Expected an Avro union, got {other:?}"),
+        };
+        let extra_files_index = fields
+            .iter()
+            .position(|(name, _)| name == "_EXTRA_FILES")
+            .unwrap();
+        fields.insert(
+            extra_files_index,
+            (
+                "_TOTAL_BUCKETS".to_string(),
+                Value::Union(1, Box::new(Value::Int(8))),
+            ),
+        );
+
+        let java_schema = MANIFEST_FILE_META_SCHEMA.replacen(
+            r#"{"name": "_EXTRA_FILES", "type": ["null", {"type": "array", "items": "string"}], "default": null}"#,
+            concat!(
+                r#"{"name": "_TOTAL_BUCKETS", "type": ["null", "int"], "default": null},"#,
+                "\n        ",
+                r#"{"name": "_EXTRA_FILES", "type": ["null", {"type": "array", "items": "string"}], "default": null}"#
+            ),
+            1,
+        );
+        let schema = Schema::parse_str(&java_schema).unwrap();
+        let mut writer = Writer::new(&schema, Vec::new());
+        writer.append(value).unwrap();
+        let bytes = writer.into_inner().unwrap();
+
+        let decoded = from_avro_bytes_fast::<ManifestFileMeta>(&bytes).unwrap();
+        assert_eq!(decoded[0].total_buckets(), Some(8));
     }
 
     #[test]

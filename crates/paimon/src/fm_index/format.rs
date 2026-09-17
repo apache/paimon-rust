@@ -18,7 +18,7 @@
 //! Java-compatible V1 FM-index container format.
 
 use crate::btree::{
-    compress_block, compute_crc32, decompress_block_with_expected_size, BlockCompressionType,
+    compress_codec_block, compute_crc32, decompress_codec_block, BlockCompressionType,
 };
 use crate::io::FileRead;
 use std::io;
@@ -404,8 +404,11 @@ pub(crate) fn write_block(
     let offset = base_offset
         .checked_add(out.len() as u64)
         .ok_or_else(|| invalid_input("FM output offset overflow"))?;
+    // Java's `FMIndexFile#writeBlock` stores the compressor's output verbatim and
+    // records `storedLength = compressedLength`, so this format carries no outer
+    // uncompressed-size varint — unlike the SST and bitmap block formats.
     let (stored, actual_compression) =
-        compress_block(uncompressed, compression, compression_level)?;
+        compress_codec_block(uncompressed, compression, compression_level)?;
     let checksum = compute_crc32(stored.as_ref(), actual_compression);
     let stored_length = stored.len();
     out.extend_from_slice(stored.as_ref());
@@ -1078,7 +1081,7 @@ fn decode_stored_block(stored: &[u8], block: BlockInfo) -> io::Result<Vec<u8>> {
         }
         return Ok(stored.to_vec());
     }
-    decompress_block_with_expected_size(stored, block.compression, block.uncompressed_length)
+    decompress_codec_block(stored, block.compression, block.uncompressed_length)
 }
 
 fn validate_footer_common(bytes: &[u8], magic: u32, scope: &str) -> io::Result<()> {
@@ -1637,5 +1640,66 @@ mod tests {
             compute_crc32(b"123456789", BlockCompressionType::None),
             0x00c4_9e49
         );
+    }
+
+    /// A block the size of a packed rank block, compressible enough that both
+    /// writers keep the compressed form (Java and Rust both require a 12.5% saving).
+    fn compressible_block() -> Vec<u8> {
+        (0..BLOCK_WORDS as u32 * 8)
+            .map(|i| (i / 97) as u8)
+            .collect()
+    }
+
+    /// What Java's `FMIndexFile#writeBlock` stores: `BlockCompressor#compress`
+    /// output verbatim. For LZ4 that is `[le32 compressedLength][le32 srcLen]`
+    /// followed by the payload; for ZSTD the bare frame.
+    fn java_stored_block(plain: &[u8], compression: BlockCompressionType) -> Vec<u8> {
+        match compression {
+            BlockCompressionType::Lz4 => {
+                let payload = lz4_flex::block::compress(plain);
+                let mut stored = Vec::with_capacity(8 + payload.len());
+                stored.extend_from_slice(&(payload.len() as i32).to_le_bytes());
+                stored.extend_from_slice(&(plain.len() as i32).to_le_bytes());
+                stored.extend_from_slice(&payload);
+                stored
+            }
+            BlockCompressionType::Zstd => zstd::bulk::compress(plain, 1).unwrap(),
+            other => panic!("unsupported in this fixture: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stores_blocks_in_javas_codec_envelope() {
+        let plain = compressible_block();
+        for compression in [BlockCompressionType::Lz4, BlockCompressionType::Zstd] {
+            let expected = java_stored_block(&plain, compression);
+
+            // Read side: a block written by Java must decode.
+            let block = BlockInfo {
+                offset: 0,
+                stored_length: expected.len(),
+                uncompressed_length: plain.len(),
+                compression,
+                checksum: compute_crc32(&expected, compression),
+            };
+            assert_eq!(
+                decode_stored_block(&expected, block).unwrap(),
+                plain,
+                "{compression:?}"
+            );
+
+            // Write side: the bytes Rust stores must be the ones Java expects.
+            let mut out = Vec::new();
+            let info = write_block(&mut out, 0, &plain, compression, 1).unwrap();
+            assert_eq!(info.compression, compression, "{compression:?}");
+            assert_eq!(info.stored_length, expected.len(), "{compression:?}");
+            assert_eq!(info.uncompressed_length, plain.len(), "{compression:?}");
+            assert_eq!(out, expected, "{compression:?}");
+            assert_eq!(
+                decode_stored_block(&out, info).unwrap(),
+                plain,
+                "{compression:?}"
+            );
+        }
     }
 }

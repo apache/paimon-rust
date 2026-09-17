@@ -97,7 +97,8 @@ mod tests {
                 0,
                 BinaryTableStats::new(value_bytes.clone(), value_bytes.clone(), vec![Some(3)]),
                 1,
-            ),
+            )
+            .with_extra_files(Some(Vec::new())),
         ];
 
         ManifestList::write(&file_io, path, &original)
@@ -270,5 +271,6 @@ mod tests {
         assert_eq!(decoded[0].max_bucket(), None);
         assert_eq!(decoded[0].min_level(), None);
         assert_eq!(decoded[0].max_level(), None);
+        assert_eq!(decoded[0].extra_files(), None);
     }
 }

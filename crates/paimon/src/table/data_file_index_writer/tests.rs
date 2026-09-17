@@ -357,6 +357,15 @@ async fn test_file_index_skips_unsupported_identifier_groups() {
 }
 
 #[test]
+fn test_file_index_read_only_index_does_not_enable_generation() {
+    assert!(FileIndexerFactory::is_supported("range-bitmap"));
+    let schema = schema(&[("file-index.range-bitmap.columns", "id")]);
+    assert!(FileIndexOptions::parse(schema.options(), schema.fields())
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn test_file_index_skips_unsupported_options_without_columns() {
     let schema = schema(&[
         ("file-index.bsi.id.version", "upstream-specific"),

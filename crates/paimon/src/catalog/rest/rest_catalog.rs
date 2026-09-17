@@ -27,7 +27,10 @@ use async_trait::async_trait;
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
-use crate::api::PagedList;
+use crate::api::{
+    DataPolicy, GetTagResponse, ListPermissionsRequest, ListPoliciesRequest, PagedList,
+    PermissionAssignment, PermissionResource, PolicyType,
+};
 use crate::catalog::{
     list_partitions_from_file_system, Catalog, Database, Identifier, DB_LOCATION_PROP,
 };
@@ -124,6 +127,67 @@ impl RESTCatalog {
     ) -> Result<PagedList<String>> {
         self.api
             .list_databases_paged(max_results, page_token, database_name_pattern)
+            .await
+    }
+
+    // ======================= permission management ==========================
+    //
+    // Like Java's `RESTCatalog.permissionManagement()`, these live on the REST catalog only
+    // and are deliberately not part of the `Catalog` trait.
+
+    pub async fn list_permissions_paged(
+        &self,
+        request: &ListPermissionsRequest,
+    ) -> Result<PagedList<PermissionAssignment>> {
+        self.api.list_permissions_paged(request).await
+    }
+
+    pub async fn grant_permission(&self, assignment: &PermissionAssignment) -> Result<()> {
+        self.api.grant_permission(assignment).await
+    }
+
+    pub async fn revoke_permission(
+        &self,
+        resource: &PermissionResource,
+        access: &str,
+        principal: &str,
+    ) -> Result<()> {
+        self.api
+            .revoke_permission(resource, access, principal)
+            .await
+    }
+
+    // ======================= policy management ==============================
+    //
+    // Java `RESTCatalog.policyManagement()`.
+
+    pub async fn list_policies_paged(
+        &self,
+        request: &ListPoliciesRequest,
+    ) -> Result<PagedList<DataPolicy>> {
+        self.api.list_policies_paged(request).await
+    }
+
+    pub async fn create_policy(&self, policy: &DataPolicy) -> Result<()> {
+        self.api.create_policy(policy).await
+    }
+
+    pub async fn drop_policy(
+        &self,
+        resource: &PermissionResource,
+        policy_type: PolicyType,
+        principal: &str,
+        column: Option<&str>,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        self.api
+            .drop_policy(
+                resource,
+                policy_type,
+                principal,
+                column,
+                ignore_if_not_exists,
+            )
             .await
     }
 }
@@ -328,6 +392,57 @@ impl Catalog for RESTCatalog {
         })
     }
 
+    async fn create_tag(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        let result = self
+            .api
+            .create_tag(identifier, tag_name, snapshot_id)
+            .await
+            .map_err(|error| map_rest_error_for_tag(error, identifier, tag_name, snapshot_id));
+        ignore_error_if(result, |error| {
+            ignore_if_exists && matches!(error, Error::TagAlreadyExist { .. })
+        })
+    }
+
+    async fn get_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<GetTagResponse> {
+        let response = self
+            .api
+            .get_tag(identifier, tag_name)
+            .await
+            .map_err(|error| map_rest_error_for_tag(error, identifier, tag_name, None))?;
+        if response.tag_name != tag_name {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "REST catalog returned tag '{}' for requested tag '{tag_name}'",
+                    response.tag_name
+                ),
+                source: None,
+            });
+        }
+        Ok(response)
+    }
+
+    async fn delete_tag(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        let result = self
+            .api
+            .delete_tag(identifier, tag_name)
+            .await
+            .map_err(|error| map_rest_error_for_tag(error, identifier, tag_name, None));
+        ignore_error_if(result, |error| {
+            ignore_if_not_exists && matches!(error, Error::TagNotExist { .. })
+        })
+    }
+
     async fn create_view(
         &self,
         identifier: &Identifier,
@@ -451,6 +566,35 @@ impl Catalog for RESTCatalog {
                 )
                 .await
                 .map_err(|error| map_rest_error_for_create_partitions(error, identifier))?;
+        }
+        Ok(())
+    }
+
+    async fn drop_partitions(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<()> {
+        if partition_specs.is_empty() {
+            return Ok(());
+        }
+        // The endpoint only unregisters metadata, which is the whole drop only for a Format Table
+        // whose catalog owns the partitions; any other table would keep its data.
+        let table = self.get_table(identifier).await?;
+        if !table.has_catalog_managed_partitions() {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "Dropping partitions through the REST catalog is supported only for Format \
+                     Tables with catalog-managed partitions, and {} is not one",
+                    identifier.full_name()
+                ),
+            });
+        }
+        for batch in partition_specs.chunks(PARTITION_BATCH_SIZE) {
+            self.api
+                .drop_partitions(identifier, batch.to_vec(), true)
+                .await
+                .map_err(|error| map_rest_error_for_partition_request(error, identifier))?;
         }
         Ok(())
     }
@@ -581,6 +725,64 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
     }
 }
 
+fn map_rest_error_for_tag(
+    error: Error,
+    identifier: &Identifier,
+    tag_name: &str,
+    snapshot_id: Option<i64>,
+) -> Error {
+    match error {
+        Error::RestApi {
+            source: RestError::AlreadyExists { .. },
+        } => Error::TagAlreadyExist {
+            tag_name: tag_name.to_string(),
+        },
+        Error::RestApi {
+            source:
+                RestError::NoSuchResource {
+                    resource_type,
+                    resource_name,
+                    ..
+                },
+        } if resource_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("snapshot")) =>
+        {
+            match snapshot_id.or_else(|| resource_name.and_then(|value| value.parse().ok())) {
+                Some(snapshot_id) => Error::SnapshotNotExist { snapshot_id },
+                None => Error::DataInvalid {
+                    message: format!(
+                        "Cannot create tag '{tag_name}' because the latest snapshot does not exist"
+                    ),
+                    source: None,
+                },
+            }
+        }
+        Error::RestApi {
+            source: RestError::NoSuchResource { resource_type, .. },
+        } if resource_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("tag")) =>
+        {
+            Error::TagNotExist {
+                tag_name: tag_name.to_string(),
+            }
+        }
+        Error::RestApi {
+            source: RestError::NoSuchResource { .. },
+        } => Error::TableNotExist {
+            full_name: identifier.full_name(),
+        },
+        Error::RestApi {
+            source: RestError::BadRequest { message },
+        } => Error::DataInvalid {
+            message,
+            source: None,
+        },
+        other => map_unsupported_endpoint(other, "tag"),
+    }
+}
+
 /// A partition spec in a form that can key a map.
 fn spec_key(spec: &HashMap<String, String>) -> Vec<(String, String)> {
     let mut entries = spec
@@ -656,6 +858,13 @@ fn map_rest_error_for_create_partitions(err: Error, identifier: &Identifier) -> 
             ),
             source: None,
         },
+        other => map_rest_error_for_partition_request(other, identifier),
+    }
+}
+
+/// Map a REST API error from a partition request other than a create conflict.
+fn map_rest_error_for_partition_request(err: Error, identifier: &Identifier) -> Error {
+    match err {
         Error::RestApi {
             source: RestError::BadRequest { message },
         } => Error::DataInvalid {
@@ -772,5 +981,30 @@ mod tests {
         let catalog = RESTCatalog::new(options, false).await.unwrap();
 
         assert!(catalog.has_local_cache());
+    }
+
+    #[test]
+    fn test_tag_error_mapping() {
+        let identifier = Identifier::new("db", "table");
+        let error = |resource_type: &str| Error::RestApi {
+            source: RestError::NoSuchResource {
+                resource_type: Some(resource_type.to_string()),
+                resource_name: None,
+                message: "missing".to_string(),
+            },
+        };
+
+        assert!(matches!(
+            map_rest_error_for_tag(error("tag"), &identifier, "release", None),
+            Error::TagNotExist { .. }
+        ));
+        assert!(matches!(
+            map_rest_error_for_tag(error("snapshot"), &identifier, "release", Some(7)),
+            Error::SnapshotNotExist { snapshot_id: 7 }
+        ));
+        assert!(matches!(
+            map_rest_error_for_tag(error("table"), &identifier, "release", None),
+            Error::TableNotExist { .. }
+        ));
     }
 }

@@ -16,7 +16,10 @@
 // under the License.
 
 use crate::lumina::ffi::LuminaSearcher;
-use crate::lumina::{strip_lumina_options, LuminaIndexMeta, LuminaVectorMetric};
+use crate::lumina::{
+    strip_lumina_options, LuminaIndexMeta, LuminaVectorMetric,
+    LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION,
+};
 use crate::vector_search::{GlobalIndexIOMeta, VectorSearch};
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
@@ -24,6 +27,10 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 const MIN_SEARCH_LIST_SIZE: usize = 16;
+// Per active Lumina reader. This admits 8,388,608 row ids while bounding
+// amplification from the default 32-way global-index search concurrency to about
+// 2 GiB of dense-filter storage. Larger segments can override the option explicitly.
+const DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES: usize = 64 * 1024 * 1024;
 // C ABI returns int64_t -1 for invalid results, which casts to u64::MAX in Rust.
 const SENTINEL: u64 = u64::MAX;
 
@@ -122,6 +129,77 @@ fn compare_scores(a: f32, b: f32) -> std::cmp::Ordering {
     }
 }
 
+/// Turn an include-set into the dense id array Lumina's filtered search takes.
+///
+/// Java's `Integer.MAX_VALUE` bound is retained, and the Rust reader adds a byte
+/// budget because Lumina alone expands the compressed set into `Vec<u64>`.
+fn to_scoped_ids(
+    include_row_ids: &roaring::RoaringTreemap,
+    max_filter_bytes: usize,
+) -> crate::Result<Vec<u64>> {
+    let cardinality = include_row_ids.len();
+    if cardinality > i32::MAX as u64 {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "include_row_ids cardinality ({cardinality}) exceeds {}",
+                i32::MAX
+            ),
+            source: None,
+        });
+    }
+    let cardinality = cardinality as usize;
+    let required_bytes = cardinality
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Lumina dense row-id filter size overflow".to_string(),
+            source: None,
+        })?;
+    if required_bytes > max_filter_bytes {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Lumina dense row-id filter requires {required_bytes} bytes, exceeding \
+                 {LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION}={max_filter_bytes}"
+            ),
+            source: None,
+        });
+    }
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(cardinality)
+        .map_err(|error| crate::Error::UnexpectedError {
+            message: format!(
+                "failed to allocate {required_bytes} bytes for Lumina dense row-id filter"
+            ),
+            source: Some(Box::new(error)),
+        })?;
+    ids.extend(include_row_ids.iter());
+    Ok(ids)
+}
+
+fn max_filter_bytes(options: &HashMap<String, String>) -> crate::Result<usize> {
+    let Some(value) = options.get(LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION) else {
+        return Ok(DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES);
+    };
+    let bytes = crate::common::options::parse_memory_size(value).map_err(|_| {
+        crate::Error::ConfigInvalid {
+            message: format!(
+                "Invalid {LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION}: '{value}'; expected a positive memory size"
+            ),
+        }
+    })?;
+    if bytes <= 0 {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!(
+                "{LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION} must be greater than 0, got: {value}"
+            ),
+        });
+    }
+    usize::try_from(bytes).map_err(|_| crate::Error::ConfigInvalid {
+        message: format!(
+            "{LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION} does not fit this platform: {value}"
+        ),
+    })
+}
+
 /// Allocate the label buffer for one native search, filled with [`SENTINEL`].
 ///
 /// [`SENTINEL`] is the "no result" marker (the C ABI's `-1`), and
@@ -205,6 +283,7 @@ pub struct LuminaVectorGlobalIndexReader {
     searcher: Option<LuminaSearcher>,
     index_meta: Option<LuminaIndexMeta>,
     search_options: Option<HashMap<String, String>>,
+    max_filter_bytes: Option<usize>,
     local_index_file: Option<PathBuf>,
 }
 
@@ -216,6 +295,7 @@ impl LuminaVectorGlobalIndexReader {
             searcher: None,
             index_meta: None,
             search_options: None,
+            max_filter_bytes: None,
             local_index_file: None,
         }
     }
@@ -260,8 +340,20 @@ impl LuminaVectorGlobalIndexReader {
                     message: "search_options not initialized".to_string(),
                     source: None,
                 })?;
+        let max_filter_bytes = self
+            .max_filter_bytes
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "max_filter_bytes not initialized".to_string(),
+                source: None,
+            })?;
 
-        search_lumina(searcher, index_meta, search_options_base, vector_search)
+        search_lumina(
+            searcher,
+            index_meta,
+            search_options_base,
+            vector_search,
+            max_filter_bytes,
+        )
     }
 
     fn search_batch(
@@ -289,8 +381,20 @@ impl LuminaVectorGlobalIndexReader {
                     message: "search_options not initialized".to_string(),
                     source: None,
                 })?;
+        let max_filter_bytes = self
+            .max_filter_bytes
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "max_filter_bytes not initialized".to_string(),
+                source: None,
+            })?;
 
-        search_lumina_batch(searcher, index_meta, search_options_base, vector_searches)
+        search_lumina_batch(
+            searcher,
+            index_meta,
+            search_options_base,
+            vector_searches,
+            max_filter_bytes,
+        )
     }
 
     fn ensure_loaded<S: Read + Seek + Send + 'static>(
@@ -303,6 +407,7 @@ impl LuminaVectorGlobalIndexReader {
 
         let index_meta = LuminaIndexMeta::deserialize(&self.io_meta.metadata)?;
 
+        let max_filter_bytes = max_filter_bytes(&self.options)?;
         let mut searcher_options = index_meta.options().clone();
         for (k, v) in strip_lumina_options(&self.options) {
             searcher_options.insert(k, v);
@@ -328,6 +433,7 @@ impl LuminaVectorGlobalIndexReader {
         }
 
         self.search_options = Some(searcher_options);
+        self.max_filter_bytes = Some(max_filter_bytes);
         self.index_meta = Some(index_meta);
         self.searcher = Some(searcher);
         self.local_index_file = Some(local_index_file);
@@ -338,6 +444,7 @@ impl LuminaVectorGlobalIndexReader {
         self.searcher = None;
         self.index_meta = None;
         self.search_options = None;
+        self.max_filter_bytes = None;
         if let Some(path) = self.local_index_file.take() {
             let _ = std::fs::remove_file(path);
         }
@@ -349,6 +456,7 @@ fn search_lumina<S: LuminaSearch + ?Sized>(
     index_meta: &LuminaIndexMeta,
     search_options_base: &HashMap<String, String>,
     vector_search: &VectorSearch,
+    max_filter_bytes: usize,
 ) -> crate::Result<Option<HashMap<u64, f32>>> {
     let expected_dim = index_meta.dim()? as usize;
     if vector_search.vector.len() != expected_dim {
@@ -377,7 +485,7 @@ fn search_lumina<S: LuminaSearch + ?Sized>(
     let include_row_ids = vector_search.effective_include_row_ids();
 
     let (distances, labels) = if let Some(include_ids) = include_row_ids {
-        let filter_id_list: Vec<u64> = include_ids.iter().collect();
+        let filter_id_list: Vec<u64> = to_scoped_ids(include_ids, max_filter_bytes)?;
         if filter_id_list.is_empty() {
             return Ok(None);
         }
@@ -426,6 +534,7 @@ fn search_lumina_batch<S: LuminaSearch + ?Sized>(
     index_meta: &LuminaIndexMeta,
     search_options_base: &HashMap<String, String>,
     vector_searches: &[VectorSearch],
+    max_filter_bytes: usize,
 ) -> crate::Result<Vec<Option<HashMap<u64, f32>>>> {
     if vector_searches.is_empty() {
         return Ok(Vec::new());
@@ -445,7 +554,13 @@ fn search_lumina_batch<S: LuminaSearch + ?Sized>(
         return vector_searches
             .iter()
             .map(|vector_search| {
-                search_lumina(searcher, index_meta, search_options_base, vector_search)
+                search_lumina(
+                    searcher,
+                    index_meta,
+                    search_options_base,
+                    vector_search,
+                    max_filter_bytes,
+                )
             })
             .collect();
     }
@@ -482,8 +597,9 @@ fn search_lumina_batch<S: LuminaSearch + ?Sized>(
     if count == 0 {
         return Ok(vec![None; vector_searches.len()]);
     }
-    let filter_id_list =
-        shared_filter.map(|include_row_ids| include_row_ids.iter().collect::<Vec<_>>());
+    let filter_id_list = shared_filter
+        .map(|include_row_ids| to_scoped_ids(include_row_ids, max_filter_bytes))
+        .transpose()?;
     let index_metric = index_meta.metric()?;
     let effective_k = filter_id_list.as_ref().map_or_else(
         || std::cmp::min(limit, count),
@@ -606,6 +722,59 @@ impl Drop for LuminaVectorGlobalIndexReader {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn to_scoped_ids_enforces_the_lumina_dense_filter_budget() {
+        let mut at_limit = roaring::RoaringTreemap::new();
+        at_limit.insert_range(0..10u64);
+        assert_eq!(
+            to_scoped_ids(&at_limit, 10 * std::mem::size_of::<u64>())
+                .unwrap()
+                .len(),
+            10
+        );
+
+        let mut over = roaring::RoaringTreemap::new();
+        over.insert_range(0..11u64);
+        let error = to_scoped_ids(&over, 10 * std::mem::size_of::<u64>())
+            .map(|_| ())
+            .expect_err("the dense filter must stay inside its byte budget");
+        assert!(error.to_string().contains("max-filter-bytes"), "{error}");
+    }
+
+    #[test]
+    fn to_scoped_ids_keeps_javas_integer_max_value_bound() {
+        let mut over = roaring::RoaringTreemap::new();
+        over.insert_range(0..=(i32::MAX as u64 + 1));
+        let error = to_scoped_ids(&over, usize::MAX)
+            .map(|_| ())
+            .expect_err("Java's dense-array index bound must remain in force");
+        assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn max_filter_bytes_parses_memory_sizes_and_rejects_bad_values() {
+        assert_eq!(
+            max_filter_bytes(&HashMap::new()).unwrap(),
+            DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES
+        );
+        assert_eq!(
+            max_filter_bytes(&HashMap::from([(
+                LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION.to_string(),
+                "2 mb".to_string(),
+            )]))
+            .unwrap(),
+            2 * 1024 * 1024
+        );
+        for value in ["0", "invalid"] {
+            assert!(max_filter_bytes(&HashMap::from([(
+                LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION.to_string(),
+                value.to_string(),
+            )]))
+            .is_err());
+        }
+    }
+
     use super::*;
     use crate::lumina::{KEY_DIMENSION, KEY_DISTANCE_METRIC};
     use crate::vector_search::GlobalIndexIOMeta;
@@ -717,6 +886,7 @@ mod tests {
             &test_index_meta(2),
             &HashMap::new(),
             &[first, second],
+            DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES,
         )
         .expect("shared filtered batch search should succeed");
 
@@ -750,6 +920,7 @@ mod tests {
             &test_index_meta(2),
             &HashMap::new(),
             &[first, second],
+            DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES,
         )
         .expect("distinct filtered searches should succeed");
 
@@ -771,6 +942,7 @@ mod tests {
             &test_index_meta(2),
             &HashMap::new(),
             &[filtered, unfiltered],
+            DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES,
         )
         .expect("mixed filtered searches should succeed");
 
@@ -802,6 +974,7 @@ mod tests {
             &test_index_meta(2),
             &HashMap::new(),
             &[first, second],
+            DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES,
         )
         .expect("differing-limit filtered searches should succeed");
 
@@ -812,6 +985,46 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls.iter().map(|call| call.k).collect::<Vec<_>>(), [1, 2]);
         assert!(calls.iter().all(|call| call.n == 1));
+    }
+
+    #[test]
+    fn a_pk_vector_live_mask_is_bounded_when_lumina_densifies_it() {
+        use crate::deletion_vector::DeletionVector;
+        use crate::spec::PrimaryKeyIndexSourceFile;
+        use crate::vindex::pkvector::ann::build_live_row_ids;
+        use roaring::RoaringBitmap;
+
+        let source_files = vec![PrimaryKeyIndexSourceFile::new("file-a".to_string(), 4).unwrap()];
+        let active = std::collections::HashSet::from(["file-a".to_string()]);
+        let mut bitmap = RoaringBitmap::new();
+        bitmap.insert(3);
+        let deletion_vectors = HashMap::from([(
+            "file-a".to_string(),
+            Arc::new(DeletionVector::from_bitmap(bitmap)),
+        )]);
+        let live = build_live_row_ids(&source_files, &active, &deletion_vectors, None)
+            .unwrap()
+            .expect("the deletion vector forces a live-row mask");
+        assert_eq!(live.len(), 3);
+
+        let searcher = RecordingSearcher::new(4);
+        let mut search = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+        search.set_shared_include_row_ids(Arc::new(live));
+        let error = search_lumina(
+            &searcher,
+            &test_index_meta(2),
+            &HashMap::new(),
+            &search,
+            2 * std::mem::size_of::<u64>(),
+        )
+        .expect_err("Lumina must reject the PK mask before calling its native searcher");
+
+        assert!(error.to_string().contains("max-filter-bytes"), "{error}");
+        assert!(searcher
+            .filtered_calls
+            .lock()
+            .expect("filtered call lock")
+            .is_empty());
     }
 
     #[test]
@@ -828,6 +1041,7 @@ mod tests {
             &test_index_meta(2),
             &HashMap::new(),
             &[first, second],
+            DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES,
         )
         .expect("empty shared filter should succeed");
 
@@ -872,6 +1086,7 @@ mod tests {
             &test_index_meta_with_unknown_metric(2),
             &HashMap::new(),
             &search,
+            DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES,
         )
         .expect("an empty index reports no hits, not a malformed metric");
         assert_eq!(result, None);
@@ -879,6 +1094,46 @@ mod tests {
             .unfiltered_calls
             .lock()
             .expect("unfiltered call lock")
+            .is_empty());
+    }
+
+    /// The two guards meet here: #803 made `index.size()` decide before the filter is
+    /// built, and this change bounds what building it may allocate. An empty index with
+    /// an include-set far above the budget must therefore report NO HITS, not an
+    /// oversized-filter error -- sizing the filter first would turn a query whose answer
+    /// is empty either way into a failure. Neither guard alone pins this: without the
+    /// ordering the budget rejects it, and without the budget there is nothing to
+    /// order against.
+    #[test]
+    fn an_empty_index_outranks_a_filter_too_large_to_densify() {
+        let searcher = RecordingSearcher::new(0);
+        let mut oversized = roaring::RoaringTreemap::new();
+        oversized.insert_range(0..=(i32::MAX as u64 + 1));
+        let shared_filter = Arc::new(oversized);
+        let mut first = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+        first.set_shared_include_row_ids(Arc::clone(&shared_filter));
+        let mut second = VectorSearch::new(vec![0.0, 1.0], 2, "embedding".to_string()).unwrap();
+        second.set_shared_include_row_ids(Arc::clone(&shared_filter));
+
+        let results = search_lumina_batch(
+            &searcher,
+            &test_index_meta(2),
+            &HashMap::new(),
+            &[first, second],
+            DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES,
+        )
+        .expect("an empty index reports no hits, not an oversized filter");
+
+        assert_eq!(results, vec![None, None]);
+        assert_eq!(
+            searcher.count_calls.load(Ordering::Relaxed),
+            1,
+            "the index size is what the answer came from"
+        );
+        assert!(searcher
+            .filtered_calls
+            .lock()
+            .expect("filtered call lock")
             .is_empty());
     }
 
@@ -898,6 +1153,7 @@ mod tests {
             &test_index_meta_with_unknown_metric(2),
             &HashMap::new(),
             &[first, second],
+            DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES,
         )
         .expect("an empty index reports no hits, not a malformed metric");
 

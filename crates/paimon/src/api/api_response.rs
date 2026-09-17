@@ -22,8 +22,9 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
+use crate::api::management::{DataPolicy, PermissionAssignment};
 use crate::catalog::{Function, FunctionDefinition, ViewSchema};
-use crate::spec::{DataField, Schema};
+use crate::spec::{DataField, Schema, Snapshot};
 
 /// Error response from REST API calls.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +41,9 @@ pub struct ErrorResponse {
 }
 
 impl ErrorResponse {
+    /// `resource_type` of a 404/409 about a policy (Java `ErrorResponse.RESOURCE_TYPE_POLICY`).
+    pub const RESOURCE_TYPE_POLICY: &'static str = "POLICY";
+
     /// Create a new ErrorResponse.
     pub fn new(
         resource_type: Option<String>,
@@ -110,6 +114,23 @@ impl AuditRESTResponse {
     }
 }
 
+/// Latest snapshot and table statistics returned by a REST catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TableSnapshot {
+    pub snapshot: Snapshot,
+    pub record_count: Option<i64>,
+    pub file_size_in_bytes: Option<i64>,
+    pub file_count: Option<i64>,
+    pub last_file_creation_time: Option<i64>,
+}
+
+/// Response for loading the latest catalog snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetTableSnapshotResponse {
+    pub snapshot: Option<TableSnapshot>,
+}
+
 /// Response for getting a table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,6 +150,16 @@ pub struct GetTableResponse {
     pub schema_id: Option<i64>,
     /// The schema of the table.
     pub schema: Option<Schema>,
+}
+
+/// Response for getting a table tag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTagResponse {
+    pub tag_name: String,
+    pub snapshot: Snapshot,
+    pub tag_create_time: Option<i64>,
+    pub tag_time_retained: Option<String>,
 }
 
 /// Response for getting a persistent view.
@@ -493,6 +524,44 @@ impl AuthTableQueryResponse {
     }
 }
 
+/// Response of `GET {prefix}/permissions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPermissionsResponse {
+    #[serde(default)]
+    pub permissions: Vec<PermissionAssignment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+impl ListPermissionsResponse {
+    pub fn new(permissions: Vec<PermissionAssignment>, next_page_token: Option<String>) -> Self {
+        Self {
+            permissions,
+            next_page_token,
+        }
+    }
+}
+
+/// Response of `GET .../tables/{table}/policies`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPoliciesResponse {
+    #[serde(default)]
+    pub policies: Vec<DataPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+impl ListPoliciesResponse {
+    pub fn new(policies: Vec<DataPolicy>, next_page_token: Option<String>) -> Self {
+        Self {
+            policies,
+            next_page_token,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +700,38 @@ mod tests {
         let blank: AuthTableQueryResponse =
             serde_json::from_str(r#"{"filter":[],"columnMasking":{}}"#).unwrap();
         assert!(blank.is_unrestricted());
+    }
+
+    #[test]
+    fn test_list_permissions_response_deserialization() {
+        let response: ListPermissionsResponse = serde_json::from_str(
+            r#"{"permissions":[{"resource":{"type":"TABLE","database":"sales","table":"orders"},"access":"SELECT","principal":"analyst"}],"nextPageToken":"next"}"#,
+        )
+        .unwrap();
+        assert_eq!(response.permissions.len(), 1);
+        assert_eq!(response.permissions[0].principal(), "analyst");
+        assert_eq!(response.next_page_token.as_deref(), Some("next"));
+        let last: ListPermissionsResponse = serde_json::from_str("{}").unwrap();
+        assert!(last.permissions.is_empty());
+        assert_eq!(last.next_page_token, None);
+        assert_eq!(
+            serde_json::to_string(&ListPermissionsResponse::new(vec![], None)).unwrap(),
+            r#"{"permissions":[]}"#
+        );
+    }
+
+    #[test]
+    fn test_list_policies_response_deserialization() {
+        let response: ListPoliciesResponse = serde_json::from_str(
+            r#"{"policies":[{"resource":{"type":"TABLE","database":"sales","table":"orders"},"rowFilter":{"predicate":"{}"},"principal":"analyst"}],"nextPageToken":"next"}"#,
+        )
+        .unwrap();
+        assert_eq!(response.policies.len(), 1);
+        assert_eq!(response.policies[0].row_filter().unwrap().predicate(), "{}");
+        assert_eq!(response.next_page_token.as_deref(), Some("next"));
+        let last: ListPoliciesResponse = serde_json::from_str("{}").unwrap();
+        assert!(last.policies.is_empty());
+        assert_eq!(ErrorResponse::RESOURCE_TYPE_POLICY, "POLICY");
     }
 
     #[test]

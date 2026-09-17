@@ -54,7 +54,7 @@ impl FileIndexOptions {
             else {
                 continue;
             };
-            if !FileIndexerFactory::is_supported(identifier) {
+            if !FileIndexerFactory::is_write_supported(identifier) {
                 continue;
             }
             for column in value.split(',').map(str::trim) {
@@ -86,7 +86,7 @@ impl FileIndexOptions {
                     message: format!("Invalid file index option: {key}"),
                 });
             };
-            if !FileIndexerFactory::is_supported(identifier) {
+            if !FileIndexerFactory::is_write_supported(identifier) {
                 continue;
             }
             let Some((column, option)) = rest.rsplit_once('.') else {

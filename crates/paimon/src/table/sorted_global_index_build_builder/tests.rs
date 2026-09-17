@@ -1133,17 +1133,22 @@ async fn test_empty_global_index_ranges_skip_legacy_manifests() {
         assert!(plan.splits().is_empty());
 
         let (traced_plan, trace) = read_builder.new_scan().plan_with_trace().await.unwrap();
-        let delta_plan = read_builder
+        let delta_error = read_builder
             .new_scan()
             .plan_snapshot_delta(&snapshot)
             .await
-            .unwrap();
+            .unwrap_err();
 
         assert!(traced_plan.splits().is_empty());
         assert_eq!(trace.manifest_entries_read, 0);
         assert_eq!(trace.final_splits, 0);
         assert_eq!(trace.final_files, 0);
-        assert!(delta_plan.splits().is_empty());
+        // A snapshot index may short-circuit a batch read, but cannot hide
+        // an invalid historical event file from incremental planning.
+        assert!(
+            matches!(delta_error, crate::Error::DataInvalid { ref message, .. }
+            if message.contains("First row id"))
+        );
     }
 }
 

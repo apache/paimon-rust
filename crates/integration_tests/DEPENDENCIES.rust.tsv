@@ -30,8 +30,8 @@ asyncband@0.6.7		X
 atoi@2.0.0											X				
 atomic-waker@1.1.2		X									X				
 autocfg@1.5.1		X									X				
-aws-lc-rs@1.17.3		X							X						
-aws-lc-sys@0.43.0		X			X				X		X	X			
+aws-lc-rs@1.18.1		X							X						
+aws-lc-sys@0.45.0		X			X				X		X	X			
 backon@1.6.0		X													
 base64@0.22.1		X									X				
 base64@0.23.1		X									X				
@@ -251,12 +251,12 @@ roaring@0.11.4		X									X
 rust-ini@0.21.3											X				
 rustc_version@0.4.1		X									X				
 rustix@1.1.4		X	X								X				
-rustls@0.23.42		X							X		X				
+rustls@0.23.45		X							X		X				
 rustls-native-certs@0.8.4		X							X		X				
 rustls-pki-types@1.15.0		X									X				
 rustls-platform-verifier@0.7.0		X									X				
 rustls-platform-verifier-android@0.1.1		X									X				
-rustls-webpki@0.103.13									X						
+rustls-webpki@0.103.15									X						
 rustversion@1.0.23		X									X				
 ryu@1.0.23		X				X									
 safe_arch@0.7.4		X									X				X
@@ -333,7 +333,6 @@ unicode-segmentation@1.13.2		X									X
 unicode-width@0.2.2		X									X				
 untrusted@0.9.0									X						
 url@2.5.8		X									X				
-urlencoding@2.1.3											X				
 utf8_iter@1.0.4		X									X				
 uuid@1.24.0		X									X				
 vcpkg@0.2.15		X									X				

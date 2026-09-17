@@ -262,7 +262,7 @@ jobs:
       - name: Core Lumina Native Build Test
         if: matrix.suite == 'lumina'
         run: >
-          cargo test --locked -p paimon
+          cargo test --locked -p paimon --lib
           table::lumina_index_build_builder::tests::test_execute_writes_lumina_index_manifest
           --features fulltext,vortex
           -- --ignored --exact
@@ -270,7 +270,7 @@ jobs:
       - name: DataFusion Lumina Build Query E2E Test
         if: matrix.suite == 'lumina'
         run: >
-          cargo test --locked -p paimon-datafusion
+          cargo test --locked -p paimon-datafusion --test read_tables
           --features vortex
           vector_search_tests::test_lumina_build_then_vector_search_query
           -- --ignored --exact

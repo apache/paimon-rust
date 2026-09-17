@@ -356,6 +356,10 @@ impl PaimonScanBuilder<'_> {
         self,
         read_fields: Vec<DataField>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(self.build_scan(read_fields)?))
+    }
+
+    pub(crate) fn build_scan(self, read_fields: Vec<DataField>) -> DFResult<PaimonTableScan> {
         let (projected_schema, read_type) = if let Some(indices) = self.projection {
             let fields: Vec<Field> = indices
                 .iter()
@@ -381,7 +385,7 @@ impl PaimonScanBuilder<'_> {
                 .collect()
         };
 
-        Ok(Arc::new(PaimonTableScan::try_new(
+        PaimonTableScan::try_new(
             projected_schema,
             self.table.clone(),
             read_type,
@@ -392,7 +396,7 @@ impl PaimonScanBuilder<'_> {
             self.scan_trace,
             None,
             self.case_sensitive,
-        )?))
+        )
     }
 }
 

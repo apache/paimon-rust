@@ -2754,13 +2754,27 @@ mod tests {
             Vec::new(),
         );
         let batches = reader
-            .read(&[split])
+            .clone()
+            .read(std::slice::from_ref(&split))
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
 
         assert_eq!(collect_ids(&batches), vec![1, 3]);
+        // Event planners do not attach endpoint DVs, but readers still honor
+        // explicitly supplied DVs in a Java streaming frame.
+        let mut bytes = split.serialize().unwrap();
+        let flag = bytes.len() - 2;
+        bytes[flag] = 1;
+        let streaming = DataSplit::deserialize(&bytes).unwrap();
+        let events = reader
+            .read(&[streaming])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(&events), vec![1, 3]);
     }
 
     /// A Mosaic file and a Parquet file in the same split must both be read and concatenated.

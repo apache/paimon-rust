@@ -51,6 +51,77 @@ Available storage features:
 | `storage-hdfs`   | HDFS             |
 | `storage-all`    | All of the above |
 
+## Reusing a storage backend
+
+On the development branch, Rust embedders can implement `paimon::io::FileIOProvider`
+to reuse an OpenDAL operator managed by their application. The provider receives
+the original URI and returns a shared operator and its relative object path.
+It can route different schemes or buckets to different operators.
+
+```rust
+use std::sync::Arc;
+use opendal::Operator;
+use paimon::io::{FileIOBuilder, FileIOProvider};
+use paimon::{Error, Result};
+
+#[derive(Debug)]
+struct SharedStorage {
+    // An application-managed operator rooted at this bucket's root.
+    operator: Operator,
+}
+
+#[async_trait::async_trait]
+impl FileIOProvider for SharedStorage {
+    async fn create(&self, uri: &str) -> Result<(Operator, String)> {
+        let key = uri.strip_prefix("s3://my-bucket/").ok_or_else(|| {
+            Error::ConfigInvalid {
+                message: "URI is outside the configured bucket".to_string(),
+            }
+        })?;
+        Ok((self.operator.clone(), key.to_string()))
+    }
+}
+
+// `operator` is supplied by the embedding application.
+let file_io = FileIOBuilder::new("s3")
+    .with_provider(Arc::new(SharedStorage { operator }))
+    .build()?;
+let bytes = file_io.new_input("s3://my-bucket/table/schema/schema-0")?
+    .read().await?;
+```
+
+The application needs `async-trait` and a compatible `opendal-core` dependency
+(named `opendal` above). Injecting a provider does not require Paimon's built-in
+feature for that storage service. Supply the resulting `FileIO` to `Table::new`
+or other APIs accepting a `FileIO`; option-based catalog constructors continue
+to construct their own storage backends.
+
+Provider configuration bypasses built-in storage construction. Provider errors
+are returned without trying properties, environment credentials, or another
+backend. `new_input` and `new_output` remain synchronous: they retain the URI and
+provider, and resolution errors are returned by the subsequent async operation.
+
+For directory listings, the returned relative path must be an unchanged suffix
+of the URI, starting at a path-component boundary. An operator rooted at
+`/tenant/`, for example, can resolve `s3://my-bucket/tenant/table/` to `table/`.
+Both listing APIs return full URIs that can be passed back to `FileIO`. Empty
+relative paths and `/` represent the operator root. Preserve literal percent
+escapes, Unicode, `?`, and `#` in object keys; do not decode or normalize them as
+URL components. Object paths that OpenDAL would change by trimming whitespace
+or collapsing slashes are rejected instead of accessing a different object.
+
+Providers manage operator reuse and credential refresh. Resolution is repeated
+for each async file operation, but an already-open reader or writer keeps its
+operator: that backend must refresh credentials internally. Custom services
+must report distinct OpenDAL storage identities (`scheme`, `name`, `root`) for
+different storage namespaces so cached data cannot overlap. Rename through a
+provider requires both paths to resolve to the same shared service instance;
+cross-backend rename is rejected.
+
+`with_fs_operator` remains available for filesystem paths. It cannot be combined
+with `with_provider` on the same builder. Without a provider, property-based
+storage configuration behaves as before.
+
 ## Mosaic File Format
 
 Mosaic data file reads are always available. The current Mosaic support is read-only: Paimon Rust can read existing `.mosaic` data files, including array and map columns, in a Paimon table, but it does not write Mosaic data files yet.
@@ -70,10 +141,11 @@ file-index.in-manifest-threshold = 500 B
 
 Column lists are comma-separated. Bitmap supports `version` (currently `2` only)
 and `index-block-size` per column. Bloom Filter supports `items` and `fpp`.
-For supported index types, invalid columns, unsupported data types, and invalid
-index options fail when creating the writer. Unsupported index types (such as
-`bsi` and `range-bitmap`) and all their options are ignored, so these table
-properties do not prevent append writes.
+For index types supported for writing, invalid columns, unsupported data types,
+and invalid index options fail when creating the writer. Index types without a
+writer (such as `bsi` and `range-bitmap`) and all their options are ignored, so
+these table properties do not prevent append writes. Range Bitmap indexes can
+still be read from existing files.
 
 When supported indexes are configured, each data file gets its own index.
 The complete serialized index is embedded in the manifest when its size

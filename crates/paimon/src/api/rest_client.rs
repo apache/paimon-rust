@@ -276,3 +276,83 @@ impl HttpClient {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use axum::extract::State;
+    use axum::http::Uri;
+    use axum::routing::get;
+    use axum::{Json, Router};
+
+    use super::*;
+    use crate::api::auth::AuthProvider;
+
+    struct RecordingProvider(Arc<Mutex<Option<HashMap<String, String>>>>);
+
+    #[async_trait]
+    impl AuthProvider for RecordingProvider {
+        async fn merge_auth_header(
+            &self,
+            base_header: HashMap<String, String>,
+            parameter: &RESTAuthParameter,
+        ) -> Result<HashMap<String, String>> {
+            *self.0.lock().unwrap() = Some(parameter.parameters.clone());
+            Ok(base_header)
+        }
+    }
+
+    async fn probe(
+        State(query): State<Arc<Mutex<Option<String>>>>,
+        uri: Uri,
+    ) -> Json<serde_json::Value> {
+        *query.lock().unwrap() = uri.query().map(str::to_string);
+        Json(serde_json::json!({}))
+    }
+
+    fn canonical(pairs: impl Iterator<Item = String>) -> String {
+        let mut parts: Vec<String> = pairs.collect();
+        parts.sort();
+        parts.join("&")
+    }
+
+    #[tokio::test]
+    async fn test_query_parameters_are_signed_as_sent() {
+        let sent_query = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/probe", get(probe))
+            .with_state(sent_query.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let signed_params = Arc::new(Mutex::new(None));
+        let auth_function = RESTAuthFunction::new(
+            HashMap::new(),
+            Box::new(RecordingProvider(signed_params.clone())),
+        );
+        let client = HttpClient::new(&format!("http://{address}"), Some(auth_function)).unwrap();
+
+        client
+            .get::<serde_json::Value>(
+                "/probe",
+                Some(&[("principal", "acs:ram::1:role/Admin"), ("pattern", "db%")]),
+            )
+            .await
+            .unwrap();
+
+        let signed = signed_params.lock().unwrap().clone().unwrap();
+        let sent = sent_query.lock().unwrap().clone().unwrap();
+
+        assert_eq!(
+            canonical(signed.iter().map(|(key, value)| format!("{key}={value}"))),
+            canonical(sent.split('&').map(str::to_string)),
+        );
+        assert_eq!(
+            signed.get("principal").map(String::as_str),
+            Some("acs%3Aram%3A%3A1%3Arole%2FAdmin"),
+        );
+    }
+}

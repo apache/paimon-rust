@@ -73,6 +73,18 @@ pub struct paimon_result_get_table {
 }
 
 #[repr(C)]
+pub struct paimon_result_get_tag {
+    pub tag: paimon_bytes,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_latest_snapshot {
+    pub snapshot: paimon_bytes,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
 pub struct paimon_result_new_read {
     pub read: *mut paimon_table_read,
     pub error: *mut paimon_error,
@@ -117,6 +129,30 @@ pub struct paimon_result_next_batch {
 #[repr(C)]
 pub struct paimon_result_vector_search_builder {
     pub builder: *mut paimon_vector_search_builder,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_vector_scan {
+    pub scan: *mut paimon_vector_scan,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_vector_plan {
+    pub plan: *mut paimon_vector_plan,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_vector_read {
+    pub read: *mut paimon_vector_read,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
+pub struct paimon_result_bucket_vector_search_split {
+    pub split: *mut paimon_bucket_vector_search_split,
     pub error: *mut paimon_error,
 }
 

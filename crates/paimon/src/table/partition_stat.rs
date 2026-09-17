@@ -26,7 +26,6 @@ use crate::spec::{
     avro::from_avro_bytes_fast, merge_active_entries, BinaryRow, CoreOptions, ManifestEntry,
     ManifestFileMeta, PartitionComputer, Snapshot,
 };
-use crate::table::SnapshotManager;
 use crate::table::Table;
 
 const MANIFEST_DIR: &str = "manifest";
@@ -66,7 +65,7 @@ impl Table {
     pub async fn partition_stats(&self) -> crate::Result<Vec<PartitionStat>> {
         // Manifests carry partition values and per-column stats.
         CoreOptions::new(self.schema().options()).ensure_read_authorized()?;
-        let sm = SnapshotManager::new(self.file_io().clone(), self.location().to_string());
+        let sm = self.snapshot_manager();
         let snapshot = match sm.get_latest_snapshot().await? {
             Some(s) => s,
             None => return Ok(Vec::new()),

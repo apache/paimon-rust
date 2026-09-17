@@ -500,9 +500,16 @@ pub struct DataSplit {
     /// physical rows are exactly its logical rows (modulo deletion files).
     /// Mirrors Java `DataSplit#rawConvertible`.
     raw_convertible: bool,
+    #[serde(default)]
+    is_streaming: bool,
 }
 
 impl DataSplit {
+    /// Whether files contain change events rather than a materialized snapshot.
+    pub fn is_streaming(&self) -> bool {
+        self.is_streaming
+    }
+
     pub fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
@@ -707,7 +714,7 @@ impl DataSplit {
             out.extend_from_slice(&d);
         }
         write_deletion_list(&mut out, self.data_deletion_files.as_deref())?;
-        out.push(0); // isStreaming = false
+        out.push(u8::from(self.is_streaming));
         out.push(u8::from(self.raw_convertible));
         Ok(out)
     }
@@ -819,14 +826,7 @@ impl DataSplit {
         }
 
         let data_deletion_files = read_deletion_list(cur)?;
-        // Rust only produces and serves batch splits (isStreaming = false); a
-        // streaming split carries a semantic bit that Java readers branch on, so
-        // reject it rather than silently dropping it.
-        if read_u8(cur)? != 0 {
-            return Err(crate::Error::Unsupported {
-                message: "streaming DataSplit (isStreaming = true) not supported".to_string(),
-            });
-        }
+        let is_streaming = read_u8(cur)? != 0;
         let raw_convertible = read_u8(cur)? != 0;
 
         let mut builder = DataSplitBuilder::new()
@@ -836,7 +836,8 @@ impl DataSplit {
             .with_bucket_path(bucket_path)
             .with_total_buckets(total_buckets.unwrap_or(1))
             .with_data_files(data_files)
-            .with_raw_convertible(raw_convertible);
+            .with_raw_convertible(raw_convertible)
+            .with_streaming(is_streaming);
         if let Some(dels) = data_deletion_files {
             builder = builder.with_data_deletion_files(dels);
         }
@@ -1165,6 +1166,7 @@ pub struct DataSplitBuilder {
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
     row_ranges: Option<Vec<RowRange>>,
     raw_convertible: bool,
+    is_streaming: bool,
 }
 
 impl DataSplitBuilder {
@@ -1182,6 +1184,7 @@ impl DataSplitBuilder {
             // utility splits) are raw by nature; the merge-tree and
             // data-evolution scan paths set this explicitly per split group.
             raw_convertible: true,
+            is_streaming: false,
         }
     }
 
@@ -1221,6 +1224,12 @@ impl DataSplitBuilder {
 
     pub fn with_row_ranges(mut self, row_ranges: Vec<RowRange>) -> Self {
         self.row_ranges = Some(row_ranges);
+        self
+    }
+
+    /// Preserve the Java DataSplit event-reading contract.
+    pub fn with_streaming(mut self, is_streaming: bool) -> Self {
+        self.is_streaming = is_streaming;
         self
     }
 
@@ -1283,6 +1292,7 @@ impl DataSplitBuilder {
             data_deletion_files: self.data_deletion_files.map(Into::into),
             row_ranges: self.row_ranges.map(Into::into),
             raw_convertible: self.raw_convertible,
+            is_streaming: self.is_streaming,
         })
     }
 }
@@ -1295,17 +1305,34 @@ impl Default for DataSplitBuilder {
 
 // ======================= Plan ===============================
 
-/// Read plan: list of splits.
+/// Read plan: splits and the snapshot they were planned from.
 ///
 /// Reference: [org.apache.paimon.table.source.PlanImpl](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/PlanImpl.java)
 #[derive(Debug)]
 pub struct Plan {
     splits: Vec<DataSplit>,
+    snapshot_id: Option<i64>,
 }
 
 impl Plan {
     pub fn new(splits: Vec<DataSplit>) -> Self {
-        Self { splits }
+        Self {
+            splits,
+            snapshot_id: None,
+        }
+    }
+
+    pub(crate) fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.snapshot_id = Some(snapshot_id);
+        self
+    }
+
+    /// Snapshot selected by the scan, even when pruning leaves no splits.
+    ///
+    /// Returns `None` when no snapshot exists or the plan does not come from
+    /// a Paimon snapshot (for example, a format-table scan).
+    pub fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
     }
     pub fn splits(&self) -> &[DataSplit] {
         &self.splits
@@ -1934,26 +1961,26 @@ mod tests {
         }
     }
 
-    // A streaming split (isStreaming = true) is rejected rather than silently
-    // dropping the bit: Rust only writes/serves batch splits (isStreaming =
-    // false), and Java readers branch on this flag. The isStreaming byte is the
-    // second-to-last byte on the wire (isStreaming, then raw_convertible).
     #[test]
-    fn deserialize_rejects_streaming_split() {
-        let bytes = sample_v8_split().serialize().unwrap();
-        assert!(DataSplit::deserialize(&bytes).is_ok());
-
-        let mut patched = bytes.clone();
-        let pos = patched.len() - 2; // isStreaming flag
-        assert_eq!(
-            patched[pos], 0,
-            "fixture must serialize isStreaming = false"
-        );
-        patched[pos] = 1;
-        match DataSplit::deserialize(&patched) {
-            Err(crate::Error::Unsupported { .. }) => {}
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+    fn streaming_split_preserves_java_flag_and_legacy_json_defaults() {
+        let batch = sample_v8_split();
+        let bytes = batch.serialize().unwrap();
+        assert!(!DataSplit::deserialize(&bytes).unwrap().is_streaming());
+        let mut streaming_bytes = bytes.clone();
+        let pos = streaming_bytes.len() - 2;
+        streaming_bytes[pos] = 1;
+        let split = DataSplit::deserialize(&streaming_bytes).unwrap();
+        assert!(split.is_streaming());
+        assert_eq!(split.serialize().unwrap(), streaming_bytes);
+        let json = serde_json::to_vec(&split).unwrap();
+        assert!(serde_json::from_slice::<DataSplit>(&json)
+            .unwrap()
+            .is_streaming());
+        let mut legacy = serde_json::to_value(batch).unwrap();
+        legacy.as_object_mut().unwrap().remove("is_streaming");
+        let restored: DataSplit = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.is_streaming());
+        assert_eq!(restored.serialize().unwrap(), bytes);
     }
 
     #[test]

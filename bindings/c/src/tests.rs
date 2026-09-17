@@ -44,12 +44,18 @@ use paimon::spec::{
     BlobDescriptor, CommitKind, DataType, IntType, Schema, TableSchema, VarCharType,
 };
 use paimon::table::{SnapshotManager, Table};
+use paimon::{Catalog, FileSystemCatalog, Options};
 
 use crate::blob_reader::*;
+use crate::bucket_vector_search_split::*;
+use crate::catalog::*;
 use crate::error::*;
 use crate::file_io::*;
+use crate::identifier::*;
 use crate::table::*;
 use crate::types::*;
+use crate::vector_read::*;
+use crate::vector_scan::*;
 use crate::vector_search::*;
 use crate::write::*;
 
@@ -61,13 +67,16 @@ fn memory_file_io() -> paimon::io::FileIO {
     FileIOBuilder::new("memory").build().unwrap()
 }
 
-fn simple_table_schema() -> TableSchema {
-    let schema = Schema::builder()
+fn simple_schema() -> Schema {
+    Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("name", DataType::VarChar(VarCharType::string_type()))
         .build()
-        .unwrap();
-    TableSchema::new(0, &schema)
+        .unwrap()
+}
+
+fn simple_table_schema() -> TableSchema {
+    TableSchema::new(0, &simple_schema())
 }
 
 fn not_null_table_schema() -> TableSchema {
@@ -95,6 +104,11 @@ fn partitioned_postpone_table_schema() -> TableSchema {
 unsafe fn wrap_table(table: Table) -> *mut paimon_table {
     let inner = Box::into_raw(Box::new(table)) as *mut c_void;
     Box::into_raw(Box::new(paimon_table { inner }))
+}
+
+unsafe fn wrap_catalog(catalog: Arc<dyn Catalog>) -> *mut paimon_catalog {
+    let inner = Box::into_raw(Box::new(catalog)) as *mut c_void;
+    Box::into_raw(Box::new(paimon_catalog { inner }))
 }
 
 unsafe fn unwrap_table(table: *mut paimon_table) {
@@ -947,6 +961,129 @@ fn test_table_from_schema_json_rejects_invalid_identifier() {
         assert!(!result.error.is_null());
         assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
         paimon_error_free(result.error);
+    }
+}
+
+// =========================================================================
+//  Catalog tag tests
+// =========================================================================
+
+#[test]
+fn test_catalog_tag_lifecycle() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut options = Options::new();
+    options.set("warehouse", temp_dir.path().to_string_lossy());
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    let identifier = Identifier::new("default", "test");
+    let table = crate::runtime().block_on(async {
+        catalog
+            .create_database("default", false, HashMap::new())
+            .await
+            .unwrap();
+        catalog
+            .create_table(&identifier, simple_schema(), false)
+            .await
+            .unwrap();
+        catalog.get_table(&identifier).await.unwrap()
+    });
+    unsafe {
+        let empty_table = wrap_table(table.clone());
+        let latest = paimon_table_latest_snapshot(empty_table);
+        assert!(latest.error.is_null());
+        let json = std::slice::from_raw_parts(latest.snapshot.data, latest.snapshot.len);
+        assert!(
+            serde_json::from_slice::<Option<paimon::spec::Snapshot>>(json)
+                .unwrap()
+                .is_none()
+        );
+        paimon_bytes_free(latest.snapshot);
+        paimon_table_free(empty_table);
+    }
+    write_data_rust(&table, &[make_batch(vec![1], vec!["a"])]);
+
+    unsafe {
+        let table = wrap_table(table);
+        let latest_result = paimon_table_latest_snapshot(table);
+        assert!(latest_result.error.is_null());
+        let latest_json =
+            std::slice::from_raw_parts(latest_result.snapshot.data, latest_result.snapshot.len);
+        let latest: Option<paimon::spec::Snapshot> = serde_json::from_slice(latest_json).unwrap();
+        assert_eq!(latest.unwrap().id(), 1);
+        paimon_bytes_free(latest_result.snapshot);
+        paimon_table_free(table);
+
+        let catalog = wrap_catalog(Arc::new(catalog));
+        let database = CString::new("default").unwrap();
+        let object = CString::new("test").unwrap();
+        let identifier = paimon_identifier_new(database.as_ptr(), object.as_ptr());
+        assert!(identifier.error.is_null());
+        let tag_name = CString::new("release-1").unwrap();
+
+        let error = paimon_catalog_create_tag(
+            catalog,
+            identifier.identifier,
+            tag_name.as_ptr(),
+            ptr::null(),
+            false,
+        );
+        assert!(error.is_null());
+
+        let tag_result = paimon_catalog_get_tag(catalog, identifier.identifier, tag_name.as_ptr());
+        assert!(tag_result.error.is_null());
+        let tag_json = std::slice::from_raw_parts(tag_result.tag.data, tag_result.tag.len);
+        let tag: paimon::api::GetTagResponse = serde_json::from_slice(tag_json).unwrap();
+        assert_eq!(tag.tag_name, "release-1");
+        assert_eq!(tag.snapshot.id(), 1);
+
+        let explicit_name = CString::new("release-explicit").unwrap();
+        let snapshot_id = 1;
+        let error = paimon_catalog_create_tag(
+            catalog,
+            identifier.identifier,
+            explicit_name.as_ptr(),
+            &snapshot_id,
+            false,
+        );
+        assert!(error.is_null());
+        let missing_snapshot_id = 2;
+        let missing_snapshot_name = CString::new("missing-snapshot").unwrap();
+        let missing = paimon_catalog_create_tag(
+            catalog,
+            identifier.identifier,
+            missing_snapshot_name.as_ptr(),
+            &missing_snapshot_id,
+            false,
+        );
+        assert_eq!((*missing).code, PaimonErrorCode::NotFound as i32);
+        paimon_error_free(missing);
+
+        let duplicate = paimon_catalog_create_tag(
+            catalog,
+            identifier.identifier,
+            tag_name.as_ptr(),
+            ptr::null(),
+            false,
+        );
+        assert_eq!((*duplicate).code, PaimonErrorCode::AlreadyExists as i32);
+        paimon_error_free(duplicate);
+
+        let error = paimon_catalog_delete_tag(catalog, identifier.identifier, tag_name.as_ptr());
+        assert!(error.is_null());
+        let missing = paimon_catalog_get_tag(catalog, identifier.identifier, tag_name.as_ptr());
+        assert_eq!((*missing.error).code, PaimonErrorCode::NotFound as i32);
+        paimon_error_free(missing.error);
+
+        let missing = paimon_catalog_delete_tag(catalog, identifier.identifier, tag_name.as_ptr());
+        assert_eq!((*missing).code, PaimonErrorCode::NotFound as i32);
+        paimon_error_free(missing);
+
+        let error =
+            paimon_catalog_delete_tag(catalog, identifier.identifier, explicit_name.as_ptr());
+        assert!(error.is_null());
+
+        paimon_bytes_free(tag_result.tag);
+        paimon_identifier_free(identifier.identifier);
+        paimon_catalog_free(catalog);
     }
 }
 
@@ -2513,7 +2650,7 @@ fn test_two_commits_same_builder() {
 //
 // Two storage shapes are exercised end-to-end through the C `execute_read`
 // terminal, each compared against an independent core Rust
-// `VectorSearchBuilder::execute_read()` reference:
+// `SearchResultReadBuilder::read()` reference:
 //
 //   * A primary-key vector table backed by a real vindex IVF-flat ANN segment
 //     built in-process (bucket-local ANN search, residual filter supported).
@@ -2987,7 +3124,9 @@ fn rust_execute_read_rows(
             .with_vector_column(column)
             .with_query_vector(query)
             .with_limit(limit);
-        let mut stream = builder.execute_read().await.unwrap();
+        let mut stream = async { builder.execute().await?.new_read_builder().read().await }
+            .await
+            .unwrap();
         let (mut rows, mut has_score) = (0usize, false);
         while let Some(b) = stream.try_next().await.unwrap() {
             rows += b.num_rows();
@@ -3014,7 +3153,9 @@ fn rust_execute_read_pairs(
         if let Some(f) = filter {
             builder.with_filter(f);
         }
-        let mut stream = builder.execute_read().await.unwrap();
+        let mut stream = async { builder.execute().await?.new_read_builder().read().await }
+            .await
+            .unwrap();
         let mut pairs = Vec::new();
         while let Some(b) = stream.try_next().await.unwrap() {
             pairs.extend(batch_id_score_pairs(&b));
@@ -3172,6 +3313,256 @@ fn vector_search_pk_table_read_matches_rust() {
             );
         }
         unwrap_table(handle);
+    }
+}
+
+const SPLIT_FIXTURE: &str = "../../crates/paimon/testdata/pkvector_split";
+const SPLIT_FIXTURE_BUCKET_PATH: &str =
+    "/tmp/pkvfixture/warehouse/default.db/pk_vector_split/bucket-0";
+
+/// Stage the JAVA-PLANNED fixture into a temp dir and rewrite the absolute bucket
+/// path the split embeds. See `crates/paimon/tests/pk_vector_bucket_split_read_test.rs`
+/// for the fixture's provenance; the Rust suite covers its semantics, and this
+/// staging exists so the C ABI is exercised over real Java-produced bytes once.
+fn stage_split_fixture() -> (tempfile::TempDir, Table, Vec<Vec<u8>>) {
+    fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let (from, to) = (entry.path(), dst.join(entry.file_name()));
+            if from.is_dir() {
+                copy_dir(&from, &to);
+            } else {
+                std::fs::copy(&from, &to).unwrap();
+            }
+        }
+    }
+    /// Rewrite one `writeUTF` string in place, length prefix included.
+    fn rewrite(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
+        let mut needle = (from.len() as u16).to_be_bytes().to_vec();
+        needle.extend_from_slice(from.as_bytes());
+        let at = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("split bytes carry the generated bucket path");
+        let mut out = Vec::with_capacity(bytes.len() + to.len());
+        out.extend_from_slice(&bytes[..at]);
+        out.extend_from_slice(&(to.len() as u16).to_be_bytes());
+        out.extend_from_slice(to.as_bytes());
+        out.extend_from_slice(&bytes[at + needle.len()..]);
+        out
+    }
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(SPLIT_FIXTURE);
+    let tmp = tempfile::tempdir().unwrap();
+    let dst = tmp.path().join("table");
+    copy_dir(&src.join("table"), &dst);
+
+    let staged_bucket = format!("{}/bucket-0", dst.display());
+    let mut splits = Vec::new();
+    for entry in std::fs::read_dir(&src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "bin") {
+            splits.push(rewrite(
+                &std::fs::read(&path).unwrap(),
+                SPLIT_FIXTURE_BUCKET_PATH,
+                &staged_bucket,
+            ));
+        }
+    }
+    assert!(!splits.is_empty());
+
+    let location = format!("file://{}", dst.display());
+    let file_io = paimon::io::FileIOBuilder::new("file").build().unwrap();
+    let schema = crate::runtime()
+        .block_on(paimon::table::SchemaManager::new(file_io.clone(), location.clone()).latest())
+        .unwrap()
+        .unwrap();
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "pk_vector_split"),
+        location,
+        (*schema).clone(),
+        None,
+    );
+    (tmp, table, splits)
+}
+
+/// Consume a common vector read's Arrow stream in relevance order.
+unsafe fn vector_plan_pairs(
+    result: crate::result::paimon_result_record_batch_reader,
+) -> Vec<(i32, f32)> {
+    assert!(
+        result.error.is_null(),
+        "{}",
+        if result.error.is_null() {
+            String::new()
+        } else {
+            error_message(result.error)
+        }
+    );
+    let mut pairs = Vec::new();
+    loop {
+        let next = paimon_record_batch_reader_next(result.reader);
+        assert!(next.error.is_null());
+        if next.batch.array.is_null() {
+            break;
+        }
+        pairs.extend(batch_id_score_pairs(&import_batch(&next.batch)));
+        paimon_arrow_batch_free(next.batch);
+    }
+    paimon_record_batch_reader_free(result.reader);
+    pairs
+}
+
+/// Decode before planning. Each handle owns its state independently, including
+/// the Arrow stream after every planning/query handle has been freed.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn vector_search_bucket_splits_read_the_java_planned_fixture() {
+    let (_tmp, table, bytes) = stage_split_fixture();
+    let handle = unsafe { wrap_table(table) };
+    unsafe {
+        let mut splits = Vec::new();
+        for bytes in &bytes {
+            let decoded =
+                paimon_bucket_vector_search_split_deserialize(bytes.as_ptr(), bytes.len());
+            assert!(decoded.error.is_null());
+            splits.push(decoded.split);
+        }
+        drop(bytes);
+        let builder = c_vector_builder(handle, "embedding", &[0.0, 0.0], 3, ptr::null_mut());
+        let scan = paimon_vector_search_builder_new_scan(builder);
+        let read = paimon_vector_search_builder_new_read(builder);
+        assert!(scan.error.is_null() && read.error.is_null());
+        paimon_vector_search_builder_free(builder);
+        unwrap_table(handle);
+        let ptrs: Vec<*const paimon_bucket_vector_search_split> =
+            splits.iter().map(|&p| p as *const _).collect();
+        let plan = paimon_vector_scan_plan_from_bucket_splits(scan.scan, ptrs.as_ptr(), ptrs.len());
+        assert!(plan.error.is_null());
+        for split in splits {
+            paimon_bucket_vector_search_split_free(split);
+        }
+        paimon_vector_scan_free(scan.scan);
+        // The same decoded plan can be read more than once without re-decoding.
+        let first = vector_plan_pairs(paimon_vector_read_read(read.read, plan.plan));
+        let stream = paimon_vector_read_read(read.read, plan.plan);
+        paimon_vector_read_free(read.read);
+        paimon_vector_plan_free(plan.plan);
+        let pairs = vector_plan_pairs(stream);
+        assert_eq!(pairs, first);
+        assert_eq!(pairs.iter().map(|p| p.0).collect::<Vec<_>>(), vec![0, 1, 2]);
+        for (got, want) in pairs.iter().map(|p| p.1).zip([1.0f32, 0.5, 0.2]) {
+            assert!((got - want).abs() < 1e-4, "score {got} != {want}");
+        }
+    }
+}
+
+#[test]
+fn vector_search_de_uses_the_common_scan_plan_read_api() {
+    let table = build_append_vector_table("memory:/vector_plan_de");
+    let expected = rust_execute_read_pairs(&table, "embedding", vec![1.0, 0.0], 2, None);
+    unsafe {
+        let handle = wrap_table(table);
+        let builder = c_vector_builder(handle, "embedding", &[1.0, 0.0], 2, ptr::null_mut());
+        let scan = paimon_vector_search_builder_new_scan(builder);
+        let read = paimon_vector_search_builder_new_read(builder);
+        assert!(scan.error.is_null() && read.error.is_null());
+        paimon_vector_search_builder_free(builder);
+        unwrap_table(handle);
+        let plan = paimon_vector_scan_plan(scan.scan);
+        assert!(plan.error.is_null());
+        paimon_vector_scan_free(scan.scan);
+        let stream = paimon_vector_read_read(read.read, plan.plan);
+        paimon_vector_plan_free(plan.plan);
+        paimon_vector_read_free(read.read);
+        let mut actual = vector_plan_pairs(stream);
+        actual.sort_by_key(|p| p.0);
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn vector_search_split_decoder_rejects_invalid_buffers_without_a_builder() {
+    unsafe {
+        for (bytes, len) in [
+            (ptr::null(), 0),
+            (ptr::null(), 1),
+            (b"x".as_ptr(), 0),
+            (b"x".as_ptr(), usize::MAX),
+        ] {
+            let result = paimon_bucket_vector_search_split_deserialize(bytes, len);
+            assert!(result.split.is_null());
+            assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
+            paimon_error_free(result.error);
+        }
+        for bytes in [vec![0xAB; 64], vec![0; 3]] {
+            let result = paimon_bucket_vector_search_split_deserialize(bytes.as_ptr(), bytes.len());
+            assert!(result.split.is_null() && !result.error.is_null());
+            paimon_error_free(result.error);
+        }
+        paimon_bucket_vector_search_split_free(ptr::null_mut());
+    }
+}
+
+#[test]
+fn vector_search_plan_rejects_invalid_split_handles() {
+    let table = build_append_vector_table("memory:/vector_plan_invalid_handles");
+    unsafe {
+        let handle = wrap_table(table);
+        let builder = c_vector_builder(handle, "embedding", &[1.0, 0.0], 2, ptr::null_mut());
+        let scan = paimon_vector_search_builder_new_scan(builder);
+        assert!(scan.error.is_null());
+        let zero = paimon_bucket_vector_search_split {
+            inner: ptr::null_mut(),
+        };
+        let null_entry = [ptr::null()];
+        let zero_entry = [&zero as *const _];
+        for (splits, count) in [
+            (ptr::null(), 0),
+            (ptr::null(), 1),
+            (null_entry.as_ptr(), 1),
+            (zero_entry.as_ptr(), 1),
+            (zero_entry.as_ptr(), usize::MAX),
+        ] {
+            let result = paimon_vector_scan_plan_from_bucket_splits(scan.scan, splits, count);
+            assert!(result.plan.is_null() && !result.error.is_null());
+            assert_eq!((*result.error).code, PaimonErrorCode::InvalidInput as i32);
+            paimon_error_free(result.error);
+        }
+        paimon_vector_scan_free(scan.scan);
+        paimon_vector_search_builder_free(builder);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn vector_search_factories_and_reads_reject_uninitialized_handles() {
+    unsafe {
+        let mut builder = paimon_vector_search_builder {
+            inner: ptr::null_mut(),
+        };
+        let scan = paimon_vector_search_builder_new_scan(&builder);
+        let read = paimon_vector_search_builder_new_read(&builder);
+        let stream = paimon_vector_search_builder_execute_read(&mut builder);
+        for error in [scan.error, read.error, stream.error] {
+            assert!(!error.is_null());
+            assert!(error_message(error).contains("not initialized"));
+            paimon_error_free(error);
+        }
+        let scan = paimon_vector_scan {
+            inner: ptr::null_mut(),
+        };
+        let plan = paimon_vector_scan_plan(&scan);
+        assert!(plan.plan.is_null() && !plan.error.is_null());
+        paimon_error_free(plan.error);
+        let read = paimon_vector_read {
+            inner: ptr::null_mut(),
+        };
+        let result = paimon_vector_read_read(&read, ptr::null());
+        assert!(result.reader.is_null() && !result.error.is_null());
+        paimon_error_free(result.error);
     }
 }
 
@@ -3505,10 +3896,12 @@ fn rust_execute_read_column_names(
             .with_vector_column(column)
             .with_query_vector(query)
             .with_limit(limit);
+        let result = builder.execute().await.unwrap();
+        let mut reader = result.new_read_builder();
         if let Some(cols) = projection {
-            builder.with_projection(cols);
+            reader.with_projection(cols);
         }
-        let mut stream = builder.execute_read().await.unwrap();
+        let mut stream = reader.read().await.unwrap();
         let mut names: Vec<String> = Vec::new();
         while let Some(b) = stream.try_next().await.unwrap() {
             names = b

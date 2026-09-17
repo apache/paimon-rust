@@ -33,15 +33,24 @@ impl ResourcePaths {
     const TABLES: &'static str = "tables";
     const TABLE_DETAILS: &'static str = "table-details";
     const PARTITIONS: &'static str = "partitions";
+    const TAGS: &'static str = "tags";
     const VIEWS: &'static str = "views";
     const FUNCTIONS: &'static str = "functions";
+    const PERMISSIONS: &'static str = "permissions";
+    const POLICIES: &'static str = "policies";
 
     /// Create a new ResourcePaths with the given prefix.
     pub fn new(prefix: &str) -> Self {
         let base_path = if prefix.is_empty() {
             format!("/{}", Self::V1)
         } else {
-            format!("/{}/{}", Self::V1, prefix.trim_matches('/'))
+            // Encode the prefix, as Java's `ResourcePaths` constructor does: it is
+            // server-supplied, and a raw `/`, `?` or `#` would restructure the URL.
+            format!(
+                "/{}/{}",
+                Self::V1,
+                RESTUtil::encode_string(prefix.trim_matches('/'))
+            )
         };
         ResourcePaths { base_path }
     }
@@ -105,6 +114,11 @@ impl ResourcePaths {
             Self::TABLES,
             RESTUtil::encode_string(table_name)
         )
+    }
+
+    /// Get the latest table snapshot endpoint path, including an optional branch suffix.
+    pub fn table_snapshot(&self, database_name: &str, table_name: &str) -> String {
+        format!("{}/snapshot", self.table(database_name, table_name))
     }
 
     /// Get the views endpoint path for a database.
@@ -204,6 +218,20 @@ impl ResourcePaths {
         )
     }
 
+    /// Get the tags endpoint path for a table.
+    pub fn tags(&self, database_name: &str, table_name: &str) -> String {
+        format!("{}/{}", self.table(database_name, table_name), Self::TAGS)
+    }
+
+    /// Get the endpoint path for a table tag.
+    pub fn tag(&self, database_name: &str, table_name: &str, tag_name: &str) -> String {
+        format!(
+            "{}/{}",
+            self.tags(database_name, table_name),
+            RESTUtil::encode_string(tag_name)
+        )
+    }
+
     /// Get the partitions endpoint path for a table.
     pub fn partitions(&self, database_name: &str, table_name: &str) -> String {
         format!(
@@ -237,6 +265,35 @@ impl ResourcePaths {
             self.partitions(database_name, table_name)
         )
     }
+
+    /// Get the permission collection of the catalog (`{base}/permissions`).
+    pub fn permissions(&self) -> String {
+        format!("{}/{}", self.base_path, Self::PERMISSIONS)
+    }
+
+    /// Get the action endpoint that grants or replaces one permission assignment.
+    pub fn grant_permission(&self) -> String {
+        format!("{}/grant", self.permissions())
+    }
+
+    /// Get the action endpoint that revokes one permission assignment.
+    pub fn revoke_permission(&self) -> String {
+        format!("{}/revoke", self.permissions())
+    }
+
+    /// Get the policy collection nested below its table (`.../tables/{table}/policies`).
+    pub fn policies(&self, database_name: &str, table_name: &str) -> String {
+        format!(
+            "{}/{}",
+            self.table(database_name, table_name),
+            Self::POLICIES
+        )
+    }
+
+    /// Get the action endpoint that drops one policy from its table.
+    pub fn drop_policy(&self, database_name: &str, table_name: &str) -> String {
+        format!("{}/drop", self.policies(database_name, table_name))
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +318,18 @@ mod tests {
     }
 
     #[test]
+    fn test_resource_paths_encodes_prefix() {
+        assert_eq!(
+            ResourcePaths::new("clg=paimon").databases(),
+            "/v1/clg%3Dpaimon/databases"
+        );
+        assert_eq!(
+            ResourcePaths::new("clg&paimon").databases(),
+            "/v1/clg%26paimon/databases"
+        );
+    }
+
+    #[test]
     fn test_resource_paths_table() {
         let paths = ResourcePaths::new("");
         let table_path = paths.table("my-db", "my-table");
@@ -274,6 +343,19 @@ mod tests {
         assert_eq!(
             paths.auth_table("analytics db", "user events"),
             "/v1/catalog/databases/analytics+db/tables/user+events/auth"
+        );
+    }
+
+    #[test]
+    fn test_tag_paths_encode_names() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.tags("analytics db", "events/table"),
+            "/v1/catalog/databases/analytics+db/tables/events%2Ftable/tags"
+        );
+        assert_eq!(
+            paths.tag("analytics db", "events/table", "release/1"),
+            "/v1/catalog/databases/analytics+db/tables/events%2Ftable/tags/release%2F1"
         );
     }
 
@@ -324,6 +406,27 @@ mod tests {
         assert_eq!(
             paths.drop_partitions("analytics db", "user events"),
             "/v1/catalog/databases/analytics+db/tables/user+events/partitions/drop"
+        );
+    }
+
+    #[test]
+    fn test_permission_paths_hang_off_the_catalog_prefix() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(paths.permissions(), "/v1/catalog/permissions");
+        assert_eq!(paths.grant_permission(), "/v1/catalog/permissions/grant");
+        assert_eq!(paths.revoke_permission(), "/v1/catalog/permissions/revoke");
+    }
+
+    #[test]
+    fn test_policy_paths_nest_under_the_table_and_encode_names() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.policies("sales db", "orders/all"),
+            "/v1/catalog/databases/sales+db/tables/orders%2Fall/policies"
+        );
+        assert_eq!(
+            paths.drop_policy("sales db", "orders/all"),
+            "/v1/catalog/databases/sales+db/tables/orders%2Fall/policies/drop"
         );
     }
 }

@@ -15,27 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Format Table partition names, paths and values, shared by the scan and the catalog
-//! registrations it reads.
+//! Format Table partition names, paths and values, shared by the scan, the catalog
+//! registrations it reads and the SQL statements that administer them.
 
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
 
-use crate::spec::{escape_path_name, DataType, Datum};
+use crate::io::FileIO;
+use crate::spec::{escape_path_name, unescape_path_name, DataType, Datum};
 
 const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
 
 /// Generates canonical names and physical paths for Format Table partitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FormatTablePartitionPaths {
+pub struct FormatTablePartitionPaths {
     partition_keys: Vec<String>,
     only_value_in_path: bool,
 }
 
 impl FormatTablePartitionPaths {
     /// Create a helper for the declared partition-key order and physical layout.
-    pub(crate) fn new<I, S>(partition_keys: I, only_value_in_path: bool) -> Self
+    pub fn new<I, S>(partition_keys: I, only_value_in_path: bool) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -47,7 +48,7 @@ impl FormatTablePartitionPaths {
     }
 
     /// Return the canonical logical partition name (`key=value/...`).
-    pub(crate) fn partition_name(&self, spec: &HashMap<String, String>) -> crate::Result<String> {
+    pub fn partition_name(&self, spec: &HashMap<String, String>) -> crate::Result<String> {
         let values = self.ordered_values(spec)?;
         Ok(self
             .partition_keys
@@ -98,7 +99,7 @@ impl FormatTablePartitionPaths {
     }
 
     /// Return the physical partition path relative to the table location.
-    pub(crate) fn relative_path(&self, spec: &HashMap<String, String>) -> crate::Result<String> {
+    pub fn relative_path(&self, spec: &HashMap<String, String>) -> crate::Result<String> {
         if !self.only_value_in_path {
             return self.partition_name(spec);
         }
@@ -108,6 +109,60 @@ impl FormatTablePartitionPaths {
             .map(escape_path_name)
             .collect::<Vec<_>>()
             .join("/"))
+    }
+
+    /// Discover complete raw partition specs from the table directory, sorted and deduplicated.
+    /// Skips hidden or non-matching entries; a malformed or non-canonical segment is an error.
+    pub async fn discover(
+        &self,
+        file_io: &FileIO,
+        table_path: &str,
+        default_partition_name: &str,
+    ) -> crate::Result<Vec<HashMap<String, String>>> {
+        let default_partition_path_name = self
+            .only_value_in_path
+            .then(|| escape_path_name(default_partition_name));
+        let mut frontier = vec![(table_path.trim_end_matches('/').to_string(), HashMap::new())];
+        for key in &self.partition_keys {
+            let mut next = Vec::new();
+            for (path, spec) in frontier {
+                let statuses = match file_io.list_status(&path).await {
+                    Ok(statuses) => statuses,
+                    Err(error) if is_storage_not_found(&error) => continue,
+                    Err(error) => return Err(error),
+                };
+                for status in statuses {
+                    if !status.is_dir {
+                        continue;
+                    }
+                    let Some(segment) = last_path_segment(&status.path) else {
+                        continue;
+                    };
+                    let is_value_only_default =
+                        default_partition_path_name.as_deref() == Some(segment);
+                    if (segment.starts_with('.') || segment.starts_with('_'))
+                        && !is_value_only_default
+                    {
+                        continue;
+                    }
+                    let Some(value) = self.partition_value_from_segment(key, segment)? else {
+                        continue;
+                    };
+                    let mut child_spec = spec.clone();
+                    child_spec.insert(key.clone(), value);
+                    next.push((status.path.trim_end_matches('/').to_string(), child_spec));
+                }
+            }
+            frontier = next;
+        }
+
+        let mut partitions = frontier
+            .into_iter()
+            .map(|(_, spec)| Ok((self.partition_name(&spec)?, spec)))
+            .collect::<crate::Result<Vec<_>>>()?;
+        partitions.sort_by(|left, right| left.0.cmp(&right.0));
+        partitions.dedup_by(|left, right| left.0 == right.0);
+        Ok(partitions.into_iter().map(|(_, spec)| spec).collect())
     }
 
     fn ordered_values<'a>(&self, spec: &'a HashMap<String, String>) -> crate::Result<Vec<&'a str>> {
@@ -147,10 +202,48 @@ impl FormatTablePartitionPaths {
             self.partition_keys
         )
     }
+
+    fn partition_value_from_segment(
+        &self,
+        key: &str,
+        segment: &str,
+    ) -> crate::Result<Option<String>> {
+        let value = if self.only_value_in_path {
+            decode_canonical_path_name(segment)?
+        } else {
+            let Some((segment_key, value)) = segment.split_once('=') else {
+                return Ok(None);
+            };
+            let decoded_key = decode_canonical_path_name(segment_key)?;
+            if decoded_key != key {
+                return Ok(None);
+            }
+            decode_canonical_path_name(value)?
+        };
+        Ok(Some(value))
+    }
+}
+
+fn decode_canonical_path_name(value: &str) -> crate::Result<String> {
+    let decoded = unescape_path_name(value).ok_or_else(|| crate::Error::DataInvalid {
+        message: format!("Invalid escaped partition path segment {value:?}"),
+        source: None,
+    })?;
+    let canonical = escape_path_name(&decoded);
+    if canonical != value {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Partition path segment {value:?} cannot round-trip through catalog metadata; \
+                 its canonical escaped form is {canonical:?}"
+            ),
+            source: None,
+        });
+    }
+    Ok(decoded)
 }
 
 /// Parse a raw Format Table partition value from a path or catalog registration.
-pub(crate) fn parse_format_partition_value(value: &str, data_type: &DataType) -> Option<Datum> {
+pub fn parse_format_partition_value(value: &str, data_type: &DataType) -> Option<Datum> {
     match data_type {
         DataType::Boolean(_) => parse_partition_bool(value).map(Datum::Bool),
         DataType::TinyInt(_) => value.parse::<i8>().ok().map(Datum::TinyInt),
@@ -165,7 +258,7 @@ pub(crate) fn parse_format_partition_value(value: &str, data_type: &DataType) ->
 }
 
 /// Format a typed value for Format Table partition metadata and paths.
-pub(crate) fn format_partition_value(
+pub fn format_partition_value(
     datum: &Datum,
     data_type: &DataType,
     default_partition_name: &str,
@@ -230,6 +323,18 @@ fn parse_partition_date(value: &str) -> Option<i32> {
 fn format_partition_date(epoch_days: i32) -> Option<String> {
     NaiveDate::from_num_days_from_ce_opt(epoch_days.checked_add(UNIX_EPOCH_DAYS_FROM_CE)?)
         .map(|date| date.format("%Y-%m-%d").to_string())
+}
+
+pub(crate) fn is_storage_not_found(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::IoUnexpected { source, .. }
+            if source.kind() == opendal::ErrorKind::NotFound
+    )
+}
+
+fn last_path_segment(path: &str) -> Option<&str> {
+    path.trim_end_matches('/').rsplit('/').next()
 }
 
 #[cfg(test)]
@@ -348,5 +453,19 @@ mod tests {
         // Escaping a value would inject the pattern's only wildcard, so pushdown is skipped
         // rather than silently widened.
         assert_eq!(paths.name_prefix_pattern(&["2026/07".to_string()]), None);
+    }
+
+    #[test]
+    fn test_storage_not_found_matches_only_not_found() {
+        for (kind, expected) in [
+            (opendal::ErrorKind::NotFound, true),
+            (opendal::ErrorKind::PermissionDenied, false),
+        ] {
+            let error = crate::Error::IoUnexpected {
+                message: "list partition directory".to_string(),
+                source: Box::new(opendal::Error::new(kind, "test")),
+            };
+            assert_eq!(is_storage_not_found(&error), expected);
+        }
     }
 }

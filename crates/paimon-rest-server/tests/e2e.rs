@@ -525,3 +525,67 @@ async fn altering_the_declared_type_is_rejected() {
         .await
         .expect("still readable");
 }
+
+#[tokio::test]
+async fn test_load_snapshot_empty_latest_and_branch() {
+    use paimon::spec::{CommitKind, Snapshot};
+    let ctx = setup().await;
+    ctx.catalog
+        .create_database("db", false, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("db", "snapshots");
+    ctx.catalog
+        .create_table(&identifier, append_only_schema(), false)
+        .await
+        .unwrap();
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    let api = table.rest_env().unwrap().api();
+    assert!(api.load_snapshot(&identifier).await.unwrap().is_none());
+    for id in [1, 2] {
+        let snapshot = Snapshot::builder()
+            .version(3)
+            .id(id)
+            .schema_id(0)
+            .base_manifest_list("base".into())
+            .delta_manifest_list("delta".into())
+            .commit_user("test".into())
+            .commit_identifier(id)
+            .commit_kind(CommitKind::APPEND)
+            .time_millis(1000)
+            .total_record_count(Some(id * 3))
+            .build();
+        table
+            .snapshot_manager()
+            .commit_snapshot(&snapshot)
+            .await
+            .unwrap();
+        if id == 1 {
+            table
+                .snapshot_manager()
+                .with_branch("dev")
+                .commit_snapshot(&snapshot)
+                .await
+                .unwrap();
+        }
+    }
+    let snapshot = api.load_snapshot(&identifier).await.unwrap().unwrap();
+    assert_eq!(snapshot.snapshot.id(), 2);
+    assert_eq!(snapshot.record_count, Some(6));
+    assert_eq!(snapshot.file_count, None);
+    let branch = api
+        .load_snapshot(&Identifier::new("db", "snapshots$branch_dev"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(branch.snapshot.id(), 1);
+    assert!(api
+        .load_snapshot(&Identifier::new("db", "snapshots$branch_empty"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(api
+        .load_snapshot(&Identifier::new("db", "missing"))
+        .await
+        .is_err());
+}

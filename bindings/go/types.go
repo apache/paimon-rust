@@ -74,6 +74,15 @@ var (
 		}[0],
 	}
 
+	typePaimonBytes = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
 	typeResultReadBlobs = ffi.Type{
 		Type: ffi.Struct,
 		Elements: &[]*ffi.Type{
@@ -99,6 +108,28 @@ var (
 	typeResultGetTable = ffi.Type{
 		Type: ffi.Struct,
 		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	// paimon_result_get_tag { tag: paimon_bytes, error: *paimon_error }
+	typeResultGetTag = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	// paimon_result_latest_snapshot { snapshot: paimon_bytes, error: *paimon_error }
+	typeResultLatestSnapshot = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
 			&ffi.TypePointer,
 			&ffi.TypePointer,
 			nil,
@@ -368,6 +399,16 @@ type resultReadBlobs struct {
 type resultGetTable struct {
 	table *paimonTable
 	error *paimonError
+}
+
+type resultGetTag struct {
+	tag   paimonBytes
+	error *paimonError
+}
+
+type resultLatestSnapshot struct {
+	snapshot paimonBytes
+	error    *paimonError
 }
 
 type resultIdentifierNew struct {

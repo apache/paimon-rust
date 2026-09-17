@@ -52,8 +52,9 @@ use serde_json::json;
 
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse, CreateTableRequest,
-    ErrorResponse, GetDatabaseResponse, GetTableResponse, ListDatabasesResponse,
-    ListPartitionsResponse, ListTablesResponse, RESTUtil, RenameTableRequest, ResourcePaths,
+    ErrorResponse, GetDatabaseResponse, GetTableResponse, GetTableSnapshotResponse,
+    ListDatabasesResponse, ListPartitionsResponse, ListTablesResponse, RESTUtil,
+    RenameTableRequest, ResourcePaths, TableSnapshot,
 };
 use paimon::catalog::{list_partitions_from_file_system, Catalog, Identifier};
 use paimon::common::{CatalogOptions, Options};
@@ -165,6 +166,10 @@ fn build_router(prefix: &str, state: Arc<AppState>) -> Router {
             &format!("{base}/databases/:db/tables/:table"),
             get(get_table).post(alter_table).delete(drop_table),
         )
+        .route(
+            &format!("{base}/databases/:db/tables/:table/snapshot"),
+            get(load_snapshot),
+        )
         .route(&format!("{base}/tables/rename"), post(rename_table))
         .route(
             &format!("{base}/databases/:db/tables/:table/commit"),
@@ -189,35 +194,50 @@ fn build_router(prefix: &str, state: Arc<AppState>) -> Router {
 // The client reconstructs the original error solely from the HTTP status code
 // (see `crates/paimon/src/api/rest_error.rs`), so the code below MUST line the
 // status codes up with `RestError::from_error_response`.
+//
+// `resourceType` is part of the same contract for a *Java* client, which
+// dispatches on it: `RESTCatalog#alterTable` only raises
+// `TableNotExistException` when it equals `ErrorResponse.RESOURCE_TYPE_TABLE`,
+// and `StringUtils#equals` compares char by char, so the case has to match.
 // ============================================================================
+
+/// Mirrors Java `ErrorResponse.RESOURCE_TYPE_DATABASE`.
+const RESOURCE_TYPE_DATABASE: &str = "DATABASE";
+/// Mirrors Java `ErrorResponse.RESOURCE_TYPE_TABLE`.
+const RESOURCE_TYPE_TABLE: &str = "TABLE";
 
 fn error_response(e: Error) -> Response {
     let (status, resource_type, resource_name) = match &e {
         Error::DatabaseNotExist { database } => (
             StatusCode::NOT_FOUND,
-            Some("database".to_string()),
+            Some(RESOURCE_TYPE_DATABASE.to_string()),
             Some(database.clone()),
         ),
         Error::TableNotExist { full_name } => (
             StatusCode::NOT_FOUND,
-            Some("table".to_string()),
+            Some(RESOURCE_TYPE_TABLE.to_string()),
             Some(full_name.clone()),
         ),
         Error::DatabaseAlreadyExist { database } => (
             StatusCode::CONFLICT,
-            Some("database".to_string()),
+            Some(RESOURCE_TYPE_DATABASE.to_string()),
             Some(database.clone()),
         ),
         Error::TableAlreadyExist { full_name } => (
             StatusCode::CONFLICT,
-            Some("table".to_string()),
+            Some(RESOURCE_TYPE_TABLE.to_string()),
             Some(full_name.clone()),
         ),
         Error::DatabaseNotEmpty { database } => (
             StatusCode::CONFLICT,
-            Some("database".to_string()),
+            Some(RESOURCE_TYPE_DATABASE.to_string()),
             Some(database.clone()),
         ),
+        // `column:<table>` and 400 diverge from Java's `RESOURCE_TYPE_COLUMN`
+        // and 404/409, but correcting the status here would make the *Rust*
+        // client report a missing column as `TableNotExist`
+        // (`map_rest_error_for_table` ignores `resourceType`), so the two must
+        // move together in a separate change.
         Error::ColumnNotExist { full_name, column } => (
             StatusCode::BAD_REQUEST,
             Some(format!("column:{full_name}")),
@@ -522,6 +542,44 @@ async fn commit(
     }
 }
 
+/// Load the latest snapshot from the filesystem catalog, respecting branch suffixes.
+async fn load_snapshot(path: RestPath, Extension(state): Extension<Arc<AppState>>) -> Response {
+    let identifier = Identifier::new(path.get("db"), path.get("table"));
+    let parsed = match identifier.parsed_object_name() {
+        Ok(parsed) if parsed.system_table().is_none() => parsed,
+        Ok(_) => {
+            return error_response(Error::Unsupported {
+                message: "System tables do not expose a table snapshot".to_string(),
+            })
+        }
+        Err(error) => return error_response(error),
+    };
+    let base = Identifier::new(identifier.database(), parsed.table());
+    let table = match state.catalog.get_table(&base).await {
+        Ok(table) => table,
+        Err(error) => return error_response(error),
+    };
+    let manager = table
+        .snapshot_manager()
+        .with_branch(parsed.branch_or_default());
+    match manager.get_latest_snapshot().await {
+        Ok(snapshot) => {
+            let response = GetTableSnapshotResponse {
+                snapshot: snapshot.map(|snapshot| TableSnapshot {
+                    record_count: snapshot.total_record_count(),
+                    snapshot,
+                    // The snapshot alone does not contain these statistics.
+                    file_size_in_bytes: None,
+                    file_count: None,
+                    last_file_creation_time: None,
+                }),
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(error) => error_response(error),
+    }
+}
+
 /// List a table's partitions, computed from the latest snapshot on disk.
 ///
 /// Mirrors `Catalog::list_partitions`: resolve the table, then derive partition
@@ -564,4 +622,71 @@ async fn table_token_stub() -> Response {
 
 fn empty_audit() -> AuditRESTResponse {
     AuditRESTResponse::new(None, None, None, None, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn resource_type_of(error: Error) -> (StatusCode, Option<String>) {
+        let response = error_response(error);
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("parse body");
+        let resource_type = json
+            .get("resourceType")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        (status, resource_type)
+    }
+
+    /// A Java client keys off `resourceType` and compares it case-sensitively, so
+    /// these are wire values, not free-form labels.
+    #[tokio::test]
+    async fn database_and_table_errors_use_javas_uppercase_resource_type() {
+        for (error, expected_status, expected_type) in [
+            (
+                Error::DatabaseNotExist {
+                    database: "db".to_string(),
+                },
+                StatusCode::NOT_FOUND,
+                "DATABASE",
+            ),
+            (
+                Error::TableNotExist {
+                    full_name: "db.t".to_string(),
+                },
+                StatusCode::NOT_FOUND,
+                "TABLE",
+            ),
+            (
+                Error::DatabaseAlreadyExist {
+                    database: "db".to_string(),
+                },
+                StatusCode::CONFLICT,
+                "DATABASE",
+            ),
+            (
+                Error::TableAlreadyExist {
+                    full_name: "db.t".to_string(),
+                },
+                StatusCode::CONFLICT,
+                "TABLE",
+            ),
+            (
+                Error::DatabaseNotEmpty {
+                    database: "db".to_string(),
+                },
+                StatusCode::CONFLICT,
+                "DATABASE",
+            ),
+        ] {
+            let label = expected_type;
+            let (status, resource_type) = resource_type_of(error).await;
+            assert_eq!(status, expected_status, "{label}");
+            assert_eq!(resource_type.as_deref(), Some(expected_type), "{label}");
+        }
+    }
 }

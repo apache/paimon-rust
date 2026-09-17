@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{DataSplit, SnapshotManager, Table, TableScan};
+use super::{DataSplit, Plan, SnapshotManager, Table, TableScan};
 use crate::spec::{CommitKind, CoreOptions};
 
 /// Batch incremental scan mode.
@@ -231,8 +231,7 @@ impl<'a> IncrementalScan<'a> {
         start_exclusive: i64,
         end_inclusive: i64,
     ) -> Self {
-        let snapshot_manager =
-            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+        let snapshot_manager = table.snapshot_manager();
         Self {
             table,
             scan,
@@ -243,8 +242,28 @@ impl<'a> IncrementalScan<'a> {
         }
     }
 
+    /// Select half-open row positions across the combined APPEND-delta batch.
+    /// This configuration requires [`Self::plan_combined_delta`]; per-commit
+    /// planning has no single row-position space across snapshots.
+    pub fn with_row_position_slice(mut self, start: u64, end: u64) -> crate::Result<Self> {
+        self.scan = self.scan.with_row_position_slice(start, end)?;
+        Ok(self)
+    }
+
+    /// Select one balanced row-position shard of the combined APPEND-delta batch.
+    pub fn with_row_position_shard(mut self, index: u64, count: u64) -> crate::Result<Self> {
+        self.scan = self.scan.with_row_position_shard(index, count)?;
+        Ok(self)
+    }
+
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
         crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        if self.scan.has_row_position_selection() {
+            return Err(crate::Error::Unsupported {
+                message: "Incremental row-position selection requires combined delta planning"
+                    .into(),
+            });
+        }
         let mode = self.resolve_mode();
         self.validate_snapshot_range(mode).await?;
         if self.start_exclusive == self.end_inclusive {
@@ -256,6 +275,44 @@ impl<'a> IncrementalScan<'a> {
             IncrementalScanMode::Auto => unreachable!("Auto must resolve before planning"),
             IncrementalScanMode::Diff => self.plan_diff(mode).await,
         }
+    }
+
+    /// Plan APPEND deltas with batch split packing and streaming read semantics.
+    /// Each physical change is retained, including repeated keys and retracts.
+    ///
+    /// Unlike [`Self::plan`], this returns an ordinary [`Plan`] for a normal
+    /// table reader. It does not preserve a separate result for each commit.
+    /// Only Delta (or Auto resolving to Delta) is supported. The end snapshot
+    /// must exist and supplies snapshot metadata. Snapshot deletion vectors and
+    /// automatic global-index pruning do not apply to these historical events.
+    pub async fn plan_combined_delta(&self) -> crate::Result<Plan> {
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        let mode = self.resolve_mode();
+        if mode != IncrementalScanMode::Delta {
+            return Err(crate::Error::Unsupported {
+                message: "Combined incremental planning only supports Delta mode".to_string(),
+            });
+        }
+        self.validate_snapshot_range(mode).await?;
+        let end_snapshot = self
+            .snapshot_manager
+            .get_snapshot(self.end_inclusive)
+            .await?;
+        let mut snapshots = Vec::new();
+        for snapshot_id in (self.start_exclusive + 1)..self.end_inclusive {
+            let snapshot = self.snapshot_manager.get_snapshot(snapshot_id).await?;
+            if snapshot.commit_kind() == &CommitKind::APPEND {
+                snapshots.push(snapshot);
+            }
+        }
+        if self.start_exclusive < self.end_inclusive
+            && end_snapshot.commit_kind() == &CommitKind::APPEND
+        {
+            snapshots.push(end_snapshot.clone());
+        }
+        self.scan
+            .plan_snapshot_deltas(&snapshots, &end_snapshot)
+            .await
     }
 
     fn resolve_mode(&self) -> IncrementalScanMode {

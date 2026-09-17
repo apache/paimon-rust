@@ -1105,7 +1105,10 @@ impl FromStr for LocalZonedTimestampType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if !s.starts_with(serde_utils::LocalZonedTimestamp::NAME) || !s.contains("WITH") {
+        // PyPaimon persists the TIMESTAMP_LTZ(p) alias for this type.
+        let alias = s.starts_with("TIMESTAMP_LTZ(");
+        if !alias && (!s.starts_with(serde_utils::LocalZonedTimestamp::NAME) || !s.contains("WITH"))
+        {
             return DataTypeInvalidSnafu {
                 message:
                     "Invalid LocalZonedTimestamp type. Expected string to start with 'TIMESTAMP'.",
@@ -1342,7 +1345,10 @@ impl FromStr for TimestampType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if !s.starts_with(serde_utils::TIMESTAMP::NAME) {
+        if !s.starts_with(serde_utils::TIMESTAMP::NAME)
+            || s.starts_with("TIMESTAMP_LTZ")
+            || s.contains("WITH LOCAL TIME ZONE")
+        {
             return DataTypeInvalidSnafu {
                 message: "Invalid TIMESTAMP type. Expected string to start with 'TIMESTAMP'.",
             }
@@ -2553,6 +2559,33 @@ mod tests {
                 .unwrap_or_else(|err| panic!("deserialize failed for {name}: {err}"));
 
             assert_eq!(actual, expect, "test data type deserialize for {name}")
+        }
+    }
+
+    #[test]
+    fn test_timestamp_ltz_alias_preserves_type_precision_and_nullability() {
+        for precision in [0, 3, 6, 9] {
+            for nullable in [true, false] {
+                let suffix = if nullable { "" } else { " NOT NULL" };
+                let canonical = format!("TIMESTAMP({precision}) WITH LOCAL TIME ZONE{suffix}");
+                let expected = LocalZonedTimestampType::with_nullable(nullable, precision).unwrap();
+                for name in [
+                    format!("TIMESTAMP_LTZ({precision}){suffix}"),
+                    canonical.clone(),
+                ] {
+                    let json = serde_json::to_string(&name).unwrap();
+                    let data_type: DataType = serde_json::from_str(&json).unwrap();
+                    assert_eq!(data_type, DataType::LocalZonedTimestamp(expected.clone()));
+                    assert_eq!(LocalZonedTimestampType::from_str(&name).unwrap(), expected);
+                    assert_eq!(serde_json::to_value(&data_type).unwrap(), canonical);
+                    assert!(TimestampType::from_str(&name).is_err());
+                }
+                let ordinary = format!("TIMESTAMP({precision}){suffix}");
+                assert_eq!(
+                    serde_json::from_value::<DataType>(serde_json::json!(ordinary)).unwrap(),
+                    DataType::Timestamp(TimestampType::with_nullable(nullable, precision).unwrap())
+                );
+            }
         }
     }
 

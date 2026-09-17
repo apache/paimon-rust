@@ -292,6 +292,44 @@ catalog, err := paimon.NewCatalog(map[string]string{
 })
 ```
 
+## Managing Tags
+
+Catalog tags pin table snapshots. Pass `nil` to tag the latest snapshot, then
+read the tag to record the snapshot ID:
+
+```go
+id := paimon.NewIdentifier("default", "my_table")
+if err := catalog.CreateTag(id, "dataset-42", nil, false); err != nil {
+    log.Fatal(err)
+}
+tag, err := catalog.GetTag(id, "dataset-42")
+if err != nil {
+    log.Fatal(err)
+}
+log.Printf("pinned snapshot %d", tag.Snapshot.ID)
+```
+
+Use `table.LatestSnapshot()` when the current snapshot must be inspected before
+tagging; it returns `nil` for an empty table.
+
+Read the pinned snapshot with the existing read options:
+
+```go
+builder, err := table.NewReadBuilderWithOptions(map[string]string{
+    "scan.tag-name": "dataset-42",
+})
+```
+
+To tag a specific snapshot, pass its ID:
+
+```go
+snapshotID := int64(123)
+err := catalog.CreateTag(id, "dataset-43", &snapshotID, false)
+```
+
+The final argument to `CreateTag` ignores an existing tag. Creating tags with
+a retention duration is not yet supported.
+
 ## Writing a Table
 
 Use `NewWriteBuilder` for ordinary and fixed-bucket tables. The `arrow.Record`
@@ -485,6 +523,34 @@ if err := rb.WithProjection([]string{"id", "name"}); err != nil {
 // Continue with scan-then-read as above...
 ```
 
+### Case-Insensitive Column Names
+
+Projected names must match the schema exactly by default. Pass `false` to
+`WithCaseSensitive` to match by ASCII case folding instead — useful for tables
+whose columns were declared in upper case by Hive or Spark. A name that folds onto
+two schema columns differing only in case is rejected as ambiguous.
+
+```go
+if err := rb.WithCaseSensitive(false); err != nil {
+    log.Fatal(err)
+}
+if err := rb.WithProjection([]string{"ID", "NAME"}); err != nil {
+    log.Fatal(err)
+}
+```
+
+Call order does not matter: names that differ from the schema only in case are
+resolved in `NewRead`, which is also where such a name surfaces as an error. A
+name that matches no column under any casing is still rejected by
+`WithProjection` itself.
+
+The returned records always carry the schema's own spelling, not the spelling you
+asked for, so downstream column lookups stay stable.
+
+This setting covers projection only. A predicate resolves its column when it is
+built, so its case sensitivity comes from which builder created it — see
+[Case-Insensitive Predicates](#case-insensitive-predicates).
+
 ## Filter Push-Down
 
 Filter push-down prunes data at two levels:
@@ -543,6 +609,29 @@ if err := rb.WithFilter(pred); err != nil {
 
 // Continue with scan-then-read...
 ```
+
+### Case-Insensitive Predicates
+
+`Table.PredicateBuilder` matches column names exactly. Its
+`WithCaseSensitive(false)` returns a builder that folds ASCII case instead; every
+predicate that builder produces resolves its column that way.
+
+```go
+pb := table.PredicateBuilder().WithCaseSensitive(false)
+
+// Resolves to the schema's "id" column.
+pred, err := pb.Eq("ID", int32(1))
+```
+
+The choice is fixed when the predicate is built, which is why it lives on the
+builder that produces predicates rather than on the read builder — the same
+`WithCaseSensitive` switch, on the object that owns the resolution.
+`ReadBuilder.WithCaseSensitive` does not affect predicates, and a predicate from a
+case-folding builder keeps that behaviour whatever the read builder is set to.
+
+The predicate stores the schema's own spelling of the column, not the one you
+passed, so file-level pruning and row-level filtering apply to it exactly as they
+would to an exactly-spelled predicate.
 
 ### Compound Predicates
 

@@ -35,14 +35,16 @@ use tokio::task::JoinHandle;
 
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse,
-    CreateFunctionRequest, CreatePartitionsRequest, CreateViewRequest, DropPartitionsRequest,
-    ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
-    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsByFilterRequest,
-    ListPartitionsByNamesRequest, ListPartitionsResponse, ListTablesResponse, ListViewsResponse,
-    RenameTableRequest, ResourcePaths,
+    CreateFunctionRequest, CreatePartitionsRequest, CreateTagRequest, CreateViewRequest,
+    DataPolicy, DropPartitionsRequest, DropPolicyRequest, ErrorResponse, GetDatabaseResponse,
+    GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
+    ListFunctionsResponse, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
+    ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse, ListTablesResponse,
+    ListViewsResponse, PermissionAssignment, PermissionResource, PolicyRequest, PolicyType,
+    RenameTableRequest, ResourcePaths, ResourceType, RevokePermissionRequest,
 };
 use paimon::catalog::{Function, Identifier};
-use paimon::spec::Partition;
+use paimon::spec::{CommitKind, Partition, Snapshot};
 
 type PartitionPageResponse = (Vec<Partition>, Option<String>);
 type PartitionSpecPageResponse = (Vec<HashMap<String, String>>, Option<String>);
@@ -53,6 +55,7 @@ struct MockState {
     tables: HashMap<String, GetTableResponse>,
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
+    tags: HashMap<String, GetTagResponse>,
     partitions: HashMap<String, Vec<Partition>>,
     partition_page_responses: HashMap<String, Vec<PartitionPageResponse>>,
     partition_list_call_counts: HashMap<String, usize>,
@@ -70,6 +73,18 @@ struct MockState {
     drop_partitions_calls: Vec<(String, String, DropPartitionsRequest)>,
     create_partitions_error_status: Option<StatusCode>,
     list_partitions_error_status: Option<StatusCode>,
+    permissions: Vec<PermissionAssignment>,
+    list_permissions_queries: Vec<HashMap<String, String>>,
+    grant_permission_bodies: Vec<serde_json::Value>,
+    revoke_permission_bodies: Vec<serde_json::Value>,
+    grant_permission_error_status: Option<StatusCode>,
+    /// Policies per `"{db}.{table}"`.
+    policies: HashMap<String, Vec<DataPolicy>>,
+    list_policies_queries: Vec<HashMap<String, String>>,
+    create_policy_bodies: Vec<serde_json::Value>,
+    drop_policy_bodies: Vec<serde_json::Value>,
+    create_policy_error: Option<ErrorResponse>,
+    drop_policy_error: Option<ErrorResponse>,
     /// ECS metadata role name (for token loader testing)
     ecs_role_name: Option<String>,
     /// ECS metadata token (for token loader testing)
@@ -111,22 +126,55 @@ fn partition_from_spec(spec: HashMap<String, String>) -> Partition {
     }
 }
 
-fn paginate_names(
-    names: Vec<String>,
+fn tag_snapshot(id: i64) -> Snapshot {
+    Snapshot::builder()
+        .version(3)
+        .id(id)
+        .schema_id(0)
+        .base_manifest_list("base-list".to_string())
+        .delta_manifest_list("delta-list".to_string())
+        .commit_user("test-user".to_string())
+        .commit_identifier(0)
+        .commit_kind(CommitKind::APPEND)
+        .time_millis(1000)
+        .build()
+}
+
+fn resource_error(
+    status: StatusCode,
+    resource_type: &str,
+    resource_name: &str,
+) -> axum::response::Response {
+    let message = if status == StatusCode::CONFLICT {
+        "Already Exists"
+    } else {
+        "Not Found"
+    };
+    let error = ErrorResponse::new(
+        Some(resource_type.to_string()),
+        Some(resource_name.to_string()),
+        Some(message.to_string()),
+        Some(status.as_u16() as i32),
+    );
+    (status, Json(error)).into_response()
+}
+
+fn paginate<T: Clone>(
+    items: Vec<T>,
     params: &HashMap<String, String>,
     page_size: Option<usize>,
-) -> (Vec<String>, Option<String>) {
+) -> (Vec<T>, Option<String>) {
     let Some(page_size) = page_size else {
-        return (names, None);
+        return (items, None);
     };
     let offset = params
         .get("pageToken")
         .and_then(|token| token.parse::<usize>().ok())
         .unwrap_or(0)
-        .min(names.len());
-    let end = (offset + page_size).min(names.len());
-    let next_page_token = (end < names.len()).then(|| end.to_string());
-    (names[offset..end].to_vec(), next_page_token)
+        .min(items.len());
+    let end = (offset + page_size).min(items.len());
+    let next_page_token = (end < items.len()).then(|| end.to_string());
+    (items[offset..end].to_vec(), next_page_token)
 }
 
 #[derive(Clone)]
@@ -488,7 +536,7 @@ impl RESTServer {
             .filter_map(|key| key.strip_prefix(&prefix).map(ToString::to_string))
             .collect();
         views.sort();
-        let (views, next_page_token) = paginate_names(views, &params, s.list_page_size);
+        let (views, next_page_token) = paginate(views, &params, s.list_page_size);
         (
             StatusCode::OK,
             Json(ListViewsResponse::new(views, next_page_token)),
@@ -594,7 +642,7 @@ impl RESTServer {
             .filter_map(|key| key.strip_prefix(&prefix).map(ToString::to_string))
             .collect();
         functions.sort();
-        let (functions, next_page_token) = paginate_names(functions, &params, s.list_page_size);
+        let (functions, next_page_token) = paginate(functions, &params, s.list_page_size);
         (
             StatusCode::OK,
             Json(ListFunctionsResponse::new(functions, next_page_token)),
@@ -721,6 +769,43 @@ impl RESTServer {
         (StatusCode::OK, Json(serde_json::json!(""))).into_response()
     }
 
+    /// Load the snapshot from the same filesystem fixtures used by table reads.
+    pub async fn load_snapshot(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let identifier = Identifier::new(&db, &table);
+        let parsed = identifier.parsed_object_name().unwrap();
+        let key = format!("{db}.{}", parsed.table());
+        let response = state.inner.lock().unwrap().tables.get(&key).cloned();
+        let Some(response) = response else {
+            return resource_error(StatusCode::NOT_FOUND, "TABLE", &table);
+        };
+        let location = response.path.unwrap();
+        let file_io = paimon::io::FileIO::from_path(&location)
+            .unwrap()
+            .build()
+            .unwrap();
+        let manager = paimon::table::SnapshotManager::new(file_io, location)
+            .with_branch(parsed.branch_or_default());
+        match manager.get_latest_snapshot().await {
+            Ok(snapshot) => (
+                StatusCode::OK,
+                Json(json!({
+                    "snapshot": snapshot.map(|snapshot| json!({"snapshot": snapshot}))
+                })),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "code": 500, "message": error.to_string()
+                })),
+            )
+                .into_response(),
+        }
+    }
+
     /// Handle GET /databases/:db/tables/:table - get a specific table.
     pub async fn get_table(
         Path((db, table)): Path<(String, String)>,
@@ -828,6 +913,65 @@ impl RESTServer {
                 Some(404),
             );
             (StatusCode::NOT_FOUND, Json(err)).into_response()
+        }
+    }
+
+    pub async fn create_tag(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<CreateTagRequest>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        if !state.tables.contains_key(&format!("{db}.{table}")) {
+            return resource_error(StatusCode::NOT_FOUND, "table", &table);
+        }
+
+        let key = format!("{db}.{table}.{}", request.tag_name);
+        if state.tags.contains_key(&key) {
+            return resource_error(StatusCode::CONFLICT, "tag", &request.tag_name);
+        }
+        let snapshot_id = request.snapshot_id.unwrap_or(1);
+        if snapshot_id != 1 {
+            return resource_error(StatusCode::NOT_FOUND, "snapshot", &snapshot_id.to_string());
+        }
+        state.tags.insert(
+            key,
+            GetTagResponse {
+                tag_name: request.tag_name,
+                snapshot: tag_snapshot(snapshot_id),
+                tag_create_time: None,
+                tag_time_retained: request.time_retained,
+            },
+        );
+        (StatusCode::OK, Json(json!(""))).into_response()
+    }
+
+    pub async fn get_tag(
+        Path((db, table, tag)): Path<(String, String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let state = state.inner.lock().unwrap();
+        if !state.tables.contains_key(&format!("{db}.{table}")) {
+            return resource_error(StatusCode::NOT_FOUND, "table", &table);
+        }
+        match state.tags.get(&format!("{db}.{table}.{tag}")) {
+            Some(response) => (StatusCode::OK, Json(response.clone())).into_response(),
+            None => resource_error(StatusCode::NOT_FOUND, "tag", &tag),
+        }
+    }
+
+    pub async fn delete_tag(
+        Path((db, table, tag)): Path<(String, String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut state = state.inner.lock().unwrap();
+        if !state.tables.contains_key(&format!("{db}.{table}")) {
+            return resource_error(StatusCode::NOT_FOUND, "table", &table);
+        }
+        if state.tags.remove(&format!("{db}.{table}.{tag}")).is_some() {
+            (StatusCode::OK, Json(json!(""))).into_response()
+        } else {
+            resource_error(StatusCode::NOT_FOUND, "tag", &tag)
         }
     }
 
@@ -1156,6 +1300,283 @@ impl RESTServer {
             .into_response()
     }
 
+    // ==================== Permission management ====================
+
+    fn same_assignment_identity(left: &PermissionAssignment, right: &PermissionAssignment) -> bool {
+        left.resource() == right.resource()
+            && left.access() == right.access()
+            && left.principal() == right.principal()
+    }
+
+    fn bad_request(message: String) -> axum::response::Response {
+        let error = ErrorResponse::new(None, None, Some(message), Some(400));
+        (StatusCode::BAD_REQUEST, Json(error)).into_response()
+    }
+
+    /// Handle GET {prefix}/permissions - direct assignments on the exact resource in the query.
+    pub async fn list_permissions(
+        Query(params): Query<HashMap<String, String>>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.list_permissions_queries.push(params.clone());
+        let Some(resource_type) = params
+            .get("resourceType")
+            .and_then(|value| value.parse::<ResourceType>().ok())
+        else {
+            return Self::bad_request("resourceType is required".to_string());
+        };
+        let locator = |name: &str| params.get(name).map(String::as_str);
+        let resource = match PermissionResource::new(
+            resource_type,
+            locator("database"),
+            locator("table"),
+            locator("function"),
+            locator("view"),
+        ) {
+            Ok(resource) => resource,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        let matching: Vec<PermissionAssignment> = inner
+            .permissions
+            .iter()
+            .filter(|assignment| assignment.resource() == &resource)
+            .filter(|assignment| {
+                params
+                    .get("principal")
+                    .is_none_or(|p| p == assignment.principal())
+            })
+            .filter(|assignment| {
+                params
+                    .get("access")
+                    .is_none_or(|a| a == assignment.access())
+            })
+            .cloned()
+            .collect();
+        let page_size = params
+            .get("maxResults")
+            .and_then(|value| value.parse().ok());
+        let (permissions, next_page_token) = paginate(matching, &params, page_size);
+        (
+            StatusCode::OK,
+            Json(ListPermissionsResponse::new(permissions, next_page_token)),
+        )
+            .into_response()
+    }
+
+    /// Handle POST {prefix}/permissions/grant - upsert by (resource, access, principal).
+    pub async fn grant_permission(
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.grant_permission_bodies.push(body.clone());
+        if let Some(status) = inner.grant_permission_error_status {
+            let error = ErrorResponse::new(
+                None,
+                None,
+                Some("forbidden".to_string()),
+                Some(status.as_u16() as i32),
+            );
+            return (status, Json(error)).into_response();
+        }
+        let assignment: PermissionAssignment = match serde_json::from_value(body) {
+            Ok(assignment) => assignment,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        inner
+            .permissions
+            .retain(|existing| !Self::same_assignment_identity(existing, &assignment));
+        inner.permissions.push(assignment);
+        StatusCode::OK.into_response()
+    }
+
+    /// Handle POST {prefix}/permissions/revoke - idempotent removal by identity.
+    pub async fn revoke_permission(
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.revoke_permission_bodies.push(body.clone());
+        let request: RevokePermissionRequest = match serde_json::from_value(body) {
+            Ok(request) => request,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        inner.permissions.retain(|existing| {
+            !(existing.resource() == &request.resource
+                && existing.access() == request.access
+                && existing.principal() == request.principal)
+        });
+        StatusCode::OK.into_response()
+    }
+
+    // ==================== Policy management ====================
+
+    fn policy_identity(policy: &DataPolicy) -> (PolicyType, String, Option<String>) {
+        (
+            policy.policy_type(),
+            policy.principal().to_string(),
+            policy
+                .column_mask()
+                .map(|mask| mask.on_column().to_string()),
+        )
+    }
+
+    fn policy_error(error: ErrorResponse) -> axum::response::Response {
+        let status = StatusCode::from_u16(error.code.unwrap_or(500) as u16)
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status, Json(error)).into_response()
+    }
+
+    fn table_not_found(table: &str) -> axum::response::Response {
+        Self::policy_error(ErrorResponse::new(
+            Some("TABLE".to_string()),
+            Some(table.to_string()),
+            Some("Table not found".to_string()),
+            Some(404),
+        ))
+    }
+
+    /// Handle GET .../tables/{table}/policies - policies on the table, filtered by identity parts.
+    pub async fn list_policies(
+        Path((db, table)): Path<(String, String)>,
+        Query(params): Query<HashMap<String, String>>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.list_policies_queries.push(params.clone());
+        let key = format!("{db}.{table}");
+        if !inner.tables.contains_key(&key) {
+            return Self::table_not_found(&table);
+        }
+        let matching: Vec<DataPolicy> = inner
+            .policies
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|policy| {
+                params
+                    .get("type")
+                    .is_none_or(|t| t == policy.policy_type().as_str())
+            })
+            .filter(|policy| {
+                params
+                    .get("principal")
+                    .is_none_or(|p| p == policy.principal())
+            })
+            .filter(|policy| {
+                params.get("column").is_none_or(|column| {
+                    policy
+                        .column_mask()
+                        .is_some_and(|mask| mask.on_column() == column)
+                })
+            })
+            .collect();
+        let page_size = params
+            .get("maxResults")
+            .and_then(|value| value.parse().ok());
+        let (policies, next_page_token) = paginate(matching, &params, page_size);
+        (
+            StatusCode::OK,
+            Json(ListPoliciesResponse::new(policies, next_page_token)),
+        )
+            .into_response()
+    }
+
+    /// Handle POST .../tables/{table}/policies - 404 TABLE for an unknown table, 409 POLICY
+    /// for a second policy with the same identity.
+    pub async fn create_policy(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.create_policy_bodies.push(body.clone());
+        if let Some(error) = inner.create_policy_error.clone() {
+            return Self::policy_error(error);
+        }
+        let request: PolicyRequest = match serde_json::from_value(body) {
+            Ok(request) => request,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        let key = format!("{db}.{table}");
+        if !inner.tables.contains_key(&key) {
+            return Self::table_not_found(&table);
+        }
+        let resource = PermissionResource::table(db, table);
+        let policy = match (request.row_filter, request.column_mask) {
+            (Some(row_filter), None) => {
+                DataPolicy::new_row_filter(resource, row_filter, &request.principal)
+            }
+            (None, Some(column_mask)) => {
+                DataPolicy::new_column_mask(resource, column_mask, &request.principal)
+            }
+            _ => return Self::bad_request("exactly one of rowFilter and columnMask".to_string()),
+        };
+        let policy = match policy {
+            Ok(policy) => policy,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        let existing = inner.policies.entry(key).or_default();
+        if existing
+            .iter()
+            .any(|candidate| Self::policy_identity(candidate) == Self::policy_identity(&policy))
+        {
+            let (policy_type, principal, column) = Self::policy_identity(&policy);
+            let name = match column {
+                Some(column) => format!("{policy_type}:{principal}:{column}"),
+                None => format!("{policy_type}:{principal}"),
+            };
+            return Self::policy_error(ErrorResponse::new(
+                Some(ErrorResponse::RESOURCE_TYPE_POLICY.to_string()),
+                Some(name),
+                Some("Policy already exists.".to_string()),
+                Some(409),
+            ));
+        }
+        existing.push(policy);
+        StatusCode::OK.into_response()
+    }
+
+    /// Handle POST .../tables/{table}/policies/drop - 404 POLICY when the identity is absent.
+    pub async fn drop_policy(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner.drop_policy_bodies.push(body.clone());
+        if let Some(error) = inner.drop_policy_error.clone() {
+            return Self::policy_error(error);
+        }
+        let request: DropPolicyRequest = match serde_json::from_value(body) {
+            Ok(request) => request,
+            Err(error) => return Self::bad_request(error.to_string()),
+        };
+        let key = format!("{db}.{table}");
+        if !inner.tables.contains_key(&key) {
+            return Self::table_not_found(&table);
+        }
+        let identity = (
+            request.policy_type,
+            request.principal.clone(),
+            request.column.clone(),
+        );
+        let policies = inner.policies.entry(key).or_default();
+        let before = policies.len();
+        policies.retain(|policy| Self::policy_identity(policy) != identity);
+        if policies.len() == before {
+            return Self::policy_error(ErrorResponse::new(
+                Some(ErrorResponse::RESOURCE_TYPE_POLICY.to_string()),
+                Some(format!("{}:{}", request.policy_type, request.principal)),
+                Some("Policy does not exist.".to_string()),
+                Some(404),
+            ));
+        }
+        StatusCode::OK.into_response()
+    }
+
     /// Handle POST /rename-table - rename a table.
     pub async fn rename_table(
         Extension(state): Extension<Arc<RESTServer>>,
@@ -1435,6 +1856,37 @@ impl RESTServer {
         inner.partition_list_call_counts.remove(&key);
     }
 
+    /// Return the partition specs registered for a table, in registration order.
+    pub fn table_partition_specs(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Vec<HashMap<String, String>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .partitions
+            .get(&format!("{database}.{table}"))
+            .map(|partitions| {
+                partitions
+                    .iter()
+                    .map(|partition| partition.spec.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Return the partitions registered for a table, statistics included, in registration order.
+    pub fn table_partitions(&self, database: &str, table: &str) -> Vec<Partition> {
+        self.inner
+            .lock()
+            .unwrap()
+            .partitions
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Set whether a stored table is external.
     pub fn set_table_external(&self, database: &str, table: &str, is_external: bool) {
         let key = format!("{database}.{table}");
@@ -1515,6 +1967,65 @@ impl RESTServer {
             .get(&format!("{database}.{table}"))
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Every query string received by `GET /permissions`.
+    pub fn list_permissions_queries(&self) -> Vec<HashMap<String, String>> {
+        self.inner.lock().unwrap().list_permissions_queries.clone()
+    }
+
+    /// Raw JSON bodies received by `POST /permissions/grant`.
+    pub fn grant_permission_bodies(&self) -> Vec<serde_json::Value> {
+        self.inner.lock().unwrap().grant_permission_bodies.clone()
+    }
+
+    /// Raw JSON bodies received by `POST /permissions/revoke`.
+    pub fn revoke_permission_bodies(&self) -> Vec<serde_json::Value> {
+        self.inner.lock().unwrap().revoke_permission_bodies.clone()
+    }
+
+    pub fn permissions(&self) -> Vec<PermissionAssignment> {
+        self.inner.lock().unwrap().permissions.clone()
+    }
+
+    /// Make every grant fail with `status` (e.g. 403) instead of storing it.
+    pub fn set_grant_permission_error_status(&self, status: Option<StatusCode>) {
+        self.inner.lock().unwrap().grant_permission_error_status = status;
+    }
+
+    /// Every query string received by `GET .../tables/{table}/policies`.
+    pub fn list_policies_queries(&self) -> Vec<HashMap<String, String>> {
+        self.inner.lock().unwrap().list_policies_queries.clone()
+    }
+
+    /// Raw JSON bodies received by `POST .../tables/{table}/policies`.
+    pub fn create_policy_bodies(&self) -> Vec<serde_json::Value> {
+        self.inner.lock().unwrap().create_policy_bodies.clone()
+    }
+
+    /// Raw JSON bodies received by `POST .../tables/{table}/policies/drop`.
+    pub fn drop_policy_bodies(&self) -> Vec<serde_json::Value> {
+        self.inner.lock().unwrap().drop_policy_bodies.clone()
+    }
+
+    pub fn table_policies(&self, database: &str, table: &str) -> Vec<DataPolicy> {
+        self.inner
+            .lock()
+            .unwrap()
+            .policies
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Make every create-policy call answer with `error` (status from its `code`).
+    pub fn set_create_policy_error(&self, error: Option<ErrorResponse>) {
+        self.inner.lock().unwrap().create_policy_error = error;
+    }
+
+    /// Make every drop-policy call answer with `error` (status from its `code`).
+    pub fn set_drop_policy_error(&self, error: Option<ErrorResponse>) {
+        self.inner.lock().unwrap().drop_policy_error = error;
     }
 
     /// Return all create-partitions calls received by the server.
@@ -1623,6 +2134,10 @@ pub async fn start_mock_server(
     let app = Router::new()
         // Config endpoint (for RESTApi initialization)
         .route("/v1/config", get(RESTServer::get_config))
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/snapshot"),
+            get(RESTServer::load_snapshot),
+        )
         // Database routes
         .route(
             &format!("{prefix}/databases"),
@@ -1643,6 +2158,14 @@ pub async fn start_mock_server(
             get(RESTServer::get_table)
                 .post(RESTServer::alter_table)
                 .delete(RESTServer::drop_table),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/tags"),
+            post(RESTServer::create_tag),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/tags/:tag"),
+            get(RESTServer::get_tag).delete(RESTServer::delete_tag),
         )
         .route(
             &format!("{prefix}/databases/:db/tables/:table/partitions"),
@@ -1679,6 +2202,26 @@ pub async fn start_mock_server(
         .route(
             &format!("{prefix}/tables/rename"),
             post(RESTServer::rename_table),
+        )
+        .route(
+            &format!("{prefix}/permissions"),
+            get(RESTServer::list_permissions),
+        )
+        .route(
+            &format!("{prefix}/permissions/grant"),
+            post(RESTServer::grant_permission),
+        )
+        .route(
+            &format!("{prefix}/permissions/revoke"),
+            post(RESTServer::revoke_permission),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/policies"),
+            get(RESTServer::list_policies).post(RESTServer::create_policy),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/policies/drop"),
+            post(RESTServer::drop_policy),
         )
         // ECS metadata endpoints (for token loader testing)
         .route(

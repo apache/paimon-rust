@@ -28,6 +28,10 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 use axum::http::StatusCode;
 use futures::TryStreamExt;
 use paimon::api::ConfigResponse;
+use paimon::api::{
+    DataPolicy, ListPermissionsRequest, ListPoliciesRequest, PermissionAssignment,
+    PermissionResource, PolicyType, RowFilter,
+};
 use paimon::catalog::{Catalog, Function, FunctionDefinition, Identifier, RESTCatalog, ViewSchema};
 use paimon::common::Options;
 use paimon::spec::{
@@ -431,6 +435,105 @@ async fn test_rest_catalog_create_partitions_maps_missing_table() {
         error,
         paimon::Error::TableNotExist { full_name } if full_name == "default.missing"
     ));
+}
+
+#[tokio::test]
+async fn test_rest_catalog_drop_partitions_maps_missing_table() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "missing");
+
+    let error = ctx
+        .catalog
+        .drop_partitions(
+            &identifier,
+            vec![HashMap::from([(
+                "dt".to_string(),
+                "2026-07-22".to_string(),
+            )])],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        paimon::Error::TableNotExist { full_name } if full_name == "default.missing"
+    ));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_rest_catalog_skips_empty_and_batches_drop_partitions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    add_internal_table_with_schema(
+        &ctx.server,
+        "managed_table",
+        format_table_schema(&[]),
+        &format!("file://{}", tmp.path().display()),
+    );
+    let partition_specs = (0..1001)
+        .map(|value| HashMap::from([("dt".to_string(), value.to_string())]))
+        .collect::<Vec<_>>();
+    ctx.server
+        .set_table_partitions("default", "managed_table", partition_specs.clone());
+
+    ctx.catalog
+        .drop_partitions(&identifier, Vec::new())
+        .await
+        .unwrap();
+    ctx.catalog
+        .drop_partitions(&identifier, partition_specs.clone())
+        .await
+        .unwrap();
+
+    let calls = ctx.server.drop_partitions_calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].2.partition_specs, partition_specs[..1000]);
+    assert_eq!(calls[1].2.partition_specs, partition_specs[1000..]);
+    assert!(calls
+        .iter()
+        .all(|(_, _, request)| request.ignore_if_not_exists));
+}
+
+#[tokio::test]
+async fn test_rest_catalog_refuses_to_drop_partitions_it_does_not_manage() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "paimon_table");
+    let schema = Schema::builder()
+        .column("dt", DataType::VarChar(VarCharType::new(255).unwrap()))
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .partition_keys(["dt"])
+        .build()
+        .unwrap();
+    ctx.server.add_table_with_schema(
+        "default",
+        "paimon_table",
+        schema,
+        "file:///tmp/test_warehouse/default.db/paimon_table",
+    );
+
+    // Unregistering would report success and leave every data file of a Paimon table in place.
+    let error = ctx
+        .catalog
+        .drop_partitions(
+            &identifier,
+            vec![HashMap::from([(
+                "dt".to_string(),
+                "2026-07-22".to_string(),
+            )])],
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            paimon::Error::Unsupported { message } if message.contains("default.paimon_table")
+        ),
+        "{error}"
+    );
+    assert!(ctx.server.drop_partitions_calls().is_empty());
 }
 
 #[tokio::test]
@@ -1661,6 +1764,57 @@ async fn test_catalog_alter_table() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn test_catalog_tag_lifecycle() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    ctx.server.add_table("default", "managed_table");
+    let identifier = Identifier::new("default", "managed_table");
+
+    ctx.catalog
+        .create_tag(&identifier, "release-1", Some(1), false)
+        .await
+        .unwrap();
+    let tag = ctx.catalog.get_tag(&identifier, "release-1").await.unwrap();
+    assert_eq!(tag.tag_name, "release-1");
+    assert_eq!(tag.snapshot.id(), 1);
+
+    assert!(matches!(
+        ctx.catalog
+            .create_tag(&identifier, "release-1", Some(1), false)
+            .await,
+        Err(paimon::Error::TagAlreadyExist { .. })
+    ));
+    ctx.catalog
+        .create_tag(&identifier, "release-1", Some(1), true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ctx.catalog
+            .create_tag(&identifier, "missing", Some(2), false)
+            .await,
+        Err(paimon::Error::SnapshotNotExist { snapshot_id: 2 })
+    ));
+
+    ctx.catalog
+        .delete_tag(&identifier, "release-1", false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ctx.catalog.get_tag(&identifier, "release-1").await,
+        Err(paimon::Error::TagNotExist { .. })
+    ));
+    assert!(matches!(
+        ctx.catalog
+            .delete_tag(&identifier, "release-1", false)
+            .await,
+        Err(paimon::Error::TagNotExist { .. })
+    ));
+    ctx.catalog
+        .delete_tag(&identifier, "release-1", true)
+        .await
+        .unwrap();
+}
+
 // ==================== Multiple Databases Tests ====================
 
 #[tokio::test]
@@ -2360,4 +2514,68 @@ async fn test_load_table_rejects_unknown_declared_type() {
             if message.contains("unknown table type")),
         "{err:?}"
     );
+}
+
+#[tokio::test]
+async fn test_rest_catalog_manages_permissions_end_to_end() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let resource = PermissionResource::table("default", "orders");
+    let assignment =
+        PermissionAssignment::new(resource.clone(), "select", "analyst", None, None).unwrap();
+
+    ctx.catalog.grant_permission(&assignment).await.unwrap();
+    let page = ctx
+        .catalog
+        .list_permissions_paged(&ListPermissionsRequest::new(resource.clone()))
+        .await
+        .unwrap();
+    assert_eq!(page.elements, vec![assignment]);
+
+    ctx.catalog
+        .revoke_permission(&resource, "SELECT", "analyst")
+        .await
+        .unwrap();
+    let page = ctx
+        .catalog
+        .list_permissions_paged(&ListPermissionsRequest::new(resource))
+        .await
+        .unwrap();
+    assert!(page.elements.is_empty());
+}
+
+#[tokio::test]
+async fn test_rest_catalog_manages_policies_end_to_end() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "orders");
+    ctx.catalog
+        .create_table(&identifier, test_schema(), false)
+        .await
+        .unwrap();
+    let resource = PermissionResource::table("default", "orders");
+    let predicate = r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"id","type":"BIGINT"}},"function":"EQUAL","literals":[1]}"#;
+    let policy = DataPolicy::new_row_filter(
+        resource.clone(),
+        RowFilter::new(predicate).unwrap(),
+        "analyst",
+    )
+    .unwrap();
+
+    ctx.catalog.create_policy(&policy).await.unwrap();
+    let page = ctx
+        .catalog
+        .list_policies_paged(&ListPoliciesRequest::new(resource.clone()))
+        .await
+        .unwrap();
+    assert_eq!(page.elements, vec![policy]);
+
+    ctx.catalog
+        .drop_policy(&resource, PolicyType::RowFilter, "analyst", None, false)
+        .await
+        .unwrap();
+    let page = ctx
+        .catalog
+        .list_policies_paged(&ListPoliciesRequest::new(resource))
+        .await
+        .unwrap();
+    assert!(page.elements.is_empty());
 }

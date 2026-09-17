@@ -321,9 +321,12 @@ pub(crate) async fn drain_indexed_jobs<T, F>(
 where
     F: std::future::Future<Output = crate::Result<T>>,
 {
+    // Materialize the wrappers before awaiting so their borrowing iterator
+    // closures do not prevent callers from exposing a Send future.
     let indexed = jobs
         .enumerate()
-        .map(|(index, job)| async move { (index, job.await) });
+        .map(|(index, job)| async move { (index, job.await) })
+        .collect::<Vec<_>>();
     let mut collected: Vec<(usize, crate::Result<T>)> = stream::iter(indexed)
         .buffer_unordered(concurrency.max(1))
         .collect()

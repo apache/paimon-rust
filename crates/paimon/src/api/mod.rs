@@ -21,6 +21,7 @@
 
 pub mod api_request;
 pub mod auth;
+pub mod management;
 pub mod resource_paths;
 pub mod rest_api;
 pub mod rest_client;
@@ -32,17 +33,25 @@ mod api_response;
 // Re-export request types
 pub use api_request::{
     AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
-    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateViewRequest,
-    DropPartitionsRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
-    RenameTableRequest,
+    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateTagRequest,
+    CreateViewRequest, DropPartitionsRequest, DropPolicyRequest, ListPartitionsByFilterRequest,
+    ListPartitionsByNamesRequest, PolicyRequest, RenameTableRequest, RevokePermissionRequest,
 };
 
 // Re-export response types
 pub use api_response::{
     AuditRESTResponse, AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
-    GetFunctionResponse, GetTableResponse, GetTableTokenResponse, GetViewResponse,
-    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListTablesResponse,
-    ListViewsResponse, PagedList,
+    GetFunctionResponse, GetTableResponse, GetTableSnapshotResponse, GetTableTokenResponse,
+    GetTagResponse, GetViewResponse, ListDatabasesResponse, ListFunctionsResponse,
+    ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse, ListTablesResponse,
+    ListViewsResponse, PagedList, TableSnapshot,
+};
+
+// Re-export management types
+pub use management::{
+    ColumnMask, DataPolicy, ListPermissionsRequest, ListPoliciesRequest, PermissionAccess,
+    PermissionAssignment, PermissionColumns, PermissionResource, PolicyType, ResourceType,
+    RowFilter,
 };
 
 // Re-export error types

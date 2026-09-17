@@ -22,9 +22,14 @@
 
 use std::collections::HashMap;
 
+use axum::http::StatusCode;
 use paimon::api::auth::{DLFECSTokenLoader, DLFToken, DLFTokenLoader};
 use paimon::api::rest_api::RESTApi;
-use paimon::api::{ConfigResponse, CreatePartitionsRequest, DropPartitionsRequest};
+use paimon::api::{
+    ColumnMask, ConfigResponse, CreatePartitionsRequest, DataPolicy, DropPartitionsRequest,
+    ErrorResponse, ListPermissionsRequest, ListPoliciesRequest, PermissionAssignment,
+    PermissionColumns, PermissionResource, PolicyType, RestError, RowFilter,
+};
 use paimon::catalog::{Function, FunctionDefinition, Identifier, ViewSchema};
 use paimon::common::Options;
 use paimon::spec::DataField;
@@ -868,6 +873,265 @@ async fn test_list_partitions_rejects_repeated_page_token() {
     );
 }
 
+// ==================== Permission Management Tests ====================
+
+fn orders_table() -> PermissionResource {
+    PermissionResource::table("sales", "orders")
+}
+
+fn assignment(access: &str, principal: &str) -> PermissionAssignment {
+    PermissionAssignment::new(orders_table(), access, principal, None, None).unwrap()
+}
+
+#[tokio::test]
+async fn test_list_permissions_sends_every_filter_and_parses_the_page() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    ctx.api
+        .grant_permission(&assignment("SELECT", "analyst"))
+        .await
+        .unwrap();
+    ctx.api
+        .grant_permission(&assignment("UPDATE", "writer"))
+        .await
+        .unwrap();
+
+    let mut request = ListPermissionsRequest::new(orders_table());
+    request.principal = Some("analyst".to_string());
+    request.access = Some("select".to_string());
+    request.max_results = Some(25);
+    request.page_token = Some("0".to_string());
+    let page = ctx.api.list_permissions_paged(&request).await.unwrap();
+
+    assert_eq!(page.elements, vec![assignment("SELECT", "analyst")]);
+    assert_eq!(page.next_page_token, None);
+    assert_eq!(
+        ctx.server.list_permissions_queries(),
+        vec![HashMap::from([
+            ("resourceType".to_string(), "TABLE".to_string()),
+            ("database".to_string(), "sales".to_string()),
+            ("table".to_string(), "orders".to_string()),
+            ("principal".to_string(), "analyst".to_string()),
+            ("access".to_string(), "SELECT".to_string()),
+            ("maxResults".to_string(), "25".to_string()),
+            ("pageToken".to_string(), "0".to_string()),
+        ])]
+    );
+}
+
+#[tokio::test]
+async fn test_list_permissions_pages_with_the_server_token() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    for principal in ["a", "b", "c"] {
+        ctx.api
+            .grant_permission(&assignment("SELECT", principal))
+            .await
+            .unwrap();
+    }
+    let mut request = ListPermissionsRequest::new(orders_table());
+    request.max_results = Some(2);
+    let first = ctx.api.list_permissions_paged(&request).await.unwrap();
+    assert_eq!(first.elements.len(), 2);
+    let token = first.next_page_token.expect("a second page");
+    request.page_token = Some(token);
+    let second = ctx.api.list_permissions_paged(&request).await.unwrap();
+    assert_eq!(second.elements, vec![assignment("SELECT", "c")]);
+    assert_eq!(second.next_page_token, None);
+}
+
+#[tokio::test]
+async fn test_grant_and_revoke_post_the_java_wire_shapes() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    let granted = PermissionAssignment::new(
+        orders_table(),
+        "select",
+        "analyst",
+        None,
+        Some("2027-01-01T00:00:00Z"),
+    )
+    .unwrap();
+    ctx.api.grant_permission(&granted).await.unwrap();
+    // Granting the same identity again replaces the expiry instead of adding a row.
+    ctx.api
+        .grant_permission(&assignment("SELECT", "analyst"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.server.permissions(),
+        vec![assignment("SELECT", "analyst")]
+    );
+
+    ctx.api
+        .revoke_permission(&orders_table(), "select", "analyst")
+        .await
+        .unwrap();
+    assert!(ctx.server.permissions().is_empty());
+
+    assert_eq!(
+        ctx.server.grant_permission_bodies()[0],
+        json!({
+            "resource": {"type": "TABLE", "database": "sales", "table": "orders"},
+            "access": "SELECT",
+            "principal": "analyst",
+            "expireTime": "2027-01-01T00:00:00Z"
+        })
+    );
+    assert_eq!(
+        ctx.server.revoke_permission_bodies(),
+        vec![json!({
+            "resource": {"type": "TABLE", "database": "sales", "table": "orders"},
+            "access": "SELECT",
+            "principal": "analyst"
+        })]
+    );
+}
+
+#[tokio::test]
+async fn test_column_grant_carries_the_range_but_revoke_only_the_identity() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    let columns = PermissionColumns::names(vec!["id".to_string(), "region".to_string()]).unwrap();
+    let granted = PermissionAssignment::new(
+        PermissionResource::column("sales", "orders"),
+        "SELECT",
+        "analyst",
+        Some(columns),
+        None,
+    )
+    .unwrap();
+    ctx.api.grant_permission(&granted).await.unwrap();
+    ctx.api
+        .revoke_permission(granted.resource(), granted.access(), granted.principal())
+        .await
+        .unwrap();
+
+    let grant = &ctx.server.grant_permission_bodies()[0];
+    assert_eq!(grant["resource"]["type"], "COLUMN");
+    assert_eq!(grant["columns"], json!({"columnNames": ["id", "region"]}));
+    let revoke = &ctx.server.revoke_permission_bodies()[0];
+    assert_eq!(revoke["resource"]["type"], "COLUMN");
+    assert!(revoke.get("columns").is_none());
+    assert!(revoke.get("expireTime").is_none());
+}
+
+#[tokio::test]
+async fn test_forbidden_grant_surfaces_the_rest_error() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    ctx.server
+        .set_grant_permission_error_status(Some(StatusCode::FORBIDDEN));
+    let error = ctx
+        .api
+        .grant_permission(&assignment("SELECT", "denied"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            paimon::Error::RestApi {
+                source: RestError::Forbidden { .. }
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_revoking_an_absent_assignment_is_idempotent() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    for _ in 0..2 {
+        ctx.api
+            .revoke_permission(&orders_table(), "SELECT", "missing")
+            .await
+            .unwrap();
+    }
+    assert_eq!(ctx.server.revoke_permission_bodies().len(), 2);
+}
+
+#[tokio::test]
+async fn test_invalid_permission_requests_never_reach_the_server() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    let error = ctx
+        .api
+        .revoke_permission(&PermissionResource::catalog(), "SELECT", "analyst")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not valid for CATALOG"),
+        "{error}"
+    );
+    let mut request = ListPermissionsRequest::new(orders_table());
+    request.max_results = Some(1001);
+    let error = ctx.api.list_permissions_paged(&request).await.unwrap_err();
+    assert!(error.to_string().contains("1000"), "{error}");
+    assert!(ctx.server.revoke_permission_bodies().is_empty());
+    assert!(ctx.server.list_permissions_queries().is_empty());
+}
+
+#[tokio::test]
+async fn test_grant_sends_the_canonical_form_of_a_listed_assignment() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    let listed: PermissionAssignment = serde_json::from_value(json!({
+        "resource": {"type": "TABLE", "database": "sales", "table": "orders", "view": ""},
+        "access": "select",
+        "principal": "analyst",
+    }))
+    .unwrap();
+    ctx.api.grant_permission(&listed).await.unwrap();
+    assert_eq!(
+        ctx.server.grant_permission_bodies(),
+        vec![json!({
+            "resource": {"type": "TABLE", "database": "sales", "table": "orders"},
+            "access": "SELECT",
+            "principal": "analyst"
+        })]
+    );
+
+    let mut request = ListPermissionsRequest::new(listed.resource().clone());
+    request.access = Some("select".to_string());
+    ctx.api.list_permissions_paged(&request).await.unwrap();
+    assert_eq!(
+        ctx.server.list_permissions_queries(),
+        vec![HashMap::from([
+            ("resourceType".to_string(), "TABLE".to_string()),
+            ("database".to_string(), "sales".to_string()),
+            ("table".to_string(), "orders".to_string()),
+            ("access".to_string(), "SELECT".to_string()),
+        ])]
+    );
+}
+
+#[tokio::test]
+async fn test_a_resource_no_constructor_could_have_built_never_reaches_the_server() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    let blank = PermissionResource::table("sales", "");
+    let assignment: PermissionAssignment = serde_json::from_value(json!({
+        "resource": {"type": "TABLE", "database": "sales", "table": ""},
+        "access": "SELECT",
+        "principal": "analyst",
+    }))
+    .unwrap();
+    let rejected = |error: paimon::Error| {
+        assert!(
+            error.to_string().contains("table is required for TABLE"),
+            "{error}"
+        );
+    };
+    rejected(ctx.api.grant_permission(&assignment).await.unwrap_err());
+    rejected(
+        ctx.api
+            .revoke_permission(&blank, "SELECT", "analyst")
+            .await
+            .unwrap_err(),
+    );
+    rejected(
+        ctx.api
+            .list_permissions_paged(&ListPermissionsRequest::new(blank))
+            .await
+            .unwrap_err(),
+    );
+    assert!(ctx.server.grant_permission_bodies().is_empty());
+    assert!(ctx.server.revoke_permission_bodies().is_empty());
+    assert!(ctx.server.list_permissions_queries().is_empty());
+}
+
 // ==================== Rename Table Tests ====================
 
 #[tokio::test]
@@ -975,4 +1239,227 @@ async fn test_ecs_loader_token() {
     assert!(error
         .to_string()
         .contains("Failed to parse token Expiration"));
+}
+
+// ==================== Policy Management Tests ====================
+
+const PREDICATE_JSON: &str = r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"region","type":"STRING"}},"function":"EQUAL","literals":["APAC"]}"#;
+const TRANSFORM_JSON: &str =
+    r#"{"name":"CONCAT","inputs":[{"index":0,"name":"region","type":"STRING"},"****"]}"#;
+
+fn managed_table() -> PermissionResource {
+    PermissionResource::table("default", "managed_table")
+}
+
+fn mask_policy() -> DataPolicy {
+    DataPolicy::new_column_mask(
+        managed_table(),
+        ColumnMask::new("email", TRANSFORM_JSON).unwrap(),
+        "analyst",
+    )
+    .unwrap()
+}
+
+fn policy_error(resource_type: &str, code: i32) -> ErrorResponse {
+    ErrorResponse::new(
+        Some(resource_type.to_string()),
+        Some("orders".to_string()),
+        Some(format!("{resource_type} error")),
+        Some(code),
+    )
+}
+
+#[tokio::test]
+async fn test_policies_round_trip_through_the_table_nested_endpoints() {
+    let (ctx, _identifier) = setup_partition_api().await;
+    let mask = mask_policy();
+    let filter = DataPolicy::new_row_filter(
+        managed_table(),
+        RowFilter::new(PREDICATE_JSON).unwrap(),
+        "analyst",
+    )
+    .unwrap();
+    ctx.api.create_policy(&mask).await.unwrap();
+    ctx.api.create_policy(&filter).await.unwrap();
+
+    let create = &ctx.server.create_policy_bodies()[0];
+    assert_eq!(
+        *create,
+        json!({"columnMask": {"onColumn": "email", "transform": TRANSFORM_JSON}, "principal": "analyst"})
+    );
+    assert!(create.get("resource").is_none());
+
+    let mut request = ListPoliciesRequest::new(managed_table());
+    request.policy_type = Some(PolicyType::ColumnMasking);
+    request.principal = Some("analyst".to_string());
+    request.column = Some("email".to_string());
+    request.max_results = Some(25);
+    request.page_token = Some("0".to_string());
+    let page = ctx.api.list_policies_paged(&request).await.unwrap();
+    assert_eq!(page.elements, vec![mask]);
+    assert_eq!(page.next_page_token, None);
+    assert_eq!(
+        ctx.server.list_policies_queries(),
+        vec![HashMap::from([
+            ("type".to_string(), "COLUMN_MASKING".to_string()),
+            ("principal".to_string(), "analyst".to_string()),
+            ("column".to_string(), "email".to_string()),
+            ("maxResults".to_string(), "25".to_string()),
+            ("pageToken".to_string(), "0".to_string()),
+        ])]
+    );
+
+    ctx.api
+        .drop_policy(
+            &managed_table(),
+            PolicyType::ColumnMasking,
+            "analyst",
+            Some("email"),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.server.drop_policy_bodies(),
+        vec![json!({"type": "COLUMN_MASKING", "principal": "analyst", "column": "email"})]
+    );
+    let page = ctx
+        .api
+        .list_policies_paged(&ListPoliciesRequest::new(managed_table()))
+        .await
+        .unwrap();
+    assert_eq!(page.elements, vec![filter]);
+}
+
+#[tokio::test]
+async fn test_create_policy_surfaces_conflicts_with_their_resource_type() {
+    let (ctx, _identifier) = setup_partition_api().await;
+    ctx.api.create_policy(&mask_policy()).await.unwrap();
+    let error = ctx.api.create_policy(&mask_policy()).await.unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi { source: RestError::AlreadyExists { resource_type: Some(t), .. } } if t == "POLICY"),
+        "{error:?}"
+    );
+    ctx.server
+        .set_create_policy_error(Some(policy_error("TABLE", 409)));
+    let error = ctx.api.create_policy(&mask_policy()).await.unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi { source: RestError::AlreadyExists { resource_type: Some(t), .. } } if t == "TABLE"),
+        "{error:?}"
+    );
+    // An unknown table is a 404 on the table, not on the policy.
+    ctx.server.set_create_policy_error(None);
+    let error = ctx
+        .api
+        .create_policy(
+            &DataPolicy::new_column_mask(
+                PermissionResource::table("default", "missing"),
+                ColumnMask::new("email", "{}").unwrap(),
+                "analyst",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi { source: RestError::NoSuchResource { resource_type: Some(t), .. } } if t == "TABLE"),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_drop_policy_if_exists_ignores_only_a_missing_policy() {
+    let (ctx, _identifier) = setup_partition_api().await;
+    ctx.api
+        .drop_policy(
+            &managed_table(),
+            PolicyType::ColumnMasking,
+            "analyst",
+            Some("email"),
+            true,
+        )
+        .await
+        .unwrap();
+    let error = ctx
+        .api
+        .drop_policy(
+            &managed_table(),
+            PolicyType::ColumnMasking,
+            "analyst",
+            Some("email"),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi { source: RestError::NoSuchResource { resource_type: Some(t), .. } } if t == "POLICY"),
+        "{error:?}"
+    );
+    ctx.server
+        .set_drop_policy_error(Some(policy_error("TABLE", 404)));
+    let error = ctx
+        .api
+        .drop_policy(
+            &managed_table(),
+            PolicyType::ColumnMasking,
+            "analyst",
+            Some("email"),
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, paimon::Error::RestApi { source: RestError::NoSuchResource { resource_type: Some(t), .. } } if t == "TABLE"),
+        "{error:?}"
+    );
+    assert_eq!(ctx.server.drop_policy_bodies().len(), 3);
+}
+
+#[tokio::test]
+async fn test_invalid_policy_requests_never_reach_the_server() {
+    let (ctx, _identifier) = setup_partition_api().await;
+    let error = ctx
+        .api
+        .drop_policy(
+            &managed_table(),
+            PolicyType::RowFilter,
+            "analyst",
+            Some("email"),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cannot contain a column"),
+        "{error}"
+    );
+    let error = ctx
+        .api
+        .list_policies_paged(&ListPoliciesRequest::new(PermissionResource::catalog()))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("only to TABLE"), "{error}");
+    // A blank locator is not a TABLE-only violation, so only the resource rules catch it.
+    let blank_table = PermissionResource::table("default", "");
+    let error = ctx
+        .api
+        .list_policies_paged(&ListPoliciesRequest::new(blank_table.clone()))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("table is required for TABLE"),
+        "{error}"
+    );
+    let error = ctx
+        .api
+        .drop_policy(&blank_table, PolicyType::RowFilter, "analyst", None, false)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("table is required for TABLE"),
+        "{error}"
+    );
+    assert!(ctx.server.create_policy_bodies().is_empty());
+    assert!(ctx.server.drop_policy_bodies().is_empty());
+    assert!(ctx.server.list_policies_queries().is_empty());
 }

@@ -28,7 +28,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use opendal::raw::normalize_root;
+use opendal::raw::{normalize_path, normalize_root};
 use opendal::Operator;
 use snafu::ResultExt;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
@@ -36,6 +36,9 @@ use url::Url;
 
 use super::cache::{CachedFileReader, LocalCache};
 use super::Storage;
+
+#[cfg(all(test, feature = "storage-memory"))]
+mod provider_tests;
 
 /// An externally managed block cache used by [`FileIO`].
 ///
@@ -56,24 +59,44 @@ pub trait FileBlockCache: std::fmt::Debug + Send + Sync + 'static {
     async fn invalidate_prefix(&self, prefix: &str);
 }
 
+/// Resolves original paths to application-managed OpenDAL operators.
+///
+/// Providers own scheme/bucket routing, operator reuse, and credential refresh.
+/// Errors propagate without falling back to built-in storage or credentials.
+/// Already-open readers and writers retain their operator, so its backend must
+/// refresh credentials internally if those handles need to outlive credentials.
+///
+/// Custom services must report distinct `(scheme, name, root)` storage identities
+/// for different namespaces, since these identities are used by the file cache.
 #[async_trait::async_trait]
-pub(crate) trait FileIOProvider: std::fmt::Debug + Send + Sync {
+pub trait FileIOProvider: std::fmt::Debug + Send + Sync + 'static {
+    /// Return an operator and its relative path, preserving literal object keys.
+    ///
+    /// Empty paths and `/` denote the operator root. For directory listings, the
+    /// relative path must be an unchanged suffix of the original path starting
+    /// at a component boundary; this permits reconstruction of reusable full URIs.
+    /// Object paths that OpenDAL would trim or collapse are rejected by FileIO.
+    /// Rename requires both paths to resolve to the same shared service instance.
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)>;
+}
+
+#[derive(Clone, Debug)]
+enum FileIOBackend {
+    Storage(Arc<Storage>),
+    Provider(Arc<dyn FileIOProvider>),
 }
 
 #[derive(Clone)]
 pub struct FileIO {
-    storage: Arc<Storage>,
+    backend: FileIOBackend,
     cache: Option<Arc<LocalCache>>,
-    provider: Option<Arc<dyn FileIOProvider>>,
 }
 
 impl std::fmt::Debug for FileIO {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileIO")
-            .field("storage", &self.storage)
+            .field("backend", &self.backend)
             .field("cache", &self.cache)
-            .field("provider", &self.provider)
             .finish()
     }
 }
@@ -97,20 +120,44 @@ impl FileIO {
         Ok(self)
     }
 
-    pub(crate) fn with_provider(mut self, provider: Arc<dyn FileIOProvider>) -> Self {
-        self.provider = Some(provider);
+    /// Replace the storage backend with a provider, retaining the file cache.
+    ///
+    /// Resolution is deferred to async operations, including for file handles
+    /// subsequently created by [`Self::new_input`] and [`Self::new_output`].
+    pub fn with_provider(mut self, provider: Arc<dyn FileIOProvider>) -> Self {
+        self.backend = FileIOBackend::Provider(provider);
         self
     }
 
     pub(crate) fn create_static(&self, path: &str) -> crate::Result<(Operator, String)> {
-        let (op, relative_path) = self.storage.create(path)?;
+        let FileIOBackend::Storage(storage) = &self.backend else {
+            return Err(Error::IoUnsupported {
+                message: "A FileIOProvider requires async path resolution".to_string(),
+            });
+        };
+        let (op, relative_path) = storage.create(path)?;
         Ok((op, relative_path.into_owned()))
     }
 
     async fn create(&self, path: &str) -> crate::Result<(Operator, String)> {
-        match &self.provider {
-            Some(provider) => provider.create(path).await,
-            None => self.create_static(path),
+        match &self.backend {
+            FileIOBackend::Provider(provider) => resolve_provider(provider.as_ref(), path).await,
+            FileIOBackend::Storage(_) => self.create_static(path),
+        }
+    }
+
+    fn file_source(&self, path: &str) -> crate::Result<FileSource> {
+        match &self.backend {
+            FileIOBackend::Provider(provider) => Ok(FileSource::Provider(provider.clone())),
+            FileIOBackend::Storage(_) => {
+                let (op, relative_path) = self.create_static(path)?;
+                let cache_path = cache_object_path(&op, &relative_path);
+                Ok(FileSource::Static {
+                    op,
+                    relative_path,
+                    cache_path,
+                })
+            }
         }
     }
 
@@ -157,42 +204,34 @@ impl FileIO {
     }
 
     /// Create a new input file to read data.
+    /// With a provider, path resolution and its errors are deferred to async IO.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L76>
     pub fn new_input(&self, path: &str) -> crate::Result<InputFile> {
-        let (op, relative_path) = self.storage.create(path)?;
-        let cache_path = cache_object_path(&op, relative_path.as_ref());
         Ok(InputFile {
-            op,
+            source: self.file_source(path)?,
             path: path.to_string(),
-            relative_path: relative_path.into_owned(),
-            cache_path,
             cache: self
                 .cache
                 .as_ref()
                 .filter(|cache| cache.is_cacheable(path))
                 .cloned(),
-            provider: self.provider.clone(),
         })
     }
 
     /// Create a new output file to write data.
+    /// With a provider, path resolution and its errors are deferred to async IO.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L87>
     pub fn new_output(&self, path: &str) -> Result<OutputFile> {
-        let (op, relative_path) = self.storage.create(path)?;
-        let cache_path = cache_object_path(&op, relative_path.as_ref());
         Ok(OutputFile {
-            op,
+            source: self.file_source(path)?,
             path: path.to_string(),
-            relative_path: relative_path.into_owned(),
-            cache_path,
             cache: self
                 .cache
                 .as_ref()
                 .filter(|cache| cache.is_cacheable(path))
                 .cloned(),
-            provider: self.provider.clone(),
         })
     }
 
@@ -225,12 +264,7 @@ impl FileIO {
     /// FIXME: how to handle large dir? Better to return a stream instead?
     pub async fn list_status(&self, path: &str) -> Result<Vec<FileStatus>> {
         let (op, relative_path) = self.create(path).await?;
-        // `relative_path` is a byte-suffix of `path` for object stores and POSIX
-        // local paths, so this recovers the scheme/root prefix. For a Windows
-        // local path the relative form only swaps `\`->`/` (length-preserving),
-        // so this is `""` and entries are reported in opendal's normalized
-        // `/C:/...` form — which still round-trips back through `create`.
-        let base_path = &path[..path.len() - relative_path.len()];
+        let base_path = listing_base_path(path, &relative_path)?;
         // Opendal list() expects directory path to end with `/`.
         // use normalize_root to make sure it end with `/`.
         let list_path = normalize_root(relative_path.as_ref());
@@ -243,6 +277,9 @@ impl FileIO {
         let list_path_normalized = list_path.trim_start_matches('/');
         for entry in entries {
             let entry_path = entry.path();
+            if matches!(self.backend, FileIOBackend::Provider(_)) {
+                validate_provider_path(path, entry_path)?;
+            }
             if entry_path.trim_start_matches('/') == list_path_normalized {
                 continue;
             }
@@ -250,7 +287,7 @@ impl FileIO {
             statuses.push(FileStatus {
                 size: meta.content_length(),
                 is_dir: meta.is_dir(),
-                path: status_path(base_path, entry_path),
+                path: status_path(&base_path, entry_path),
                 last_modified: meta
                     .last_modified()
                     .map(|v| DateTime::<Utc>::from(SystemTime::from(v))),
@@ -286,9 +323,8 @@ impl FileIO {
         }
 
         let (op, relative_path) = self.create(path).await?;
-        // See `list_status`: `relative_path` is a byte-suffix of `path` except
-        // for Windows local paths, where it only swaps separators (same length).
-        let base_path = path[..path.len() - relative_path.len()].to_string();
+        let base_path = listing_base_path(path, &relative_path)?;
+        let has_provider = matches!(self.backend, FileIOBackend::Provider(_));
         let list_path = normalize_root(relative_path.as_ref());
 
         let entries =
@@ -308,6 +344,9 @@ impl FileIO {
                 message: format!("Failed to list files recursively in '{path}'"),
             })? {
                 let entry_path = entry.path();
+                if has_provider {
+                    validate_provider_path(&path, entry_path)?;
+                }
                 if entry_path.trim_start_matches('/') == list_path_normalized {
                     continue;
                 }
@@ -426,6 +465,14 @@ impl FileIO {
     pub async fn rename(&self, src: &str, dst: &str) -> Result<()> {
         let (op_src, relative_path_src) = self.create(src).await?;
         let (op_dst, relative_path_dst) = self.create(dst).await?;
+        if matches!(self.backend, FileIOBackend::Provider(_))
+            && !Arc::ptr_eq(op_src.service(), op_dst.service())
+        {
+            return Err(Error::IoUnsupported {
+                message: "Rename through a FileIOProvider requires the same shared storage service"
+                    .to_string(),
+            });
+        }
         let cache_path_src = cache_object_path(&op_src, relative_path_src.as_ref());
         let cache_path_dst = cache_object_path(&op_dst, relative_path_dst.as_ref());
 
@@ -442,6 +489,57 @@ impl FileIO {
 
         Ok(())
     }
+}
+
+async fn resolve_provider(
+    provider: &dyn FileIOProvider,
+    path: &str,
+) -> crate::Result<(Operator, String)> {
+    let (op, relative_path) = provider.create(path).await?;
+    validate_provider_path(path, &relative_path)?;
+    Ok((op, relative_path))
+}
+
+fn validate_provider_path(path: &str, relative_path: &str) -> Result<()> {
+    // Filesystem paths retain their existing separator normalization. Object
+    // keys must not silently resolve to another object through OpenDAL's path
+    // normalization (e.g. `a//b` -> `a/b` or `key ` -> `key`).
+    if path.contains("://")
+        && !path.starts_with("file:/")
+        && !relative_path.is_empty()
+        && normalize_path(relative_path) != relative_path
+    {
+        return Err(Error::ConfigInvalid {
+            message: "FileIOProvider returned an object path that OpenDAL would normalize"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn listing_base_path(path: &str, relative_path: &str) -> Result<String> {
+    if relative_path.is_empty() || relative_path == "/" {
+        return Ok(path.to_string());
+    }
+    if let Some(base) = path.strip_suffix(relative_path) {
+        if base.is_empty() || base.ends_with('/') {
+            return Ok(base.to_string());
+        }
+    }
+    // Windows filesystem paths only change separators. Try the original path
+    // first, since backslashes are literal filename characters on POSIX.
+    if looks_like_windows_drive_path(path) || (cfg!(windows) && path.starts_with("file:/")) {
+        let normalized = path.replace('\\', "/");
+        if let Some(base) = normalized.strip_suffix(relative_path) {
+            if base.is_empty() || base.ends_with('/') {
+                return Ok(base.to_string());
+            }
+        }
+    }
+    Err(Error::ConfigInvalid {
+        message: "Cannot list a path whose resolved relative path is not a component suffix"
+            .to_string(),
+    })
 }
 
 fn status_path(base_path: &str, entry_path: &str) -> String {
@@ -478,6 +576,7 @@ pub struct FileIOBuilder {
     props: HashMap<String, String>,
     cache: Option<Arc<LocalCache>>,
     operator: Option<Operator>,
+    provider: Option<Arc<dyn FileIOProvider>>,
 }
 
 impl FileIOBuilder {
@@ -487,6 +586,7 @@ impl FileIOBuilder {
             props: HashMap::default(),
             cache: None,
             operator: None,
+            provider: None,
         }
     }
 
@@ -510,6 +610,16 @@ impl FileIOBuilder {
         self
     }
 
+    /// Use an application-managed provider instead of built-in storage.
+    ///
+    /// The provider receives original paths, regardless of the builder's scheme.
+    /// Storage properties are not parsed and no built-in storage feature is
+    /// required. Combining this with [`Self::with_fs_operator`] is an error.
+    pub fn with_provider(mut self, provider: Arc<dyn FileIOProvider>) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
     pub fn with_prop(mut self, key: impl ToString, value: impl ToString) -> Self {
         self.props.insert(key.to_string(), value.to_string());
         self
@@ -529,14 +639,19 @@ impl FileIOBuilder {
         self
     }
 
-    pub fn build(self) -> crate::Result<FileIO> {
+    pub fn build(mut self) -> crate::Result<FileIO> {
         let cache = self.cache.clone();
-        let storage = Storage::build(self)?;
-        Ok(FileIO {
-            storage: Arc::new(storage),
-            cache,
-            provider: None,
-        })
+        let backend = if let Some(provider) = self.provider.take() {
+            if self.operator.is_some() {
+                return Err(Error::ConfigInvalid {
+                    message: "with_provider and with_fs_operator cannot be combined".to_string(),
+                });
+            }
+            FileIOBackend::Provider(provider)
+        } else {
+            FileIOBackend::Storage(Arc::new(Storage::build(self)?))
+        };
+        Ok(FileIO { backend, cache })
     }
 }
 
@@ -670,45 +785,52 @@ pub struct FileStatus {
     pub last_modified: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug)]
-pub struct InputFile {
-    op: Operator,
-    path: String,
-    /// The opendal-relative path (see [`FileIO::new_input`]); not necessarily a
-    /// suffix of `path`, since local paths are separator-normalized.
-    relative_path: String,
-    cache_path: String,
-    cache: Option<Arc<LocalCache>>,
-    provider: Option<Arc<dyn FileIOProvider>>,
+#[derive(Clone, Debug)]
+enum FileSource {
+    Static {
+        op: Operator,
+        relative_path: String,
+        cache_path: String,
+    },
+    Provider(Arc<dyn FileIOProvider>),
 }
 
-impl InputFile {
-    async fn resolve(&self) -> crate::Result<(Operator, String, String)> {
-        match &self.provider {
-            Some(provider) => {
-                let (op, relative_path) = provider.create(&self.path).await?;
+impl FileSource {
+    async fn resolve(&self, path: &str) -> crate::Result<(Operator, String, String)> {
+        match self {
+            Self::Provider(provider) => {
+                let (op, relative_path) = resolve_provider(provider.as_ref(), path).await?;
                 let cache_path = cache_object_path(&op, &relative_path);
                 Ok((op, relative_path, cache_path))
             }
-            None => Ok((
-                self.op.clone(),
-                self.relative_path.clone(),
-                self.cache_path.clone(),
-            )),
+            Self::Static {
+                op,
+                relative_path,
+                cache_path,
+            } => Ok((op.clone(), relative_path.clone(), cache_path.clone())),
         }
     }
+}
 
+#[derive(Debug)]
+pub struct InputFile {
+    source: FileSource,
+    path: String,
+    cache: Option<Arc<LocalCache>>,
+}
+
+impl InputFile {
     pub fn location(&self) -> &str {
         &self.path
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
-        let (op, relative_path, _) = self.resolve().await?;
+        let (op, relative_path, _) = self.source.resolve(&self.path).await?;
         Ok(op.exists(&relative_path).await?)
     }
 
     pub async fn metadata(&self) -> crate::Result<FileStatus> {
-        let (op, relative_path, _) = self.resolve().await?;
+        let (op, relative_path, _) = self.source.resolve(&self.path).await?;
         let meta = op.stat(&relative_path).await?;
 
         Ok(FileStatus {
@@ -722,7 +844,7 @@ impl InputFile {
     }
 
     pub async fn read(&self) -> crate::Result<Bytes> {
-        let (op, relative_path, cache_path) = self.resolve().await?;
+        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let Some(cache) = &self.cache else {
             return Ok(op.read(&relative_path).await?.to_bytes());
         };
@@ -741,7 +863,7 @@ impl InputFile {
     }
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
-        let (op, relative_path, cache_path) = self.resolve().await?;
+        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let reader = op.reader(&relative_path).await?;
         let Some(cache) = &self.cache else {
             return Ok(InputFileReader::Direct(reader));
@@ -766,50 +888,27 @@ impl InputFile {
 
 #[derive(Debug, Clone)]
 pub struct OutputFile {
-    op: Operator,
+    source: FileSource,
     path: String,
-    /// The opendal-relative path (see [`FileIO::new_output`]); not necessarily a
-    /// suffix of `path`, since local paths are separator-normalized.
-    relative_path: String,
-    cache_path: String,
     cache: Option<Arc<LocalCache>>,
-    provider: Option<Arc<dyn FileIOProvider>>,
 }
 
 impl OutputFile {
-    async fn resolve(&self) -> crate::Result<(Operator, String, String)> {
-        match &self.provider {
-            Some(provider) => {
-                let (op, relative_path) = provider.create(&self.path).await?;
-                let cache_path = cache_object_path(&op, &relative_path);
-                Ok((op, relative_path, cache_path))
-            }
-            None => Ok((
-                self.op.clone(),
-                self.relative_path.clone(),
-                self.cache_path.clone(),
-            )),
-        }
-    }
-
     pub fn location(&self) -> &str {
         &self.path
     }
 
     pub async fn exists(&self) -> crate::Result<bool> {
-        let (op, relative_path, _) = self.resolve().await?;
+        let (op, relative_path, _) = self.source.resolve(&self.path).await?;
         Ok(op.exists(&relative_path).await?)
     }
 
     pub fn to_input_file(self) -> InputFile {
         let cache = self.cache.filter(|cache| cache.is_cacheable(&self.path));
         InputFile {
-            op: self.op,
+            source: self.source,
             path: self.path,
-            relative_path: self.relative_path,
-            cache_path: self.cache_path,
             cache,
-            provider: self.provider,
         }
     }
 
@@ -820,7 +919,7 @@ impl OutputFile {
     }
 
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
-        let (op, relative_path, cache_path) = self.resolve().await?;
+        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let writer: Box<dyn FileWrite> = Box::new(
             op.writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
@@ -838,7 +937,7 @@ impl OutputFile {
 
     /// Get an async streaming writer for format-level writes (e.g. parquet).
     pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
-        let (op, relative_path, cache_path) = self.resolve().await?;
+        let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let writer: Box<dyn AsyncFileWrite> = Box::new(
             op.writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
@@ -1332,14 +1431,20 @@ mod object_storage_path_test {
     fn assert_relative_paths(file_io: &FileIO, path: &str, expected_relative_path: &str) {
         let input = file_io.new_input(path).unwrap();
         assert_eq!(input.location(), path);
-        assert_eq!(input.relative_path, expected_relative_path);
+        let FileSource::Static { relative_path, .. } = input.source else {
+            panic!("expected static input")
+        };
+        assert_eq!(relative_path, expected_relative_path);
 
         let output = file_io.new_output(path).unwrap();
         assert_eq!(output.location(), path);
-        assert_eq!(output.relative_path, expected_relative_path);
+        let FileSource::Static { relative_path, .. } = output.source else {
+            panic!("expected static output")
+        };
+        assert_eq!(relative_path, expected_relative_path);
 
-        let (_op, relative_path) = file_io.storage.create(path).unwrap();
-        assert_eq!(relative_path.as_ref(), expected_relative_path);
+        let (_op, relative_path) = file_io.create_static(path).unwrap();
+        assert_eq!(relative_path, expected_relative_path);
 
         let base_path = &path[..path.len() - relative_path.len()];
         assert_eq!(format!("{base_path}{relative_path}"), path);

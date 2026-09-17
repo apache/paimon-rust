@@ -41,6 +41,13 @@ pub struct paimon_bytes {
 }
 
 impl paimon_bytes {
+    pub fn empty() -> Self {
+        Self {
+            data: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
+
     pub fn new(v: Vec<u8>) -> Self {
         let boxed = v.into_boxed_slice();
         let len = boxed.len();
@@ -244,6 +251,35 @@ pub struct paimon_predicate {
 #[repr(C)]
 pub struct paimon_vector_search_builder {
     pub inner: *mut c_void,
+}
+
+/// Owned vector scan, usable after its builder is freed.
+#[repr(C)]
+pub struct paimon_vector_scan {
+    pub inner: *mut c_void,
+}
+
+/// Owned snapshot-scoped vector plan, shared by DE and PK reads.
+#[repr(C)]
+pub struct paimon_vector_plan {
+    pub inner: *mut c_void,
+}
+
+/// Owned vector query and output projection.
+#[repr(C)]
+pub struct paimon_vector_read {
+    pub inner: *mut c_void,
+}
+
+/// A decoded Java PK bucket split. Free with paimon_bucket_vector_search_split_free.
+#[repr(C)]
+pub struct paimon_bucket_vector_search_split {
+    pub inner: *mut c_void,
+}
+
+pub(crate) struct VectorReadState {
+    pub read: paimon::table::VectorRead,
+    pub projection: Option<Vec<String>>,
 }
 
 /// Internal state for a vector-search builder: the table plus the query

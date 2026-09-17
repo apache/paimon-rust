@@ -30,11 +30,15 @@ impl RESTUtil {
         url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
     }
 
-    /// URL-decode a string value.
+    /// URL-decode a string value, as Java's `URLDecoder.decode(s, UTF-8)` does.
+    ///
+    /// Whole-string decoding: `%XX` is resolved and `+` becomes a space, while `=` and `&` are
+    /// ordinary characters. Java throws on a malformed escape; this decodes lossily instead,
+    /// so that a signer keeps the stray bytes rather than signing an empty resource.
     pub fn decode_string(encoded: &str) -> String {
-        url::form_urlencoded::parse(encoded.as_bytes())
-            .map(|(k, _)| k.to_string())
-            .collect()
+        percent_encoding::percent_decode(encoded.replace('+', " ").as_bytes())
+            .decode_utf8_lossy()
+            .into_owned()
     }
 
     /// Extract all keys with a given prefix from options, returning a new HashMap with the prefix removed.
@@ -79,6 +83,34 @@ mod tests {
         let encoded = RESTUtil::encode_string(original);
         let decoded = RESTUtil::decode_string(&encoded);
         assert_eq!(decoded, original);
+    }
+
+    /// Java's `RESTUtil.decodeString` is `URLDecoder.decode`: a whole-string decoder, in which
+    /// `=` and `&` are ordinary characters rather than separators.
+    #[test]
+    fn test_decode_string_decodes_the_whole_string() {
+        assert_eq!(
+            RESTUtil::decode_string("/v1/a=b/databases/x"),
+            "/v1/a=b/databases/x"
+        );
+        assert_eq!(RESTUtil::decode_string("/v1/x&y/d"), "/v1/x&y/d");
+        assert_eq!(RESTUtil::decode_string("a+b"), "a b");
+        assert_eq!(RESTUtil::decode_string("a%2Fb"), "a/b");
+        assert_eq!(RESTUtil::decode_string("a%2Bb"), "a+b");
+        assert_eq!(
+            RESTUtil::decode_string("%E4%B8%AD%E6%96%87"),
+            "\u{4e2d}\u{6587}"
+        );
+    }
+
+    /// Malformed escapes decode lossily: Java throws, but dropping the rest of a resource that
+    /// is about to be signed is worse than keeping the stray bytes.
+    #[test]
+    fn test_decode_string_passes_through_malformed_escapes() {
+        assert_eq!(RESTUtil::decode_string("100%"), "100%");
+        assert_eq!(RESTUtil::decode_string("a%zzb"), "a%zzb");
+        assert_eq!(RESTUtil::decode_string("a%2"), "a%2");
+        assert_eq!(RESTUtil::decode_string("a%FFb"), "a\u{FFFD}b");
     }
 
     #[test]

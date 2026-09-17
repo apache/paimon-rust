@@ -76,6 +76,11 @@ pub use index_manifest::{IndexManifest, IndexManifestEntry};
 mod manifest;
 pub(crate) use manifest::merge_active_entries;
 pub use manifest::Manifest;
+mod manifest_sidecar;
+pub use manifest_sidecar::{
+    ManifestSidecar, ManifestSidecarBlock, ManifestSidecarBuilder, ManifestSidecarSelection,
+    MANIFEST_SIDECAR_SUFFIX,
+};
 mod manifest_common;
 pub use manifest_common::FileKind;
 mod manifest_entry;
@@ -99,7 +104,7 @@ mod partition;
 pub use partition::Partition;
 mod partition_utils;
 pub(crate) use partition_utils::{
-    bucket_path, bucket_path_under, escape_path_name, PartitionComputer,
+    bucket_path, bucket_path_under, escape_path_name, unescape_path_name, PartitionComputer,
 };
 mod predicate;
 pub(crate) use predicate::datum_cmp;

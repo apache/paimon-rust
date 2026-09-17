@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Snapshot manager for reading snapshot metadata using FileIO.
+//! Snapshot manager for reading file and catalog snapshot metadata.
 //!
 //! Reference:[org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
 use crate::catalog::DEFAULT_MAIN_BRANCH;
@@ -29,7 +29,7 @@ const SNAPSHOT_PREFIX: &str = "snapshot-";
 const LATEST_HINT: &str = "LATEST";
 const EARLIEST_HINT: &str = "EARLIEST";
 
-/// Manager for snapshot files using unified FileIO.
+/// Manager for snapshot files and REST catalog snapshot resolution.
 ///
 /// Reference: [org.apache.paimon.utils.SnapshotManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
 #[derive(Debug, Clone)]
@@ -37,6 +37,7 @@ pub struct SnapshotManager {
     file_io: FileIO,
     table_path: String,
     branch: String,
+    rest_env: Option<super::RESTEnv>,
 }
 
 impl SnapshotManager {
@@ -46,7 +47,13 @@ impl SnapshotManager {
             file_io,
             table_path,
             branch: DEFAULT_MAIN_BRANCH.to_string(),
+            rest_env: None,
         }
+    }
+
+    pub(crate) fn with_rest_env(mut self, rest_env: Option<super::RESTEnv>) -> Self {
+        self.rest_env = rest_env;
+        self
     }
 
     pub fn file_io(&self) -> &FileIO {
@@ -74,6 +81,7 @@ impl SnapshotManager {
             file_io: self.file_io.clone(),
             table_path: self.table_path.clone(),
             branch: branch.to_string(),
+            rest_env: self.rest_env.clone(),
         }
     }
 
@@ -137,11 +145,22 @@ impl SnapshotManager {
 
     /// Get the latest snapshot id.
     ///
-    /// First tries the LATEST hint file. If the hint is valid and no next snapshot
-    /// exists, returns it. Otherwise falls back to listing snapshot files.
+    /// REST tables use the catalog snapshot. Otherwise, first tries the LATEST
+    /// hint file. If the hint is valid and no next snapshot exists, returns it.
+    /// Otherwise falls back to listing snapshot files.
     ///
     /// Reference: [HintFileUtils.findLatest](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/HintFileUtils.java)
     pub async fn get_latest_snapshot_id(&self) -> crate::Result<Option<i64>> {
+        if self.rest_env.is_some() {
+            return Ok(self
+                .get_latest_snapshot()
+                .await?
+                .map(|snapshot| snapshot.id()));
+        }
+        self.latest_snapshot_id_from_filesystem().await
+    }
+
+    async fn latest_snapshot_id_from_filesystem(&self) -> crate::Result<Option<i64>> {
         let hint_path = self.latest_hint_path();
         if let Some(hint_id) = self.read_hint(&hint_path).await {
             if hint_id > 0 {
@@ -231,7 +250,12 @@ impl SnapshotManager {
 
     /// Get the latest snapshot, or None if no snapshots exist.
     pub async fn get_latest_snapshot(&self) -> crate::Result<Option<Snapshot>> {
-        let snapshot_id = match self.get_latest_snapshot_id().await? {
+        if let Some(env) = &self.rest_env {
+            // Java REST NotImplementedException (HTTP 501) is a service error,
+            // not SnapshotLoader's UnsupportedOperationException fallback.
+            return env.load_snapshot(&self.branch).await;
+        }
+        let snapshot_id = match self.latest_snapshot_id_from_filesystem().await? {
             Some(id) => id,
             None => return Ok(None),
         };
@@ -512,6 +536,164 @@ mod tests {
             .commit_kind(CommitKind::APPEND)
             .time_millis(1000 * id as u64)
             .build()
+    }
+
+    struct RestFixture {
+        table: crate::table::Table,
+        response: std::sync::Arc<std::sync::Mutex<(u16, serde_json::Value)>>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for RestFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn rest_fixture() -> RestFixture {
+        use crate::api::rest_api::RESTApi;
+        use crate::catalog::Identifier;
+        use crate::common::Options;
+        use crate::spec::{DataType, IntType, Schema, TableSchema};
+        use axum::{
+            http::{HeaderMap, StatusCode, Uri},
+            Json, Router,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let response = Arc::new(Mutex::new((
+            200_u16,
+            serde_json::json!({
+                "snapshot": {"snapshot": test_snapshot(7), "recordCount": 10}
+            }),
+        )));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let handler_response = response.clone();
+        let handler_requests = requests.clone();
+        let app = Router::new().fallback(move |uri: Uri, headers: HeaderMap| {
+            let (status, value) = handler_response.lock().unwrap().clone();
+            handler_requests.lock().unwrap().push(uri.to_string());
+            assert_eq!(headers["authorization"], "Bearer test-token");
+            async move { (StatusCode::from_u16(status).unwrap(), Json(value)) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut options = Options::new();
+        options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
+        options.set("prefix", "test");
+        options.set("token.provider", "bear");
+        options.set("token", "test-token");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+        let id = Identifier::new("database", "table");
+        let env = crate::table::RESTEnv::new(id.clone(), "uuid".into(), api, options, false, None);
+        let (io, manager) = setup("/rest-table").await;
+        manager.commit_snapshot(&test_snapshot(2)).await.unwrap();
+        let schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .build()
+                .unwrap(),
+        );
+        let table = crate::table::Table::new(io, id, "/rest-table".into(), schema, Some(env));
+        RestFixture {
+            table,
+            response,
+            requests,
+            server,
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_latest_snapshot_and_id_use_catalog_without_snapshot_file() {
+        let fixture = rest_fixture().await;
+        let sm = fixture.table.snapshot_manager();
+        assert_eq!(sm.get_latest_snapshot().await.unwrap().unwrap().id(), 7);
+        assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), Some(7));
+        assert!(sm.get_snapshot(7).await.is_err());
+        assert_eq!(
+            *fixture.requests.lock().unwrap(),
+            vec!["/v1/test/databases/database/tables/table/snapshot"; 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_empty_snapshot_is_authoritative() {
+        let fixture = rest_fixture().await;
+        let sm = fixture.table.snapshot_manager();
+        for body in [serde_json::json!({"snapshot": null}), serde_json::json!({})] {
+            *fixture.response.lock().unwrap() = (200, body);
+            assert!(sm.get_latest_snapshot().await.unwrap().is_none());
+            assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), None);
+        }
+        *fixture.response.lock().unwrap() = (
+            404,
+            serde_json::json!({
+                "code": 404, "resourceType": "SNAPSHOT", "message": "No snapshot"
+            }),
+        );
+        assert!(sm.get_latest_snapshot().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rest_snapshot_errors_never_fall_back_to_filesystem() {
+        let fixture = rest_fixture().await;
+        let sm = fixture.table.snapshot_manager();
+        for code in [401, 403, 404, 500, 501, 503] {
+            *fixture.response.lock().unwrap() = (
+                code,
+                serde_json::json!({
+                    "code": code, "resourceType": "TABLE", "message": "unavailable"
+                }),
+            );
+            assert!(sm.get_latest_snapshot().await.is_err(), "status {code}");
+            assert!(sm.get_latest_snapshot_id().await.is_err(), "status {code}");
+        }
+        *fixture.response.lock().unwrap() = (200, serde_json::json!({"snapshot": {}}));
+        assert!(sm.get_latest_snapshot().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolved_schema_copy_preserves_catalog_and_branch() {
+        let fixture = rest_fixture().await;
+        // Changing the resolved schema must not discard the catalog provider.
+        let schema = fixture
+            .table
+            .schema()
+            .copy_with_options(std::collections::HashMap::from([(
+                "source.split.target-size".into(),
+                "1mb".into(),
+            )]));
+        let table = fixture
+            .table
+            .copy_with_resolved_schema(schema, "main")
+            .unwrap();
+        assert_eq!(
+            table
+                .snapshot_manager()
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            Some(7)
+        );
+        let sm = table.snapshot_manager().with_branch("dev");
+        assert_eq!(sm.get_latest_snapshot_id().await.unwrap(), Some(7));
+        assert_eq!(
+            fixture.requests.lock().unwrap().last().unwrap(),
+            "/v1/test/databases/database/tables/table%24branch_dev/snapshot"
+        );
+        assert_eq!(
+            sm.with_branch("main")
+                .get_latest_snapshot_id()
+                .await
+                .unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            fixture.requests.lock().unwrap().last().unwrap(),
+            "/v1/test/databases/database/tables/table/snapshot"
+        );
     }
 
     fn test_snapshot_with_watermark(id: i64, watermark: Option<i64>) -> Snapshot {

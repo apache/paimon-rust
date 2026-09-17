@@ -30,17 +30,23 @@ use crate::Result;
 
 use super::api_request::{
     AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
-    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateViewRequest,
-    DropPartitionsRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
-    RenameTableRequest,
+    CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateTagRequest,
+    CreateViewRequest, DropPartitionsRequest, DropPolicyRequest, ListPartitionsByFilterRequest,
+    ListPartitionsByNamesRequest, PolicyRequest, RenameTableRequest, RevokePermissionRequest,
 };
 use super::api_response::{
-    AuthTableQueryResponse, ConfigResponse, GetDatabaseResponse, GetFunctionResponse,
-    GetTableResponse, GetViewResponse, ListDatabasesResponse, ListFunctionsResponse,
-    ListPartitionsResponse, ListTablesResponse, ListViewsResponse, PagedList,
+    AuthTableQueryResponse, ConfigResponse, ErrorResponse, GetDatabaseResponse,
+    GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
+    ListFunctionsResponse, ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse,
+    ListTablesResponse, ListViewsResponse, PagedList,
 };
 use super::auth::{AuthProviderFactory, RESTAuthFunction};
+use super::management::{
+    bad_request, DataPolicy, ListPermissionsRequest, ListPoliciesRequest, PermissionAssignment,
+    PermissionResource, PolicyType,
+};
 use super::resource_paths::ResourcePaths;
+use super::rest_error::RestError;
 use super::rest_util::RESTUtil;
 
 /// Validate that a string is not empty after trimming.
@@ -72,6 +78,18 @@ fn validate_non_empty_multi(values: &[(&str, &str)]) -> Result<()> {
         validate_non_empty(value, field_name)?;
     }
     Ok(())
+}
+
+/// The canonical `(database, table)` of a policy resource, shared by all three calls.
+fn policy_table(resource: PermissionResource) -> Result<(String, String)> {
+    resource.validate_policy_attachment()?;
+    let resource = resource.canonicalized()?;
+    match (resource.database_name(), resource.table_name()) {
+        (Some(database), Some(table)) => Ok((database.to_string(), table.to_string())),
+        _ => Err(bad_request(
+            "A TABLE resource needs both database and table.",
+        )),
+    }
 }
 
 /// REST API wrapper for Paimon catalog operations.
@@ -143,10 +161,9 @@ impl RESTApi {
                 });
             }
 
-            let query_params: Vec<(&str, String)> = vec![(
-                CatalogOptions::WAREHOUSE,
-                RESTUtil::encode_string(warehouse),
-            )];
+            // Pass the warehouse raw: the client and the signer each encode it once.
+            let query_params: Vec<(&str, String)> =
+                vec![(CatalogOptions::WAREHOUSE, warehouse.to_string())];
             let config_response: ConfigResponse = client
                 .get(&ResourcePaths::config(), Some(&query_params))
                 .await?;
@@ -374,6 +391,23 @@ impl RESTApi {
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
         let path = self.resource_paths.table(database, table);
         self.client.get(&path, None::<&[(&str, &str)]>).await
+    }
+
+    /// Load the latest snapshot and statistics from the catalog.
+    pub async fn load_snapshot(
+        &self,
+        identifier: &Identifier,
+    ) -> Result<Option<super::TableSnapshot>> {
+        validate_non_empty_multi(&[
+            (identifier.database(), "database name"),
+            (identifier.object(), "table name"),
+        ])?;
+        let path = self
+            .resource_paths
+            .table_snapshot(identifier.database(), identifier.object());
+        let response: super::GetTableSnapshotResponse =
+            self.client.get(&path, None::<&[(&str, &str)]>).await?;
+        Ok(response.snapshot)
     }
 
     /// Rename a table.
@@ -845,6 +879,156 @@ impl RESTApi {
         let path = self.resource_paths.auth_table(database, table);
         let request = AuthTableQueryRequest::new(select);
         self.client.post(&path, &request).await
+    }
+
+    // ==================== Permission Management ====================
+    //
+    // Experimental REST management API (Java `RESTPermissionManagement`).
+
+    /// List the direct assignments on one exact resource or scope: the server synthesizes none
+    /// of those inherited through `CATALOG_ALL` / `DATABASE_ALL`, and may still list expired ones.
+    pub async fn list_permissions_paged(
+        &self,
+        request: &ListPermissionsRequest,
+    ) -> Result<PagedList<PermissionAssignment>> {
+        let params = request.query_params()?;
+        let response: ListPermissionsResponse = self
+            .client
+            .get(&self.resource_paths.permissions(), Some(&params))
+            .await?;
+        Ok(PagedList::new(
+            response.permissions,
+            response.next_page_token,
+        ))
+    }
+
+    /// Grant an assignment, replacing the expiry and column range of an identical one.
+    pub async fn grant_permission(&self, assignment: &PermissionAssignment) -> Result<()> {
+        let assignment = assignment.clone().canonicalized()?;
+        let path = self.resource_paths.grant_permission();
+        let _resp: serde_json::Value = self.client.post(&path, &assignment).await?;
+        Ok(())
+    }
+
+    /// Revoke an assignment by identity; revoking an absent one succeeds.
+    pub async fn revoke_permission(
+        &self,
+        resource: &PermissionResource,
+        access: &str,
+        principal: &str,
+    ) -> Result<()> {
+        let request = RevokePermissionRequest::new(resource.clone(), access, principal)?;
+        let path = self.resource_paths.revoke_permission();
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
+
+    // ==================== Tag Operations ====================
+
+    pub async fn create_tag(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+    ) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[
+            (database, "database name"),
+            (table, "table name"),
+            (tag_name, "tag name"),
+        ])?;
+        let path = self.resource_paths.tags(database, table);
+        let request = CreateTagRequest::new(tag_name.to_string(), snapshot_id);
+        let _response: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
+
+    pub async fn get_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<GetTagResponse> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[
+            (database, "database name"),
+            (table, "table name"),
+            (tag_name, "tag name"),
+        ])?;
+        let path = self.resource_paths.tag(database, table, tag_name);
+        self.client.get(&path, None::<&[(&str, &str)]>).await
+    }
+
+    pub async fn delete_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<()> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[
+            (database, "database name"),
+            (table, "table name"),
+            (tag_name, "tag name"),
+        ])?;
+        let path = self.resource_paths.tag(database, table, tag_name);
+        let _response: serde_json::Value =
+            self.client.delete(&path, None::<&[(&str, &str)]>).await?;
+        Ok(())
+    }
+
+    // ==================== Policy Management ====================
+    //
+    // Experimental REST management API (Java `RESTPolicyManagement`).
+
+    pub async fn list_policies_paged(
+        &self,
+        request: &ListPoliciesRequest,
+    ) -> Result<PagedList<DataPolicy>> {
+        let params = request.query_params()?;
+        let (database, table) = policy_table(request.resource.clone())?;
+        let path = self.resource_paths.policies(&database, &table);
+        let response: ListPoliciesResponse = if params.is_empty() {
+            self.client.get(&path, None::<&[(&str, &str)]>).await?
+        } else {
+            self.client.get(&path, Some(&params)).await?
+        };
+        Ok(PagedList::new(response.policies, response.next_page_token))
+    }
+
+    /// Create a policy on its table. A policy with the same identity surfaces as
+    /// `RestError::AlreadyExists` whose `resource_type` is `POLICY`.
+    pub async fn create_policy(&self, policy: &DataPolicy) -> Result<()> {
+        let (database, table) = policy_table(policy.resource().clone())?;
+        let request = PolicyRequest::from(policy);
+        let path = self.resource_paths.policies(&database, &table);
+        let _resp: serde_json::Value = self.client.post(&path, &request).await?;
+        Ok(())
+    }
+
+    /// Drop one policy by identity. `ignore_if_not_exists` swallows a 404 on the policy only:
+    /// a 404 on the table still surfaces.
+    pub async fn drop_policy(
+        &self,
+        resource: &PermissionResource,
+        policy_type: PolicyType,
+        principal: &str,
+        column: Option<&str>,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        let (database, table) = policy_table(resource.clone())?;
+        let request = DropPolicyRequest::new(policy_type, principal, column)?;
+        let path = self.resource_paths.drop_policy(&database, &table);
+        match self
+            .client
+            .post::<serde_json::Value, _>(&path, &request)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(crate::Error::RestApi {
+                source:
+                    RestError::NoSuchResource {
+                        resource_type: Some(resource_type),
+                        ..
+                    },
+            }) if ignore_if_not_exists && resource_type == ErrorResponse::RESOURCE_TYPE_POLICY => {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     // ==================== Commit Operations ====================

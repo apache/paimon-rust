@@ -41,6 +41,10 @@ use futures::{stream, StreamExt};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+#[path = "audit_log_table/read.rs"]
+mod audit;
+pub use audit::AuditLogRead;
+
 const MAX_MERGE_INPUT_STREAMS: usize = 256;
 
 /// Table read: reads data from splits (e.g. produced by [TableScan::plan]).
@@ -723,12 +727,15 @@ impl<'a> PaimonTableRead<'a> {
         let merge_engine = core_options.merge_engine()?;
 
         // Route supported PK merge engines through the split-aware reader.
-        // Deduplicate may mix raw and KV splits. Partial-update and aggregation
+        // Deduplicate and first-row may mix raw and KV splits. Partial-update and aggregation
         // use KV reads normally, but fully materialized DV plans can read raw.
         if has_primary_keys
             && matches!(
                 merge_engine,
-                MergeEngine::Deduplicate | MergeEngine::PartialUpdate | MergeEngine::Aggregation
+                MergeEngine::Deduplicate
+                    | MergeEngine::FirstRow
+                    | MergeEngine::PartialUpdate
+                    | MergeEngine::Aggregation
             )
         {
             return self.read_pk(data_splits, &core_options);
@@ -741,7 +748,7 @@ impl<'a> PaimonTableRead<'a> {
         }
     }
 
-    /// Read PK table. For `Deduplicate`, splits marked raw convertible by scan
+    /// Read PK table. For `Deduplicate` and `FirstRow`, raw-convertible splits from scan
     /// planning (mirrors Java `DataSplit#convertToRawFiles`) use the faster
     /// DataFileReader; the rest go through KeyValueFileReader for sort-merge
     /// dedup. A fully materialized deletion-vector plan for `PartialUpdate` or
@@ -753,6 +760,19 @@ impl<'a> PaimonTableRead<'a> {
         data_splits: &[DataSplit],
         core_options: &CoreOptions,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        if data_splits.iter().any(DataSplit::is_streaming) {
+            let streams = data_splits
+                .iter()
+                .map(|split| {
+                    if split.is_streaming() {
+                        self.read_raw(std::slice::from_ref(split))
+                    } else {
+                        self.read_pk(std::slice::from_ref(split), core_options)
+                    }
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            return Ok(Box::pin(futures::stream::select_all(streams)));
+        }
         let merge_engine = core_options.merge_engine()?;
         let dv_enabled = core_options.deletion_vectors_enabled();
         if matches!(
@@ -1497,7 +1517,7 @@ mod tests {
     use crate::table::source::DataSplitBuilder;
     use futures::TryStreamExt;
 
-    fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
+    pub(super) fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
         DataFileMeta {
             file_name: name.to_string(),
             file_size: 128,
@@ -1523,7 +1543,7 @@ mod tests {
         }
     }
 
-    fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
+    pub(super) fn split(files: Vec<DataFileMeta>, raw_convertible: bool) -> DataSplit {
         DataSplitBuilder::new()
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))
@@ -1577,10 +1597,13 @@ mod tests {
             .to_vec()
     }
 
-    fn file_index_table(path: &str, enabled: Option<bool>) -> Table {
+    fn file_index_table(path: &str, enabled: Option<bool>, primary_key: bool) -> Table {
         let mut builder = Schema::builder().column("id", DataType::Int(IntType::new()));
         if let Some(enabled) = enabled {
             builder = builder.option("file-index.read.enabled", enabled.to_string());
+        }
+        if primary_key {
+            builder = builder.primary_key(["id"]).option("bucket", "1");
         }
         Table::new(
             FileIOBuilder::new("memory").build().unwrap(),
@@ -1597,7 +1620,7 @@ mod tests {
         indexed_file.row_count = 1;
         indexed_file.embedded_index = Some(embedded_bitmap_index().await);
         let split = split(vec![indexed_file], true);
-        let table = file_index_table("memory:/table_read_file_index", None);
+        let table = file_index_table("memory:/table_read_file_index", None, false);
         let fields = table.schema().fields().to_vec();
         let predicate = PredicateBuilder::new(&fields)
             .equal("id", Datum::Int(99))
@@ -1631,8 +1654,24 @@ mod tests {
             .unwrap();
         assert!(audit.is_empty());
 
+        let pk_table = file_index_table("memory:/table_read_audit_file_index", None, true);
+        let pk_fields = pk_table.schema().fields().to_vec();
+        let pk_predicate = PredicateBuilder::new(&pk_fields)
+            .equal("id", Datum::Int(99))
+            .unwrap();
+        let pk_read = TableRead::new(&pk_table, pk_fields, vec![pk_predicate]);
+        let splits = vec![split.clone()];
+        let current_audit = AuditLogRead::new(pk_read)
+            .unwrap()
+            .to_arrow(&splits)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(current_audit.is_empty());
+
         let disabled_table =
-            file_index_table("memory:/table_read_file_index_disabled", Some(false));
+            file_index_table("memory:/table_read_file_index_disabled", Some(false), false);
         let disabled_fields = disabled_table.schema().fields().to_vec();
         let disabled_predicate = PredicateBuilder::new(&disabled_fields)
             .equal("id", Datum::Int(99))

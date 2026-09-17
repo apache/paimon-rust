@@ -168,19 +168,43 @@ impl PaimonCatalog {
         })
     }
 
-    /// Get a table handle by `"db.table"` identifier.
-    fn get_table(&self, py: Python<'_>, identifier: &str) -> PyResult<PyTable> {
-        let parts: Vec<&str> = identifier.splitn(2, '.').collect();
-        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-            return Err(PyValueError::new_err(format!(
-                "expected identifier in 'db.table' format, got '{identifier}'"
-            )));
+    /// Get a table by "db.table" or a (database, table) tuple.
+    /// Tuple components preserve dots; the table can include a branch suffix.
+    fn get_table(&self, py: Python<'_>, identifier: &Bound<'_, PyAny>) -> PyResult<PyTable> {
+        let (database, object_name) = if let Ok(name) = identifier.extract::<String>() {
+            let (database, table) = name.split_once('.').ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "expected identifier in 'db.table' format, got '{name}'"
+                ))
+            })?;
+            (database.to_string(), table.to_string())
+        } else {
+            identifier.extract::<(String, String)>()?
+        };
+        if database.is_empty() || object_name.is_empty() {
+            return Err(PyValueError::new_err(
+                "database and table names must not be empty",
+            ));
         }
-        let id = Identifier::new(parts[0], parts[1]);
+        let id = Identifier::new(&database, &object_name);
+        let parsed = id.parsed_object_name().map_err(to_py_err)?;
+        if parsed.system_table().is_some() {
+            return Err(PyValueError::new_err(
+                "get_table() does not support system-table identifiers",
+            ));
+        }
+        let base_id = Identifier::new(&database, parsed.table());
+        let branch = parsed.branch().map(str::to_string);
         let catalog = Arc::clone(&self.catalog);
         let table = py.detach(|| {
             runtime()
-                .block_on(catalog.get_table(&id))
+                .block_on(async {
+                    let table = catalog.get_table(&base_id).await?;
+                    match branch {
+                        Some(branch) => table.copy_with_branch(&branch).await,
+                        None => Ok(table),
+                    }
+                })
                 .map_err(to_py_err)
         })?;
         Ok(PyTable::new(Arc::new(table)))

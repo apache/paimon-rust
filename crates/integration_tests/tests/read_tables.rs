@@ -2957,34 +2957,39 @@ async fn test_time_travel_conflicting_selectors_fail() {
     let catalog = create_file_system_catalog();
     let table = get_table_from_catalog(&catalog, "time_travel_table").await;
 
-    let conflicted = table.copy_with_options(HashMap::from([
-        ("scan.version".to_string(), "snapshot1".to_string()),
-        ("scan.timestamp-millis".to_string(), "1234".to_string()),
-    ]));
+    // Java resolves scan.version before validating conflicts with other selectors.
+    for (version, selector) in [
+        ("snapshot1", "scan.tag-name"),
+        ("1", "scan.snapshot-id"),
+        ("watermark-1", "scan.watermark"),
+    ] {
+        let conflicted = table.copy_with_options(HashMap::from([
+            ("scan.version".to_string(), version.to_string()),
+            ("scan.timestamp-millis".to_string(), "1234".to_string()),
+        ]));
 
-    let plan_err = conflicted
-        .new_read_builder()
-        .new_scan()
-        .plan()
-        .await
-        .expect_err("conflicting time-travel selectors should fail");
+        let plan_err = conflicted
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .expect_err("conflicting time-travel selectors should fail");
 
-    match plan_err {
-        Error::DataInvalid { message, .. } => {
-            assert!(
-                message.contains("Only one time-travel selector may be set"),
-                "unexpected conflict error: {message}"
-            );
-            assert!(
-                message.contains("scan.version"),
-                "conflict error should mention scan.version: {message}"
-            );
-            assert!(
-                message.contains("scan.timestamp-millis"),
-                "conflict error should mention scan.timestamp-millis: {message}"
-            );
+        match plan_err {
+            Error::DataInvalid { message, .. } => {
+                assert!(
+                    message.contains("Only one time-travel selector may be set"),
+                    "unexpected conflict error for version {version}: {message}"
+                );
+                for key in [selector, "scan.timestamp-millis"] {
+                    assert!(
+                        message.contains(key),
+                        "conflict error should mention {key}: {message}"
+                    );
+                }
+            }
+            other => panic!("unexpected error for version {version}: {other:?}"),
         }
-        other => panic!("unexpected error: {other:?}"),
     }
 }
 

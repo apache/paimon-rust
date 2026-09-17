@@ -52,9 +52,12 @@ impl paimon_error {
             }
             paimon::Error::TableNotExist { .. }
             | paimon::Error::DatabaseNotExist { .. }
+            | paimon::Error::SnapshotNotExist { .. }
+            | paimon::Error::TagNotExist { .. }
             | paimon::Error::ColumnNotExist { .. } => PaimonErrorCode::NotFound,
             paimon::Error::TableAlreadyExist { .. }
             | paimon::Error::DatabaseAlreadyExist { .. }
+            | paimon::Error::TagAlreadyExist { .. }
             | paimon::Error::ColumnAlreadyExist { .. } => PaimonErrorCode::AlreadyExists,
             paimon::Error::ConfigInvalid { .. }
             | paimon::Error::DataTypeInvalid { .. }

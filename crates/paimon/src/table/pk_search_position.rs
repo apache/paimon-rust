@@ -111,16 +111,15 @@ impl PrimaryKeySearchPosition {
         )
     }
 
-    pub(crate) fn from_vector_candidate(
-        candidate: &crate::table::pk_vector_orchestrator::PkVectorCandidate,
-        metric: crate::vindex::pkvector::metric::VectorSearchMetric,
+    pub(crate) fn from_vector_position(
+        position: &crate::vector_search::PrimaryKeySearchPosition,
     ) -> crate::Result<Self> {
         Self::new(
-            candidate.partition.clone(),
-            candidate.bucket,
-            candidate.data_file_name.clone(),
-            candidate.row_position,
-            metric.distance_to_score(candidate.distance),
+            position.partition.clone(),
+            position.bucket,
+            position.data_file_name.clone(),
+            position.row_position,
+            position.score,
         )
     }
 
@@ -169,8 +168,6 @@ impl Hash for PrimaryKeySearchPosition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::table::pk_vector_orchestrator::PkVectorCandidate;
-    use crate::vindex::pkvector::metric::VectorSearchMetric;
     use std::collections::HashSet;
 
     fn pos(row_position: i64, score: f32) -> crate::Result<PrimaryKeySearchPosition> {
@@ -213,27 +210,31 @@ mod tests {
         assert_eq!(set.len(), 2);
     }
 
-    fn vector_candidate(distance: f32) -> PkVectorCandidate {
-        PkVectorCandidate {
-            split_index: 0,
+    fn vector_position(score: f32) -> crate::vector_search::PrimaryKeySearchPosition {
+        crate::vector_search::PrimaryKeySearchPosition {
             partition: BinaryRow::new(0),
             bucket: 0,
             data_file_name: "f".to_string(),
             row_position: 0,
-            distance,
+            score,
         }
     }
 
     #[test]
-    fn from_vector_candidate_applies_distance_to_score() {
-        // L2: score = 1/(1+distance); distance 1.0 -> score 0.5 (score != distance).
-        let candidate = vector_candidate(1.0);
-        let position =
-            PrimaryKeySearchPosition::from_vector_candidate(&candidate, VectorSearchMetric::L2)
-                .unwrap();
+    fn from_vector_position_preserves_score_and_validates_position() {
+        // SearchResult already converted distance to score; fusion must preserve it.
+        let mut hit = vector_position(0.5);
+        let position = PrimaryKeySearchPosition::from_vector_position(&hit).unwrap();
         assert_eq!(position.score(), 0.5);
         assert_eq!(position.row_position(), 0);
         assert_eq!(position.data_file_name(), "f");
+        for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            hit.score = score;
+            assert!(PrimaryKeySearchPosition::from_vector_position(&hit).is_err());
+        }
+        hit.score = 0.5;
+        hit.row_position = -1;
+        assert!(PrimaryKeySearchPosition::from_vector_position(&hit).is_err());
     }
 
     #[cfg(feature = "fulltext")]

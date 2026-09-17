@@ -261,7 +261,7 @@ impl fmt::Debug for Identifier {
 
 use async_trait::async_trait;
 
-use crate::api::PagedList;
+use crate::api::{GetTagResponse, PagedList};
 use crate::spec::{Partition, Schema, SchemaChange, TableType};
 use crate::table::{ObjectTable, Table};
 
@@ -490,6 +490,41 @@ pub trait Catalog: Send + Sync {
         ignore_if_not_exists: bool,
     ) -> Result<()>;
 
+    /// Create a tag for a snapshot, or for the latest snapshot when `snapshot_id` is `None`.
+    async fn create_tag(
+        &self,
+        _identifier: &Identifier,
+        _tag_name: &str,
+        _snapshot_id: Option<i64>,
+        _ignore_if_exists: bool,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "tag management is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Return a tag and its snapshot metadata.
+    async fn get_tag(&self, _identifier: &Identifier, _tag_name: &str) -> Result<GetTagResponse> {
+        Err(Error::Unsupported {
+            message: "tag management is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Delete a tag.
+    ///
+    /// `FileSystemCatalog` returns [`crate::Error::Unsupported`] when the tagged snapshot has
+    /// expired because Rust does not yet implement Java's tag file cleanup.
+    async fn delete_tag(
+        &self,
+        _identifier: &Identifier,
+        _tag_name: &str,
+        _ignore_if_not_exists: bool,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "tag management is not supported by this catalog".to_string(),
+        })
+    }
+
     // ======================= view methods ===============================
 
     /// Create a persistent view.
@@ -603,6 +638,18 @@ pub trait Catalog: Send + Sync {
     ) -> Result<()> {
         Err(Error::Unsupported {
             message: "Catalog does not support creating partitions".to_string(),
+        })
+    }
+
+    /// Unregister table partition metadata from the catalog, keeping directories and data files.
+    /// Missing specs are ignored so callers can safely retry the request.
+    async fn drop_partitions(
+        &self,
+        _identifier: &Identifier,
+        _partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support dropping partitions".to_string(),
         })
     }
 

@@ -68,6 +68,7 @@ Served under the configured prefix (`/v1/...` by default):
 | --- | --- | --- |
 | GET | `/v1/config` | server config |
 | GET / POST | `/databases` | list / create database |
+| GET | `/databases/:db/tables/:table/snapshot` | latest snapshot (including `$branch_<name>`), or null for an empty table |
 | GET / POST / DELETE | `/databases/{db}` | get / alter (no-op) / drop database |
 | GET / POST | `/databases/{db}/tables` | list / create table |
 | GET / POST / DELETE | `/databases/{db}/tables/{table}` | get / alter / drop table |

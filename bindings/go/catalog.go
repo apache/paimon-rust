@@ -72,8 +72,7 @@ func (c *Catalog) GetTable(id Identifier) (*Table, error) {
 	if c.inner == nil {
 		return nil, ErrClosed
 	}
-	createIdFn := ffiIdentifierNew.symbol(c.ctx)
-	cID, err := createIdFn(id.database, id.object)
+	cID, err := c.newIdentifier(id)
 	if err != nil {
 		return nil, err
 	}
@@ -86,6 +85,10 @@ func (c *Catalog) GetTable(id Identifier) (*Table, error) {
 	}
 	c.lib.acquire()
 	return &Table{ctx: c.ctx, lib: c.lib, inner: inner}, nil
+}
+
+func (c *Catalog) newIdentifier(id Identifier) (*paimonIdentifier, error) {
+	return ffiIdentifierNew.symbol(c.ctx)(id.database, id.object)
 }
 
 var ffiCatalogCreate = newFFI(ffiOpts{

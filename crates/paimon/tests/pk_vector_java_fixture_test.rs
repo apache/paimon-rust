@@ -30,25 +30,8 @@
 //! Physical-position contract: Java never writes `first_row_id` on a primary-key
 //! table (row-tracking is forbidden for PK tables), so the committed data files
 //! below carry NO `first_row_id`. Row identity is therefore physical
-//! `(file, position)`, not a global row id. Two consequences the assertions pin:
-//!   * `execute_scored()` — which reports global row ids — MUST fail on this
-//!     table, because a global row id cannot be recovered without `first_row_id`.
-//!   * `execute_read()` — which materializes rows by physical position — MUST
-//!     succeed and return the rows best-first.
-//!
-//! Provenance of `testdata/pkvector/pk_vector_ivf_flat` (opaque binary table
-//! directory, regenerate rather than hand-edit):
-//!   * Source: Apache Paimon Java, module `paimon-vector`, commit `7234e4c34`.
-//!   * Generator: `PkVectorFixtureGenerator`.
-//!   * Command: `mvn -pl paimon-vector test -Dtest=PkVectorFixtureGenerator \
-//!               -Dgen.pkvector.fixture=true -Drun.e2e.tests=true`.
-//!   * Config: primary key `id`, vector column `embedding`, `ivf-flat`,
-//!     `nlist = 1` (exact, deterministic single inverted list), `deduplicate`
-//!     merge engine, deletion-vectors enabled.
-//!   * Rows: `id == row position`, vectors `[0,0] [1,0] [2,0] [3,0] [4,0]`.
-//!   * Query `[0, 0]`, squared-L2 distances `[0, 1, 4, 9, 16]`; top-3 -> ids
-//!     `[0, 1, 2]`, distances `[0, 1, 4]`, scores `1/(1+d) = [1.0, 0.5, 0.2]`.
-//!   * Fixture tree checksum: `f6c21a447fa7be880713c3d1c27791e7dcb1db10`.
+//! `(file, position)`. Search returns those positions with scores; a projected
+//! result read must retrieve the same rows without inventing global row IDs.
 
 use std::path::Path;
 
@@ -182,23 +165,27 @@ async fn reads_back_java_written_pk_vector_table() {
         "fixture top-3 ids must be [0, 1, 2]"
     );
 
-    // execute_scored() reports global row ids. On a Java-written PK table the data
-    // files carry no `first_row_id`, so a global row id is unrecoverable and the
-    // scored path MUST fail loudly rather than fabricate ids.
+    // Java PK files need no first_row_id: the result retains physical positions.
     let scored = table
         .new_vector_search_builder()
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query.clone())
         .with_limit(k)
-        .execute_scored()
-        .await;
-    assert!(
-        scored.is_err(),
-        "execute_scored() must fail on a primary-key vector table: global row ids \
-         are unavailable when the data files carry no first_row_id"
+        .execute()
+        .await
+        .unwrap();
+    assert!(scored.row_ids().is_err());
+    assert_eq!(
+        scored
+            .positions()
+            .unwrap()
+            .iter()
+            .map(|p| p.row_position as i32)
+            .collect::<Vec<_>>(),
+        expected_ids
     );
 
-    // execute_read() materializes rows by physical position, so it MUST succeed
+    // the result reader materializes rows by physical position, so it MUST succeed
     // and emit the top-k best-first. The `id` column cross-checks the
     // position->id mapping (the fixture pins them equal) and `__paimon_search_score`
     // carries the metric score.
@@ -206,15 +193,21 @@ async fn reads_back_java_written_pk_vector_table() {
     builder
         .with_vector_column(VECTOR_COLUMN)
         .with_query_vector(query)
-        .with_limit(k)
-        .with_projection(&["id"]);
-    let batches = builder
-        .execute_read()
-        .await
-        .expect("primary-key vector read over the Java fixture failed")
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("collecting read batches failed");
+        .with_limit(k);
+    let batches = async {
+        builder
+            .execute()
+            .await?
+            .new_read_builder()
+            .with_projection(&["id"])
+            .read()
+            .await
+    }
+    .await
+    .expect("primary-key vector read over the Java fixture failed")
+    .try_collect::<Vec<_>>()
+    .await
+    .expect("collecting read batches failed");
 
     let ids = batch_i32(&batches, "id");
     assert_eq!(

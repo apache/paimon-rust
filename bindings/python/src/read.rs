@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow::pyarrow::ToPyArrow;
 use futures::TryStreamExt;
 use paimon::spec::Predicate;
-use paimon::table::{DataSplit, RowRange, Table};
+use paimon::table::{DataSplit, IncrementalScanMode, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -135,12 +135,14 @@ impl PyReadBuilder {
         // conflict error via its Java-parity silent fallback, so the strict
         // gate below would otherwise misattribute the failure to a single
         // selector. Surface the real conflict, listing the keys the user set.
+        // scan.version must first be adapted by the core: Java allows it to
+        // overwrite a selector of the same kind after resolving tag precedence.
         let present: Vec<&str> = TIME_TRAVEL_SELECTORS
             .iter()
             .copied()
             .filter(|name| opts.contains_key(*name))
             .collect();
-        if present.len() > 1 {
+        if present.len() > 1 && !opts.contains_key("scan.version") {
             return Err(PyValueError::new_err(format!(
                 "Only one time-travel selector may be set, found: {}",
                 present.join(", ")
@@ -233,7 +235,18 @@ impl PyReadBuilder {
             filter: self.filter.clone(),
             row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
+            incremental_range: None,
+            row_position_slice: None,
+            row_position_shard: None,
         }
+    }
+
+    /// Plan APPEND deltas in (start_snapshot_id, end_snapshot_id] as one batch.
+    /// Primary-key versions are grouped across all selected snapshots.
+    fn new_incremental_scan(&self, start_snapshot_id: i64, end_snapshot_id: i64) -> PyTableScan {
+        let mut scan = self.new_scan();
+        scan.incremental_range = Some((start_snapshot_id, end_snapshot_id));
+        scan
     }
 
     fn new_read(&self) -> PyTableRead {
@@ -255,30 +268,106 @@ pub struct PyTableScan {
     filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
+    incremental_range: Option<(i64, i64)>,
+    row_position_slice: Option<(u64, u64)>,
+    row_position_shard: Option<(u64, u64)>,
+}
+
+impl PyTableScan {
+    fn core_scan(&self) -> PyResult<paimon::table::TableScan<'_>> {
+        let mut scan = self.read_builder()?.new_scan();
+        if let Some((start, end)) = self.row_position_slice {
+            scan = scan
+                .with_row_position_slice(start, end)
+                .map_err(to_py_err)?;
+        }
+        if let Some((index, count)) = self.row_position_shard {
+            scan = scan
+                .with_row_position_shard(index, count)
+                .map_err(to_py_err)?;
+        }
+        Ok(scan)
+    }
+
+    fn core_incremental_scan(
+        &self,
+        start: i64,
+        end: i64,
+    ) -> PyResult<paimon::table::IncrementalScan<'_>> {
+        let mut scan =
+            self.read_builder()?
+                .new_incremental_scan(IncrementalScanMode::Delta, start, end);
+        if let Some((start, end)) = self.row_position_slice {
+            scan = scan
+                .with_row_position_slice(start, end)
+                .map_err(to_py_err)?;
+        }
+        if let Some((index, count)) = self.row_position_shard {
+            scan = scan
+                .with_row_position_shard(index, count)
+                .map_err(to_py_err)?;
+        }
+        Ok(scan)
+    }
+
+    fn read_builder(&self) -> PyResult<paimon::table::ReadBuilder<'_>> {
+        let mut builder = self.table.new_read_builder();
+        apply_read_config(
+            &mut builder,
+            &self.projection,
+            self.limit,
+            &self.filter,
+            self.case_sensitive,
+        )?;
+        if let Some(row_ranges) = &self.row_ranges {
+            builder.with_row_ranges(row_ranges.clone());
+        }
+        Ok(builder)
+    }
 }
 
 #[pymethods]
 impl PyTableScan {
+    /// Select a half-open range of Data Evolution row positions.
+    fn with_row_position_slice(
+        mut slf: PyRefMut<'_, Self>,
+        start: u64,
+        end: u64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.core_scan()?
+            .with_row_position_slice(start, end)
+            .map_err(to_py_err)?;
+        slf.row_position_slice = Some((start, end));
+        Ok(slf)
+    }
+
+    /// Select one Data Evolution row-position shard.
+    fn with_row_position_shard(
+        mut slf: PyRefMut<'_, Self>,
+        index: u64,
+        count: u64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.core_scan()?
+            .with_row_position_shard(index, count)
+            .map_err(to_py_err)?;
+        slf.row_position_shard = Some((index, count));
+        Ok(slf)
+    }
+
     fn plan(&self, py: Python<'_>) -> PyResult<PyPlan> {
-        let rt = runtime();
-        let splits = py.detach(|| {
-            rt.block_on(async {
-                let mut builder = self.table.new_read_builder();
-                apply_read_config(
-                    &mut builder,
-                    &self.projection,
-                    self.limit,
-                    &self.filter,
-                    self.case_sensitive,
-                )?;
-                if let Some(row_ranges) = &self.row_ranges {
-                    builder.with_row_ranges(row_ranges.clone());
-                }
-                let plan = builder.new_scan().plan().await.map_err(to_py_err)?;
-                Ok::<_, PyErr>(plan.splits().to_vec())
+        py.detach(|| {
+            runtime().block_on(async {
+                let plan = match self.incremental_range {
+                    Some((start, end)) => {
+                        self.core_incremental_scan(start, end)?
+                            .plan_combined_delta()
+                            .await
+                    }
+                    None => self.core_scan()?.plan().await,
+                };
+                plan.map(PyPlan::from).map_err(to_py_err)
             })
-        })?;
-        Ok(PyPlan { splits })
+        })
     }
 }
 
@@ -328,10 +417,26 @@ impl PyTableRead {
 #[pyclass(name = "Plan", module = "pypaimon_rust.datafusion")]
 pub struct PyPlan {
     splits: Vec<DataSplit>,
+    snapshot_id: Option<i64>,
+}
+
+impl From<paimon::table::Plan> for PyPlan {
+    fn from(plan: paimon::table::Plan) -> Self {
+        Self {
+            splits: plan.splits().to_vec(),
+            snapshot_id: plan.snapshot_id(),
+        }
+    }
 }
 
 #[pymethods]
 impl PyPlan {
+    /// Snapshot selected by the scan, even when pruning produces no splits.
+    /// `None` means no snapshot was selected, including snapshot-free format tables.
+    fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
+    }
+
     fn splits(&self) -> Vec<PySplit> {
         self.splits
             .iter()
@@ -369,9 +474,13 @@ impl PySplit {
         self.inner.row_count()
     }
 
-    /// Serialize this planned split to the Java `SplitSerializer` (v1) binary, so pypaimon (or
-    /// any Paimon reader) can rebuild it without re-planning. A split carrying row ranges is
-    /// serialized as an `IndexedSplit`.
+    /// Whether the split must be read as physical change events.
+    fn is_streaming(&self) -> bool {
+        self.inner.is_streaming()
+    }
+
+    /// Serialize to Java SplitSerializer v1, using IndexedSplit for row ranges.
+    /// Preserves the streaming flag for physical change-event reads.
     fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = self.inner.serialize_split_v1().map_err(to_py_err)?;
         Ok(PyBytes::new(py, &bytes))

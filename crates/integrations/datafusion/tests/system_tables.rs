@@ -22,13 +22,16 @@ mod common;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, BooleanArray, Int32Array, Int64Array, ListArray, StringArray, TimestampMillisecondArray,
+    Array, BooleanArray, Int32Array, Int64Array, Int8Array, ListArray, StringArray,
+    TimestampMillisecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::SQLContext;
+
+use common::string_value;
 
 const FIXTURE_TABLE: &str = "test_tantivy_fulltext";
 
@@ -85,17 +88,26 @@ async fn query_error(ctx: &SQLContext, sql: &str) -> String {
 }
 
 #[tokio::test]
-async fn test_query_auth_table_fails_closed() {
+async fn test_query_auth_system_tables_fail_closed() {
     let (ctx, _catalog, _tmp) = create_context().await;
     run_sql(
         &ctx,
-        "CREATE TABLE paimon.default.qa (id INT) WITH ('query-auth.enabled' = 'true')",
+        "CREATE TABLE paimon.default.qa (id INT) WITH (
+            'query-auth.enabled' = 'true',
+            's3.secret-key' = 'persisted-secret'
+        )",
     )
     .await;
 
-    // Data reads and data-derived system tables must all fail closed.
+    // Rust cannot yet apply query-auth filters or masks to table and system-table
+    // data. Metadata paths, including persisted options, must fail closed.
     for sql in [
         "SELECT * FROM paimon.default.qa",
+        "SELECT * FROM paimon.default.qa$audit_log",
+        "SELECT * FROM paimon.default.qa$files",
+        "SELECT value FROM paimon.default.qa$options WHERE key = 's3.secret-key'",
+        "SELECT * FROM paimon.default.qa$schemas",
+        "SELECT * FROM paimon.default.qa$partitions",
         "SELECT * FROM paimon.default.qa$manifests",
         "SELECT * FROM paimon.default.qa$table_indexes",
     ] {
@@ -105,6 +117,308 @@ async fn test_query_auth_table_fails_closed() {
             "`{sql}` should fail closed, got: {err}"
         );
     }
+
+    run_sql(&ctx, "CREATE TABLE paimon.default.qa_dynamic (id INT)").await;
+    run_sql(&ctx, "SET 'paimon.query-auth.enabled' = 'true'").await;
+    for sql in [
+        "SELECT * FROM paimon.default.qa_dynamic",
+        "SELECT * FROM paimon.default.qa_dynamic$audit_log",
+        "SELECT * FROM paimon.default.qa_dynamic$files",
+        "SELECT * FROM paimon.default.qa_dynamic$options",
+        "SELECT * FROM paimon.default.qa_dynamic$schemas",
+        "SELECT * FROM paimon.default.qa_dynamic$partitions",
+        "SELECT * FROM paimon.default.qa_dynamic$manifests",
+        "SELECT * FROM paimon.default.qa_dynamic$table_indexes",
+    ] {
+        let err = query_error(&ctx, sql).await;
+        assert!(
+            err.contains("query-auth.enabled"),
+            "dynamic auth should make `{sql}` fail closed, got: {err}"
+        );
+    }
+    run_sql(&ctx, "RESET 'paimon.query-auth.enabled'").await;
+
+    run_sql(&ctx, "SET 'paimon.s3.secret-key' = 'session-secret'").await;
+    let batches = run_sql(
+        &ctx,
+        "SELECT value FROM paimon.default.qa_dynamic$options \
+         WHERE key = 's3.secret-key'",
+    )
+    .await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    run_sql(&ctx, "RESET 'paimon.s3.secret-key'").await;
+}
+
+#[tokio::test]
+async fn test_audit_log_rejects_dynamic_sequence_number_option() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    run_sql(
+        &ctx,
+        "CREATE TABLE paimon.default.audit_dynamic_sequence (
+            id INT NOT NULL,
+            PRIMARY KEY (id)
+        ) WITH ('bucket' = '1')",
+    )
+    .await;
+
+    run_sql(
+        &ctx,
+        "SET 'paimon.table-read.sequence-number.enabled' = 'true'",
+    )
+    .await;
+    let err = query_error(
+        &ctx,
+        "SELECT * FROM paimon.default.audit_dynamic_sequence$audit_log",
+    )
+    .await;
+    assert!(
+        err.contains("table-read.sequence-number.enabled")
+            && err.contains("not supported by dynamic options"),
+        "unexpected error: {err}"
+    );
+    run_sql(&ctx, "RESET 'paimon.table-read.sequence-number.enabled'").await;
+}
+
+#[tokio::test]
+async fn test_audit_log_respects_dynamic_time_travel() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    run_sql(&ctx, "CREATE TABLE paimon.default.audit_tt (id INT)").await;
+    run_sql(&ctx, "INSERT INTO paimon.default.audit_tt VALUES (1)").await;
+    run_sql(&ctx, "INSERT INTO paimon.default.audit_tt VALUES (2)").await;
+
+    run_sql(&ctx, "SET 'paimon.scan.version' = '1'").await;
+    let batches = run_sql(
+        &ctx,
+        "SELECT COUNT(*) FROM paimon.default.audit_tt$audit_log",
+    )
+    .await;
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+    run_sql(&ctx, "RESET 'paimon.scan.version'").await;
+}
+
+#[tokio::test]
+async fn test_audit_log_system_table_keeps_row_kinds_and_sequence_numbers() {
+    let (ctx, catalog, _tmp) = create_context().await;
+    run_sql(
+        &ctx,
+        "CREATE TABLE paimon.default.audit_rows (
+            id INT NOT NULL,
+            value INT,
+            PRIMARY KEY (id)
+        ) WITH (
+            'bucket' = '1',
+            'merge-engine' = 'deduplicate',
+            'changelog-producer' = 'input',
+            'table-read.sequence-number.enabled' = 'true'
+        )",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("default", "audit_rows"))
+        .await
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 1, 2])),
+            Arc::new(Int32Array::from(vec![10, 20, 10, 25])),
+            Arc::new(Int8Array::from(vec![0, 0, 3, 2])),
+        ],
+    )
+    .unwrap();
+    let builder = table.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    write.write_arrow_batch(&batch).await.unwrap();
+    let messages = write.prepare_commit().await.unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+
+    let batches = run_sql(
+        &ctx,
+        "SELECT \"_SEQUENCE_NUMBER\", rowkind, id, value
+         FROM paimon.default.audit_rows$audit_log
+         WHERE rowkind = '-D' OR id = 2
+         ORDER BY id",
+    )
+    .await;
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let sequence = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let rowkind = batch.column(1);
+        let id = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let value = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                sequence.value(row),
+                string_value(rowkind.as_ref(), row).to_string(),
+                id.value(row),
+                value.value(row),
+            ));
+        }
+    }
+    assert_eq!(
+        rows,
+        vec![(2, "-D".to_string(), 1, 10), (3, "+U".to_string(), 2, 25)]
+    );
+
+    let batches = run_sql(
+        &ctx,
+        "SELECT id FROM paimon.default.audit_rows$audit_log WHERE value = 20",
+    )
+    .await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+
+    let batches = run_sql(
+        &ctx,
+        "SELECT COUNT(*) FROM paimon.default.audit_rows$audit_log",
+    )
+    .await;
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        2
+    );
+
+    run_sql(&ctx, "CREATE TABLE paimon.default.append_rows (id INT)").await;
+    run_sql(
+        &ctx,
+        "INSERT INTO paimon.default.append_rows VALUES (1), (2)",
+    )
+    .await;
+    let batches = run_sql(
+        &ctx,
+        "SELECT rowkind FROM paimon.default.append_rows$audit_log",
+    )
+    .await;
+    assert!(batches.iter().all(|batch| {
+        (0..batch.num_rows()).all(|row| string_value(batch.column(0).as_ref(), row) == "+I")
+    }));
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+    let explain = run_sql(
+        &ctx,
+        "EXPLAIN SELECT id FROM paimon.default.audit_rows$audit_log WHERE id = 2",
+    )
+    .await;
+    assert!(explain.iter().any(|batch| {
+        (0..batch.num_rows()).any(|row| {
+            let plan = string_value(batch.column(1).as_ref(), row);
+            plan.contains("PaimonAuditLogScan") && plan.contains("predicate=")
+        })
+    }));
+}
+
+#[tokio::test]
+async fn test_first_row_audit_log_merges_level_zero_before_filtering() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    run_sql(
+        &ctx,
+        "CREATE TABLE paimon.default.first_row_audit (
+            id INT NOT NULL,
+            value INT,
+            PRIMARY KEY (id)
+        ) WITH (
+            'bucket' = '1',
+            'merge-engine' = 'first-row'
+        )",
+    )
+    .await;
+    run_sql(
+        &ctx,
+        "INSERT INTO paimon.default.first_row_audit VALUES (1, 10)",
+    )
+    .await;
+    run_sql(
+        &ctx,
+        "INSERT INTO paimon.default.first_row_audit VALUES (1, 20)",
+    )
+    .await;
+
+    let batches = run_sql(
+        &ctx,
+        "SELECT value FROM paimon.default.first_row_audit$audit_log",
+    )
+    .await;
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[10]
+    );
+
+    let batches = run_sql(
+        &ctx,
+        "SELECT value FROM paimon.default.first_row_audit$audit_log WHERE value = 20",
+    )
+    .await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+}
+
+#[tokio::test]
+async fn test_audit_log_system_table_matches_deletion_vector_visibility() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    run_sql(
+        &ctx,
+        "CREATE TABLE paimon.default.dv_audit (id INT NOT NULL) WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true',
+            'deletion-vectors.enabled' = 'true'
+        )",
+    )
+    .await;
+    run_sql(
+        &ctx,
+        "INSERT INTO paimon.default.dv_audit (id) VALUES (1), (2)",
+    )
+    .await;
+    run_sql(&ctx, "DELETE FROM paimon.default.dv_audit WHERE id = 1").await;
+
+    let batches = run_sql(
+        &ctx,
+        "SELECT rowkind, id FROM paimon.default.dv_audit$audit_log",
+    )
+    .await;
+    assert_eq!(string_value(batches[0].column(0).as_ref(), 0), "+I");
+    assert_eq!(
+        batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[2]
+    );
 }
 
 #[tokio::test]

@@ -20,6 +20,7 @@
 #![allow(non_camel_case_types)]
 
 mod blob_reader;
+mod bucket_vector_search_split;
 mod catalog;
 mod error;
 mod file_io;
@@ -29,6 +30,8 @@ mod table;
 #[cfg(test)]
 mod tests;
 mod types;
+mod vector_read;
+mod vector_scan;
 mod vector_search;
 mod write;
 

@@ -107,6 +107,36 @@ print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
 
+### Tables resolved outside the Rust catalog
+
+`Table.from_resolved_schema(location, schema_json, *, database="default",
+table="table", branch="main", options=None)` accepts a Java-format TableSchema
+JSON document. It preserves the supplied fields, field IDs and complete table
+options, including removed options, without reloading a catalog schema.
+`options` configures FileIO; `branch` selects the snapshot/schema/tag namespace.
+
+Use `new_read_builder()` without extra options to keep that resolved schema.
+Snapshot selectors in the schema's options still select the requested snapshot.
+Passing options to `new_read_builder(options)` instead uses the normal schema
+and snapshot time-travel resolution.
+
+For names containing dots, use `catalog.get_table(("namespace.database", "table.with.dots"))`
+to preserve the database and table components. Both string and tuple identifiers
+support `$branch_<name>` on the table component and reject system-table suffixes.
+
+For REST tables, first use `PaimonCatalog.get_table()`, then
+`table.copy_with_resolved_schema(schema_json, branch=None)`. This replaces the
+complete fields/options while retaining the table location, identity, FileIO
+provider and REST environment. The optional branch selects its metadata namespace
+without reading a branch schema file. Omit it to retain the original branch.
+Cached time-travel resolution is discarded so the supplied options select the
+snapshot, with the externally resolved fields preserved.
+
+REST tables load the latest snapshot through the catalog, including empty
+results and branch-scoped requests. Permission and service failures (including
+HTTP 501) are propagated as in Java, and the
+FileIO provider continues to refresh catalog credentials after schema replacement.
+
 ## Setup
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/):

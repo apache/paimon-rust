@@ -27,14 +27,14 @@
 
 use super::data_file_reader::DataFileReader;
 use super::sort_merge::{
-    AggregateMergeFunction, DeduplicateMergeFunction, PartialUpdateMergeFunction,
-    SortMergeReaderBuilder,
+    AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, MergeFunction,
+    PartialUpdateMergeFunction, SortMergeReaderBuilder,
 };
 use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::io::FileIO;
 use crate::spec::{
-    BigIntType, DataField, DataFileMeta, DataType as PaimonDataType, MergeEngine,
+    BigIntType, CoreOptions, DataField, DataFileMeta, DataType as PaimonDataType, MergeEngine,
     PartialUpdateConfig, Predicate, TinyIntType, SEQUENCE_NUMBER_FIELD_ID,
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
@@ -283,39 +283,44 @@ impl KeyValueFileReader {
     }
 
     fn new_merge_function(
-        merge_engine: MergeEngine,
-        table_options: &HashMap<String, String>,
-        table_name: &str,
-        table_fields: &[DataField],
+        config: &KeyValueReadConfig,
         merge_output_fields: &[DataField],
-        primary_keys: &[String],
-        sequence_fields: &[String],
-    ) -> crate::Result<Box<dyn super::sort_merge::MergeFunction>> {
-        match merge_engine {
+    ) -> crate::Result<Box<dyn MergeFunction>> {
+        match config.merge_engine {
             MergeEngine::Deduplicate => Ok(Box::new(DeduplicateMergeFunction)),
-            MergeEngine::PartialUpdate => Ok(Box::new(
-                PartialUpdateMergeFunction::new_with_schema(
-                    table_options,
-                    table_name,
-                    table_fields,
+            MergeEngine::PartialUpdate => {
+                Ok(Box::new(PartialUpdateMergeFunction::new_with_schema(
+                    &config.table_options,
+                    &config.table_name,
+                    &config.table_fields,
                     merge_output_fields,
-                    primary_keys,
-                )?,
-            )),
-            MergeEngine::FirstRow => Err(Error::Unsupported {
-                message: "KeyValueFileReader does not support merge-engine=first-row; first-row reads should use the non-KV path".to_string(),
-            }),
+                    &config.primary_keys,
+                )?))
+            }
+            MergeEngine::FirstRow => Ok(Box::new(FirstRowMergeFunction {
+                ignore_delete: CoreOptions::new(&config.table_options).ignore_delete(),
+            })),
             MergeEngine::Aggregation => Ok(Box::new(AggregateMergeFunction::new(
-                table_options,
-                table_name,
+                &config.table_options,
+                &config.table_name,
                 merge_output_fields,
-                primary_keys,
-                sequence_fields,
+                &config.primary_keys,
+                &config.sequence_fields,
             )?)),
         }
     }
 
     pub fn read(self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_with_merge_function(data_splits, Self::new_merge_function)
+    }
+
+    pub(super) fn read_with_merge_function(
+        self,
+        data_splits: &[DataSplit],
+        merge_function: impl Fn(&KeyValueReadConfig, &[DataField]) -> crate::Result<Box<dyn MergeFunction>>
+            + Send
+            + 'static,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         // A projected `_ROW_ID` is synthesized as all-nulls here, so the residual
         // would silently drop every row rather than hit its missing-column guard.
         super::row_id_predicate::reject_row_id_filter(
@@ -371,10 +376,17 @@ impl KeyValueFileReader {
             ))
         };
         // User columns = read_type fields + any key fields not already in read_type
-        //              + any sequence fields not already included.
+        //              + any sequence fields not already included. Physical system
+        // fields are already the first two columns of every KV file.
         let read_type_names: std::collections::HashSet<&str> =
             self.config.read_type.iter().map(|f| f.name()).collect();
-        let mut user_fields: Vec<DataField> = self.config.read_type.clone();
+        let mut user_fields: Vec<DataField> = self
+            .config
+            .read_type
+            .iter()
+            .filter(|field| !matches!(field.id(), SEQUENCE_NUMBER_FIELD_ID | VALUE_KIND_FIELD_ID))
+            .cloned()
+            .collect();
         for kf in &key_fields {
             if !read_type_names.contains(kf.name()) {
                 user_fields.push(kf.clone());
@@ -447,17 +459,20 @@ impl KeyValueFileReader {
                     .unwrap()
             })
             .collect();
-        let value_fields: Vec<DataField> = user_fields
-            .iter()
-            .filter(|f| !key_names.contains(f.name()))
-            .cloned()
-            .collect();
-        let value_indices: Vec<usize> = user_fields
+        let (value_indices, value_fields): (Vec<_>, Vec<_>) = internal_read_type
             .iter()
             .enumerate()
-            .filter(|(_, f)| !key_names.contains(f.name()))
-            .map(|(i, _)| i + 2)
-            .collect();
+            .filter(|(index, field)| {
+                !key_names.contains(field.name())
+                    && (*index >= 2
+                        || self
+                            .config
+                            .read_type
+                            .iter()
+                            .any(|requested| requested.id() == field.id()))
+            })
+            .map(|(index, field)| (index, field.clone()))
+            .unzip();
 
         // If sequence.field is configured, find each field's index in the internal schema.
         let user_sequence_indices: Vec<usize> = self
@@ -506,23 +521,13 @@ impl KeyValueFileReader {
             data_splits.into_iter().map(|split| vec![split]).collect()
         };
         let file_io = self.file_io;
-        let merge_engine = self.config.merge_engine;
-        let schema_manager = self.config.schema_manager;
-        let table_schema_id = self.config.table_schema_id;
-        let table_fields = self.config.table_fields;
-        let table_name = self.config.table_name;
-        let table_options = self.config.table_options;
+        let config = self.config;
+        let table_schema_id = config.table_schema_id;
         let pushdown_predicates = self.pushdown_predicates;
-        let residual_predicates = self.config.predicates;
-        let primary_keys = self.config.primary_keys;
-        let sequence_fields = self.config.sequence_fields;
-        let read_batch_size = self.config.read_batch_size;
-        let max_merge_input_streams = self.config.max_merge_input_streams;
-        let parquet_read_budget = self.config.parquet_read_budget;
         #[cfg(test)]
         let input_batch_sizes = self.input_batch_sizes;
 
-        // Build the merge output schema (keys + values, no system columns).
+        // Build the merge output schema (keys + projected values).
         let mut merge_output_fields: Vec<DataField> = Vec::new();
         merge_output_fields.extend(key_fields);
         merge_output_fields.extend(value_fields);
@@ -561,13 +566,13 @@ impl KeyValueFileReader {
                     merge_splits,
                 ) {
                     let input_stream_count = merge_group.len();
-                    ensure_merge_input_limit(input_stream_count, max_merge_input_streams)?;
+                    ensure_merge_input_limit(input_stream_count, config.max_merge_input_streams)?;
                     // Sort-merge must first obtain one batch from every input
                     // stream. Keep concurrent row-group reads disabled whenever
                     // multiple runs advance in lockstep; one run may still use
                     // the shared budget because its files are opened serially.
                     let group_parquet_read_budget = if input_stream_count == 1 {
-                        parquet_read_budget.clone()
+                        config.parquet_read_budget.clone()
                     } else {
                         None
                     };
@@ -576,15 +581,15 @@ impl KeyValueFileReader {
                     for MergeRun { files } in merge_group {
                         let reader = DataFileReader::new(
                             file_io.clone(),
-                            schema_manager.clone(),
+                            config.schema_manager.clone(),
                             table_schema_id,
-                            table_fields.clone(),
+                            config.table_fields.clone(),
                             internal_read_type.clone(),
                             pushdown_predicates.clone(),
                         )
-                        .with_batch_size(Some(read_batch_size))
+                        .with_batch_size(Some(config.read_batch_size))
                         .with_parquet_read_budget(group_parquet_read_budget.clone());
-                        let run_schema_manager = schema_manager.clone();
+                        let run_schema_manager = config.schema_manager.clone();
                         let run_file_io = file_io.clone();
                         let deletion_files_by_split = deletion_files_by_split.clone();
                         let run_stream: ArrowRecordBatchStream = Box::pin(try_stream! {
@@ -646,15 +651,7 @@ impl KeyValueFileReader {
                         user_sequence_indices.clone(),
                         value_indices.clone(),
                         merge_output_schema.clone(),
-                        Self::new_merge_function(
-                            merge_engine,
-                            &table_options,
-                            &table_name,
-                            &table_fields,
-                            &merge_output_fields,
-                            &primary_keys,
-                            &sequence_fields,
-                        )?,
+                        merge_function(&config, &merge_output_fields)?,
                     )
                     .build()?;
 
@@ -668,13 +665,13 @@ impl KeyValueFileReader {
                         // the merge-output batch (keys + values, including widened
                         // predicate columns); the reorder below projects the output
                         // back to read_type.
-                        let batch = if residual_predicates.is_empty() {
+                        let batch = if config.predicates.is_empty() {
                             batch
                         } else {
                             match crate::arrow::residual::evaluate_predicates_mask(
                                 &batch,
-                                &residual_predicates,
-                                &table_fields,
+                                &config.predicates,
+                                &config.table_fields,
                                 &merge_output_fields,
                             )? {
                                 Some(mask) => arrow_select::filter::filter_record_batch(
@@ -2273,10 +2270,9 @@ mod tests {
         assert!(!names.contains(&"banana".to_string()));
     }
 
-    /// Aggregation (sum): inputs 10 + 20 merge to 30. `value = 30` must match
-    /// the merged row (a pre-merge filter would drop both inputs);
-    /// `value = 10` must match nothing (a pre-merge filter would keep the
-    /// 10-input and leak it).
+    /// Each flush aggregates its duplicate keys first (30 and 9); the read
+    /// merges both files to 39. `value = 39` must match the merged row, while
+    /// `value = 10` must not leak an input row.
     #[tokio::test]
     async fn kv_read_aggregation_filters_on_merged_value() {
         let file_io = test_file_io();
@@ -2291,17 +2287,17 @@ mod tests {
             ],
         );
 
-        write_commit(&table, &int_batch(vec![1], vec![Some(10)])).await;
-        write_commit(&table, &int_batch(vec![1], vec![Some(20)])).await;
+        write_commit(&table, &int_batch(vec![1, 1], vec![Some(10), Some(20)])).await;
+        write_commit(&table, &int_batch(vec![1, 1], vec![Some(4), Some(5)])).await;
 
         let fields = table.schema().fields().to_vec();
 
         let match_merged = PredicateBuilder::new(&fields)
-            .equal("value", Datum::Int(30))
+            .equal("value", Datum::Int(39))
             .unwrap();
         let batches = read_rows(&table, None, Some(match_merged)).await;
         assert_eq!(int_column(&batches, "id"), vec![1]);
-        assert_eq!(int_column(&batches, "value"), vec![30]);
+        assert_eq!(int_column(&batches, "value"), vec![39]);
 
         let match_input = PredicateBuilder::new(&fields)
             .equal("value", Datum::Int(10))
