@@ -80,10 +80,10 @@ enum AddItem {
     Spilled(Vec<i64>, MutableBuffer),
 }
 
-type SpillTask = JoinHandle<std::io::Result<std::fs::File>>;
+type SpillTask = JoinHandle<std::io::Result<(std::fs::File, u64, Duration)>>;
 type ConsumerTask = JoinHandle<Result<(VectorIndexWriter, usize, usize, Duration)>>;
 type TrainingTask = JoinHandle<std::io::Result<(VectorIndexTraining, Duration)>>;
-type ReplayTask = JoinHandle<std::io::Result<usize>>;
+type ReplayTask = JoinHandle<std::io::Result<(usize, Duration)>>;
 
 struct SpillWriter {
     sender: mpsc::Sender<SpillRecord>,
@@ -91,7 +91,7 @@ struct SpillWriter {
 }
 
 impl SpillWriter {
-    async fn finish(self) -> Result<std::fs::File> {
+    async fn finish(self) -> Result<(std::fs::File, u64, Duration)> {
         drop(self.sender);
         join_spill(self.task).await
     }
@@ -101,9 +101,11 @@ struct LivePipeline {
     sender: mpsc::Sender<AddItem>,
     consumer: ConsumerTask,
     replay: ReplayTask,
+    spill_bytes: u64,
+    spill_write: Duration,
 }
 
-fn spawn_spill_writer() -> Result<SpillWriter> {
+fn spawn_spill_writer(timing_enabled: bool) -> Result<SpillWriter> {
     let file = tempfile::tempfile().map_err(|e| Error::UnexpectedError {
         message: format!("Failed to create temporary vindex vector file: {e}"),
         source: Some(Box::new(e)),
@@ -111,21 +113,36 @@ fn spawn_spill_writer() -> Result<SpillWriter> {
     let (sender, mut receiver) = mpsc::channel::<SpillRecord>(QUEUE_CAPACITY);
     let task = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
         let mut writer = BufWriter::with_capacity(BUFFER_BYTES, file);
+        let mut spill_bytes = 0u64;
+        let mut spill_write = Duration::ZERO;
         while let Some(record) = receiver.blocking_recv() {
+            let write_start = timing_enabled.then(Instant::now);
             let count = record.ids.len() as u64;
             writer.write_all(&count.to_le_bytes())?;
             for id in record.ids {
                 writer.write_all(&id.to_le_bytes())?;
             }
             writer.write_all(&record.bytes)?;
+            spill_bytes = spill_bytes
+                .saturating_add(8)
+                .saturating_add(count.saturating_mul(8))
+                .saturating_add(record.bytes.len() as u64);
+            if let Some(start) = write_start {
+                spill_write = spill_write.saturating_add(start.elapsed());
+            }
         }
+        let write_start = timing_enabled.then(Instant::now);
         writer.flush()?;
-        writer.into_inner().map_err(|e| e.into_error())
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        if let Some(start) = write_start {
+            spill_write = spill_write.saturating_add(start.elapsed());
+        }
+        Ok((file, spill_bytes, spill_write))
     });
     Ok(SpillWriter { sender, task })
 }
 
-async fn join_spill(task: SpillTask) -> Result<std::fs::File> {
+async fn join_spill(task: SpillTask) -> Result<(std::fs::File, u64, Duration)> {
     task.await
         .map_err(|e| Error::UnexpectedError {
             message: format!("vindex spill task failed: {e}"),
@@ -223,7 +240,7 @@ async fn start_live_pipeline(
     let trained = join_training(training).await;
     let spilled = spill.finish().await;
     let (trained, train_finish) = trained?;
-    let file = spilled?;
+    let (file, spill_bytes, spill_write) = spilled?;
     let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
     let consumer = spawn_add_consumer(
         VectorIndexWriter::new(trained),
@@ -232,12 +249,14 @@ async fn start_live_pipeline(
         dimension,
         timing_enabled,
     );
-    let replay = spawn_replay(file, sender.clone(), dimension);
+    let replay = spawn_replay(file, sender.clone(), dimension, timing_enabled);
     Ok((
         LivePipeline {
             sender,
             consumer,
             replay,
+            spill_bytes,
+            spill_write,
         },
         train_finish,
     ))
@@ -247,7 +266,9 @@ async fn finish_live_pipeline(
     pipeline: LivePipeline,
 ) -> (
     Result<(VectorIndexWriter, usize, usize, Duration)>,
-    Result<usize>,
+    Result<(usize, Duration)>,
+    u64,
+    Duration,
 ) {
     let replay = pipeline
         .replay
@@ -264,24 +285,34 @@ async fn finish_live_pipeline(
         });
     drop(pipeline.sender);
     let consumer = join_consumer(pipeline.consumer).await;
-    (consumer, replay)
+    (consumer, replay, pipeline.spill_bytes, pipeline.spill_write)
 }
 
 fn spawn_replay(
     mut file: std::fs::File,
     sender: mpsc::Sender<AddItem>,
     dimension: usize,
+    timing_enabled: bool,
 ) -> ReplayTask {
-    tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
+    tokio::task::spawn_blocking(move || -> std::io::Result<(usize, Duration)> {
+        let mut spill_read = Duration::ZERO;
+        let read_start = timing_enabled.then(Instant::now);
         file.seek(SeekFrom::Start(0))?;
+        if let Some(start) = read_start {
+            spill_read = spill_read.saturating_add(start.elapsed());
+        }
         let mut reader = BufReader::with_capacity(BUFFER_BYTES, file);
         let mut rows = 0usize;
         let mut ids = Vec::new();
         let mut vectors = MutableBuffer::new(REPLAY_TARGET_BYTES);
         loop {
+            let read_start = timing_enabled.then(Instant::now);
             let mut header = [0u8; 8];
             let read = reader.read(&mut header)?;
             if read == 0 {
+                if let Some(start) = read_start {
+                    spill_read = spill_read.saturating_add(start.elapsed());
+                }
                 break;
             }
             reader.read_exact(&mut header[read..])?;
@@ -308,6 +339,9 @@ fn spawn_replay(
             let offset = vectors.len();
             vectors.resize(offset + vector_bytes, 0);
             reader.read_exact(&mut vectors.as_slice_mut()[offset..])?;
+            if let Some(start) = read_start {
+                spill_read = spill_read.saturating_add(start.elapsed());
+            }
             rows += count;
             if vectors.len() >= REPLAY_TARGET_BYTES {
                 let item = AddItem::Spilled(
@@ -315,14 +349,14 @@ fn spawn_replay(
                     std::mem::replace(&mut vectors, MutableBuffer::new(REPLAY_TARGET_BYTES)),
                 );
                 if sender.blocking_send(item).is_err() {
-                    return Ok(rows);
+                    return Ok((rows, spill_read));
                 }
             }
         }
         if !ids.is_empty() {
             let _ = sender.blocking_send(AddItem::Spilled(ids, vectors));
         }
-        Ok(rows)
+        Ok((rows, spill_read))
     })
 }
 
@@ -658,7 +692,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 message: format!("Failed to initialize vindex trainer: {e}"),
                 source: Some(Box::new(e)),
             })?;
-        let mut spill = Some(spawn_spill_writer()?);
+        let mut spill = Some(spawn_spill_writer(timing_enabled)?);
         let training_rows = eligible.min(plan.first_rows);
         let training_buffer_rows = (BUFFER_BYTES / checked_vector_bytes(1, dimension)?).max(1);
         let training_buffer_floats = training_buffer_rows * dimension;
@@ -876,7 +910,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
 
         if let Err(producer_error) = producer_result {
             if let Some(pipeline) = live.take() {
-                let (consumer, replay) = finish_live_pipeline(pipeline).await;
+                let (consumer, replay, _, _) = finish_live_pipeline(pipeline).await;
                 consumer?;
                 replay?;
             } else {
@@ -897,9 +931,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             go_live!();
         }
 
-        let (consumer, replay) = finish_live_pipeline(live.unwrap()).await;
+        let (consumer, replay, granule_spill_bytes, granule_spill_write) =
+            finish_live_pipeline(live.unwrap()).await;
         let (writer, rows_added, consumer_replay_rows, index_add) = consumer?;
-        let replay_rows = replay?;
+        let (replay_rows, granule_spill_read) = replay?;
         if rows_added != row_count_usize || replay_rows != consumer_replay_rows {
             return Err(Error::DataInvalid {
                 message: format!(
@@ -942,8 +977,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             parquet_projected_bytes_total: parquet_diagnostics.projected_bytes_total,
             parquet_peak_inflight_row_groups: parquet_diagnostics.peak_inflight,
             raw_temp_write: Duration::ZERO,
+            granule_spill_write,
             train_finish,
             raw_temp_reread: Duration::ZERO,
+            granule_spill_read,
             index_add,
             serialize_upload,
             rows: row_count_usize,
@@ -951,6 +988,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             training_rows_retained: training_rows,
             batch_count,
             raw_temp_bytes: 0,
+            granule_spill_bytes,
             index_bytes: meta.file_size as u64,
             data_file_count: shard.files.len(),
             file_name: meta.file_name.clone(),
@@ -1047,5 +1085,29 @@ mod tests {
         assert!(!granules_partition_shard(&granules, &shard_range));
         granules.truncate(1);
         assert!(granules_partition_shard(&granules, &shard_range));
+    }
+
+    #[tokio::test]
+    async fn spill_reports_written_bytes() {
+        let spill = spawn_spill_writer(true).unwrap();
+        spill
+            .sender
+            .send(SpillRecord {
+                ids: vec![1, 2],
+                bytes: vec![0; 16],
+            })
+            .await
+            .unwrap();
+
+        let (file, bytes, _) = spill.finish().await.unwrap();
+        assert_eq!(bytes, 40);
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (rows, _) = spawn_replay(file, sender, 2, true).await.unwrap().unwrap();
+        assert_eq!(rows, 2);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(AddItem::Spilled(ids, _)) if ids == vec![1, 2]
+        ));
     }
 }
