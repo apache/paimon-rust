@@ -18,9 +18,9 @@
 use crate::spec::core_options::{
     first_row_supports_changelog_producer, ChangelogProducer, CoreOptions, MergeEngine,
     BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION, BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION,
-    CHANGELOG_PRODUCER_OPTION, INDEX_FILE_IN_DATA_FILE_DIR_OPTION, POSTPONE_BUCKET,
-    QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION, TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION,
-    TABLE_TYPE_OPTION,
+    CHANGELOG_PRODUCER_OPTION, INDEX_FILE_IN_DATA_FILE_DIR_OPTION, MANIFEST_SORT_ENABLED_OPTION,
+    MANIFEST_SORT_PARTITION_FIELD_OPTION, POSTPONE_BUCKET, QUERY_AUTH_ENABLED_OPTION,
+    SEQUENCE_FIELD_OPTION, TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION, TABLE_TYPE_OPTION,
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
 use crate::spec::{
@@ -1194,6 +1194,7 @@ impl Schema {
         Self::validate_rowkind_field(options, primary_keys, fields)?;
         Self::validate_deletion_vectors(options)?;
         Self::validate_bucket_keys(options, fields, partition_keys, primary_keys)?;
+        Self::validate_manifest_sort(options, fields, partition_keys)?;
         Self::validate_sequence_field(options, fields, partition_keys, primary_keys)?;
         Self::validate_read_batch_size(options)?;
         Self::validate_primary_key_vector_index(fields, primary_keys, options)?;
@@ -1774,6 +1775,69 @@ impl Schema {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_manifest_sort(
+        options: &HashMap<String, String>,
+        fields: &[DataField],
+        partition_keys: &[String],
+    ) -> crate::Result<()> {
+        let core_options = CoreOptions::new(options);
+        if !core_options.manifest_sort_enabled() {
+            return Ok(());
+        }
+        if partition_keys.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Cannot enable '{MANIFEST_SORT_ENABLED_OPTION}' for non-partition table."
+                ),
+            });
+        }
+        let field_name = core_options
+            .manifest_sort_partition_field()
+            .unwrap_or(&partition_keys[0]);
+        if !partition_keys
+            .iter()
+            .any(|partition| partition == field_name)
+        {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "'{MANIFEST_SORT_PARTITION_FIELD_OPTION}' = '{field_name}' is not a partition \
+                     field. Available partition fields: {partition_keys:?}."
+                ),
+            });
+        }
+        let field = fields
+            .iter()
+            .find(|field| field.name() == field_name)
+            .expect("partition field existence is validated before manifest sort");
+        if !matches!(
+            field.data_type(),
+            DataType::Boolean(_)
+                | DataType::TinyInt(_)
+                | DataType::SmallInt(_)
+                | DataType::Int(_)
+                | DataType::BigInt(_)
+                | DataType::Float(_)
+                | DataType::Double(_)
+                | DataType::Char(_)
+                | DataType::VarChar(_)
+                | DataType::Date(_)
+                | DataType::Time(_)
+                | DataType::Timestamp(_)
+                | DataType::LocalZonedTimestamp(_)
+                | DataType::Decimal(_)
+                | DataType::Binary(_)
+                | DataType::VarBinary(_)
+        ) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Partition field '{field_name}' with type {:?} cannot be used for manifest sorting.",
+                    field.data_type()
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -3450,6 +3514,33 @@ mod tests {
             )]),
             "non-primary-key table",
         );
+    }
+
+    #[test]
+    fn test_manifest_sort_requires_partition_and_existing_sort_field() {
+        let non_partitioned = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option(MANIFEST_SORT_ENABLED_OPTION, "true")
+            .build();
+        assert_config_invalid(non_partitioned, "non-partition table");
+
+        let invalid_field = Schema::builder()
+            .column("pt", DataType::Int(IntType::new()))
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .option(MANIFEST_SORT_ENABLED_OPTION, "true")
+            .option(MANIFEST_SORT_PARTITION_FIELD_OPTION, "id")
+            .build();
+        assert_config_invalid(invalid_field, "is not a partition field");
+
+        let valid = Schema::builder()
+            .column("pt", DataType::Int(IntType::new()))
+            .partition_keys(["pt"])
+            .option(MANIFEST_SORT_ENABLED_OPTION, "true")
+            .option(MANIFEST_SORT_PARTITION_FIELD_OPTION, "pt")
+            .build()
+            .unwrap();
+        assert_eq!(valid.partition_keys(), &["pt".to_string()]);
     }
 
     fn cast_test_schema(options: &[(&str, &str)]) -> TableSchema {

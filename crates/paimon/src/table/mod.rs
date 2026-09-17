@@ -63,6 +63,7 @@ pub(crate) mod index_file_path;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
+mod manifest_sort;
 pub(crate) mod merge_tree_split_generator;
 mod object_table;
 mod partition_filter;

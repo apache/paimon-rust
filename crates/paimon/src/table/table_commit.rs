@@ -33,6 +33,11 @@ use crate::spec::{
 use crate::table::commit_message::CommitMessage;
 use crate::table::global_index_build_common::same_extra_field_ids;
 use crate::table::index_file_path::committed_index_file_path;
+use crate::table::manifest_sort::{
+    manifest_may_contain_partition, plan_rewrite, reaches_full_compaction_threshold,
+    ManifestRewritePlan, ManifestSection, ManifestSortConfig, PartitionSortKey,
+    SpillableManifestSorter,
+};
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::snapshot_commit::SnapshotCommit;
 use crate::table::{SnapshotManager, Table, TableScan};
@@ -116,6 +121,9 @@ pub struct TableCommit {
     manifest_compression: String,
     manifest_target_size: i64,
     manifest_merge_min_count: usize,
+    manifest_sort_enabled: bool,
+    manifest_sort_partition_field: Option<String>,
+    manifest_sort_config: ManifestSortConfig,
     row_tracking_enabled: bool,
     data_evolution_enabled: bool,
     partition_default_name: String,
@@ -140,6 +148,11 @@ impl TableCommit {
         let manifest_compression = core_options.manifest_compression().to_string();
         let manifest_target_size = core_options.manifest_target_size();
         let manifest_merge_min_count = core_options.manifest_merge_min_count();
+        let manifest_sort_enabled = core_options.manifest_sort_enabled();
+        let manifest_sort_partition_field = core_options
+            .manifest_sort_partition_field()
+            .map(str::to_string);
+        let manifest_sort_config = ManifestSortConfig::from_options(&core_options);
         let row_tracking_enabled = core_options.row_tracking_enabled();
         let data_evolution_enabled = core_options.data_evolution_enabled();
         let partition_default_name = core_options.partition_default_name().to_string();
@@ -156,6 +169,9 @@ impl TableCommit {
             manifest_compression,
             manifest_target_size,
             manifest_merge_min_count,
+            manifest_sort_enabled,
+            manifest_sort_partition_field,
+            manifest_sort_config,
             row_tracking_enabled,
             data_evolution_enabled,
             partition_default_name,
@@ -1129,6 +1145,11 @@ impl TableCommit {
         if manifest_files.is_empty() {
             return Ok((vec![], vec![]));
         }
+        if self.manifest_sort_enabled {
+            return self
+                .sort_manifest_files(file_io, manifest_dir, manifest_files)
+                .await;
+        }
 
         let target_size = self.manifest_target_size.max(1);
         let mut result = Vec::new();
@@ -1166,6 +1187,555 @@ impl TableCommit {
         }
 
         Ok((result, new_files))
+    }
+
+    async fn sort_manifest_files(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_files: Vec<ManifestFileMeta>,
+    ) -> Result<(Vec<ManifestFileMeta>, Vec<ManifestFileMeta>)> {
+        let partition_fields = self.table.schema().partition_fields();
+        let sort_key = PartitionSortKey::new(
+            &partition_fields,
+            self.manifest_sort_partition_field.as_deref(),
+        )?;
+        let mut new_files = Vec::new();
+        let result = self
+            .sort_manifest_files_inner(
+                file_io,
+                manifest_dir,
+                &manifest_files,
+                &partition_fields,
+                &sort_key,
+                &mut new_files,
+            )
+            .await;
+        if result.is_err() {
+            for file in &new_files {
+                let path = format!("{manifest_dir}/{}", file.file_name());
+                let _ = file_io.delete_file(&path).await;
+            }
+        }
+        result.map(|files| (files, new_files))
+    }
+
+    async fn sort_manifest_files_inner(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_files: &[ManifestFileMeta],
+        partition_fields: &[crate::spec::DataField],
+        sort_key: &PartitionSortKey,
+        new_files: &mut Vec<ManifestFileMeta>,
+    ) -> Result<Vec<ManifestFileMeta>> {
+        if reaches_full_compaction_threshold(
+            manifest_files,
+            self.manifest_sort_config.target_size,
+            self.manifest_sort_config.full_compaction_threshold_size,
+        ) {
+            if let Some(files) = self
+                .try_full_manifest_sort(
+                    file_io,
+                    manifest_dir,
+                    manifest_files,
+                    partition_fields,
+                    sort_key,
+                    new_files,
+                )
+                .await?
+            {
+                return Ok(files);
+            }
+        }
+        self.try_minor_manifest_sort(file_io, manifest_dir, manifest_files, sort_key, new_files)
+            .await
+    }
+
+    async fn try_full_manifest_sort(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_files: &[ManifestFileMeta],
+        partition_fields: &[crate::spec::DataField],
+        sort_key: &PartitionSortKey,
+        new_files: &mut Vec<ManifestFileMeta>,
+    ) -> Result<Option<Vec<ManifestFileMeta>>> {
+        let mut deleted_identifiers = HashSet::new();
+        let mut deleted_partitions = Vec::new();
+        for meta in manifest_files
+            .iter()
+            .filter(|meta| meta.num_deleted_files() > 0)
+        {
+            let path = format!("{manifest_dir}/{}", meta.file_name());
+            for entry in Manifest::read(file_io, &path).await? {
+                if entry.kind() == &FileKind::Delete {
+                    deleted_identifiers.insert(entry.identifier());
+                    deleted_partitions.push(entry.partition().to_vec());
+                }
+            }
+        }
+
+        let mut default_compaction = HashMap::new();
+        for meta in manifest_files {
+            let small = meta.file_size() < self.manifest_sort_config.target_size;
+            let mut in_delete_range = false;
+            for partition in &deleted_partitions {
+                if manifest_may_contain_partition(meta, partition, partition_fields)? {
+                    in_delete_range = true;
+                    break;
+                }
+            }
+            if small || in_delete_range {
+                default_compaction.insert(meta.file_name().to_string(), in_delete_range);
+            }
+        }
+
+        let Some(plan) = plan_rewrite(
+            manifest_files,
+            &default_compaction,
+            sort_key,
+            &self.manifest_sort_config,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let mut output = ManifestRewriteOutput::full(
+            manifest_files
+                .iter()
+                .filter(|file| !plan.picked_file_names.contains(file.file_name()))
+                .cloned()
+                .collect(),
+        );
+        self.rewrite_manifest_sections(
+            file_io,
+            manifest_dir,
+            plan,
+            &default_compaction,
+            &deleted_identifiers,
+            true,
+            sort_key,
+            new_files,
+            &mut output,
+        )
+        .await?;
+        Ok(Some(output.into_files()))
+    }
+
+    async fn try_minor_manifest_sort(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_files: &[ManifestFileMeta],
+        sort_key: &PartitionSortKey,
+        new_files: &mut Vec<ManifestFileMeta>,
+    ) -> Result<Vec<ManifestFileMeta>> {
+        let default_compaction = manifest_files
+            .iter()
+            .filter(|file| file.file_size() < self.manifest_sort_config.target_size)
+            .map(|file| (file.file_name().to_string(), false))
+            .collect::<HashMap<_, _>>();
+        let Some(plan) = plan_rewrite(
+            manifest_files,
+            &default_compaction,
+            sort_key,
+            &self.manifest_sort_config,
+        )?
+        else {
+            return Ok(manifest_files.to_vec());
+        };
+
+        let mut output = ManifestRewriteOutput::minor(manifest_files, &plan.picked_file_names)?;
+        for file in manifest_files
+            .iter()
+            .filter(|file| !plan.picked_file_names.contains(file.file_name()))
+        {
+            output.add_unchanged(file.clone())?;
+        }
+        self.rewrite_manifest_sections(
+            file_io,
+            manifest_dir,
+            plan,
+            &default_compaction,
+            &HashSet::new(),
+            false,
+            sort_key,
+            new_files,
+            &mut output,
+        )
+        .await?;
+        Ok(output.into_files())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rewrite_manifest_sections(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        plan: ManifestRewritePlan,
+        default_compaction: &HashMap<String, bool>,
+        deleted_identifiers: &HashSet<crate::spec::Identifier>,
+        full_compaction: bool,
+        sort_key: &PartitionSortKey,
+        new_files: &mut Vec<ManifestFileMeta>,
+        output: &mut ManifestRewriteOutput,
+    ) -> Result<()> {
+        let mut sections = plan.sections;
+        let mut processed_size = 0i64;
+        let mut reached_limit = false;
+        let mut index = 0usize;
+        while index < sections.len() {
+            let section = sections[index].clone();
+            if section.files.len() == 1 {
+                self.rewrite_manifest_section(
+                    file_io,
+                    manifest_dir,
+                    &section.files,
+                    default_compaction,
+                    deleted_identifiers,
+                    full_compaction,
+                    sort_key,
+                    new_files,
+                    output,
+                )
+                .await?;
+                index += 1;
+                continue;
+            }
+
+            if processed_size.saturating_add(section.total_size)
+                <= self.manifest_sort_config.max_rewrite_size
+            {
+                processed_size += section.total_size;
+                self.rewrite_manifest_section(
+                    file_io,
+                    manifest_dir,
+                    &section.files,
+                    default_compaction,
+                    deleted_identifiers,
+                    full_compaction,
+                    sort_key,
+                    new_files,
+                    output,
+                )
+                .await?;
+            } else if !reached_limit {
+                let available = self
+                    .manifest_sort_config
+                    .max_rewrite_size
+                    .saturating_sub(processed_size);
+                let mut rewrite_files = Vec::new();
+                let mut remaining_files = Vec::new();
+                let mut rewrite_size = 0i64;
+                let mut remaining_size = 0i64;
+                let mut remaining_has_default = false;
+                for file in section.files {
+                    // The budget is a file-granularity soft limit: include the
+                    // first file that crosses it and at least two files, even
+                    // when the limit is smaller than the target file size.
+                    // Otherwise repeated commits could make no progress.
+                    if rewrite_size <= available || rewrite_files.len() < 2 {
+                        rewrite_size += file.file_size();
+                        rewrite_files.push(file);
+                    } else {
+                        remaining_size += file.file_size();
+                        remaining_has_default |= default_compaction.contains_key(file.file_name());
+                        remaining_files.push(file);
+                    }
+                }
+                if !rewrite_files.is_empty() {
+                    self.rewrite_manifest_section(
+                        file_io,
+                        manifest_dir,
+                        &rewrite_files,
+                        default_compaction,
+                        deleted_identifiers,
+                        full_compaction,
+                        sort_key,
+                        new_files,
+                        output,
+                    )
+                    .await?;
+                }
+                if !remaining_files.is_empty() {
+                    sections.push(ManifestSection {
+                        files: remaining_files,
+                        total_size: remaining_size,
+                        has_default_compaction_file: remaining_has_default,
+                    });
+                }
+                reached_limit = true;
+            } else if section.has_default_compaction_file {
+                self.rewrite_manifest_subsegments(
+                    file_io,
+                    manifest_dir,
+                    &section.files,
+                    default_compaction,
+                    deleted_identifiers,
+                    full_compaction,
+                    sort_key,
+                    new_files,
+                    output,
+                )
+                .await?;
+            } else {
+                output.add_all_unchanged(section.files)?;
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rewrite_manifest_subsegments(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        files: &[ManifestFileMeta],
+        default_compaction: &HashMap<String, bool>,
+        deleted_identifiers: &HashSet<crate::spec::Identifier>,
+        full_compaction: bool,
+        sort_key: &PartitionSortKey,
+        new_files: &mut Vec<ManifestFileMeta>,
+        output: &mut ManifestRewriteOutput,
+    ) -> Result<()> {
+        let mut candidates = Vec::new();
+        let mut candidate_size = 0i64;
+        for file in files {
+            candidate_size += file.file_size();
+            candidates.push(file.clone());
+            if candidate_size >= self.manifest_sort_config.target_size {
+                self.rewrite_manifest_section(
+                    file_io,
+                    manifest_dir,
+                    &candidates,
+                    default_compaction,
+                    deleted_identifiers,
+                    full_compaction,
+                    sort_key,
+                    new_files,
+                    output,
+                )
+                .await?;
+                candidates.clear();
+                candidate_size = 0;
+            }
+        }
+        if !candidates.is_empty() {
+            if !deleted_identifiers.is_empty()
+                || candidates.len() >= self.manifest_sort_config.merge_min_count
+            {
+                self.rewrite_manifest_section(
+                    file_io,
+                    manifest_dir,
+                    &candidates,
+                    default_compaction,
+                    deleted_identifiers,
+                    full_compaction,
+                    sort_key,
+                    new_files,
+                    output,
+                )
+                .await?;
+            } else {
+                output.add_all_unchanged(candidates)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rewrite_manifest_section(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        section: &[ManifestFileMeta],
+        default_compaction: &HashMap<String, bool>,
+        deleted_identifiers: &HashSet<crate::spec::Identifier>,
+        full_compaction: bool,
+        sort_key: &PartitionSortKey,
+        new_files: &mut Vec<ManifestFileMeta>,
+        output: &mut ManifestRewriteOutput,
+    ) -> Result<()> {
+        if section.is_empty() {
+            return Ok(());
+        }
+        if section.len() == 1
+            && !default_compaction
+                .get(section[0].file_name())
+                .copied()
+                .unwrap_or(false)
+        {
+            output.add_unchanged(section[0].clone())?;
+            return Ok(());
+        }
+
+        if full_compaction {
+            let mut sorter = SpillableManifestSorter::new(sort_key, &self.manifest_sort_config)?;
+            for meta in section {
+                let path = format!("{manifest_dir}/{}", meta.file_name());
+                for entry in Manifest::read(file_io, &path).await? {
+                    if entry.kind() == &FileKind::Add
+                        && !deleted_identifiers.contains(&entry.identifier())
+                    {
+                        sorter.push(entry)?;
+                    }
+                }
+            }
+            let sorted = self
+                .write_sorted_manifest_entries(file_io, manifest_dir, sorter, new_files)
+                .await?;
+            output.add_sorted_files(sorted)?;
+            return Ok(());
+        }
+
+        let mut sorter = SpillableManifestSorter::new(sort_key, &self.manifest_sort_config)?;
+        let mut delete_identifiers = HashSet::new();
+        for meta in section {
+            let path = format!("{manifest_dir}/{}", meta.file_name());
+            for entry in Manifest::read(file_io, &path).await? {
+                if entry.kind() == &FileKind::Delete {
+                    delete_identifiers.insert(entry.identifier());
+                }
+                sorter.push(entry)?;
+            }
+        }
+        let (add_files, delete_files) = self
+            .write_minor_sorted_manifest_entries(
+                file_io,
+                manifest_dir,
+                sorter,
+                delete_identifiers,
+                new_files,
+            )
+            .await?;
+        output.add_sorted_files(add_files)?;
+        output.add_delete_files(delete_files)?;
+        Ok(())
+    }
+
+    async fn write_sorted_manifest_entries(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        sorter: SpillableManifestSorter,
+        new_files: &mut Vec<ManifestFileMeta>,
+    ) -> Result<Vec<ManifestFileMeta>> {
+        let mut sorted = sorter.finish()?;
+        let mut chunk = Vec::new();
+        let mut chunk_bytes = 0usize;
+        let target = usize::try_from(self.manifest_target_size.max(1)).unwrap_or(usize::MAX);
+        let mut result = Vec::new();
+        while let Some(entry) = sorted.next_entry()? {
+            chunk_bytes = chunk_bytes.saturating_add(manifest_entry_sort_size(&entry)?);
+            chunk.push(entry);
+            if chunk_bytes >= target {
+                let files = self
+                    .write_manifest_sort_chunk(file_io, manifest_dir, &mut chunk, new_files)
+                    .await?;
+                result.extend(files);
+                chunk_bytes = 0;
+            }
+        }
+        result.extend(
+            self.write_manifest_sort_chunk(file_io, manifest_dir, &mut chunk, new_files)
+                .await?,
+        );
+        Ok(result)
+    }
+
+    async fn write_minor_sorted_manifest_entries(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        sorter: SpillableManifestSorter,
+        delete_identifiers: HashSet<crate::spec::Identifier>,
+        new_files: &mut Vec<ManifestFileMeta>,
+    ) -> Result<(Vec<ManifestFileMeta>, Vec<ManifestFileMeta>)> {
+        let mut sorted = sorter.finish()?;
+        let mut matched = HashSet::new();
+        let mut emitted_deletes = HashSet::new();
+        let mut add_chunk = Vec::new();
+        let mut delete_chunk = Vec::new();
+        let mut add_bytes = 0usize;
+        let mut delete_bytes = 0usize;
+        let target = usize::try_from(self.manifest_target_size.max(1)).unwrap_or(usize::MAX);
+        let mut add_files = Vec::new();
+        let mut delete_files = Vec::new();
+
+        while let Some(entry) = sorted.next_entry()? {
+            let identifier = entry.identifier();
+            match entry.kind() {
+                FileKind::Add if delete_identifiers.contains(&identifier) => {
+                    matched.insert(identifier);
+                }
+                FileKind::Add => {
+                    add_bytes = add_bytes.saturating_add(manifest_entry_sort_size(&entry)?);
+                    add_chunk.push(entry);
+                    if add_bytes >= target {
+                        add_files.extend(
+                            self.write_manifest_sort_chunk(
+                                file_io,
+                                manifest_dir,
+                                &mut add_chunk,
+                                new_files,
+                            )
+                            .await?,
+                        );
+                        add_bytes = 0;
+                    }
+                }
+                FileKind::Delete
+                    if !matched.contains(&identifier) && emitted_deletes.insert(identifier) =>
+                {
+                    delete_bytes = delete_bytes.saturating_add(manifest_entry_sort_size(&entry)?);
+                    delete_chunk.push(entry);
+                    if delete_bytes >= target {
+                        delete_files.extend(
+                            self.write_manifest_sort_chunk(
+                                file_io,
+                                manifest_dir,
+                                &mut delete_chunk,
+                                new_files,
+                            )
+                            .await?,
+                        );
+                        delete_bytes = 0;
+                    }
+                }
+                FileKind::Delete => {}
+            }
+        }
+
+        add_files.extend(
+            self.write_manifest_sort_chunk(file_io, manifest_dir, &mut add_chunk, new_files)
+                .await?,
+        );
+        delete_files.extend(
+            self.write_manifest_sort_chunk(file_io, manifest_dir, &mut delete_chunk, new_files)
+                .await?,
+        );
+        Ok((add_files, delete_files))
+    }
+
+    async fn write_manifest_sort_chunk(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        entries: &mut Vec<ManifestEntry>,
+        new_files: &mut Vec<ManifestFileMeta>,
+    ) -> Result<Vec<ManifestFileMeta>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prefix = format!("manifest-{}", uuid::Uuid::new_v4());
+        let entries = std::mem::take(entries);
+        let files = self
+            .write_manifest_files(file_io, manifest_dir, &prefix, &entries)
+            .await?;
+        new_files.extend(files.clone());
+        Ok(files)
     }
 
     async fn merge_manifest_candidates(
@@ -2928,6 +3498,121 @@ impl TableCommit {
                 adds.chain(deletes)
             })
             .collect()
+    }
+}
+
+fn manifest_entry_sort_size(entry: &ManifestEntry) -> Result<usize> {
+    serde_json::to_vec(entry)
+        .map(|encoded| encoded.len().saturating_add(8))
+        .map_err(|error| crate::Error::UnexpectedError {
+            message: "Failed to size manifest entry for sorted output".to_string(),
+            source: Some(Box::new(error)),
+        })
+}
+
+enum ManifestRewriteOutput {
+    Full {
+        files: Vec<ManifestFileMeta>,
+    },
+    Minor {
+        slots: Vec<Vec<ManifestFileMeta>>,
+        positions: HashMap<String, usize>,
+        min_picked_index: usize,
+        max_picked_index: usize,
+    },
+}
+
+impl ManifestRewriteOutput {
+    fn full(files: Vec<ManifestFileMeta>) -> Self {
+        Self::Full { files }
+    }
+
+    fn minor(input: &[ManifestFileMeta], picked_file_names: &HashSet<String>) -> Result<Self> {
+        let positions = input
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.file_name().to_string(), index))
+            .collect::<HashMap<_, _>>();
+        let mut picked_indexes = input.iter().enumerate().filter_map(|(index, file)| {
+            picked_file_names
+                .contains(file.file_name())
+                .then_some(index)
+        });
+        let Some(first) = picked_indexes.next() else {
+            return Err(crate::Error::UnexpectedError {
+                message: "Manifest sort plan selected no input files".to_string(),
+                source: None,
+            });
+        };
+        let (min_picked_index, max_picked_index) = picked_indexes
+            .fold((first, first), |(min, max), index| {
+                (min.min(index), max.max(index))
+            });
+        Ok(Self::Minor {
+            slots: vec![Vec::new(); input.len()],
+            positions,
+            min_picked_index,
+            max_picked_index,
+        })
+    }
+
+    fn add_unchanged(&mut self, file: ManifestFileMeta) -> Result<()> {
+        match self {
+            Self::Full { files } => files.push(file),
+            Self::Minor {
+                slots, positions, ..
+            } => {
+                let Some(index) = positions.get(file.file_name()).copied() else {
+                    return Err(crate::Error::UnexpectedError {
+                        message: format!(
+                            "Manifest sort output cannot place unknown file '{}'",
+                            file.file_name()
+                        ),
+                        source: None,
+                    });
+                };
+                slots[index].push(file);
+            }
+        }
+        Ok(())
+    }
+
+    fn add_all_unchanged(&mut self, files: Vec<ManifestFileMeta>) -> Result<()> {
+        for file in files {
+            self.add_unchanged(file)?;
+        }
+        Ok(())
+    }
+
+    fn add_sorted_files(&mut self, added: Vec<ManifestFileMeta>) -> Result<()> {
+        match self {
+            Self::Full { files } => files.extend(added),
+            Self::Minor {
+                slots,
+                min_picked_index,
+                ..
+            } => slots[*min_picked_index].extend(added),
+        }
+        Ok(())
+    }
+
+    fn add_delete_files(&mut self, deleted: Vec<ManifestFileMeta>) -> Result<()> {
+        match self {
+            Self::Full { files } => files.extend(deleted),
+            Self::Minor {
+                slots,
+                max_picked_index,
+                ..
+            } => slots[*max_picked_index].extend(deleted),
+        }
+        Ok(())
+    }
+
+    fn into_files(self) -> Vec<ManifestFileMeta> {
+        match self {
+            Self::Full { files } => files,
+            Self::Minor { slots, .. } => slots.into_iter().flatten().collect(),
+        }
     }
 }
 
@@ -6046,6 +6731,245 @@ mod tests {
             active_file_names,
             HashSet::from(["data-1.parquet".to_string(), "data-2.parquet".to_string()])
         );
+    }
+
+    fn sorted_partition_commit(file_io: &FileIO, path: &str, full: bool) -> TableCommit {
+        let mut options = HashMap::from([
+            ("manifest-sort.enabled".to_string(), "true".to_string()),
+            ("manifest.target-file-size".to_string(), "1 mb".to_string()),
+        ]);
+        if full {
+            options.insert(
+                "manifest.full-compaction-threshold-size".to_string(),
+                "1 b".to_string(),
+            );
+        }
+        let schema = test_partitioned_schema().copy_with_replaced_options(options);
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "sort_test"),
+            path.to_string(),
+            schema,
+            None,
+        );
+        TableCommit::new(table, "test-user".to_string())
+    }
+
+    #[tokio::test]
+    async fn test_manifest_sort_minor_keeps_unmatched_delete_after_adds() {
+        let file_io = test_file_io();
+        let path = "memory:/test_manifest_sort_minor_deletes";
+        setup_dirs(&file_io, path).await;
+        let commit = sorted_partition_commit(&file_io, path, false);
+        let dir = format!("{path}/manifest");
+        let partition = partition_bytes("a");
+        let original = commit
+            .write_manifest_files(
+                &file_io,
+                &dir,
+                "manifest-minor-old",
+                &[
+                    ManifestEntry::new(
+                        FileKind::Add,
+                        partition.clone(),
+                        0,
+                        1,
+                        test_data_file("remove.parquet", 1),
+                        2,
+                    ),
+                    ManifestEntry::new(
+                        FileKind::Add,
+                        partition.clone(),
+                        0,
+                        1,
+                        test_data_file("keep.parquet", 1),
+                        2,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        let later = commit
+            .write_manifest_files(
+                &file_io,
+                &dir,
+                "manifest-minor-new",
+                &[
+                    ManifestEntry::new(
+                        FileKind::Delete,
+                        partition.clone(),
+                        0,
+                        1,
+                        test_data_file("remove.parquet", 1),
+                        2,
+                    ),
+                    ManifestEntry::new(
+                        FileKind::Delete,
+                        partition,
+                        0,
+                        1,
+                        test_data_file("unmatched.parquet", 1),
+                        2,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        let (merged, created) = commit
+            .sort_manifest_files(&file_io, &dir, [original, later].concat())
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 2);
+        assert_eq!(merged.len(), 2);
+        let entries = [
+            Manifest::read(&file_io, &format!("{dir}/{}", merged[0].file_name()))
+                .await
+                .unwrap(),
+            Manifest::read(&file_io, &format!("{dir}/{}", merged[1].file_name()))
+                .await
+                .unwrap(),
+        ]
+        .concat();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.file().file_name.as_str(), *entry.kind()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("keep.parquet", FileKind::Add),
+                ("unmatched.parquet", FileKind::Delete),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_sort_full_nets_cross_manifest_deletes() {
+        let file_io = test_file_io();
+        let path = "memory:/test_manifest_sort_full_deletes";
+        setup_dirs(&file_io, path).await;
+        let commit = sorted_partition_commit(&file_io, path, true);
+        let dir = format!("{path}/manifest");
+        let partition = partition_bytes("a");
+        let original = commit
+            .write_manifest_files(
+                &file_io,
+                &dir,
+                "manifest-full-old",
+                &[
+                    ManifestEntry::new(
+                        FileKind::Add,
+                        partition.clone(),
+                        0,
+                        1,
+                        test_data_file("remove.parquet", 1),
+                        2,
+                    ),
+                    ManifestEntry::new(
+                        FileKind::Add,
+                        partition.clone(),
+                        0,
+                        1,
+                        test_data_file("keep.parquet", 1),
+                        2,
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        let later = commit
+            .write_manifest_files(
+                &file_io,
+                &dir,
+                "manifest-full-new",
+                &[ManifestEntry::new(
+                    FileKind::Delete,
+                    partition,
+                    0,
+                    1,
+                    test_data_file("remove.parquet", 1),
+                    2,
+                )],
+            )
+            .await
+            .unwrap();
+        let (merged, created) = commit
+            .sort_manifest_files(&file_io, &dir, [original, later].concat())
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(merged, created);
+        let entries = Manifest::read(&file_io, &format!("{dir}/{}", merged[0].file_name()))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file().file_name, "keep.parquet");
+        assert_eq!(*entries[0].kind(), FileKind::Add);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_sort_commit_keeps_delta_separate_and_orders_base() {
+        let file_io = test_file_io();
+        let path = "memory:/test_manifest_sort_commit";
+        setup_dirs(&file_io, path).await;
+        let commit = sorted_partition_commit(&file_io, path, false);
+        let messages = ["z", "a", "m"]
+            .into_iter()
+            .map(|partition| {
+                CommitMessage::new(
+                    partition_bytes(partition),
+                    0,
+                    vec![test_data_file(&format!("{partition}.parquet"), 1)],
+                )
+            })
+            .collect();
+        commit.commit(messages).await.unwrap();
+        commit
+            .commit(vec![CommitMessage::new(
+                partition_bytes("b"),
+                0,
+                vec![test_data_file("b.parquet", 1)],
+            )])
+            .await
+            .unwrap();
+        commit
+            .commit(vec![CommitMessage::new(
+                partition_bytes("q"),
+                0,
+                vec![test_data_file("q.parquet", 1)],
+            )])
+            .await
+            .unwrap();
+        let snapshot = latest_snapshot(&file_io, path).await.unwrap();
+        let dir = format!("{path}/manifest");
+        let base = ManifestList::read(
+            &file_io,
+            &format!("{dir}/{}", snapshot.base_manifest_list()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(base.len(), 1, "two under-target manifests are sorted");
+        let base_entries = Manifest::read(&file_io, &format!("{dir}/{}", base[0].file_name()))
+            .await
+            .unwrap();
+        assert_eq!(
+            base_entries
+                .iter()
+                .map(|entry| entry.file().file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.parquet", "b.parquet", "m.parquet", "z.parquet"]
+        );
+        let delta = ManifestList::read(
+            &file_io,
+            &format!("{dir}/{}", snapshot.delta_manifest_list()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delta.len(), 1);
+        let delta_entries = Manifest::read(&file_io, &format!("{dir}/{}", delta[0].file_name()))
+            .await
+            .unwrap();
+        assert_eq!(delta_entries[0].file().file_name, "q.parquet");
+        assert_eq!(active_entries(&file_io, path, &snapshot).await.len(), 5);
     }
 
     /// `write_manifest_file` must aggregate min/max bucket and level across entries so the

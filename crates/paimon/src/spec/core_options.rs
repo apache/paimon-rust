@@ -88,6 +88,17 @@ const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
 const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
 const MANIFEST_MERGE_MIN_COUNT_OPTION: &str = "manifest.merge-min-count";
+pub(crate) const MANIFEST_SORT_ENABLED_OPTION: &str = "manifest-sort.enabled";
+pub(crate) const MANIFEST_SORT_PARTITION_FIELD_OPTION: &str = "manifest-sort.partition-field";
+const MANIFEST_SORT_MAX_REWRITE_SIZE_OPTION: &str = "manifest-sort.max-rewrite-size";
+const MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION: &str =
+    "manifest.full-compaction-threshold-size";
+const COMPACTION_MAX_SIZE_AMPLIFICATION_PERCENT_OPTION: &str =
+    "compaction.max-size-amplification-percent";
+const COMPACTION_SIZE_RATIO_OPTION: &str = "compaction.size-ratio";
+const SORT_SPILL_BUFFER_SIZE_OPTION: &str = "sort-spill-buffer-size";
+const LOCAL_SORT_MAX_NUM_FILE_HANDLES_OPTION: &str = "local-sort.max-num-file-handles";
+const WRITE_BUFFER_SPILL_MAX_DISK_SIZE_OPTION: &str = "write-buffer-spill.max-disk-size";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
@@ -133,6 +144,12 @@ const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_MANIFEST_COMPRESSION: &str = "zstd";
 const DEFAULT_MANIFEST_TARGET_FILE_SIZE: i64 = 8 * 1024 * 1024;
 const DEFAULT_MANIFEST_MERGE_MIN_COUNT: usize = 30;
+const DEFAULT_MANIFEST_SORT_MAX_REWRITE_SIZE: i64 = 256 * 1024 * 1024;
+const DEFAULT_MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE: i64 = 16 * 1024 * 1024;
+const DEFAULT_COMPACTION_MAX_SIZE_AMPLIFICATION_PERCENT: i32 = 200;
+const DEFAULT_COMPACTION_SIZE_RATIO: i32 = 1;
+const DEFAULT_SORT_SPILL_BUFFER_SIZE: i64 = 64 * 1024 * 1024;
+const DEFAULT_LOCAL_SORT_MAX_NUM_FILE_HANDLES: usize = 128;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 const DEFAULT_CHANGELOG_FILE_PREFIX: &str = "changelog-";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
@@ -1163,6 +1180,87 @@ impl<'a> CoreOptions<'a> {
             .and_then(|v| v.parse().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_MANIFEST_MERGE_MIN_COUNT)
+    }
+
+    /// Whether commit-time manifest compaction uses the sorted rewrite path.
+    pub fn manifest_sort_enabled(&self) -> bool {
+        self.options
+            .get(MANIFEST_SORT_ENABLED_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Partition field used as the manifest sort key.
+    ///
+    /// When absent, the first partition field is used.
+    pub fn manifest_sort_partition_field(&self) -> Option<&str> {
+        self.options
+            .get(MANIFEST_SORT_PARTITION_FIELD_OPTION)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Maximum input bytes consumed by the aggressive sorted rewrite portion.
+    pub fn manifest_sort_max_rewrite_size(&self) -> i64 {
+        self.options
+            .get(MANIFEST_SORT_MAX_REWRITE_SIZE_OPTION)
+            .and_then(|v| parse_memory_size(v))
+            .filter(|v| *v >= 0)
+            .unwrap_or(DEFAULT_MANIFEST_SORT_MAX_REWRITE_SIZE)
+    }
+
+    /// Delta manifest bytes which trigger full manifest compaction.
+    pub fn manifest_full_compaction_threshold_size(&self) -> i64 {
+        self.options
+            .get(MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION)
+            .and_then(|v| parse_memory_size(v))
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE)
+    }
+
+    /// Maximum acceptable size amplification percentage for manifest sorted runs.
+    pub fn compaction_max_size_amplification_percent(&self) -> i32 {
+        self.options
+            .get(COMPACTION_MAX_SIZE_AMPLIFICATION_PERCENT_OPTION)
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_COMPACTION_MAX_SIZE_AMPLIFICATION_PERCENT)
+    }
+
+    /// Size-ratio flexibility used when selecting adjacent manifest sorted runs.
+    pub fn compaction_size_ratio(&self) -> i32 {
+        self.options
+            .get(COMPACTION_SIZE_RATIO_OPTION)
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_COMPACTION_SIZE_RATIO)
+    }
+
+    /// Maximum in-memory bytes held by one manifest external-sort run.
+    pub fn sort_spill_buffer_size(&self) -> i64 {
+        self.options
+            .get(SORT_SPILL_BUFFER_SIZE_OPTION)
+            .and_then(|v| parse_memory_size(v))
+            .filter(|v| *v > 0)
+            .unwrap_or(DEFAULT_SORT_SPILL_BUFFER_SIZE)
+    }
+
+    /// Maximum number of spill runs opened by one external merge.
+    pub fn local_sort_max_num_file_handles(&self) -> usize {
+        self.options
+            .get(LOCAL_SORT_MAX_NUM_FILE_HANDLES_OPTION)
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v >= 2)
+            .unwrap_or(DEFAULT_LOCAL_SORT_MAX_NUM_FILE_HANDLES)
+    }
+
+    /// Maximum local disk bytes used by one spillable write buffer.
+    pub fn write_buffer_spill_max_disk_size(&self) -> i64 {
+        self.options
+            .get(WRITE_BUFFER_SPILL_MAX_DISK_SIZE_OPTION)
+            .and_then(|v| parse_memory_size(v))
+            .filter(|v| *v > 0)
+            .unwrap_or(i64::MAX)
     }
 
     /// Number of buckets for the table. Default is -1 (dynamic bucket).
@@ -2562,6 +2660,18 @@ mod tests {
         assert_eq!(core.manifest_compression(), "zstd");
         assert_eq!(core.manifest_target_size(), 8 * 1024 * 1024);
         assert_eq!(core.manifest_merge_min_count(), 30);
+        assert!(!core.manifest_sort_enabled());
+        assert_eq!(core.manifest_sort_partition_field(), None);
+        assert_eq!(core.manifest_sort_max_rewrite_size(), 256 * 1024 * 1024);
+        assert_eq!(
+            core.manifest_full_compaction_threshold_size(),
+            16 * 1024 * 1024
+        );
+        assert_eq!(core.compaction_max_size_amplification_percent(), 200);
+        assert_eq!(core.compaction_size_ratio(), 1);
+        assert_eq!(core.sort_spill_buffer_size(), 64 * 1024 * 1024);
+        assert_eq!(core.local_sort_max_num_file_handles(), 128);
+        assert_eq!(core.write_buffer_spill_max_disk_size(), i64::MAX);
     }
 
     #[test]
@@ -2579,6 +2689,33 @@ mod tests {
             ),
             (MANIFEST_COMPRESSION_OPTION.to_string(), "null".to_string()),
             (MANIFEST_MERGE_MIN_COUNT_OPTION.to_string(), "3".to_string()),
+            (MANIFEST_SORT_ENABLED_OPTION.to_string(), "true".to_string()),
+            (
+                MANIFEST_SORT_PARTITION_FIELD_OPTION.to_string(),
+                "pt".to_string(),
+            ),
+            (
+                MANIFEST_SORT_MAX_REWRITE_SIZE_OPTION.to_string(),
+                "64mb".to_string(),
+            ),
+            (
+                MANIFEST_FULL_COMPACTION_THRESHOLD_SIZE_OPTION.to_string(),
+                "32mb".to_string(),
+            ),
+            (
+                COMPACTION_MAX_SIZE_AMPLIFICATION_PERCENT_OPTION.to_string(),
+                "300".to_string(),
+            ),
+            (COMPACTION_SIZE_RATIO_OPTION.to_string(), "5".to_string()),
+            (SORT_SPILL_BUFFER_SIZE_OPTION.to_string(), "8mb".to_string()),
+            (
+                LOCAL_SORT_MAX_NUM_FILE_HANDLES_OPTION.to_string(),
+                "16".to_string(),
+            ),
+            (
+                WRITE_BUFFER_SPILL_MAX_DISK_SIZE_OPTION.to_string(),
+                "1gb".to_string(),
+            ),
         ]);
         let core = CoreOptions::new(&options);
         assert_eq!(core.bucket(), 4);
@@ -2590,6 +2727,18 @@ mod tests {
         assert_eq!(core.manifest_compression(), "null");
         assert_eq!(core.manifest_target_size(), 1024);
         assert_eq!(core.manifest_merge_min_count(), 3);
+        assert!(core.manifest_sort_enabled());
+        assert_eq!(core.manifest_sort_partition_field(), Some("pt"));
+        assert_eq!(core.manifest_sort_max_rewrite_size(), 64 * 1024 * 1024);
+        assert_eq!(
+            core.manifest_full_compaction_threshold_size(),
+            32 * 1024 * 1024
+        );
+        assert_eq!(core.compaction_max_size_amplification_percent(), 300);
+        assert_eq!(core.compaction_size_ratio(), 5);
+        assert_eq!(core.sort_spill_buffer_size(), 8 * 1024 * 1024);
+        assert_eq!(core.local_sort_max_num_file_handles(), 16);
+        assert_eq!(core.write_buffer_spill_max_disk_size(), 1024 * 1024 * 1024);
     }
 
     #[test]
