@@ -70,11 +70,13 @@ file-index.in-manifest-threshold = 500 B
 
 Column lists are comma-separated. Bitmap supports `version` (currently `2` only)
 and `index-block-size` per column. Bloom Filter supports `items` and `fpp`.
-Invalid columns, unsupported index/data types, and invalid index options fail
-when creating the writer.
+For supported index types, invalid columns, unsupported data types, and invalid
+index options fail when creating the writer. Unsupported index types (such as
+`bsi` and `range-bitmap`) and all their options are ignored, so these table
+properties do not prevent append writes.
 
-Each data file gets its own index containing all configured columns and index
-types. The complete serialized index is embedded in the manifest when its size
+When supported indexes are configured, each data file gets its own index.
+The complete serialized index is embedded in the manifest when its size
 is at most `file-index.in-manifest-threshold` (default `500 B`); larger indexes
 are stored beside the data file as a `.index` sidecar. Indexed write failures
 return an error and clean up newly created files on a best-effort basis.
@@ -84,9 +86,9 @@ when the prepared write will not be committed.
 `file-index.read.enabled` controls only reading, independently of index creation.
 Existing files are not backfilled. Index generation is not supported for
 primary-key writes, data-evolution writes, or dedicated Blob/Vector paths;
-ordinary writer creation rejects index configuration on these paths. COW and
-partial DataEvolution rewrites do not generate indexes. Nested indexes and
-additional index types are not supported.
+ordinary writer creation rejects supported index configuration on these paths.
+COW and partial DataEvolution rewrites do not generate indexes. Nested indexes
+and additional index types are not supported.
 
 ## Catalog Management
 

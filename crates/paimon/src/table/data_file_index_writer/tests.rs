@@ -293,6 +293,81 @@ async fn test_file_index_unconfigured_and_read_flag_only() {
 }
 
 #[tokio::test]
+async fn test_file_index_skips_unsupported_identifier_groups() {
+    for supported in [
+        vec![],
+        vec!["bitmap"],
+        vec!["bloom-filter"],
+        vec!["bitmap", "bloom-filter"],
+    ] {
+        let mut options = vec![
+            ("file-index.bsi.columns", "id"),
+            ("file-index.bsi.id.version", "upstream-specific"),
+            ("file-index.range-bitmap.columns", "missing[nested]"),
+            (
+                "file-index.range-bitmap.missing[nested].version",
+                "upstream-specific",
+            ),
+            ("file-index.unknown.columns", ""),
+            ("file-index.in-manifest-threshold", "1 MB"),
+        ];
+        if supported.contains(&"bitmap") {
+            options.push(("file-index.bitmap.columns", "id"));
+        }
+        if supported.contains(&"bloom-filter") {
+            options.push(("file-index.bloom-filter.columns", "id"));
+            options.push(("file-index.bloom-filter.id.items", "10"));
+        }
+        let table = table(memory_io(), schema(&options)).await;
+        let config =
+            FileIndexOptions::parse(table.schema().options(), table.schema().fields()).unwrap();
+        if supported.is_empty() {
+            assert!(config.is_none());
+        } else {
+            let config = config.unwrap();
+            assert_eq!(config.columns.len(), 1);
+            assert_eq!(config.columns[0].field.name(), "id");
+            assert_eq!(
+                config.columns[0]
+                    .indexes
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                supported
+            );
+        }
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        let data = batch(vec![Some(1), Some(3)], vec![None, Some(30)]);
+        writer.write_arrow_batch(&data).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let file = &messages[0].new_files[0];
+        assert_eq!(file.embedded_index.is_some(), !supported.is_empty());
+        assert!(file.extra_files.is_empty());
+        builder.new_commit().commit(messages).await.unwrap();
+        assert_eq!(query(&table, true, None).await, rows(&[data]));
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("id", Datum::Int(3))
+            .unwrap();
+        assert_eq!(
+            query(&table, true, Some(predicate)).await,
+            vec![(Some(3), Some(30))]
+        );
+    }
+}
+
+#[test]
+fn test_file_index_skips_unsupported_options_without_columns() {
+    let schema = schema(&[
+        ("file-index.bsi.id.version", "upstream-specific"),
+        ("file-index.range-bitmap.version", "upstream-specific"),
+    ]);
+    assert!(FileIndexOptions::parse(schema.options(), schema.fields())
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn test_file_index_threshold_boundary_and_abort() {
     let data = batch(vec![Some(1), None, Some(3)], vec![None, None, None]);
     let table_schema = schema(&[("file-index.bitmap.columns", "id")]);
@@ -347,7 +422,7 @@ async fn test_file_index_threshold_boundary_and_abort() {
 async fn test_file_index_invalid_configuration_fails_before_writing() {
     let cases = vec![
         vec![("file-index.bitmap.columns", "missing")],
-        vec![("file-index.unknown.columns", "id")],
+        vec![("file-index.bitmap.version", "2")],
         vec![("file-index.bitmap.columns", "")],
         vec![("file-index.bitmap.columns", "id,")],
         vec![("file-index.bitmap.columns", "id[nested]")],
@@ -376,7 +451,9 @@ async fn test_file_index_invalid_configuration_fails_before_writing() {
         vec![("file-index.in-manifest-threshold", "-1")],
         vec![("file-index.in-manifest-threshold", "9223372036854775807 TB")],
     ];
-    for options in cases {
+    for mut options in cases {
+        options.push(("file-index.bsi.columns", "id"));
+        options.push(("file-index.bsi.id.version", "upstream-specific"));
         let table = table(memory_io(), schema(&options)).await;
         assert!(
             table.new_write_builder().new_write().is_err(),

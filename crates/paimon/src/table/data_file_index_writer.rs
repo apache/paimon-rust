@@ -55,9 +55,7 @@ impl FileIndexOptions {
                 continue;
             };
             if !FileIndexerFactory::is_supported(identifier) {
-                return Err(Error::Unsupported {
-                    message: format!("Unsupported file index in {key}: {identifier}"),
-                });
+                continue;
             }
             for column in value.split(',').map(str::trim) {
                 if column.is_empty() {
@@ -83,11 +81,15 @@ impl FileIndexOptions {
             {
                 continue;
             }
-            let parts = suffix.split_once('.').and_then(|(identifier, rest)| {
-                rest.rsplit_once('.')
-                    .map(|(column, option)| (identifier, column, option))
-            });
-            let Some((identifier, column, option)) = parts else {
+            let Some((identifier, rest)) = suffix.split_once('.') else {
+                return Err(Error::ConfigInvalid {
+                    message: format!("Invalid file index option: {key}"),
+                });
+            };
+            if !FileIndexerFactory::is_supported(identifier) {
+                continue;
+            }
+            let Some((column, option)) = rest.rsplit_once('.') else {
                 return Err(Error::ConfigInvalid {
                     message: format!("Invalid file index option: {key}"),
                 });
