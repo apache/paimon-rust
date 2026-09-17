@@ -623,58 +623,26 @@ async fn vindex_second_build_without_new_data_is_noop() {
 #[tokio::test]
 async fn vindex_incremental_build_indexes_only_new_rows() {
     let table_path = "memory:/test_vindex_incremental";
-    let mut options = vindex_e2e_options("2048");
-    options.insert("ivf-flat.dimension".to_string(), "4096".to_string());
-    options.insert("ivf-flat.nlist".to_string(), "3".to_string());
-    let table = test_table_with_io(
-        FileIOBuilder::new("memory").build().unwrap(),
-        table_path,
-        vindex_schema_builder(options).build().unwrap(),
-    );
+    let table = vindex_e2e_table(table_path, "10");
     setup_dirs(table.file_io(), table_path).await;
 
     // Build #1 over the initial batch via a real end-to-end build.
     write_vectors(
         &table,
-        (0..1024).collect(),
-        (0..1024)
-            .map(|id| {
-                (0..4096)
-                    .map(|component| (id * 4096 + component) as f32)
-                    .collect()
-            })
-            .collect(),
+        vec![1, 2, 3],
+        vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]],
     )
     .await;
-    let build_options =
-        HashMap::from([("ivf-flat.train.sample-ratio".to_string(), "0.2".to_string())]);
-    let snapshots = SnapshotManager::new(table.file_io().clone(), table_path.to_string());
-    let snapshot = snapshots.get_latest_snapshot().await.unwrap().unwrap();
-    let entries = table
-        .new_read_builder()
-        .new_scan()
-        .with_scan_all_files()
-        .plan_manifest_entries(&snapshot)
+    let first_built = table
+        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+        .with_index_column("embedding")
+        .with_options(HashMap::from([(
+            "ivf-flat.train.sample-ratio".to_string(),
+            "0.9".to_string(),
+        )]))
+        .execute()
         .await
         .unwrap();
-    let core_options = CoreOptions::new(table.schema().options());
-    let shards = plan_vindex_shards(
-        table_path,
-        table.schema().partition_keys(),
-        table.schema().fields(),
-        &core_options,
-        snapshot.id(),
-        entries,
-        core_options.global_index_row_count_per_shard().unwrap(),
-        &[],
-    )
-    .unwrap();
-    assert_eq!(shards.len(), 1);
-    let mut builder = table.new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER);
-    builder
-        .with_index_column("embedding")
-        .with_options(build_options);
-    let first_built = builder.execute().await.unwrap();
     assert!(first_built > 0, "first build must index the initial rows");
 
     // First appended row-id, derived from the data manifest (never hard-coded).
@@ -692,41 +660,18 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     // Append a second batch (new row-ids [n..]).
     write_vectors(
         &table,
-        vec![1024, 1025, 1026],
-        (1024..1027)
-            .map(|id| {
-                (0..4096)
-                    .map(|component| (id * 4096 + component) as f32)
-                    .collect()
-            })
-            .collect(),
+        vec![4, 5, 6],
+        vec![vec![2.0, 0.0], vec![0.0, 2.0], vec![2.0, 2.0]],
     )
     .await;
 
-    let snapshot = snapshots.get_latest_snapshot().await.unwrap().unwrap();
-    let entries = table
-        .new_read_builder()
-        .new_scan()
-        .with_scan_all_files()
-        .plan_manifest_entries(&snapshot)
+    // End-to-end: build #2 must SUCCEED and index the appended rows.
+    let second_built = table
+        .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
+        .with_index_column("embedding")
+        .execute()
         .await
         .unwrap();
-    let shards = plan_vindex_shards(
-        table_path,
-        table.schema().partition_keys(),
-        table.schema().fields(),
-        &core_options,
-        snapshot.id(),
-        entries,
-        core_options.global_index_row_count_per_shard().unwrap(),
-        &indexed_coverage,
-    )
-    .unwrap();
-    assert_eq!(shards.len(), 1);
-    let mut builder = table.new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER);
-    builder.with_index_column("embedding");
-    // End-to-end: build #2 must SUCCEED and index the appended rows.
-    let second_built = builder.execute().await.unwrap();
     assert!(second_built > 0, "appended rows must be indexed");
 
     let all_files = latest_vindex_index_files(&table).await;
