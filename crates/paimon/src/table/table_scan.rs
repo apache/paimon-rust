@@ -37,9 +37,9 @@ use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_path, BinaryRow, BucketFunctionType, CoreOptions, DataField,
     DataFileMeta, FileKind, GlobalIndexSearchMode, IndexManifest, IndexManifestEntry,
-    ManifestEntry, ManifestSidecar, PartitionComputer, Predicate, Snapshot, ROW_ID_FIELD_ID,
-    ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
-    VALUE_KIND_FIELD_NAME,
+    ManifestEntry, ManifestFileMeta, ManifestSidecar, PartitionComputer, Predicate, Snapshot,
+    ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
+    VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bin_pack::{pack_for_ordered, split_for_batch};
 use crate::table::index_file_path::IndexFileLocation;
@@ -109,6 +109,89 @@ async fn read_manifest_list(
     let input = file_io.new_input(&path)?;
     let bytes = input.read().await?;
     crate::spec::avro::from_avro_bytes_fast::<crate::spec::ManifestFileMeta>(&bytes)
+}
+
+struct ManifestSidecarPruning<'a> {
+    row_range_index: Option<&'a RowRangeIndex>,
+    partition_filter: Option<&'a PartitionFilter>,
+    partition_arity: usize,
+    bucket_predicate: Option<&'a Predicate>,
+    bucket_key_fields: &'a [DataField],
+    bucket_function_type: BucketFunctionType,
+}
+
+impl ManifestSidecarPruning<'_> {
+    fn has_filter(&self) -> bool {
+        self.row_range_index.is_some()
+            || self.partition_filter.is_some()
+            || self.bucket_predicate.is_some()
+    }
+}
+
+/// Read a complete manifest or a sidecar-selected OCF stream.
+///
+/// Callers decide whether row-range block pruning is safe by supplying or omitting
+/// `row_range_index`; incremental paths must validate DELETE entries before pruning them.
+async fn read_manifest_bytes_with_sidecar(
+    file_io: &FileIO,
+    path: &str,
+    manifest: &ManifestFileMeta,
+    enabled: bool,
+    pruning: ManifestSidecarPruning<'_>,
+) -> crate::Result<bytes::Bytes> {
+    if !enabled || !pruning.has_filter() {
+        return file_io.new_input(path)?.read().await;
+    }
+
+    let ManifestSidecarPruning {
+        row_range_index,
+        partition_filter,
+        partition_arity,
+        bucket_predicate,
+        bucket_key_fields,
+        bucket_function_type,
+    } = pruning;
+    let row_filter = |start, end| row_range_index.is_some_and(|index| index.intersects(start, end));
+    let mut partition_block_filter = |partition: &[u8]| {
+        partition_filter
+            .and_then(|filter| filter.matches_entry(partition).ok())
+            .unwrap_or(true)
+    };
+    let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+    let mut bucket_block_filter = |bucket: i32, total_buckets: i32| {
+        let Some(predicate) = bucket_predicate else {
+            return true;
+        };
+        bucket_cache
+            .entry(total_buckets)
+            .or_insert_with(|| {
+                compute_target_buckets(
+                    predicate,
+                    bucket_key_fields,
+                    bucket_function_type,
+                    total_buckets,
+                )
+            })
+            .as_ref()
+            .is_none_or(|targets| targets.contains(&bucket))
+    };
+    let selection = ManifestSidecar::read_with_filters(
+        file_io,
+        path,
+        manifest,
+        row_range_index.map(|_| &row_filter as &(dyn Fn(i64, i64) -> bool + Sync)),
+        partition_filter
+            .map(|_| &mut partition_block_filter as &mut (dyn FnMut(&[u8]) -> bool + Send)),
+        Some(partition_arity),
+        bucket_predicate
+            .map(|_| &mut bucket_block_filter as &mut (dyn FnMut(i32, i32) -> bool + Send)),
+    )
+    .await;
+
+    match selection.as_ref() {
+        Some(selection) => ManifestSidecar::read_selected_bytes(file_io, path, selection).await,
+        None => file_io.new_input(path)?.read().await,
+    }
 }
 
 fn validate_incremental_entries(entries: &[ManifestEntry]) -> crate::Result<()> {
@@ -239,60 +322,21 @@ async fn read_all_manifest_entries(
                 // Incremental delta validation must observe every ADD/DELETE before
                 // row-range pruning; keep its existing post-validation row filter.
                 let sidecar_row_index = (!incremental).then_some(row_range_index).flatten();
-                let has_sidecar_filter = sidecar_row_index.is_some()
-                    || partition_filter.is_some()
-                    || bucket_predicate.is_some();
-                let row_filter = |start, end| {
-                    sidecar_row_index.is_some_and(|index| index.intersects(start, end))
-                };
-                let mut partition_block_filter = |partition: &[u8]| {
-                    partition_filter
-                        .and_then(|filter| filter.matches_entry(partition).ok())
-                        .unwrap_or(true)
-                };
-                let mut sidecar_bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
-                let mut bucket_block_filter = |bucket: i32, total_buckets: i32| {
-                    let Some(predicate) = bucket_predicate else {
-                        return true;
-                    };
-                    sidecar_bucket_cache
-                        .entry(total_buckets)
-                        .or_insert_with(|| {
-                            compute_target_buckets(
-                                predicate,
-                                bucket_key_fields,
-                                bucket_function_type,
-                                total_buckets,
-                            )
-                        })
-                        .as_ref()
-                        .is_none_or(|targets| targets.contains(&bucket))
-                };
-                let selection = if manifest_sidecar_enabled && has_sidecar_filter {
-                    ManifestSidecar::read_with_filters(
-                        file_io,
-                        &path,
-                        &meta,
-                        sidecar_row_index
-                            .map(|_| &row_filter as &(dyn Fn(i64, i64) -> bool + Sync)),
-                        partition_filter.as_ref().map(|_| {
-                            &mut partition_block_filter as &mut (dyn FnMut(&[u8]) -> bool + Send)
-                        }),
-                        Some(partition_fields.len()),
-                        bucket_predicate.as_ref().map(|_| {
-                            &mut bucket_block_filter as &mut (dyn FnMut(i32, i32) -> bool + Send)
-                        }),
-                    )
-                    .await
-                } else {
-                    None
-                };
-                let content = match selection.as_ref() {
-                    Some(selection) => {
-                        ManifestSidecar::read_selected_bytes(file_io, &path, selection).await?
-                    }
-                    None => file_io.new_input(&path)?.read().await?,
-                };
+                let content = read_manifest_bytes_with_sidecar(
+                    file_io,
+                    &path,
+                    &meta,
+                    manifest_sidecar_enabled,
+                    ManifestSidecarPruning {
+                        row_range_index: sidecar_row_index,
+                        partition_filter,
+                        partition_arity: partition_fields.len(),
+                        bucket_predicate,
+                        bucket_key_fields,
+                        bucket_function_type,
+                    },
+                )
+                .await?;
 
                 // Per-task bucket cache (few distinct total_buckets values per manifest).
                 let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
@@ -1967,54 +2011,21 @@ impl<'a> PaimonTableScan<'a> {
             // This path validates incremental/changelog manifests before its
             // existing post-read row-range pruning, so do not hide DELETEs at
             // the block layer.
-            let has_sidecar_filter = partition_filter.is_some() || bucket_predicate.is_some();
-            let mut partition_block_filter = |partition: &[u8]| {
-                partition_filter
-                    .and_then(|filter| filter.matches_entry(partition).ok())
-                    .unwrap_or(true)
-            };
-            let mut sidecar_bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
-            let mut bucket_block_filter = |bucket: i32, total_buckets: i32| {
-                let Some(predicate) = bucket_predicate else {
-                    return true;
-                };
-                sidecar_bucket_cache
-                    .entry(total_buckets)
-                    .or_insert_with(|| {
-                        compute_target_buckets(
-                            predicate,
-                            &bucket_key_fields,
-                            bucket_function_type,
-                            total_buckets,
-                        )
-                    })
-                    .as_ref()
-                    .is_none_or(|targets| targets.contains(&bucket))
-            };
-            let selection = if core_options.manifest_sidecar_enabled() && has_sidecar_filter {
-                ManifestSidecar::read_with_filters(
-                    file_io,
-                    &path,
-                    &meta,
-                    None,
-                    partition_filter.map(|_| {
-                        &mut partition_block_filter as &mut (dyn FnMut(&[u8]) -> bool + Send)
-                    }),
-                    Some(partition_fields.len()),
-                    bucket_predicate.map(|_| {
-                        &mut bucket_block_filter as &mut (dyn FnMut(i32, i32) -> bool + Send)
-                    }),
-                )
-                .await
-            } else {
-                None
-            };
-            let bytes = match selection.as_ref() {
-                Some(selection) => {
-                    ManifestSidecar::read_selected_bytes(file_io, &path, selection).await?
-                }
-                None => file_io.new_input(&path)?.read().await?,
-            };
+            let bytes = read_manifest_bytes_with_sidecar(
+                file_io,
+                &path,
+                &meta,
+                core_options.manifest_sidecar_enabled(),
+                ManifestSidecarPruning {
+                    row_range_index: None,
+                    partition_filter,
+                    partition_arity: partition_fields.len(),
+                    bucket_predicate,
+                    bucket_key_fields: &bucket_key_fields,
+                    bucket_function_type,
+                },
+            )
+            .await?;
             let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
             let manifest_entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
                 &bytes,
