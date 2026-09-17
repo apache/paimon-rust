@@ -68,76 +68,261 @@ impl ManifestSortConfig {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PartitionSortKey {
+pub(crate) struct PartitionSortField {
     field_index: usize,
     data_type: crate::spec::DataType,
 }
 
-impl PartitionSortKey {
-    pub(crate) fn new(
+#[derive(Debug, Clone)]
+pub(crate) enum ManifestSortKey {
+    Partition {
+        field: PartitionSortField,
+    },
+    RowId {
+        partition_fields: Vec<PartitionSortField>,
+    },
+}
+
+impl ManifestSortKey {
+    pub(crate) fn create(
         partition_fields: &[DataField],
         configured_field: Option<&str>,
-    ) -> Result<Self> {
-        let field_index = match configured_field {
-            Some(name) => partition_fields
+        data_evolution_enabled: bool,
+        manifests: &[ManifestFileMeta],
+    ) -> Result<Option<Self>> {
+        if data_evolution_enabled
+            && !manifests.is_empty()
+            && manifests
                 .iter()
-                .position(|field| field.name() == name)
-                .ok_or_else(|| crate::Error::ConfigInvalid {
-                    message: format!(
-                        "Cannot resolve manifest sort partition field '{name}' from {:?}",
-                        partition_fields
-                            .iter()
-                            .map(|field| field.name())
-                            .collect::<Vec<_>>()
-                    ),
-                })?,
-            None => {
-                if partition_fields.is_empty() {
-                    return Err(crate::Error::ConfigInvalid {
-                        message: "Cannot enable manifest-sort.enabled for non-partition table."
-                            .to_string(),
-                    });
-                }
-                0
-            }
+                .all(|meta| meta.min_row_id().is_some() && meta.max_row_id().is_some())
+        {
+            let partition_fields = match configured_field {
+                Some(name) => vec![resolve_partition_field(partition_fields, name)?],
+                None => partition_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(field_index, field)| PartitionSortField {
+                        field_index,
+                        data_type: field.data_type().clone(),
+                    })
+                    .collect(),
+            };
+            return Ok(Some(Self::RowId { partition_fields }));
+        }
+
+        if partition_fields.is_empty() {
+            return Ok(None);
+        }
+        let field = match configured_field {
+            Some(name) => resolve_partition_field(partition_fields, name)?,
+            None => PartitionSortField {
+                field_index: 0,
+                data_type: partition_fields[0].data_type().clone(),
+            },
         };
-        Ok(Self {
-            field_index,
-            data_type: partition_fields[field_index].data_type().clone(),
-        })
+        Ok(Some(Self::Partition { field }))
     }
 
-    pub(crate) fn entry_key(&self, entry: &ManifestEntry) -> Result<Option<Datum>> {
-        self.key_from_serialized_row(entry.partition())
+    fn entry_key(&self, entry: &ManifestEntry) -> Result<ManifestEntrySortKey> {
+        match self {
+            Self::Partition { field } => Ok(ManifestEntrySortKey::Partition(
+                read_partition_values(entry.partition(), std::slice::from_ref(field))?,
+            )),
+            Self::RowId { partition_fields } => {
+                let first_row_id =
+                    entry
+                        .file()
+                        .first_row_id
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: format!(
+                                "Manifest entry '{}' has no first RowID",
+                                entry.file().file_name
+                            ),
+                            source: None,
+                        })?;
+                let row_count = entry.file().row_count;
+                if row_count <= 0 {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Manifest entry '{}' has invalid row count {row_count}",
+                            entry.file().file_name
+                        ),
+                        source: None,
+                    });
+                }
+                let range_end = first_row_id.checked_add(row_count - 1).ok_or_else(|| {
+                    crate::Error::DataInvalid {
+                        message: format!(
+                            "Manifest entry '{}' RowID range overflows i64",
+                            entry.file().file_name
+                        ),
+                        source: None,
+                    }
+                })?;
+                Ok(ManifestEntrySortKey::RowId {
+                    partition: read_partition_values(entry.partition(), partition_fields)?,
+                    first_row_id,
+                    range_end,
+                    max_sequence_number: entry.file().max_sequence_number,
+                })
+            }
+        }
     }
 
     pub(crate) fn range(&self, meta: ManifestFileMeta) -> Result<ManifestRange> {
-        let min = self.key_from_serialized_row(meta.partition_stats().min_values())?;
-        let max = self.key_from_serialized_row(meta.partition_stats().max_values())?;
+        let (min, max) = match self {
+            Self::Partition { field } => (
+                ManifestBound::Partition(read_partition_values(
+                    meta.partition_stats().min_values(),
+                    std::slice::from_ref(field),
+                )?),
+                ManifestBound::Partition(read_partition_values(
+                    meta.partition_stats().max_values(),
+                    std::slice::from_ref(field),
+                )?),
+            ),
+            Self::RowId { partition_fields } => (
+                ManifestBound::RowId {
+                    partition: read_partition_values(
+                        meta.partition_stats().min_values(),
+                        partition_fields,
+                    )?,
+                    row_id: meta.min_row_id().ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("Manifest '{}' has no minimum RowID", meta.file_name()),
+                        source: None,
+                    })?,
+                },
+                ManifestBound::RowId {
+                    partition: read_partition_values(
+                        meta.partition_stats().max_values(),
+                        partition_fields,
+                    )?,
+                    row_id: meta.max_row_id().ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("Manifest '{}' has no maximum RowID", meta.file_name()),
+                        source: None,
+                    })?,
+                },
+            ),
+        };
         Ok(ManifestRange { meta, min, max })
     }
 
-    fn key_from_serialized_row(&self, bytes: &[u8]) -> Result<Option<Datum>> {
-        let row = BinaryRow::from_serialized_bytes(bytes)?;
-        if self.field_index >= row.arity() as usize {
-            return Err(crate::Error::DataInvalid {
-                message: format!(
-                    "Manifest sort field index {} is outside partition row arity {}",
-                    self.field_index,
-                    row.arity()
-                ),
-                source: None,
-            });
+    fn compare_bounds(&self, left: &ManifestBound, right: &ManifestBound) -> Ordering {
+        match (self, left, right) {
+            (
+                Self::Partition { .. },
+                ManifestBound::Partition(left),
+                ManifestBound::Partition(right),
+            ) => compare_partition_values(left, right),
+            (
+                Self::RowId { .. },
+                ManifestBound::RowId {
+                    partition: left_partition,
+                    row_id: left_row_id,
+                },
+                ManifestBound::RowId {
+                    partition: right_partition,
+                    row_id: right_row_id,
+                },
+            ) => compare_partition_values(left_partition, right_partition)
+                .then_with(|| left_row_id.cmp(right_row_id)),
+            _ => unreachable!("manifest bounds are built by one whole-pass sort key"),
         }
-        extract_datum(&row, self.field_index, &self.data_type)
     }
+
+    fn is_after_max(&self, min: &ManifestBound, max: &ManifestBound) -> bool {
+        let ordering = self.compare_bounds(min, max);
+        match self {
+            // Partition ranges preserve Java's historical boundary-equality
+            // behavior. RowID ranges are inclusive, so equality overlaps.
+            Self::Partition { .. } => ordering != Ordering::Less,
+            Self::RowId { .. } => ordering == Ordering::Greater,
+        }
+    }
+}
+
+fn resolve_partition_field(
+    partition_fields: &[DataField],
+    name: &str,
+) -> Result<PartitionSortField> {
+    partition_fields
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.name() == name)
+        .map(|(field_index, field)| PartitionSortField {
+            field_index,
+            data_type: field.data_type().clone(),
+        })
+        .ok_or_else(|| crate::Error::ConfigInvalid {
+            message: format!(
+                "Cannot resolve manifest sort partition field '{name}' from {:?}",
+                partition_fields
+                    .iter()
+                    .map(|field| field.name())
+                    .collect::<Vec<_>>()
+            ),
+        })
+}
+
+fn read_partition_values(
+    bytes: &[u8],
+    fields: &[PartitionSortField],
+) -> Result<Vec<Option<Datum>>> {
+    if fields.is_empty() {
+        return Ok(Vec::new());
+    }
+    let row = BinaryRow::from_serialized_bytes(bytes)?;
+    fields
+        .iter()
+        .map(|field| {
+            if field.field_index >= row.arity() as usize {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Manifest sort field index {} is outside partition row arity {}",
+                        field.field_index,
+                        row.arity()
+                    ),
+                    source: None,
+                });
+            }
+            extract_datum(&row, field.field_index, &field.data_type)
+        })
+        .collect()
+}
+
+fn compare_partition_values(left: &[Option<Datum>], right: &[Option<Datum>]) -> Ordering {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| compare_optional_datums(left, right))
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
+}
+
+#[derive(Debug)]
+enum ManifestEntrySortKey {
+    Partition(Vec<Option<Datum>>),
+    RowId {
+        partition: Vec<Option<Datum>>,
+        first_row_id: i64,
+        range_end: i64,
+        max_sequence_number: i64,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum ManifestBound {
+    Partition(Vec<Option<Datum>>),
+    RowId {
+        partition: Vec<Option<Datum>>,
+        row_id: i64,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestRange {
     pub(crate) meta: ManifestFileMeta,
-    min: Option<Datum>,
-    max: Option<Datum>,
+    min: ManifestBound,
+    max: ManifestBound,
 }
 
 #[derive(Debug, Clone)]
@@ -217,13 +402,13 @@ fn canonical_double(value: f64) -> f64 {
 
 #[derive(Debug)]
 struct SortRecord {
-    key: Option<Datum>,
+    key: ManifestEntrySortKey,
     encoded: Vec<u8>,
     entry: ManifestEntry,
 }
 
 impl SortRecord {
-    fn new(entry: ManifestEntry, sort_key: &PartitionSortKey) -> Result<Self> {
+    fn new(entry: ManifestEntry, sort_key: &ManifestSortKey) -> Result<Self> {
         let key = sort_key.entry_key(&entry)?;
         let encoded =
             serde_json::to_vec(&entry).map_err(|error| crate::Error::UnexpectedError {
@@ -237,7 +422,7 @@ impl SortRecord {
         })
     }
 
-    fn from_encoded(encoded: Vec<u8>, sort_key: &PartitionSortKey) -> Result<Self> {
+    fn from_encoded(encoded: Vec<u8>, sort_key: &ManifestSortKey) -> Result<Self> {
         let entry =
             serde_json::from_slice(&encoded).map_err(|error| crate::Error::UnexpectedError {
                 message: "Failed to decode spilled manifest entry".to_string(),
@@ -253,8 +438,42 @@ impl SortRecord {
 }
 
 fn compare_sort_records(left: &SortRecord, right: &SortRecord) -> Ordering {
-    compare_optional_datums(&left.key, &right.key)
+    let partition_order = match (&left.key, &right.key) {
+        (ManifestEntrySortKey::Partition(left), ManifestEntrySortKey::Partition(right)) => {
+            compare_partition_values(left, right)
+        }
+        (
+            ManifestEntrySortKey::RowId {
+                partition: left, ..
+            },
+            ManifestEntrySortKey::RowId {
+                partition: right, ..
+            },
+        ) => compare_partition_values(left, right),
+        _ => unreachable!("entries in one sorter use one whole-pass sort key"),
+    };
+    partition_order
         .then_with(|| file_kind_order(left.entry.kind()).cmp(&file_kind_order(right.entry.kind())))
+        .then_with(|| match (&left.key, &right.key) {
+            (
+                ManifestEntrySortKey::RowId {
+                    first_row_id: left_first,
+                    range_end: left_end,
+                    max_sequence_number: left_sequence,
+                    ..
+                },
+                ManifestEntrySortKey::RowId {
+                    first_row_id: right_first,
+                    range_end: right_end,
+                    max_sequence_number: right_sequence,
+                    ..
+                },
+            ) => left_first
+                .cmp(right_first)
+                .then_with(|| left_end.cmp(right_end))
+                .then_with(|| right_sequence.cmp(left_sequence)),
+            _ => Ordering::Equal,
+        })
         .then_with(|| {
             left.entry
                 .file()
@@ -277,7 +496,7 @@ struct SpillRun {
 /// manifests remain Avro. Runs are merged until the final fan-in is bounded by
 /// `max_file_handles`.
 pub(crate) struct SpillableManifestSorter {
-    sort_key: PartitionSortKey,
+    sort_key: ManifestSortKey,
     buffer: Vec<SortRecord>,
     buffer_bytes: usize,
     spill_buffer_size: usize,
@@ -290,7 +509,7 @@ pub(crate) struct SpillableManifestSorter {
 }
 
 impl SpillableManifestSorter {
-    pub(crate) fn new(sort_key: &PartitionSortKey, config: &ManifestSortConfig) -> Result<Self> {
+    pub(crate) fn new(sort_key: &ManifestSortKey, config: &ManifestSortConfig) -> Result<Self> {
         let temp_dir = tempfile::tempdir().map_err(|error| crate::Error::UnexpectedError {
             message: "Failed to create manifest-sort spill directory".to_string(),
             source: Some(Box::new(error)),
@@ -518,14 +737,14 @@ pub(crate) struct SpilledManifestEntries {
     _temp_dir: tempfile::TempDir,
     readers: Vec<SpillRunReader>,
     heap: BinaryHeap<HeapRecord>,
-    sort_key: PartitionSortKey,
+    sort_key: ManifestSortKey,
 }
 
 impl SpilledManifestEntries {
     fn new(
         temp_dir: tempfile::TempDir,
         runs: Vec<SpillRun>,
-        sort_key: PartitionSortKey,
+        sort_key: ManifestSortKey,
     ) -> Result<Self> {
         let mut readers = runs
             .iter()
@@ -577,7 +796,7 @@ impl SpillRunReader {
         })
     }
 
-    fn next_record(&mut self, sort_key: &PartitionSortKey) -> Result<Option<SortRecord>> {
+    fn next_record(&mut self, sort_key: &ManifestSortKey) -> Result<Option<SortRecord>> {
         let mut length = [0u8; 8];
         let first =
             self.reader
@@ -712,7 +931,7 @@ pub(crate) fn manifest_may_contain_partition(
 pub(crate) fn plan_rewrite(
     input: &[ManifestFileMeta],
     default_compaction: &HashMap<String, bool>,
-    sort_key: &PartitionSortKey,
+    sort_key: &ManifestSortKey,
     config: &ManifestSortConfig,
 ) -> Result<Option<ManifestRewritePlan>> {
     let lsm_files = input
@@ -721,7 +940,7 @@ pub(crate) fn plan_rewrite(
         .cloned()
         .map(|file| sort_key.range(file))
         .collect::<Result<Vec<_>>>()?;
-    let level_runs = build_level_sorted_runs(lsm_files);
+    let level_runs = build_level_sorted_runs(lsm_files, sort_key);
     let picked_runs = ManifestPickStrategy::new(
         config.max_size_amplification_percent,
         config.sorted_run_size_ratio,
@@ -747,7 +966,7 @@ pub(crate) fn plan_rewrite(
     }
 
     let sections = merge_small_adjacent_sections(
-        split_into_sections(picked_files, default_compaction),
+        split_into_sections(picked_files, default_compaction, sort_key),
         config.target_size,
     );
     Ok(Some(ManifestRewritePlan {
@@ -756,15 +975,18 @@ pub(crate) fn plan_rewrite(
     }))
 }
 
-fn build_level_sorted_runs(mut input: Vec<ManifestRange>) -> Vec<ManifestAdjacentSortedRun> {
-    input.sort_by(compare_ranges);
+fn build_level_sorted_runs(
+    mut input: Vec<ManifestRange>,
+    sort_key: &ManifestSortKey,
+) -> Vec<ManifestAdjacentSortedRun> {
+    input.sort_by(|left, right| compare_ranges(left, right, sort_key));
     let mut runs: Vec<Vec<ManifestRange>> = Vec::new();
     for file in input {
         let earliest = runs
             .iter()
             .enumerate()
             .min_by(|(_, left), (_, right)| {
-                compare_optional_datums(
+                sort_key.compare_bounds(
                     &left.last().expect("non-empty run").max,
                     &right.last().expect("non-empty run").max,
                 )
@@ -772,10 +994,8 @@ fn build_level_sorted_runs(mut input: Vec<ManifestRange>) -> Vec<ManifestAdjacen
             .map(|(index, _)| index);
         match earliest {
             Some(index)
-                if compare_optional_datums(
-                    &file.min,
-                    &runs[index].last().expect("non-empty run").max,
-                ) != Ordering::Less =>
+                if sort_key
+                    .is_after_max(&file.min, &runs[index].last().expect("non-empty run").max) =>
             {
                 runs[index].push(file);
             }
@@ -802,18 +1022,19 @@ fn build_level_sorted_runs(mut input: Vec<ManifestRange>) -> Vec<ManifestAdjacen
 fn split_into_sections(
     mut picked_files: Vec<ManifestRange>,
     default_compaction: &HashMap<String, bool>,
+    sort_key: &ManifestSortKey,
 ) -> Vec<ManifestSection> {
-    picked_files.sort_by(compare_ranges);
+    picked_files.sort_by(|left, right| compare_ranges(left, right, sort_key));
     let mut sections = Vec::new();
     let mut current_files = Vec::new();
     let mut current_size = 0;
     let mut current_has_default = false;
-    let mut current_max: Option<Option<Datum>> = None;
+    let mut current_max: Option<ManifestBound> = None;
 
     for file in picked_files {
         let starts_new = current_max
             .as_ref()
-            .is_some_and(|max| compare_optional_datums(&file.min, max) != Ordering::Less);
+            .is_some_and(|max| sort_key.is_after_max(&file.min, max));
         if starts_new {
             sections.push(ManifestSection {
                 files: current_files,
@@ -830,7 +1051,7 @@ fn split_into_sections(
         current_has_default |= default_compaction.contains_key(file.meta.file_name());
         if current_max
             .as_ref()
-            .is_none_or(|max| compare_optional_datums(&file.max, max) == Ordering::Greater)
+            .is_none_or(|max| sort_key.compare_bounds(&file.max, max) == Ordering::Greater)
         {
             current_max = Some(file.max.clone());
         }
@@ -924,9 +1145,14 @@ impl ManifestPickStrategy {
     }
 }
 
-fn compare_ranges(left: &ManifestRange, right: &ManifestRange) -> Ordering {
-    compare_optional_datums(&left.min, &right.min)
-        .then_with(|| compare_optional_datums(&left.max, &right.max))
+fn compare_ranges(
+    left: &ManifestRange,
+    right: &ManifestRange,
+    sort_key: &ManifestSortKey,
+) -> Ordering {
+    sort_key
+        .compare_bounds(&left.min, &right.min)
+        .then_with(|| sort_key.compare_bounds(&left.max, &right.max))
         .then_with(|| left.meta.file_name().cmp(right.meta.file_name()))
 }
 
@@ -960,19 +1186,43 @@ mod tests {
         )
     }
 
-    fn sort_key() -> PartitionSortKey {
-        PartitionSortKey::new(
+    fn row_id_meta(
+        name: &str,
+        size: i64,
+        partition: i32,
+        min_row_id: i64,
+        max_row_id: i64,
+    ) -> ManifestFileMeta {
+        meta(name, size, partition, partition).with_row_id_stats(Some(min_row_id), Some(max_row_id))
+    }
+
+    fn sort_key() -> ManifestSortKey {
+        ManifestSortKey::create(
             &[DataField::new(
                 0,
                 "pt".to_string(),
                 DataType::Int(IntType::new()),
             )],
             None,
+            false,
+            &[],
         )
+        .unwrap()
         .unwrap()
     }
 
     fn entry(kind: FileKind, partition: i32, file_name: &str) -> ManifestEntry {
+        row_id_entry(kind, partition, file_name, None, 1, 0)
+    }
+
+    fn row_id_entry(
+        kind: FileKind,
+        partition: i32,
+        file_name: &str,
+        first_row_id: Option<i64>,
+        row_count: i64,
+        max_sequence_number: i64,
+    ) -> ManifestEntry {
         ManifestEntry::new(
             kind,
             row(partition),
@@ -981,13 +1231,13 @@ mod tests {
             DataFileMeta {
                 file_name: file_name.to_string(),
                 file_size: 1,
-                row_count: 1,
+                row_count,
                 min_key: Vec::new(),
                 max_key: Vec::new(),
                 key_stats: BinaryTableStats::empty(),
                 value_stats: BinaryTableStats::empty(),
                 min_sequence_number: 0,
-                max_sequence_number: 0,
+                max_sequence_number,
                 schema_id: 0,
                 level: 0,
                 extra_files: Vec::new(),
@@ -997,7 +1247,7 @@ mod tests {
                 file_source: None,
                 value_stats_cols: None,
                 external_path: None,
-                first_row_id: None,
+                first_row_id,
                 write_cols: None,
                 column_max_sequence_numbers: None,
             },
@@ -1030,12 +1280,89 @@ mod tests {
             key.range(meta("a", 100, 0, 10)).unwrap(),
             key.range(meta("b", 100, 10, 20)).unwrap(),
         ];
-        let runs = build_level_sorted_runs(ranges.clone());
+        let runs = build_level_sorted_runs(ranges.clone(), &key);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].files.len(), 2);
 
-        let sections = split_into_sections(ranges, &HashMap::new());
+        let sections = split_into_sections(ranges, &HashMap::new(), &key);
         assert_eq!(sections.len(), 2);
+    }
+
+    #[test]
+    fn row_id_boundary_equality_overlaps_runs_and_sections() {
+        let manifests = vec![
+            row_id_meta("a", 100, 0, 0, 10),
+            row_id_meta("b", 100, 0, 10, 20),
+        ];
+        let key = ManifestSortKey::create(
+            &[DataField::new(
+                0,
+                "pt".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            None,
+            true,
+            &manifests,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(key, ManifestSortKey::RowId { .. }));
+
+        let ranges = manifests
+            .into_iter()
+            .map(|meta| key.range(meta))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let runs = build_level_sorted_runs(ranges.clone(), &key);
+        assert_eq!(runs.len(), 2);
+
+        let sections = split_into_sections(ranges, &HashMap::new(), &key);
+        assert_eq!(sections.len(), 1);
+    }
+
+    #[test]
+    fn row_id_sort_orders_kind_range_sequence_and_name() {
+        let manifests = vec![row_id_meta("m", 100, 0, 10, 20)];
+        let key = ManifestSortKey::create(
+            &[DataField::new(
+                0,
+                "pt".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            None,
+            true,
+            &manifests,
+        )
+        .unwrap()
+        .unwrap();
+        let mut sorter = SpillableManifestSorter::new(&key, &spill_config(1, 2, u64::MAX)).unwrap();
+        sorter
+            .push(row_id_entry(FileKind::Delete, 0, "delete", Some(1), 1, 0))
+            .unwrap();
+        sorter
+            .push(row_id_entry(FileKind::Add, 0, "later", Some(2), 1, 0))
+            .unwrap();
+        sorter
+            .push(row_id_entry(FileKind::Add, 0, "old", Some(1), 1, 3))
+            .unwrap();
+        sorter
+            .push(row_id_entry(FileKind::Add, 0, "new", Some(1), 1, 5))
+            .unwrap();
+
+        let mut sorted = sorter.finish().unwrap();
+        let mut actual = Vec::new();
+        while let Some(entry) = sorted.next_entry().unwrap() {
+            actual.push((*entry.kind(), entry.file().file_name.clone()));
+        }
+        assert_eq!(
+            actual,
+            vec![
+                (FileKind::Add, "new".to_string()),
+                (FileKind::Add, "old".to_string()),
+                (FileKind::Add, "later".to_string()),
+                (FileKind::Delete, "delete".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1046,7 +1373,7 @@ mod tests {
             .enumerate()
             .map(|(index, size)| key.range(meta(&format!("m-{index}"), size, 0, 10)).unwrap())
             .collect();
-        let runs = build_level_sorted_runs(files);
+        let runs = build_level_sorted_runs(files, &key);
         assert_eq!(runs.len(), 5);
         let picked = ManifestPickStrategy::new(1_000, 1).pick(&runs);
         assert_eq!(picked, vec![0, 1]);

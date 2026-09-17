@@ -1788,9 +1788,15 @@ impl Schema {
             return Ok(());
         }
         if partition_keys.is_empty() {
+            if core_options.data_evolution_enabled()
+                && core_options.manifest_sort_partition_field().is_none()
+            {
+                return Ok(());
+            }
             return Err(crate::Error::ConfigInvalid {
                 message: format!(
-                    "Cannot enable '{MANIFEST_SORT_ENABLED_OPTION}' for non-partition table."
+                    "Cannot enable '{MANIFEST_SORT_ENABLED_OPTION}' for a non-partition table \
+                     without Data Evolution RowID sorting."
                 ),
             });
         }
@@ -3523,6 +3529,14 @@ mod tests {
             .option(MANIFEST_SORT_ENABLED_OPTION, "true")
             .build();
         assert_config_invalid(non_partitioned, "non-partition table");
+
+        Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option(MANIFEST_SORT_ENABLED_OPTION, "true")
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
 
         let invalid_field = Schema::builder()
             .column("pt", DataType::Int(IntType::new()))

@@ -35,7 +35,7 @@ use crate::table::global_index_build_common::same_extra_field_ids;
 use crate::table::index_file_path::committed_index_file_path;
 use crate::table::manifest_sort::{
     manifest_may_contain_partition, plan_rewrite, reaches_full_compaction_threshold,
-    ManifestRewritePlan, ManifestSection, ManifestSortConfig, PartitionSortKey,
+    ManifestRewritePlan, ManifestSection, ManifestSortConfig, ManifestSortKey,
     SpillableManifestSorter,
 };
 use crate::table::partition_filter::PartitionFilter;
@@ -1150,7 +1150,16 @@ impl TableCommit {
                 .sort_manifest_files(file_io, manifest_dir, manifest_files)
                 .await;
         }
+        self.merge_manifest_files_legacy(file_io, manifest_dir, manifest_files)
+            .await
+    }
 
+    async fn merge_manifest_files_legacy(
+        &self,
+        file_io: &FileIO,
+        manifest_dir: &str,
+        manifest_files: Vec<ManifestFileMeta>,
+    ) -> Result<(Vec<ManifestFileMeta>, Vec<ManifestFileMeta>)> {
         let target_size = self.manifest_target_size.max(1);
         let mut result = Vec::new();
         let mut new_files = Vec::new();
@@ -1196,10 +1205,17 @@ impl TableCommit {
         manifest_files: Vec<ManifestFileMeta>,
     ) -> Result<(Vec<ManifestFileMeta>, Vec<ManifestFileMeta>)> {
         let partition_fields = self.table.schema().partition_fields();
-        let sort_key = PartitionSortKey::new(
+        let Some(sort_key) = ManifestSortKey::create(
             &partition_fields,
             self.manifest_sort_partition_field.as_deref(),
-        )?;
+            self.data_evolution_enabled,
+            &manifest_files,
+        )?
+        else {
+            return self
+                .merge_manifest_files_legacy(file_io, manifest_dir, manifest_files)
+                .await;
+        };
         let mut new_files = Vec::new();
         let result = self
             .sort_manifest_files_inner(
@@ -1226,7 +1242,7 @@ impl TableCommit {
         manifest_dir: &str,
         manifest_files: &[ManifestFileMeta],
         partition_fields: &[crate::spec::DataField],
-        sort_key: &PartitionSortKey,
+        sort_key: &ManifestSortKey,
         new_files: &mut Vec<ManifestFileMeta>,
     ) -> Result<Vec<ManifestFileMeta>> {
         if reaches_full_compaction_threshold(
@@ -1258,7 +1274,7 @@ impl TableCommit {
         manifest_dir: &str,
         manifest_files: &[ManifestFileMeta],
         partition_fields: &[crate::spec::DataField],
-        sort_key: &PartitionSortKey,
+        sort_key: &ManifestSortKey,
         new_files: &mut Vec<ManifestFileMeta>,
     ) -> Result<Option<Vec<ManifestFileMeta>>> {
         let mut deleted_identifiers = HashSet::new();
@@ -1328,7 +1344,7 @@ impl TableCommit {
         file_io: &FileIO,
         manifest_dir: &str,
         manifest_files: &[ManifestFileMeta],
-        sort_key: &PartitionSortKey,
+        sort_key: &ManifestSortKey,
         new_files: &mut Vec<ManifestFileMeta>,
     ) -> Result<Vec<ManifestFileMeta>> {
         let default_compaction = manifest_files
@@ -1377,7 +1393,7 @@ impl TableCommit {
         default_compaction: &HashMap<String, bool>,
         deleted_identifiers: &HashSet<crate::spec::Identifier>,
         full_compaction: bool,
-        sort_key: &PartitionSortKey,
+        sort_key: &ManifestSortKey,
         new_files: &mut Vec<ManifestFileMeta>,
         output: &mut ManifestRewriteOutput,
     ) -> Result<()> {
@@ -1496,7 +1512,7 @@ impl TableCommit {
         default_compaction: &HashMap<String, bool>,
         deleted_identifiers: &HashSet<crate::spec::Identifier>,
         full_compaction: bool,
-        sort_key: &PartitionSortKey,
+        sort_key: &ManifestSortKey,
         new_files: &mut Vec<ManifestFileMeta>,
         output: &mut ManifestRewriteOutput,
     ) -> Result<()> {
@@ -1554,7 +1570,7 @@ impl TableCommit {
         default_compaction: &HashMap<String, bool>,
         deleted_identifiers: &HashSet<crate::spec::Identifier>,
         full_compaction: bool,
-        sort_key: &PartitionSortKey,
+        sort_key: &ManifestSortKey,
         new_files: &mut Vec<ManifestFileMeta>,
         output: &mut ManifestRewriteOutput,
     ) -> Result<()> {
