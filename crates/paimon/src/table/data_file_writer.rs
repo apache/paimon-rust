@@ -25,7 +25,7 @@
 use crate::arrow::format::{create_format_writer, FormatFileWriter, FormatValueStats};
 use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
-use crate::spec::{bucket_dir_name, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
+use crate::spec::{bucket_path_under, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
 use crate::Result;
 use arrow_array::RecordBatch;
 use chrono::Utc;
@@ -142,16 +142,7 @@ impl DataFileWriter {
             self.written_files.len(),
             self.file_format,
         );
-        let bucket_dir = if self.partition_path.is_empty() {
-            format!("{}/{}", self.table_location, bucket_dir_name(self.bucket))
-        } else {
-            format!(
-                "{}/{}/{}",
-                self.table_location,
-                self.partition_path,
-                bucket_dir_name(self.bucket)
-            )
-        };
+        let bucket_dir = bucket_path_under(&self.table_location, &self.partition_path, self.bucket);
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
 
         let file_path = format!("{bucket_dir}/{file_name}");
@@ -278,5 +269,80 @@ impl DataFileWriter {
             write_cols,
             column_max_sequence_numbers: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::{FileIOBuilder, FileIOProvider};
+    use crate::spec::{DataType, IntType};
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema};
+    use opendal::Operator;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct RecordingProvider {
+        operator: Operator,
+        paths: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileIOProvider for RecordingProvider {
+        async fn create(&self, path: &str) -> Result<(Operator, String)> {
+            let relative_path = path
+                .strip_prefix("s3://bucket/")
+                .expect("writer path must use the configured bucket")
+                .to_string();
+            self.paths.lock().unwrap().push(relative_path.clone());
+            Ok((self.operator.clone(), relative_path))
+        }
+    }
+
+    #[tokio::test]
+    async fn partitioned_writer_does_not_create_double_slash_bucket_paths() {
+        let provider = Arc::new(RecordingProvider {
+            operator: Operator::from_config(opendal::services::MemoryConfig::default()).unwrap(),
+            paths: Mutex::new(Vec::new()),
+        });
+        let file_io = FileIOBuilder::new("unused")
+            .with_provider(provider.clone())
+            .build()
+            .unwrap();
+        let mut writer = DataFileWriter::new(
+            file_io,
+            "s3://bucket/table".to_string(),
+            "dt=2026-09-17/".to_string(),
+            0,
+            0,
+            i64::MAX,
+            "none".to_string(),
+            0,
+            1024,
+            "parquet".to_string(),
+            vec![DataField::new(
+                0,
+                "id".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            HashMap::new(),
+            None,
+            None,
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+
+        writer.open_new_file(schema).await.unwrap();
+
+        assert!(provider
+            .paths
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|path| !path.contains("//")));
     }
 }
