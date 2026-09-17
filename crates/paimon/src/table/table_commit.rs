@@ -597,6 +597,7 @@ impl TableCommit {
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.ensure_not_format_table()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         if partitions.is_empty() {
@@ -678,6 +679,7 @@ impl TableCommit {
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.ensure_not_format_table()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         self.try_commit(
@@ -696,6 +698,21 @@ impl TableCommit {
             filter_committed,
         )
         .await
+    }
+
+    /// A Format Table has no snapshots, so an overwrite commit would find nothing to delete and
+    /// report success; see [`crate::table::FormatTableTruncator`].
+    fn ensure_not_format_table(&self) -> Result<()> {
+        if CoreOptions::new(self.table.schema().options()).is_format_table() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "Format Table {} cannot be truncated through a snapshot commit; use \
+                     FormatTableTruncator or TRUNCATE TABLE in SQL",
+                    self.table.identifier().full_name()
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Abort a prepared commit by deleting newly written data, changelog and index files.

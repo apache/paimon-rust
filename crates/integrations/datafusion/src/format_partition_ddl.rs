@@ -40,7 +40,9 @@ use paimon::table::{
 };
 
 use crate::error::to_datafusion_error;
-use crate::sql_context::{is_table_not_exist, ok_result, partition_assignment, SQLContext};
+use crate::sql_context::{
+    is_table_not_exist, normalize_schema_identifier, ok_result, partition_assignment, SQLContext,
+};
 
 #[derive(Debug)]
 pub(crate) struct ShowPartitionsStatement {
@@ -356,6 +358,63 @@ pub(crate) async fn drop_catalog_managed_partitions(
             .map_err(to_datafusion_error)?;
     }
     ok_result(ctx.ctx())
+}
+
+/// The values a `PARTITION (...)` clause of ANALYZE or TRUNCATE fixes, in partition-key order.
+/// Valued columns must be a leading run of the keys, so `PARTITION (hour = '00')` is rejected.
+pub(crate) fn leading_partition_prefix(
+    expressions: &[SqlExpr],
+    table: &paimon::Table,
+    operation: &str,
+    enable_ident_normalization: bool,
+) -> DFResult<Vec<(String, String)>> {
+    let partition_keys = table.schema().partition_keys();
+    let mut named = HashSet::with_capacity(expressions.len());
+    let mut assignments = Vec::with_capacity(expressions.len());
+    for expression in expressions {
+        let column = match expression {
+            SqlExpr::Identifier(identifier) => {
+                normalize_schema_identifier(identifier, enable_ident_normalization)
+            }
+            other => {
+                let (column, _) = partition_assignment(other, enable_ident_normalization)?;
+                assignments.push(other.clone());
+                column
+            }
+        };
+        if !partition_keys.contains(&column) {
+            return Err(DataFusionError::Plan(format!(
+                "Column '{column}' is not a partition column"
+            )));
+        }
+        if !named.insert(column.clone()) {
+            return Err(DataFusionError::Plan(format!(
+                "Duplicate partition column '{column}'"
+            )));
+        }
+    }
+    let spec = parse_format_partition_spec(
+        &assignments,
+        table,
+        false,
+        Some(operation),
+        enable_ident_normalization,
+    )?;
+    let leading = partition_keys
+        .iter()
+        .take_while(|key| spec.contains_key(key.as_str()))
+        .count();
+    if leading != spec.len() {
+        return Err(DataFusionError::Plan(format!(
+            "{operation} {} PARTITION must give values for a leading run of its partition \
+             columns {partition_keys:?}",
+            table.identifier().full_name()
+        )));
+    }
+    Ok(partition_keys[..leading]
+        .iter()
+        .map(|key| (key.clone(), spec[key].clone()))
+        .collect())
 }
 
 /// Whether the catalog registered a partition at a location of its own rather than under the

@@ -458,6 +458,23 @@ pub(crate) async fn list_format_table_data_files(
     partition_levels_below_root: usize,
     format_extension: &str,
 ) -> crate::Result<Vec<crate::io::FileStatus>> {
+    list_format_table_files(
+        file_io,
+        root,
+        partition_levels_below_root,
+        Some(format_extension),
+    )
+    .await
+}
+
+/// As [`list_format_table_data_files`], with every non-hidden file when `format_extension` is
+/// `None`: the files Java treats as table data, whatever their names end with.
+pub(crate) async fn list_format_table_files(
+    file_io: &crate::io::FileIO,
+    root: &str,
+    partition_levels_below_root: usize,
+    format_extension: Option<&str>,
+) -> crate::Result<Vec<crate::io::FileStatus>> {
     let statuses = match file_io.list_status_recursive_stream(root, None).await {
         Ok(listing) => collect_listing(listing).await?,
         Err(error) if is_storage_not_found(&error) => Vec::new(),
@@ -471,7 +488,8 @@ pub(crate) async fn list_format_table_data_files(
         }
         let is_data_file = split_parent_and_file(&status.path).is_some_and(|(_, file_name)| {
             is_format_table_data_file_name(file_name)
-                && file_name.to_ascii_lowercase().ends_with(format_extension)
+                && format_extension
+                    .is_none_or(|extension| file_name.to_ascii_lowercase().ends_with(extension))
         });
         if !is_data_file {
             continue;
