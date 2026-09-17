@@ -47,7 +47,16 @@ pub(super) fn data_split_for_shard_ranges(
 pub(super) struct ValidatedVectorBatch<'a> {
     pub(super) values: &'a [f32],
     pub(super) bytes: &'a [u8],
+    pub(super) row_ids: &'a [i64],
     pub(super) row_count: usize,
+}
+
+pub(super) fn extract_vector_batch<'a>(
+    batch: &'a RecordBatch,
+    index_column: &str,
+    dimension: usize,
+) -> Result<ValidatedVectorBatch<'a>> {
+    validate_vector_batch_with(batch, index_column, dimension, |_| Ok(()))
 }
 
 pub(super) fn validate_vector_batch<'a>(
@@ -245,6 +254,7 @@ fn validate_vector_batch_with<'a>(
     Ok(ValidatedVectorBatch {
         values: &values.values()[start..end],
         bytes: &values.values().inner().as_slice()[byte_start..byte_end],
+        row_ids: row_ids.values(),
         row_count: batch.num_rows(),
     })
 }
