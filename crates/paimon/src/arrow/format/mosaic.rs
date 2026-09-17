@@ -317,15 +317,28 @@ impl<T> MosaicTask<T> {
     }
 }
 
-fn mosaic_executor() -> crate::Result<&'static MosaicExecutor> {
-    static EXECUTOR: OnceLock<Result<MosaicExecutor, String>> = OnceLock::new();
-    match EXECUTOR.get_or_init(|| MosaicExecutor::new().map_err(|error| error.to_string())) {
-        Ok(executor) => Ok(executor),
-        Err(message) => Err(Error::UnexpectedError {
-            message: message.clone(),
-            source: None,
-        }),
+fn get_or_try_init<'a, T, E>(
+    cell: &'a OnceLock<T>,
+    init_lock: &Mutex<()>,
+    initialize: impl FnOnce() -> Result<T, E>,
+) -> Result<&'a T, E> {
+    if let Some(value) = cell.get() {
+        return Ok(value);
     }
+    let _guard = init_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(value) = cell.get() {
+        return Ok(value);
+    }
+    let value = initialize()?;
+    Ok(cell.get_or_init(|| value))
+}
+
+fn mosaic_executor() -> crate::Result<&'static MosaicExecutor> {
+    static EXECUTOR: OnceLock<MosaicExecutor> = OnceLock::new();
+    static INIT_LOCK: Mutex<()> = Mutex::new(());
+    get_or_try_init(&EXECUTOR, &INIT_LOCK, MosaicExecutor::new)
 }
 
 fn read_mosaic_batches_blocking(
@@ -453,6 +466,10 @@ fn read_mosaic_batches_blocking(
                 return Ok(());
             }
         }
+        return Ok(());
+    }
+
+    if planned.is_empty() {
         return Ok(());
     }
 
@@ -1016,7 +1033,36 @@ mod tests {
     use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    #[test]
+    fn test_mosaic_executor_init_retries_after_transient_failure() {
+        let executor = OnceLock::new();
+        let init_lock = Mutex::new(());
+        let attempts = AtomicUsize::new(0);
+        let initialize = || {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("transient thread creation failure")
+            } else {
+                Ok(42)
+            }
+        };
+
+        assert_eq!(
+            get_or_try_init(&executor, &init_lock, initialize),
+            Err("transient thread creation failure")
+        );
+        assert!(executor.get().is_none(), "a failed init must not be cached");
+        assert_eq!(
+            *get_or_try_init(&executor, &init_lock, initialize).unwrap(),
+            42
+        );
+        assert_eq!(
+            *get_or_try_init(&executor, &init_lock, initialize).unwrap(),
+            42
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
 
     struct TestFileRead {
         data: Bytes,
