@@ -93,7 +93,6 @@ const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
 const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
     "read.parquet.row-group.max-inflight-bytes";
-const MOSAIC_ROW_GROUP_PARALLELISM_OPTION: &str = "read.mosaic.row-group.parallelism";
 pub(crate) const TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION: &str =
     "table-read.sequence-number.enabled";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
@@ -141,7 +140,6 @@ const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_READ_BATCH_SIZE: usize = 1024;
 const DEFAULT_PARQUET_ROW_GROUP_PARALLELISM: usize = 8;
 const DEFAULT_PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES: i64 = 256 * 1024 * 1024;
-const DEFAULT_MOSAIC_ROW_GROUP_PARALLELISM: usize = 8;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
@@ -397,30 +395,6 @@ impl<'a> CoreOptions<'a> {
             return Err(crate::Error::DataInvalid {
                 message: format!(
                     "Option '{PARQUET_ROW_GROUP_PARALLELISM_OPTION}' must be greater than 0"
-                ),
-                source: None,
-            });
-        }
-        Ok(value)
-    }
-
-    /// Maximum concurrent Mosaic row-group reads shared by every file in a scan.
-    pub fn mosaic_row_group_parallelism(&self) -> crate::Result<usize> {
-        let Some(raw) = self.options.get(MOSAIC_ROW_GROUP_PARALLELISM_OPTION) else {
-            return Ok(DEFAULT_MOSAIC_ROW_GROUP_PARALLELISM);
-        };
-        let value = raw
-            .parse::<usize>()
-            .map_err(|error| crate::Error::DataInvalid {
-                message: format!(
-                    "Option '{MOSAIC_ROW_GROUP_PARALLELISM_OPTION}' must be a positive integer, got: {raw}"
-                ),
-                source: Some(Box::new(error)),
-            })?;
-        if value == 0 {
-            return Err(crate::Error::DataInvalid {
-                message: format!(
-                    "Option '{MOSAIC_ROW_GROUP_PARALLELISM_OPTION}' must be greater than 0"
                 ),
                 source: None,
             });
@@ -1700,38 +1674,6 @@ mod tests {
             )]);
             assert!(CoreOptions::new(&options)
                 .parquet_row_group_max_inflight_bytes()
-                .is_err());
-        }
-    }
-
-    #[test]
-    fn test_mosaic_row_group_parallelism_option() {
-        let options = HashMap::new();
-        assert_eq!(
-            CoreOptions::new(&options)
-                .mosaic_row_group_parallelism()
-                .unwrap(),
-            8
-        );
-
-        let options = HashMap::from([(
-            MOSAIC_ROW_GROUP_PARALLELISM_OPTION.to_string(),
-            "3".to_string(),
-        )]);
-        assert_eq!(
-            CoreOptions::new(&options)
-                .mosaic_row_group_parallelism()
-                .unwrap(),
-            3
-        );
-
-        for value in ["0", "-1", "invalid"] {
-            let options = HashMap::from([(
-                MOSAIC_ROW_GROUP_PARALLELISM_OPTION.to_string(),
-                value.to_string(),
-            )]);
-            assert!(CoreOptions::new(&options)
-                .mosaic_row_group_parallelism()
                 .is_err());
         }
     }

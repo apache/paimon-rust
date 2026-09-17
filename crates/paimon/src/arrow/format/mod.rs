@@ -193,7 +193,7 @@ pub(crate) fn create_format_reader(
     create_format_reader_with_budget(path, blob_as_descriptor, read_fields, None)
 }
 
-/// Create a format reader with scan-shared row-group resource budgets.
+/// Create a format reader with a scan-shared Parquet resource budget.
 pub(crate) fn create_format_reader_with_budget(
     path: &str,
     blob_as_descriptor: bool,
@@ -219,11 +219,10 @@ pub(crate) fn create_format_reader_with_budget(
         Box::new(row::RowFormatReader)
     } else {
         if lower.ends_with(".mosaic") {
-            let reader: Box<dyn FormatFileReader> = Box::new(match parquet_read_budget {
-                Some(read_budget) => mosaic::MosaicFormatReader::with_read_budget(read_budget),
-                None => mosaic::MosaicFormatReader::default(),
-            });
-            return Ok(shredding::maybe_wrap_reader(reader, read_fields));
+            return Ok(shredding::maybe_wrap_reader(
+                Box::new(mosaic::MosaicFormatReader),
+                read_fields,
+            ));
         }
         #[cfg(feature = "vortex")]
         if lower.ends_with(".vortex") {
