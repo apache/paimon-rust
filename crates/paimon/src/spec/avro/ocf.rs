@@ -29,6 +29,8 @@ pub struct OcfHeader {
     pub schema_json: String,
     pub codec: OcfCodec,
     pub sync_marker: [u8; SYNC_MARKER_LEN],
+    /// Encoded header length, including the sync marker.
+    pub encoded_len: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +44,10 @@ pub enum OcfCodec {
 pub struct OcfBlock<'a> {
     pub object_count: usize,
     pub data: Cow<'a, [u8]>,
+    /// Offset of the encoded block in the original OCF container.
+    pub encoded_offset: usize,
+    /// Length of the complete encoded block, including its sync marker.
+    pub encoded_len: usize,
 }
 
 /// Streaming iterator over OCF blocks with lazy decompression and reusable decoder state.
@@ -67,6 +73,7 @@ impl<'a> OcfBlockIter<'a> {
             return Ok(None);
         }
 
+        let encoded_offset = self.cursor.position();
         let raw_object_count = self.cursor.read_long()?;
         if raw_object_count < 0 {
             return Err(Error::UnexpectedError {
@@ -95,7 +102,12 @@ impl<'a> OcfBlockIter<'a> {
             });
         }
 
-        Ok(Some(OcfBlock { object_count, data }))
+        Ok(Some(OcfBlock {
+            object_count,
+            data,
+            encoded_offset,
+            encoded_len: self.cursor.position() - encoded_offset,
+        }))
     }
 
     fn decompress(&mut self, data: &'a [u8]) -> crate::Result<Cow<'a, [u8]>> {
@@ -181,6 +193,7 @@ pub fn parse_ocf_streaming(bytes: &[u8]) -> crate::Result<(OcfHeader, OcfBlockIt
         schema_json,
         codec,
         sync_marker,
+        encoded_len: cursor.position(),
     };
 
     let iter = OcfBlockIter::new(cursor, header.codec, header.sync_marker);

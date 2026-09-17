@@ -37,9 +37,9 @@ use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_path, BinaryRow, BucketFunctionType, CoreOptions, DataField,
     DataFileMeta, FileKind, GlobalIndexSearchMode, IndexManifest, IndexManifestEntry,
-    ManifestEntry, PartitionComputer, Predicate, Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
-    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
-    VALUE_KIND_FIELD_NAME,
+    ManifestEntry, ManifestFileMeta, ManifestSidecar, PartitionComputer, Predicate, Snapshot,
+    ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
+    VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bin_pack::{pack_for_ordered, split_for_batch};
 use crate::table::index_file_path::IndexFileLocation;
@@ -111,6 +111,89 @@ async fn read_manifest_list(
     crate::spec::avro::from_avro_bytes_fast::<crate::spec::ManifestFileMeta>(&bytes)
 }
 
+struct ManifestSidecarPruning<'a> {
+    row_range_index: Option<&'a RowRangeIndex>,
+    partition_filter: Option<&'a PartitionFilter>,
+    partition_arity: usize,
+    bucket_predicate: Option<&'a Predicate>,
+    bucket_key_fields: &'a [DataField],
+    bucket_function_type: BucketFunctionType,
+}
+
+impl ManifestSidecarPruning<'_> {
+    fn has_filter(&self) -> bool {
+        self.row_range_index.is_some()
+            || self.partition_filter.is_some()
+            || self.bucket_predicate.is_some()
+    }
+}
+
+/// Read a complete manifest or a sidecar-selected OCF stream.
+///
+/// Callers decide whether row-range block pruning is safe by supplying or omitting
+/// `row_range_index`; incremental paths must validate DELETE entries before pruning them.
+async fn read_manifest_bytes_with_sidecar(
+    file_io: &FileIO,
+    path: &str,
+    manifest: &ManifestFileMeta,
+    enabled: bool,
+    pruning: ManifestSidecarPruning<'_>,
+) -> crate::Result<bytes::Bytes> {
+    if !enabled || !pruning.has_filter() {
+        return file_io.new_input(path)?.read().await;
+    }
+
+    let ManifestSidecarPruning {
+        row_range_index,
+        partition_filter,
+        partition_arity,
+        bucket_predicate,
+        bucket_key_fields,
+        bucket_function_type,
+    } = pruning;
+    let row_filter = |start, end| row_range_index.is_some_and(|index| index.intersects(start, end));
+    let mut partition_block_filter = |partition: &[u8]| {
+        partition_filter
+            .and_then(|filter| filter.matches_entry(partition).ok())
+            .unwrap_or(true)
+    };
+    let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+    let mut bucket_block_filter = |bucket: i32, total_buckets: i32| {
+        let Some(predicate) = bucket_predicate else {
+            return true;
+        };
+        bucket_cache
+            .entry(total_buckets)
+            .or_insert_with(|| {
+                compute_target_buckets(
+                    predicate,
+                    bucket_key_fields,
+                    bucket_function_type,
+                    total_buckets,
+                )
+            })
+            .as_ref()
+            .is_none_or(|targets| targets.contains(&bucket))
+    };
+    let selection = ManifestSidecar::read_with_filters(
+        file_io,
+        path,
+        manifest,
+        row_range_index.map(|_| &row_filter as &(dyn Fn(i64, i64) -> bool + Sync)),
+        partition_filter
+            .map(|_| &mut partition_block_filter as &mut (dyn FnMut(&[u8]) -> bool + Send)),
+        Some(partition_arity),
+        bucket_predicate
+            .map(|_| &mut bucket_block_filter as &mut (dyn FnMut(i32, i32) -> bool + Send)),
+    )
+    .await;
+
+    match selection.as_ref() {
+        Some(selection) => ManifestSidecar::read_selected_bytes(file_io, path, selection).await,
+        None => file_io.new_input(path)?.read().await,
+    }
+}
+
 fn validate_incremental_entries(entries: &[ManifestEntry]) -> crate::Result<()> {
     if entries.iter().any(|entry| *entry.kind() != FileKind::Add) {
         return Err(crate::Error::DataInvalid {
@@ -157,6 +240,7 @@ async fn read_all_manifest_entries(
     bucket_key_fields: &[DataField],
     bucket_function_type: BucketFunctionType,
     row_range_index: Option<&RowRangeIndex>,
+    manifest_sidecar_enabled: bool,
     trace: Option<&mut ScanTrace>,
 ) -> crate::Result<Vec<ManifestEntry>> {
     let incremental = matches!(&source, ManifestListSource::AppendDeltas(_));
@@ -235,8 +319,24 @@ async fn read_all_manifest_entries(
             let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
             let cache = shared_cache.clone();
             async move {
-                let input_file = file_io.new_input(&path)?;
-                let content = input_file.read().await?;
+                // Incremental delta validation must observe every ADD/DELETE before
+                // row-range pruning; keep its existing post-validation row filter.
+                let sidecar_row_index = (!incremental).then_some(row_range_index).flatten();
+                let content = read_manifest_bytes_with_sidecar(
+                    file_io,
+                    &path,
+                    &meta,
+                    manifest_sidecar_enabled,
+                    ManifestSidecarPruning {
+                        row_range_index: sidecar_row_index,
+                        partition_filter,
+                        partition_arity: partition_fields.len(),
+                        bucket_predicate,
+                        bucket_key_fields,
+                        bucket_function_type,
+                    },
+                )
+                .await?;
 
                 // Per-task bucket cache (few distinct total_buckets values per manifest).
                 let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
@@ -1427,6 +1527,7 @@ impl<'a> PaimonTableScan<'a> {
             &bucket_key_fields,
             bucket_function_type,
             row_range_index,
+            core_options.manifest_sidecar_enabled(),
             trace,
         )
         .await?;
@@ -1907,8 +2008,24 @@ impl<'a> PaimonTableScan<'a> {
         let mut entries = Vec::new();
         for meta in manifest_metas {
             let path = format!("{base_path}/{}", meta.file_name());
-            let input = file_io.new_input(&path)?;
-            let bytes = input.read().await?;
+            // This path validates incremental/changelog manifests before its
+            // existing post-read row-range pruning, so do not hide DELETEs at
+            // the block layer.
+            let bytes = read_manifest_bytes_with_sidecar(
+                file_io,
+                &path,
+                &meta,
+                core_options.manifest_sidecar_enabled(),
+                ManifestSidecarPruning {
+                    row_range_index: None,
+                    partition_filter,
+                    partition_arity: partition_fields.len(),
+                    bucket_predicate,
+                    bucket_key_fields: &bucket_key_fields,
+                    bucket_function_type,
+                },
+            )
+            .await?;
             let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
             let manifest_entries = crate::spec::avro::from_manifest_bytes_filtered_shared(
                 &bytes,
@@ -3624,6 +3741,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_manifest_sidecar_prunes_avro_blocks_before_entry_decode() {
+        const FILE_COUNT: usize = 1_000;
+        let table_path = "memory:/manifest_sidecar_block_pruning";
+        let schema = two_column_schema(0, "id", "name").copy_with_options(HashMap::from([(
+            "manifest.sidecar.enabled".to_string(),
+            "true".to_string(),
+        )]));
+        let table = data_evolution_test_table(table_path, schema);
+        setup_scan_trace_dirs(&table).await;
+
+        let files = (0..FILE_COUNT)
+            .map(|row_id| {
+                make_evo_file(
+                    &format!("data-{row_id:04}.parquet"),
+                    10,
+                    1,
+                    row_id as i64,
+                    Some(row_id as i64),
+                )
+            })
+            .collect();
+        TableCommit::new(table.clone(), "manifest-sidecar-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                files,
+            )])
+            .await
+            .unwrap();
+
+        let mut reader = table.new_read_builder();
+        reader.with_row_ranges(vec![RowRange::new(0, 0)]);
+        let (plan, trace) = reader.new_scan().plan_with_trace().await.unwrap();
+        let planned = plan
+            .splits()
+            .iter()
+            .flat_map(|split| split.data_files())
+            .map(|file| file.file_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(planned, vec!["data-0000.parquet"]);
+        assert!(trace.manifest_entries_read > 0);
+        assert!(
+            trace.manifest_entries_read < FILE_COUNT,
+            "the sidecar should avoid decoding non-overlapping Avro blocks"
+        );
+    }
+
+    #[tokio::test]
     async fn test_row_range_trace_excludes_manifest_netting() {
         let table_path = "memory:/de_row_range_trace_netting";
         let table = data_evolution_test_table(table_path, two_column_schema(0, "id", "name"));
@@ -3666,7 +3832,11 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_delta_rejects_manifest_deletes_before_row_range_pruning() {
         let table_path = "memory:/de_delta_row_range_netting";
-        let table = data_evolution_test_table(table_path, two_column_schema(0, "id", "payload"));
+        let schema = two_column_schema(0, "id", "payload").copy_with_options(HashMap::from([(
+            "manifest.sidecar.enabled".to_string(),
+            "true".to_string(),
+        )]));
+        let table = data_evolution_test_table(table_path, schema);
         setup_scan_trace_dirs(&table).await;
 
         let deleted = make_evo_file_with_cols("deleted.blob", 100, 1, 0, &["payload"]);
