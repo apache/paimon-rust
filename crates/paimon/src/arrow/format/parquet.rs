@@ -67,30 +67,21 @@ impl ParquetFormatReader {
     }
 }
 
-pub(crate) async fn has_beneficial_offset_index(
+#[derive(Debug, Clone)]
+pub(crate) struct ParquetGranule {
+    pub(crate) first_row: i64,
+    pub(crate) row_count: i64,
+    pub(crate) byte_ranges: Vec<Range<u64>>,
+}
+
+pub(crate) async fn parquet_granules(
     reader: Box<dyn FileRead>,
     file_size: u64,
     column_name: &str,
-    sample_ranges: &[RowRange],
-    scan_ranges: &[RowRange],
-) -> crate::Result<bool> {
+) -> crate::Result<(Vec<ParquetGranule>, bool)> {
     let options = ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional);
     let mut reader = ArrowFileReader::new(file_size, reader.into());
     let metadata = reader.get_metadata(Some(&options)).await?;
-    Ok(metadata_has_beneficial_offset_index(
-        &metadata,
-        column_name,
-        sample_ranges,
-        scan_ranges,
-    ))
-}
-
-fn metadata_has_beneficial_offset_index(
-    metadata: &ParquetMetaData,
-    column_name: &str,
-    sample_ranges: &[RowRange],
-    scan_ranges: &[RowRange],
-) -> bool {
     let columns = metadata
         .file_metadata()
         .schema_descr()
@@ -106,84 +97,105 @@ fn metadata_has_beneficial_offset_index(
                 .then_some(index)
         })
         .collect::<Vec<_>>();
-    let Some(offset_index) = metadata.offset_index() else {
-        return false;
-    };
-    if columns.is_empty() || offset_index.len() != metadata.row_groups().len() {
-        return false;
+    if columns.is_empty() {
+        return Err(Error::DataInvalid {
+            message: format!("Parquet column '{column_name}' not found"),
+            source: None,
+        });
     }
-    let mut sample_selection = build_row_ranges_selection(metadata.row_groups(), sample_ranges);
-    let mut scan_selection = build_row_ranges_selection(metadata.row_groups(), scan_ranges);
-    let mut checked = false;
-    let mut sample_bytes = 0u64;
-    let mut scan_bytes = 0u64;
+    let Some(offset_index) = metadata
+        .offset_index()
+        .filter(|index| index.len() == metadata.row_groups().len())
+    else {
+        return Ok((row_group_granules(&metadata, &columns), false));
+    };
+
+    let mut granules = Vec::new();
+    let mut cursor = 0i64;
     for (row_group, indexes) in metadata.row_groups().iter().zip(offset_index) {
         let Ok(row_count) = usize::try_from(row_group.num_rows()) else {
-            return false;
+            return Ok((row_group_granules(&metadata, &columns), false));
         };
-        let sample_row_group_selection = sample_selection.split_off(row_count);
-        let scan_row_group_selection = scan_selection.split_off(row_count);
-        let sample_selected = sample_row_group_selection.selects_any();
-        let scan_selected = scan_row_group_selection.selects_any();
-        checked |= sample_selected;
-        if !sample_selected && !scan_selected {
-            continue;
+        let Some(leaf_pages) = columns
+            .iter()
+            .map(|index| indexes.get(*index).map(|index| index.page_locations()))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok((row_group_granules(&metadata, &columns), false));
+        };
+        let pages = leaf_pages[0];
+        if pages.is_empty()
+            || leaf_pages.iter().any(|other| {
+                !page_boundaries_valid(other, row_count)
+                    || other.len() != pages.len()
+                    || other
+                        .iter()
+                        .zip(pages)
+                        .any(|(a, b)| a.first_row_index != b.first_row_index)
+            })
+        {
+            return Ok((row_group_granules(&metadata, &columns), false));
         }
-        let mut sample_byte_ranges = Vec::new();
-        let mut scan_byte_ranges = Vec::new();
-        for index in &columns {
-            let column = row_group.column(*index);
-            let Some(page_locations) = indexes.get(*index).map(|index| index.page_locations())
-            else {
-                return false;
-            };
-            let Some(first_page) = page_locations.first() else {
-                return false;
-            };
-            let Ok(column_start) = u64::try_from(
-                column
-                    .dictionary_page_offset()
-                    .unwrap_or_else(|| column.data_page_offset()),
-            ) else {
-                return false;
-            };
-            let Ok(first_page_offset) = u64::try_from(first_page.offset) else {
-                return false;
-            };
-            for (selection, selected_ranges) in [
-                (&sample_row_group_selection, &mut sample_byte_ranges),
-                (&scan_row_group_selection, &mut scan_byte_ranges),
-            ] {
-                if !selection.selects_any() {
-                    continue;
+        for (page_index, page) in pages.iter().enumerate() {
+            let next = pages
+                .get(page_index + 1)
+                .map_or(row_group.num_rows(), |page| page.first_row_index);
+            let mut byte_ranges = Vec::with_capacity(columns.len() * 2);
+            for (column_index, pages) in columns.iter().zip(&leaf_pages) {
+                let column = row_group.column(*column_index);
+                let (column_start, _) = column.byte_range();
+                if let Some(first) = pages.first() {
+                    let Ok(first_page) = u64::try_from(first.offset) else {
+                        return Ok((row_group_granules(&metadata, &columns), false));
+                    };
+                    if column_start < first_page {
+                        byte_ranges.push(column_start..first_page);
+                    }
                 }
-                if column_start < first_page_offset {
-                    selected_ranges.push(column_start..first_page_offset);
-                }
-                selected_ranges.extend(selection.scan_ranges(page_locations));
+                let page = &pages[page_index];
+                let (Ok(start), Ok(length)) = (
+                    u64::try_from(page.offset),
+                    u64::try_from(page.compressed_page_size),
+                ) else {
+                    return Ok((row_group_granules(&metadata, &columns), false));
+                };
+                let Some(end) = start.checked_add(length).filter(|end| *end <= file_size) else {
+                    return Ok((row_group_granules(&metadata, &columns), false));
+                };
+                byte_ranges.push(start..end);
             }
+            granules.push(ParquetGranule {
+                first_row: cursor + page.first_row_index,
+                row_count: next - page.first_row_index,
+                byte_ranges,
+            });
         }
-        for (selected_ranges, total_bytes) in [
-            (sample_byte_ranges, &mut sample_bytes),
-            (scan_byte_ranges, &mut scan_bytes),
-        ] {
-            let Some(group_bytes) = merge_byte_ranges(&selected_ranges, RANGE_COALESCE_BYTES)
-                .into_iter()
-                .try_fold(0u64, |total, range| {
-                    total.checked_add(range.end.checked_sub(range.start)?)
-                })
-            else {
-                return false;
-            };
-            let Some(total) = total_bytes.checked_add(group_bytes) else {
-                return false;
-            };
-            *total_bytes = total;
-        }
+        cursor += row_group.num_rows();
     }
-    // Sparse training is followed by a full scan, so require it to skip at
-    // least half of the projected bytes instead of accepting marginal savings.
-    checked && sample_bytes <= scan_bytes / 2
+    Ok((granules, true))
+}
+
+fn row_group_granules(metadata: &ParquetMetaData, columns: &[usize]) -> Vec<ParquetGranule> {
+    let mut cursor = 0i64;
+    metadata
+        .row_groups()
+        .iter()
+        .map(|row_group| {
+            let granule = ParquetGranule {
+                first_row: cursor,
+                row_count: row_group.num_rows(),
+                byte_ranges: columns
+                    .iter()
+                    .map(|index| {
+                        let (start, length) = row_group.column(*index).byte_range();
+                        start..start + length
+                    })
+                    .collect(),
+            };
+            cursor += row_group.num_rows();
+            granule
+        })
+        .collect()
 }
 
 enum ParquetRowGroupMessage {
@@ -2366,6 +2378,13 @@ fn merge_byte_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
     merged
 }
 
+pub(crate) fn coalesced_parquet_range_bytes(ranges: &[Range<u64>]) -> u64 {
+    merge_byte_ranges(ranges, RANGE_COALESCE_BYTES)
+        .into_iter()
+        .map(|range| range.end - range.start)
+        .sum()
+}
+
 /// Split merged ranges into fixed-size batches to utilize concurrency,
 /// Each merged range is divided into chunks of `expected_size`,
 /// with the last chunk taking whatever remains.
@@ -2425,9 +2444,8 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 mod tests {
     use super::build_parquet_row_filter;
     use super::{
-        forward_row_group_batches, metadata_has_beneficial_offset_index, parse_compression,
-        supported_compressions, FilePredicates,
-        ParquetFormatReader, ParquetFormatWriter, ParquetRowGroupMessage,
+        forward_row_group_batches, parquet_granules, parse_compression, supported_compressions,
+        FilePredicates, ParquetFormatReader, ParquetFormatWriter, ParquetRowGroupMessage,
     };
     use super::{
         AsyncArrowWriter, Bytes, PageIndexPolicy, ParquetMetaDataReader, Predicate,
@@ -3721,77 +3739,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sparse_row_selection_requires_offset_index_and_page_savings() {
-        let bytes = write_multi_row_group_parquet(10, 30, EnabledStatistics::Chunk, false).await;
-        let metadata = load_metadata_with_page_index(&bytes, true);
-        assert!(
-            !metadata_has_beneficial_offset_index(
-                &metadata,
-                "value",
-                &[RowRange::new(0, 19)],
-                &[RowRange::new(0, 29)],
-            ),
-            "reading two of three row groups is not sufficiently sparse"
-        );
-
-        let bytes = write_multi_page_parquet(10, 80).await;
-        let metadata = load_metadata_with_page_index(&bytes, true);
-        assert!(
-            !metadata_has_beneficial_offset_index(
-                &metadata,
-                "value",
-                &[RowRange::new(20, 38)],
-                &[RowRange::new(20, 39)],
-            ),
-            "near-full reads within one shard must not use the whole file as the baseline"
-        );
-        assert!(!metadata_has_beneficial_offset_index(
-            &metadata,
-            "value",
-            &[RowRange::new(0, 69)],
-            &[RowRange::new(0, 79)],
-        ));
-        assert!(!metadata_has_beneficial_offset_index(
-            &metadata,
-            "value",
-            &[RowRange::new(0, 0), RowRange::new(79, 79)],
-            &[RowRange::new(0, 79)],
-        ));
-
-        let bytes = write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, false).await;
-        let metadata = load_metadata_with_page_index(&bytes, true);
-
-        assert!(!metadata_has_beneficial_offset_index(
-            &metadata,
-            "value",
-            &[RowRange::new(0, 19)],
-            &[RowRange::new(0, 19)],
-        ));
-        let sparse_ranges = [RowRange::new(0, 0)];
-        assert!(metadata_has_beneficial_offset_index(
-            &metadata,
-            "value",
-            &sparse_ranges,
-            &[RowRange::new(0, 19)],
-        ));
-        assert!(!metadata_has_beneficial_offset_index(
-            &metadata,
-            "missing",
-            &sparse_ranges,
-            &[RowRange::new(0, 19)],
-        ));
-        let bytes_without_index =
-            write_multi_row_group_parquet(10, 20, EnabledStatistics::Chunk, true).await;
-        let metadata_without_index = load_metadata_with_page_index(&bytes_without_index, true);
-        assert!(!metadata_has_beneficial_offset_index(
-            &metadata_without_index,
-            "value",
-            &sparse_ranges,
-            &[RowRange::new(0, 19)],
-        ));
-    }
-
-    #[tokio::test]
     async fn test_row_group_selection_in_fails_open_on_unusable_stats() {
         let fields = vec![int_field("id"), int_field("value")];
         let predicates = vec![id_leaf(PredicateOperator::In, vec![Datum::Int(100)])];
@@ -3866,6 +3813,50 @@ mod tests {
             let _ = writer.close().await.unwrap();
         }
         buf
+    }
+
+    #[tokio::test]
+    async fn test_parquet_granules_prefers_pages_and_falls_back_to_row_groups() {
+        let bytes = Bytes::from(write_multi_page_parquet(10, 80).await);
+        let (granules, page_level) = parquet_granules(
+            Box::new(TrackingFileRead::new(bytes.clone())),
+            bytes.len() as u64,
+            "value",
+        )
+        .await
+        .unwrap();
+        assert!(page_level);
+        assert!(granules.len() > 1);
+        assert_eq!(
+            granules
+                .iter()
+                .map(|granule| granule.row_count)
+                .sum::<i64>(),
+            80
+        );
+        assert!(granules
+            .iter()
+            .all(|granule| !granule.byte_ranges.is_empty()));
+
+        let bytes = Bytes::from(
+            write_multi_row_group_parquet(10, 30, EnabledStatistics::Chunk, true).await,
+        );
+        let (granules, page_level) = parquet_granules(
+            Box::new(TrackingFileRead::new(bytes.clone())),
+            bytes.len() as u64,
+            "value",
+        )
+        .await
+        .unwrap();
+        assert!(!page_level);
+        assert_eq!(granules.len(), 3);
+        assert_eq!(
+            granules
+                .iter()
+                .map(|granule| granule.row_count)
+                .sum::<i64>(),
+            30
+        );
     }
 
     #[derive(Clone)]

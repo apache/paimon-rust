@@ -140,10 +140,6 @@ impl ReadBudget {
         self.parallelism
     }
 
-    pub(crate) fn max_inflight_bytes(&self) -> u64 {
-        self.max_inflight_bytes
-    }
-
     pub(crate) fn enable_diagnostics(&self) {
         self.diagnostics.enabled.store(true, Ordering::Relaxed);
     }
