@@ -66,6 +66,7 @@ mod lumina_index_build_builder;
 pub(crate) mod merge_tree_split_generator;
 mod object_table;
 mod partition_filter;
+mod partition_row_count;
 mod partition_stat;
 #[cfg(feature = "fulltext")]
 mod pk_full_text_bucket_search;
@@ -152,6 +153,7 @@ pub use incremental_scan::{
 };
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use object_table::{ObjectEntry, ObjectTable};
+pub use partition_row_count::PartitionRowCount;
 pub use partition_stat::PartitionStat;
 pub use pk_vector_bucket_split::{BucketVectorPayload, BucketVectorSearchSplit};
 pub use postpone_bucket_plan::{PostponeBucketPlan, POSTPONE_BUCKET_PLAN_TOTAL_BUCKETS_FIELD};

@@ -216,7 +216,7 @@ mod tests {
                                 DeletionVectorMeta {
                                     offset: 31,
                                     length: 22,
-                                    cardinality: None,
+                                    cardinality: has_cardinality.then_some(4),
                                 },
                             ),
                         ])),
@@ -224,13 +224,43 @@ mod tests {
                         global_index_meta: None,
                     },
                 };
-                // Two entries also catch a cursor shifted past the final DV.
-                let entries = vec![entry.clone(), entry];
+                // The second entry also catches cursor shifts and verifies that one
+                // unknown cardinality makes the slim aggregate unknown.
+                let mut partially_unknown = entry.clone();
+                partially_unknown
+                    .index_file
+                    .deletion_vectors_ranges
+                    .as_mut()
+                    .unwrap()
+                    .insert(
+                        "data-unknown.parquet".into(),
+                        DeletionVectorMeta {
+                            offset: 53,
+                            length: 18,
+                            cardinality: None,
+                        },
+                    );
+                let entries = vec![entry, partially_unknown];
                 let bytes = crate::spec::to_avro_bytes(&schema.to_string(), &entries).unwrap();
                 assert_eq!(
                     IndexManifest::read_from_bytes(&bytes).unwrap(),
                     entries,
                     "nullable_items={nullable_items}, has_cardinality={has_cardinality}"
+                );
+                let mut cardinalities = Vec::new();
+                crate::spec::avro::visit_slim_index_manifest_entries(
+                    &bytes,
+                    &crate::spec::avro::SharedSchemaCache::new(),
+                    &mut |entry| {
+                        cardinalities.push(entry.deletion_vector_cardinality);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    cardinalities,
+                    vec![Some(has_cardinality.then_some(7)), Some(None)],
+                    "slim: nullable_items={nullable_items}, has_cardinality={has_cardinality}"
                 );
             }
         }
@@ -307,6 +337,18 @@ mod tests {
         writer.append(value.resolve(&schema).unwrap()).unwrap();
         let bytes = writer.into_inner().unwrap();
         assert_eq!(IndexManifest::read_from_bytes(&bytes).unwrap(), vec![entry]);
+
+        let mut cardinalities = Vec::new();
+        crate::spec::avro::visit_slim_index_manifest_entries(
+            &bytes,
+            &crate::spec::avro::SharedSchemaCache::new(),
+            &mut |entry| {
+                cardinalities.push(entry.deletion_vector_cardinality);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(cardinalities, vec![Some(Some(2))]);
     }
 
     #[test]

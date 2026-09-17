@@ -692,7 +692,7 @@ impl ColumnStatsAccumulator {
     }
 }
 
-fn datum_to_scalar(value: Datum, data_type: &ArrowDataType) -> Option<ScalarValue> {
+pub(crate) fn datum_to_scalar(value: Datum, data_type: &ArrowDataType) -> Option<ScalarValue> {
     match (value, data_type) {
         (Datum::Bool(value), ArrowDataType::Boolean) => Some(ScalarValue::Boolean(Some(value))),
         (Datum::TinyInt(value), ArrowDataType::Int8) => Some(ScalarValue::Int8(Some(value))),

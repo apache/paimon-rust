@@ -159,6 +159,63 @@ where
     decode_manifest_streaming(&mut block_iter, &writer_schema, filter)
 }
 
+pub(crate) use index_manifest_entry_decode::SlimIndexManifestEntry;
+pub(crate) use manifest_entry_decode::SlimManifestEntry;
+
+/// Visit every entry of a manifest file as a borrowed [`SlimManifestEntry`].
+///
+/// Nothing is collected: each entry is handed to `visit` and dropped, and
+/// per-file statistics are skipped rather than decoded, so peak memory is the
+/// manifest's decompressed block regardless of how many files it lists.
+pub(crate) fn visit_slim_manifest_entries<F>(
+    bytes: &[u8],
+    shared_cache: &SharedSchemaCache,
+    visit: &mut F,
+) -> crate::Result<()>
+where
+    F: FnMut(SlimManifestEntry<'_>) -> crate::Result<()>,
+{
+    let (header, mut block_iter) = parse_ocf_streaming(bytes)?;
+    let writer_schema = shared_cache.get_or_parse(&header.schema_json)?;
+    while let Some(block) = block_iter.next_block()? {
+        let mut cursor = AvroCursor::new(&block.data);
+        for _ in 0..block.object_count {
+            visit(manifest_entry_decode::decode_slim_manifest_entry(
+                &mut cursor,
+                &writer_schema,
+                writer_schema.is_union_wrapped,
+            )?)?;
+        }
+    }
+    Ok(())
+}
+
+/// Visit index-manifest entries without materializing deletion-vector maps.
+pub(crate) fn visit_slim_index_manifest_entries<F>(
+    bytes: &[u8],
+    shared_cache: &SharedSchemaCache,
+    visit: &mut F,
+) -> crate::Result<()>
+where
+    F: FnMut(SlimIndexManifestEntry<'_>) -> crate::Result<()>,
+{
+    let (header, mut block_iter) = parse_ocf_streaming(bytes)?;
+    let writer_schema = shared_cache.get_or_parse(&header.schema_json)?;
+    while let Some(block) = block_iter.next_block()? {
+        let mut cursor = AvroCursor::new(&block.data);
+        for _ in 0..block.object_count {
+            visit(
+                index_manifest_entry_decode::decode_slim_index_manifest_entry(
+                    &mut cursor,
+                    &writer_schema,
+                    writer_schema.is_union_wrapped,
+                )?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn decode_manifest_streaming<F>(
     block_iter: &mut ocf::OcfBlockIter<'_>,
     writer_schema: &WriterSchema,
