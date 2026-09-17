@@ -78,6 +78,10 @@ pub(crate) enum ManifestSortKey {
     Partition {
         field: PartitionSortField,
     },
+    Bucket {
+        field: Option<PartitionSortField>,
+        compare_manifest_buckets: bool,
+    },
     RowId {
         partition_fields: Vec<PartitionSortField>,
     },
@@ -89,6 +93,7 @@ impl ManifestSortKey {
         configured_field: Option<&str>,
         data_evolution_enabled: bool,
         manifests: &[ManifestFileMeta],
+        bucketed: bool,
     ) -> Result<Option<Self>> {
         if data_evolution_enabled
             && !manifests.is_empty()
@@ -110,17 +115,23 @@ impl ManifestSortKey {
             return Ok(Some(Self::RowId { partition_fields }));
         }
 
-        if partition_fields.is_empty() {
-            return Ok(None);
-        }
-        let field = match configured_field {
-            Some(name) => resolve_partition_field(partition_fields, name)?,
-            None => PartitionSortField {
+        let field = match (configured_field, partition_fields.first()) {
+            (Some(name), _) => Some(resolve_partition_field(partition_fields, name)?),
+            (None, Some(field)) => Some(PartitionSortField {
                 field_index: 0,
-                data_type: partition_fields[0].data_type().clone(),
-            },
+                data_type: field.data_type().clone(),
+            }),
+            (None, None) => None,
         };
-        Ok(Some(Self::Partition { field }))
+        if bucketed {
+            return Ok(Some(Self::Bucket {
+                field,
+                compare_manifest_buckets: manifests
+                    .iter()
+                    .all(|meta| meta.min_bucket().is_some() && meta.max_bucket().is_some()),
+            }));
+        }
+        Ok(field.map(|field| Self::Partition { field }))
     }
 
     fn entry_key(&self, entry: &ManifestEntry) -> Result<ManifestEntrySortKey> {
@@ -128,6 +139,13 @@ impl ManifestSortKey {
             Self::Partition { field } => Ok(ManifestEntrySortKey::Partition(
                 read_partition_values(entry.partition(), std::slice::from_ref(field))?,
             )),
+            Self::Bucket { field, .. } => Ok(ManifestEntrySortKey::Bucket {
+                bucket: entry.bucket(),
+                partition: read_partition_values(
+                    entry.partition(),
+                    field.as_ref().map(std::slice::from_ref).unwrap_or_default(),
+                )?,
+            }),
             Self::RowId { partition_fields } => {
                 let first_row_id =
                     entry
@@ -181,6 +199,34 @@ impl ManifestSortKey {
                     std::slice::from_ref(field),
                 )?),
             ),
+            Self::Bucket {
+                field,
+                compare_manifest_buckets,
+            } => {
+                let fields = field.as_ref().map(std::slice::from_ref).unwrap_or_default();
+                (
+                    ManifestBound::Bucket {
+                        bucket: compare_manifest_buckets.then(|| {
+                            meta.min_bucket()
+                                .expect("bucket stats were validated for the whole input")
+                        }),
+                        partition: read_partition_values(
+                            meta.partition_stats().min_values(),
+                            fields,
+                        )?,
+                    },
+                    ManifestBound::Bucket {
+                        bucket: compare_manifest_buckets.then(|| {
+                            meta.max_bucket()
+                                .expect("bucket stats were validated for the whole input")
+                        }),
+                        partition: read_partition_values(
+                            meta.partition_stats().max_values(),
+                            fields,
+                        )?,
+                    },
+                )
+            }
             Self::RowId { partition_fields } => (
                 ManifestBound::RowId {
                     partition: read_partition_values(
@@ -215,6 +261,19 @@ impl ManifestSortKey {
                 ManifestBound::Partition(right),
             ) => compare_partition_values(left, right),
             (
+                Self::Bucket { .. },
+                ManifestBound::Bucket {
+                    bucket: left_bucket,
+                    partition: left_partition,
+                },
+                ManifestBound::Bucket {
+                    bucket: right_bucket,
+                    partition: right_partition,
+                },
+            ) => left_bucket
+                .cmp(right_bucket)
+                .then_with(|| compare_partition_values(left_partition, right_partition)),
+            (
                 Self::RowId { .. },
                 ManifestBound::RowId {
                     partition: left_partition,
@@ -236,6 +295,32 @@ impl ManifestSortKey {
             // Partition ranges preserve Java's historical boundary-equality
             // behavior. RowID ranges are inclusive, so equality overlaps.
             Self::Partition { .. } => ordering != Ordering::Less,
+            Self::Bucket {
+                field,
+                compare_manifest_buckets,
+            } => match (min, max) {
+                (
+                    ManifestBound::Bucket {
+                        bucket: min_bucket,
+                        partition: min_partition,
+                    },
+                    ManifestBound::Bucket {
+                        bucket: max_bucket,
+                        partition: max_partition,
+                    },
+                ) => {
+                    if *compare_manifest_buckets {
+                        let bucket_order = min_bucket.cmp(max_bucket);
+                        if bucket_order != Ordering::Equal {
+                            return bucket_order == Ordering::Greater;
+                        }
+                    }
+                    field.as_ref().is_some_and(|_| {
+                        compare_partition_values(min_partition, max_partition) != Ordering::Less
+                    }) || (field.is_none() && *compare_manifest_buckets)
+                }
+                _ => unreachable!("bucket sort builds bucket manifest bounds"),
+            },
             Self::RowId { .. } => ordering == Ordering::Greater,
         }
     }
@@ -301,6 +386,10 @@ fn compare_partition_values(left: &[Option<Datum>], right: &[Option<Datum>]) -> 
 #[derive(Debug)]
 enum ManifestEntrySortKey {
     Partition(Vec<Option<Datum>>),
+    Bucket {
+        bucket: i32,
+        partition: Vec<Option<Datum>>,
+    },
     RowId {
         partition: Vec<Option<Datum>>,
         first_row_id: i64,
@@ -312,6 +401,10 @@ enum ManifestEntrySortKey {
 #[derive(Debug, Clone)]
 enum ManifestBound {
     Partition(Vec<Option<Datum>>),
+    Bucket {
+        bucket: Option<i32>,
+        partition: Vec<Option<Datum>>,
+    },
     RowId {
         partition: Vec<Option<Datum>>,
         row_id: i64,
@@ -442,6 +535,18 @@ fn compare_sort_records(left: &SortRecord, right: &SortRecord) -> Ordering {
         (ManifestEntrySortKey::Partition(left), ManifestEntrySortKey::Partition(right)) => {
             compare_partition_values(left, right)
         }
+        (
+            ManifestEntrySortKey::Bucket {
+                bucket: left_bucket,
+                partition: left_partition,
+            },
+            ManifestEntrySortKey::Bucket {
+                bucket: right_bucket,
+                partition: right_partition,
+            },
+        ) => left_bucket
+            .cmp(right_bucket)
+            .then_with(|| compare_partition_values(left_partition, right_partition)),
         (
             ManifestEntrySortKey::RowId {
                 partition: left, ..
@@ -1196,6 +1301,21 @@ mod tests {
         meta(name, size, partition, partition).with_row_id_stats(Some(min_row_id), Some(max_row_id))
     }
 
+    fn bucket_meta(
+        name: &str,
+        size: i64,
+        partition: i32,
+        min_bucket: i32,
+        max_bucket: i32,
+    ) -> ManifestFileMeta {
+        meta(name, size, partition, partition).with_bucket_level_stats(
+            Some(min_bucket),
+            Some(max_bucket),
+            None,
+            None,
+        )
+    }
+
     fn sort_key() -> ManifestSortKey {
         ManifestSortKey::create(
             &[DataField::new(
@@ -1206,6 +1326,7 @@ mod tests {
             None,
             false,
             &[],
+            false,
         )
         .unwrap()
         .unwrap()
@@ -1213,6 +1334,39 @@ mod tests {
 
     fn entry(kind: FileKind, partition: i32, file_name: &str) -> ManifestEntry {
         row_id_entry(kind, partition, file_name, None, 1, 0)
+    }
+
+    fn bucket_entry(partition: i32, bucket: i32, file_name: &str) -> ManifestEntry {
+        ManifestEntry::new(
+            FileKind::Add,
+            row(partition),
+            bucket,
+            4,
+            DataFileMeta {
+                file_name: file_name.to_string(),
+                file_size: 1,
+                row_count: 1,
+                min_key: Vec::new(),
+                max_key: Vec::new(),
+                key_stats: BinaryTableStats::empty(),
+                value_stats: BinaryTableStats::empty(),
+                min_sequence_number: 0,
+                max_sequence_number: 0,
+                schema_id: 0,
+                level: 0,
+                extra_files: Vec::new(),
+                creation_time: None,
+                delete_row_count: None,
+                embedded_index: None,
+                file_source: None,
+                value_stats_cols: None,
+                external_path: None,
+                first_row_id: None,
+                write_cols: None,
+                column_max_sequence_numbers: None,
+            },
+            2,
+        )
     }
 
     fn row_id_entry(
@@ -1303,6 +1457,7 @@ mod tests {
             None,
             true,
             &manifests,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -1332,6 +1487,7 @@ mod tests {
             None,
             true,
             &manifests,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -1363,6 +1519,77 @@ mod tests {
                 (FileKind::Delete, "delete".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn bucket_sort_orders_bucket_before_partition() {
+        let manifests = vec![bucket_meta("m", 100, 0, 0, 3)];
+        let key = ManifestSortKey::create(
+            &[DataField::new(
+                0,
+                "pt".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            None,
+            false,
+            &manifests,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(key, ManifestSortKey::Bucket { .. }));
+
+        let mut sorter = SpillableManifestSorter::new(&key, &spill_config(1, 2, u64::MAX)).unwrap();
+        sorter.push(bucket_entry(0, 2, "bucket-2")).unwrap();
+        sorter
+            .push(bucket_entry(10, 1, "bucket-1-partition-10"))
+            .unwrap();
+        sorter
+            .push(bucket_entry(0, 1, "bucket-1-partition-0"))
+            .unwrap();
+
+        let mut sorted = sorter.finish().unwrap();
+        let mut actual = Vec::new();
+        while let Some(entry) = sorted.next_entry().unwrap() {
+            actual.push(entry.file().file_name.clone());
+        }
+        assert_eq!(
+            actual,
+            vec![
+                "bucket-1-partition-0".to_string(),
+                "bucket-1-partition-10".to_string(),
+                "bucket-2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn bucket_ranges_fall_back_when_legacy_manifests_lack_bucket_stats() {
+        let manifests = vec![meta("a", 100, 0, 0), meta("b", 100, 0, 0)];
+        let key = ManifestSortKey::create(&[], None, false, &manifests, true)
+            .unwrap()
+            .unwrap();
+        let ranges = manifests
+            .into_iter()
+            .map(|meta| key.range(meta))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(build_level_sorted_runs(ranges.clone(), &key).len(), 2);
+        assert_eq!(split_into_sections(ranges, &HashMap::new(), &key).len(), 1);
+    }
+
+    #[test]
+    fn data_evolution_row_id_sort_precedes_bucket_sort() {
+        let manifests = vec![row_id_meta("m", 100, 0, 10, 20).with_bucket_level_stats(
+            Some(0),
+            Some(3),
+            None,
+            None,
+        )];
+        let key = ManifestSortKey::create(&[], None, true, &manifests, true)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(key, ManifestSortKey::RowId { .. }));
     }
 
     #[test]

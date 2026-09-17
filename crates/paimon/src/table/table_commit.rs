@@ -1210,6 +1210,7 @@ impl TableCommit {
             self.manifest_sort_partition_field.as_deref(),
             self.data_evolution_enabled,
             &manifest_files,
+            self.total_buckets > 0 || self.total_buckets == POSTPONE_BUCKET,
         )?
         else {
             return self
