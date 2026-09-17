@@ -25,6 +25,7 @@ mod shredding;
 #[cfg(feature = "vortex")]
 mod vortex;
 
+pub(crate) use mosaic::MosaicPrefetchOptions;
 #[cfg(test)]
 pub(crate) use parquet::ParquetFormatWriter;
 
@@ -196,16 +197,19 @@ pub(crate) fn create_format_reader(
         read_fields,
         None,
         blob::DEFAULT_BLOB_READ_PARALLELISM,
+        MosaicPrefetchOptions::default(),
     )
 }
 
-/// Create a format reader with a scan-shared Parquet resource budget.
+/// Create a format reader with a scan-shared Parquet resource budget and the
+/// per-file Mosaic prefetch settings.
 pub(crate) fn create_format_reader_with_budget(
     path: &str,
     blob_as_descriptor: bool,
     read_fields: &[DataField],
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     blob_parallelism: usize,
+    mosaic_prefetch: MosaicPrefetchOptions,
 ) -> crate::Result<Box<dyn FormatFileReader>> {
     let lower = path.to_ascii_lowercase();
     let reader: Box<dyn FormatFileReader> = if lower.ends_with(".parquet") {
@@ -227,7 +231,7 @@ pub(crate) fn create_format_reader_with_budget(
     } else {
         if lower.ends_with(".mosaic") {
             return Ok(shredding::maybe_wrap_reader(
-                Box::new(mosaic::MosaicFormatReader),
+                Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch)),
                 read_fields,
             ));
         }

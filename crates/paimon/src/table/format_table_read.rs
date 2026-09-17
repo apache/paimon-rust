@@ -19,7 +19,7 @@
 
 use super::data_file_reader::DataFileReader;
 use super::read_builder::split_scan_predicates;
-use super::table_read::configured_parquet_read_budget;
+use super::table_read::{configured_mosaic_prefetch, configured_parquet_read_budget};
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::partition::partition_array;
@@ -127,6 +127,7 @@ impl<'a> FormatTableRead<'a> {
         let schema_id = self.table.schema().id();
         let mut remaining = self.limit;
         let batch_size = Some(core_options.read_batch_size()?);
+        let mosaic_prefetch = configured_mosaic_prefetch(self.table)?;
         let row_filter_factory = self.row_filter_factory.clone();
         let parquet_read_budget = Some(self.parquet_read_budget()?);
         let blob_parallelism = self.blob_parallelism;
@@ -147,7 +148,8 @@ impl<'a> FormatTableRead<'a> {
                 )
                 .with_batch_size(batch_size)
                 .with_blob_parallelism(blob_parallelism)
-                .with_parquet_read_budget(parquet_read_budget.clone());
+                .with_parquet_read_budget(parquet_read_budget.clone())
+                .with_mosaic_prefetch(mosaic_prefetch);
                 if let Some(factory) = &row_filter_factory {
                     reader = reader.with_row_filter_factory(Arc::clone(factory));
                 }

@@ -24,6 +24,7 @@ use super::data_file_reader::{
 };
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
+use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
@@ -116,6 +117,7 @@ pub(crate) struct DataEvolutionReader {
     blob_parallelism: usize,
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
 
@@ -195,6 +197,7 @@ impl DataEvolutionReader {
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             batch_size: None,
             parquet_read_budget: None,
+            mosaic_prefetch: MosaicPrefetchOptions::default(),
             read_timing: None,
         })
     }
@@ -216,6 +219,11 @@ impl DataEvolutionReader {
         parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     ) -> Self {
         self.parquet_read_budget = parquet_read_budget;
+        self
+    }
+
+    pub(crate) fn with_mosaic_prefetch(mut self, mosaic_prefetch: MosaicPrefetchOptions) -> Self {
+        self.mosaic_prefetch = mosaic_prefetch;
         self
     }
 
@@ -267,6 +275,7 @@ impl DataEvolutionReader {
             .with_batch_size(self.batch_size)
             .with_blob_parallelism(self.blob_parallelism)
             .with_parquet_read_budget(self.parquet_read_budget.clone())
+            .with_mosaic_prefetch(self.mosaic_prefetch)
             .with_read_timing(self.read_timing.clone());
 
             for split in splits {
@@ -566,7 +575,8 @@ impl DataEvolutionReader {
             None,
         )?
         .with_batch_size(self.batch_size)
-        .with_parquet_read_budget(self.parquet_read_budget.clone());
+        .with_parquet_read_budget(self.parquet_read_budget.clone())
+        .with_mosaic_prefetch(self.mosaic_prefetch);
         let mut stream = prescan.read(splits)?;
         let mut view_structs = HashSet::new();
         while let Some(batch) = stream.next().await {
@@ -631,6 +641,7 @@ impl DataEvolutionReader {
         let blob_parallelism = self.blob_parallelism;
         let batch_size = self.batch_size;
         let parquet_read_budget = self.parquet_read_budget.clone();
+        let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
         let anchor_deletion_vector = anchor_deletion_vector.clone();
         // Batch size for column-merge output. Matches the default Parquet reader batch size.
@@ -719,6 +730,7 @@ impl DataEvolutionReader {
                             blob_as_descriptor,
                             blob_parallelism,
                             source_parquet_read_budget.clone(),
+                            mosaic_prefetch,
                             read_timing.clone(),
                             anchor_deletion_vector.as_ref(),
                         )
@@ -1259,6 +1271,7 @@ fn open_source_stream(
     blob_as_descriptor: bool,
     blob_parallelism: usize,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
@@ -1328,6 +1341,7 @@ fn open_source_stream(
     .with_blob_as_descriptor(blob_as_descriptor)
     .with_blob_parallelism(blob_parallelism)
     .with_parquet_read_budget(parquet_read_budget)
+    .with_mosaic_prefetch(mosaic_prefetch)
     .with_read_timing(read_timing);
 
     match source {

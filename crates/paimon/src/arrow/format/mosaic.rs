@@ -43,7 +43,35 @@ use std::ops::Range;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-pub(crate) struct MosaicFormatReader;
+/// Row-group prefetch settings of one Mosaic file read, from the table options
+/// `mosaic.read.prefetch-row-groups` and `mosaic.read.prefetch-max-bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MosaicPrefetchOptions {
+    /// Row groups kept opening ahead of the consumer; `0` reads on demand.
+    pub row_groups: usize,
+    /// Estimated decoded bytes allowed in flight beyond the head row group.
+    pub max_bytes: usize,
+}
+
+impl Default for MosaicPrefetchOptions {
+    fn default() -> Self {
+        Self {
+            row_groups: DEFAULT_PREFETCH_ROW_GROUPS,
+            max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MosaicFormatReader {
+    prefetch: MosaicPrefetchOptions,
+}
+
+impl MosaicFormatReader {
+    pub(crate) fn with_prefetch(prefetch: MosaicPrefetchOptions) -> Self {
+        Self { prefetch }
+    }
+}
 
 const DEFAULT_BATCH_SIZE: usize = 8192;
 const DEFAULT_PREFETCH_ROW_GROUPS: usize = 8;
@@ -77,6 +105,7 @@ impl FormatFileReader for MosaicFormatReader {
             file_fields: predicates.file_fields.clone(),
         });
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
+        let prefetch = self.prefetch;
         let (mut batch_tx, mut batch_rx) = futures::channel::mpsc::channel(1);
         let read_task = tokio::task::spawn_blocking(move || {
             let result = read_mosaic_batches_blocking(
@@ -88,8 +117,8 @@ impl FormatFileReader for MosaicFormatReader {
                     batch_size,
                     row_selection,
                     handle,
-                    prefetch_row_groups: DEFAULT_PREFETCH_ROW_GROUPS,
-                    prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
+                    prefetch_row_groups: prefetch.row_groups,
+                    prefetch_max_bytes: prefetch.max_bytes,
                 },
                 |batch| futures::executor::block_on(batch_tx.send(Ok(batch))).is_ok(),
             );
@@ -1308,7 +1337,7 @@ mod tests {
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<Vec<RecordBatch>> {
         let file_size = data.len() as u64;
-        MosaicFormatReader
+        MosaicFormatReader::default()
             .read_batch_stream(
                 Box::new(TestFileRead { data }),
                 file_size,
@@ -1330,7 +1359,7 @@ mod tests {
     ) -> crate::Result<Vec<Range<u64>>> {
         let file_size = data.len() as u64;
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let _: Vec<RecordBatch> = MosaicFormatReader
+        let _: Vec<RecordBatch> = MosaicFormatReader::default()
             .read_batch_stream(
                 Box::new(TrackingFileRead {
                     data,
@@ -1356,7 +1385,7 @@ mod tests {
     ) -> crate::Result<Vec<Range<u64>>> {
         let file_size = data.len() as u64;
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let _: Vec<RecordBatch> = MosaicFormatReader
+        let _: Vec<RecordBatch> = MosaicFormatReader::default()
             .read_batch_stream(
                 Box::new(TrackingFileRead {
                     data,
@@ -1525,6 +1554,55 @@ mod tests {
         assert_eq!(ids.value(4), 5);
     }
 
+    async fn read_via_format_reader_tracking(
+        data: Bytes,
+        fields: Vec<DataField>,
+        prefetch: MosaicPrefetchOptions,
+    ) -> (Vec<RecordBatch>, usize) {
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let file_size = data.len() as u64;
+        let read = ConcurrentTrackingFileRead {
+            data,
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::clone(&max_active),
+        };
+        let stream = MosaicFormatReader::with_prefetch(prefetch)
+            .read_batch_stream(Box::new(read), file_size, &fields, None, None, None)
+            .await
+            .unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        (batches, max_active.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_format_reader_prefetch_options_control_look_ahead() {
+        let fields = vec![data_fields()[0].clone()];
+
+        let (batches, max_active) = read_via_format_reader_tracking(
+            multi_row_group_mosaic(Vec::new()),
+            fields.clone(),
+            MosaicPrefetchOptions {
+                row_groups: 0,
+                max_bytes: usize::MAX,
+            },
+        )
+        .await;
+        assert_eq!(collect_i32_column(&batches, 0), vec![1, 2, 10, 11, 20, 21]);
+        assert_eq!(max_active, 1, "depth 0 must read row groups on demand");
+
+        let (batches, max_active) = read_via_format_reader_tracking(
+            multi_row_group_mosaic(Vec::new()),
+            fields,
+            MosaicPrefetchOptions::default(),
+        )
+        .await;
+        assert_eq!(collect_i32_column(&batches, 0), vec![1, 2, 10, 11, 20, 21]);
+        assert!(
+            max_active >= 2,
+            "default prefetch should overlap storage reads, max_active={max_active}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_prefetch_overlaps_row_group_reads_and_preserves_order() {
         let data = multi_row_group_mosaic(Vec::new());
@@ -1656,7 +1734,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         assert!(file_size > 64 * 1024);
 
-        let batches = MosaicFormatReader
+        let batches = MosaicFormatReader::default()
             .read_batch_stream(
                 Box::new(TrackingFileRead {
                     data,
@@ -1712,7 +1790,7 @@ mod tests {
             .unwrap();
 
         let batches = runtime.block_on(async move {
-            MosaicFormatReader
+            MosaicFormatReader::default()
                 .read_batch_stream(
                     Box::new(RuntimeThreadFileRead {
                         data,

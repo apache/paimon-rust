@@ -30,6 +30,7 @@ use super::sort_merge::{
     AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, MergeFunction,
     PartialUpdateMergeFunction, SortMergeReaderBuilder,
 };
+use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::io::FileIO;
@@ -82,6 +83,8 @@ pub(crate) struct KeyValueReadConfig {
     pub max_merge_input_streams: Option<usize>,
     /// Scan-shared Parquet concurrency and projected-byte budget.
     pub parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    /// Per-file Mosaic row-group prefetch settings.
+    pub mosaic_prefetch: MosaicPrefetchOptions,
 }
 
 /// Keep only the conjuncts of `predicates` that reference primary-key columns,
@@ -588,7 +591,8 @@ impl KeyValueFileReader {
                             pushdown_predicates.clone(),
                         )
                         .with_batch_size(Some(config.read_batch_size))
-                        .with_parquet_read_budget(group_parquet_read_budget.clone());
+                        .with_parquet_read_budget(group_parquet_read_budget.clone())
+                        .with_mosaic_prefetch(config.mosaic_prefetch);
                         let run_schema_manager = config.schema_manager.clone();
                         let run_file_io = file_io.clone();
                         let deletion_files_by_split = deletion_files_by_split.clone();
@@ -1314,6 +1318,7 @@ mod tests {
                 merge_splits: true,
                 max_merge_input_streams: None,
                 parquet_read_budget: Some(budget),
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
             },
         )
     }
@@ -1433,6 +1438,7 @@ mod tests {
                 merge_splits: true,
                 max_merge_input_streams: Some(256),
                 parquet_read_budget: None,
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
             },
         );
 
@@ -1640,6 +1646,7 @@ mod tests {
                 merge_splits: false,
                 max_merge_input_streams: None,
                 parquet_read_budget: None,
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
             },
         )
         .with_input_batch_sizes(input_batch_sizes.clone());
@@ -1711,6 +1718,7 @@ mod tests {
                 merge_splits: false,
                 max_merge_input_streams: None,
                 parquet_read_budget: Some(Arc::new(ParquetReadBudget::new(2, 256 << 20).unwrap())),
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
             },
         );
         let batches = tokio::time::timeout(
@@ -1905,6 +1913,7 @@ mod tests {
                     merge_splits,
                     max_merge_input_streams: None,
                     parquet_read_budget: None,
+                    mosaic_prefetch: MosaicPrefetchOptions::default(),
                 },
             )
             .read(splits)
@@ -1972,6 +1981,7 @@ mod tests {
                 merge_splits: true,
                 max_merge_input_streams: Some(256),
                 parquet_read_budget: None,
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
             },
         );
         let batches = reader
