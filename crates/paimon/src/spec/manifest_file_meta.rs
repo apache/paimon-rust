@@ -104,14 +104,11 @@ pub struct ManifestFileMeta {
     )]
     max_row_id: Option<i64>,
 
-    /// Common positive bucket count for every entry in this manifest. `None`
-    /// means that the writer could not prove a single usable value, so readers
-    /// must not use it for manifest-level bucket pruning.
-    #[serde(
-        rename = "_TOTAL_BUCKETS",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Common positive bucket count recorded by an external manifest writer.
+    ///
+    /// Rust consumes this field for manifest pruning but intentionally does not
+    /// serialize it into manifest lists.
+    #[serde(rename = "_TOTAL_BUCKETS", default, skip_serializing)]
     total_buckets: Option<i32>,
 
     /// Files owned by this manifest and sharing its lifecycle.
@@ -247,11 +244,11 @@ impl ManifestFileMeta {
         self
     }
 
-    /// Attach a common positive bucket count aggregated from every manifest
-    /// entry. Invalid or mixed values must be represented as `None`.
+    /// Attach external manifest metadata in read-path tests.
+    #[cfg(test)]
     #[inline]
     #[must_use]
-    pub fn with_total_buckets(mut self, total_buckets: Option<i32>) -> Self {
+    pub(crate) fn with_total_buckets(mut self, total_buckets: Option<i32>) -> Self {
         self.total_buckets = total_buckets.filter(|value| *value > 0);
         self
     }
@@ -358,7 +355,6 @@ pub const MANIFEST_FILE_META_SCHEMA: &str = r#"["null", {
         {"name": "_MAX_LEVEL", "type": ["null", "int"], "default": null},
         {"name": "_MIN_ROW_ID", "type": ["null", "long"], "default": null},
         {"name": "_MAX_ROW_ID", "type": ["null", "long"], "default": null},
-        {"name": "_TOTAL_BUCKETS", "type": ["null", "int"], "default": null},
         {"name": "_EXTRA_FILES", "type": ["null", {"type": "array", "items": "string"}], "default": null}
     ]
 }]"#;

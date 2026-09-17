@@ -52,15 +52,6 @@ type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
 type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
 
-fn common_positive_total_buckets(entries: &[ManifestEntry]) -> Option<i32> {
-    let total_buckets = entries.first()?.total_buckets();
-    (total_buckets > 0
-        && entries
-            .iter()
-            .all(|entry| entry.total_buckets() == total_buckets))
-    .then_some(total_buckets)
-}
-
 fn validate_bucket_ownership(messages: &[CommitMessage]) -> Result<()> {
     let mut owners = HashSet::new();
     for message in messages {
@@ -1237,7 +1228,6 @@ impl TableCommit {
         let mut max_level: Option<i32> = None;
         let mut min_row_id: Option<i64> = None;
         let mut max_row_id: Option<i64> = None;
-        let total_buckets = common_positive_total_buckets(entries);
         let mut all_entries_have_row_id = !entries.is_empty();
         let mut schema_id = self.table.schema().id();
         for entry in entries {
@@ -1275,8 +1265,7 @@ impl TableCommit {
             schema_id,
         )
         .with_bucket_level_stats(min_bucket, max_bucket, min_level, max_level)
-        .with_row_id_stats(min_row_id, max_row_id)
-        .with_total_buckets(total_buckets))
+        .with_row_id_stats(min_row_id, max_row_id))
     }
 
     /// Check if this commit was already completed (idempotency).
@@ -5805,29 +5794,6 @@ mod tests {
         BinaryRow::from_serialized_bytes(stats.max_values())
             .expect("max_values must decode via the same protocol as Java's deserializeBinaryRow");
         assert!(stats.null_counts().is_empty());
-    }
-
-    #[test]
-    fn manifest_total_buckets_requires_one_consistent_positive_value() {
-        let entry = |total_buckets| {
-            ManifestEntry::new(
-                FileKind::Add,
-                vec![],
-                0,
-                total_buckets,
-                test_data_file("data.parquet", 1),
-                2,
-            )
-        };
-
-        assert_eq!(common_positive_total_buckets(&[]), None);
-        assert_eq!(
-            common_positive_total_buckets(&[entry(8), entry(8)]),
-            Some(8)
-        );
-        assert_eq!(common_positive_total_buckets(&[entry(8), entry(4)]), None);
-        assert_eq!(common_positive_total_buckets(&[entry(0)]), None);
-        assert_eq!(common_positive_total_buckets(&[entry(-1)]), None);
     }
 
     /// Regression: when there are no entries at all, the empty stats we return must also
