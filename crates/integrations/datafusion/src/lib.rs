@@ -52,6 +52,7 @@ mod full_text_search;
 mod hybrid_search;
 mod lateral_vector_search;
 mod merge_into;
+mod partition_count_pushdown;
 mod physical_plan;
 mod procedures;
 mod relation_planner;

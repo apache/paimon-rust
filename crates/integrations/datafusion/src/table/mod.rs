@@ -173,6 +173,11 @@ impl PaimonTableProvider {
     pub fn table(&self) -> &Table {
         &self.table
     }
+
+    pub(crate) fn with_table(mut self, table: Table) -> Self {
+        self.table = table;
+        self
+    }
 }
 
 /// Build a `CREATE TABLE` DDL string for a Paimon table.

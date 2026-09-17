@@ -96,6 +96,141 @@ impl AvroRecordDecode for IndexManifestEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SlimIndexManifestEntry<'a> {
+    pub kind: FileKind,
+    pub partition: &'a [u8],
+    pub index_type: &'a str,
+    /// `None` means no ranges field; `Some(None)` means a missing cardinality.
+    pub deletion_vector_cardinality: Option<Option<i128>>,
+}
+
+const EMPTY_PARTITION: &[u8] = &[0, 0, 0, 0];
+
+pub(crate) fn decode_slim_index_manifest_entry<'a>(
+    cursor: &mut AvroCursor<'a>,
+    writer_schema: &WriterSchema,
+    is_union_wrapped: bool,
+) -> crate::Result<SlimIndexManifestEntry<'a>> {
+    if is_union_wrapped && cursor.read_union_index()? == 0 {
+        return Err(crate::Error::UnexpectedError {
+            message: "avro decode: unexpected null in top-level union".into(),
+            source: None,
+        });
+    }
+
+    let mut entry = SlimIndexManifestEntry {
+        kind: FileKind::Add,
+        partition: EMPTY_PARTITION,
+        index_type: "",
+        deletion_vector_cardinality: None,
+    };
+    for field in &writer_schema.fields {
+        match field.name.as_str() {
+            "_KIND" => {
+                entry.kind = match read_int_field(cursor, field.nullable)? {
+                    0 => FileKind::Add,
+                    1 => FileKind::Delete,
+                    v => {
+                        return Err(crate::Error::UnexpectedError {
+                            message: format!("unknown FileKind: {v}"),
+                            source: None,
+                        })
+                    }
+                }
+            }
+            "_PARTITION" => {
+                if !field.nullable || cursor.read_union_index()? != 0 {
+                    let partition = cursor.read_bytes()?;
+                    if partition.len() >= 4 {
+                        entry.partition = partition;
+                    }
+                }
+            }
+            "_INDEX_TYPE" => {
+                if !field.nullable || cursor.read_union_index()? != 0 {
+                    entry.index_type = cursor.read_string()?;
+                }
+            }
+            "_DELETIONS_VECTORS_RANGES" | "_DELETION_VECTORS_RANGES" => {
+                entry.deletion_vector_cardinality =
+                    decode_nullable_dv_cardinality(cursor, field.nullable, &field.schema)?;
+            }
+            _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
+        }
+    }
+    Ok(entry)
+}
+
+fn decode_nullable_dv_cardinality(
+    cursor: &mut AvroCursor<'_>,
+    nullable: bool,
+    schema: &FieldSchema,
+) -> crate::Result<Option<Option<i128>>> {
+    if nullable && cursor.read_union_index()? == 0 {
+        return Ok(None);
+    }
+    let FieldSchema::Array(item_schema) = schema else {
+        return Err(crate::Error::UnexpectedError {
+            message: "deletion vector ranges must be an Avro array".into(),
+            source: None,
+        });
+    };
+    let mut total = Some(0i128);
+    loop {
+        let count = cursor.read_long()?;
+        if count == 0 {
+            break;
+        }
+        let count = if count < 0 {
+            cursor.skip_long()?;
+            neg_count_to_usize(count)?
+        } else {
+            count as usize
+        };
+        for _ in 0..count {
+            let item_schema = match item_schema.as_ref() {
+                FieldSchema::Union(branches) => {
+                    let index = cursor.read_union_index()?;
+                    branches
+                        .get(index as usize)
+                        .ok_or_else(|| crate::Error::UnexpectedError {
+                            message: format!("invalid deletion vector item union index: {index}"),
+                            source: None,
+                        })?
+                }
+                schema => schema,
+            };
+            if matches!(item_schema, FieldSchema::Null) {
+                continue;
+            }
+            let FieldSchema::Record(record) = item_schema else {
+                return Err(crate::Error::UnexpectedError {
+                    message: "deletion vector array item must be an Avro record".into(),
+                    source: None,
+                });
+            };
+            let mut cardinality = None;
+            for field in &record.fields {
+                if field.name == "_CARDINALITY" {
+                    if !field.nullable || cursor.read_union_index()? != 0 {
+                        cardinality = Some(cursor.read_long()?);
+                    }
+                } else {
+                    skip_nullable_field(cursor, &field.schema, field.nullable)?;
+                }
+            }
+            total = match (total, cardinality) {
+                (Some(total), Some(cardinality)) if cardinality >= 0 => {
+                    total.checked_add(i128::from(cardinality))
+                }
+                _ => None,
+            };
+        }
+    }
+    Ok(Some(total))
+}
+
 fn decode_nullable_dv_ranges(
     cursor: &mut AvroCursor,
     nullable: bool,

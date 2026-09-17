@@ -167,6 +167,174 @@ where
     )))
 }
 
+/// Borrowed view of the manifest-entry fields needed to count rows per partition.
+/// Everything else (key/value stats, min/max keys, ...) is skipped in place, so
+/// decoding never materializes the per-file statistics that dominate manifest size.
+/// Ordinary files allocate nothing; files with `extra_files` allocate only that list.
+#[derive(Debug)]
+pub(crate) struct SlimManifestEntry<'a> {
+    pub kind: FileKind,
+    pub partition: &'a [u8],
+    pub bucket: i32,
+    pub level: i32,
+    pub file_name: &'a str,
+    pub row_count: i64,
+    pub first_row_id: Option<i64>,
+    pub extra_files: Vec<&'a str>,
+    pub embedded_index: Option<&'a [u8]>,
+    pub external_path: Option<&'a str>,
+}
+
+const EMPTY_PARTITION: &[u8] = &[0, 0, 0, 0];
+
+/// Decode one manifest entry as a [`SlimManifestEntry`] borrowing from the block.
+pub(crate) fn decode_slim_manifest_entry<'a>(
+    cursor: &mut AvroCursor<'a>,
+    writer_schema: &WriterSchema,
+    is_union_wrapped: bool,
+) -> crate::Result<SlimManifestEntry<'a>> {
+    if is_union_wrapped {
+        let idx = cursor.read_union_index()?;
+        if idx == 0 {
+            return Err(crate::Error::UnexpectedError {
+                message: "avro decode: unexpected null in top-level union".into(),
+                source: None,
+            });
+        }
+    }
+
+    let mut entry = SlimManifestEntry {
+        kind: FileKind::Add,
+        partition: EMPTY_PARTITION,
+        bucket: 0,
+        level: 0,
+        file_name: "",
+        row_count: 0,
+        first_row_id: None,
+        extra_files: Vec::new(),
+        embedded_index: None,
+        external_path: None,
+    };
+
+    for field in &writer_schema.fields {
+        match field.name.as_str() {
+            "_KIND" => {
+                entry.kind = match read_int_field(cursor, field.nullable)? {
+                    0 => FileKind::Add,
+                    1 => FileKind::Delete,
+                    v => {
+                        return Err(crate::Error::UnexpectedError {
+                            message: format!("unknown FileKind: {v}"),
+                            source: None,
+                        })
+                    }
+                };
+            }
+            "_PARTITION" => {
+                if !field.nullable || cursor.read_union_index()? != 0 {
+                    let bytes = cursor.read_bytes()?;
+                    // Same rule as `normalize_partition`: anything shorter than a
+                    // BinaryRow header is the unpartitioned row.
+                    if bytes.len() >= 4 {
+                        entry.partition = bytes;
+                    }
+                }
+            }
+            "_BUCKET" => entry.bucket = read_int_field(cursor, field.nullable)?,
+            "_FILE" => {
+                if field.nullable && cursor.read_union_index()? == 0 {
+                    continue;
+                }
+                let record_schema = extract_record_schema(&field.schema).ok_or_else(|| {
+                    crate::Error::UnexpectedError {
+                        message: "avro decode: _FILE field is not a record".into(),
+                        source: None,
+                    }
+                })?;
+                for file_field in &record_schema.fields {
+                    match file_field.name.as_str() {
+                        "_FILE_NAME" => {
+                            if !file_field.nullable || cursor.read_union_index()? != 0 {
+                                entry.file_name = cursor.read_string()?;
+                            }
+                        }
+                        "_ROW_COUNT" => {
+                            entry.row_count = read_long_field(cursor, file_field.nullable)?
+                        }
+                        "_LEVEL" => entry.level = read_int_field(cursor, file_field.nullable)?,
+                        "_EXTRA_FILES" => {
+                            entry.extra_files =
+                                decode_borrowed_string_array(cursor, file_field.nullable)?
+                        }
+                        "_EMBEDDED_FILE_INDEX" => {
+                            entry.embedded_index =
+                                decode_nullable_bytes_ref(cursor, file_field.nullable)?
+                        }
+                        "_EXTERNAL_PATH" => {
+                            entry.external_path =
+                                decode_nullable_string_ref(cursor, file_field.nullable)?
+                        }
+                        "_FIRST_ROW_ID" => {
+                            entry.first_row_id = decode_nullable_long(cursor, file_field.nullable)?
+                        }
+                        _ => skip_nullable_field(cursor, &file_field.schema, file_field.nullable)?,
+                    }
+                }
+            }
+            _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
+        }
+    }
+
+    Ok(entry)
+}
+
+fn decode_borrowed_string_array<'a>(
+    cursor: &mut AvroCursor<'a>,
+    nullable: bool,
+) -> crate::Result<Vec<&'a str>> {
+    if nullable && cursor.read_union_index()? == 0 {
+        return Ok(Vec::new());
+    }
+    let mut values = Vec::new();
+    loop {
+        let count = cursor.read_long()?;
+        if count == 0 {
+            break;
+        }
+        let count = if count < 0 {
+            cursor.skip_long()?;
+            neg_count_to_usize(count)?
+        } else {
+            count as usize
+        };
+        values.reserve(count.min(cursor.remaining()));
+        for _ in 0..count {
+            values.push(cursor.read_string()?);
+        }
+    }
+    Ok(values)
+}
+
+fn decode_nullable_bytes_ref<'a>(
+    cursor: &mut AvroCursor<'a>,
+    nullable: bool,
+) -> crate::Result<Option<&'a [u8]>> {
+    if nullable && cursor.read_union_index()? == 0 {
+        return Ok(None);
+    }
+    cursor.read_bytes().map(Some)
+}
+
+fn decode_nullable_string_ref<'a>(
+    cursor: &mut AvroCursor<'a>,
+    nullable: bool,
+) -> crate::Result<Option<&'a str>> {
+    if nullable && cursor.read_union_index()? == 0 {
+        return Ok(None);
+    }
+    cursor.read_string().map(Some)
+}
+
 fn decode_nullable_data_file_meta(
     cursor: &mut AvroCursor,
     field_schema: &FieldSchema,
