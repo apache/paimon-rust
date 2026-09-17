@@ -1332,6 +1332,7 @@ enum TypedColumn<'a> {
     Utf8View(&'a arrow_array::StringViewArray),
     LargeUtf8(&'a arrow_array::LargeStringArray),
     Date32(&'a arrow_array::Date32Array),
+    Time32Ms(&'a arrow_array::Time32MillisecondArray),
     Decimal128(&'a arrow_array::Decimal128Array, u32, u32), // (array, precision, scale)
     Binary(&'a arrow_array::BinaryArray),
     Variant(&'a arrow_array::StructArray),
@@ -1407,6 +1408,18 @@ fn downcast_columns<'a>(
                     col.as_any()
                         .downcast_ref()
                         .ok_or_else(|| type_mismatch_err("Date", col_idx))?,
+                ),
+                // Java writes TIME with the same `writeInt` as INTEGER and DATE
+                // (`BinaryWriter`), so in the binary format a TIME *is* an int
+                // millis-of-day and no precision can add detail. Hence one arm
+                // rather than the `match precision` the `Timestamp` arm below
+                // needs; `paimon_type_to_arrow` maps every precision to
+                // `Time32(Millisecond)` and the batch is validated against the
+                // schema built from it, so that is what arrives here.
+                DataType::Time(_) => TypedColumn::Time32Ms(
+                    col.as_any()
+                        .downcast_ref()
+                        .ok_or_else(|| type_mismatch_err("Time", col_idx))?,
                 ),
                 DataType::Decimal(d) => TypedColumn::Decimal128(
                     col.as_any()
@@ -1581,6 +1594,16 @@ fn write_typed_value(
             }
         }
         TypedColumn::Date32(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                builder.write_int(pos, arr.value(row_idx));
+            }
+        }
+        // Java keeps TIME in the fixed-length part and writes it with `writeInt`
+        // (`BinaryWriter#write` -> `BinaryRowWriter#writeInt`), so the four bytes and
+        // the zeroed upper half of the slot have to match for `hash_code` parity.
+        TypedColumn::Time32Ms(arr) => {
             if arr.is_null(row_idx) {
                 builder.set_null_at(pos);
             } else {
@@ -2299,19 +2322,25 @@ mod tests {
 
     #[test]
     fn test_batch_vs_per_row_equivalence() {
-        use arrow_array::{Int32Array, StringArray};
-        use arrow_schema::{DataType as ArrowDT, Field, Schema};
+        use arrow_array::{Int32Array, StringArray, Time32MillisecondArray};
+        use arrow_schema::{DataType as ArrowDT, Field, Schema, TimeUnit};
         use std::sync::Arc;
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", ArrowDT::Int32, true),
             Field::new("name", ArrowDT::Utf8, true),
+            Field::new("tm", ArrowDT::Time32(TimeUnit::Millisecond), true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
                 Arc::new(StringArray::from(vec![Some("hello"), Some("world"), None])),
+                Arc::new(Time32MillisecondArray::from(vec![
+                    Some(45_296_123),
+                    None,
+                    Some(0),
+                ])),
             ],
         )
         .unwrap();
@@ -2323,8 +2352,13 @@ mod tests {
                 "name".into(),
                 DataType::VarChar(crate::spec::VarCharType::string_type()),
             ),
+            crate::spec::DataField::new(
+                2,
+                "tm".into(),
+                DataType::Time(crate::spec::TimeType::new(3).unwrap()),
+            ),
         ];
-        let indices = vec![0, 1];
+        let indices = vec![0, 1, 2];
 
         // Batch results
         let batch_bytes = batch_to_serialized_bytes(&batch, &indices, &fields).unwrap();

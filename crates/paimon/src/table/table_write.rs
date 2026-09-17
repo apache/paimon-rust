@@ -2634,6 +2634,135 @@ pub(in crate::table) mod tests {
         assert_eq!(total_rows, 4);
     }
 
+    /// TIME as an append table's `bucket-key`. Java allows it: `validateBucket`
+    /// rejects only ARRAY, MULTISET, MAP and ROW there. Routing has to agree with
+    /// `BinaryRow::hash_code`, so the bucket is pinned against the row the per-row
+    /// encoder produces rather than against a hard-coded number.
+    #[tokio::test]
+    async fn test_time_bucket_key_routes_by_binary_row_hash() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_time_bucket_key";
+        setup_dirs(&file_io, table_path).await;
+
+        let time_type = DataType::Time(TimeType::new(3).unwrap());
+        let schema = Schema::builder()
+            .column("tm", time_type.clone())
+            .column("value", DataType::Int(IntType::new()))
+            .option("bucket", "4")
+            .option("bucket-key", "tm")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_time_bucket_key_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        // 12:34:56.123 and midnight.
+        let times = [45_296_123_i32, 0];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tm", ArrowDataType::Time32(TimeUnit::Millisecond), true),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Time32MillisecondArray::from(times.map(Some).to_vec())),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])),
+            ],
+        )
+        .unwrap();
+
+        let fields = table.schema().fields().to_vec();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let output = table_write
+            .bucket_assigner
+            .assign_batch(&batch, &fields)
+            .await
+            .unwrap();
+
+        let expected: Vec<i32> = times
+            .iter()
+            .map(|&millis| {
+                let row = BinaryRow::from_datums(&[(Some(&Datum::Time(millis)), &time_type)]);
+                // Mirrors `default_bucket`: `(hash % n).abs()`, which is Java's
+                // `Math.abs(hashcode % numBuckets)` and is *not* a euclidean
+                // remainder for negative hashes.
+                (row.hash_code() % 4).wrapping_abs()
+            })
+            .collect();
+        assert_eq!(output.buckets, expected);
+
+        // And the write itself must land, not just the routing.
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let rows: i64 = messages
+            .iter()
+            .flat_map(|m| m.new_files.iter())
+            .map(|f| f.row_count)
+            .sum();
+        assert_eq!(rows, 2);
+    }
+
+    /// TIME as a partition key. `partition_utils` already renders TIME partition
+    /// values, but that code was unreachable from the write path while the batch
+    /// encoder rejected the column, so this is the first test that exercises the
+    /// two together — hence the assertion on the rendered path, not just the row.
+    #[tokio::test]
+    async fn test_time_partition_key_writes_formatted_partition() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_time_partition_key";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("tm", DataType::Time(TimeType::new(3).unwrap()))
+            .column("value", DataType::Int(IntType::new()))
+            .partition_keys(["tm"])
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_time_partition_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tm", ArrowDataType::Time32(TimeUnit::Millisecond), true),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Time32MillisecondArray::from(vec![Some(45_296_123)])),
+                Arc::new(Int32Array::from(vec![Some(10)])),
+            ],
+        )
+        .unwrap();
+
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        let partition = BinaryRow::from_serialized_bytes(&messages[0].partition).unwrap();
+        assert_eq!(partition.get_int(0).unwrap(), 45_296_123);
+
+        let computer = PartitionComputer::new(
+            table.schema().partition_keys(),
+            table.schema().fields(),
+            "__DEFAULT_PARTITION__",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            computer.generate_partition_path(&partition).unwrap(),
+            "tm=12%3A34%3A56.123/"
+        );
+    }
+
     fn test_bucketed_schema() -> TableSchema {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
