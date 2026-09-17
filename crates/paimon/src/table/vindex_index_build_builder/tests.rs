@@ -763,12 +763,11 @@ async fn vindex_small_training_sample_preserves_tail_cluster_recall() {
         .execute()
         .await
         .unwrap();
-    assert_eq!(result.iter().map(RowRange::count).sum::<i64>(), 10);
+    let row_ids = &result.row_ids().unwrap().row_ids;
+    assert_eq!(row_ids.len(), 10);
     // Equal-distance IDs need not have a stable order; all hits must be in the tail cluster.
     assert!(
-        result
-            .iter()
-            .all(|range| range.from() >= 900 && range.to() < 1000),
+        row_ids.iter().all(|row_id| (900..1000).contains(row_id)),
         "{result:?}"
     );
 }
