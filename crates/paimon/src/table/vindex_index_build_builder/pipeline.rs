@@ -411,6 +411,22 @@ fn append_shard_granules(
     Ok(())
 }
 
+fn granules_partition_shard(granules: &[Granule], shard_range: &RowRange) -> bool {
+    if granules
+        .windows(2)
+        .any(|pair| pair[1].range.from() <= pair[0].range.to())
+    {
+        return false;
+    }
+    let coverage = merge_row_ranges(
+        granules
+            .iter()
+            .map(|granule| granule.range.clone())
+            .collect(),
+    );
+    coverage.len() == 1 && coverage.first() == Some(shard_range)
+}
+
 fn local_ids(row_ids: &[i64], start: i64, row_count: usize) -> Result<Vec<i64>> {
     let end = start
         .checked_add(i64::try_from(row_count).map_err(|e| Error::DataInvalid {
@@ -556,13 +572,9 @@ impl<'a> VindexIndexBuildBuilder<'a> {
 
         granules.sort_by_key(|granule| granule.range.from());
         if !use_whole_shard {
-            let coverage = merge_row_ranges(
-                granules
-                    .iter()
-                    .map(|granule| granule.range.clone())
-                    .collect(),
-            );
-            use_whole_shard = coverage.len() != 1 || coverage[0] != shard_range;
+            // Data Evolution may retain multiple physical providers for the same logical rows.
+            // Let the reader choose the provider instead of counting those rows twice here.
+            use_whole_shard = !granules_partition_shard(&granules, &shard_range);
         }
         if use_whole_shard || granules.is_empty() {
             granules = vec![Granule {
@@ -1010,5 +1022,30 @@ mod tests {
 
         assert_eq!(granules.len(), 300);
         assert_eq!(select_first(&granules, 250).len(), granules.len());
+    }
+
+    #[test]
+    fn overlapping_data_evolution_providers_do_not_partition_shard() {
+        let shard_range = RowRange::new(0, 99);
+        let mut granules = Vec::new();
+        for file_index in 0..2 {
+            append_shard_granules(
+                &mut granules,
+                file_index,
+                0,
+                &shard_range,
+                vec![ParquetGranule {
+                    first_row: 0,
+                    row_count: 100,
+                    byte_ranges: std::iter::once(0..1).collect(),
+                }],
+            )
+            .unwrap();
+        }
+        granules.sort_by_key(|granule| granule.range.from());
+
+        assert!(!granules_partition_shard(&granules, &shard_range));
+        granules.truncate(1);
+        assert!(granules_partition_shard(&granules, &shard_range));
     }
 }
