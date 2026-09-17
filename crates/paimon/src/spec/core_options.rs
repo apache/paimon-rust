@@ -88,6 +88,8 @@ const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
 const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
 const MANIFEST_MERGE_MIN_COUNT_OPTION: &str = "manifest.merge-min-count";
+const MANIFEST_SIDECAR_ENABLED_OPTION: &str = "manifest.sidecar.enabled";
+const MANIFEST_SORT_ENABLED_OPTION: &str = "manifest-sort.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
@@ -1163,6 +1165,18 @@ impl<'a> CoreOptions<'a> {
             .and_then(|v| v.parse().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_MANIFEST_MERGE_MIN_COUNT)
+    }
+
+    /// Whether manifest block sidecars are read and written.
+    ///
+    /// An explicit `manifest.sidecar.enabled` value wins. When it is absent,
+    /// this follows Java Paimon's `manifest-sort.enabled` compatibility rule.
+    pub fn manifest_sidecar_enabled(&self) -> bool {
+        self.options
+            .get(MANIFEST_SIDECAR_ENABLED_OPTION)
+            .or_else(|| self.options.get(MANIFEST_SORT_ENABLED_OPTION))
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     }
 
     /// Number of buckets for the table. Default is -1 (dynamic bucket).
@@ -2562,6 +2576,7 @@ mod tests {
         assert_eq!(core.manifest_compression(), "zstd");
         assert_eq!(core.manifest_target_size(), 8 * 1024 * 1024);
         assert_eq!(core.manifest_merge_min_count(), 30);
+        assert!(!core.manifest_sidecar_enabled());
     }
 
     #[test]
@@ -2598,6 +2613,32 @@ mod tests {
         let core = CoreOptions::new(&options);
 
         assert_eq!(core.manifest_target_size(), 2 * 1024);
+    }
+
+    #[test]
+    fn test_manifest_sidecar_defaults_to_sort_with_explicit_override() {
+        for (sort, sidecar, expected) in [
+            (None, None, false),
+            (Some("true"), None, true),
+            (Some("false"), None, false),
+            (Some("true"), Some("false"), false),
+            (Some("false"), Some("true"), true),
+        ] {
+            let mut options = HashMap::new();
+            if let Some(sort) = sort {
+                options.insert(MANIFEST_SORT_ENABLED_OPTION.to_string(), sort.to_string());
+            }
+            if let Some(sidecar) = sidecar {
+                options.insert(
+                    MANIFEST_SIDECAR_ENABLED_OPTION.to_string(),
+                    sidecar.to_string(),
+                );
+            }
+            assert_eq!(
+                CoreOptions::new(&options).manifest_sidecar_enabled(),
+                expected
+            );
+        }
     }
 
     #[test]

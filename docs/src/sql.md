@@ -2460,10 +2460,17 @@ the normal physical format without wrapping the writer.
 | `'sequence.field' = 'col'` | Sequence field used to determine which record wins during deduplication |
 | `'row-tracking.enabled' = 'true'` | Enable stable row ids |
 | `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE/DELETE) |
+| `'manifest.sidecar.enabled' = 'true'` | Write and read manifest block sidecars for partition, row-id, and bucket pruning; when unset, inherits `manifest-sort.enabled` |
 | `'global-index.enabled' = 'true'` | Enable global index metadata and reads |
 | `'deletion-vectors.enabled' = 'true'` | Enable deletion vectors |
 | `'deletion-vectors.merge-on-read' = 'true'` | Include and key-merge uncompacted level-0 files in DV-enabled deduplicate batch reads |
 | `'changelog-producer' = 'input'` | Changelog producer; primary-key tables support reads and writes in this mode |
+
+Manifest sidecars use the Java-compatible `<manifest-name>.avro.sidecar`
+format and are published through the manifest metadata's `_EXTRA_FILES` list.
+Missing, corrupt, unsupported, or mismatched sidecars fall back to reading the
+complete manifest. Entry filters and ADD/DELETE reconciliation still run after
+block selection.
 
 Cross-partition updates are not configured by an option: a primary-key table is
 in cross-partition update mode when `'bucket' = '-1'` and the primary key does

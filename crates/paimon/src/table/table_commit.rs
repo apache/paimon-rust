@@ -116,6 +116,7 @@ pub struct TableCommit {
     manifest_compression: String,
     manifest_target_size: i64,
     manifest_merge_min_count: usize,
+    manifest_sidecar_enabled: bool,
     row_tracking_enabled: bool,
     data_evolution_enabled: bool,
     partition_default_name: String,
@@ -140,6 +141,7 @@ impl TableCommit {
         let manifest_compression = core_options.manifest_compression().to_string();
         let manifest_target_size = core_options.manifest_target_size();
         let manifest_merge_min_count = core_options.manifest_merge_min_count();
+        let manifest_sidecar_enabled = core_options.manifest_sidecar_enabled();
         let row_tracking_enabled = core_options.row_tracking_enabled();
         let data_evolution_enabled = core_options.data_evolution_enabled();
         let partition_default_name = core_options.partition_default_name().to_string();
@@ -156,6 +158,7 @@ impl TableCommit {
             manifest_compression,
             manifest_target_size,
             manifest_merge_min_count,
+            manifest_sidecar_enabled,
             row_tracking_enabled,
             data_evolution_enabled,
             partition_default_name,
@@ -1214,8 +1217,34 @@ impl TableCommit {
         bytes: Vec<u8>,
     ) -> Result<ManifestFileMeta> {
         let file_size = bytes.len() as i64;
+        let sidecar = if self.manifest_sidecar_enabled {
+            Some(crate::spec::ManifestSidecar::build(
+                &bytes,
+                entries,
+                self.data_evolution_enabled,
+                self.total_buckets != -1,
+            )?)
+        } else {
+            None
+        };
         let output = file_io.new_output(path)?;
         output.write(bytes::Bytes::from(bytes)).await?;
+        let sidecar_name = sidecar
+            .as_ref()
+            .map(|_| format!("{}{}", file_name, crate::spec::MANIFEST_SIDECAR_SUFFIX));
+        if let (Some(sidecar), Some(_)) = (sidecar, sidecar_name.as_ref()) {
+            let sidecar_path = crate::spec::ManifestSidecar::path(path);
+            let write_result = async {
+                let output = file_io.new_output(&sidecar_path)?;
+                output.write(bytes::Bytes::from(sidecar)).await
+            }
+            .await;
+            if let Err(error) = write_result {
+                let _ = file_io.delete_file(path).await;
+                let _ = file_io.delete_file(&sidecar_path).await;
+                return Err(error);
+            }
+        }
 
         let mut added_file_count: i64 = 0;
         let mut deleted_file_count: i64 = 0;
@@ -1265,7 +1294,8 @@ impl TableCommit {
             schema_id,
         )
         .with_bucket_level_stats(min_bucket, max_bucket, min_level, max_level)
-        .with_row_id_stats(min_row_id, max_row_id))
+        .with_row_id_stats(min_row_id, max_row_id)
+        .with_extra_files(sidecar_name.map(|name| vec![name])))
     }
 
     /// Check if this commit was already completed (idempotency).
@@ -3502,6 +3532,57 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(*entries[0].kind(), FileKind::Add);
         assert_eq!(entries[0].file().file_name, "data-0.parquet");
+    }
+
+    #[tokio::test]
+    async fn test_commit_writes_and_publishes_manifest_sidecar() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_manifest_sidecar_commit";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([("manifest.sidecar.enabled".to_string(), "true".to_string())]),
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 100)],
+            )])
+            .await
+            .unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        let manifest_dir = format!("{table_path}/manifest");
+        let metas = ManifestList::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", snapshot.delta_manifest_list()),
+        )
+        .await
+        .unwrap();
+        let manifest = &metas[0];
+        let sidecar_name = format!(
+            "{}{}",
+            manifest.file_name(),
+            crate::spec::MANIFEST_SIDECAR_SUFFIX
+        );
+        assert_eq!(
+            manifest.extra_files(),
+            Some([sidecar_name.clone()].as_slice())
+        );
+
+        let manifest_path = format!("{manifest_dir}/{}", manifest.file_name());
+        let selection =
+            crate::spec::ManifestSidecar::read(&file_io, &manifest_path, manifest, None)
+                .await
+                .expect("published sidecar should be readable");
+        assert_eq!(selection.blocks().len(), 1);
+        assert!(file_io
+            .exists(&format!("{manifest_dir}/{sidecar_name}"))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
