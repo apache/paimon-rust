@@ -19,15 +19,19 @@ use super::extraction::{
     data_split_for_shard_ranges, extract_vector_batch, validate_vector_batch_ranges,
 };
 use super::planning::VindexIndexShard;
-use super::timing::vector_index_build_timing_enabled;
+use super::timing::{vector_index_build_timing_enabled, VectorIndexBuildTiming};
 use super::validation::{
     checked_row_count, checked_training_sample_index, checked_training_vector_count,
     checked_vector_bytes,
 };
 use super::writer::BuiltIndexFile;
 use super::VindexIndexBuildBuilder;
-use crate::arrow::format::parquet::{coalesced_parquet_range_bytes, parquet_granules};
+use crate::arrow::format::parquet::{
+    coalesced_parquet_range_bytes, parquet_granules, ParquetGranule,
+};
 use crate::spec::ROW_ID_FIELD_NAME;
+use crate::table::data_file_reader::DataFileReadTiming;
+use crate::table::table_read::configured_parquet_read_budget;
 use crate::table::{merge_row_ranges, ArrowRecordBatchStream, RowRange};
 use crate::vindex::VindexVectorIndexOptions;
 use crate::{Error, Result};
@@ -39,7 +43,8 @@ use paimon_vindex_core::index::{VectorIndexTrainer, VectorIndexTraining, VectorI
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -63,11 +68,6 @@ pub(super) struct GranulePlan {
     pub(super) first: Vec<RowRange>,
     pub(super) rest: Vec<RowRange>,
     first_rows: usize,
-    first_bytes: u64,
-    total_bytes: u64,
-    granule_count: usize,
-    first_granules: usize,
-    source: &'static str,
 }
 
 struct SpillRecord {
@@ -80,8 +80,9 @@ enum AddItem {
     Spilled(Vec<i64>, MutableBuffer),
 }
 
-type SpillTask = JoinHandle<std::io::Result<(std::fs::File, u64)>>;
-type ConsumerTask = JoinHandle<Result<(VectorIndexWriter, usize, usize)>>;
+type SpillTask = JoinHandle<std::io::Result<std::fs::File>>;
+type ConsumerTask = JoinHandle<Result<(VectorIndexWriter, usize, usize, Duration)>>;
+type TrainingTask = JoinHandle<std::io::Result<(VectorIndexTraining, Duration)>>;
 type ReplayTask = JoinHandle<std::io::Result<usize>>;
 
 struct SpillWriter {
@@ -90,7 +91,7 @@ struct SpillWriter {
 }
 
 impl SpillWriter {
-    async fn finish(self) -> Result<(std::fs::File, u64)> {
+    async fn finish(self) -> Result<std::fs::File> {
         drop(self.sender);
         join_spill(self.task).await
     }
@@ -110,7 +111,6 @@ fn spawn_spill_writer() -> Result<SpillWriter> {
     let (sender, mut receiver) = mpsc::channel::<SpillRecord>(QUEUE_CAPACITY);
     let task = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
         let mut writer = BufWriter::with_capacity(BUFFER_BYTES, file);
-        let mut bytes_written = 0u64;
         while let Some(record) = receiver.blocking_recv() {
             let count = record.ids.len() as u64;
             writer.write_all(&count.to_le_bytes())?;
@@ -118,16 +118,14 @@ fn spawn_spill_writer() -> Result<SpillWriter> {
                 writer.write_all(&id.to_le_bytes())?;
             }
             writer.write_all(&record.bytes)?;
-            bytes_written += 8 + count * 8 + record.bytes.len() as u64;
         }
         writer.flush()?;
-        let file = writer.into_inner().map_err(|e| e.into_error())?;
-        Ok((file, bytes_written))
+        writer.into_inner().map_err(|e| e.into_error())
     });
     Ok(SpillWriter { sender, task })
 }
 
-async fn join_spill(task: SpillTask) -> Result<(std::fs::File, u64)> {
+async fn join_spill(task: SpillTask) -> Result<std::fs::File> {
     task.await
         .map_err(|e| Error::UnexpectedError {
             message: format!("vindex spill task failed: {e}"),
@@ -144,12 +142,15 @@ fn spawn_add_consumer(
     mut receiver: mpsc::Receiver<AddItem>,
     index_column: String,
     dimension: usize,
+    timing_enabled: bool,
 ) -> ConsumerTask {
     tokio::task::spawn_blocking(move || -> Result<_> {
         let mut writer = writer;
         let mut rows_added = 0usize;
         let mut replay_rows = 0usize;
+        let mut index_add = Duration::ZERO;
         while let Some(item) = receiver.blocking_recv() {
+            let add_start = timing_enabled.then(Instant::now);
             match item {
                 AddItem::Batch(batch, ids) => {
                     let vectors = extract_vector_batch(&batch, &index_column, dimension)?;
@@ -185,21 +186,22 @@ fn spawn_add_consumer(
                     replay_rows += ids.len();
                 }
             }
+            if let Some(start) = add_start {
+                index_add = index_add.saturating_add(start.elapsed());
+            }
         }
-        Ok((writer, rows_added, replay_rows))
+        Ok((writer, rows_added, replay_rows, index_add))
     })
 }
 
-async fn join_consumer(task: ConsumerTask) -> Result<(VectorIndexWriter, usize, usize)> {
+async fn join_consumer(task: ConsumerTask) -> Result<(VectorIndexWriter, usize, usize, Duration)> {
     task.await.map_err(|e| Error::UnexpectedError {
         message: format!("vindex add task failed: {e}"),
         source: None,
     })?
 }
 
-async fn join_training(
-    task: JoinHandle<std::io::Result<VectorIndexTraining>>,
-) -> Result<VectorIndexTraining> {
+async fn join_training(task: TrainingTask) -> Result<(VectorIndexTraining, Duration)> {
     task.await
         .map_err(|e| Error::UnexpectedError {
             message: format!("vindex training task failed: {e}"),
@@ -212,21 +214,23 @@ async fn join_training(
 }
 
 async fn start_live_pipeline(
-    training: JoinHandle<std::io::Result<VectorIndexTraining>>,
+    training: TrainingTask,
     spill: SpillWriter,
     index_column: String,
     dimension: usize,
-) -> Result<(LivePipeline, u64)> {
+    timing_enabled: bool,
+) -> Result<(LivePipeline, Duration)> {
     let trained = join_training(training).await;
     let spilled = spill.finish().await;
-    let trained = trained?;
-    let (file, spill_bytes) = spilled?;
+    let (trained, train_finish) = trained?;
+    let file = spilled?;
     let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
     let consumer = spawn_add_consumer(
         VectorIndexWriter::new(trained),
         receiver,
         index_column,
         dimension,
+        timing_enabled,
     );
     let replay = spawn_replay(file, sender.clone(), dimension);
     Ok((
@@ -235,13 +239,16 @@ async fn start_live_pipeline(
             consumer,
             replay,
         },
-        spill_bytes,
+        train_finish,
     ))
 }
 
 async fn finish_live_pipeline(
     pipeline: LivePipeline,
-) -> (Result<(VectorIndexWriter, usize, usize)>, Result<usize>) {
+) -> (
+    Result<(VectorIndexWriter, usize, usize, Duration)>,
+    Result<usize>,
+) {
     let replay = pipeline
         .replay
         .await
@@ -286,11 +293,9 @@ fn spawn_replay(
             })?;
             let mut id_bytes = vec![0u8; id_bytes_len];
             reader.read_exact(&mut id_bytes)?;
-            ids.extend(
-                id_bytes
-                    .chunks_exact(8)
-                    .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap())),
-            );
+            let (id_chunks, remainder) = id_bytes.as_chunks::<8>();
+            debug_assert!(remainder.is_empty());
+            ids.extend(id_chunks.iter().map(|bytes| i64::from_le_bytes(*bytes)));
             let vector_bytes = count
                 .checked_mul(dimension)
                 .and_then(|value| value.checked_mul(4))
@@ -352,9 +357,9 @@ fn select_first(granules: &[Granule], training_rows: usize) -> HashSet<usize> {
         .map(|index| granules[*index].range.count() as usize)
         .sum::<usize>();
     if rows < training_rows {
-        for index in 0..granules.len() {
+        for (index, granule) in granules.iter().enumerate() {
             if selected.insert(index) {
-                rows += granules[index].range.count() as usize;
+                rows += granule.range.count() as usize;
                 if rows >= training_rows {
                     break;
                 }
@@ -373,6 +378,37 @@ fn select_first(granules: &[Granule], training_rows: usize) -> HashSet<usize> {
     } else {
         selected
     }
+}
+
+fn append_shard_granules(
+    granules: &mut Vec<Granule>,
+    file_index: usize,
+    file_start: i64,
+    shard_range: &RowRange,
+    file_granules: Vec<ParquetGranule>,
+) -> Result<()> {
+    for granule in file_granules {
+        let from = file_start
+            .checked_add(granule.first_row)
+            .ok_or_else(|| Error::DataInvalid {
+                message: "vindex granule row id overflows i64".to_string(),
+                source: None,
+            })?;
+        let to = from
+            .checked_add(granule.row_count - 1)
+            .ok_or_else(|| Error::DataInvalid {
+                message: "vindex granule row range overflows i64".to_string(),
+                source: None,
+            })?;
+        if let Some(range) = shard_range.intersect_inclusive(from, to) {
+            granules.push(Granule {
+                range,
+                file_index,
+                byte_ranges: granule.byte_ranges,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn local_ids(row_ids: &[i64], start: i64, row_count: usize) -> Result<Vec<i64>> {
@@ -406,11 +442,22 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         shard: &VindexIndexShard,
         ranges: Vec<RowRange>,
         index_column: &str,
+        read_timing: Option<&Arc<DataFileReadTiming>>,
+        parquet_read_budget: Option<&Arc<crate::arrow::ParquetReadBudget>>,
     ) -> Result<ArrowRecordBatchStream> {
         let split = data_split_for_shard_ranges(shard, ranges)?;
         let mut read_builder = self.table.new_read_builder();
         read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
-        read_builder.new_read()?.to_arrow(&[split])
+        let read = read_builder.new_read()?;
+        let read = match read_timing {
+            Some(timing) => read.with_data_file_read_timing(Arc::clone(timing)),
+            None => read,
+        };
+        let read = match parquet_read_budget {
+            Some(budget) => read.with_parquet_read_budget(Arc::clone(budget)),
+            None => read,
+        };
+        read.to_arrow(&[split])
     }
 
     pub(super) async fn plan_granules(
@@ -421,7 +468,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
     ) -> Result<GranulePlan> {
         let shard_range = RowRange::new(shard.row_range_start, shard.row_range_end);
         let mut granules = Vec::new();
-        let mut page_level = true;
         let mut use_whole_shard = false;
         let mut parquet_files = Vec::new();
 
@@ -451,11 +497,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             if path.to_ascii_lowercase().ends_with(".parquet") {
                 parquet_files.push((file_index, path, file_size, file_start, file_end));
             } else {
-                page_level = false;
                 granules.push(Granule {
                     range,
                     file_index,
-                    byte_ranges: vec![0..file_size],
+                    byte_ranges: std::iter::once(0..file_size).collect(),
                 });
             }
         }
@@ -473,16 +518,15 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                     |(file_index, path, file_size, file_start, file_end)| async move {
                         let input = file_io.new_input(&path)?;
                         let reader = Box::new(input.reader().await?);
-                        let (granules, pages) =
+                        let (granules, _) =
                             parquet_granules(reader, file_size, index_column).await?;
-                        Ok::<_, Error>((file_index, file_start, file_end, granules, pages))
+                        Ok::<_, Error>((file_index, file_start, file_end, granules))
                     },
                 )
                 .buffer_unordered(concurrency);
             while let Some(result) = results.next().await {
                 match result {
-                    Ok((file_index, file_start, file_end, file_granules, pages)) => {
-                        page_level &= pages;
+                    Ok((file_index, file_start, file_end, file_granules)) => {
                         let covered = file_granules
                             .iter()
                             .map(|granule| granule.row_count)
@@ -491,28 +535,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                             use_whole_shard = true;
                             break;
                         }
-                        for granule in file_granules {
-                            let from =
-                                file_start.checked_add(granule.first_row).ok_or_else(|| {
-                                    Error::DataInvalid {
-                                        message: "vindex granule row id overflows i64".to_string(),
-                                        source: None,
-                                    }
-                                })?;
-                            let to = from.checked_add(granule.row_count - 1).ok_or_else(|| {
-                                Error::DataInvalid {
-                                    message: "vindex granule row range overflows i64".to_string(),
-                                    source: None,
-                                }
-                            })?;
-                            if let Some(range) = shard_range.intersect_inclusive(from, to) {
-                                granules.push(Granule {
-                                    range,
-                                    file_index,
-                                    byte_ranges: granule.byte_ranges,
-                                });
-                            }
-                        }
+                        append_shard_granules(
+                            &mut granules,
+                            file_index,
+                            file_start,
+                            &shard_range,
+                            file_granules,
+                        )?;
                     }
                     Err(error) => {
                         log::warn!(
@@ -535,30 +564,25 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             );
             use_whole_shard = coverage.len() != 1 || coverage[0] != shard_range;
         }
-        let source = if use_whole_shard || granules.is_empty() {
+        if use_whole_shard || granules.is_empty() {
             granules = vec![Granule {
                 range: shard_range,
                 file_index: 0,
-                byte_ranges: vec![
+                byte_ranges: std::iter::once(
                     0..shard
                         .files
                         .iter()
                         .map(|file| file.file_size.max(0) as u64)
                         .sum(),
-                ],
+                )
+                .collect(),
             }];
-            "shard"
-        } else if page_level {
-            "page"
-        } else {
-            "row_group_or_file"
-        };
+        }
 
         let selected = select_first(&granules, training_rows);
         let mut first = Vec::with_capacity(selected.len());
         let mut rest = Vec::with_capacity(granules.len() - selected.len());
         let mut first_rows = 0usize;
-        let total_bytes = granule_bytes(&granules, None);
         for (index, granule) in granules.iter().enumerate() {
             if selected.contains(&index) {
                 first_rows += granule.range.count() as usize;
@@ -567,16 +591,10 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 rest.push(granule.range.clone());
             }
         }
-        let first_bytes = granule_bytes(&granules, Some(&selected));
         Ok(GranulePlan {
             first: merge_row_ranges(first),
             rest: merge_row_ranges(rest),
             first_rows,
-            first_bytes,
-            total_bytes,
-            granule_count: granules.len(),
-            first_granules: selected.len(),
-            source,
         })
     }
 
@@ -590,7 +608,18 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         options: &VindexVectorIndexOptions,
         index_meta: Vec<u8>,
     ) -> Result<BuiltIndexFile> {
-        let total_start = Instant::now();
+        let timing_enabled = vector_index_build_timing_enabled();
+        let total_start = timing_enabled.then(Instant::now);
+        let mut source_batch_wait = Duration::ZERO;
+        let mut batch_count = 0usize;
+        let read_timing = timing_enabled.then(|| Arc::new(DataFileReadTiming::default()));
+        let parquet_read_budget = if timing_enabled {
+            let budget = configured_parquet_read_budget(self.table)?;
+            budget.enable_diagnostics();
+            Some(budget)
+        } else {
+            None
+        };
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
         let row_count_usize = usize::try_from(row_count).map_err(|e| Error::DataInvalid {
             message: format!("Invalid vindex row count: {row_count}"),
@@ -626,9 +655,22 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let mut first_rows = 0usize;
         let mut range_index = 0usize;
         let first_result: Result<()> = async {
-            let mut stream = self.open_vector_stream(shard, plan.first.clone(), index_column)?;
+            let mut stream = self.open_vector_stream(
+                shard,
+                plan.first.clone(),
+                index_column,
+                read_timing.as_ref(),
+                parquet_read_budget.as_ref(),
+            )?;
             let mut expected_row_id = plan.first[0].from();
-            while let Some(batch) = stream.try_next().await? {
+            loop {
+                let source_start = timing_enabled.then(Instant::now);
+                let batch = stream.try_next().await?;
+                if let Some(start) = source_start {
+                    source_batch_wait = source_batch_wait.saturating_add(start.elapsed());
+                }
+                let Some(batch) = batch else { break };
+                batch_count += 1;
                 let vectors = validate_vector_batch_ranges(
                     &batch,
                     index_column,
@@ -711,25 +753,31 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             };
         }
 
-        let train_start = Instant::now();
-        let mut training: Option<JoinHandle<std::io::Result<VectorIndexTraining>>> =
-            Some(tokio::task::spawn_blocking(move || trainer.finish()));
+        let mut training: Option<TrainingTask> = Some(tokio::task::spawn_blocking(
+            move || -> std::io::Result<_> {
+                let start = timing_enabled.then(Instant::now);
+                let training = trainer.finish()?;
+                Ok((
+                    training,
+                    start.map_or(Duration::ZERO, |start| start.elapsed()),
+                ))
+            },
+        ));
         let mut live: Option<LivePipeline> = None;
-        let mut train_ms = 0.0;
-        let mut spill_bytes = 0u64;
+        let mut train_finish = Duration::ZERO;
         let index_column = index_column.to_string();
 
         macro_rules! go_live {
             () => {{
-                let (pipeline, bytes) = start_live_pipeline(
+                let (pipeline, duration) = start_live_pipeline(
                     training.take().expect("training task"),
                     spill.take().expect("spill writer"),
                     index_column.clone(),
                     dimension,
+                    timing_enabled,
                 )
                 .await?;
-                train_ms = train_start.elapsed().as_secs_f64() * 1000.0;
-                spill_bytes = bytes;
+                train_finish = duration;
                 live = Some(pipeline);
             }};
         }
@@ -737,10 +785,23 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         let mut rest_rows = 0usize;
         let producer_result: Result<()> = async {
             if !plan.rest.is_empty() {
-                let mut stream = self.open_vector_stream(shard, plan.rest.clone(), &index_column)?;
+                let mut stream = self.open_vector_stream(
+                    shard,
+                    plan.rest.clone(),
+                    &index_column,
+                    read_timing.as_ref(),
+                    parquet_read_budget.as_ref(),
+                )?;
                 let mut range_index = 0usize;
                 let mut expected_row_id = plan.rest[0].from();
-                while let Some(batch) = stream.try_next().await? {
+                loop {
+                    let source_start = timing_enabled.then(Instant::now);
+                    let batch = stream.try_next().await?;
+                    if let Some(start) = source_start {
+                        source_batch_wait = source_batch_wait.saturating_add(start.elapsed());
+                    }
+                    let Some(batch) = batch else { break };
+                    batch_count += 1;
                     if live.is_none() && training.as_ref().is_some_and(|task| task.is_finished()) {
                         go_live!();
                     }
@@ -804,12 +865,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         if let Err(producer_error) = producer_result {
             if let Some(pipeline) = live.take() {
                 let (consumer, replay) = finish_live_pipeline(pipeline).await;
-                if let Err(consumer_error) = consumer {
-                    return Err(consumer_error);
-                }
-                if let Err(replay_error) = replay {
-                    return Err(replay_error);
-                }
+                consumer?;
+                replay?;
             } else {
                 let spill_result = match spill.take() {
                     Some(spill) => spill.finish().await.map(|_| ()),
@@ -829,7 +886,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         }
 
         let (consumer, replay) = finish_live_pipeline(live.unwrap()).await;
-        let (writer, rows_added, consumer_replay_rows) = consumer?;
+        let (writer, rows_added, consumer_replay_rows, index_add) = consumer?;
         let replay_rows = replay?;
         if rows_added != row_count_usize || replay_rows != consumer_replay_rows {
             return Err(Error::DataInvalid {
@@ -840,28 +897,53 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             });
         }
 
+        let serialize_upload_start = timing_enabled.then(Instant::now);
         let meta = self
             .finish_index_file(writer, shard, index_field_id, index_meta, row_count)
             .await?;
-        if vector_index_build_timing_enabled() {
-            eprintln!(
-                "event=paimon_vector_index_build_pipeline index_type={} rows={} dimension={} granule_source={} granules={} first_granules={} first_rows={} first_bytes={} total_bytes={} training_rows={} train_ms={:.1} spill_bytes={} total_ms={:.1}",
-                self.index_type,
-                row_count_usize,
-                dimension,
-                plan.source,
-                plan.granule_count,
-                plan.first_granules,
-                plan.first_rows,
-                plan.first_bytes,
-                plan.total_bytes,
-                training_rows,
-                train_ms,
-                spill_bytes,
-                total_start.elapsed().as_secs_f64() * 1000.0,
-            );
-        }
-        Ok(BuiltIndexFile { meta, timing: None })
+        let serialize_upload =
+            serialize_upload_start.map_or(Duration::ZERO, |start| start.elapsed());
+        let (oss_read, parquet_decode) = read_timing
+            .as_ref()
+            .map_or((Duration::ZERO, Duration::ZERO), |timing| {
+                (timing.file_read(), timing.parquet_decode())
+            });
+        let (file_schema_open, first_batch_wait, remaining_batch_wait) = read_timing
+            .as_ref()
+            .map_or((Duration::ZERO, Duration::ZERO, Duration::ZERO), |timing| {
+                timing.file_waits()
+            });
+        let parquet_diagnostics = parquet_read_budget
+            .as_ref()
+            .map_or_else(Default::default, |budget| budget.diagnostics());
+        let timing = total_start.map(|start| VectorIndexBuildTiming {
+            total_without_commit: start.elapsed(),
+            source_batch_wait,
+            oss_read,
+            parquet_decode,
+            file_schema_open,
+            first_batch_wait,
+            remaining_batch_wait,
+            parquet_row_group_count: parquet_diagnostics.row_group_count,
+            parquet_projected_bytes_min: parquet_diagnostics.projected_bytes_min,
+            parquet_projected_bytes_max: parquet_diagnostics.projected_bytes_max,
+            parquet_projected_bytes_total: parquet_diagnostics.projected_bytes_total,
+            parquet_peak_inflight_row_groups: parquet_diagnostics.peak_inflight,
+            raw_temp_write: Duration::ZERO,
+            train_finish,
+            raw_temp_reread: Duration::ZERO,
+            index_add,
+            serialize_upload,
+            rows: row_count_usize,
+            training_rows_seen: plan.first_rows,
+            training_rows_retained: training_rows,
+            batch_count,
+            raw_temp_bytes: 0,
+            index_bytes: meta.file_size as u64,
+            data_file_count: shard.files.len(),
+            file_name: meta.file_name.clone(),
+        });
+        Ok(BuiltIndexFile { meta, timing })
     }
 }
 
@@ -875,7 +957,7 @@ mod tests {
             .map(|row| Granule {
                 range: RowRange::new(row, row),
                 file_index: row as usize,
-                byte_ranges: vec![0..1],
+                byte_ranges: std::iter::once(0..1).collect(),
             })
             .collect::<Vec<_>>();
         let selected = select_first(&granules, 256);
@@ -890,7 +972,7 @@ mod tests {
             .map(|row| Granule {
                 range: RowRange::new(row, row),
                 file_index: 0,
-                byte_ranges: vec![row as u64 * 2..row as u64 * 2 + 1],
+                byte_ranges: std::iter::once(row as u64 * 2..row as u64 * 2 + 1).collect(),
             })
             .collect::<Vec<_>>();
 
@@ -903,9 +985,30 @@ mod tests {
             .map(|row| Granule {
                 range: RowRange::new(row, row),
                 file_index: 0,
-                byte_ranges: vec![row as u64..row as u64 + 1],
+                byte_ranges: std::iter::once(row as u64..row as u64 + 1).collect(),
             })
             .collect::<Vec<_>>();
         assert_eq!(select_first(&granules, 8).len(), granules.len());
+    }
+
+    #[test]
+    fn near_full_shard_in_shared_file_reads_all_first() {
+        let file_granules = (0..1_200)
+            .map(|row| ParquetGranule {
+                first_row: row,
+                row_count: 1,
+                byte_ranges: std::iter::once(
+                    row as u64 * 2 * 1024 * 1024..row as u64 * 2 * 1024 * 1024 + 1,
+                )
+                .collect(),
+            })
+            .collect();
+        let shard_range = RowRange::new(400, 699);
+        let mut granules = Vec::new();
+
+        append_shard_granules(&mut granules, 0, 0, &shard_range, file_granules).unwrap();
+
+        assert_eq!(granules.len(), 300);
+        assert_eq!(select_first(&granules, 250).len(), granules.len());
     }
 }
