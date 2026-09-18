@@ -593,10 +593,22 @@ def test_read_returns_expected_rows():
         assert t.sort_by("id").to_pydict() == {"id": [1, 2, 3], "name": ["a", "b", "c"]}
 
 
+def test_read_arrow_streams_expected_rows():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+        splits = builder.new_scan().plan().splits()
+        reader = builder.new_read().read_arrow(splits)
+        batches = list(reader)
+        assert pa.Table.from_batches(batches).to_pydict() == {"id": [1, 2, 3]}
+        assert reader.read_next_batch() is None
+
+
 def test_read_empty_splits():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
         assert table.new_read_builder().new_read().read([]) == []
+        assert list(table.new_read_builder().new_read().read_arrow([])) == []
 
 
 def test_read_empty_splits_still_validates_projection():
@@ -607,6 +619,8 @@ def test_read_empty_splits_still_validates_projection():
         read = table.new_read_builder().with_projection(["does_not_exist"]).new_read()
         with pytest.raises(Exception):
             read.read([])
+        with pytest.raises(Exception):
+            read.read_arrow([])
 
 
 def test_read_non_split_raises_typeerror():

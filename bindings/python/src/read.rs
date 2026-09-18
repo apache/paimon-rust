@@ -16,14 +16,14 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::pyarrow::ToPyArrow;
 use futures::TryStreamExt;
 use paimon::spec::Predicate;
-use paimon::table::{DataSplit, IncrementalScanMode, RowRange, Table};
+use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
@@ -380,37 +380,91 @@ pub struct PyTableRead {
     case_sensitive: bool,
 }
 
+impl PyTableRead {
+    fn read_stream(
+        &self,
+        py: Python<'_>,
+        splits: &Bound<'_, PyAny>,
+    ) -> PyResult<ArrowRecordBatchStream> {
+        let splits = extract_splits(splits)?;
+        py.detach(|| {
+            let mut builder = self.table.new_read_builder();
+            apply_read_config(
+                &mut builder,
+                &self.projection,
+                self.limit,
+                &self.filter,
+                self.case_sensitive,
+            )?;
+            // Validate config (e.g. projection) before the empty-splits fast
+            // path so an invalid projection fails consistently regardless of
+            // how many splits are passed.
+            let read = builder.new_read().map_err(to_py_err)?;
+            read.to_arrow(&splits).map_err(to_py_err)
+        })
+    }
+}
+
 #[pymethods]
 impl PyTableRead {
+    /// Lazily read the given splits as an iterator of PyArrow RecordBatches.
+    fn read_arrow(
+        &self,
+        py: Python<'_>,
+        splits: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRecordBatchReader> {
+        Ok(PyRecordBatchReader {
+            stream: Mutex::new(self.read_stream(py, splits)?),
+        })
+    }
+
     /// Read the given splits into a list of PyArrow RecordBatches.
     fn read(&self, py: Python<'_>, splits: &Bound<'_, PyAny>) -> PyResult<Vec<Py<PyAny>>> {
-        let splits = extract_splits(splits)?;
+        let stream = self.read_stream(py, splits)?;
         let rt = runtime();
         let batches = py.detach(|| {
-            rt.block_on(async {
-                let mut builder = self.table.new_read_builder();
-                apply_read_config(
-                    &mut builder,
-                    &self.projection,
-                    self.limit,
-                    &self.filter,
-                    self.case_sensitive,
-                )?;
-                // Validate config (e.g. projection) before the empty-splits fast
-                // path so an invalid projection fails consistently regardless of
-                // how many splits are passed.
-                let read = builder.new_read().map_err(to_py_err)?;
-                if splits.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let stream = read.to_arrow(&splits).map_err(to_py_err)?;
-                stream.try_collect::<Vec<_>>().await.map_err(to_py_err)
-            })
+            rt.block_on(stream.try_collect::<Vec<_>>())
+                .map_err(to_py_err)
         })?;
         batches
             .iter()
             .map(|batch| Ok(batch.to_pyarrow(py)?.unbind()))
             .collect()
+    }
+}
+
+#[pyclass(name = "RecordBatchReader", module = "pypaimon_rust.datafusion")]
+pub struct PyRecordBatchReader {
+    stream: Mutex<ArrowRecordBatchStream>,
+}
+
+impl PyRecordBatchReader {
+    fn next_batch(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let batch = py.detach(|| {
+            let mut stream = self
+                .stream
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("native record batch reader lock poisoned"))?;
+            runtime().block_on(stream.try_next()).map_err(to_py_err)
+        })?;
+        batch
+            .map(|batch| Ok(batch.to_pyarrow(py)?.unbind()))
+            .transpose()
+    }
+}
+
+#[pymethods]
+impl PyRecordBatchReader {
+    fn read_next_batch(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.next_batch(py)
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.next_batch(py)
     }
 }
 
