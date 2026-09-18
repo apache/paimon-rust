@@ -16,6 +16,7 @@
 // under the License.
 
 mod extraction;
+mod pipeline;
 mod planning;
 mod timing;
 mod validation;

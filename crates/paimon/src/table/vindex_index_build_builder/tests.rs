@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::extraction::validate_vector_batch;
+use super::extraction::{validate_vector_batch, validate_vector_batch_ranges};
 use super::planning::{plan_vindex_shards, VindexIndexShard};
 use super::validation::{
     checked_training_sample_index, checked_training_vector_count, checked_vector_bytes,
@@ -250,6 +250,70 @@ fn test_extract_vectors_accepts_list_float32_and_row_ids() {
     let vectors = extract_vectors_from_batches(&[batch], "embedding", 2, 10, 2).unwrap();
 
     assert_eq!(vectors, vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn test_ranged_vector_validation_accepts_gaps_across_batches() {
+    let ranges = vec![RowRange::new(10, 11), RowRange::new(15, 16)];
+    let batches = [
+        vector_batch(
+            vec![
+                Some(vec![Some(1.0), Some(2.0)]),
+                Some(vec![Some(3.0), Some(4.0)]),
+            ],
+            vec![Some(10), Some(11)],
+        ),
+        vector_batch(
+            vec![
+                Some(vec![Some(5.0), Some(6.0)]),
+                Some(vec![Some(7.0), Some(8.0)]),
+            ],
+            vec![Some(15), Some(16)],
+        ),
+    ];
+    let mut range_index = 0;
+    let mut expected_row_id = ranges[0].from();
+
+    for batch in &batches {
+        validate_vector_batch_ranges(
+            batch,
+            "embedding",
+            2,
+            &ranges,
+            &mut range_index,
+            &mut expected_row_id,
+        )
+        .unwrap();
+    }
+
+    assert_eq!(range_index, ranges.len());
+    assert_eq!(expected_row_id, 17);
+}
+
+#[test]
+fn test_ranged_vector_validation_rejects_bad_row_ids() {
+    let ranges = vec![RowRange::new(10, 11), RowRange::new(15, 16)];
+    for row_ids in [
+        vec![Some(10), Some(10)],
+        vec![Some(10), Some(15)],
+        vec![Some(9), Some(10)],
+        vec![Some(10), Some(11), Some(16), Some(15)],
+        vec![Some(10), Some(11), Some(15), Some(16), Some(17)],
+    ] {
+        let rows = row_ids.len();
+        let batch = vector_batch(vec![Some(vec![Some(1.0), Some(2.0)]); rows], row_ids);
+        let mut range_index = 0;
+        let mut expected_row_id = ranges[0].from();
+        assert!(validate_vector_batch_ranges(
+            &batch,
+            "embedding",
+            2,
+            &ranges,
+            &mut range_index,
+            &mut expected_row_id,
+        )
+        .is_err());
+    }
 }
 
 #[test]
@@ -605,6 +669,10 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     let second_built = table
         .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
         .with_index_column("embedding")
+        .with_options(HashMap::from([(
+            "vindex.build.granule.enabled".to_string(),
+            "false".to_string(),
+        )]))
         .execute()
         .await
         .unwrap();
@@ -641,6 +709,71 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
             meta.row_range_end
         );
     }
+}
+
+#[tokio::test]
+async fn vindex_small_training_sample_preserves_tail_cluster_recall() {
+    let table_path = "memory:/test_vindex_small_sample_recall";
+    let mut options = table_options("1000");
+    for (key, value) in [
+        ("ivf-sq.dimension", "1"),
+        ("ivf-sq.nlist", "1"),
+        ("ivf-sq.metric", "l2"),
+        ("ivf-sq.train.sample-ratio", "0.1"),
+    ] {
+        options.insert(key.to_string(), value.to_string());
+    }
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        table_path,
+        vindex_schema_builder(options).build().unwrap(),
+    );
+    setup_dirs(table.file_io(), table_path).await;
+    write_vectors(
+        &table,
+        (0..1000).collect(),
+        (0..1000)
+            .map(|id| {
+                vec![if id < 450 {
+                    0.0
+                } else if id < 900 {
+                    1.0
+                } else {
+                    100.0
+                }]
+            })
+            .collect(),
+    )
+    .await;
+    assert_eq!(
+        table
+            .new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![100.0])
+        .with_limit(10)
+        .with_options(HashMap::from([(
+            "ivf-sq.nprobe".to_string(),
+            "1".to_string(),
+        )]))
+        .execute()
+        .await
+        .unwrap();
+    let row_ids = &result.row_ids().unwrap().row_ids;
+    assert_eq!(row_ids.len(), 10);
+    // Equal-distance IDs need not have a stable order; all hits must be in the tail cluster.
+    assert!(
+        row_ids.iter().all(|row_id| (900..1000).contains(row_id)),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]
