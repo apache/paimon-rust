@@ -21,7 +21,7 @@ use crate::spec::Datum;
 use crate::Result;
 
 /// Writes one concrete file index payload.
-pub(crate) trait FileIndexWriter {
+pub(crate) trait FileIndexWriter: Send {
     /// Adds one row to the index. `None` represents a null value.
     fn write(&mut self, datum: Option<&Datum>) -> Result<()>;
 

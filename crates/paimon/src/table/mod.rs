@@ -38,6 +38,7 @@ mod consumer_manager;
 pub(crate) mod cow_writer;
 mod data_evolution_reader;
 pub mod data_evolution_writer;
+mod data_file_index_writer;
 mod data_file_reader;
 mod data_file_writer;
 mod de_vector_read;
