@@ -40,6 +40,7 @@ const DEFAULT_NLIST: &str = "256";
 const DEFAULT_PQ_M: &str = "16";
 const DEFAULT_PQ_USE_OPQ: &str = "false";
 const DEFAULT_TRAIN_SAMPLE_RATIO: f64 = 1.0;
+const VINDEX_BUILD_GRANULE_ENABLED: &str = "vindex.build.granule.enabled";
 const VECTOR_SEARCH_TIMING_ENV: &str = "PAIMON_LOG_VECTOR_SEARCH_TIMING";
 const DISKANN_OPTION_KEYS: &[(&str, &str)] = &[
     ("deployment-profile", "deployment-profile"),
@@ -114,6 +115,7 @@ pub(crate) struct VindexVectorIndexOptions {
     pub config: VectorIndexConfig,
     pub native_options: HashMap<String, String>,
     pub train_sample_ratio: f64,
+    pub granule_build_enabled: bool,
 }
 
 impl VindexVectorIndexOptions {
@@ -228,10 +230,12 @@ impl VindexVectorIndexOptions {
         })?;
         let train_sample_ratio =
             resolve_train_sample_ratio(table_options, user_options, index_type, field.name())?;
+        let granule_build_enabled = resolve_granule_build_enabled(table_options, user_options)?;
         Ok(Self {
             config,
             native_options,
             train_sample_ratio,
+            granule_build_enabled,
         })
     }
 
@@ -290,6 +294,9 @@ fn is_supported_user_option_key(key: &str, index_type: &str, field_name: &str) -
     if key == "index.type" {
         return true;
     }
+    if key == VINDEX_BUILD_GRANULE_ENABLED {
+        return index_type != DISKANN_IDENTIFIER;
+    }
     if is_allowed_native_key(key, index_type) {
         return true;
     }
@@ -305,6 +312,25 @@ fn is_supported_user_option_key(key: &str, index_type: &str, field_name: &str) -
     }
 
     false
+}
+
+fn resolve_granule_build_enabled(
+    table_options: &HashMap<String, String>,
+    user_options: &HashMap<String, String>,
+) -> crate::Result<bool> {
+    match user_options
+        .get(VINDEX_BUILD_GRANULE_ENABLED)
+        .or_else(|| table_options.get(VINDEX_BUILD_GRANULE_ENABLED))
+    {
+        Some(value) => value
+            .parse::<bool>()
+            .map_err(|_| crate::Error::ConfigInvalid {
+                message: format!(
+                    "Invalid vindex option {VINDEX_BUILD_GRANULE_ENABLED}='{value}'; expected true or false"
+                ),
+            }),
+        None => Ok(true),
+    }
 }
 
 fn is_allowed_native_key(key: &str, index_type: &str) -> bool {
@@ -832,6 +858,53 @@ mod tests {
     }
 
     #[test]
+    fn test_vindex_options_granule_build_enabled() {
+        let field = array_float_field();
+        let defaults = VindexVectorIndexOptions::new(
+            &HashMap::new(),
+            &HashMap::new(),
+            IVF_FLAT_IDENTIFIER,
+            &field,
+        )
+        .unwrap();
+        assert!(defaults.granule_build_enabled);
+
+        let table_options = HashMap::from([(
+            VINDEX_BUILD_GRANULE_ENABLED.to_string(),
+            "false".to_string(),
+        )]);
+        let disabled = VindexVectorIndexOptions::new(
+            &table_options,
+            &HashMap::new(),
+            IVF_FLAT_IDENTIFIER,
+            &field,
+        )
+        .unwrap();
+        assert!(!disabled.granule_build_enabled);
+
+        let user_options =
+            HashMap::from([(VINDEX_BUILD_GRANULE_ENABLED.to_string(), "true".to_string())]);
+        let overridden = VindexVectorIndexOptions::new(
+            &table_options,
+            &user_options,
+            IVF_FLAT_IDENTIFIER,
+            &field,
+        )
+        .unwrap();
+        assert!(overridden.granule_build_enabled);
+
+        let invalid =
+            HashMap::from([(VINDEX_BUILD_GRANULE_ENABLED.to_string(), "yes".to_string())]);
+        assert!(VindexVectorIndexOptions::new(
+            &HashMap::new(),
+            &invalid,
+            IVF_FLAT_IDENTIFIER,
+            &field,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn test_vindex_options_reject_invalid_train_sample_ratio() {
         for value in ["0", "-0.1", "1.1", "NaN", "inf", "not-a-number"] {
             let user_options =
@@ -949,6 +1022,7 @@ mod tests {
             (IVF_FLAT_IDENTIFIER, "ivf-flat.pq.m"),
             (IVF_FLAT_IDENTIFIER, "diskann.max-degree"),
             (DISKANN_IDENTIFIER, "diskann.nlist"),
+            (DISKANN_IDENTIFIER, VINDEX_BUILD_GRANULE_ENABLED),
         ] {
             let user_options = HashMap::from([(key.to_string(), "2".to_string())]);
             let err = VindexVectorIndexOptions::new(
