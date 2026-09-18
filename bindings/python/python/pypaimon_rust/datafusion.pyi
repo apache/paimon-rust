@@ -84,6 +84,9 @@ class ReadBuilder:
         """Set a scan-planning row-limit hint, not an exact cap: a matching split is
         returned whole. Apply application-level limiting for an exact bound."""
         ...
+    def with_blob_parallelism(self, blob_parallelism: int) -> "ReadBuilder":
+        """Set the maximum number of concurrent BLOB range reads. Must be positive."""
+        ...
     def with_filter(self, predicate: dict) -> "ReadBuilder": ...
     def with_row_ranges(self, ranges: Sequence[tuple[int, int]]) -> "ReadBuilder":
         """Set Data Evolution row ranges. Empty selects no rows; format tables are unsupported."""

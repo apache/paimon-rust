@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::arrow::build_target_arrow_schema;
+use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::create_format_reader_with_budget;
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::arrow::ParquetReadBudget;
@@ -117,6 +118,7 @@ pub(crate) struct DataFileReader {
     file_index_read_enabled: bool,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     blob_as_descriptor: bool,
+    blob_parallelism: usize,
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     read_timing: Option<Arc<DataFileReadTiming>>,
@@ -141,6 +143,7 @@ impl DataFileReader {
             file_index_read_enabled: false,
             row_filter_factory: None,
             blob_as_descriptor: false,
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             batch_size: None,
             parquet_read_budget: None,
             read_timing: None,
@@ -149,6 +152,12 @@ impl DataFileReader {
 
     pub(crate) fn with_blob_as_descriptor(mut self, blob_as_descriptor: bool) -> Self {
         self.blob_as_descriptor = blob_as_descriptor;
+        self
+    }
+
+    pub(crate) fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
+        debug_assert!(blob_parallelism > 0);
+        self.blob_parallelism = blob_parallelism;
         self
     }
 
@@ -448,6 +457,7 @@ impl DataFileReader {
         let file_io = self.file_io.clone();
         let split = split.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
+        let blob_parallelism = self.blob_parallelism;
         let batch_size = self.batch_size;
         let parquet_read_budget = self.parquet_read_budget.clone();
         let read_timing = self.read_timing.clone();
@@ -509,6 +519,7 @@ impl DataFileReader {
                 blob_as_descriptor,
                 &format_read_fields,
                 parquet_read_budget,
+                blob_parallelism,
             )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let open_start = read_timing.as_ref().map(|_| Instant::now());
@@ -716,6 +727,7 @@ impl DataFileReader {
         let file_io = self.file_io.clone();
         let split = split.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
+        let blob_parallelism = self.blob_parallelism;
         let parquet_read_budget = self.parquet_read_budget.clone();
 
         let target_schema = build_target_arrow_schema(&read_type)?;
@@ -781,6 +793,7 @@ impl DataFileReader {
                 blob_as_descriptor,
                 &format_read_fields,
                 parquet_read_budget,
+                blob_parallelism,
             )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let file_reader = input_file.reader().await?;

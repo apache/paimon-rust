@@ -17,11 +17,12 @@
 
 mod blob_fallback;
 
-use super::blob_resolver::{BlobReadLimiter, BLOB_DESCRIPTOR_READ_CONCURRENCY};
+use super::blob_resolver::BlobReadLimiter;
 use super::data_file_reader::{
     append_null_row_id_column, attach_row_id, expand_selected_row_ids, insert_column_at,
     DataFileReadTiming, DataFileReader,
 };
+use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
 use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
@@ -112,6 +113,7 @@ pub(crate) struct DataEvolutionReader {
     blob_view_resolve_enabled: bool,
     blob_view_rest_env: Option<RESTEnv>,
     blob_read_limiter: BlobReadLimiter,
+    blob_parallelism: usize,
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     read_timing: Option<Arc<DataFileReadTiming>>,
@@ -190,6 +192,7 @@ impl DataEvolutionReader {
             blob_view_resolve_enabled,
             blob_view_rest_env,
             blob_read_limiter: BlobReadLimiter::new(),
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             batch_size: None,
             parquet_read_budget: None,
             read_timing: None,
@@ -198,6 +201,13 @@ impl DataEvolutionReader {
 
     pub(crate) fn with_batch_size(mut self, batch_size: Option<usize>) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    pub(crate) fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
+        debug_assert!(blob_parallelism > 0);
+        self.blob_read_limiter = BlobReadLimiter::with_parallelism(blob_parallelism);
+        self.blob_parallelism = blob_parallelism;
         self
     }
 
@@ -255,6 +265,7 @@ impl DataEvolutionReader {
                 },
             )
             .with_batch_size(self.batch_size)
+            .with_blob_parallelism(self.blob_parallelism)
             .with_parquet_read_budget(self.parquet_read_budget.clone())
             .with_read_timing(self.read_timing.clone());
 
@@ -617,6 +628,7 @@ impl DataEvolutionReader {
         let table_fields = self.table_fields.clone();
         let blob_descriptor_fields = self.blob_descriptor_fields.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
+        let blob_parallelism = self.blob_parallelism;
         let batch_size = self.batch_size;
         let parquet_read_budget = self.parquet_read_budget.clone();
         let read_timing = self.read_timing.clone();
@@ -705,6 +717,7 @@ impl DataEvolutionReader {
                             table_fields.clone(),
                             batch_size,
                             blob_as_descriptor,
+                            blob_parallelism,
                             source_parquet_read_budget.clone(),
                             read_timing.clone(),
                             anchor_deletion_vector.as_ref(),
@@ -870,17 +883,23 @@ async fn resolve_descriptor_columns(
     file_io: &FileIO,
     limiter: &BlobReadLimiter,
 ) -> crate::Result<RecordBatch> {
-    resolve_descriptor_columns_with(batch, blob_descriptor_fields, |column| {
+    resolve_descriptor_columns_with(
+        batch,
+        blob_descriptor_fields,
+        limiter.parallelism(),
+        |column| {
         let file_io = file_io.clone();
         let limiter = limiter.clone();
         async move { super::blob_resolver::resolve_blob_column(&column, &file_io, limiter).await }
-    })
+        },
+    )
     .await
 }
 
 async fn resolve_descriptor_columns_with<F, Fut>(
     batch: RecordBatch,
     blob_descriptor_fields: &HashSet<String>,
+    blob_parallelism: usize,
     resolve: F,
 ) -> crate::Result<RecordBatch>
 where
@@ -913,7 +932,7 @@ where
             let future = resolve(column);
             async move { future.await.map(|resolved| (idx, resolved)) }
         })
-        .buffer_unordered(BLOB_DESCRIPTOR_READ_CONCURRENCY)
+        .buffer_unordered(blob_parallelism)
         .try_collect()
         .await?;
     for (idx, resolved) in resolved_columns {
@@ -1237,6 +1256,7 @@ fn open_source_stream(
     table_fields: Vec<DataField>,
     batch_size: Option<usize>,
     blob_as_descriptor: bool,
+    blob_parallelism: usize,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     read_timing: Option<Arc<DataFileReadTiming>>,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
@@ -1272,6 +1292,7 @@ fn open_source_stream(
                     batch_size,
                     file_io,
                     blob_as_descriptor,
+                    blob_parallelism,
                     anchor_deletion_vector.cloned(),
                 );
             }
@@ -1287,6 +1308,7 @@ fn open_source_stream(
                 batch_size,
                 file_io,
                 blob_as_descriptor,
+                blob_parallelism,
                 anchor_deletion_vector.cloned(),
             );
         }
@@ -1303,6 +1325,7 @@ fn open_source_stream(
     )
     .with_batch_size(batch_size)
     .with_blob_as_descriptor(blob_as_descriptor)
+    .with_blob_parallelism(blob_parallelism)
     .with_parquet_read_budget(parquet_read_budget)
     .with_read_timing(read_timing);
 
@@ -2686,7 +2709,7 @@ mod tests {
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let resolved = resolve_descriptor_columns_with(batch, &fields, |column| {
+        let resolved = resolve_descriptor_columns_with(batch, &fields, 2, |column| {
             let in_flight = in_flight.clone();
             let max_in_flight = max_in_flight.clone();
             async move {

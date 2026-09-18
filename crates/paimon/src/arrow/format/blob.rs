@@ -39,6 +39,7 @@ use std::sync::Arc;
 pub(crate) struct BlobFormatReader {
     descriptor_mode: bool,
     file_path: String,
+    blob_parallelism: usize,
 }
 
 impl BlobFormatReader {
@@ -46,7 +47,14 @@ impl BlobFormatReader {
         Self {
             descriptor_mode,
             file_path,
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
         }
+    }
+
+    pub(crate) fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
+        debug_assert!(blob_parallelism > 0);
+        self.blob_parallelism = blob_parallelism;
+        self
     }
 }
 
@@ -55,21 +63,42 @@ pub(crate) struct IndexedBlobReader {
     index: BlobFileIndex,
     descriptor_mode: bool,
     file_path: String,
+    blob_parallelism: usize,
 }
 
 impl IndexedBlobReader {
+    #[cfg(test)]
     pub(crate) async fn open(
         reader: Box<dyn FileRead>,
         file_size: u64,
         file_path: String,
         descriptor_mode: bool,
     ) -> crate::Result<Self> {
+        Self::open_with_parallelism(
+            reader,
+            file_size,
+            file_path,
+            descriptor_mode,
+            DEFAULT_BLOB_READ_PARALLELISM,
+        )
+        .await
+    }
+
+    pub(crate) async fn open_with_parallelism(
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        file_path: String,
+        descriptor_mode: bool,
+        blob_parallelism: usize,
+    ) -> crate::Result<Self> {
+        debug_assert!(blob_parallelism > 0);
         let index = BlobFileIndex::load(reader.as_ref(), file_size).await?;
         Ok(Self {
             reader,
             index,
             descriptor_mode,
             file_path,
+            blob_parallelism,
         })
     }
 
@@ -85,7 +114,7 @@ impl IndexedBlobReader {
             build_descriptor_values(&self.index, positions, &self.file_path)
         } else {
             let planned_reads = plan_blob_reads(&self.index, positions)?;
-            fetch_blob_values(self.reader.as_ref(), planned_reads).await
+            fetch_blob_values(self.reader.as_ref(), planned_reads, self.blob_parallelism).await
         }
     }
 
@@ -99,6 +128,7 @@ impl IndexedBlobReader {
             planned_reads,
             &self.file_path,
             self.descriptor_mode,
+            self.blob_parallelism,
         )
         .await
     }
@@ -115,6 +145,7 @@ impl IndexedBlobReader {
             &self.file_path,
             self.descriptor_mode,
             key_type,
+            self.blob_parallelism,
         )
         .await
     }
@@ -137,7 +168,7 @@ const BLOB_INLINE_HEADER_SIZE: u64 = 4;
 const BLOB_TRAILER_SIZE: u64 = 12;
 const BLOB_ENTRY_OVERHEAD: u64 = BLOB_INLINE_HEADER_SIZE + BLOB_TRAILER_SIZE;
 const DEFAULT_BATCH_SIZE: usize = 128;
-const BLOB_READ_CONCURRENCY: usize = 8;
+pub(crate) const DEFAULT_BLOB_READ_PARALLELISM: usize = 8;
 const BLOB_ARRAY_MAGIC_NUMBER: i32 = 1094861634;
 const BLOB_ARRAY_VERSION: u8 = 1;
 const BLOB_ARRAY_HEADER_SIZE: u64 = 9;
@@ -178,11 +209,12 @@ impl FormatFileReader for BlobFormatReader {
 
         let target_schema = build_target_arrow_schema(read_fields)?;
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
-        let blob_reader = IndexedBlobReader::open(
+        let blob_reader = IndexedBlobReader::open_with_parallelism(
             reader,
             file_size,
             self.file_path.clone(),
             self.descriptor_mode,
+            self.blob_parallelism,
         )
         .await?;
         let mut selection = RowSelectionCursor::new(blob_reader.num_rows(), row_selection)?;
@@ -653,6 +685,7 @@ fn plan_blob_reads(
 async fn fetch_blob_values(
     reader: &dyn FileRead,
     planned_reads: Vec<PlannedBlobRead>,
+    blob_parallelism: usize,
 ) -> crate::Result<Vec<BlobReadValue>> {
     futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
         match planned_read {
@@ -663,7 +696,7 @@ async fn fetch_blob_values(
                 .map(BlobReadValue::Value),
         }
     }))
-    .buffered(BLOB_READ_CONCURRENCY)
+    .buffered(blob_parallelism)
     .try_collect()
     .await
 }
@@ -759,6 +792,7 @@ async fn fetch_blob_array_values(
     planned_reads: Vec<PlannedBlobArrayRead>,
     file_path: &str,
     descriptor_mode: bool,
+    blob_parallelism: usize,
 ) -> crate::Result<Vec<BlobReadValue>> {
     futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
         match planned_read {
@@ -774,7 +808,7 @@ async fn fetch_blob_array_values(
             }
         }
     }))
-    .buffered(BLOB_READ_CONCURRENCY)
+    .buffered(blob_parallelism)
     .try_collect()
     .await
 }
@@ -1076,6 +1110,7 @@ async fn fetch_blob_map_values(
     file_path: &str,
     descriptor_mode: bool,
     key_type: &DataType,
+    blob_parallelism: usize,
 ) -> crate::Result<Vec<BlobReadValue>> {
     futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
         match planned_read {
@@ -1087,7 +1122,7 @@ async fn fetch_blob_map_values(
             }
         }
     }))
-    .buffered(BLOB_READ_CONCURRENCY)
+    .buffered(blob_parallelism)
     .try_collect()
     .await
 }
@@ -2446,7 +2481,48 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(reader.max_in_flight() > 1);
-        assert!(reader.max_in_flight() <= BLOB_READ_CONCURRENCY);
+        assert!(reader.max_in_flight() <= DEFAULT_BLOB_READ_PARALLELISM);
+    }
+
+    #[tokio::test]
+    async fn test_blob_reader_honors_configured_parallelism() {
+        let payloads = (0_u8..12).map(|value| vec![value]).collect::<Vec<_>>();
+        let rows = payloads
+            .iter()
+            .map(|payload| Some(payload.as_slice()))
+            .collect::<Vec<_>>();
+        let file_bytes = blob_test_utils::build_blob_file_bytes(&rows);
+        let read_fields = vec![DataField::new(
+            0,
+            "payload".to_string(),
+            DataType::Blob(BlobType::new()),
+        )];
+        let reader = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
+
+        let batches = BlobFormatReader::new(String::new(), false)
+            .with_blob_parallelism(2)
+            .read_batch_stream(
+                Box::new(reader.clone()),
+                file_bytes.len() as u64,
+                &read_fields,
+                None,
+                Some(12),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            collect_binary_values(&batches[0]),
+            (0_u8..12)
+                .map(|value| Some(vec![value]))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reader.max_in_flight(), 2);
     }
 
     #[tokio::test]
