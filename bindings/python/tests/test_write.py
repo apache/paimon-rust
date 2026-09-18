@@ -299,7 +299,9 @@ def test_ltz_schema_alias_write_roundtrip(tmp_path, precision, unit, micros, fra
     schema["fields"][1]["type"] = "TIMESTAMP_LTZ({})".format(precision)
     schema_path.write_text(json.dumps(schema))
     table = _get_table(str(tmp_path))
-    assert "LocalZonedTimestamp" in table.schema().fields()[1].field_type()
+    assert table.schema().fields()[1].field_type() == (
+        f"TIMESTAMP({precision}) WITH LOCAL TIME ZONE"
+    )
     value = datetime(2026, 9, 15, 20, 0, 0, micros, tzinfo=timezone.utc)
     arrow_schema = pa.schema([("id", pa.int32()), ("ts", pa.timestamp(unit, tz="UTC"))])
     builder = table.new_write_builder()
