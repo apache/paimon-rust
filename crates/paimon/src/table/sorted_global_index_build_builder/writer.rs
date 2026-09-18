@@ -105,11 +105,12 @@ impl SortedGlobalIndexBuildBuilder<'_> {
                     let GlobalIndexWriteOptions::Sorted(write_options) = write_options else {
                         unreachable!("BTree uses sorted write options")
                     };
-                    let mut writer = BTreeIndexWriter::with_comparator_and_compression_level(
+                    let mut writer = BTreeIndexWriter::with_comparator_and_options(
                         writer,
                         write_options.block_size,
                         write_options.compression_type,
                         write_options.compression_level,
+                        write_options.bloom_filter_enabled,
                         cmp,
                     );
                     for (key, local_row_id) in &rows {

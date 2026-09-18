@@ -24,6 +24,7 @@ use crate::{Error, Result};
 use std::collections::HashMap;
 
 pub(crate) const BTREE_BLOCK_SIZE_OPTION: &str = "btree-index.block-size";
+pub(crate) const BTREE_BLOOM_FILTER_ENABLED_OPTION: &str = "btree-index.bloom-filter.enabled";
 pub(crate) const BTREE_COMPRESSION_OPTION: &str = "btree-index.compression";
 pub(crate) const BTREE_COMPRESSION_LEVEL_OPTION: &str = "btree-index.compression-level";
 pub(crate) const BITMAP_DICTIONARY_BLOCK_SIZE_OPTION: &str = "bitmap-index.dictionary-block-size";
@@ -43,6 +44,7 @@ pub(crate) struct SortedIndexWriteOptions {
     pub(crate) block_size: usize,
     pub(crate) compression_type: BlockCompressionType,
     pub(crate) compression_level: i32,
+    pub(crate) bloom_filter_enabled: bool,
 }
 
 impl SortedIndexWriteOptions {
@@ -81,7 +83,26 @@ impl SortedIndexWriteOptions {
                 compression_level_option,
                 DEFAULT_COMPRESSION_LEVEL,
             )?,
+            bloom_filter_enabled: if index_type == BTREE_GLOBAL_INDEX_TYPE {
+                parse_boolean(options, BTREE_BLOOM_FILTER_ENABLED_OPTION, false)?
+            } else {
+                false
+            },
         })
+    }
+}
+
+fn parse_boolean(options: &HashMap<String, String>, option: &str, default: bool) -> Result<bool> {
+    let Some(raw) = options.get(option) else {
+        return Ok(default);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(Error::DataInvalid {
+            message: format!("Option '{option}' must be true or false, got: {raw}"),
+            source: None,
+        }),
     }
 }
 
@@ -163,6 +184,7 @@ mod tests {
                 block_size: 64 * 1024,
                 compression_type: BlockCompressionType::None,
                 compression_level: 1,
+                bloom_filter_enabled: false,
             }
         );
         for index_type in [BITMAP_GLOBAL_INDEX_TYPE, MULTIVALUE_GLOBAL_INDEX_TYPE] {
@@ -172,6 +194,7 @@ mod tests {
                     block_size: 16 * 1024,
                     compression_type: BlockCompressionType::None,
                     compression_level: 1,
+                    bloom_filter_enabled: false,
                 }
             );
         }
@@ -210,9 +233,20 @@ mod tests {
                     block_size: 32 * 1024,
                     compression_type: BlockCompressionType::Lz4,
                     compression_level: 7,
+                    bloom_filter_enabled: false,
                 }
             );
         }
+
+        let options = HashMap::from([(
+            BTREE_BLOOM_FILTER_ENABLED_OPTION.to_string(),
+            " TrUe ".to_string(),
+        )]);
+        assert!(
+            SortedIndexWriteOptions::from_options(BTREE_GLOBAL_INDEX_TYPE, &options)
+                .unwrap()
+                .bloom_filter_enabled
+        );
     }
 
     #[test]
@@ -233,6 +267,11 @@ mod tests {
                 BTREE_GLOBAL_INDEX_TYPE,
                 BTREE_COMPRESSION_LEVEL_OPTION,
                 "fast",
+            ),
+            (
+                BTREE_GLOBAL_INDEX_TYPE,
+                BTREE_BLOOM_FILTER_ENABLED_OPTION,
+                "yes",
             ),
         ] {
             let options = HashMap::from([(option.to_string(), value.to_string())]);

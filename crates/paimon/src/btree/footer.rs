@@ -50,6 +50,8 @@ pub struct BTreeFileFooter {
 }
 
 impl BTreeFileFooter {
+    pub const ENCODED_LENGTH: usize = BTREE_FOOTER_ENCODED_LENGTH;
+
     pub fn new(
         bloom_filter_handle: Option<BloomFilterHandle>,
         index_block_handle: BlockHandle,

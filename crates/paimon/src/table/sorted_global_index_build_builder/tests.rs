@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::btree::BTreeIndexMeta;
+use crate::btree::{BTreeFileFooter, BTreeIndexMeta};
 use crate::catalog::Identifier;
 use crate::io::FileIOBuilder;
 use crate::spec::stats::BinaryTableStats;
@@ -677,7 +677,12 @@ async fn scan_ids(table: &Table, predicate: Predicate) -> Vec<i32> {
 #[tokio::test]
 async fn test_execute_writes_btree_index_manifest_and_file() {
     let table_path = "memory:/test_btree_global_index_builder_e2e";
-    let table = test_table_with_path(table_path, table_options("10"));
+    let mut options = table_options("10");
+    options.insert(
+        "btree-index.bloom-filter.enabled".to_string(),
+        "true".to_string(),
+    );
+    let table = test_table_with_path(table_path, options);
     setup_dirs(&table).await;
 
     let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
@@ -720,6 +725,23 @@ async fn test_execute_writes_btree_index_manifest_and_file() {
     assert!(index_file.file_name.starts_with("btree-global-index-"));
     assert_eq!(index_file.row_count, 3);
     assert!(index_file.file_size > 0);
+
+    let index_path = format!("{table_path}/index/{}", index_file.file_name);
+    let index_bytes = table
+        .file_io()
+        .new_input(&index_path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let footer = BTreeFileFooter::read_footer(
+        &index_bytes[index_bytes.len() - BTreeFileFooter::ENCODED_LENGTH..],
+    )
+    .unwrap();
+    let bloom_handle = footer
+        .bloom_filter_handle
+        .expect("enabled BTree build must write a Bloom filter");
+    assert_eq!(bloom_handle.expected_entries, 2);
 
     let global_meta = index_file
         .global_index_meta

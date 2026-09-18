@@ -16,12 +16,15 @@
 // under the License.
 
 use crate::btree::block::BlockCompressionType;
+use crate::btree::bloom_filter::BloomFilter;
+use crate::btree::footer::{BTreeFileFooter, BTREE_FOOTER_ENCODED_LENGTH};
 use crate::btree::meta::BTreeIndexMeta;
 use crate::btree::query::IndexQuery;
 use crate::btree::reader::BTreeIndexReader;
 use crate::btree::test_util::{BytesFileRead, VecFileWrite};
 use crate::btree::writer::BTreeIndexWriter;
 use crate::io::FileRead;
+use crate::spec::murmur_hash::hash_bytes;
 use crate::spec::{DataType, Datum, PredicateOperator, VarCharType};
 use bytes::Bytes;
 use std::ops::Range;
@@ -89,6 +92,120 @@ async fn test_write_read_roundtrip() {
     assert!(bm.contains(99));
     let all = reader.all_non_null_rows().await.unwrap();
     assert_eq!(all.len(), 100);
+}
+
+fn read_footer(data: &[u8]) -> BTreeFileFooter {
+    BTreeFileFooter::read_footer(&data[data.len() - BTREE_FOOTER_ENCODED_LENGTH..]).unwrap()
+}
+
+#[tokio::test]
+async fn test_bloom_filter_is_disabled_by_default() {
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::new(Box::new(buf.clone()), 64, BlockCompressionType::None);
+    writer.write(Some(&int_key(1)), 0).await.unwrap();
+    writer.finish().await.unwrap();
+
+    assert!(read_footer(&buf.to_vec()).bloom_filter_handle.is_none());
+}
+
+#[tokio::test]
+async fn test_bloom_filter_skips_missing_point_lookup_data_reads() {
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::with_comparator_and_options(
+        Box::new(buf.clone()),
+        64,
+        BlockCompressionType::None,
+        1,
+        true,
+        int_cmp,
+    );
+    for i in 0..1000 {
+        let key = int_key(i * 2);
+        writer.write(Some(&key), i as i64).await.unwrap();
+        if i == 4 {
+            writer.write(Some(&key), 1000).await.unwrap();
+        }
+    }
+    let write_result = writer.finish().await.unwrap();
+    let data = Bytes::from(buf.to_vec());
+    let footer = read_footer(&data);
+    let handle = footer
+        .bloom_filter_handle
+        .expect("enabled non-empty index must write a Bloom filter");
+    assert_eq!(handle.expected_entries, 1000, "one entry per distinct key");
+
+    let bloom = BloomFilter::from_bytes(
+        handle.expected_entries,
+        data.slice(handle.offset as usize..handle.offset as usize + handle.size as usize),
+    )
+    .unwrap();
+    let missing_key = (1..2000)
+        .step_by(2)
+        .map(int_key)
+        .find(|key| !bloom.test_hash(hash_bytes(key)))
+        .expect("test data should contain a Bloom-negative missing key");
+
+    for use_in in [false, true] {
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let reader = BTreeIndexReader::open(
+            Box::new(RecordingFileRead {
+                data: data.clone(),
+                ranges: ranges.clone(),
+            }),
+            data.len() as u64,
+            &write_result.meta,
+            int_cmp,
+        )
+        .await
+        .unwrap();
+        ranges.lock().unwrap().clear();
+
+        let rows = if use_in {
+            reader.query_in(&[missing_key.as_slice()]).await.unwrap()
+        } else {
+            reader.query_equal(&missing_key).await.unwrap()
+        };
+        assert!(rows.is_empty());
+        assert_eq!(
+            *ranges.lock().unwrap(),
+            vec![handle.offset..handle.offset + u64::from(handle.size)]
+        );
+    }
+
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let reader = BTreeIndexReader::open(
+        Box::new(RecordingFileRead {
+            data: data.clone(),
+            ranges: ranges.clone(),
+        }),
+        data.len() as u64,
+        &write_result.meta,
+        int_cmp,
+    )
+    .await
+    .unwrap();
+    ranges.lock().unwrap().clear();
+    let in_keys = [missing_key.as_slice()];
+    let (equal_rows, in_rows) =
+        tokio::join!(reader.query_equal(&missing_key), reader.query_in(&in_keys));
+    assert!(equal_rows.unwrap().is_empty());
+    assert!(in_rows.unwrap().is_empty());
+    assert_eq!(
+        *ranges.lock().unwrap(),
+        vec![handle.offset..handle.offset + u64::from(handle.size)],
+        "concurrent point lookups should share one lazy Bloom read"
+    );
+
+    let reader = write_and_open(&buf, &write_result, int_cmp).await;
+    assert_eq!(
+        reader
+            .query_equal(&int_key(8))
+            .await
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![4, 1000]
+    );
 }
 
 #[tokio::test]
