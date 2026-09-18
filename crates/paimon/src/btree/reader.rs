@@ -309,101 +309,64 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         self.range_query(from, to, true, true).await
     }
 
-    /// In query: sort keys and do a single sequential scan (merge-join style).
+    /// IN query: group sorted target keys by data block, then seek each key within its block.
+    /// This reads every target block at most once and skips unrelated blocks and entries between
+    /// sparse target keys.
     pub async fn query_in(&self, keys: &[&[u8]]) -> io::Result<RoaringTreemap> {
         if keys.is_empty() {
             return Ok(RoaringTreemap::new());
         }
 
         let cmp = &self.key_comparator;
+        let (Some(min_key), Some(max_key)) = (self.min_key.as_deref(), self.max_key.as_deref())
+        else {
+            return Ok(RoaringTreemap::new());
+        };
 
-        // Sort query keys
+        // Sort, deduplicate, and discard keys outside this file's bounds before resolving blocks.
         let mut sorted_keys: Vec<&[u8]> = keys.to_vec();
         sorted_keys.sort_by(|a, b| cmp(a, b));
         sorted_keys.dedup_by(|a, b| cmp(a, b) == Ordering::Equal);
-
-        let mut result = RoaringTreemap::new();
-        let mut key_idx = 0;
-
-        // Seek in index block to the first data block
-        let index_block = self.sst_reader.index_block();
-        let (_, mut index_iter) = index_block.seek_and_iter(sorted_keys[0], cmp);
-
-        // First block: seek within
-        let first_block = match index_iter.next() {
-            Some((_key, handle_bytes)) => {
-                let handle = BlockHandle::decode(handle_bytes)?;
-                self.read_data_block(&handle).await?
-            }
-            None => return Ok(result),
-        };
-
-        let (_, seeked) = first_block.seek_and_iter(sorted_keys[0], cmp);
-        let mut offset = seeked.offset;
-
-        if self.scan_block_in(
-            &first_block,
-            &mut offset,
-            &sorted_keys,
-            &mut key_idx,
-            &mut result,
-        )? {
-            return Ok(result);
+        sorted_keys.retain(|key| {
+            cmp(key, min_key) != Ordering::Less && cmp(key, max_key) != Ordering::Greater
+        });
+        if sorted_keys.is_empty() {
+            return Ok(RoaringTreemap::new());
         }
 
-        while let Some((_key, handle_bytes)) = index_iter.next() {
+        // The index block is already resident in memory. Resolve every target key to its first
+        // possible data block and coalesce adjacent targets that share the same block handle.
+        let index_block = self.sst_reader.index_block();
+        let mut target_blocks: Vec<(BlockHandle, Vec<&[u8]>)> = Vec::new();
+        for key in sorted_keys {
+            let (_, mut index_iter) = index_block.seek_and_iter(key, cmp);
+            let Some((_last_key, handle_bytes)) = index_iter.next() else {
+                break;
+            };
             let handle = BlockHandle::decode(handle_bytes)?;
+
+            match target_blocks.last_mut() {
+                Some((current, block_keys))
+                    if current.offset == handle.offset && current.size == handle.size =>
+                {
+                    block_keys.push(key);
+                }
+                _ => target_blocks.push((handle, vec![key])),
+            }
+        }
+
+        let mut result = RoaringTreemap::new();
+        for (handle, block_keys) in target_blocks {
             let block = self.read_data_block(&handle).await?;
-            let mut block_offset = 0;
-            if self.scan_block_in(
-                &block,
-                &mut block_offset,
-                &sorted_keys,
-                &mut key_idx,
-                &mut result,
-            )? {
-                return Ok(result);
+            for key in block_keys {
+                let (found, mut entry_iter) = block.seek_and_iter(key, cmp);
+                if let (true, Some((_entry_key, value))) = (found, entry_iter.next()) {
+                    insert_row_ids_into(value, &mut result)?;
+                }
             }
         }
 
         Ok(result)
-    }
-
-    /// Scan a block for IN query. Returns true when all keys are consumed.
-    fn scan_block_in(
-        &self,
-        block: &BlockReader,
-        offset: &mut usize,
-        sorted_keys: &[&[u8]],
-        key_idx: &mut usize,
-        result: &mut RoaringTreemap,
-    ) -> io::Result<bool> {
-        let cmp = &self.key_comparator;
-        while *offset < block.data.len() {
-            let (entry_key, value, next_offset) = block.read_entry_at(*offset);
-            *offset = next_offset;
-
-            // Advance key_idx past keys smaller than current entry
-            while *key_idx < sorted_keys.len()
-                && cmp(sorted_keys[*key_idx], entry_key) == Ordering::Less
-            {
-                *key_idx += 1;
-            }
-
-            if *key_idx >= sorted_keys.len() {
-                return Ok(true);
-            }
-
-            // Past the last query key
-            if cmp(entry_key, sorted_keys[sorted_keys.len() - 1]) == Ordering::Greater {
-                return Ok(true);
-            }
-
-            if cmp(entry_key, sorted_keys[*key_idx]) == Ordering::Equal {
-                insert_row_ids_into(value, result)?;
-            }
-        }
-        Ok(false)
     }
 
     /// Not equal query.
