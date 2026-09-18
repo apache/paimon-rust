@@ -68,6 +68,24 @@ pub fn hash_by_words(data: &[u8]) -> i32 {
     fmix(h1 ^ data.len() as u32) as i32
 }
 
+/// Murmur3 32-bit hash over arbitrary bytes.
+///
+/// This matches Java Paimon's `MurmurHashUtils.hashBytes` with `DEFAULT_SEED = 42`.
+/// In particular, Java mixes each trailing signed byte independently instead of combining the
+/// tail bytes into one word as the canonical Murmur3 algorithm does.
+pub(crate) fn hash_bytes(data: &[u8]) -> i32 {
+    let (words, tail) = data.as_chunks::<4>();
+    let mut h1 = DEFAULT_SEED;
+    for word in words {
+        h1 = mix_h1(h1, mix_k1(u32::from_le_bytes(*word)));
+    }
+    for byte in tail {
+        let signed = i32::from(*byte as i8) as u32;
+        h1 = mix_h1(h1, mix_k1(signed));
+    }
+    fmix(h1 ^ data.len() as u32) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +105,14 @@ mod tests {
         let h1 = mix_h1(DEFAULT_SEED, k1);
         let expected = fmix(h1 ^ 4) as i32;
         assert_eq!(h, expected);
+    }
+
+    #[test]
+    fn test_hash_bytes_matches_java() {
+        assert_eq!(hash_bytes(b"a"), 1_485_273_170);
+        assert_eq!(hash_bytes(b"hello"), -1_008_564_952);
+        assert_eq!(hash_bytes(b"world"), -623_458_850);
+        assert_eq!(hash_bytes(&[0xff]), 1_398_487_324);
     }
 
     #[test]

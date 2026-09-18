@@ -1077,7 +1077,7 @@ CALL sys.create_global_index(
   table => 'paimon.my_db.my_table',
   index_column => 'id',
   index_type => 'btree',
-  options => 'btree-index.block-size=64kb,btree-index.compression=zstd,btree-index.compression-level=1'
+  options => 'btree-index.block-size=64kb,btree-index.bloom-filter.enabled=true,btree-index.compression=zstd,btree-index.compression-level=1'
 );
 
 CALL sys.create_global_index(
@@ -1114,8 +1114,9 @@ row are indexed once. All three sorted index types accept
 are `btree-index.block-size`, `bitmap-index.dictionary-block-size`, or
 `multivalue-index.dictionary-block-size`, together with the corresponding
 `*.compression` (`none`, `zstd`, `lz4`, or `lzo`) and `*.compression-level`
-options. Per-call options override table options. Bitmap and multivalue global
-indexes use Java-compatible bitmap files.
+options. BTree additionally accepts `btree-index.bloom-filter.enabled` (default
+`false`) to accelerate equality and `IN` lookups. Per-call options override table
+options. Bitmap and multivalue global indexes use Java-compatible bitmap files.
 
 FM global indexes support character-string columns and exact byte-substring
 `contains`, `IS NULL`, and `IS NOT NULL` predicates. They use the
@@ -2404,6 +2405,7 @@ deletion vectors enabled.
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
 | `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, or FM global-index file range; falls back to legacy `btree-index.records-per-range`. |
 | `btree-index.block-size` | `64kb` | Target BTree data-block size. |
+| `btree-index.bloom-filter.enabled` | `false` | Writes a Bloom filter used to avoid BTree data-block reads for missing equality and `IN` keys. |
 | `btree-index.compression` | `none` | BTree block compression: `none`, `zstd`, `lz4`, or `lzo`. |
 | `btree-index.compression-level` | `1` | BTree compression level (used by codecs that support levels). |
 | `bitmap-index.dictionary-block-size` | `16kb` | Target bitmap dictionary-block size. |

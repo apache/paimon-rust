@@ -37,6 +37,7 @@
 //! ```
 
 mod block;
+mod bloom_filter;
 mod footer;
 pub(crate) mod key_serde;
 mod meta;
