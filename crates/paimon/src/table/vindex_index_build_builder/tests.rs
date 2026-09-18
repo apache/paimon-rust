@@ -669,6 +669,10 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     let second_built = table
         .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
         .with_index_column("embedding")
+        .with_options(HashMap::from([(
+            "vindex.build.granule.enabled".to_string(),
+            "false".to_string(),
+        )]))
         .execute()
         .await
         .unwrap();

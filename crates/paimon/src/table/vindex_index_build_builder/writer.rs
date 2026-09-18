@@ -57,7 +57,13 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         options: &VindexVectorIndexOptions,
         index_meta: Vec<u8>,
     ) -> Result<BuiltIndexFile> {
-        if self.index_type != DISKANN_IDENTIFIER {
+        let use_granule = self.index_type != DISKANN_IDENTIFIER && options.granule_build_enabled;
+        log::info!(
+            "vindex build strategy: index_type={}, strategy={}",
+            self.index_type,
+            if use_granule { "granule" } else { "full-spill" }
+        );
+        if use_granule {
             return self
                 .build_index_file_granule(
                     shard,
@@ -69,7 +75,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 )
                 .await;
         }
-        self.build_diskann_index_file(
+        self.build_full_spill_index_file(
             shard,
             index_column,
             dimension,
@@ -80,7 +86,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         .await
     }
 
-    async fn build_diskann_index_file(
+    async fn build_full_spill_index_file(
         &self,
         shard: &VindexIndexShard,
         index_column: &str,
