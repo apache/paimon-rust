@@ -190,7 +190,13 @@ pub(crate) fn create_format_reader(
     blob_as_descriptor: bool,
     read_fields: &[DataField],
 ) -> crate::Result<Box<dyn FormatFileReader>> {
-    create_format_reader_with_budget(path, blob_as_descriptor, read_fields, None)
+    create_format_reader_with_budget(
+        path,
+        blob_as_descriptor,
+        read_fields,
+        None,
+        blob::DEFAULT_BLOB_READ_PARALLELISM,
+    )
 }
 
 /// Create a format reader with a scan-shared Parquet resource budget.
@@ -199,6 +205,7 @@ pub(crate) fn create_format_reader_with_budget(
     blob_as_descriptor: bool,
     read_fields: &[DataField],
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    blob_parallelism: usize,
 ) -> crate::Result<Box<dyn FormatFileReader>> {
     let lower = path.to_ascii_lowercase();
     let reader: Box<dyn FormatFileReader> = if lower.ends_with(".parquet") {
@@ -207,10 +214,10 @@ pub(crate) fn create_format_reader_with_budget(
             None => parquet::ParquetFormatReader::default(),
         })
     } else if lower.ends_with(".blob") {
-        Box::new(blob::BlobFormatReader::new(
-            path.to_string(),
-            blob_as_descriptor,
-        ))
+        Box::new(
+            blob::BlobFormatReader::new(path.to_string(), blob_as_descriptor)
+                .with_blob_parallelism(blob_parallelism),
+        )
     } else if lower.ends_with(".orc") {
         Box::new(orc::OrcFormatReader)
     } else if lower.ends_with(".avro") {

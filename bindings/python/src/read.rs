@@ -112,6 +112,7 @@ pub struct PyReadBuilder {
     filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
+    blob_parallelism: Option<usize>,
 }
 
 impl PyReadBuilder {
@@ -123,6 +124,7 @@ impl PyReadBuilder {
             filter: None,
             row_ranges: None,
             case_sensitive: true,
+            blob_parallelism: None,
         }
     }
 
@@ -168,6 +170,7 @@ impl PyReadBuilder {
             filter: None,
             row_ranges: None,
             case_sensitive: true,
+            blob_parallelism: None,
         })
     }
 }
@@ -182,6 +185,20 @@ impl PyReadBuilder {
     fn with_limit(mut slf: PyRefMut<'_, Self>, limit: usize) -> PyRefMut<'_, Self> {
         slf.limit = Some(limit);
         slf
+    }
+
+    /// Set the maximum number of concurrent BLOB range reads for this read.
+    fn with_blob_parallelism(
+        mut slf: PyRefMut<'_, Self>,
+        blob_parallelism: usize,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        if blob_parallelism == 0 {
+            return Err(PyValueError::new_err(
+                "blob_parallelism must be greater than zero",
+            ));
+        }
+        slf.blob_parallelism = Some(blob_parallelism);
+        Ok(slf)
     }
 
     /// Set whether column-name matching (projection and predicate resolution) is
@@ -256,6 +273,7 @@ impl PyReadBuilder {
             limit: self.limit,
             filter: self.filter.clone(),
             case_sensitive: self.case_sensitive,
+            blob_parallelism: self.blob_parallelism,
         }
     }
 }
@@ -378,6 +396,7 @@ pub struct PyTableRead {
     limit: Option<usize>,
     filter: Option<Predicate>,
     case_sensitive: bool,
+    blob_parallelism: Option<usize>,
 }
 
 impl PyTableRead {
@@ -396,6 +415,11 @@ impl PyTableRead {
                 &self.filter,
                 self.case_sensitive,
             )?;
+            if let Some(blob_parallelism) = self.blob_parallelism {
+                builder
+                    .with_blob_parallelism(blob_parallelism)
+                    .map_err(to_py_err)?;
+            }
             // Validate config (e.g. projection) before the empty-splits fast
             // path so an invalid projection fails consistently regardless of
             // how many splits are passed.

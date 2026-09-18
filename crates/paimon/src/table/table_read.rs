@@ -23,6 +23,7 @@ use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::build_target_arrow_schema;
+use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::ParquetReadBudget;
 use crate::spec::{
     BigIntType, CoreOptions, DataField, DataType, MergeEngine, Predicate, TinyIntType,
@@ -133,6 +134,24 @@ impl<'a> TableRead<'a> {
         }
     }
 
+    /// Set the maximum number of concurrent BLOB range reads for this read.
+    pub fn with_blob_parallelism(self, blob_parallelism: usize) -> crate::Result<Self> {
+        if blob_parallelism == 0 {
+            return Err(crate::Error::DataInvalid {
+                message: "BLOB read parallelism must be greater than zero".to_string(),
+                source: None,
+            });
+        }
+        Ok(match self.0 {
+            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
+                read.with_blob_parallelism(blob_parallelism),
+            )),
+            TableReadKind::Format(read) => Self(TableReadKind::Format(
+                read.with_blob_parallelism(blob_parallelism),
+            )),
+        })
+    }
+
     /// Attach an engine-specific Parquet decoder-filter factory.
     ///
     /// The hook is used only by schema-identical raw reads. Callers must still
@@ -230,6 +249,7 @@ struct PaimonTableRead<'a> {
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     data_file_read_timing: Option<Arc<DataFileReadTiming>>,
+    blob_parallelism: usize,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -246,6 +266,7 @@ impl<'a> PaimonTableRead<'a> {
             row_filter_factory: None,
             parquet_read_budget: None,
             data_file_read_timing: None,
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
         }
     }
 
@@ -294,6 +315,11 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
+    fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
+        self.blob_parallelism = blob_parallelism;
+        self
+    }
+
     fn parquet_read_budget(&self) -> crate::Result<Arc<ParquetReadBudget>> {
         match &self.parquet_read_budget {
             Some(budget) => Ok(Arc::clone(budget)),
@@ -337,6 +363,7 @@ impl<'a> PaimonTableRead<'a> {
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
+        let blob_parallelism = self.blob_parallelism;
 
         Ok(Box::pin(async_stream::try_stream! {
             let mut workers = stream::iter(pairs.into_iter().map(|(before, after)| {
@@ -346,7 +373,8 @@ impl<'a> PaimonTableRead<'a> {
                 let parquet_read_budget = Arc::clone(&parquet_read_budget);
                 let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
                     let pair_read = PaimonTableRead::new(&table, read_type, data_predicates)
-                        .with_parquet_read_budget(parquet_read_budget);
+                        .with_parquet_read_budget(parquet_read_budget)
+                        .with_blob_parallelism(blob_parallelism);
                     let mut pair_stream = pair_read.to_diff_after_image_stream(&before, &after)?;
                     while let Some(batch) = pair_stream.next().await {
                         yield batch?;
@@ -421,6 +449,7 @@ impl<'a> PaimonTableRead<'a> {
         )
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))
+        .with_blob_parallelism(self.blob_parallelism)
         .with_parquet_read_budget(Some(self.parquet_read_budget()?));
         let raw_stream = reader.read(&data_splits)?;
 
@@ -480,6 +509,7 @@ impl<'a> PaimonTableRead<'a> {
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
+        let blob_parallelism = self.blob_parallelism;
 
         Ok(Box::pin(async_stream::try_stream! {
             let mut workers = stream::iter(pairs.into_iter().map(|(before, after)| {
@@ -489,7 +519,8 @@ impl<'a> PaimonTableRead<'a> {
                 let parquet_read_budget = Arc::clone(&parquet_read_budget);
                 let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
                     let pair_read = PaimonTableRead::new(&table, read_type, data_predicates)
-                        .with_parquet_read_budget(parquet_read_budget);
+                        .with_parquet_read_budget(parquet_read_budget)
+                        .with_blob_parallelism(blob_parallelism);
                     let mut pair_stream =
                         pair_read.to_audit_log_arrow_for_diff(&before, &after)?;
                     while let Some(batch) = pair_stream.next().await {
@@ -535,11 +566,13 @@ impl<'a> PaimonTableRead<'a> {
         let read_type_for_output = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
+        let blob_parallelism = self.blob_parallelism;
 
         Ok(Box::pin(async_stream::try_stream! {
             let core_options = CoreOptions::new(table.schema().options());
             let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates)
-                .with_parquet_read_budget(parquet_read_budget);
+                .with_parquet_read_budget(parquet_read_budget)
+                .with_blob_parallelism(blob_parallelism);
             let before_stream =
                 pair_read.read_pk_sorted_for_diff_with_type(&before, &core_options, &diff_read_type)?;
             let after_stream =
@@ -621,11 +654,13 @@ impl<'a> PaimonTableRead<'a> {
         let before = before.to_vec();
         let after = after.to_vec();
         let parquet_read_budget = self.parquet_read_budget()?;
+        let blob_parallelism = self.blob_parallelism;
 
         Ok(Box::pin(async_stream::try_stream! {
             let core_options = CoreOptions::new(table.schema().options());
             let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates)
-                .with_parquet_read_budget(parquet_read_budget);
+                .with_parquet_read_budget(parquet_read_budget)
+                .with_blob_parallelism(blob_parallelism);
             let before_stream = pair_read.read_pk_sorted_for_diff_with_type(
                 &before,
                 &core_options,
@@ -894,6 +929,7 @@ impl<'a> PaimonTableRead<'a> {
             self.table.rest_env().cloned(),
         )?
         .with_batch_size(Some(core_options.read_batch_size()?))
+        .with_blob_parallelism(self.blob_parallelism)
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
         .with_read_timing(self.data_file_read_timing.clone());
         reader.read(data_splits)
@@ -916,6 +952,7 @@ impl<'a> PaimonTableRead<'a> {
         )
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))
+        .with_blob_parallelism(self.blob_parallelism)
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
         .with_read_timing(self.data_file_read_timing.clone());
         // The engine decoder filter is safe only on the plain append/raw path.

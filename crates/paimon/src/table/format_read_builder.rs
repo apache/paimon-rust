@@ -22,6 +22,7 @@ use super::read_builder::split_scan_predicates;
 use super::read_builder::{resolve_projected_fields, validate_projection_possible};
 use super::table_read::configured_parquet_read_budget;
 use super::{Table, TableRead, TableScan};
+use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::ParquetReadBudget;
 use crate::spec::{DataField, Predicate};
 use crate::table::source::RowRange;
@@ -42,6 +43,7 @@ pub(crate) struct FormatReadBuilder<'a> {
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    blob_parallelism: usize,
 }
 
 impl<'a> FormatReadBuilder<'a> {
@@ -56,6 +58,7 @@ impl<'a> FormatReadBuilder<'a> {
             row_ranges: None,
             case_sensitive: true,
             parquet_read_budget: None,
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
         }
     }
 
@@ -115,6 +118,11 @@ impl<'a> FormatReadBuilder<'a> {
         self
     }
 
+    pub(crate) fn with_blob_parallelism(&mut self, blob_parallelism: usize) -> &mut Self {
+        self.blob_parallelism = blob_parallelism;
+        self
+    }
+
     pub(crate) fn new_scan(&self) -> TableScan<'a> {
         TableScan::new(
             self.table,
@@ -144,13 +152,14 @@ impl<'a> FormatReadBuilder<'a> {
             Some(budget) => Arc::clone(budget),
             None => configured_parquet_read_budget(self.table)?,
         };
-        Ok(TableRead::new_format(
+        TableRead::new_format(
             self.table,
             read_type,
             self.data_predicates.clone(),
             self.limit,
         )
-        .with_parquet_read_budget(parquet_read_budget))
+        .with_parquet_read_budget(parquet_read_budget)
+        .with_blob_parallelism(self.blob_parallelism)
     }
 
     /// Resolve the effective read type, deferring projection name resolution to

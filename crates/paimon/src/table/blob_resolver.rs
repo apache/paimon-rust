@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::io::{FileIO, FileRead};
 use crate::spec::BlobDescriptor;
 use crate::Result;
@@ -29,7 +30,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const BLOB_RANGE_MERGE_GAP: u64 = 64 * 1024;
 const BLOB_RANGE_MERGE_MAX_SPAN: u64 = 8 * 1024 * 1024;
-pub(crate) const BLOB_DESCRIPTOR_READ_CONCURRENCY: usize = 8;
+pub(crate) const BLOB_DESCRIPTOR_READ_CONCURRENCY: usize = DEFAULT_BLOB_READ_PARALLELISM;
 const BLOB_DESCRIPTOR_READ_BYTE_UNIT: u64 = 1024 * 1024;
 const BLOB_DESCRIPTOR_READ_MAX_IN_FLIGHT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -105,6 +106,7 @@ impl BlobReader {
         }
 
         let limiter = self.limiter.clone();
+        let blob_parallelism = limiter.parallelism();
         let groups: Vec<Vec<(usize, Vec<u8>)>> = stream::iter(by_uri)
             .map(|(uri, entries)| {
                 let limiter = limiter.clone();
@@ -145,7 +147,7 @@ impl BlobReader {
                     )
                 }
             })
-            .buffer_unordered(BLOB_DESCRIPTOR_READ_CONCURRENCY)
+            .buffer_unordered(blob_parallelism)
             .try_collect()
             .await?;
 
@@ -322,6 +324,7 @@ pub(crate) struct BlobReadLimiter {
     bytes: Arc<Semaphore>,
     byte_unit: u64,
     max_byte_permits: u32,
+    parallelism: usize,
 }
 
 impl BlobReadLimiter {
@@ -331,6 +334,18 @@ impl BlobReadLimiter {
             BLOB_DESCRIPTOR_READ_MAX_IN_FLIGHT_BYTES,
             BLOB_DESCRIPTOR_READ_BYTE_UNIT,
         )
+    }
+
+    pub(crate) fn with_parallelism(parallelism: usize) -> Self {
+        Self::with_limits(
+            parallelism,
+            BLOB_DESCRIPTOR_READ_MAX_IN_FLIGHT_BYTES,
+            BLOB_DESCRIPTOR_READ_BYTE_UNIT,
+        )
+    }
+
+    pub(crate) fn parallelism(&self) -> usize {
+        self.parallelism
     }
 
     fn with_limits(request_limit: usize, byte_budget: u64, byte_unit: u64) -> Self {
@@ -344,6 +359,7 @@ impl BlobReadLimiter {
             bytes: Arc::new(Semaphore::new(max_byte_permits as usize)),
             byte_unit,
             max_byte_permits: max_byte_permits as u32,
+            parallelism: request_limit,
         }
     }
 
@@ -574,6 +590,7 @@ async fn read_blob_groups(
     groups: Vec<BlobReadGroup>,
     limiter: BlobReadLimiter,
 ) -> Result<Vec<ResolvedMergedBlobRead>> {
+    let blob_parallelism = limiter.parallelism();
     let grouped_results: Vec<Vec<ResolvedMergedBlobRead>> =
         stream::iter(groups)
             .map(|group| {
@@ -582,7 +599,7 @@ async fn read_blob_groups(
                     read_merged_blob_ranges(&group.uri, group.reader, group.reads, limiter).await
                 }
             })
-            .buffer_unordered(BLOB_DESCRIPTOR_READ_CONCURRENCY)
+            .buffer_unordered(blob_parallelism)
             .try_collect()
             .await?;
     Ok(grouped_results.into_iter().flatten().collect())
@@ -594,6 +611,7 @@ async fn read_merged_blob_ranges(
     reads: Vec<MergedBlobRead>,
     limiter: BlobReadLimiter,
 ) -> Result<Vec<ResolvedMergedBlobRead>> {
+    let blob_parallelism = limiter.parallelism();
     stream::iter(reads)
         .map(|merged| {
             let uri = uri.to_string();
@@ -627,7 +645,7 @@ async fn read_merged_blob_ranges(
                 Ok(ResolvedMergedBlobRead { merged, data })
             }
         })
-        .buffer_unordered(BLOB_DESCRIPTOR_READ_CONCURRENCY)
+        .buffer_unordered(blob_parallelism)
         .try_collect()
         .await
 }
@@ -766,6 +784,34 @@ mod tests {
         assert_eq!(results.len(), 12);
         assert!(reader.max_in_flight() > 1);
         assert!(reader.max_in_flight() <= BLOB_DESCRIPTOR_READ_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn test_blob_range_reads_honor_configured_parallelism() {
+        let reader = TrackingFileRead::new(Bytes::from_static(b"abcdefghijkl"));
+        let reads = (0..12)
+            .map(|row| MergedBlobRead {
+                start: row,
+                end: row + 1,
+                requests: vec![BlobReadRequest {
+                    row: row as usize,
+                    offset: row,
+                    length: 1,
+                }],
+            })
+            .collect();
+
+        let results = read_merged_blob_ranges(
+            "memory:/blob.bin",
+            std::sync::Arc::new(reader.clone()),
+            reads,
+            BlobReadLimiter::with_parallelism(2),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 12);
+        assert_eq!(reader.max_in_flight(), 2);
     }
 
     #[tokio::test]

@@ -66,6 +66,19 @@ def test_with_limit():
         assert plan is not None
 
 
+def test_with_blob_parallelism():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder().with_blob_parallelism(2)
+        plan = builder.new_scan().plan()
+        assert pa.Table.from_batches(
+            builder.new_read().read(plan.splits())
+        ).num_rows == 3
+
+        with pytest.raises(ValueError, match="must be greater than zero"):
+            table.new_read_builder().with_blob_parallelism(0)
+
+
 def test_with_row_ranges():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()

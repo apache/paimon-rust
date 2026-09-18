@@ -51,6 +51,7 @@ impl LazyBlobFile {
         positions: &[usize],
         file_io: &FileIO,
         blob_as_descriptor: bool,
+        blob_parallelism: usize,
         field_kind: &BlobFieldKind,
     ) -> crate::Result<Vec<BlobReadValue>> {
         if self.reader.is_none() {
@@ -63,11 +64,12 @@ impl LazyBlobFile {
             })?;
             let input = file_io.new_input(&self.path)?;
             let reader = input.reader().await?;
-            let reader = IndexedBlobReader::open(
+            let reader = IndexedBlobReader::open_with_parallelism(
                 Box::new(reader),
                 file_size,
                 self.path.clone(),
                 blob_as_descriptor,
+                blob_parallelism,
             )
             .await?;
             let indexed_rows =
@@ -116,6 +118,7 @@ pub(super) fn read(
     batch_size: Option<usize>,
     file_io: FileIO,
     blob_as_descriptor: bool,
+    blob_parallelism: usize,
     anchor_deletion_vector: Option<DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
     if read_fields.len() != 1 || !read_fields[0].data_type().is_blob_file_field() {
@@ -180,6 +183,7 @@ pub(super) fn read(
                 target_schema.clone(),
                 &file_io,
                 blob_as_descriptor,
+                blob_parallelism,
                 &field_kind,
             ).await?;
         }
@@ -193,6 +197,7 @@ async fn resolve_batch(
     target_schema: Arc<arrow_schema::Schema>,
     file_io: &FileIO,
     blob_as_descriptor: bool,
+    blob_parallelism: usize,
     field_kind: &BlobFieldKind,
 ) -> crate::Result<RecordBatch> {
     let mut resolved = (0..row_ids.len())
@@ -241,7 +246,13 @@ async fn resolve_batch(
 
             if !file_positions.is_empty() {
                 let values = file
-                    .read_positions(&file_positions, file_io, blob_as_descriptor, field_kind)
+                    .read_positions(
+                        &file_positions,
+                        file_io,
+                        blob_as_descriptor,
+                        blob_parallelism,
+                        field_kind,
+                    )
                     .await?;
                 for (output_position, value) in output_positions.into_iter().zip(values) {
                     if !matches!(&value, BlobReadValue::Placeholder) {
@@ -438,6 +449,7 @@ mod tests {
             schema,
             &file_io,
             false,
+            crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM,
             &BlobFieldKind::Scalar,
         )
         .await

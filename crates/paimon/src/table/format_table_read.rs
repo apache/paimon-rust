@@ -21,6 +21,7 @@ use super::data_file_reader::DataFileReader;
 use super::read_builder::split_scan_predicates;
 use super::table_read::configured_parquet_read_budget;
 use super::{ArrowRecordBatchStream, Table};
+use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::partition::partition_array;
 use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
 use crate::spec::{DataField, Predicate};
@@ -38,6 +39,7 @@ pub(crate) struct FormatTableRead<'a> {
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     parquet_read_budget: Option<Arc<ParquetReadBudget>>,
     limit: Option<usize>,
+    blob_parallelism: usize,
 }
 
 impl<'a> FormatTableRead<'a> {
@@ -54,6 +56,7 @@ impl<'a> FormatTableRead<'a> {
             row_filter_factory: None,
             parquet_read_budget: None,
             limit,
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
         }
     }
 
@@ -84,6 +87,11 @@ impl<'a> FormatTableRead<'a> {
 
     pub(crate) fn with_parquet_read_budget(mut self, budget: Arc<ParquetReadBudget>) -> Self {
         self.parquet_read_budget = Some(budget);
+        self
+    }
+
+    pub(crate) fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
+        self.blob_parallelism = blob_parallelism;
         self
     }
 
@@ -121,6 +129,7 @@ impl<'a> FormatTableRead<'a> {
         let batch_size = Some(core_options.read_batch_size()?);
         let row_filter_factory = self.row_filter_factory.clone();
         let parquet_read_budget = Some(self.parquet_read_budget()?);
+        let blob_parallelism = self.blob_parallelism;
 
         Ok(try_stream! {
             for split in splits {
@@ -137,6 +146,7 @@ impl<'a> FormatTableRead<'a> {
                     data_predicates.clone(),
                 )
                 .with_batch_size(batch_size)
+                .with_blob_parallelism(blob_parallelism)
                 .with_parquet_read_budget(parquet_read_budget.clone());
                 if let Some(factory) = &row_filter_factory {
                     reader = reader.with_row_filter_factory(Arc::clone(factory));
