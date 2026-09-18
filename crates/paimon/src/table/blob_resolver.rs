@@ -19,8 +19,8 @@ use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::io::{FileIO, FileRead};
 use crate::spec::BlobDescriptor;
 use crate::Result;
-use arrow_array::builder::BinaryBuilder;
-use arrow_array::{Array, BinaryArray};
+use arrow_array::builder::LargeBinaryBuilder;
+use arrow_array::{Array, LargeBinaryArray};
 use bytes::Bytes;
 use futures::{stream, StreamExt, TryStreamExt};
 use std::collections::HashMap;
@@ -122,7 +122,7 @@ impl BlobReader {
                                 blob_error_with_context(error, &indices, Some(&uri))
                             })?,
                     };
-                    let mut builder = BinaryBuilder::with_capacity(entries.len(), 0);
+                    let mut builder = LargeBinaryBuilder::with_capacity(entries.len(), 0);
                     for (_, descriptor) in &entries {
                         builder.append_value(
                             BlobDescriptor::new(
@@ -405,10 +405,10 @@ impl BlobReadLimiter {
 /// resolve it by reading the actual data from the referenced URI+offset+length.
 /// Raw data values are passed through unchanged.
 pub(crate) async fn resolve_blob_column(
-    col: &BinaryArray,
+    col: &LargeBinaryArray,
     file_io: &FileIO,
     limiter: BlobReadLimiter,
-) -> Result<BinaryArray> {
+) -> Result<LargeBinaryArray> {
     let mut needs_resolve = false;
     for i in 0..col.len() {
         if !col.is_null(i) && BlobDescriptor::is_blob_descriptor(col.value(i)) {
@@ -538,7 +538,7 @@ pub(crate) async fn resolve_blob_column(
         }
     }
 
-    let mut builder = BinaryBuilder::with_capacity(col.len(), value_capacity);
+    let mut builder = LargeBinaryBuilder::with_capacity(col.len(), value_capacity);
     for cell in cells {
         match cell {
             ResolvedBlobCell::Null => builder.append_null(),

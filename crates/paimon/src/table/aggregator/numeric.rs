@@ -1388,8 +1388,8 @@ mod tests {
     #[test]
     fn test_min_rejects_unsupported_type() {
         // Java's `TypeCheckUtils#isComparable` rejects exactly MAP, MULTISET, ROW,
-        // ARRAY, VECTOR, VARIANT and BLOB. BLOB is the interesting one here: it
-        // shares Arrow's `Binary` with BINARY and VARBINARY, which min/max accepts.
+        // ARRAY, VECTOR, VARIANT and BLOB. BINARY and VARBINARY remain comparable,
+        // while BLOB is intentionally rejected even though it is represented as LargeBinary.
         let err = MinAgg::new("v", &DataType::Blob(crate::spec::BlobType::new())).unwrap_err();
         assert!(matches!(err, crate::Error::ConfigInvalid { message } if message.contains("min")));
     }

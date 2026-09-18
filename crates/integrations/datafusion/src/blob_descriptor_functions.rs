@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, BinaryArray, BinaryBuilder, BinaryViewArray, LargeBinaryArray, LargeStringArray,
+    Array, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeBinaryBuilder, LargeStringArray,
     StringArray, StringBuilder, StringViewArray,
 };
 use datafusion::arrow::datatypes::DataType as ArrowDataType;
@@ -71,7 +71,7 @@ impl ScalarUDFImpl for PathToDescriptorFunc {
     }
 
     fn return_type(&self, _arg_types: &[ArrowDataType]) -> DFResult<ArrowDataType> {
-        Ok(ArrowDataType::Binary)
+        Ok(ArrowDataType::LargeBinary)
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -147,7 +147,7 @@ fn path_scalar(value: ScalarValue) -> DFResult<ColumnarValue> {
         ScalarValue::Null => None,
         other => return unexpected_type(PATH_TO_DESCRIPTOR, &other.data_type()),
     };
-    Ok(ColumnarValue::Scalar(ScalarValue::Binary(
+    Ok(ColumnarValue::Scalar(ScalarValue::LargeBinary(
         path.as_deref().map(serialize_path),
     )))
 }
@@ -166,7 +166,7 @@ fn path_array(input: &dyn Array) -> DFResult<ColumnarValue> {
 }
 
 fn descriptor_array_from_paths<'a>(paths: impl Iterator<Item = Option<&'a str>>) -> ColumnarValue {
-    let mut builder = BinaryBuilder::new();
+    let mut builder = LargeBinaryBuilder::new();
     for path in paths {
         match path {
             Some(path) => builder.append_value(serialize_path(path)),

@@ -35,7 +35,7 @@ use crate::table::schema_manager::SchemaManager;
 use crate::table::source::any_range_overlaps_file;
 use crate::table::{ArrowRecordBatchStream, RESTEnv, RowRange};
 use crate::{DataSplit, Error};
-use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch};
+use arrow_array::{Array, Int64Array, LargeBinaryArray, RecordBatch};
 use async_stream::try_stream;
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
@@ -903,8 +903,8 @@ async fn resolve_descriptor_columns_with<F, Fut>(
     resolve: F,
 ) -> crate::Result<RecordBatch>
 where
-    F: Fn(BinaryArray) -> Fut,
-    Fut: Future<Output = crate::Result<BinaryArray>>,
+    F: Fn(LargeBinaryArray) -> Fut,
+    Fut: Future<Output = crate::Result<LargeBinaryArray>>,
 {
     let schema = batch.schema();
     let mut columns = batch.columns().to_vec();
@@ -915,7 +915,7 @@ where
             if let Some(bin_col) = batch
                 .column(idx)
                 .as_any()
-                .downcast_ref::<arrow_array::BinaryArray>()
+                .downcast_ref::<LargeBinaryArray>()
             {
                 descriptor_columns.push((idx, bin_col.clone()));
             }
@@ -927,14 +927,15 @@ where
     }
 
     let resolve = &resolve;
-    let resolved_columns: Vec<(usize, BinaryArray)> = futures::stream::iter(descriptor_columns)
-        .map(move |(idx, column)| {
-            let future = resolve(column);
-            async move { future.await.map(|resolved| (idx, resolved)) }
-        })
-        .buffer_unordered(blob_parallelism)
-        .try_collect()
-        .await?;
+    let resolved_columns: Vec<(usize, LargeBinaryArray)> =
+        futures::stream::iter(descriptor_columns)
+            .map(move |(idx, column)| {
+                let future = resolve(column);
+                async move { future.await.map(|resolved| (idx, resolved)) }
+            })
+            .buffer_unordered(blob_parallelism)
+            .try_collect()
+            .await?;
     for (idx, resolved) in resolved_columns {
         columns[idx] = Arc::new(resolved);
     }
@@ -989,7 +990,7 @@ fn collect_blob_view_structs(
         if !blob_view_fields.contains(field.name()) {
             continue;
         }
-        let col = binary_column(batch, idx, field.name())?;
+        let col = large_binary_column(batch, idx, field.name())?;
         for row in 0..col.len() {
             if col.is_null(row) {
                 continue;
@@ -1025,8 +1026,8 @@ fn replace_blob_view_columns(
             continue;
         }
 
-        let col = binary_column(&batch, idx, field.name())?;
-        let mut builder = arrow_array::builder::BinaryBuilder::new();
+        let col = large_binary_column(&batch, idx, field.name())?;
+        let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
         for row in 0..col.len() {
             if col.is_null(row) {
                 builder.append_null();
@@ -1063,17 +1064,17 @@ fn replace_blob_view_columns(
     })
 }
 
-fn binary_column<'a>(
+fn large_binary_column<'a>(
     batch: &'a RecordBatch,
     idx: usize,
     field_name: &str,
-) -> crate::Result<&'a BinaryArray> {
+) -> crate::Result<&'a LargeBinaryArray> {
     batch
         .column(idx)
         .as_any()
-        .downcast_ref::<BinaryArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .ok_or_else(|| Error::DataInvalid {
-            message: format!("blob-view-field '{field_name}' requires a BinaryArray column"),
+            message: format!("blob-view-field '{field_name}' requires a LargeBinaryArray column"),
             source: None,
         })
 }
@@ -1142,10 +1143,10 @@ impl BlobViewLookup {
                 let blob_col = batch
                     .column(0)
                     .as_any()
-                    .downcast_ref::<BinaryArray>()
+                    .downcast_ref::<LargeBinaryArray>()
                     .ok_or_else(|| Error::DataInvalid {
                         message: format!(
-                            "Upstream blob field '{}' did not read as BinaryArray",
+                            "Upstream blob field '{}' did not read as LargeBinaryArray",
                             field.name()
                         ),
                         source: None,
@@ -2649,8 +2650,8 @@ mod tests {
         CommitMessage, DataSplitBuilder, DeletionFile, Table, TableCommit, TableRead,
     };
     use arrow_array::{
-        Array, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, ListArray,
-        RecordBatch,
+        Array, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeBinaryArray,
+        ListArray, RecordBatch,
     };
     use bytes::Bytes;
     use futures::TryStreamExt;
@@ -2692,16 +2693,16 @@ mod tests {
     #[tokio::test]
     async fn test_descriptor_columns_resolve_concurrently_and_preserve_order() {
         let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("blob_a", arrow_schema::DataType::Binary, true),
+            arrow_schema::Field::new("blob_a", arrow_schema::DataType::LargeBinary, true),
             arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
-            arrow_schema::Field::new("blob_b", arrow_schema::DataType::Binary, true),
+            arrow_schema::Field::new("blob_b", arrow_schema::DataType::LargeBinary, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(BinaryArray::from(vec![Some(b"a".as_slice())])),
+                Arc::new(LargeBinaryArray::from(vec![Some(b"a".as_slice())])),
                 Arc::new(Int32Array::from(vec![7])),
-                Arc::new(BinaryArray::from(vec![Some(b"b".as_slice())])),
+                Arc::new(LargeBinaryArray::from(vec![Some(b"b".as_slice())])),
             ],
         )
         .unwrap();
@@ -2730,7 +2731,7 @@ mod tests {
             resolved
                 .column(0)
                 .as_any()
-                .downcast_ref::<BinaryArray>()
+                .downcast_ref::<LargeBinaryArray>()
                 .unwrap()
                 .value(0),
             b"a"
@@ -2739,7 +2740,7 @@ mod tests {
             resolved
                 .column(2)
                 .as_any()
-                .downcast_ref::<BinaryArray>()
+                .downcast_ref::<LargeBinaryArray>()
                 .unwrap()
                 .value(0),
             b"b"
@@ -6530,7 +6531,7 @@ mod tests {
                 let array = batch
                     .column(idx)
                     .as_any()
-                    .downcast_ref::<BinaryArray>()
+                    .downcast_ref::<LargeBinaryArray>()
                     .unwrap();
                 (0..array.len())
                     .map(|row| (!array.is_null(row)).then(|| array.value(row).to_vec()))
@@ -6558,7 +6559,7 @@ mod tests {
                             return None;
                         }
                         let values = array.value(row);
-                        let values = values.as_any().downcast_ref::<BinaryArray>().unwrap();
+                        let values = values.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
                         Some(
                             (0..values.len())
                                 .map(|idx| {

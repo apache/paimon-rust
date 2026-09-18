@@ -102,9 +102,9 @@ func StringBlobMapDescriptors(column arrow.Array, row int) (map[string][]byte, e
 	if !ok {
 		return nil, fmt.Errorf("paimon: BLOB map keys are %T, want *array.String", m.Keys())
 	}
-	descriptors, ok := m.Items().(*array.Binary)
+	descriptors, ok := m.Items().(*array.LargeBinary)
 	if !ok {
-		return nil, fmt.Errorf("paimon: BLOB map values are %T, want *array.Binary", m.Items())
+		return nil, fmt.Errorf("paimon: BLOB map values are %T, want *array.LargeBinary", m.Items())
 	}
 	start, end := m.ValueOffsets(row)
 	result := make(map[string][]byte, end-start)

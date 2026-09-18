@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion::arrow::array::{Array, BinaryArray, StringArray};
+use datafusion::arrow::array::{Array, LargeBinaryArray, StringArray};
 use paimon_datafusion::SQLContext;
 
 const JAVA_V2_HEX: &str =
@@ -61,7 +61,7 @@ async fn test_blob_descriptor_functions_are_registered_with_aliases_and_java_for
         let descriptors = batch
             .column(column)
             .as_any()
-            .downcast_ref::<BinaryArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap();
         assert_eq!(to_hex(descriptors.value(0)), JAVA_V2_HEX);
     }
@@ -100,7 +100,7 @@ async fn test_blob_descriptor_functions_propagate_nulls() {
     let descriptors = batch
         .column(1)
         .as_any()
-        .downcast_ref::<BinaryArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .unwrap();
     let strings = batch
         .column(2)
