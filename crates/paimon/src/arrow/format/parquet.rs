@@ -18,10 +18,10 @@
 use super::shredding::PhysicalFormatWriterFactory;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
-use crate::arrow::parquet_read_budget::ParquetReadPermit;
+use crate::arrow::read_budget::ReadPermit;
 use crate::arrow::shredding::map::MapShreddingReadPlan;
 use crate::arrow::shredding::ShreddingReadPlan;
-use crate::arrow::{ParquetReadBudget, RowFilter, RowFilterContext};
+use crate::arrow::{ReadBudget, RowFilter, RowFilterContext};
 use crate::io::{FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
@@ -56,11 +56,11 @@ use tokio::sync::mpsc;
 
 #[derive(Default)]
 pub(crate) struct ParquetFormatReader {
-    read_budget: Option<Arc<ParquetReadBudget>>,
+    read_budget: Option<Arc<ReadBudget>>,
 }
 
 impl ParquetFormatReader {
-    pub(crate) fn with_read_budget(read_budget: Arc<ParquetReadBudget>) -> Self {
+    pub(crate) fn with_read_budget(read_budget: Arc<ReadBudget>) -> Self {
         Self {
             read_budget: Some(read_budget),
         }
@@ -702,7 +702,7 @@ async fn read_row_group(
     projection: ProjectionMask,
     row_group_index: usize,
     batch_size: Option<usize>,
-    _permit: ParquetReadPermit,
+    _permit: ReadPermit,
     sender: mpsc::Sender<ParquetRowGroupMessage>,
 ) {
     let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
@@ -2300,7 +2300,7 @@ mod tests {
     use crate::arrow::format::{
         create_format_reader, create_format_writer, FormatFileReader, FormatFileWriter,
     };
-    use crate::arrow::{build_target_arrow_schema, variant_arrow_type, ParquetReadBudget};
+    use crate::arrow::{build_target_arrow_schema, variant_arrow_type, ReadBudget};
     use crate::io::FileIOBuilder;
     use crate::spec::{
         ArrayType, BigIntType, DataField, DataType, Datum, IntType, MapType, PredicateBuilder,
@@ -2838,7 +2838,7 @@ mod tests {
             DataType::Int(IntType::new()),
         )];
         let batches = ParquetFormatReader::with_read_budget(Arc::new(
-            ParquetReadBudget::new(8, 256 * 1024 * 1024).unwrap(),
+            ReadBudget::new(8, 256 * 1024 * 1024).unwrap(),
         ))
         .read_batch_stream(
             Box::new(file_reader),
@@ -2910,7 +2910,7 @@ mod tests {
             "id".to_string(),
             DataType::Int(IntType::new()),
         )];
-        let budget = Arc::new(ParquetReadBudget::new(2, 256 * 1024 * 1024).unwrap());
+        let budget = Arc::new(ReadBudget::new(2, 256 * 1024 * 1024).unwrap());
         let first = ParquetFormatReader::with_read_budget(Arc::clone(&budget))
             .read_batch_stream(
                 Box::new(new_file_reader()),
@@ -2965,7 +2965,7 @@ mod tests {
     #[tokio::test]
     async fn test_parquet_diagnostics_include_reads_with_row_selection() {
         let data = write_multi_row_group_parquet(32, 64, EnabledStatistics::Chunk).await;
-        let budget = Arc::new(ParquetReadBudget::new(8, 256 * 1024 * 1024).unwrap());
+        let budget = Arc::new(ReadBudget::new(8, 256 * 1024 * 1024).unwrap());
         budget.enable_diagnostics();
         let file_size = data.len() as u64;
         let fields = vec![int_field("id")];

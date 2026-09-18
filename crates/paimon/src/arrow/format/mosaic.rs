@@ -20,8 +20,10 @@ use crate::arrow::build_target_arrow_schema;
 use crate::arrow::filtering::{
     predicates_may_match_with_schema, remap_predicates_to_file, StatsAccessor,
 };
+use crate::arrow::read_budget::{ReadBudget, ReadPermit};
 use crate::arrow::residual::{filter_record_batch_by_predicates, widen_scan_fields};
 use crate::io::FileRead;
+use crate::spec::MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION;
 use crate::spec::{DataField, DataType as PaimonDataType, Datum, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
@@ -41,7 +43,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::ops::Range;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Row-group prefetch settings of one Mosaic file read, from the table options
 /// `mosaic.read.prefetch-row-groups` and `mosaic.read.prefetch-max-bytes`.
@@ -164,112 +166,13 @@ struct PlannedRowGroup {
 }
 
 struct PendingRowGroup {
-    permit: MosaicPrefetchPermit,
+    permit: ReadPermit,
     task: MosaicTask<RecordBatch>,
 }
 
 struct BudgetedBatch {
     batch: RecordBatch,
-    permit: Option<Arc<MosaicPrefetchPermit>>,
-}
-
-#[derive(Default)]
-struct MosaicPrefetchBudgetState {
-    bytes: usize,
-    groups: usize,
-}
-
-struct MosaicPrefetchBudgetInner {
-    max_bytes: usize,
-    max_groups: usize,
-    state: Mutex<MosaicPrefetchBudgetState>,
-    released: Condvar,
-}
-
-#[derive(Clone)]
-struct MosaicPrefetchBudget {
-    inner: Arc<MosaicPrefetchBudgetInner>,
-}
-
-impl MosaicPrefetchBudget {
-    fn new(max_bytes: usize, max_groups: usize) -> Self {
-        Self {
-            inner: Arc::new(MosaicPrefetchBudgetInner {
-                max_bytes,
-                max_groups,
-                state: Mutex::new(MosaicPrefetchBudgetState::default()),
-                released: Condvar::new(),
-            }),
-        }
-    }
-
-    fn try_acquire(&self, estimated_bytes: usize) -> Option<MosaicPrefetchPermit> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !self.can_acquire(&state, estimated_bytes) {
-            return None;
-        }
-        Self::charge(&mut state, estimated_bytes);
-        Some(MosaicPrefetchPermit {
-            inner: Arc::clone(&self.inner),
-            estimated_bytes,
-        })
-    }
-
-    fn acquire(&self, estimated_bytes: usize) -> MosaicPrefetchPermit {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while !self.can_acquire(&state, estimated_bytes) {
-            state = self
-                .inner
-                .released
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        Self::charge(&mut state, estimated_bytes);
-        MosaicPrefetchPermit {
-            inner: Arc::clone(&self.inner),
-            estimated_bytes,
-        }
-    }
-
-    fn can_acquire(&self, state: &MosaicPrefetchBudgetState, estimated_bytes: usize) -> bool {
-        if state.groups >= self.inner.max_groups {
-            return false;
-        }
-        // An oversized head group may consume the whole budget so the reader
-        // always makes progress, but it cannot overlap peers.
-        state.groups == 0 || state.bytes.saturating_add(estimated_bytes) <= self.inner.max_bytes
-    }
-
-    fn charge(state: &mut MosaicPrefetchBudgetState, estimated_bytes: usize) {
-        state.groups += 1;
-        state.bytes = state.bytes.saturating_add(estimated_bytes);
-    }
-}
-
-struct MosaicPrefetchPermit {
-    inner: Arc<MosaicPrefetchBudgetInner>,
-    estimated_bytes: usize,
-}
-
-impl Drop for MosaicPrefetchPermit {
-    fn drop(&mut self) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.groups -= 1;
-        state.bytes = state.bytes.saturating_sub(self.estimated_bytes);
-        self.inner.released.notify_all();
-    }
+    permit: Option<Arc<ReadPermit>>,
 }
 
 type MosaicJob = Box<dyn FnOnce() + Send + 'static>;
@@ -505,12 +408,14 @@ fn read_mosaic_batches_blocking(
     let projected_names = Arc::new(projected_names);
     let executor = mosaic_executor()?;
     let mut pending = VecDeque::<PendingRowGroup>::new();
-    let prefetch_budget = MosaicPrefetchBudget::new(prefetch_max_bytes, prefetch_row_groups);
+    let prefetch_budget =
+        ReadBudget::with_byte_granularity(prefetch_row_groups, prefetch_max_bytes as u64, 1)?
+            .with_byte_option(MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION);
     let mut outcome = Ok(());
 
     'read: while !planned.is_empty() || !pending.is_empty() {
         while let Some(next) = planned.front() {
-            let Some(permit) = prefetch_budget.try_acquire(next.estimated_bytes) else {
+            let Some(permit) = prefetch_budget.try_acquire(next.estimated_bytes as u64) else {
                 break;
             };
             let plan = planned.pop_front().unwrap();
@@ -535,7 +440,13 @@ fn read_mosaic_batches_blocking(
             };
             // Earlier decoded batches can still own the budget downstream.
             // With no task left to join, wait for their permits to be released.
-            let permit = prefetch_budget.acquire(next.estimated_bytes);
+            let permit = match prefetch_budget.acquire_blocking(next.estimated_bytes as u64) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    outcome = Err(error);
+                    break 'read;
+                }
+            };
             let plan = planned.pop_front().unwrap();
             let reader = Arc::clone(&mosaic_reader);
             let names = Arc::clone(&projected_names);
@@ -629,7 +540,7 @@ fn apply_mosaic_residual(
 fn send_mosaic_batch_chunks(
     batch: RecordBatch,
     batch_size: usize,
-    permit: Option<Arc<MosaicPrefetchPermit>>,
+    permit: Option<Arc<ReadPermit>>,
     send_batch: &mut impl FnMut(BudgetedBatch) -> bool,
 ) -> bool {
     split_batch(batch, batch_size).into_iter().all(|batch| {
@@ -1652,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mosaic_prefetch_budget_is_cumulative_and_oversized_head_progresses() {
+    fn test_estimated_row_bytes_matches_java_prefetch_budget() {
         assert_eq!(estimated_row_bytes(&[data_fields()[0].clone()]), 5);
         assert_eq!(estimated_row_bytes(&[data_fields()[1].clone()]), 40);
         assert_eq!(
@@ -1663,25 +1574,6 @@ mod tests {
             )]),
             128
         );
-
-        let budget = MosaicPrefetchBudget::new(20, 8);
-        let first = budget.try_acquire(10).unwrap();
-        let second = budget.try_acquire(10).unwrap();
-        assert!(budget.try_acquire(10).is_none());
-        drop(first);
-        let third = budget.try_acquire(10).unwrap();
-        drop((second, third));
-
-        let oversized = budget.try_acquire(21).unwrap();
-        assert!(budget.try_acquire(1).is_none());
-        drop(oversized);
-        assert!(budget.try_acquire(1).is_some());
-
-        let group_limited = MosaicPrefetchBudget::new(usize::MAX, 2);
-        let first = group_limited.try_acquire(1).unwrap();
-        let second = group_limited.try_acquire(1).unwrap();
-        assert!(group_limited.try_acquire(1).is_none());
-        drop((first, second));
     }
 
     #[tokio::test]

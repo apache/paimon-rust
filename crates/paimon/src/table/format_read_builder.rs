@@ -23,7 +23,7 @@ use super::read_builder::{resolve_projected_fields, validate_projection_possible
 use super::table_read::configured_parquet_read_budget;
 use super::{Table, TableRead, TableScan};
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
-use crate::arrow::ParquetReadBudget;
+use crate::arrow::ReadBudget;
 use crate::spec::{DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::Result;
@@ -42,7 +42,7 @@ pub(crate) struct FormatReadBuilder<'a> {
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
     blob_parallelism: usize,
 }
 
@@ -113,7 +113,7 @@ impl<'a> FormatReadBuilder<'a> {
         self
     }
 
-    pub(crate) fn with_parquet_read_budget(&mut self, budget: Arc<ParquetReadBudget>) -> &mut Self {
+    pub(crate) fn with_parquet_read_budget(&mut self, budget: Arc<ReadBudget>) -> &mut Self {
         self.parquet_read_budget = Some(budget);
         self
     }

@@ -23,7 +23,7 @@ use super::table_read::{configured_mosaic_prefetch, configured_parquet_read_budg
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::partition::partition_array;
-use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
+use crate::arrow::{build_target_arrow_schema, ReadBudget};
 use crate::spec::{DataField, Predicate};
 use crate::{DataSplit, Error};
 use arrow_array::{RecordBatch, RecordBatchOptions};
@@ -37,7 +37,7 @@ pub(crate) struct FormatTableRead<'a> {
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
     limit: Option<usize>,
     blob_parallelism: usize,
 }
@@ -85,7 +85,7 @@ impl<'a> FormatTableRead<'a> {
         self
     }
 
-    pub(crate) fn with_parquet_read_budget(mut self, budget: Arc<ParquetReadBudget>) -> Self {
+    pub(crate) fn with_parquet_read_budget(mut self, budget: Arc<ReadBudget>) -> Self {
         self.parquet_read_budget = Some(budget);
         self
     }
@@ -95,7 +95,7 @@ impl<'a> FormatTableRead<'a> {
         self
     }
 
-    fn parquet_read_budget(&self) -> crate::Result<Arc<ParquetReadBudget>> {
+    fn parquet_read_budget(&self) -> crate::Result<Arc<ReadBudget>> {
         match &self.parquet_read_budget {
             Some(budget) => Ok(Arc::clone(budget)),
             None => configured_parquet_read_budget(self.table),

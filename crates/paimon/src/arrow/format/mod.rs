@@ -29,7 +29,7 @@ pub(crate) use mosaic::MosaicPrefetchOptions;
 #[cfg(test)]
 pub(crate) use parquet::ParquetFormatWriter;
 
-use super::ParquetReadBudget;
+use super::ReadBudget;
 use super::RowFilterFactory;
 use crate::io::{FileIO, FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
@@ -207,7 +207,7 @@ pub(crate) fn create_format_reader_with_budget(
     path: &str,
     blob_as_descriptor: bool,
     read_fields: &[DataField],
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
     blob_parallelism: usize,
     mosaic_prefetch: MosaicPrefetchOptions,
 ) -> crate::Result<Box<dyn FormatFileReader>> {

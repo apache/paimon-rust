@@ -25,7 +25,7 @@ use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::MosaicPrefetchOptions;
-use crate::arrow::ParquetReadBudget;
+use crate::arrow::ReadBudget;
 use crate::spec::{
     BigIntType, CoreOptions, DataField, DataType, MergeEngine, Predicate, TinyIntType,
     ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
@@ -61,11 +61,9 @@ enum TableReadKind<'a> {
     Format(FormatTableRead<'a>),
 }
 
-pub(super) fn configured_parquet_read_budget(
-    table: &Table,
-) -> crate::Result<Arc<ParquetReadBudget>> {
+pub(super) fn configured_parquet_read_budget(table: &Table) -> crate::Result<Arc<ReadBudget>> {
     let options = table.schema().core_options();
-    Ok(Arc::new(ParquetReadBudget::new(
+    Ok(Arc::new(ReadBudget::new(
         options.parquet_row_group_parallelism()?,
         options.parquet_row_group_max_inflight_bytes()?,
     )?))
@@ -179,7 +177,7 @@ impl<'a> TableRead<'a> {
 
     /// Override the Parquet resource budget shared by this read.
     #[doc(hidden)]
-    pub fn with_parquet_read_budget(self, budget: Arc<ParquetReadBudget>) -> Self {
+    pub fn with_parquet_read_budget(self, budget: Arc<ReadBudget>) -> Self {
         match self.0 {
             TableReadKind::Paimon(read) => {
                 Self(TableReadKind::Paimon(read.with_parquet_read_budget(budget)))
@@ -256,7 +254,7 @@ struct PaimonTableRead<'a> {
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
     data_file_read_timing: Option<Arc<DataFileReadTiming>>,
     blob_parallelism: usize,
 }
@@ -314,7 +312,7 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
-    fn with_parquet_read_budget(mut self, budget: Arc<ParquetReadBudget>) -> Self {
+    fn with_parquet_read_budget(mut self, budget: Arc<ReadBudget>) -> Self {
         self.parquet_read_budget = Some(budget);
         self
     }
@@ -329,7 +327,7 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
-    fn parquet_read_budget(&self) -> crate::Result<Arc<ParquetReadBudget>> {
+    fn parquet_read_budget(&self) -> crate::Result<Arc<ReadBudget>> {
         match &self.parquet_read_budget {
             Some(budget) => Ok(Arc::clone(budget)),
             None => configured_parquet_read_budget(self.table),
@@ -1805,7 +1803,7 @@ mod tests {
             ));
 
             let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new())
-                .with_parquet_read_budget(Arc::new(ParquetReadBudget::default()));
+                .with_parquet_read_budget(Arc::new(ReadBudget::default()));
             assert!(read.to_arrow(&[]).is_ok());
         }
     }

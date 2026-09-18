@@ -20,24 +20,31 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::spec::PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION;
+
 const BYTE_PERMIT_UNIT: u64 = 1024 * 1024;
+const DEFAULT_BYTE_OPTION: &str = "the row-group read budget";
 const DEFAULT_PARALLELISM: usize = 8;
 const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Shared resource budget for concurrent Parquet row-group reads.
+/// Resource budget for concurrent row-group reads, bounding both the number of
+/// row groups in flight and their estimated bytes. Parquet holds one per scan;
+/// Mosaic builds one per open file from its own prefetch options.
 #[derive(Debug)]
-pub struct ParquetReadBudget {
+pub struct ReadBudget {
     parallelism: usize,
     row_groups: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     byte_permits: u32,
+    byte_permit_unit: u64,
     max_inflight_bytes: u64,
+    byte_option: &'static str,
     oversized_warning_logged: AtomicBool,
-    diagnostics: Arc<ParquetReadDiagnostics>,
+    diagnostics: Arc<ReadBudgetDiagnostics>,
 }
 
 #[derive(Debug)]
-struct ParquetReadDiagnostics {
+struct ReadBudgetDiagnostics {
     enabled: AtomicBool,
     row_group_count: AtomicU64,
     projected_bytes_min: AtomicU64,
@@ -47,7 +54,7 @@ struct ParquetReadDiagnostics {
     peak_inflight: AtomicUsize,
 }
 
-impl Default for ParquetReadDiagnostics {
+impl Default for ReadBudgetDiagnostics {
     fn default() -> Self {
         Self {
             enabled: AtomicBool::new(false),
@@ -62,7 +69,7 @@ impl Default for ParquetReadDiagnostics {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ParquetReadDiagnosticsSnapshot {
+pub(crate) struct ReadBudgetDiagnosticsSnapshot {
     pub(crate) row_group_count: u64,
     pub(crate) projected_bytes_min: u64,
     pub(crate) projected_bytes_max: u64,
@@ -71,12 +78,28 @@ pub(crate) struct ParquetReadDiagnosticsSnapshot {
     pub(crate) peak_inflight: usize,
 }
 
-impl ParquetReadBudget {
+impl ReadBudget {
+    /// Scan-wide budget with MiB-granular byte permits, as the Parquet reader
+    /// takes it; its oversized-row-group warning names the Parquet option.
     pub fn new(parallelism: usize, max_inflight_bytes: u64) -> crate::Result<Self> {
+        Ok(
+            Self::with_byte_granularity(parallelism, max_inflight_bytes, BYTE_PERMIT_UNIT)?
+                .with_byte_option(PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION),
+        )
+    }
+
+    /// Budget whose byte permits count `byte_permit_unit` bytes each. Mosaic
+    /// charges the exact estimated bytes of a row group, so it passes `1`; at
+    /// most `u32::MAX` permits are tracked, which caps that unit at 4 GiB.
+    pub(crate) fn with_byte_granularity(
+        parallelism: usize,
+        max_inflight_bytes: u64,
+        byte_permit_unit: u64,
+    ) -> crate::Result<Self> {
         if parallelism == 0 || parallelism > Semaphore::MAX_PERMITS {
             return Err(crate::Error::DataInvalid {
                 message: format!(
-                    "Parquet row-group parallelism must be between 1 and {}, got {parallelism}",
+                    "Row-group read parallelism must be between 1 and {}, got {parallelism}",
                     Semaphore::MAX_PERMITS
                 ),
                 source: None,
@@ -84,13 +107,14 @@ impl ParquetReadBudget {
         }
         if max_inflight_bytes == 0 {
             return Err(crate::Error::DataInvalid {
-                message: "Parquet row-group max in-flight bytes must be greater than 0".to_string(),
+                message: "Row-group read max in-flight bytes must be greater than 0".to_string(),
                 source: None,
             });
         }
+        let byte_permit_unit = byte_permit_unit.max(1);
         let max_byte_permits = Semaphore::MAX_PERMITS.min(u32::MAX as usize) as u32;
         let byte_permits = max_inflight_bytes
-            .div_ceil(BYTE_PERMIT_UNIT)
+            .div_ceil(byte_permit_unit)
             .min(u64::from(max_byte_permits)) as u32;
 
         Ok(Self {
@@ -98,10 +122,18 @@ impl ParquetReadBudget {
             row_groups: Arc::new(Semaphore::new(parallelism)),
             bytes: Arc::new(Semaphore::new(byte_permits as usize)),
             byte_permits,
+            byte_permit_unit,
             max_inflight_bytes,
+            byte_option: DEFAULT_BYTE_OPTION,
             oversized_warning_logged: AtomicBool::new(false),
-            diagnostics: Arc::new(ParquetReadDiagnostics::default()),
+            diagnostics: Arc::new(ReadBudgetDiagnostics::default()),
         })
+    }
+
+    /// Name the table option that set the byte budget, for the oversized warning.
+    pub(crate) fn with_byte_option(mut self, byte_option: &'static str) -> Self {
+        self.byte_option = byte_option;
+        self
     }
 
     pub fn parallelism(&self) -> usize {
@@ -140,9 +172,9 @@ impl ParquetReadBudget {
         );
     }
 
-    pub(crate) fn diagnostics(&self) -> ParquetReadDiagnosticsSnapshot {
+    pub(crate) fn diagnostics(&self) -> ReadBudgetDiagnosticsSnapshot {
         let row_group_count = self.diagnostics.row_group_count.load(Ordering::Relaxed);
-        ParquetReadDiagnosticsSnapshot {
+        ReadBudgetDiagnosticsSnapshot {
             row_group_count,
             projected_bytes_min: if row_group_count == 0 {
                 0
@@ -159,39 +191,62 @@ impl ParquetReadBudget {
         }
     }
 
-    pub(crate) async fn acquire(
-        &self,
-        projected_uncompressed_bytes: u64,
-    ) -> crate::Result<ParquetReadPermit> {
+    /// Wait for a row-group slot and the estimated bytes. The Parquet reader
+    /// acquires from its async tasks.
+    pub(crate) async fn acquire(&self, estimated_bytes: u64) -> crate::Result<ReadPermit> {
         let row_group = Arc::clone(&self.row_groups)
             .acquire_owned()
             .await
-            .map_err(|error| crate::Error::UnexpectedError {
-                message: "Parquet row-group read budget was closed".to_string(),
-                source: Some(Box::new(error)),
-            })?;
-        let requested = projected_uncompressed_bytes
-            .max(1)
-            .div_ceil(BYTE_PERMIT_UNIT)
-            .min(u64::from(self.byte_permits)) as u32;
-        if projected_uncompressed_bytes > self.max_inflight_bytes
+            .map_err(|_| Self::closed("row-group"))?;
+        let bytes = Arc::clone(&self.bytes)
+            .acquire_many_owned(self.byte_permits_for(estimated_bytes))
+            .await
+            .map_err(|_| Self::closed("byte"))?;
+        Ok(self.permit(row_group, bytes))
+    }
+
+    /// Take a row-group slot and the estimated bytes if both are free now. The
+    /// Mosaic reader refills its look-ahead without waiting.
+    pub(crate) fn try_acquire(&self, estimated_bytes: u64) -> Option<ReadPermit> {
+        let row_group = Arc::clone(&self.row_groups).try_acquire_owned().ok()?;
+        let bytes = Arc::clone(&self.bytes)
+            .try_acquire_many_owned(self.byte_permits_for(estimated_bytes))
+            .ok()?;
+        Some(self.permit(row_group, bytes))
+    }
+
+    /// Block until a row-group slot and the estimated bytes are free. The
+    /// Mosaic reader decodes on its own threads, so it waits here.
+    pub(crate) fn acquire_blocking(&self, estimated_bytes: u64) -> crate::Result<ReadPermit> {
+        futures::executor::block_on(self.acquire(estimated_bytes))
+    }
+
+    fn closed(resource: &str) -> crate::Error {
+        crate::Error::UnexpectedError {
+            message: format!("The {resource} read budget was closed"),
+            source: None,
+        }
+    }
+
+    fn byte_permits_for(&self, estimated_bytes: u64) -> u32 {
+        if estimated_bytes > self.max_inflight_bytes
             && !self.oversized_warning_logged.swap(true, Ordering::Relaxed)
         {
             log::warn!(
-                "Parquet row group projected size ({projected_uncompressed_bytes} bytes) exceeds \
-                 read.parquet.row-group.max-inflight-bytes ({} bytes); it will consume the entire \
-                 byte budget and may reduce row-group read parallelism; increase the option if \
-                 memory allows",
+                "A row group's estimated size ({estimated_bytes} bytes) exceeds {} ({} bytes); it \
+                 will consume the entire byte budget and may reduce row-group read parallelism; \
+                 increase the option if memory allows",
+                self.byte_option,
                 self.max_inflight_bytes
             );
         }
-        let bytes = Arc::clone(&self.bytes)
-            .acquire_many_owned(requested)
-            .await
-            .map_err(|error| crate::Error::UnexpectedError {
-                message: "Parquet byte read budget was closed".to_string(),
-                source: Some(Box::new(error)),
-            })?;
+        estimated_bytes
+            .max(1)
+            .div_ceil(self.byte_permit_unit)
+            .min(u64::from(self.byte_permits)) as u32
+    }
+
+    fn permit(&self, row_group: OwnedSemaphorePermit, bytes: OwnedSemaphorePermit) -> ReadPermit {
         let diagnostics = self.diagnostics_enabled().then(|| {
             let current = self
                 .diagnostics
@@ -203,15 +258,15 @@ impl ParquetReadBudget {
                 .fetch_max(current, Ordering::Relaxed);
             Arc::clone(&self.diagnostics)
         });
-        Ok(ParquetReadPermit {
+        ReadPermit {
             _row_group: row_group,
             _bytes: bytes,
             diagnostics,
-        })
+        }
     }
 }
 
-impl Default for ParquetReadBudget {
+impl Default for ReadBudget {
     fn default() -> Self {
         Self::new(DEFAULT_PARALLELISM, DEFAULT_MAX_INFLIGHT_BYTES)
             .expect("default Parquet read budget is valid")
@@ -219,13 +274,13 @@ impl Default for ParquetReadBudget {
 }
 
 #[derive(Debug)]
-pub(crate) struct ParquetReadPermit {
+pub(crate) struct ReadPermit {
     _row_group: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
-    diagnostics: Option<Arc<ParquetReadDiagnostics>>,
+    diagnostics: Option<Arc<ReadBudgetDiagnostics>>,
 }
 
-impl Drop for ParquetReadPermit {
+impl Drop for ReadPermit {
     fn drop(&mut self) {
         if let Some(diagnostics) = &self.diagnostics {
             diagnostics.current_inflight.fetch_sub(1, Ordering::Relaxed);
@@ -240,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_budget_blocks_until_permits_are_released() {
-        let budget = Arc::new(ParquetReadBudget::new(2, BYTE_PERMIT_UNIT).unwrap());
+        let budget = Arc::new(ReadBudget::new(2, BYTE_PERMIT_UNIT).unwrap());
         let first = budget.acquire(2 * BYTE_PERMIT_UNIT).await.unwrap();
 
         assert!(
@@ -259,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostics_aggregate_shared_row_group_reads() {
-        let budget = Arc::new(ParquetReadBudget::new(2, 2 * BYTE_PERMIT_UNIT).unwrap());
+        let budget = Arc::new(ReadBudget::new(2, 2 * BYTE_PERMIT_UNIT).unwrap());
         budget.enable_diagnostics();
         budget.record_projected_row_groups(&[300, 100, 200]);
 
@@ -267,7 +322,7 @@ mod tests {
         let second = budget.acquire(1).await.unwrap();
         assert_eq!(
             budget.diagnostics(),
-            ParquetReadDiagnosticsSnapshot {
+            ReadBudgetDiagnosticsSnapshot {
                 row_group_count: 3,
                 projected_bytes_min: 100,
                 projected_bytes_max: 300,
@@ -285,18 +340,17 @@ mod tests {
 
     #[test]
     fn rejects_invalid_limits() {
-        assert!(ParquetReadBudget::new(0, BYTE_PERMIT_UNIT).is_err());
-        assert!(ParquetReadBudget::new(1, 0).is_err());
+        assert!(ReadBudget::new(0, BYTE_PERMIT_UNIT).is_err());
+        assert!(ReadBudget::new(1, 0).is_err());
         assert!(
-            ParquetReadBudget::new(Semaphore::MAX_PERMITS.saturating_add(1), BYTE_PERMIT_UNIT)
-                .is_err()
+            ReadBudget::new(Semaphore::MAX_PERMITS.saturating_add(1), BYTE_PERMIT_UNIT).is_err()
         );
     }
 
     #[tokio::test]
     async fn oversized_row_group_consumes_the_budget() {
         let max_inflight_bytes = 8 * BYTE_PERMIT_UNIT + 1;
-        let budget = Arc::new(ParquetReadBudget::new(8, max_inflight_bytes).unwrap());
+        let budget = Arc::new(ReadBudget::new(8, max_inflight_bytes).unwrap());
         let first = budget.acquire(max_inflight_bytes).await.unwrap();
         assert!(!budget.oversized_warning_logged.load(Ordering::Relaxed));
         assert!(
@@ -314,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn small_row_groups_keep_exact_accounting() {
-        let budget = Arc::new(ParquetReadBudget::new(4, 4 * BYTE_PERMIT_UNIT).unwrap());
+        let budget = Arc::new(ReadBudget::new(4, 4 * BYTE_PERMIT_UNIT).unwrap());
         let mut permits = Vec::new();
         for _ in 0..4 {
             permits.push(budget.acquire(BYTE_PERMIT_UNIT).await.unwrap());
@@ -328,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn tiny_budget_still_admits_one_at_a_time() {
-        let budget = Arc::new(ParquetReadBudget::new(8, BYTE_PERMIT_UNIT).unwrap());
+        let budget = Arc::new(ReadBudget::new(8, BYTE_PERMIT_UNIT).unwrap());
         let first = budget.acquire(100 * BYTE_PERMIT_UNIT).await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(20), budget.acquire(1))
@@ -338,5 +392,50 @@ mod tests {
         );
         drop(first);
         budget.acquire(1).await.unwrap();
+    }
+
+    #[test]
+    fn try_acquire_is_cumulative_and_an_oversized_head_takes_the_whole_budget() {
+        // Byte-exact granularity, the way the Mosaic reader charges row groups.
+        let budget = ReadBudget::with_byte_granularity(8, 20, 1).unwrap();
+        let first = budget.try_acquire(10).unwrap();
+        let second = budget.try_acquire(10).unwrap();
+        assert!(budget.try_acquire(10).is_none());
+        drop(first);
+        let third = budget.try_acquire(10).unwrap();
+        drop((second, third));
+
+        let oversized = budget.try_acquire(21).unwrap();
+        assert!(budget.try_acquire(1).is_none());
+        drop(oversized);
+        assert!(budget.try_acquire(1).is_some());
+
+        let slot_limited = ReadBudget::with_byte_granularity(2, u64::MAX, 1).unwrap();
+        let first = slot_limited.try_acquire(1).unwrap();
+        let second = slot_limited.try_acquire(1).unwrap();
+        assert!(slot_limited.try_acquire(1).is_none());
+        drop((first, second));
+    }
+
+    #[test]
+    fn acquire_blocking_waits_off_the_runtime_until_a_permit_is_released() {
+        let budget = Arc::new(ReadBudget::with_byte_granularity(1, 10, 1).unwrap());
+        let held = budget.try_acquire(10).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn({
+            let budget = Arc::clone(&budget);
+            move || {
+                let permit = budget.acquire_blocking(10);
+                tx.send(()).ok();
+                permit
+            }
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "the budget must hold the waiter until a permit is released"
+        );
+        drop(held);
+        waiter.join().unwrap().unwrap();
     }
 }

@@ -93,10 +93,10 @@ const MANIFEST_SORT_ENABLED_OPTION: &str = "manifest-sort.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
-const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
+pub(crate) const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
     "read.parquet.row-group.max-inflight-bytes";
 const MOSAIC_READ_PREFETCH_ROW_GROUPS_OPTION: &str = "mosaic.read.prefetch-row-groups";
-const MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION: &str = "mosaic.read.prefetch-max-bytes";
+pub(crate) const MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION: &str = "mosaic.read.prefetch-max-bytes";
 pub(crate) const TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION: &str =
     "table-read.sequence-number.enabled";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";

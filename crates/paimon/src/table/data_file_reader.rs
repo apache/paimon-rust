@@ -19,7 +19,7 @@ use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::{create_format_reader_with_budget, MosaicPrefetchOptions};
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
-use crate::arrow::ParquetReadBudget;
+use crate::arrow::ReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::file_index::evaluator::evaluate_file_index;
 use crate::file_index::file_index_result::FileIndexResult;
@@ -120,7 +120,7 @@ pub(crate) struct DataFileReader {
     blob_as_descriptor: bool,
     blob_parallelism: usize,
     batch_size: Option<usize>,
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
@@ -175,7 +175,7 @@ impl DataFileReader {
 
     pub(crate) fn with_parquet_read_budget(
         mut self,
-        parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+        parquet_read_budget: Option<Arc<ReadBudget>>,
     ) -> Self {
         self.parquet_read_budget = parquet_read_budget;
         self

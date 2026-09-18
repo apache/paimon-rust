@@ -25,7 +25,7 @@ use super::data_file_reader::{
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
 use crate::arrow::format::MosaicPrefetchOptions;
-use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
+use crate::arrow::{build_target_arrow_schema, ReadBudget};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{
@@ -116,7 +116,7 @@ pub(crate) struct DataEvolutionReader {
     blob_read_limiter: BlobReadLimiter,
     blob_parallelism: usize,
     batch_size: Option<usize>,
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
@@ -216,7 +216,7 @@ impl DataEvolutionReader {
 
     pub(crate) fn with_parquet_read_budget(
         mut self,
-        parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+        parquet_read_budget: Option<Arc<ReadBudget>>,
     ) -> Self {
         self.parquet_read_budget = parquet_read_budget;
         self
@@ -1270,7 +1270,7 @@ fn open_source_stream(
     batch_size: Option<usize>,
     blob_as_descriptor: bool,
     blob_parallelism: usize,
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
     anchor_deletion_vector: Option<&DeletionVectorContext>,

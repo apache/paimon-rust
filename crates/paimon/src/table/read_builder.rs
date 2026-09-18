@@ -259,10 +259,7 @@ impl<'a> ReadBuilder<'a> {
 
     /// Inject a Parquet budget shared with sibling scan partitions.
     #[doc(hidden)]
-    pub fn with_parquet_read_budget(
-        &mut self,
-        budget: Arc<crate::arrow::ParquetReadBudget>,
-    ) -> &mut Self {
+    pub fn with_parquet_read_budget(&mut self, budget: Arc<crate::arrow::ReadBudget>) -> &mut Self {
         match &mut self.0 {
             ReadBuilderKind::Paimon(builder) => {
                 builder.with_parquet_read_budget(budget);
@@ -336,7 +333,7 @@ struct PaimonReadBuilder<'a> {
     /// Kept apart so neither setter discards the other's constraint.
     derived_row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
-    parquet_read_budget: Option<Arc<crate::arrow::ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<crate::arrow::ReadBudget>>,
     blob_parallelism: usize,
 }
 
@@ -485,10 +482,7 @@ impl<'a> PaimonReadBuilder<'a> {
         self
     }
 
-    fn with_parquet_read_budget(
-        &mut self,
-        budget: Arc<crate::arrow::ParquetReadBudget>,
-    ) -> &mut Self {
+    fn with_parquet_read_budget(&mut self, budget: Arc<crate::arrow::ReadBudget>) -> &mut Self {
         self.parquet_read_budget = Some(budget);
         self
     }
