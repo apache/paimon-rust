@@ -913,6 +913,9 @@ A partition the catalog holds at a custom location (the partition option `path`)
 read from that location yet: a scan that reaches it fails rather than reading the table
 directory in its place.
 
+No statement of this client writes rows into a Format Table. `INSERT`, `UPDATE`, `DELETE`
+and `MERGE INTO` are all refused, whether or not the catalog manages the partitions.
+
 ### SHOW PARTITIONS
 
 ```sql

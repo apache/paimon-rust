@@ -104,6 +104,18 @@ impl CopyOnWriteMergeWriter {
             });
         }
 
+        // A rewrite would write Paimon data files into the directories a Format Table reads, and
+        // the commit that should publish them has no snapshot to write.
+        if core_options.is_format_table() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "Rewriting the files of format table {} is not supported by the Rust client \
+                     yet, so UPDATE, DELETE and MERGE INTO are refused",
+                    table.identifier().full_name()
+                ),
+            });
+        }
+
         let partition_keys = schema.partition_keys();
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
         for col in &update_columns {
