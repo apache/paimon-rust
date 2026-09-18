@@ -19,7 +19,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 
 struct ProcessRuntime {
     pid: u32,
@@ -103,14 +103,18 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    if Handle::try_current().is_ok() {
-        let handle = global_runtime().handle().clone();
-        std::thread::spawn(move || handle.block_on(future))
+    if let Ok(handle) = Handle::try_current() {
+        if handle.runtime_flavor() == RuntimeFlavor::MultiThread {
+            return tokio::task::block_in_place(|| handle.block_on(future));
+        }
+
+        let fallback = global_runtime().handle().clone();
+        return std::thread::spawn(move || fallback.block_on(future))
             .join()
-            .expect(panic_error)
-    } else {
-        global_runtime().block_on(future)
+            .expect(panic_error);
     }
+
+    global_runtime().block_on(future)
 }
 
 #[cfg(test)]
@@ -153,5 +157,15 @@ mod tests {
             runtime().runtime_flavor(),
             tokio::runtime::RuntimeFlavor::CurrentThread
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_helper_keeps_the_active_runtime() {
+        let active_runtime = Handle::current().id();
+
+        let observed_runtime =
+            block_on_with_runtime(async { Handle::current().id() }, "blocking helper panicked");
+
+        assert_eq!(observed_runtime, active_runtime);
     }
 }
