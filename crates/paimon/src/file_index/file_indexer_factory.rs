@@ -59,11 +59,17 @@ impl BuiltinFileIndexer {
 pub(crate) struct FileIndexerFactory;
 
 impl FileIndexerFactory {
+    /// Whether this identifier has a built-in reader.
     pub(crate) fn is_supported(identifier: &str) -> bool {
         matches!(
             identifier,
             BITMAP_INDEX | BLOOM_FILTER_INDEX | RANGE_BITMAP_INDEX
         )
+    }
+
+    /// Reader support does not imply that the index can be generated.
+    pub(crate) fn is_write_supported(identifier: &str) -> bool {
+        matches!(identifier, BITMAP_INDEX | BLOOM_FILTER_INDEX)
     }
 
     pub(crate) fn create_writer(
@@ -128,6 +134,7 @@ mod tests {
     #[test]
     fn test_builtin_writers_track_empty_rows_consistently() {
         for identifier in [BITMAP_INDEX, BLOOM_FILTER_INDEX] {
+            assert!(FileIndexerFactory::is_write_supported(identifier));
             let mut writer =
                 FileIndexerFactory::create_writer(identifier, int_type(), &Options::new()).unwrap();
 
@@ -178,6 +185,8 @@ mod tests {
     #[test]
     fn test_unknown_identifier_is_rejected() {
         assert!(FileIndexerFactory::is_supported(RANGE_BITMAP_INDEX));
+        assert!(!FileIndexerFactory::is_write_supported(RANGE_BITMAP_INDEX));
+        assert!(!FileIndexerFactory::is_write_supported("unknown"));
         assert!(matches!(
             FileIndexerFactory::create_writer(RANGE_BITMAP_INDEX, int_type(), &Options::new()),
             Err(Error::Unsupported { .. })

@@ -1023,6 +1023,28 @@ listings and footer reads alike. Set it for the session:
 SET 'paimon.format-table.statistics.parallelism' = '16';
 ```
 
+### TRUNCATE TABLE
+
+```sql
+TRUNCATE TABLE paimon.my_db.events;
+TRUNCATE TABLE paimon.my_db.events PARTITION (dt = '2024-01-01');
+```
+
+Unlike the statements above, this works on any Format Table, including one that discovers
+its partitions from the directory layout. It deletes data files only: partition directories
+and catalog registrations stay. Every non-hidden file in a partition directory is deleted,
+whatever its extension, because other engines read those files too; staging entries such as
+`_temporary` are left alone.
+
+With catalog-managed partitions, the statement empties the registered partitions and
+reports zero statistics for each of them, replacing what the catalog holds. A directory
+nobody registered is not part of the table and is not touched. Without them, it empties the
+partition directories found below the table, and an unpartitioned table loses the data
+files in its table directory. `PARTITION (...)` must give values for a leading run of the
+partition keys, as in `ANALYZE TABLE`, but a column named without a value is rejected
+rather than read as every value. It is an error when no partition matches. A selected partition at a custom location fails the statement before
+anything is deleted.
+
 ## Procedures
 
 Use `CALL` to invoke built-in procedures. All procedures are under the `sys` namespace.
