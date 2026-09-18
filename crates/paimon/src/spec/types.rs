@@ -51,7 +51,7 @@ bitflags! {
 /// Data type for paimon table.
 ///
 /// Impl Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/types/DataType.java#L45>
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(untagged)]
 pub enum DataType {
     /// Data type of a boolean with a (possibly) three-valued logic of `TRUE`, `FALSE`, `UNKNOWN`.
@@ -109,7 +109,119 @@ pub enum DataType {
     Vector(VectorType),
 }
 
+/// Names of the constructed types that are encoded as JSON objects.
+const CONSTRUCTED_TYPE_NAMES: &[&str] = &["ARRAY", "MAP", "MULTISET", "ROW", "VECTOR"];
+
+/// The type keyword before any length, precision or nullability suffix.
+fn type_base_name(s: &str) -> &str {
+    s.split([' ', '(']).next().unwrap_or(s)
+}
+
+/// Nullability of a plain keyword type (`NAME` or `NAME NOT NULL`), `None` when `s` is neither.
+fn plain_type_nullable(s: &str, name: &str) -> Option<bool> {
+    let (base, rest) = s.split_once(' ').unwrap_or((s, ""));
+    if base != name {
+        None
+    } else if rest.is_empty() {
+        Some(true)
+    } else if rest.contains("NOT NULL") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+impl<'de> Deserialize<'de> for DataType {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DataTypeVisitor)
+    }
+}
+
+// Dispatches on the type name once; an untagged enum would try every variant in turn and
+// format an error for each rejected one, which dominated parsing of wide schemas.
+struct DataTypeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for DataTypeVisitor {
+    type Value = DataType;
+
+    fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a Paimon data type string or a constructed type object")
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<DataType, E>
+    where
+        E: serde::de::Error,
+    {
+        DataType::parse_atomic(value).map_err(E::custom)
+    }
+
+    fn visit_map<A>(self, map: A) -> std::result::Result<DataType, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let value =
+            serde_json::Value::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+        let name = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(|name| type_base_name(name).to_string())
+            .ok_or_else(|| serde::de::Error::missing_field("type"))?;
+        let parsed = match name.as_str() {
+            "ARRAY" => ArrayType::deserialize(value).map(DataType::Array),
+            "MAP" => MapType::deserialize(value).map(DataType::Map),
+            "MULTISET" => MultisetType::deserialize(value).map(DataType::Multiset),
+            "ROW" => RowType::deserialize(value).map(DataType::Row),
+            "VECTOR" => VectorType::deserialize(value).map(DataType::Vector),
+            other => {
+                return Err(serde::de::Error::unknown_variant(
+                    other,
+                    CONSTRUCTED_TYPE_NAMES,
+                ))
+            }
+        };
+        parsed.map_err(serde::de::Error::custom)
+    }
+}
+
 impl DataType {
+    /// Parses an atomic type string such as `DOUBLE`, `VARCHAR(10) NOT NULL` or
+    /// `TIMESTAMP(6) WITH LOCAL TIME ZONE`, choosing the parser by the leading keyword.
+    fn parse_atomic(s: &str) -> Result<DataType> {
+        let invalid = || Error::DataTypeInvalid {
+            message: format!("Invalid data type: {s}"),
+        };
+        let plain = |name: &str| plain_type_nullable(s, name).ok_or_else(invalid);
+        let parsed = match type_base_name(s) {
+            "BOOLEAN" => DataType::Boolean(BooleanType::with_nullable(plain("BOOLEAN")?)),
+            "TINYINT" => DataType::TinyInt(TinyIntType::with_nullable(plain("TINYINT")?)),
+            "SMALLINT" => DataType::SmallInt(SmallIntType::with_nullable(plain("SMALLINT")?)),
+            "INT" => DataType::Int(IntType::with_nullable(plain("INT")?)),
+            "BIGINT" => DataType::BigInt(BigIntType::with_nullable(plain("BIGINT")?)),
+            "FLOAT" => DataType::Float(FloatType::with_nullable(plain("FLOAT")?)),
+            "DOUBLE" => DataType::Double(DoubleType::with_nullable(plain("DOUBLE")?)),
+            "DATE" => DataType::Date(DateType::with_nullable(plain("DATE")?)),
+            "VARIANT" => DataType::Variant(VariantType::with_nullable(plain("VARIANT")?)),
+            "BLOB" => DataType::Blob(BlobType::with_nullable(plain("BLOB")?)),
+            "DECIMAL" => DataType::Decimal(DecimalType::from_str(s)?),
+            "BINARY" => DataType::Binary(BinaryType::from_str(s)?),
+            "BYTES" | "VARBINARY" => DataType::VarBinary(VarBinaryType::from_str(s)?),
+            "CHAR" => DataType::Char(CharType::from_str(s)?),
+            "STRING" | "VARCHAR" => DataType::VarChar(VarCharType::from_str(s)?),
+            "TIME" => DataType::Time(TimeType::from_str(s)?),
+            // PyPaimon persists the TIMESTAMP_LTZ(p) alias for this type.
+            "TIMESTAMP_LTZ" => DataType::LocalZonedTimestamp(LocalZonedTimestampType::from_str(s)?),
+            "TIMESTAMP" if s.contains("WITH LOCAL TIME ZONE") => {
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::from_str(s)?)
+            }
+            "TIMESTAMP" => DataType::Timestamp(TimestampType::from_str(s)?),
+            _ => return Err(invalid()),
+        };
+        Ok(parsed)
+    }
+
     /// Returns whether this type is or contains (recursively) a [`RowType`].
     /// Used to reject schema columns that would require field ID assignment for nested row fields,
     /// which is not yet implemented (see <https://github.com/apache/paimon/pull/1547>).
@@ -2772,5 +2884,119 @@ mod tests {
         );
         let arrow = crate::arrow::paimon_type_to_arrow(&dt).unwrap();
         assert!(matches!(arrow, arrow_schema::DataType::FixedSizeList(_, 4)));
+    }
+
+    #[test]
+    fn test_datatype_deserialize_atomic_by_keyword() {
+        for (json, nullable) in [
+            ("BOOLEAN", true),
+            ("BOOLEAN NOT NULL", false),
+            ("TINYINT", true),
+            ("SMALLINT NOT NULL", false),
+            ("INT", true),
+            ("BIGINT NOT NULL", false),
+            ("FLOAT", true),
+            ("DOUBLE NOT NULL", false),
+            ("DATE", true),
+            ("VARIANT NOT NULL", false),
+            ("BLOB", true),
+            ("DECIMAL(10, 2)", true),
+            ("DECIMAL(10, 2) NOT NULL", false),
+            ("BINARY(3)", true),
+            ("VARBINARY(3) NOT NULL", false),
+            ("BYTES", true),
+            ("CHAR(3)", true),
+            ("VARCHAR(3) NOT NULL", false),
+            ("STRING", true),
+            ("STRING NOT NULL", false),
+            ("TIME(3)", true),
+            ("TIMESTAMP(6)", true),
+            ("TIMESTAMP(6) NOT NULL", false),
+            ("TIMESTAMP(6) WITH LOCAL TIME ZONE", true),
+            ("TIMESTAMP(6) WITH LOCAL TIME ZONE NOT NULL", false),
+            ("TIMESTAMP_LTZ(3)", true),
+            ("TIMESTAMP_LTZ(3) NOT NULL", false),
+        ] {
+            let parsed: DataType = serde_json::from_str(&format!("\"{json}\"")).unwrap();
+            assert_eq!(parsed.is_nullable(), nullable, "{json}");
+            let roundtrip: DataType =
+                serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+            assert_eq!(roundtrip, parsed, "{json}");
+        }
+        assert!(matches!(
+            serde_json::from_str::<DataType>("\"STRING\"").unwrap(),
+            DataType::VarChar(_)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<DataType>("\"BYTES\"").unwrap(),
+            DataType::VarBinary(_)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<DataType>("\"TIMESTAMP(3) WITH LOCAL TIME ZONE\"").unwrap(),
+            DataType::LocalZonedTimestamp(_)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<DataType>("\"TIMESTAMP(3)\"").unwrap(),
+            DataType::Timestamp(_)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<DataType>("\"TIME(3)\"").unwrap(),
+            DataType::Time(_)
+        ));
+    }
+
+    #[test]
+    fn test_datatype_deserialize_constructed_by_name() {
+        let array: DataType =
+            serde_json::from_str(r#"{"type":"ARRAY NOT NULL","element":"INT"}"#).unwrap();
+        assert_eq!(
+            array,
+            DataType::Array(ArrayType::with_nullable(
+                false,
+                DataType::Int(IntType::new())
+            ))
+        );
+        let map: DataType =
+            serde_json::from_str(r#"{"type":"MAP","key":"STRING","value":"DOUBLE NOT NULL"}"#)
+                .unwrap();
+        assert!(matches!(map, DataType::Map(_)));
+        assert!(map.is_nullable());
+        let multiset: DataType =
+            serde_json::from_str(r#"{"type":"MULTISET","element":"BIGINT"}"#).unwrap();
+        assert!(matches!(multiset, DataType::Multiset(_)));
+        let row: DataType = serde_json::from_str(
+            r#"{"type":"ROW NOT NULL","fields":[{"id":0,"name":"a","type":"INT"},{"id":1,"name":"b","type":{"type":"ARRAY","element":"STRING"}}]}"#,
+        )
+        .unwrap();
+        match &row {
+            DataType::Row(row_type) => {
+                assert_eq!(row_type.fields().len(), 2);
+                assert!(matches!(
+                    row_type.fields()[1].data_type(),
+                    DataType::Array(_)
+                ));
+            }
+            other => panic!("expected ROW, got {other:?}"),
+        }
+        assert!(!row.is_nullable());
+        // Key order must not matter for the dispatch on "type".
+        let vector: DataType =
+            serde_json::from_str(r#"{"length":4,"element":"FLOAT","type":"VECTOR"}"#).unwrap();
+        assert_eq!(
+            vector,
+            DataType::Vector(
+                VectorType::try_new(true, 4, DataType::Float(FloatType::new())).unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn test_datatype_deserialize_rejects_unknown_shapes() {
+        assert!(serde_json::from_str::<DataType>("\"TUPLE\"").is_err());
+        assert!(serde_json::from_str::<DataType>("\"INT NULLABLE\"").is_err());
+        assert!(serde_json::from_str::<DataType>("\"VARCHAR\"").is_err());
+        assert!(serde_json::from_str::<DataType>(r#"{"type":"TUPLE","element":"INT"}"#).is_err());
+        assert!(serde_json::from_str::<DataType>(r#"{"element":"INT"}"#).is_err());
+        assert!(serde_json::from_str::<DataType>("7").is_err());
     }
 }
