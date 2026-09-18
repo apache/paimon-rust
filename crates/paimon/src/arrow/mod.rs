@@ -18,14 +18,14 @@
 pub(crate) mod filtering;
 pub(crate) mod format;
 pub(crate) mod nested_evolution;
-mod parquet_read_budget;
 pub(crate) mod partition;
+mod read_budget;
 pub(crate) mod residual;
 mod row_filter;
 pub(crate) mod schema_evolution;
 pub(crate) mod shredding;
 
-pub use parquet_read_budget::ParquetReadBudget;
+pub use read_budget::ReadBudget;
 pub use row_filter::{RowFilter, RowFilterContext, RowFilterFactory};
 
 use crate::spec::{

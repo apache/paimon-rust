@@ -93,8 +93,10 @@ const MANIFEST_SORT_ENABLED_OPTION: &str = "manifest-sort.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
-const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
+pub(crate) const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
     "read.parquet.row-group.max-inflight-bytes";
+const MOSAIC_READ_PREFETCH_ROW_GROUPS_OPTION: &str = "mosaic.read.prefetch-row-groups";
+pub(crate) const MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION: &str = "mosaic.read.prefetch-max-bytes";
 pub(crate) const TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION: &str =
     "table-read.sequence-number.enabled";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
@@ -142,6 +144,8 @@ const DEFAULT_WRITE_PARQUET_BUFFER_SIZE: i64 = 256 * 1024 * 1024;
 const DEFAULT_READ_BATCH_SIZE: usize = 1024;
 const DEFAULT_PARQUET_ROW_GROUP_PARALLELISM: usize = 8;
 const DEFAULT_PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES: i64 = 256 * 1024 * 1024;
+const DEFAULT_MOSAIC_READ_PREFETCH_ROW_GROUPS: usize = 8;
+const DEFAULT_MOSAIC_READ_PREFETCH_MAX_BYTES: i64 = 64 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
@@ -402,6 +406,41 @@ impl<'a> CoreOptions<'a> {
             });
         }
         Ok(value)
+    }
+
+    /// Mosaic row groups kept opening ahead of the consumer per file; `0` disables prefetch.
+    pub fn mosaic_read_prefetch_row_groups(&self) -> crate::Result<usize> {
+        let Some(raw) = self.options.get(MOSAIC_READ_PREFETCH_ROW_GROUPS_OPTION) else {
+            return Ok(DEFAULT_MOSAIC_READ_PREFETCH_ROW_GROUPS);
+        };
+        raw.parse::<usize>().map_err(|error| crate::Error::DataInvalid {
+            message: format!(
+                "Option '{MOSAIC_READ_PREFETCH_ROW_GROUPS_OPTION}' must be a non-negative integer, got: {raw}"
+            ),
+            source: Some(Box::new(error)),
+        })
+    }
+
+    /// Estimated decoded bytes a Mosaic file may hold in flight beyond the head row group.
+    pub fn mosaic_read_prefetch_max_bytes(&self) -> crate::Result<u64> {
+        let value = match self.options.get(MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION) {
+            Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION}' must be a valid memory size, got: {raw}"
+                ),
+                source: None,
+            })?,
+            None => DEFAULT_MOSAIC_READ_PREFETCH_MAX_BYTES,
+        };
+        u64::try_from(value)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION}' must be greater than 0, got: {value}"
+                ),
+                source: None,
+            })
     }
 
     /// Scan-wide projected uncompressed bytes for concurrent Parquet row groups.
@@ -1653,6 +1692,53 @@ mod tests {
             "false".to_string(),
         )]);
         assert!(!CoreOptions::new(&options).file_index_read_enabled());
+    }
+
+    #[test]
+    fn test_mosaic_read_prefetch_options() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.mosaic_read_prefetch_row_groups().unwrap(), 8);
+        assert_eq!(
+            core.mosaic_read_prefetch_max_bytes().unwrap(),
+            64 * 1024 * 1024
+        );
+
+        let options = HashMap::from([
+            (
+                MOSAIC_READ_PREFETCH_ROW_GROUPS_OPTION.to_string(),
+                "0".to_string(),
+            ),
+            (
+                MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION.to_string(),
+                "16 mb".to_string(),
+            ),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.mosaic_read_prefetch_row_groups().unwrap(), 0);
+        assert_eq!(
+            core.mosaic_read_prefetch_max_bytes().unwrap(),
+            16 * 1024 * 1024
+        );
+
+        for value in ["-1", "invalid", "1.5"] {
+            let options = HashMap::from([(
+                MOSAIC_READ_PREFETCH_ROW_GROUPS_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            assert!(CoreOptions::new(&options)
+                .mosaic_read_prefetch_row_groups()
+                .is_err());
+        }
+        for value in ["0", "-1", "invalid", "9223372036854775807 tb"] {
+            let options = HashMap::from([(
+                MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            assert!(CoreOptions::new(&options)
+                .mosaic_read_prefetch_max_bytes()
+                .is_err());
+        }
     }
 
     #[test]
