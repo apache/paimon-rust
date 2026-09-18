@@ -2282,13 +2282,13 @@ pub(in crate::table) mod tests {
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
-            ArrowField::new("payload", ArrowDataType::Binary, true),
+            ArrowField::new("payload", ArrowDataType::LargeBinary, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(arrow_array::BinaryArray::from(vec![
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![
                     Some(b"hello" as &[u8]),
                     None,
                     Some(b"world"),
@@ -2354,12 +2354,12 @@ pub(in crate::table) mod tests {
         );
         let batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("payload", ArrowDataType::Binary, true),
+                ArrowField::new("payload", ArrowDataType::LargeBinary, true),
                 ArrowField::new("a", ArrowDataType::Int32, false),
                 ArrowField::new("b", ArrowDataType::Int32, false),
             ])),
             vec![
-                Arc::new(arrow_array::BinaryArray::from(vec![Some(
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![Some(
                     b"payload" as &[u8],
                 )])),
                 Arc::new(Int32Array::from(vec![100])),

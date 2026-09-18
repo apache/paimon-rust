@@ -21,7 +21,7 @@
 
 mod common;
 
-use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch};
+use arrow_array::{Array, Int32Array, LargeBinaryArray, RecordBatch};
 use common::{assert_sql_error, create_sql_context, create_test_env, exec, string_value};
 use paimon::catalog::Identifier;
 use paimon::spec::{BlobDescriptor, BlobViewStruct};
@@ -58,7 +58,7 @@ fn collect_id_name_picture(batches: &[RecordBatch]) -> Vec<(i32, String, Option<
         let pics = batch
             .column(2)
             .as_any()
-            .downcast_ref::<BinaryArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap();
         for i in 0..batch.num_rows() {
             let pic = if pics.is_null(i) {
@@ -175,12 +175,12 @@ async fn test_blob_multiple_columns() {
     let p1 = batch
         .column(1)
         .as_any()
-        .downcast_ref::<BinaryArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .unwrap();
     let p2 = batch
         .column(2)
         .as_any()
-        .downcast_ref::<BinaryArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .unwrap();
     assert_eq!(ids.value(0), 1);
     assert_eq!(p1.value(0), b"AAA");
@@ -496,7 +496,7 @@ async fn test_blob_with_partition() {
         let pics = batch
             .column(1)
             .as_any()
-            .downcast_ref::<BinaryArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap();
         for i in 0..batch.num_rows() {
             rows.push((ids.value(i), pics.value(i).to_vec()));
@@ -1106,8 +1106,8 @@ async fn test_blob_view_preserves_branch_reference() {
     let value = batches[0]
         .column(0)
         .as_any()
-        .downcast_ref::<BinaryArray>()
-        .expect("binary blob view")
+        .downcast_ref::<LargeBinaryArray>()
+        .expect("large binary blob view")
         .value(0);
     let view = BlobViewStruct::deserialize(value).expect("deserialize blob view");
     assert_eq!(view.identifier().full_name(), "test_db.src$branch_b1");

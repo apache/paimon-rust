@@ -268,11 +268,11 @@ impl AppendDedicatedFormatFileWriter {
             let Some(col) = batch
                 .column(*column_index)
                 .as_any()
-                .downcast_ref::<arrow_array::BinaryArray>()
+                .downcast_ref::<arrow_array::LargeBinaryArray>()
             else {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
-                        "blob-view-field '{field_name}' requires a BinaryArray value column"
+                        "blob-view-field '{field_name}' requires a LargeBinaryArray value column"
                     ),
                     source: None,
                 });

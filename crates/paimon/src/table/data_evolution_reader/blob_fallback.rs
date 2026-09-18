@@ -331,7 +331,7 @@ mod tests {
     use super::*;
     use crate::io::FileRead;
     use crate::spec::{BlobType, DataType};
-    use arrow_array::{Array, BinaryArray};
+    use arrow_array::{Array, LargeBinaryArray};
     use bytes::Bytes;
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -457,7 +457,7 @@ mod tests {
         let values = batch
             .column(0)
             .as_any()
-            .downcast_ref::<BinaryArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap();
 
         assert_eq!(values.value(0), b"new-0");
