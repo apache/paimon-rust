@@ -1736,6 +1736,17 @@ impl SQLContext {
             }
             Err(e) => return Err(to_datafusion_error(e)),
         };
+        if CoreOptions::new(table.schema().options()).is_format_table() {
+            return crate::format_table_truncate::execute_truncate(
+                self,
+                catalog.as_ref(),
+                &identifier,
+                &table,
+                truncate.partitions.as_deref(),
+                enable_ident_normalization,
+            )
+            .await;
+        }
 
         let wb = table.new_write_builder();
         let commit = wb.try_new_commit().map_err(to_datafusion_error)?;
