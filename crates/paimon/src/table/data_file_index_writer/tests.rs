@@ -147,7 +147,7 @@ async fn evaluate(
 
 #[tokio::test]
 async fn test_file_index_append_commit_reload_and_rolling() {
-    for identifier in ["bitmap", "bloom-filter", "both"] {
+    for identifier in ["bitmap", "bloom-filter", "both", "range-bitmap", "all"] {
         for rolling in [false, true] {
             for threshold in ["0 B", "1 MB"] {
                 let mut options = vec![
@@ -155,14 +155,18 @@ async fn test_file_index_append_commit_reload_and_rolling() {
                     ("file-index.in-manifest-threshold", threshold),
                     ("file-index.read.enabled", "false"),
                 ];
-                if identifier != "bloom-filter" {
+                if matches!(identifier, "bitmap" | "both" | "all") {
                     options.push(("file-index.bitmap.columns", " id, value, id "));
                 }
-                if identifier != "bitmap" {
+                if matches!(identifier, "bloom-filter" | "both" | "all") {
                     options.extend([
                         ("file-index.bloom-filter.columns", "id"),
                         ("file-index.bloom-filter.id.items", "10"),
                     ]);
+                }
+                if matches!(identifier, "range-bitmap" | "all") {
+                    options.push(("file-index.range-bitmap.columns", "id, value"));
+                    options.push(("file-index.range-bitmap.id.chunk-size", "0b"));
                 }
                 let table = table(memory_io(), schema(&options)).await;
                 let builder = table.new_write_builder();
@@ -303,9 +307,9 @@ async fn test_file_index_skips_unsupported_identifier_groups() {
         let mut options = vec![
             ("file-index.bsi.columns", "id"),
             ("file-index.bsi.id.version", "upstream-specific"),
-            ("file-index.range-bitmap.columns", "missing[nested]"),
+            ("file-index.future-index.columns", "missing[nested]"),
             (
-                "file-index.range-bitmap.missing[nested].version",
+                "file-index.future-index.missing[nested].version",
                 "upstream-specific",
             ),
             ("file-index.unknown.columns", ""),
@@ -357,19 +361,19 @@ async fn test_file_index_skips_unsupported_identifier_groups() {
 }
 
 #[test]
-fn test_file_index_read_only_index_does_not_enable_generation() {
+fn test_file_index_range_bitmap_enables_generation() {
     assert!(FileIndexerFactory::is_supported("range-bitmap"));
     let schema = schema(&[("file-index.range-bitmap.columns", "id")]);
     assert!(FileIndexOptions::parse(schema.options(), schema.fields())
         .unwrap()
-        .is_none());
+        .is_some());
 }
 
 #[test]
 fn test_file_index_skips_unsupported_options_without_columns() {
     let schema = schema(&[
         ("file-index.bsi.id.version", "upstream-specific"),
-        ("file-index.range-bitmap.version", "upstream-specific"),
+        ("file-index.future-index.version", "upstream-specific"),
     ]);
     assert!(FileIndexOptions::parse(schema.options(), schema.fields())
         .unwrap()
@@ -430,6 +434,17 @@ async fn test_file_index_threshold_boundary_and_abort() {
 #[tokio::test]
 async fn test_file_index_invalid_configuration_fails_before_writing() {
     let cases = vec![
+        vec![("file-index.range-bitmap.columns", "missing")],
+        vec![("file-index.range-bitmap.columns", "id[nested]")],
+        vec![("file-index.range-bitmap.id.chunk-size", "0b")],
+        vec![
+            ("file-index.range-bitmap.columns", "id"),
+            ("file-index.range-bitmap.id.chunk-size", "2gb"),
+        ],
+        vec![
+            ("file-index.range-bitmap.columns", "id"),
+            ("file-index.range-bitmap.id.version", "1"),
+        ],
         vec![("file-index.bitmap.columns", "missing")],
         vec![("file-index.bitmap.version", "2")],
         vec![("file-index.bitmap.columns", "")],
@@ -487,33 +502,35 @@ async fn test_file_index_invalid_configuration_fails_before_writing() {
 
 #[tokio::test]
 async fn test_file_index_rejects_unsupported_table_write_modes() {
-    for schema in [
-        Schema::builder()
-            .column("id", crate::spec::DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .option("bucket", "1")
-            .option("file-index.bitmap.columns", "id")
-            .build()
-            .unwrap(),
-        Schema::builder()
-            .column("id", crate::spec::DataType::Int(IntType::new()))
-            .option("data-evolution.enabled", "true")
-            .option("row-tracking.enabled", "true")
-            .option("file-index.bitmap.columns", "id")
-            .build()
-            .unwrap(),
-    ] {
-        let table = table(memory_io(), schema).await;
-        let error = match table.new_write_builder().new_write() {
-            Ok(_) => panic!("unsupported write mode must reject index generation"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("FileIndex generation supports ordinary append writes only"),
-            "{error}"
-        );
+    for identifier in ["bitmap", "range-bitmap"] {
+        for schema in [
+            Schema::builder()
+                .column("id", crate::spec::DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option(format!("file-index.{identifier}.columns"), "id")
+                .build()
+                .unwrap(),
+            Schema::builder()
+                .column("id", crate::spec::DataType::Int(IntType::new()))
+                .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
+                .option(format!("file-index.{identifier}.columns"), "id")
+                .build()
+                .unwrap(),
+        ] {
+            let table = table(memory_io(), schema).await;
+            let error = match table.new_write_builder().new_write() {
+                Ok(_) => panic!("unsupported write mode must reject index generation"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("FileIndex generation supports ordinary append writes only"),
+                "{error}"
+            );
+        }
     }
 }
 
@@ -526,6 +543,7 @@ async fn test_file_index_uses_partition_bucket_file_row_order() {
         .option("bucket", "2")
         .option("bucket-key", "id")
         .option("file-index.bitmap.columns", "id,value")
+        .option("file-index.range-bitmap.columns", "id,value")
         .option("file-index.in-manifest-threshold", "0 B")
         .build()
         .unwrap();
@@ -568,7 +586,7 @@ async fn test_file_index_uses_partition_bucket_file_row_order() {
                 .try_collect()
                 .await
                 .unwrap();
-            let expected = batches
+            let expected: roaring::RoaringBitmap = batches
                 .iter()
                 .flat_map(|batch| {
                     batch
@@ -581,19 +599,17 @@ async fn test_file_index_uses_partition_bucket_file_row_order() {
                 .enumerate()
                 .filter_map(|(row, id)| (id == Some(3)).then_some(row as u32))
                 .collect();
-            let actual = evaluate(
-                &table,
-                split.bucket_path(),
-                file,
-                PredicateBuilder::new(table.schema().fields())
-                    .equal("id", Datum::Int(3))
-                    .unwrap(),
-            )
-            .await;
-            match actual {
-                FileIndexResult::Selection(rows) => assert_eq!(rows, expected),
-                FileIndexResult::Skip => assert!(roaring::RoaringBitmap::is_empty(&expected)),
-                FileIndexResult::Remain => panic!("bitmap equality must select physical rows"),
+            let predicates = PredicateBuilder::new(table.schema().fields());
+            for predicate in [
+                predicates.equal("id", Datum::Int(3)).unwrap(),
+                predicates.greater_than("id", Datum::Int(2)).unwrap(),
+            ] {
+                let actual = evaluate(&table, split.bucket_path(), file, predicate).await;
+                match actual {
+                    FileIndexResult::Selection(rows) => assert_eq!(rows, expected),
+                    FileIndexResult::Skip => assert!(expected.is_empty()),
+                    FileIndexResult::Remain => panic!("index predicate must select physical rows"),
+                }
             }
         }
     }
@@ -667,7 +683,7 @@ impl StorageProbe {
 impl FileIOProvider for StorageProbe {
     async fn create(&self, path: &str) -> Result<(Operator, String)> {
         let relative = path.strip_prefix("memory:/").unwrap().to_string();
-        if path.ends_with(".parquet") {
+        if path.ends_with(".parquet") || path.ends_with(".row") {
             self.data_accesses.fetch_add(1, Ordering::SeqCst);
         }
         if path.ends_with(".index")
@@ -723,6 +739,83 @@ async fn test_file_index_prunes_without_opening_data_file() {
         assert_eq!(storage.data_accesses.load(Ordering::SeqCst), 0);
         assert!(query(&table, false, Some(predicate)).await.is_empty());
         assert!(storage.data_accesses.load(Ordering::SeqCst) > 0);
+    }
+}
+
+#[tokio::test]
+async fn test_range_bitmap_append_range_pruning() {
+    for format in ["parquet", "row"] {
+        for threshold in ["0 B", "1 MB"] {
+            let storage = StorageProbe::new(0);
+            let table = table(
+                storage.io(),
+                schema(&[
+                    ("file.format", format),
+                    ("file-index.range-bitmap.columns", "id"),
+                    ("file-index.range-bitmap.id.chunk-size", "0b"),
+                    ("file-index.in-manifest-threshold", threshold),
+                ]),
+            )
+            .await;
+            let builder = table.new_write_builder();
+            let mut writer = builder.new_write().unwrap();
+            writer
+                .write_arrow_batch(&batch(vec![Some(9), None, Some(1), Some(9)], vec![None; 4]))
+                .await
+                .unwrap();
+            builder
+                .new_commit()
+                .commit(writer.prepare_commit().await.unwrap())
+                .await
+                .unwrap();
+            let predicates = PredicateBuilder::new(table.schema().fields());
+            let missing = predicates
+                .between("id", Datum::Int(3), Datum::Int(7))
+                .unwrap();
+            let mut scan = table.new_read_builder();
+            scan.with_filter(missing.clone());
+            let (_, trace) = scan.new_scan().plan_with_trace().await.unwrap();
+            assert_eq!(trace.final_files, 1, "statistics must retain the file");
+            storage.data_accesses.store(0, Ordering::SeqCst);
+            assert!(query(&table, true, Some(missing.clone())).await.is_empty());
+            assert_eq!(storage.data_accesses.load(Ordering::SeqCst), 0);
+            assert!(query(&table, false, Some(missing)).await.is_empty());
+            assert!(storage.data_accesses.load(Ordering::SeqCst) > 0);
+
+            let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+            let split = &plan.splits()[0];
+            let file = &split.data_files()[0];
+            assert_eq!(file.embedded_index.is_some(), threshold != "0 B");
+            assert_eq!(file.extra_files.len(), usize::from(threshold == "0 B"));
+            for (predicate, positions, expected) in [
+                (
+                    predicates.less_than("id", Datum::Int(5)).unwrap(),
+                    vec![2],
+                    vec![(Some(1), None)],
+                ),
+                (
+                    predicates.greater_or_equal("id", Datum::Int(9)).unwrap(),
+                    vec![0, 3],
+                    vec![(Some(9), None); 2],
+                ),
+                (
+                    predicates.is_null("id").unwrap(),
+                    vec![1],
+                    vec![(None, None)],
+                ),
+            ] {
+                assert_eq!(
+                    evaluate(&table, split.bucket_path(), file, predicate.clone()).await,
+                    FileIndexResult::Selection(positions.into_iter().collect())
+                );
+                for enabled in [false, true] {
+                    assert_eq!(
+                        query(&table, enabled, Some(predicate.clone())).await,
+                        expected
+                    );
+                }
+            }
+        }
     }
 }
 
