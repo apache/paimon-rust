@@ -17,7 +17,9 @@
 
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
-use crate::arrow::format::{create_format_reader_with_budget, MosaicPrefetchOptions};
+use crate::arrow::format::{
+    create_format_reader_with_options, FormatReaderOptions, MosaicPrefetchOptions,
+};
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::arrow::ReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
@@ -470,12 +472,14 @@ impl DataFileReader {
             .flatten();
         let file_io = self.file_io.clone();
         let split = split.clone();
-        let blob_as_descriptor = self.blob_as_descriptor;
-        let blob_parallelism = self.blob_parallelism;
         let batch_size = self.batch_size;
-        let parquet_read_budget = self.parquet_read_budget.clone();
-        let parquet_page_index_enabled = self.parquet_page_index_enabled;
-        let mosaic_prefetch = self.mosaic_prefetch;
+        let format_reader_options = FormatReaderOptions {
+            blob_as_descriptor: self.blob_as_descriptor,
+            blob_parallelism: self.blob_parallelism,
+            parquet_read_budget: self.parquet_read_budget.clone(),
+            parquet_page_index_enabled: self.parquet_page_index_enabled,
+            mosaic_prefetch: self.mosaic_prefetch,
+        };
         let read_timing = self.read_timing.clone();
 
         let target_schema = build_target_arrow_schema(&read_type)?;
@@ -530,14 +534,10 @@ impl DataFileReader {
         Ok(try_stream! {
             let schema_open_start = read_timing.as_ref().map(|_| Instant::now());
             let path_to_read = split.data_file_path(&file_meta);
-            let format_reader = create_format_reader_with_budget(
+            let format_reader = create_format_reader_with_options(
                 &path_to_read,
-                blob_as_descriptor,
                 &format_read_fields,
-                parquet_read_budget,
-                parquet_page_index_enabled,
-                blob_parallelism,
-                mosaic_prefetch,
+                format_reader_options,
             )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let open_start = read_timing.as_ref().map(|_| Instant::now());
@@ -744,11 +744,13 @@ impl DataFileReader {
         let predicates = self.predicates.clone();
         let file_io = self.file_io.clone();
         let split = split.clone();
-        let blob_as_descriptor = self.blob_as_descriptor;
-        let blob_parallelism = self.blob_parallelism;
-        let parquet_read_budget = self.parquet_read_budget.clone();
-        let parquet_page_index_enabled = self.parquet_page_index_enabled;
-        let mosaic_prefetch = self.mosaic_prefetch;
+        let format_reader_options = FormatReaderOptions {
+            blob_as_descriptor: self.blob_as_descriptor,
+            blob_parallelism: self.blob_parallelism,
+            parquet_read_budget: self.parquet_read_budget.clone(),
+            parquet_page_index_enabled: self.parquet_page_index_enabled,
+            mosaic_prefetch: self.mosaic_prefetch,
+        };
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
@@ -808,14 +810,10 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let path_to_read = split.data_file_path(&file_meta);
-            let format_reader = create_format_reader_with_budget(
+            let format_reader = create_format_reader_with_options(
                 &path_to_read,
-                blob_as_descriptor,
                 &format_read_fields,
-                parquet_read_budget,
-                parquet_page_index_enabled,
-                blob_parallelism,
-                mosaic_prefetch,
+                format_reader_options,
             )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let file_reader = input_file.reader().await?;
