@@ -458,6 +458,7 @@ impl<'a> PaimonTableRead<'a> {
         .with_batch_size(Some(core_options.read_batch_size()?))
         .with_blob_parallelism(self.blob_parallelism)
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
+        .with_parquet_page_index_enabled(core_options.parquet_filter_column_index_enabled()?)
         .with_mosaic_prefetch(configured_mosaic_prefetch(self.table)?);
         let raw_stream = reader.read(&data_splits)?;
 
@@ -941,6 +942,7 @@ impl<'a> PaimonTableRead<'a> {
         .with_batch_size(Some(core_options.read_batch_size()?))
         .with_blob_parallelism(self.blob_parallelism)
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
+        .with_parquet_page_index_enabled(core_options.parquet_filter_column_index_enabled()?)
         .with_mosaic_prefetch(configured_mosaic_prefetch(self.table)?)
         .with_read_timing(self.data_file_read_timing.clone());
         reader.read(data_splits)
@@ -965,6 +967,7 @@ impl<'a> PaimonTableRead<'a> {
         .with_batch_size(Some(core_options.read_batch_size()?))
         .with_blob_parallelism(self.blob_parallelism)
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
+        .with_parquet_page_index_enabled(core_options.parquet_filter_column_index_enabled()?)
         .with_mosaic_prefetch(configured_mosaic_prefetch(self.table)?)
         .with_read_timing(self.data_file_read_timing.clone());
         // The engine decoder filter is safe only on the plain append/raw path.

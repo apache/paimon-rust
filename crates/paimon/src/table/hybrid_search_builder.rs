@@ -492,6 +492,12 @@ impl<'a> HybridSearchBuilder<'a> {
             self.table.schema().fields().to_vec(),
             self.table.schema().fields().to_vec(),
             Vec::new(),
+        )
+        .with_parquet_page_index_enabled(
+            self.table
+                .schema()
+                .core_options()
+                .parquet_filter_column_index_enabled()?,
         );
 
         let mut batches: Vec<RecordBatch> = Vec::new();
@@ -634,6 +640,12 @@ impl<'a> HybridSearchBuilder<'a> {
             table.schema().fields().to_vec(),
             table.schema().fields().to_vec(),
             Vec::new(),
+        )
+        .with_parquet_page_index_enabled(
+            table
+                .schema()
+                .core_options()
+                .parquet_filter_column_index_enabled()?,
         );
         let read = PrimaryKeyFullTextRead::new(
             table.file_io().clone(),

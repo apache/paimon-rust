@@ -196,6 +196,7 @@ pub(crate) fn create_format_reader(
         blob_as_descriptor,
         read_fields,
         None,
+        true,
         blob::DEFAULT_BLOB_READ_PARALLELISM,
         MosaicPrefetchOptions::default(),
     )
@@ -208,15 +209,19 @@ pub(crate) fn create_format_reader_with_budget(
     blob_as_descriptor: bool,
     read_fields: &[DataField],
     parquet_read_budget: Option<Arc<ReadBudget>>,
+    parquet_page_index_enabled: bool,
     blob_parallelism: usize,
     mosaic_prefetch: MosaicPrefetchOptions,
 ) -> crate::Result<Box<dyn FormatFileReader>> {
     let lower = path.to_ascii_lowercase();
     let reader: Box<dyn FormatFileReader> = if lower.ends_with(".parquet") {
-        Box::new(match parquet_read_budget {
-            Some(read_budget) => parquet::ParquetFormatReader::with_read_budget(read_budget),
-            None => parquet::ParquetFormatReader::default(),
-        })
+        Box::new(
+            match parquet_read_budget {
+                Some(read_budget) => parquet::ParquetFormatReader::with_read_budget(read_budget),
+                None => parquet::ParquetFormatReader::default(),
+            }
+            .with_page_index_enabled(parquet_page_index_enabled),
+        )
     } else if lower.ends_with(".blob") {
         Box::new(
             blob::BlobFormatReader::new(path.to_string(), blob_as_descriptor)

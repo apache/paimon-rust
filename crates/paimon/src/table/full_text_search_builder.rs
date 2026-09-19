@@ -273,6 +273,12 @@ impl<'a> FullTextSearchBuilder<'a> {
             self.table.schema().fields().to_vec(),
             self.table.schema().fields().to_vec(),
             Vec::new(),
+        )
+        .with_parquet_page_index_enabled(
+            self.table
+                .schema()
+                .core_options()
+                .parquet_filter_column_index_enabled()?,
         );
         let read = PrimaryKeyFullTextRead::new(
             self.table.file_io().clone(),

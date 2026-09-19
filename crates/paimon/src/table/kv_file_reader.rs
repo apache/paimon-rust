@@ -526,6 +526,8 @@ impl KeyValueFileReader {
         let file_io = self.file_io;
         let config = self.config;
         let table_schema_id = config.table_schema_id;
+        let parquet_page_index_enabled =
+            CoreOptions::new(&config.table_options).parquet_filter_column_index_enabled()?;
         let pushdown_predicates = self.pushdown_predicates;
         #[cfg(test)]
         let input_batch_sizes = self.input_batch_sizes;
@@ -592,6 +594,7 @@ impl KeyValueFileReader {
                         )
                         .with_batch_size(Some(config.read_batch_size))
                         .with_parquet_read_budget(group_parquet_read_budget.clone())
+                        .with_parquet_page_index_enabled(parquet_page_index_enabled)
                         .with_mosaic_prefetch(config.mosaic_prefetch);
                         let run_schema_manager = config.schema_manager.clone();
                         let run_file_io = file_io.clone();

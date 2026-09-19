@@ -117,6 +117,7 @@ pub(crate) struct DataEvolutionReader {
     blob_parallelism: usize,
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
+    parquet_page_index_enabled: bool,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
@@ -197,6 +198,7 @@ impl DataEvolutionReader {
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             batch_size: None,
             parquet_read_budget: None,
+            parquet_page_index_enabled: true,
             mosaic_prefetch: MosaicPrefetchOptions::default(),
             read_timing: None,
         })
@@ -219,6 +221,11 @@ impl DataEvolutionReader {
         parquet_read_budget: Option<Arc<ReadBudget>>,
     ) -> Self {
         self.parquet_read_budget = parquet_read_budget;
+        self
+    }
+
+    pub(crate) fn with_parquet_page_index_enabled(mut self, enabled: bool) -> Self {
+        self.parquet_page_index_enabled = enabled;
         self
     }
 
@@ -275,6 +282,7 @@ impl DataEvolutionReader {
             .with_batch_size(self.batch_size)
             .with_blob_parallelism(self.blob_parallelism)
             .with_parquet_read_budget(self.parquet_read_budget.clone())
+            .with_parquet_page_index_enabled(self.parquet_page_index_enabled)
             .with_mosaic_prefetch(self.mosaic_prefetch)
             .with_read_timing(self.read_timing.clone());
 
@@ -576,6 +584,7 @@ impl DataEvolutionReader {
         )?
         .with_batch_size(self.batch_size)
         .with_parquet_read_budget(self.parquet_read_budget.clone())
+        .with_parquet_page_index_enabled(self.parquet_page_index_enabled)
         .with_mosaic_prefetch(self.mosaic_prefetch);
         let mut stream = prescan.read(splits)?;
         let mut view_structs = HashSet::new();
@@ -641,6 +650,7 @@ impl DataEvolutionReader {
         let blob_parallelism = self.blob_parallelism;
         let batch_size = self.batch_size;
         let parquet_read_budget = self.parquet_read_budget.clone();
+        let parquet_page_index_enabled = self.parquet_page_index_enabled;
         let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
         let anchor_deletion_vector = anchor_deletion_vector.clone();
@@ -730,6 +740,7 @@ impl DataEvolutionReader {
                             blob_as_descriptor,
                             blob_parallelism,
                             source_parquet_read_budget.clone(),
+                            parquet_page_index_enabled,
                             mosaic_prefetch,
                             read_timing.clone(),
                             anchor_deletion_vector.as_ref(),
@@ -1271,6 +1282,7 @@ fn open_source_stream(
     blob_as_descriptor: bool,
     blob_parallelism: usize,
     parquet_read_budget: Option<Arc<ReadBudget>>,
+    parquet_page_index_enabled: bool,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
@@ -1341,6 +1353,7 @@ fn open_source_stream(
     .with_blob_as_descriptor(blob_as_descriptor)
     .with_blob_parallelism(blob_parallelism)
     .with_parquet_read_budget(parquet_read_budget)
+    .with_parquet_page_index_enabled(parquet_page_index_enabled)
     .with_mosaic_prefetch(mosaic_prefetch)
     .with_read_timing(read_timing);
 

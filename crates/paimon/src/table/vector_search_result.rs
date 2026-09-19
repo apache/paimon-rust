@@ -201,7 +201,8 @@ impl SearchResultReadBuilder<'_> {
 
     pub async fn read(&self) -> crate::Result<ArrowRecordBatchStream> {
         let table = &self.result.table;
-        CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
+        let core_options = CoreOptions::new(table.schema().options());
+        core_options.ensure_read_authorized()?;
         match &self.result.hits {
             SearchHits::DataEvolution {
                 vector_column,
@@ -220,6 +221,9 @@ impl SearchResultReadBuilder<'_> {
                     table.schema().fields().to_vec(),
                     read_type,
                     Vec::new(),
+                )
+                .with_parquet_page_index_enabled(
+                    core_options.parquet_filter_column_index_enabled()?,
                 );
                 materialize_positions(positions, splits, &reader).await
             }

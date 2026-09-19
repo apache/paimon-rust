@@ -121,6 +121,7 @@ pub(crate) struct DataFileReader {
     blob_parallelism: usize,
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
+    parquet_page_index_enabled: bool,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
@@ -147,6 +148,7 @@ impl DataFileReader {
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             batch_size: None,
             parquet_read_budget: None,
+            parquet_page_index_enabled: true,
             mosaic_prefetch: MosaicPrefetchOptions::default(),
             read_timing: None,
         }
@@ -178,6 +180,11 @@ impl DataFileReader {
         parquet_read_budget: Option<Arc<ReadBudget>>,
     ) -> Self {
         self.parquet_read_budget = parquet_read_budget;
+        self
+    }
+
+    pub(crate) fn with_parquet_page_index_enabled(mut self, enabled: bool) -> Self {
+        self.parquet_page_index_enabled = enabled;
         self
     }
 
@@ -467,6 +474,7 @@ impl DataFileReader {
         let blob_parallelism = self.blob_parallelism;
         let batch_size = self.batch_size;
         let parquet_read_budget = self.parquet_read_budget.clone();
+        let parquet_page_index_enabled = self.parquet_page_index_enabled;
         let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
 
@@ -527,6 +535,7 @@ impl DataFileReader {
                 blob_as_descriptor,
                 &format_read_fields,
                 parquet_read_budget,
+                parquet_page_index_enabled,
                 blob_parallelism,
                 mosaic_prefetch,
             )?;
@@ -738,6 +747,7 @@ impl DataFileReader {
         let blob_as_descriptor = self.blob_as_descriptor;
         let blob_parallelism = self.blob_parallelism;
         let parquet_read_budget = self.parquet_read_budget.clone();
+        let parquet_page_index_enabled = self.parquet_page_index_enabled;
         let mosaic_prefetch = self.mosaic_prefetch;
 
         let target_schema = build_target_arrow_schema(&read_type)?;
@@ -803,6 +813,7 @@ impl DataFileReader {
                 blob_as_descriptor,
                 &format_read_fields,
                 parquet_read_budget,
+                parquet_page_index_enabled,
                 blob_parallelism,
                 mosaic_prefetch,
             )?;
