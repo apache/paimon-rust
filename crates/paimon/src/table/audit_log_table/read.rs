@@ -44,7 +44,9 @@ pub struct AuditLogRead<'a> {
 
 impl<'a> AuditLogRead<'a> {
     pub fn new(read: TableRead<'a>) -> crate::Result<Self> {
-        read.ensure_query_auth_allowed()?;
+        // Query-auth is decided per split in `to_arrow`; only the type is known here.
+        crate::spec::CoreOptions::new(read.table().schema().options())
+            .ensure_type_paimon_served(&read.table().identifier().full_name())?;
         match read.0 {
             TableReadKind::Paimon(read) => Ok(Self { read }),
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
@@ -55,6 +57,10 @@ impl<'a> AuditLogRead<'a> {
 
     /// Reads splits planned by an audit scan, retaining winning retract rows.
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        // The primary-key path below builds its readers directly, so the
+        // split-carried decision is taken here rather than in `TableRead`.
+        self.read
+            .ensure_authorized_by_splits(&self.read.table.schema.core_options(), data_splits)?;
         let output_read_type = self.read.read_type.clone();
         if output_read_type
             .iter()

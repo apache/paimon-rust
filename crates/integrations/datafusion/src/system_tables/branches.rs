@@ -74,6 +74,7 @@ impl TableProvider for BranchesTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        super::ensure_scan_authorized(&self.table).await?;
         let table = self.table.clone();
         let (names, create_times) =
             crate::runtime::await_with_runtime(async move { collect_branches(&table).await })
