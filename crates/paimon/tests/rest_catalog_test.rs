@@ -2686,6 +2686,40 @@ async fn test_query_auth_refuses_a_stale_handle() {
 }
 
 #[tokio::test]
+async fn test_query_auth_refuses_other_columns_under_the_same_schema_id() {
+    // Same id, other fields: the id alone does not say what the server rules on.
+    let g = guarded("edited", &["id"]).await;
+    g.ctx
+        .server
+        .set_table_schema_id("default", "edited", schema_of(&["id", "extra"], GUARDED), 0);
+
+    assert_drifted(
+        plan_err(
+            &g.table,
+            "a handle whose columns differ from the server's must be refused",
+        )
+        .await,
+        "serves other columns",
+    );
+}
+
+#[tokio::test]
+async fn test_query_auth_refuses_a_schema_replaced_copy() {
+    // A caller can restore a dropped column under the current schema id; the
+    // copy is no longer the handle the catalog loaded.
+    let g = guarded("replaced", &["id"]).await;
+    let forged = g
+        .table
+        .copy_with_resolved_schema(
+            paimon::spec::TableSchema::new(0, &schema_of(&["id", "secret"], GUARDED)),
+            "main",
+        )
+        .unwrap();
+
+    assert_refused(plan_err(&forged, "a schema-replaced copy must not plan").await);
+}
+
+#[tokio::test]
 async fn test_query_auth_refuses_a_recreated_table() {
     let g = guarded("recreated", &["id"]).await;
     g.ctx

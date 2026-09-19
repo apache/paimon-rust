@@ -1416,7 +1416,7 @@ impl<'a> PaimonTableScan<'a> {
         }
         if let Some(rest_env) = self.table.rest_env() {
             rest_env
-                .current_table_checked(self.table.schema().id())
+                .current_table_checked(self.table.schema().id(), self.table.schema().fields())
                 .await?;
         }
         super::query_auth::reject_unauthorized_stats(

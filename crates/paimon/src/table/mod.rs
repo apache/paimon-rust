@@ -464,7 +464,7 @@ impl Table {
 
         // Naming a system column here would fail the server's column check.
         let response = rest_env
-            .table_query_auth(&self.branch, self.schema.id(), None)
+            .table_query_auth(&self.branch, self.schema.id(), self.schema.fields(), None)
             .await?;
         Ok(Some(std::sync::Arc::new(query_auth::QueryAuthGrant::new(
             response, session,
@@ -625,6 +625,8 @@ impl Table {
             branch_reference: self.branch_reference || branch != DEFAULT_MAIN_BRANCH,
             time_traveled: false,
             travel_snapshot: None,
+            // Not the schema the catalog loaded, so not a handle it authorizes.
+            query_auth_session: None,
             ..self.clone()
         })
     }

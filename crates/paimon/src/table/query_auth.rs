@@ -249,6 +249,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_schema_replaced_copy_loses_its_session() {
+        let table = crate::table::rest_query_auth_table().await;
+        assert!(table.query_auth_session().is_some());
+        let copy = table
+            .copy_with_resolved_schema(table.schema().clone(), "main")
+            .unwrap();
+        assert!(copy.query_auth_session().is_none());
+    }
+
+    #[tokio::test]
     async fn test_a_grant_does_not_cross_into_a_travelled_or_branch_view() {
         let table = crate::table::rest_query_auth_table().await;
         let grant = super::QueryAuthGrant::new(

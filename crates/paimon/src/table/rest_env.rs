@@ -88,14 +88,15 @@ impl RESTEnv {
         &self,
         branch: &str,
         schema_id: i64,
+        fields: &[crate::spec::DataField],
         select: Option<Vec<String>>,
     ) -> Result<crate::api::AuthTableQueryResponse> {
-        self.current_table_checked(schema_id).await?;
+        self.current_table_checked(schema_id, fields).await?;
         let response = self
             .api
             .auth_table_query(&self.branch_identifier(branch)?, select)
             .await?;
-        self.current_table_checked(schema_id).await?;
+        self.current_table_checked(schema_id, fields).await?;
         Ok(response)
     }
 
@@ -135,7 +136,11 @@ impl RESTEnv {
     /// Refused unless the name still resolves to the loaded table — a missing
     /// identity too, which checks nothing. Asserts nothing on its own: an
     /// ordinary table must not inherit a freshness restriction.
-    pub(crate) async fn current_table_checked(&self, schema_id: i64) -> Result<GetTableResponse> {
+    pub(crate) async fn current_table_checked(
+        &self,
+        schema_id: i64,
+        fields: &[crate::spec::DataField],
+    ) -> Result<GetTableResponse> {
         let response = self.api.get_table(&self.identifier).await?;
         let name = self.identifier.full_name();
         let same = |what: &str, loaded: String, now: Option<String>| match now {
@@ -155,6 +160,24 @@ impl RESTEnv {
             schema_id.to_string(),
             response.schema_id.map(|id| id.to_string()),
         )?;
+        // An id is not the schema: a handle can carry other fields under the
+        // same id, so the columns the server rules on are compared too.
+        let key =
+            |f: &crate::spec::DataField| (f.id(), f.name().to_string(), f.data_type().clone());
+        let served: Vec<_> = response
+            .schema
+            .as_ref()
+            .map(|schema| schema.fields().iter().map(key).collect())
+            .unwrap_or_default();
+        if served != fields.iter().map(key).collect::<Vec<_>>() {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "table '{name}' serves other columns than this handle carries under schema \
+                     {schema_id}; re-load the table before reading it"
+                ),
+                source: None,
+            });
+        }
         Ok(response)
     }
 
