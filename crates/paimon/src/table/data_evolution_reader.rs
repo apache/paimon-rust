@@ -17,13 +17,15 @@
 
 mod blob_fallback;
 
-use super::blob_resolver::{BlobReadLimiter, BLOB_DESCRIPTOR_READ_CONCURRENCY};
+use super::blob_resolver::BlobReadLimiter;
 use super::data_file_reader::{
     append_null_row_id_column, attach_row_id, expand_selected_row_ids, insert_column_at,
     DataFileReadTiming, DataFileReader,
 };
+use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
-use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
+use crate::arrow::format::MosaicPrefetchOptions;
+use crate::arrow::{build_target_arrow_schema, ReadBudget};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{
@@ -34,7 +36,7 @@ use crate::table::schema_manager::SchemaManager;
 use crate::table::source::any_range_overlaps_file;
 use crate::table::{ArrowRecordBatchStream, RESTEnv, RowRange};
 use crate::{DataSplit, Error};
-use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch};
+use arrow_array::{Array, Int64Array, LargeBinaryArray, RecordBatch};
 use async_stream::try_stream;
 use futures::{StreamExt, TryStreamExt};
 use roaring::RoaringBitmap;
@@ -112,8 +114,10 @@ pub(crate) struct DataEvolutionReader {
     blob_view_resolve_enabled: bool,
     blob_view_rest_env: Option<RESTEnv>,
     blob_read_limiter: BlobReadLimiter,
+    blob_parallelism: usize,
     batch_size: Option<usize>,
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
+    mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
 
@@ -190,8 +194,10 @@ impl DataEvolutionReader {
             blob_view_resolve_enabled,
             blob_view_rest_env,
             blob_read_limiter: BlobReadLimiter::new(),
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             batch_size: None,
             parquet_read_budget: None,
+            mosaic_prefetch: MosaicPrefetchOptions::default(),
             read_timing: None,
         })
     }
@@ -201,11 +207,23 @@ impl DataEvolutionReader {
         self
     }
 
+    pub(crate) fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
+        debug_assert!(blob_parallelism > 0);
+        self.blob_read_limiter = BlobReadLimiter::with_parallelism(blob_parallelism);
+        self.blob_parallelism = blob_parallelism;
+        self
+    }
+
     pub(crate) fn with_parquet_read_budget(
         mut self,
-        parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+        parquet_read_budget: Option<Arc<ReadBudget>>,
     ) -> Self {
         self.parquet_read_budget = parquet_read_budget;
+        self
+    }
+
+    pub(crate) fn with_mosaic_prefetch(mut self, mosaic_prefetch: MosaicPrefetchOptions) -> Self {
+        self.mosaic_prefetch = mosaic_prefetch;
         self
     }
 
@@ -255,7 +273,9 @@ impl DataEvolutionReader {
                 },
             )
             .with_batch_size(self.batch_size)
+            .with_blob_parallelism(self.blob_parallelism)
             .with_parquet_read_budget(self.parquet_read_budget.clone())
+            .with_mosaic_prefetch(self.mosaic_prefetch)
             .with_read_timing(self.read_timing.clone());
 
             for split in splits {
@@ -555,7 +575,8 @@ impl DataEvolutionReader {
             None,
         )?
         .with_batch_size(self.batch_size)
-        .with_parquet_read_budget(self.parquet_read_budget.clone());
+        .with_parquet_read_budget(self.parquet_read_budget.clone())
+        .with_mosaic_prefetch(self.mosaic_prefetch);
         let mut stream = prescan.read(splits)?;
         let mut view_structs = HashSet::new();
         while let Some(batch) = stream.next().await {
@@ -617,8 +638,10 @@ impl DataEvolutionReader {
         let table_fields = self.table_fields.clone();
         let blob_descriptor_fields = self.blob_descriptor_fields.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
+        let blob_parallelism = self.blob_parallelism;
         let batch_size = self.batch_size;
         let parquet_read_budget = self.parquet_read_budget.clone();
+        let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
         let anchor_deletion_vector = anchor_deletion_vector.clone();
         // Batch size for column-merge output. Matches the default Parquet reader batch size.
@@ -705,7 +728,9 @@ impl DataEvolutionReader {
                             table_fields.clone(),
                             batch_size,
                             blob_as_descriptor,
+                            blob_parallelism,
                             source_parquet_read_budget.clone(),
+                            mosaic_prefetch,
                             read_timing.clone(),
                             anchor_deletion_vector.as_ref(),
                         )
@@ -870,22 +895,28 @@ async fn resolve_descriptor_columns(
     file_io: &FileIO,
     limiter: &BlobReadLimiter,
 ) -> crate::Result<RecordBatch> {
-    resolve_descriptor_columns_with(batch, blob_descriptor_fields, |column| {
+    resolve_descriptor_columns_with(
+        batch,
+        blob_descriptor_fields,
+        limiter.parallelism(),
+        |column| {
         let file_io = file_io.clone();
         let limiter = limiter.clone();
         async move { super::blob_resolver::resolve_blob_column(&column, &file_io, limiter).await }
-    })
+        },
+    )
     .await
 }
 
 async fn resolve_descriptor_columns_with<F, Fut>(
     batch: RecordBatch,
     blob_descriptor_fields: &HashSet<String>,
+    blob_parallelism: usize,
     resolve: F,
 ) -> crate::Result<RecordBatch>
 where
-    F: Fn(BinaryArray) -> Fut,
-    Fut: Future<Output = crate::Result<BinaryArray>>,
+    F: Fn(LargeBinaryArray) -> Fut,
+    Fut: Future<Output = crate::Result<LargeBinaryArray>>,
 {
     let schema = batch.schema();
     let mut columns = batch.columns().to_vec();
@@ -896,7 +927,7 @@ where
             if let Some(bin_col) = batch
                 .column(idx)
                 .as_any()
-                .downcast_ref::<arrow_array::BinaryArray>()
+                .downcast_ref::<LargeBinaryArray>()
             {
                 descriptor_columns.push((idx, bin_col.clone()));
             }
@@ -908,14 +939,15 @@ where
     }
 
     let resolve = &resolve;
-    let resolved_columns: Vec<(usize, BinaryArray)> = futures::stream::iter(descriptor_columns)
-        .map(move |(idx, column)| {
-            let future = resolve(column);
-            async move { future.await.map(|resolved| (idx, resolved)) }
-        })
-        .buffer_unordered(BLOB_DESCRIPTOR_READ_CONCURRENCY)
-        .try_collect()
-        .await?;
+    let resolved_columns: Vec<(usize, LargeBinaryArray)> =
+        futures::stream::iter(descriptor_columns)
+            .map(move |(idx, column)| {
+                let future = resolve(column);
+                async move { future.await.map(|resolved| (idx, resolved)) }
+            })
+            .buffer_unordered(blob_parallelism)
+            .try_collect()
+            .await?;
     for (idx, resolved) in resolved_columns {
         columns[idx] = Arc::new(resolved);
     }
@@ -970,7 +1002,7 @@ fn collect_blob_view_structs(
         if !blob_view_fields.contains(field.name()) {
             continue;
         }
-        let col = binary_column(batch, idx, field.name())?;
+        let col = large_binary_column(batch, idx, field.name())?;
         for row in 0..col.len() {
             if col.is_null(row) {
                 continue;
@@ -1006,8 +1038,8 @@ fn replace_blob_view_columns(
             continue;
         }
 
-        let col = binary_column(&batch, idx, field.name())?;
-        let mut builder = arrow_array::builder::BinaryBuilder::new();
+        let col = large_binary_column(&batch, idx, field.name())?;
+        let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
         for row in 0..col.len() {
             if col.is_null(row) {
                 builder.append_null();
@@ -1044,17 +1076,17 @@ fn replace_blob_view_columns(
     })
 }
 
-fn binary_column<'a>(
+fn large_binary_column<'a>(
     batch: &'a RecordBatch,
     idx: usize,
     field_name: &str,
-) -> crate::Result<&'a BinaryArray> {
+) -> crate::Result<&'a LargeBinaryArray> {
     batch
         .column(idx)
         .as_any()
-        .downcast_ref::<BinaryArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .ok_or_else(|| Error::DataInvalid {
-            message: format!("blob-view-field '{field_name}' requires a BinaryArray column"),
+            message: format!("blob-view-field '{field_name}' requires a LargeBinaryArray column"),
             source: None,
         })
 }
@@ -1123,10 +1155,10 @@ impl BlobViewLookup {
                 let blob_col = batch
                     .column(0)
                     .as_any()
-                    .downcast_ref::<BinaryArray>()
+                    .downcast_ref::<LargeBinaryArray>()
                     .ok_or_else(|| Error::DataInvalid {
                         message: format!(
-                            "Upstream blob field '{}' did not read as BinaryArray",
+                            "Upstream blob field '{}' did not read as LargeBinaryArray",
                             field.name()
                         ),
                         source: None,
@@ -1237,7 +1269,9 @@ fn open_source_stream(
     table_fields: Vec<DataField>,
     batch_size: Option<usize>,
     blob_as_descriptor: bool,
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    blob_parallelism: usize,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
+    mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
 ) -> crate::Result<ArrowRecordBatchStream> {
@@ -1272,6 +1306,7 @@ fn open_source_stream(
                     batch_size,
                     file_io,
                     blob_as_descriptor,
+                    blob_parallelism,
                     anchor_deletion_vector.cloned(),
                 );
             }
@@ -1287,6 +1322,7 @@ fn open_source_stream(
                 batch_size,
                 file_io,
                 blob_as_descriptor,
+                blob_parallelism,
                 anchor_deletion_vector.cloned(),
             );
         }
@@ -1303,7 +1339,9 @@ fn open_source_stream(
     )
     .with_batch_size(batch_size)
     .with_blob_as_descriptor(blob_as_descriptor)
+    .with_blob_parallelism(blob_parallelism)
     .with_parquet_read_budget(parquet_read_budget)
+    .with_mosaic_prefetch(mosaic_prefetch)
     .with_read_timing(read_timing);
 
     match source {
@@ -2626,8 +2664,8 @@ mod tests {
         CommitMessage, DataSplitBuilder, DeletionFile, Table, TableCommit, TableRead,
     };
     use arrow_array::{
-        Array, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, ListArray,
-        RecordBatch,
+        Array, FixedSizeListArray, Float32Array, Int32Array, Int64Array, LargeBinaryArray,
+        ListArray, RecordBatch,
     };
     use bytes::Bytes;
     use futures::TryStreamExt;
@@ -2669,16 +2707,16 @@ mod tests {
     #[tokio::test]
     async fn test_descriptor_columns_resolve_concurrently_and_preserve_order() {
         let schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("blob_a", arrow_schema::DataType::Binary, true),
+            arrow_schema::Field::new("blob_a", arrow_schema::DataType::LargeBinary, true),
             arrow_schema::Field::new("id", arrow_schema::DataType::Int32, false),
-            arrow_schema::Field::new("blob_b", arrow_schema::DataType::Binary, true),
+            arrow_schema::Field::new("blob_b", arrow_schema::DataType::LargeBinary, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(BinaryArray::from(vec![Some(b"a".as_slice())])),
+                Arc::new(LargeBinaryArray::from(vec![Some(b"a".as_slice())])),
                 Arc::new(Int32Array::from(vec![7])),
-                Arc::new(BinaryArray::from(vec![Some(b"b".as_slice())])),
+                Arc::new(LargeBinaryArray::from(vec![Some(b"b".as_slice())])),
             ],
         )
         .unwrap();
@@ -2686,7 +2724,7 @@ mod tests {
         let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let resolved = resolve_descriptor_columns_with(batch, &fields, |column| {
+        let resolved = resolve_descriptor_columns_with(batch, &fields, 2, |column| {
             let in_flight = in_flight.clone();
             let max_in_flight = max_in_flight.clone();
             async move {
@@ -2707,7 +2745,7 @@ mod tests {
             resolved
                 .column(0)
                 .as_any()
-                .downcast_ref::<BinaryArray>()
+                .downcast_ref::<LargeBinaryArray>()
                 .unwrap()
                 .value(0),
             b"a"
@@ -2716,7 +2754,7 @@ mod tests {
             resolved
                 .column(2)
                 .as_any()
-                .downcast_ref::<BinaryArray>()
+                .downcast_ref::<LargeBinaryArray>()
                 .unwrap()
                 .value(0),
             b"b"
@@ -6507,7 +6545,7 @@ mod tests {
                 let array = batch
                     .column(idx)
                     .as_any()
-                    .downcast_ref::<BinaryArray>()
+                    .downcast_ref::<LargeBinaryArray>()
                     .unwrap();
                 (0..array.len())
                     .map(|row| (!array.is_null(row)).then(|| array.value(row).to_vec()))
@@ -6535,7 +6573,7 @@ mod tests {
                             return None;
                         }
                         let values = array.value(row);
-                        let values = values.as_any().downcast_ref::<BinaryArray>().unwrap();
+                        let values = values.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
                         Some(
                             (0..values.len())
                                 .map(|idx| {

@@ -21,11 +21,11 @@ use crate::io::{FileRead, FileWrite};
 use crate::spec::{BlobDescriptor, DataField, DataType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
-use arrow_array::builder::{BinaryBuilder, ListBuilder};
+use arrow_array::builder::{LargeBinaryBuilder, ListBuilder};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, MapArray, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray, Time32MillisecondArray,
+    Int32Array, Int64Array, Int8Array, LargeBinaryArray, MapArray, RecordBatch, RecordBatchOptions,
+    StringArray, StructArray, Time32MillisecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::DataType as ArrowDataType;
@@ -39,6 +39,7 @@ use std::sync::Arc;
 pub(crate) struct BlobFormatReader {
     descriptor_mode: bool,
     file_path: String,
+    blob_parallelism: usize,
 }
 
 impl BlobFormatReader {
@@ -46,7 +47,14 @@ impl BlobFormatReader {
         Self {
             descriptor_mode,
             file_path,
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
         }
+    }
+
+    pub(crate) fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
+        debug_assert!(blob_parallelism > 0);
+        self.blob_parallelism = blob_parallelism;
+        self
     }
 }
 
@@ -55,21 +63,42 @@ pub(crate) struct IndexedBlobReader {
     index: BlobFileIndex,
     descriptor_mode: bool,
     file_path: String,
+    blob_parallelism: usize,
 }
 
 impl IndexedBlobReader {
+    #[cfg(test)]
     pub(crate) async fn open(
         reader: Box<dyn FileRead>,
         file_size: u64,
         file_path: String,
         descriptor_mode: bool,
     ) -> crate::Result<Self> {
+        Self::open_with_parallelism(
+            reader,
+            file_size,
+            file_path,
+            descriptor_mode,
+            DEFAULT_BLOB_READ_PARALLELISM,
+        )
+        .await
+    }
+
+    pub(crate) async fn open_with_parallelism(
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        file_path: String,
+        descriptor_mode: bool,
+        blob_parallelism: usize,
+    ) -> crate::Result<Self> {
+        debug_assert!(blob_parallelism > 0);
         let index = BlobFileIndex::load(reader.as_ref(), file_size).await?;
         Ok(Self {
             reader,
             index,
             descriptor_mode,
             file_path,
+            blob_parallelism,
         })
     }
 
@@ -85,7 +114,7 @@ impl IndexedBlobReader {
             build_descriptor_values(&self.index, positions, &self.file_path)
         } else {
             let planned_reads = plan_blob_reads(&self.index, positions)?;
-            fetch_blob_values(self.reader.as_ref(), planned_reads).await
+            fetch_blob_values(self.reader.as_ref(), planned_reads, self.blob_parallelism).await
         }
     }
 
@@ -99,6 +128,7 @@ impl IndexedBlobReader {
             planned_reads,
             &self.file_path,
             self.descriptor_mode,
+            self.blob_parallelism,
         )
         .await
     }
@@ -115,6 +145,7 @@ impl IndexedBlobReader {
             &self.file_path,
             self.descriptor_mode,
             key_type,
+            self.blob_parallelism,
         )
         .await
     }
@@ -137,7 +168,7 @@ const BLOB_INLINE_HEADER_SIZE: u64 = 4;
 const BLOB_TRAILER_SIZE: u64 = 12;
 const BLOB_ENTRY_OVERHEAD: u64 = BLOB_INLINE_HEADER_SIZE + BLOB_TRAILER_SIZE;
 const DEFAULT_BATCH_SIZE: usize = 128;
-const BLOB_READ_CONCURRENCY: usize = 8;
+pub(crate) const DEFAULT_BLOB_READ_PARALLELISM: usize = 8;
 const BLOB_ARRAY_MAGIC_NUMBER: i32 = 1094861634;
 const BLOB_ARRAY_VERSION: u8 = 1;
 const BLOB_ARRAY_HEADER_SIZE: u64 = 9;
@@ -178,11 +209,12 @@ impl FormatFileReader for BlobFormatReader {
 
         let target_schema = build_target_arrow_schema(read_fields)?;
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
-        let blob_reader = IndexedBlobReader::open(
+        let blob_reader = IndexedBlobReader::open_with_parallelism(
             reader,
             file_size,
             self.file_path.clone(),
             self.descriptor_mode,
+            self.blob_parallelism,
         )
         .await?;
         let mut selection = RowSelectionCursor::new(blob_reader.num_rows(), row_selection)?;
@@ -290,7 +322,7 @@ pub(crate) fn build_blob_batch(
     target_schema: &Arc<arrow_schema::Schema>,
     values: Vec<BlobReadValue>,
 ) -> crate::Result<RecordBatch> {
-    let mut builder = BinaryBuilder::new();
+    let mut builder = LargeBinaryBuilder::new();
     for value in values {
         match value {
             BlobReadValue::Value(bytes) => builder.append_value(bytes.as_ref()),
@@ -320,13 +352,13 @@ pub(crate) fn build_blob_array_batch(
         other => {
             return Err(Error::UnexpectedError {
                 message: format!(
-                    "Expected Array<Blob> to map to Arrow List<Binary>, got {other:?}"
+                    "Expected Array<Blob> to map to Arrow List<LargeBinary>, got {other:?}"
                 ),
                 source: None,
             });
         }
     };
-    let mut builder = ListBuilder::new(BinaryBuilder::new()).with_field(element_field);
+    let mut builder = ListBuilder::new(LargeBinaryBuilder::new()).with_field(element_field);
     for value in values {
         match value {
             BlobReadValue::Array(elements) => {
@@ -375,7 +407,6 @@ pub(crate) fn build_blob_map_batch(
 
     let mut keys = Vec::new();
     let mut blobs = Vec::new();
-    let mut blob_data_length = 0u64;
     let mut offsets = vec![0i32];
     let mut validity = Vec::with_capacity(values.len());
     for value in values {
@@ -398,13 +429,6 @@ pub(crate) fn build_blob_map_batch(
                         source: None,
                     })?;
                 for (key, blob) in entries {
-                    if let Some(blob) = &blob {
-                        blob_data_length = checked_arrow_binary_data_length(
-                            blob_data_length,
-                            blob.len() as u64,
-                            "MAP<X, BLOB> batch value data",
-                        )?;
-                    }
                     keys.push(key);
                     blobs.push(blob);
                 }
@@ -424,7 +448,7 @@ pub(crate) fn build_blob_map_batch(
     }
 
     let key_array = decode_blob_map_keys(&keys, key_type)?;
-    let value_array = Arc::new(BinaryArray::from_iter(
+    let value_array = Arc::new(LargeBinaryArray::from_iter(
         blobs.iter().map(|value| value.as_deref()),
     )) as ArrayRef;
     let entries = StructArray::try_new(entry_fields.clone(), vec![key_array, value_array], None)
@@ -653,6 +677,7 @@ fn plan_blob_reads(
 async fn fetch_blob_values(
     reader: &dyn FileRead,
     planned_reads: Vec<PlannedBlobRead>,
+    blob_parallelism: usize,
 ) -> crate::Result<Vec<BlobReadValue>> {
     futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
         match planned_read {
@@ -663,7 +688,7 @@ async fn fetch_blob_values(
                 .map(BlobReadValue::Value),
         }
     }))
-    .buffered(BLOB_READ_CONCURRENCY)
+    .buffered(blob_parallelism)
     .try_collect()
     .await
 }
@@ -759,6 +784,7 @@ async fn fetch_blob_array_values(
     planned_reads: Vec<PlannedBlobArrayRead>,
     file_path: &str,
     descriptor_mode: bool,
+    blob_parallelism: usize,
 ) -> crate::Result<Vec<BlobReadValue>> {
     futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
         match planned_read {
@@ -774,7 +800,7 @@ async fn fetch_blob_array_values(
             }
         }
     }))
-    .buffered(BLOB_READ_CONCURRENCY)
+    .buffered(blob_parallelism)
     .try_collect()
     .await
 }
@@ -892,19 +918,6 @@ fn parse_blob_array_layout(
     })
 }
 
-fn validate_inline_blob_array_data_length(layout: &BlobArrayLayout) -> crate::Result<()> {
-    let data_length = layout.element_data_range.end - layout.element_data_range.start;
-    if data_length > i32::MAX as u64 {
-        return Err(Error::DataInvalid {
-            message: format!(
-                "ARRAY<BLOB> inline element data is too large for Arrow Binary: {data_length} bytes"
-            ),
-            source: None,
-        });
-    }
-    Ok(())
-}
-
 fn decode_blob_array_metadata(
     layout: BlobArrayLayout,
     index_bytes: &[u8],
@@ -986,8 +999,7 @@ async fn read_inline_blob_array_entry(
     reader: &dyn FileRead,
     payload_range: Range<u64>,
 ) -> crate::Result<BlobReadValue> {
-    let preflight_layout = read_blob_array_layout(reader, payload_range.clone()).await?;
-    validate_inline_blob_array_data_length(&preflight_layout)?;
+    let _preflight_layout = read_blob_array_layout(reader, payload_range.clone()).await?;
 
     let payload = read_blob_entry(reader, blob_entry_range(&payload_range)).await?;
     let payload_length = validate_blob_array_payload_range(&payload_range)?;
@@ -1008,7 +1020,6 @@ async fn read_inline_blob_array_entry(
         &payload[..BLOB_ARRAY_HEADER_SIZE as usize],
         &payload[index_length_position..],
     )?;
-    validate_inline_blob_array_data_length(&layout)?;
     let index_start = (layout.element_index_range.start - payload_range.start) as usize;
     let index_end = (layout.element_index_range.end - payload_range.start) as usize;
     let metadata = decode_blob_array_metadata(layout, &payload[index_start..index_end])?;
@@ -1076,6 +1087,7 @@ async fn fetch_blob_map_values(
     file_path: &str,
     descriptor_mode: bool,
     key_type: &DataType,
+    blob_parallelism: usize,
 ) -> crate::Result<Vec<BlobReadValue>> {
     futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
         match planned_read {
@@ -1087,7 +1099,7 @@ async fn fetch_blob_map_values(
             }
         }
     }))
-    .buffered(BLOB_READ_CONCURRENCY)
+    .buffered(blob_parallelism)
     .try_collect()
     .await
 }
@@ -1253,9 +1265,6 @@ async fn read_blob_map_entry(
                 .to_string(),
             source: None,
         });
-    }
-    if !descriptor_mode {
-        checked_arrow_binary_data_length(0, total_value_length, "MAP<X, BLOB> inline value data")?;
     }
     if blob_map_key_uses_binary_offsets(key_type) {
         checked_arrow_binary_data_length(0, key_data_length, "MAP<X, BLOB> key data")?;
@@ -1754,9 +1763,9 @@ impl FormatFileWriter for BlobFormatWriter {
         let col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<arrow_array::BinaryArray>()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
             .ok_or_else(|| Error::DataInvalid {
-                message: "BlobFormatWriter expects a single Binary column".to_string(),
+                message: "BlobFormatWriter expects a single LargeBinary column".to_string(),
                 source: None,
             })?;
 
@@ -2208,20 +2217,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_inline_blob_map_reader_rejects_oversized_data_before_entry_read() {
+    async fn test_inline_blob_map_reader_accepts_large_binary_value_data() {
         let value_length = i32::MAX as u64 + 1;
-        let (reader, payload_range) = sparse_blob_map_entry(&[1], &[value_length as i64]);
+        let (reader, payload_range) = sparse_blob_map_entry(&[0], &[value_length as i64]);
         let key_type = DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap());
 
-        let error = read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type)
+        let _error = read_blob_map_entry(&reader, payload_range.clone(), "", false, &key_type)
             .await
             .unwrap_err();
 
         assert!(
-            !reader.ranges().contains(&blob_entry_range(&payload_range)),
-            "oversized inline MAP<X, BLOB> must be rejected before reading the complete entry"
+            reader.ranges().contains(&blob_entry_range(&payload_range)),
+            "LargeBinary MAP values must not be rejected by the i32 Arrow Binary limit"
         );
-        assert_data_invalid(error, "too large");
     }
 
     #[tokio::test]
@@ -2267,10 +2275,13 @@ mod tests {
     }
 
     #[test]
-    fn test_blob_map_batch_rejects_oversized_binary_data() {
-        let error =
-            checked_arrow_binary_data_length(i32::MAX as u64, 1, "MAP<X, BLOB> batch value data")
-                .unwrap_err();
+    fn test_blob_map_batch_rejects_oversized_binary_key_data() {
+        let error = checked_arrow_binary_data_length(
+            i32::MAX as u64,
+            1,
+            "MAP<BINARY, BLOB> batch key data",
+        )
+        .unwrap_err();
 
         assert_data_invalid(error, "too large");
     }
@@ -2299,7 +2310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_inline_blob_array_reader_rejects_oversized_data_before_entry_read() {
+    async fn test_inline_blob_array_reader_accepts_large_binary_element_data() {
         let element_data_length = i32::MAX as u64 + 1;
         let element_index = encode_delta_varints_write(&[element_data_length as i64]);
         let payload_length =
@@ -2320,15 +2331,14 @@ mod tests {
             ),
         ]);
 
-        let error = read_inline_blob_array_entry(&reader, payload_range.clone())
+        let _error = read_inline_blob_array_entry(&reader, payload_range.clone())
             .await
             .unwrap_err();
 
         assert!(
-            !reader.ranges().contains(&blob_entry_range(&payload_range)),
-            "oversized inline ARRAY<BLOB> must be rejected before reading the complete entry"
+            reader.ranges().contains(&blob_entry_range(&payload_range)),
+            "LargeBinary ARRAY elements must not be rejected by the i32 Arrow Binary limit"
         );
-        assert_data_invalid(error, "too large");
     }
 
     #[tokio::test]
@@ -2446,7 +2456,48 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(reader.max_in_flight() > 1);
-        assert!(reader.max_in_flight() <= BLOB_READ_CONCURRENCY);
+        assert!(reader.max_in_flight() <= DEFAULT_BLOB_READ_PARALLELISM);
+    }
+
+    #[tokio::test]
+    async fn test_blob_reader_honors_configured_parallelism() {
+        let payloads = (0_u8..12).map(|value| vec![value]).collect::<Vec<_>>();
+        let rows = payloads
+            .iter()
+            .map(|payload| Some(payload.as_slice()))
+            .collect::<Vec<_>>();
+        let file_bytes = blob_test_utils::build_blob_file_bytes(&rows);
+        let read_fields = vec![DataField::new(
+            0,
+            "payload".to_string(),
+            DataType::Blob(BlobType::new()),
+        )];
+        let reader = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
+
+        let batches = BlobFormatReader::new(String::new(), false)
+            .with_blob_parallelism(2)
+            .read_batch_stream(
+                Box::new(reader.clone()),
+                file_bytes.len() as u64,
+                &read_fields,
+                None,
+                Some(12),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            collect_binary_values(&batches[0]),
+            (0_u8..12)
+                .map(|value| Some(vec![value]))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(reader.max_in_flight(), 2);
     }
 
     #[tokio::test]
@@ -3050,7 +3101,7 @@ mod tests {
         let array = batch
             .column(0)
             .as_any()
-            .downcast_ref::<arrow_array::BinaryArray>()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
             .unwrap();
         (0..array.len())
             .map(|idx| (!array.is_null(idx)).then(|| array.value(idx).to_vec()))
@@ -3072,7 +3123,7 @@ mod tests {
                 let values = array.value(row_idx);
                 let values = values
                     .as_any()
-                    .downcast_ref::<arrow_array::BinaryArray>()
+                    .downcast_ref::<arrow_array::LargeBinaryArray>()
                     .unwrap();
                 Some(
                     (0..values.len())
@@ -3091,7 +3142,7 @@ mod tests {
         let values = array
             .values()
             .as_any()
-            .downcast_ref::<BinaryArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap();
         (0..array.len())
             .map(|row| {
@@ -3201,6 +3252,7 @@ mod tests {
         let lengths_start = payload_range.end - BLOB_MAP_INDEX_LENGTHS_SIZE;
         let value_index_start = lengths_start - value_index.len() as u64;
         let key_index_start = value_index_start - key_index.len() as u64;
+        let data_start = payload_range.start + BLOB_MAP_HEADER_SIZE;
         let mut index_lengths = Vec::with_capacity(BLOB_MAP_INDEX_LENGTHS_SIZE as usize);
         index_lengths.extend_from_slice(&(key_index.len() as i32).to_le_bytes());
         index_lengths.extend_from_slice(&(value_index.len() as i32).to_le_bytes());
@@ -3212,6 +3264,7 @@ mod tests {
             (lengths_start..payload_range.end, Bytes::from(index_lengths)),
             (key_index_start..value_index_start, Bytes::from(key_index)),
             (value_index_start..lengths_start, Bytes::from(value_index)),
+            (data_start..data_start, Bytes::new()),
         ]);
         (reader, payload_range)
     }

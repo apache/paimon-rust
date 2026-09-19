@@ -49,7 +49,7 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use paimon::arrow::ParquetReadBudget;
+use paimon::arrow::ReadBudget;
 use paimon::spec::{
     CoreOptions, DataField, Datum, MergeEngine, Predicate, PredicateBuilder, PredicateOperator,
 };
@@ -804,7 +804,7 @@ pub struct PaimonTableScan {
     /// Parquet row filter instead, avoiding duplicate decoder evaluation.
     decoder_filters: Vec<Arc<dyn PhysicalExpr>>,
     /// Query-wide budget shared by every DataFusion scan partition.
-    parquet_read_budget: Arc<ParquetReadBudget>,
+    parquet_read_budget: Arc<ReadBudget>,
 }
 
 impl PaimonTableScan {
@@ -833,7 +833,7 @@ impl PaimonTableScan {
             scan_trace,
             pushed_variants,
             case_sensitive,
-            Arc::new(ParquetReadBudget::default()),
+            Arc::new(ReadBudget::default()),
         )
     }
 
@@ -852,7 +852,7 @@ impl PaimonTableScan {
     ) -> DFResult<Self> {
         let options = table.schema().core_options();
         let parquet_read_budget = Arc::new(
-            ParquetReadBudget::new(
+            ReadBudget::new(
                 options
                     .parquet_row_group_parallelism()
                     .map_err(to_datafusion_error)?,
@@ -889,7 +889,7 @@ impl PaimonTableScan {
         scan_trace: Option<ScanTrace>,
         pushed_variants: Option<String>,
         case_sensitive: bool,
-        parquet_read_budget: Arc<ParquetReadBudget>,
+        parquet_read_budget: Arc<ReadBudget>,
     ) -> Self {
         let plan_properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),

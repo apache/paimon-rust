@@ -20,6 +20,7 @@ use super::decode::{neg_count_to_usize, AvroRecordDecode};
 use super::decode_helpers::{
     extract_record_schema, read_bytes_field, read_int_field, read_long_field, read_string_field,
 };
+use super::manifest_entry_decode::decode_nullable_string_array;
 use super::schema::{skip_nullable_field, FieldSchema, WriterSchema};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::ManifestFileMeta;
@@ -39,6 +40,8 @@ impl AvroRecordDecode for ManifestFileMeta {
         let mut max_level: Option<i32> = None;
         let mut min_row_id: Option<i64> = None;
         let mut max_row_id: Option<i64> = None;
+        let mut total_buckets: Option<i32> = None;
+        let mut extra_files: Option<Vec<String>> = None;
 
         for field in &writer_schema.fields {
             match field.name.as_str() {
@@ -62,6 +65,10 @@ impl AvroRecordDecode for ManifestFileMeta {
                 "_MAX_LEVEL" => max_level = read_optional_int(cursor, field.nullable)?,
                 "_MIN_ROW_ID" => min_row_id = read_optional_long(cursor, field.nullable)?,
                 "_MAX_ROW_ID" => max_row_id = read_optional_long(cursor, field.nullable)?,
+                "_TOTAL_BUCKETS" => total_buckets = read_optional_int(cursor, field.nullable)?,
+                "_EXTRA_FILES" => {
+                    extra_files = decode_nullable_string_array(cursor, field.nullable)?
+                }
                 _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
             }
         }
@@ -80,6 +87,8 @@ impl AvroRecordDecode for ManifestFileMeta {
             max_level,
             min_row_id,
             max_row_id,
+            total_buckets,
+            extra_files,
         ))
     }
 }

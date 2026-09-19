@@ -35,6 +35,7 @@ use crate::table::bucket_assigner_dynamic::DynamicBucketAssigner;
 use crate::table::bucket_assigner_fixed::FixedBucketAssigner;
 use crate::table::bucket_function::validate_bucket_function;
 use crate::table::commit_message::CommitMessage;
+use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
@@ -152,6 +153,7 @@ pub struct TableWrite {
     /// The first write or commit asks the server; `new` is sync and can only
     /// read the schema cached on the handle.
     live_checked: bool,
+    file_index_options: Option<Arc<FileIndexOptions>>,
 }
 
 impl TableWrite {
@@ -378,6 +380,19 @@ impl TableWrite {
                 .iter()
                 .any(|f| matches!(f.data_type(), DataType::Vector(_)));
 
+        let file_index_options = FileIndexOptions::parse(schema.options(), schema.fields())?;
+        if file_index_options.is_some()
+            && (has_primary_keys
+                || has_blob_fields
+                || has_dedicated_vector_fields
+                || !blob_view_fields.is_empty()
+                || core_options.data_evolution_enabled())
+        {
+            return Err(crate::Error::Unsupported {
+                message: "FileIndex generation supports ordinary append writes only; primary-key, data-evolution and dedicated Blob/Vector writes are not supported".to_string(),
+            });
+        }
+
         Ok(Self {
             table: table.clone(),
             write_schema,
@@ -413,6 +428,7 @@ impl TableWrite {
             row_kind_generator,
             row_kind_filter,
             live_checked: false,
+            file_index_options: file_index_options.map(Arc::new),
         })
     }
 
@@ -849,12 +865,26 @@ impl TableWrite {
         bucket: i32,
         batch: RecordBatch,
     ) -> Result<()> {
-        let key = (partition_bytes, bucket);
-        if !self.partition_writers.contains_key(&key) {
-            self.create_writer(key.0.clone(), key.1).await?;
+        let result = async {
+            let key = (partition_bytes, bucket);
+            if !self.partition_writers.contains_key(&key) {
+                self.create_writer(key.0.clone(), key.1).await?;
+            }
+            self.partition_writers
+                .get_mut(&key)
+                .unwrap()
+                .write(&batch)
+                .await
         }
-        let writer = self.partition_writers.get_mut(&key).unwrap();
-        writer.write(&batch).await
+        .await;
+        if result.is_err() && self.file_index_options.is_some() {
+            for (_, writer) in self.partition_writers.drain() {
+                if let FileWriter::Append(mut writer) = writer {
+                    writer.abort().await;
+                }
+            }
+        }
+        result
     }
 
     /// Write multiple Arrow RecordBatches.
@@ -869,6 +899,9 @@ impl TableWrite {
     /// Writers are cleared after this call, allowing the TableWrite to be reused.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         self.ensure_live_authorized().await?;
+        if self.file_index_options.is_some() {
+            return self.prepare_indexed_append_commit().await;
+        }
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
             self.partition_writers.drain().collect();
 
@@ -908,6 +941,37 @@ impl TableWrite {
                 msg.new_index_files = idx_files;
                 messages.push(msg);
             }
+        }
+        Ok(messages)
+    }
+
+    async fn prepare_indexed_append_commit(&mut self) -> Result<Vec<CommitMessage>> {
+        let closes =
+            self.partition_writers
+                .drain()
+                .map(|((partition, bucket), writer)| async move {
+                    (partition, bucket, writer.prepare_commit().await)
+                });
+        // Do not cancel another partition's close when one fails: its completed
+        // files must remain reachable for abort cleanup.
+        let results = futures::future::join_all(closes).await;
+        let mut messages = Vec::new();
+        let mut error = None;
+        for (partition, bucket, result) in results {
+            match result {
+                Ok(files) if !files.data_files.is_empty() => {
+                    messages.push(CommitMessage::new(partition, bucket, files.data_files));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    error.get_or_insert(err);
+                }
+            }
+        }
+        if let Some(error) = error {
+            let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
+            let _ = commit.abort(&messages).await;
+            return Err(error);
         }
         Ok(messages)
     }
@@ -968,23 +1032,26 @@ impl TableWrite {
                 ),
             )))
         } else {
-            Ok(FileWriter::Append(DataFileWriter::new(
-                self.table.file_io().clone(),
-                self.table.location().to_string(),
-                partition_path,
-                bucket,
-                self.schema_id,
-                self.target_file_size,
-                self.file_compression.clone(),
-                self.file_compression_zstd_level,
-                self.write_buffer_size,
-                self.file_format.clone(),
-                self.table.schema().fields().to_vec(),
-                self.table.schema().options().clone(),
-                Some(0),
-                None,
-                None,
-            )))
+            Ok(FileWriter::Append(
+                DataFileWriter::new(
+                    self.table.file_io().clone(),
+                    self.table.location().to_string(),
+                    partition_path,
+                    bucket,
+                    self.schema_id,
+                    self.target_file_size,
+                    self.file_compression.clone(),
+                    self.file_compression_zstd_level,
+                    self.write_buffer_size,
+                    self.file_format.clone(),
+                    self.table.schema().fields().to_vec(),
+                    self.table.schema().options().clone(),
+                    Some(0),
+                    None,
+                    None,
+                )
+                .with_file_index(self.file_index_options.clone()),
+            ))
         }
     }
 
@@ -2231,13 +2298,13 @@ pub(in crate::table) mod tests {
 
         let schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("id", ArrowDataType::Int32, false),
-            ArrowField::new("payload", ArrowDataType::Binary, true),
+            ArrowField::new("payload", ArrowDataType::LargeBinary, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(vec![1, 2, 3])),
-                Arc::new(arrow_array::BinaryArray::from(vec![
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![
                     Some(b"hello" as &[u8]),
                     None,
                     Some(b"world"),
@@ -2303,12 +2370,12 @@ pub(in crate::table) mod tests {
         );
         let batch = RecordBatch::try_new(
             Arc::new(ArrowSchema::new(vec![
-                ArrowField::new("payload", ArrowDataType::Binary, true),
+                ArrowField::new("payload", ArrowDataType::LargeBinary, true),
                 ArrowField::new("a", ArrowDataType::Int32, false),
                 ArrowField::new("b", ArrowDataType::Int32, false),
             ])),
             vec![
-                Arc::new(arrow_array::BinaryArray::from(vec![Some(
+                Arc::new(arrow_array::LargeBinaryArray::from(vec![Some(
                     b"payload" as &[u8],
                 )])),
                 Arc::new(Int32Array::from(vec![100])),
@@ -2648,6 +2715,135 @@ pub(in crate::table) mod tests {
 
         let total_rows: i64 = messages[0].new_files.iter().map(|f| f.row_count).sum();
         assert_eq!(total_rows, 4);
+    }
+
+    /// TIME as an append table's `bucket-key`. Java allows it: `validateBucket`
+    /// rejects only ARRAY, MULTISET, MAP and ROW there. Routing has to agree with
+    /// `BinaryRow::hash_code`, so the bucket is pinned against the row the per-row
+    /// encoder produces rather than against a hard-coded number.
+    #[tokio::test]
+    async fn test_time_bucket_key_routes_by_binary_row_hash() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_time_bucket_key";
+        setup_dirs(&file_io, table_path).await;
+
+        let time_type = DataType::Time(TimeType::new(3).unwrap());
+        let schema = Schema::builder()
+            .column("tm", time_type.clone())
+            .column("value", DataType::Int(IntType::new()))
+            .option("bucket", "4")
+            .option("bucket-key", "tm")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_time_bucket_key_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        // 12:34:56.123 and midnight.
+        let times = [45_296_123_i32, 0];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tm", ArrowDataType::Time32(TimeUnit::Millisecond), true),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Time32MillisecondArray::from(times.map(Some).to_vec())),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])),
+            ],
+        )
+        .unwrap();
+
+        let fields = table.schema().fields().to_vec();
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        let output = table_write
+            .bucket_assigner
+            .assign_batch(&batch, &fields)
+            .await
+            .unwrap();
+
+        let expected: Vec<i32> = times
+            .iter()
+            .map(|&millis| {
+                let row = BinaryRow::from_datums(&[(Some(&Datum::Time(millis)), &time_type)]);
+                // Mirrors `default_bucket`: `(hash % n).abs()`, which is Java's
+                // `Math.abs(hashcode % numBuckets)` and is *not* a euclidean
+                // remainder for negative hashes.
+                (row.hash_code() % 4).wrapping_abs()
+            })
+            .collect();
+        assert_eq!(output.buckets, expected);
+
+        // And the write itself must land, not just the routing.
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        let rows: i64 = messages
+            .iter()
+            .flat_map(|m| m.new_files.iter())
+            .map(|f| f.row_count)
+            .sum();
+        assert_eq!(rows, 2);
+    }
+
+    /// TIME as a partition key. `partition_utils` already renders TIME partition
+    /// values, but that code was unreachable from the write path while the batch
+    /// encoder rejected the column, so this is the first test that exercises the
+    /// two together — hence the assertion on the rendered path, not just the row.
+    #[tokio::test]
+    async fn test_time_partition_key_writes_formatted_partition() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_time_partition_key";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("tm", DataType::Time(TimeType::new(3).unwrap()))
+            .column("value", DataType::Int(IntType::new()))
+            .partition_keys(["tm"])
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_time_partition_table"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tm", ArrowDataType::Time32(TimeUnit::Millisecond), true),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![
+                Arc::new(Time32MillisecondArray::from(vec![Some(45_296_123)])),
+                Arc::new(Int32Array::from(vec![Some(10)])),
+            ],
+        )
+        .unwrap();
+
+        table_write.write_arrow_batch(&batch).await.unwrap();
+        let messages = table_write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        let partition = BinaryRow::from_serialized_bytes(&messages[0].partition).unwrap();
+        assert_eq!(partition.get_int(0).unwrap(), 45_296_123);
+
+        let computer = PartitionComputer::new(
+            table.schema().partition_keys(),
+            table.schema().fields(),
+            "__DEFAULT_PARTITION__",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            computer.generate_partition_path(&partition).unwrap(),
+            "tm=12%3A34%3A56.123/"
+        );
     }
 
     fn test_bucketed_schema() -> TableSchema {

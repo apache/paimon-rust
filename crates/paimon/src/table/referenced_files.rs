@@ -19,7 +19,7 @@
 //!
 //! Reference: [LocalOrphanFilesClean](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/operation/LocalOrphanFilesClean.java)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::{
@@ -405,6 +405,34 @@ async fn collect_snapshot_files(
             .manifest_files
             .entry(meta.file_name().to_string())
             .or_insert(meta.file_size());
+    }
+
+    // Manifest-owned sidecars live in the manifest directory and must remain
+    // referenced for exactly as long as their owner manifest. Java Paimon may
+    // add these files even when this Rust process only reads and rewrites the
+    // manifest list metadata.
+    let manifest_extra_names = all_manifest_metas
+        .iter()
+        .flat_map(|meta| meta.extra_files().unwrap_or_default())
+        .cloned()
+        .collect::<HashSet<_>>();
+    if !manifest_extra_names.is_empty() {
+        let manifest_extra_names = manifest_extra_names.into_iter().collect::<Vec<_>>();
+        let manifest_extra_paths = manifest_extra_names
+            .iter()
+            .map(|name| manifest_sm.manifest_path(name))
+            .collect::<Vec<_>>();
+        let sizes = try_join_all(
+            manifest_extra_paths
+                .iter()
+                .map(|path| try_stat_file_size(file_io, path)),
+        )
+        .await?;
+        for (name, size) in manifest_extra_names.into_iter().zip(sizes) {
+            if size > 0 {
+                file_set.manifest_files.entry(name).or_insert(size);
+            }
+        }
     }
 
     // Read manifest files to get data file entries, using cache by full path
@@ -953,6 +981,7 @@ mod tests {
         let external_dir = "memory:/external_sidecar_references";
         let sidecar_name = "data-0.row.index";
         let sidecar_content = "sidecar-bytes";
+        let manifest_sidecar_name = "manifest-external-sidecar-0.index";
         let file_io = test_file_io();
 
         file_io
@@ -967,6 +996,12 @@ mod tests {
             &file_io,
             &format!("{external_dir}/{sidecar_name}"),
             sidecar_content,
+        )
+        .await;
+        write_test_file(
+            &file_io,
+            &format!("{table_path}/manifest/{manifest_sidecar_name}"),
+            "manifest-sidecar-bytes",
         )
         .await;
 
@@ -1009,7 +1044,8 @@ mod tests {
             0,
             BinaryTableStats::empty(),
             0,
-        );
+        )
+        .with_extra_files(Some(vec![manifest_sidecar_name.to_string()]));
         ManifestList::write(&file_io, &manifest_list_path, &[manifest_meta])
             .await
             .unwrap();
@@ -1040,6 +1076,7 @@ mod tests {
         let total = result.iter().find(|r| r.source == "total").unwrap();
         assert_eq!(total.data_file_count, 2);
         assert_eq!(total.data_file_size, 100 + sidecar_content.len() as i64);
+        assert_eq!(total.manifest_file_count, 4);
     }
 
     #[tokio::test]

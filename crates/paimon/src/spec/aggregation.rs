@@ -430,9 +430,13 @@ pub(crate) fn validate_aggregator_for_type(
                 | DataType::Float(_)
                 | DataType::Double(_)
         ),
+        // Java `FieldMinAggFactory` / `FieldMaxAggFactory` accept anything
+        // `TypeCheckUtils#isComparable` allows, i.e. everything except MAP,
+        // MULTISET, ROW, ARRAY, VECTOR, VARIANT and BLOB.
         "min" | "max" => matches!(
             dt,
-            DataType::TinyInt(_)
+            DataType::Boolean(_)
+                | DataType::TinyInt(_)
                 | DataType::SmallInt(_)
                 | DataType::Int(_)
                 | DataType::BigInt(_)
@@ -442,8 +446,11 @@ pub(crate) fn validate_aggregator_for_type(
                 | DataType::Date(_)
                 | DataType::Time(_)
                 | DataType::Timestamp(_)
+                | DataType::LocalZonedTimestamp(_)
                 | DataType::Char(_)
                 | DataType::VarChar(_)
+                | DataType::Binary(_)
+                | DataType::VarBinary(_)
         ),
         "bool_and" | "bool_or" => matches!(dt, DataType::Boolean(_)),
         // Java `FieldListaggAggFactory` only accepts unbounded VARCHAR (STRING);
@@ -842,8 +849,9 @@ mod tests {
     #[test]
     fn validation_table_matches_constructors() {
         use crate::spec::{
-            BigIntType, BooleanType, DateType, DecimalType, DoubleType, FloatType, SmallIntType,
-            TimeType, TimestampType, TinyIntType,
+            BigIntType, BinaryType, BlobType, BooleanType, DateType, DecimalType, DoubleType,
+            FloatType, LocalZonedTimestampType, SmallIntType, TimeType, TimestampType, TinyIntType,
+            VarBinaryType,
         };
 
         let names = [
@@ -875,6 +883,14 @@ mod tests {
             DataType::Date(DateType::new()),
             DataType::Time(TimeType::new(3).unwrap()),
             DataType::Timestamp(TimestampType::new(6).unwrap()),
+            // Carries a timezone in Arrow, unlike TIMESTAMP — min/max must build a
+            // result array that still matches the schema.
+            DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap()),
+            DataType::Binary(BinaryType::new(4).unwrap()),
+            DataType::VarBinary(VarBinaryType::new(8).unwrap()),
+            // Maps to the same Arrow Binary as the two above, but Java's
+            // `isComparable` excludes it, so min/max must keep rejecting it.
+            DataType::Blob(BlobType::new()),
             // Bounded VARCHAR (listagg must reject) and unbounded STRING
             // (listagg must accept) — exercises both sides of the listagg rule.
             DataType::VarChar(VarCharType::new(255).unwrap()),

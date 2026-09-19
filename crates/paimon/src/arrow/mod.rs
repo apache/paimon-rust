@@ -18,14 +18,14 @@
 pub(crate) mod filtering;
 pub(crate) mod format;
 pub(crate) mod nested_evolution;
-mod parquet_read_budget;
 pub(crate) mod partition;
+mod read_budget;
 pub(crate) mod residual;
 mod row_filter;
 pub(crate) mod schema_evolution;
 pub(crate) mod shredding;
 
-pub use parquet_read_budget::ParquetReadBudget;
+pub use read_budget::ReadBudget;
 pub use row_filter::{RowFilter, RowFilterContext, RowFilterFactory};
 
 use crate::spec::{
@@ -52,9 +52,8 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
         PaimonDataType::Float(_) => ArrowDataType::Float32,
         PaimonDataType::Double(_) => ArrowDataType::Float64,
         PaimonDataType::VarChar(_) | PaimonDataType::Char(_) => ArrowDataType::Utf8,
-        PaimonDataType::Binary(_) | PaimonDataType::VarBinary(_) | PaimonDataType::Blob(_) => {
-            ArrowDataType::Binary
-        }
+        PaimonDataType::Binary(_) | PaimonDataType::VarBinary(_) => ArrowDataType::Binary,
+        PaimonDataType::Blob(_) => ArrowDataType::LargeBinary,
         PaimonDataType::Variant(_) => variant_arrow_type(),
         PaimonDataType::Date(_) => ArrowDataType::Date32,
         PaimonDataType::Time(_) => ArrowDataType::Time32(TimeUnit::Millisecond),
@@ -419,9 +418,11 @@ mod tests {
 
     #[test]
     fn test_binary_types() {
+        let binary = PaimonDataType::Binary(BinaryType::new(16).unwrap());
         let varbinary = PaimonDataType::VarBinary(
             VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH).unwrap(),
         );
+        assert_paimon_to_arrow(&binary, &ArrowDataType::Binary);
         assert_paimon_to_arrow(&varbinary, &ArrowDataType::Binary);
 
         for arrow in &[
@@ -434,14 +435,37 @@ mod tests {
     }
 
     #[test]
-    fn test_blob_type_maps_one_way_to_arrow_binary() {
+    fn test_blob_type_maps_one_way_to_arrow_large_binary() {
         let blob = PaimonDataType::Blob(BlobType::new());
         let varbinary = PaimonDataType::VarBinary(
             VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH).unwrap(),
         );
 
-        assert_paimon_to_arrow(&blob, &ArrowDataType::Binary);
+        assert_paimon_to_arrow(&blob, &ArrowDataType::LargeBinary);
         assert_arrow_to_paimon(&ArrowDataType::Binary, true, &varbinary);
+
+        let array = PaimonDataType::Array(ArrayType::new(blob.clone()));
+        assert_paimon_to_arrow(
+            &array,
+            &ArrowDataType::List(Arc::new(ArrowField::new(
+                "element",
+                ArrowDataType::LargeBinary,
+                true,
+            ))),
+        );
+
+        let map = PaimonDataType::Map(MapType::new(
+            PaimonDataType::VarChar(VarCharType::string_type()),
+            blob,
+        ));
+        let map_arrow = paimon_type_to_arrow(&map).unwrap();
+        let ArrowDataType::Map(entries, _) = map_arrow else {
+            panic!("expected Arrow Map");
+        };
+        let ArrowDataType::Struct(fields) = entries.data_type() else {
+            panic!("expected Arrow Map entries Struct");
+        };
+        assert_eq!(fields[1].data_type(), &ArrowDataType::LargeBinary);
     }
 
     #[test]

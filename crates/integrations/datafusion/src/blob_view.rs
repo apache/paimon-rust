@@ -20,7 +20,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, BinaryBuilder, Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray,
+    Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryBuilder, LargeStringArray,
     StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, FieldRef};
@@ -133,13 +133,13 @@ impl ScalarUDFImpl for BlobViewFunc {
     }
 
     fn return_type(&self, _arg_types: &[ArrowDataType]) -> DFResult<ArrowDataType> {
-        Ok(ArrowDataType::Binary)
+        Ok(ArrowDataType::LargeBinary)
     }
 
     fn return_field_from_args(&self, _args: ReturnFieldArgs) -> DFResult<FieldRef> {
         Ok(Arc::new(Field::new(
             FUNCTION_NAME,
-            ArrowDataType::Binary,
+            ArrowDataType::LargeBinary,
             true,
         )))
     }
@@ -156,7 +156,7 @@ impl ScalarUDFImpl for BlobViewFunc {
         let fields = arrays[1].as_ref();
         let row_ids = arrays[2].as_ref();
         let mut field_id_cache = HashMap::new();
-        let mut builder = BinaryBuilder::new();
+        let mut builder = LargeBinaryBuilder::new();
 
         for row in 0..table_names.len() {
             let Some(table_name) = string_at(table_names, row)? else {

@@ -31,6 +31,8 @@ use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::io;
 
+const BLOOM_FILTER_FPP: f64 = 0.05;
+
 /// BTree index writer. Writes sorted key -> row_id_list entries into a BTree index file.
 ///
 /// Usage:
@@ -104,12 +106,32 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
         compression_level: i32,
         cmp: F,
     ) -> Self {
+        Self::with_comparator_and_options(
+            writer,
+            block_size,
+            compression_type,
+            compression_level,
+            false,
+            cmp,
+        )
+    }
+
+    /// Create a writer with all Java-compatible BTree file options.
+    pub fn with_comparator_and_options(
+        writer: Box<dyn FileWrite>,
+        block_size: usize,
+        compression_type: BlockCompressionType,
+        compression_level: i32,
+        bloom_filter_enabled: bool,
+        cmp: F,
+    ) -> Self {
         Self {
-            sst_writer: SstFileWriter::with_compression_level(
+            sst_writer: SstFileWriter::with_bloom_filter(
                 writer,
                 block_size,
                 compression_type,
                 compression_level,
+                bloom_filter_enabled,
             ),
             current_row_ids: Vec::new(),
             last_key: None,
@@ -208,8 +230,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
         // Write null bitmap
         let null_bitmap_handle = self.write_null_bitmap().await?;
 
-        // No bloom filter for now (same as Java: todo)
-        let bloom_filter_handle = None;
+        // Write the optional Bloom filter after the null bitmap and before the index block.
+        let bloom_filter_handle = self.sst_writer.write_bloom_filter(BLOOM_FILTER_FPP).await?;
 
         // Write index block
         let index_block_handle = self.sst_writer.write_index_block().await?;

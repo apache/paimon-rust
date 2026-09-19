@@ -25,10 +25,11 @@ mod shredding;
 #[cfg(feature = "vortex")]
 mod vortex;
 
+pub(crate) use mosaic::MosaicPrefetchOptions;
 #[cfg(test)]
 pub(crate) use parquet::ParquetFormatWriter;
 
-use super::ParquetReadBudget;
+use super::ReadBudget;
 use super::RowFilterFactory;
 use crate::io::{FileIO, FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
@@ -190,15 +191,25 @@ pub(crate) fn create_format_reader(
     blob_as_descriptor: bool,
     read_fields: &[DataField],
 ) -> crate::Result<Box<dyn FormatFileReader>> {
-    create_format_reader_with_budget(path, blob_as_descriptor, read_fields, None)
+    create_format_reader_with_budget(
+        path,
+        blob_as_descriptor,
+        read_fields,
+        None,
+        blob::DEFAULT_BLOB_READ_PARALLELISM,
+        MosaicPrefetchOptions::default(),
+    )
 }
 
-/// Create a format reader with a scan-shared Parquet resource budget.
+/// Create a format reader with a scan-shared Parquet resource budget and the
+/// per-file Mosaic prefetch settings.
 pub(crate) fn create_format_reader_with_budget(
     path: &str,
     blob_as_descriptor: bool,
     read_fields: &[DataField],
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
+    blob_parallelism: usize,
+    mosaic_prefetch: MosaicPrefetchOptions,
 ) -> crate::Result<Box<dyn FormatFileReader>> {
     let lower = path.to_ascii_lowercase();
     let reader: Box<dyn FormatFileReader> = if lower.ends_with(".parquet") {
@@ -207,10 +218,10 @@ pub(crate) fn create_format_reader_with_budget(
             None => parquet::ParquetFormatReader::default(),
         })
     } else if lower.ends_with(".blob") {
-        Box::new(blob::BlobFormatReader::new(
-            path.to_string(),
-            blob_as_descriptor,
-        ))
+        Box::new(
+            blob::BlobFormatReader::new(path.to_string(), blob_as_descriptor)
+                .with_blob_parallelism(blob_parallelism),
+        )
     } else if lower.ends_with(".orc") {
         Box::new(orc::OrcFormatReader)
     } else if lower.ends_with(".avro") {
@@ -220,7 +231,7 @@ pub(crate) fn create_format_reader_with_budget(
     } else {
         if lower.ends_with(".mosaic") {
             return Ok(shredding::maybe_wrap_reader(
-                Box::new(mosaic::MosaicFormatReader),
+                Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch)),
                 read_fields,
             ));
         }

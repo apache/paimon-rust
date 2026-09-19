@@ -28,6 +28,7 @@ use crate::spec::{
 };
 use crate::table::data_file_reader::DataFileReader;
 use crate::table::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
+use crate::table::table_read::configured_mosaic_prefetch;
 use crate::table::ArrowRecordBatchStream;
 use crate::DataSplit;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions, StringArray};
@@ -131,6 +132,7 @@ impl<'a> AuditLogRead<'a> {
                     merge_splits: false,
                     max_merge_input_streams: Some(MAX_MERGE_INPUT_STREAMS),
                     parquet_read_budget: Some(parquet_read_budget),
+                    mosaic_prefetch: configured_mosaic_prefetch(self.read.table)?,
                 },
             )
             .read_with_merge_function(

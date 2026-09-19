@@ -30,7 +30,8 @@ use super::sort_merge::{
     AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, MergeFunction,
     PartialUpdateMergeFunction, SortMergeReaderBuilder,
 };
-use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
+use crate::arrow::format::MosaicPrefetchOptions;
+use crate::arrow::{build_target_arrow_schema, ReadBudget};
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::io::FileIO;
 use crate::spec::{
@@ -81,7 +82,9 @@ pub(crate) struct KeyValueReadConfig {
     /// This limits merge fan-in, not files: files within a run are opened serially.
     pub max_merge_input_streams: Option<usize>,
     /// Scan-shared Parquet concurrency and projected-byte budget.
-    pub parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    pub parquet_read_budget: Option<Arc<ReadBudget>>,
+    /// Per-file Mosaic row-group prefetch settings.
+    pub mosaic_prefetch: MosaicPrefetchOptions,
 }
 
 /// Keep only the conjuncts of `predicates` that reference primary-key columns,
@@ -588,7 +591,8 @@ impl KeyValueFileReader {
                             pushdown_predicates.clone(),
                         )
                         .with_batch_size(Some(config.read_batch_size))
-                        .with_parquet_read_budget(group_parquet_read_budget.clone());
+                        .with_parquet_read_budget(group_parquet_read_budget.clone())
+                        .with_mosaic_prefetch(config.mosaic_prefetch);
                         let run_schema_manager = config.schema_manager.clone();
                         let run_file_io = file_io.clone();
                         let deletion_files_by_split = deletion_files_by_split.clone();
@@ -1295,7 +1299,7 @@ mod tests {
         file
     }
 
-    fn kv_reader_with_budget(table: &Table, budget: Arc<ParquetReadBudget>) -> KeyValueFileReader {
+    fn kv_reader_with_budget(table: &Table, budget: Arc<ReadBudget>) -> KeyValueFileReader {
         let core_options = table.schema().core_options();
         KeyValueFileReader::new(
             table.file_io().clone(),
@@ -1314,6 +1318,7 @@ mod tests {
                 merge_splits: true,
                 max_merge_input_streams: None,
                 parquet_read_budget: Some(budget),
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
             },
         )
     }
@@ -1433,6 +1438,7 @@ mod tests {
                 merge_splits: true,
                 max_merge_input_streams: Some(256),
                 parquet_read_budget: None,
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
             },
         );
 
@@ -1640,6 +1646,7 @@ mod tests {
                 merge_splits: false,
                 max_merge_input_streams: None,
                 parquet_read_budget: None,
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
             },
         )
         .with_input_batch_sizes(input_batch_sizes.clone());
@@ -1710,7 +1717,8 @@ mod tests {
                 read_batch_size: core_options.read_batch_size().unwrap(),
                 merge_splits: false,
                 max_merge_input_streams: None,
-                parquet_read_budget: Some(Arc::new(ParquetReadBudget::new(2, 256 << 20).unwrap())),
+                parquet_read_budget: Some(Arc::new(ReadBudget::new(2, 256 << 20).unwrap())),
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
             },
         );
         let batches = tokio::time::timeout(
@@ -1767,10 +1775,8 @@ mod tests {
         assert_eq!(planned[0].len(), 1);
         assert_eq!(planned[0][0].files.len(), 2);
 
-        let reader = kv_reader_with_budget(
-            &table,
-            Arc::new(ParquetReadBudget::new(1, 256 << 20).unwrap()),
-        );
+        let reader =
+            kv_reader_with_budget(&table, Arc::new(ReadBudget::new(1, 256 << 20).unwrap()));
         let batches = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             reader
@@ -1826,7 +1832,7 @@ mod tests {
         };
         let first_split = split(vec![first_high, first_low]);
         let second_split = split(vec![second_high, second_low]);
-        let budget = Arc::new(ParquetReadBudget::new(1, 256 << 20).unwrap());
+        let budget = Arc::new(ReadBudget::new(1, 256 << 20).unwrap());
         let first_reader = kv_reader_with_budget(&table, budget.clone());
         let second_reader = kv_reader_with_budget(&table, budget);
 
@@ -1905,6 +1911,7 @@ mod tests {
                     merge_splits,
                     max_merge_input_streams: None,
                     parquet_read_budget: None,
+                    mosaic_prefetch: MosaicPrefetchOptions::default(),
                 },
             )
             .read(splits)
@@ -1972,6 +1979,7 @@ mod tests {
                 merge_splits: true,
                 max_merge_input_streams: Some(256),
                 parquet_read_budget: None,
+                mosaic_prefetch: MosaicPrefetchOptions::default(),
             },
         );
         let batches = reader

@@ -409,7 +409,7 @@ fn decode_nullable_string(
     Ok(Some(cursor.read_string()?.to_string()))
 }
 
-fn decode_nullable_string_array(
+pub(super) fn decode_nullable_string_array(
     cursor: &mut AvroCursor,
     nullable: bool,
 ) -> crate::Result<Option<Vec<String>>> {

@@ -27,7 +27,7 @@
 use crate::arrow::format::{create_format_writer, FormatFileWriter};
 use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
-use crate::spec::{bucket_dir_name, DataFileMeta, EMPTY_SERIALIZED_ROW, VALUE_KIND_FIELD_NAME};
+use crate::spec::{bucket_path_under, DataFileMeta, EMPTY_SERIALIZED_ROW, VALUE_KIND_FIELD_NAME};
 use crate::table::kv_file_writer::build_physical_schema;
 use crate::Result;
 use arrow_array::{Int64Array, Int8Array, RecordBatch};
@@ -205,20 +205,11 @@ impl PostponeFileWriter {
             self.written_files.len(),
             self.config.file_format,
         );
-        let bucket_dir = if self.config.partition_path.is_empty() {
-            format!(
-                "{}/{}",
-                self.config.table_location,
-                bucket_dir_name(self.config.bucket)
-            )
-        } else {
-            format!(
-                "{}/{}/{}",
-                self.config.table_location,
-                self.config.partition_path,
-                bucket_dir_name(self.config.bucket)
-            )
-        };
+        let bucket_dir = bucket_path_under(
+            &self.config.table_location,
+            &self.config.partition_path,
+            self.config.bucket,
+        );
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
         let physical_schema = build_physical_schema(&user_schema);
         let file_path = format!("{bucket_dir}/{file_name}");

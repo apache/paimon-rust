@@ -38,6 +38,7 @@ mod consumer_manager;
 pub(crate) mod cow_writer;
 mod data_evolution_reader;
 pub mod data_evolution_writer;
+mod data_file_index_writer;
 mod data_file_reader;
 mod data_file_writer;
 mod de_vector_read;
@@ -45,6 +46,7 @@ mod de_vector_scan;
 mod dedicated_format_file_writer;
 mod format_partition;
 mod format_partition_stats;
+mod format_partition_truncate;
 mod format_read_builder;
 mod format_table_read;
 mod format_table_scan;
@@ -138,6 +140,7 @@ pub use format_partition::{
     format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
 };
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
+pub use format_partition_truncate::FormatTableTruncator;
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;

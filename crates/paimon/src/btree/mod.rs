@@ -37,6 +37,7 @@
 //! ```
 
 mod block;
+mod bloom_filter;
 mod footer;
 pub(crate) mod key_serde;
 mod meta;
@@ -48,7 +49,7 @@ mod writer;
 
 pub use block::BlockCompressionType;
 pub(crate) use block::{
-    compress_block, compute_crc32, decompress_block, decompress_block_with_expected_size,
+    compress_block, compress_codec_block, compute_crc32, decompress_block, decompress_codec_block,
 };
 pub use footer::BTreeFileFooter;
 pub use key_serde::{make_key_comparator, serialize_datum};

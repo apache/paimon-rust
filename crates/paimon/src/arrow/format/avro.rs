@@ -25,9 +25,9 @@ use apache_avro::types::Value;
 use apache_avro::Reader;
 use arrow_array::{
     BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, RecordBatch, StringArray,
-    StructArray, Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray,
+    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray, MapArray,
+    RecordBatch, StringArray, StructArray, Time32MillisecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::SchemaRef;
@@ -322,11 +322,18 @@ fn build_column(
                 .collect();
             Arc::new(arr)
         }
-        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_) => {
+        DataType::Binary(_) | DataType::VarBinary(_) => {
             let values: Vec<Option<&[u8]>> = (0..num_rows)
                 .map(|i| get_field_at(&records[i], idx).and_then(value_as_bytes))
                 .collect();
             let arr: BinaryArray = values.into_iter().collect();
+            Arc::new(arr)
+        }
+        DataType::Blob(_) => {
+            let values: Vec<Option<&[u8]>> = (0..num_rows)
+                .map(|i| get_field_at(&records[i], idx).and_then(value_as_bytes))
+                .collect();
+            let arr: LargeBinaryArray = values.into_iter().collect();
             Arc::new(arr)
         }
         DataType::Date(_) => {
@@ -1110,7 +1117,7 @@ mod tests {
             vec![("b", av_null())],
         ]);
         let col = build_column(&records, "b", &DataType::Blob(BlobType::new()), 2).unwrap();
-        let arr = col.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let arr = col.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert_eq!(arr.value(0), &[0xDE, 0xAD]);
         assert!(arr.is_null(1));
     }

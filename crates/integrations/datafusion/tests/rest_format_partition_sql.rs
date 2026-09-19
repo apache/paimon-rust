@@ -27,7 +27,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use paimon::api::ConfigResponse;
-use paimon::catalog::RESTCatalog;
+use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::spec::{BigIntType, BooleanType, DataType, DateType, IntType, Schema, VarCharType};
 use paimon::{CatalogOptions, Options};
 use paimon_datafusion::SQLContext;
@@ -60,15 +60,19 @@ async fn setup_rest_table(temp_dir: &TempDir, schema: Schema) -> (RESTServer, SQ
     );
     server.set_table_external(DATABASE, TABLE, false);
 
+    let catalog = rest_catalog(&server).await;
+    let mut context = SQLContext::new();
+    context.register_catalog("paimon", catalog).await.unwrap();
+    (server, context)
+}
+
+async fn rest_catalog(server: &RESTServer) -> Arc<RESTCatalog> {
     let mut options = Options::new();
     options.set(CatalogOptions::URI, server.url().unwrap());
     options.set(CatalogOptions::WAREHOUSE, WAREHOUSE);
     options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
     options.set(CatalogOptions::TOKEN, "test-token");
-    let catalog = Arc::new(RESTCatalog::new(options, true).await.unwrap());
-    let mut context = SQLContext::new();
-    context.register_catalog("paimon", catalog).await.unwrap();
-    (server, context)
+    Arc::new(RESTCatalog::new(options, true).await.unwrap())
 }
 
 fn format_table_schema(partition_columns: &[(&str, DataType)]) -> Schema {
@@ -929,6 +933,241 @@ async fn test_analyze_refuses_what_it_cannot_measure() {
         "catalog-managed",
     )
     .await;
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_truncate_table_empties_registered_partitions_and_keeps_them_registered() {
+    let (temp_dir, server, context) = dt_hh_table(&[("a", "00"), ("a", "01"), ("b", "00")]).await;
+    let root = temp_dir.path();
+    write_ids(&root.join("dt=a/hh=00"), &[1, 2]);
+    write_ids(&root.join("dt=a/hh=01"), &[3]);
+    // A Java reader reads a file whatever its name ends with, so truncating deletes it too.
+    std::fs::write(root.join("dt=b/hh=00/part-00000"), b"data").unwrap();
+    // Neither another writer's staging output nor a directory awaiting MSCK REPAIR is table data.
+    write_ids_file(&root.join("dt=a/hh=00/_temporary/0/part-1.parquet"), &[8]);
+    write_ids(&root.join("dt=c/hh=00"), &[9]);
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS NOSCAN"),
+    )
+    .await;
+    assert_eq!(counts(&partition_statistics(&server)["dt=a/hh=00"]).1, 1);
+    let select = format!("SELECT id FROM {TABLE_NAME}");
+    assert_eq!(ids(&context, &select).await, [1, 2, 3]);
+
+    common::exec(&context, &format!("TRUNCATE TABLE {TABLE_NAME}")).await;
+
+    assert!(ids(&context, &select).await.is_empty());
+    assert!(!root.join("dt=a/hh=00/part-0.parquet").exists());
+    assert!(!root.join("dt=b/hh=00/part-00000").exists());
+    assert!(root.join("dt=a/hh=00/_temporary/0/part-1.parquet").exists());
+    assert!(root.join("dt=c/hh=00/part-0.parquet").exists());
+    assert_eq!(server.table_partition_specs(DATABASE, TABLE).len(), 3);
+    let emptied = partition_statistics(&server);
+    for name in ["dt=a/hh=00", "dt=a/hh=01", "dt=b/hh=00"] {
+        assert!(root.join(name).is_dir(), "{name}");
+        assert_eq!(counts(&emptied[name]), (0, 0), "{name}");
+        assert_eq!(emptied[name].file_size_in_bytes, 0, "{name}");
+        assert!(emptied[name].last_file_creation_time > 0, "{name}");
+    }
+    let calls = server.create_partitions_calls();
+    let (_, _, request) = calls.last().unwrap();
+    assert_eq!(request.replace_statistics, Some(true));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_truncate_partition_clause_empties_a_leading_run_of_partition_values() {
+    let (temp_dir, server, context) = dt_hh_table(&[("a", "00"), ("a", "01"), ("b", "00")]).await;
+    let root = temp_dir.path();
+    for directory in ["dt=a/hh=00", "dt=a/hh=01", "dt=b/hh=00"] {
+        write_ids(&root.join(directory), &[1]);
+    }
+    common::exec(
+        &context,
+        &format!("ANALYZE TABLE {TABLE_NAME} COMPUTE STATISTICS NOSCAN"),
+    )
+    .await;
+    let has_data = || {
+        ["dt=a/hh=00", "dt=a/hh=01", "dt=b/hh=00"]
+            .map(|directory| root.join(directory).join("part-0.parquet").exists())
+    };
+
+    common::exec(
+        &context,
+        &format!("TRUNCATE TABLE {TABLE_NAME} PARTITION (dt = 'a', hh = '01')"),
+    )
+    .await;
+    assert_eq!(has_data(), [true, false, true]);
+    let measured = partition_statistics(&server);
+    assert_eq!(counts(&measured["dt=a/hh=00"]), (UNKNOWN, 1));
+    assert_eq!(counts(&measured["dt=a/hh=01"]), (0, 0));
+
+    common::exec(
+        &context,
+        &format!("TRUNCATE TABLE {TABLE_NAME} PARTITION (dt = 'a')"),
+    )
+    .await;
+    assert_eq!(has_data(), [false, false, true]);
+    assert_eq!(
+        counts(&partition_statistics(&server)["dt=b/hh=00"]),
+        (UNKNOWN, 1)
+    );
+
+    for (clause, message) in [
+        ("PARTITION (hh = '00')", "leading run"),
+        ("PARTITION (id = 1)", "not a partition column"),
+        ("PARTITION (dt = 'zzz')", "does not exist"),
+        ("PARTITION (dt = 'b', hh = '99')", "does not exist"),
+        ("PARTITION (dt, hh)", "at least one column = value"),
+    ] {
+        common::assert_sql_error(
+            &context,
+            &format!("TRUNCATE TABLE {TABLE_NAME} {clause}"),
+            message,
+        )
+        .await;
+    }
+    assert_eq!(has_data(), [false, false, true]);
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_truncate_refuses_a_custom_location_before_deleting_anything() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let (server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = 'a') PARTITION (dt = 'b')"),
+    )
+    .await;
+    let root = temp_dir.path();
+    write_ids(&root.join("dt=a"), &[1]);
+    write_ids(&root.join("dt=b"), &[2]);
+    write_ids(external_dir.path(), &[3]);
+    server.set_table_partition_options(
+        DATABASE,
+        TABLE,
+        &spec(&[("dt", "b")]),
+        HashMap::from([(
+            "path".to_string(),
+            format!("file://{}", external_dir.path().display()),
+        )]),
+    );
+    let reports = server.create_partitions_calls().len();
+
+    common::assert_sql_error(
+        &context,
+        &format!("TRUNCATE TABLE {TABLE_NAME}"),
+        "custom location",
+    )
+    .await;
+    assert!(root.join("dt=a/part-0.parquet").exists());
+    assert!(root.join("dt=b/part-0.parquet").exists());
+    assert!(external_dir.path().join("part-0.parquet").exists());
+    assert_eq!(server.create_partitions_calls().len(), reports);
+
+    // A partition clause that leaves it out does not meet it.
+    common::exec(
+        &context,
+        &format!("TRUNCATE TABLE {TABLE_NAME} PARTITION (dt = 'a')"),
+    )
+    .await;
+    assert!(!root.join("dt=a/part-0.parquet").exists());
+    assert!(root.join("dt=b/part-0.parquet").exists());
+    assert!(external_dir.path().join("part-0.parquet").exists());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_truncate_a_format_table_that_discovers_partitions_from_directories() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let schema = Schema::builder()
+        .column("dt", varchar())
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .partition_keys(["dt"])
+        .option("type", "format-table")
+        .option("file.format", "parquet")
+        .build()
+        .unwrap();
+    let (server, context) = setup_rest_table(&temp_dir, schema).await;
+    let root = temp_dir.path();
+    write_ids(&root.join("dt=a"), &[1]);
+    write_ids(&root.join("dt=b"), &[2]);
+    // Not a partition directory, so not part of the table.
+    write_ids(&root.join("tmp/unknown"), &[3]);
+
+    common::exec(
+        &context,
+        &format!("TRUNCATE TABLE {TABLE_NAME} PARTITION (dt = 'a')"),
+    )
+    .await;
+    assert!(!root.join("dt=a/part-0.parquet").exists());
+    assert!(root.join("dt=b/part-0.parquet").exists());
+    common::assert_sql_error(
+        &context,
+        &format!("TRUNCATE TABLE {TABLE_NAME} PARTITION (dt = 'zzz')"),
+        "does not exist",
+    )
+    .await;
+
+    common::exec(&context, &format!("TRUNCATE TABLE {TABLE_NAME}")).await;
+    assert!(!root.join("dt=b/part-0.parquet").exists());
+    assert!(root.join("dt=a").is_dir() && root.join("dt=b").is_dir());
+    assert!(root.join("tmp/unknown/part-0.parquet").exists());
+    assert!(server.create_partitions_calls().is_empty());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_truncate_an_unpartitioned_format_table() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let schema = Schema::builder()
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .option("type", "format-table")
+        .option("file.format", "parquet")
+        .build()
+        .unwrap();
+    let (_server, context) = setup_rest_table(&temp_dir, schema).await;
+    let root = temp_dir.path();
+    write_ids(root, &[1]);
+    write_ids_file(&root.join("_temporary/0/part-1.parquet"), &[2]);
+
+    common::assert_sql_error(
+        &context,
+        &format!("TRUNCATE TABLE {TABLE_NAME} PARTITION (id = 1)"),
+        "not partitioned",
+    )
+    .await;
+    assert!(root.join("part-0.parquet").exists());
+
+    common::exec(&context, &format!("TRUNCATE TABLE {TABLE_NAME}")).await;
+    assert!(!root.join("part-0.parquet").exists());
+    assert!(root.join("_temporary/0/part-1.parquet").exists());
+}
+
+#[tokio::test]
+async fn test_a_snapshot_commit_refuses_to_truncate_a_format_table() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (server, _context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    let catalog = rest_catalog(&server).await;
+    let table = catalog
+        .get_table(&Identifier::new(DATABASE, TABLE))
+        .await
+        .unwrap();
+
+    // Without snapshots such a commit finds nothing to delete, and used to report success.
+    let commit = paimon::table::WriteBuilder::new(&table).new_commit();
+    let error = commit.truncate_table().await.unwrap_err();
+    assert!(error.to_string().contains("snapshot commit"), "{error}");
+    assert!(commit
+        .truncate_partitions(vec![HashMap::from([("dt".to_string(), None)])])
+        .await
+        .is_err());
 }
 
 /// `SQLContext::sql` futures have to stay `Send` for callers that box or spawn them; this stops

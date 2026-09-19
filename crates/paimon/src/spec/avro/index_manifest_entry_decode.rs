@@ -191,62 +191,37 @@ fn decode_nullable_global_index(
             return Ok(None);
         }
     }
-    let row_range_start = cursor.read_long()?;
-    let row_range_end = cursor.read_long()?;
-    let index_field_id = cursor.read_int()?;
-
-    // _EXTRA_FIELD_IDS: nullable array of int
-    let extra_field_ids = {
-        let u_idx = cursor.read_union_index()?;
-        if u_idx == 0 {
-            None
-        } else {
-            let mut ids = Vec::new();
-            loop {
-                let count = cursor.read_long()?;
-                if count == 0 {
-                    break;
-                }
-                let count = if count < 0 {
-                    cursor.skip_long()?;
-                    neg_count_to_usize(count)?
-                } else {
-                    count as usize
-                };
-                for _ in 0..count {
-                    ids.push(cursor.read_int()?);
-                }
+    // Walk the writer's own field list, as the deletion-vector record above does.
+    // Nothing in a manifest says how many fields this record has: Java tried a
+    // runtime `getFieldCount() <= 5` check when `_SOURCE_META` was added (#8549),
+    // replaced it with an entry-serializer version (#8952), then reverted to
+    // `GlobalIndexMeta.SCHEMA.getFieldCount()` (#9004) and deleted the versioned
+    // serializer entirely (#9039). Shape compatibility is therefore delegated to the
+    // file format's schema resolution, which is exactly what positional decoding
+    // cannot do — the writer's schema is the only description of the record.
+    let record = extract_record_schema(schema).ok_or_else(|| crate::Error::UnexpectedError {
+        message: "global index metadata must be an Avro record".into(),
+        source: None,
+    })?;
+    let mut row_range_start = 0;
+    let mut row_range_end = 0;
+    let mut index_field_id = 0;
+    let mut extra_field_ids = None;
+    let mut index_meta = None;
+    let mut source_meta = None;
+    for field in &record.fields {
+        match field.name.as_str() {
+            "_ROW_RANGE_START" => row_range_start = read_long_field(cursor, field.nullable)?,
+            "_ROW_RANGE_END" => row_range_end = read_long_field(cursor, field.nullable)?,
+            "_INDEX_FIELD_ID" => index_field_id = read_int_field(cursor, field.nullable)?,
+            "_EXTRA_FIELD_IDS" => {
+                extra_field_ids = decode_nullable_int_array(cursor, field.nullable)?
             }
-            Some(ids)
+            "_INDEX_META" => index_meta = read_optional_bytes(cursor, field.nullable)?,
+            "_SOURCE_META" => source_meta = read_optional_bytes(cursor, field.nullable)?,
+            _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
         }
-    };
-
-    // _INDEX_META: nullable bytes
-    let index_meta = {
-        let u_idx = cursor.read_union_index()?;
-        if u_idx == 0 {
-            None
-        } else {
-            Some(cursor.read_bytes()?.to_vec())
-        }
-    };
-
-    // _SOURCE_META: nullable bytes — only present in >= #8549 writer schemas.
-    // Guard on the writer's nested field list so a legacy 5-field _GLOBAL_INDEX
-    // record does not misalign the cursor into the next record.
-    let has_source_meta = extract_record_schema(schema)
-        .map(|s| s.fields.iter().any(|f| f.name == "_SOURCE_META"))
-        .unwrap_or(false);
-    let source_meta = if has_source_meta {
-        let u_idx = cursor.read_union_index()?;
-        if u_idx == 0 {
-            None
-        } else {
-            Some(cursor.read_bytes()?.to_vec())
-        }
-    } else {
-        None
-    };
+    }
 
     Ok(Some(GlobalIndexMeta {
         row_range_start,
@@ -256,4 +231,37 @@ fn decode_nullable_global_index(
         index_meta,
         source_meta,
     }))
+}
+
+fn read_optional_bytes(cursor: &mut AvroCursor, nullable: bool) -> crate::Result<Option<Vec<u8>>> {
+    if nullable && cursor.read_union_index()? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(cursor.read_bytes()?.to_vec()))
+}
+
+fn decode_nullable_int_array(
+    cursor: &mut AvroCursor,
+    nullable: bool,
+) -> crate::Result<Option<Vec<i32>>> {
+    if nullable && cursor.read_union_index()? == 0 {
+        return Ok(None);
+    }
+    let mut ids = Vec::new();
+    loop {
+        let count = cursor.read_long()?;
+        if count == 0 {
+            break;
+        }
+        let count = if count < 0 {
+            cursor.skip_long()?;
+            neg_count_to_usize(count)?
+        } else {
+            count as usize
+        };
+        for _ in 0..count {
+            ids.push(cursor.read_int()?);
+        }
+    }
+    Ok(Some(ids))
 }

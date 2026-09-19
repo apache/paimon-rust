@@ -21,7 +21,10 @@ use crate::btree::block::{
     compress_block, compute_crc32, decompress_block, BlockCompressionType, BlockHandle,
     BlockReader, BlockTrailer, BlockWriter, BLOCK_HANDLE_MAX_ENCODED_LENGTH, BLOCK_TRAILER_LENGTH,
 };
+use crate::btree::bloom_filter::BloomFilter;
+use crate::btree::footer::BloomFilterHandle;
 use crate::io::FileWrite;
+use crate::spec::murmur_hash::hash_bytes;
 use bytes::Bytes;
 use std::io;
 
@@ -42,6 +45,7 @@ pub struct SstFileWriter {
     compression_level: i32,
     last_key: Option<Vec<u8>>,
     record_count: u64,
+    bloom_hashes: Option<Vec<i32>>,
 }
 
 impl SstFileWriter {
@@ -70,7 +74,22 @@ impl SstFileWriter {
             compression_level,
             last_key: None,
             record_count: 0,
+            bloom_hashes: None,
         }
+    }
+
+    /// Create a writer with optional Bloom filter collection.
+    pub(super) fn with_bloom_filter(
+        writer: Box<dyn FileWrite>,
+        block_size: usize,
+        compression_type: BlockCompressionType,
+        compression_level: i32,
+        bloom_filter_enabled: bool,
+    ) -> Self {
+        let mut writer =
+            Self::with_compression_level(writer, block_size, compression_type, compression_level);
+        writer.bloom_hashes = bloom_filter_enabled.then(Vec::new);
+        writer
     }
 
     /// Current write position in the output.
@@ -91,6 +110,9 @@ impl SstFileWriter {
     /// Put a key-value pair. Keys must be monotonically increasing.
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
         self.data_block_writer.add(key, value);
+        if let Some(hashes) = &mut self.bloom_hashes {
+            hashes.push(hash_bytes(key));
+        }
 
         // Only clone key if it changed
         match &self.last_key {
@@ -159,6 +181,25 @@ impl SstFileWriter {
         self.write_bytes(&trailer.to_bytes()).await?;
 
         Ok(block_handle)
+    }
+
+    /// Build and write the optional Bloom filter from the keys collected by [`Self::put`].
+    pub async fn write_bloom_filter(&mut self, fpp: f64) -> io::Result<Option<BloomFilterHandle>> {
+        let Some(hashes) = self.bloom_hashes.take() else {
+            return Ok(None);
+        };
+        let Some(filter) = BloomFilter::from_hashes(&hashes, fpp)? else {
+            return Ok(None);
+        };
+        let handle = BloomFilterHandle {
+            offset: self.position(),
+            size: u32::try_from(filter.bytes().len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "Bloom filter exceeds u32 size")
+            })?,
+            expected_entries: filter.expected_entries(),
+        };
+        self.write_bytes(filter.bytes()).await?;
+        Ok(Some(handle))
     }
 
     /// Write raw bytes (e.g., footer, null bitmap).

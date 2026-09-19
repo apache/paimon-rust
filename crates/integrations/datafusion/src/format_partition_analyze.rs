@@ -17,20 +17,16 @@
 
 //! ANALYZE TABLE for Format Tables with catalog-managed partitions.
 
-use std::collections::HashSet;
-
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::DataFrame;
-use datafusion::sql::sqlparser::ast::{Analyze, Expr as SqlExpr};
+use datafusion::sql::sqlparser::ast::Analyze;
 use paimon::table::FormatTablePartitionStatsCollector;
 
 use crate::error::to_datafusion_error;
 use crate::format_partition_ddl::{
-    ensure_catalog_managed_format_table, has_custom_location, parse_format_partition_spec,
+    ensure_catalog_managed_format_table, has_custom_location, leading_partition_prefix,
 };
-use crate::sql_context::{
-    normalize_schema_identifier, ok_result, partition_assignment, SQLContext,
-};
+use crate::sql_context::{ok_result, SQLContext};
 
 /// `ANALYZE TABLE t [PARTITION (...)] COMPUTE STATISTICS [NOSCAN]` on a Format Table with
 /// catalog-managed partitions. Mirrors Java `PaimonAnalyzeFormatTablePartitionsCommand`.
@@ -68,9 +64,10 @@ pub(crate) async fn execute_analyze(
         .await
         .map_err(to_datafusion_error)?;
     ensure_catalog_managed_format_table(&table, "ANALYZE TABLE")?;
-    let prefix = analyze_partition_prefix(
+    let prefix = leading_partition_prefix(
         analyze.partitions.as_deref().unwrap_or_default(),
         &table,
+        "ANALYZE TABLE",
         enable_ident_normalization,
     )?;
 
@@ -137,60 +134,4 @@ fn format_table_statistics_parallelism(ctx: &SQLContext) -> usize {
         .and_then(|value| value.trim().parse::<i64>().ok())
         .map(|value| value.max(1) as usize)
         .unwrap_or(8)
-}
-
-/// The values an `ANALYZE ... PARTITION (...)` clause fixes, in partition-key order; valued
-/// columns must be a leading run of the keys, so `PARTITION (hour = '00')` is rejected.
-fn analyze_partition_prefix(
-    expressions: &[SqlExpr],
-    table: &paimon::Table,
-    enable_ident_normalization: bool,
-) -> DFResult<Vec<(String, String)>> {
-    let partition_keys = table.schema().partition_keys();
-    let mut named = HashSet::with_capacity(expressions.len());
-    let mut assignments = Vec::with_capacity(expressions.len());
-    for expression in expressions {
-        let column = match expression {
-            SqlExpr::Identifier(identifier) => {
-                normalize_schema_identifier(identifier, enable_ident_normalization)
-            }
-            other => {
-                let (column, _) = partition_assignment(other, enable_ident_normalization)?;
-                assignments.push(other.clone());
-                column
-            }
-        };
-        if !partition_keys.contains(&column) {
-            return Err(DataFusionError::Plan(format!(
-                "Column '{column}' is not a partition column"
-            )));
-        }
-        if !named.insert(column.clone()) {
-            return Err(DataFusionError::Plan(format!(
-                "Duplicate partition column '{column}'"
-            )));
-        }
-    }
-    let spec = parse_format_partition_spec(
-        &assignments,
-        table,
-        false,
-        Some("ANALYZE TABLE"),
-        enable_ident_normalization,
-    )?;
-    let leading = partition_keys
-        .iter()
-        .take_while(|key| spec.contains_key(key.as_str()))
-        .count();
-    if leading != spec.len() {
-        return Err(DataFusionError::Plan(format!(
-            "ANALYZE TABLE {} PARTITION must give values for a leading run of its partition \
-             columns {partition_keys:?}",
-            table.identifier().full_name()
-        )));
-    }
-    Ok(partition_keys[..leading]
-        .iter()
-        .map(|key| (key.clone(), spec[key].clone()))
-        .collect())
 }

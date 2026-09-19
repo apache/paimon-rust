@@ -23,7 +23,9 @@ use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::build_target_arrow_schema;
-use crate::arrow::ParquetReadBudget;
+use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
+use crate::arrow::format::MosaicPrefetchOptions;
+use crate::arrow::ReadBudget;
 use crate::spec::{
     BigIntType, CoreOptions, DataField, DataType, MergeEngine, Predicate, TinyIntType,
     ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
@@ -59,14 +61,20 @@ enum TableReadKind<'a> {
     Format(FormatTableRead<'a>),
 }
 
-pub(super) fn configured_parquet_read_budget(
-    table: &Table,
-) -> crate::Result<Arc<ParquetReadBudget>> {
+pub(super) fn configured_parquet_read_budget(table: &Table) -> crate::Result<Arc<ReadBudget>> {
     let options = table.schema().core_options();
-    Ok(Arc::new(ParquetReadBudget::new(
+    Ok(Arc::new(ReadBudget::new(
         options.parquet_row_group_parallelism()?,
         options.parquet_row_group_max_inflight_bytes()?,
     )?))
+}
+
+pub(crate) fn configured_mosaic_prefetch(table: &Table) -> crate::Result<MosaicPrefetchOptions> {
+    let options = table.schema().core_options();
+    Ok(MosaicPrefetchOptions {
+        row_groups: options.mosaic_read_prefetch_row_groups()?,
+        max_bytes: usize::try_from(options.mosaic_read_prefetch_max_bytes()?).unwrap_or(usize::MAX),
+    })
 }
 
 impl<'a> TableRead<'a> {
@@ -133,6 +141,24 @@ impl<'a> TableRead<'a> {
         }
     }
 
+    /// Set the maximum number of concurrent BLOB range reads for this read.
+    pub fn with_blob_parallelism(self, blob_parallelism: usize) -> crate::Result<Self> {
+        if blob_parallelism == 0 {
+            return Err(crate::Error::DataInvalid {
+                message: "BLOB read parallelism must be greater than zero".to_string(),
+                source: None,
+            });
+        }
+        Ok(match self.0 {
+            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
+                read.with_blob_parallelism(blob_parallelism),
+            )),
+            TableReadKind::Format(read) => Self(TableReadKind::Format(
+                read.with_blob_parallelism(blob_parallelism),
+            )),
+        })
+    }
+
     /// Attach an engine-specific Parquet decoder-filter factory.
     ///
     /// The hook is used only by schema-identical raw reads. Callers must still
@@ -151,7 +177,7 @@ impl<'a> TableRead<'a> {
 
     /// Override the Parquet resource budget shared by this read.
     #[doc(hidden)]
-    pub fn with_parquet_read_budget(self, budget: Arc<ParquetReadBudget>) -> Self {
+    pub fn with_parquet_read_budget(self, budget: Arc<ReadBudget>) -> Self {
         match self.0 {
             TableReadKind::Paimon(read) => {
                 Self(TableReadKind::Paimon(read.with_parquet_read_budget(budget)))
@@ -253,8 +279,9 @@ struct PaimonTableRead<'a> {
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
     data_file_read_timing: Option<Arc<DataFileReadTiming>>,
+    blob_parallelism: usize,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -271,6 +298,7 @@ impl<'a> PaimonTableRead<'a> {
             row_filter_factory: None,
             parquet_read_budget: None,
             data_file_read_timing: None,
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
         }
     }
 
@@ -309,7 +337,7 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
-    fn with_parquet_read_budget(mut self, budget: Arc<ParquetReadBudget>) -> Self {
+    fn with_parquet_read_budget(mut self, budget: Arc<ReadBudget>) -> Self {
         self.parquet_read_budget = Some(budget);
         self
     }
@@ -319,7 +347,12 @@ impl<'a> PaimonTableRead<'a> {
         self
     }
 
-    fn parquet_read_budget(&self) -> crate::Result<Arc<ParquetReadBudget>> {
+    fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
+        self.blob_parallelism = blob_parallelism;
+        self
+    }
+
+    fn parquet_read_budget(&self) -> crate::Result<Arc<ReadBudget>> {
         match &self.parquet_read_budget {
             Some(budget) => Ok(Arc::clone(budget)),
             None => configured_parquet_read_budget(self.table),
@@ -362,6 +395,7 @@ impl<'a> PaimonTableRead<'a> {
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
+        let blob_parallelism = self.blob_parallelism;
 
         Ok(Box::pin(async_stream::try_stream! {
             let mut workers = stream::iter(pairs.into_iter().map(|(before, after)| {
@@ -371,7 +405,8 @@ impl<'a> PaimonTableRead<'a> {
                 let parquet_read_budget = Arc::clone(&parquet_read_budget);
                 let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
                     let pair_read = PaimonTableRead::new(&table, read_type, data_predicates)
-                        .with_parquet_read_budget(parquet_read_budget);
+                        .with_parquet_read_budget(parquet_read_budget)
+                        .with_blob_parallelism(blob_parallelism);
                     let mut pair_stream = pair_read.to_diff_after_image_stream(&before, &after)?;
                     while let Some(batch) = pair_stream.next().await {
                         yield batch?;
@@ -446,7 +481,9 @@ impl<'a> PaimonTableRead<'a> {
         )
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))
-        .with_parquet_read_budget(Some(self.parquet_read_budget()?));
+        .with_blob_parallelism(self.blob_parallelism)
+        .with_parquet_read_budget(Some(self.parquet_read_budget()?))
+        .with_mosaic_prefetch(configured_mosaic_prefetch(self.table)?);
         let raw_stream = reader.read(&data_splits)?;
 
         Ok(Box::pin(async_stream::try_stream! {
@@ -505,6 +542,7 @@ impl<'a> PaimonTableRead<'a> {
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
+        let blob_parallelism = self.blob_parallelism;
 
         Ok(Box::pin(async_stream::try_stream! {
             let mut workers = stream::iter(pairs.into_iter().map(|(before, after)| {
@@ -514,7 +552,8 @@ impl<'a> PaimonTableRead<'a> {
                 let parquet_read_budget = Arc::clone(&parquet_read_budget);
                 let worker: ArrowRecordBatchStream = Box::pin(async_stream::try_stream! {
                     let pair_read = PaimonTableRead::new(&table, read_type, data_predicates)
-                        .with_parquet_read_budget(parquet_read_budget);
+                        .with_parquet_read_budget(parquet_read_budget)
+                        .with_blob_parallelism(blob_parallelism);
                     let mut pair_stream =
                         pair_read.to_audit_log_arrow_for_diff(&before, &after)?;
                     while let Some(batch) = pair_stream.next().await {
@@ -560,11 +599,13 @@ impl<'a> PaimonTableRead<'a> {
         let read_type_for_output = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
         let parquet_read_budget = self.parquet_read_budget()?;
+        let blob_parallelism = self.blob_parallelism;
 
         Ok(Box::pin(async_stream::try_stream! {
             let core_options = CoreOptions::new(table.schema().options());
             let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates)
-                .with_parquet_read_budget(parquet_read_budget);
+                .with_parquet_read_budget(parquet_read_budget)
+                .with_blob_parallelism(blob_parallelism);
             let before_stream =
                 pair_read.read_pk_sorted_for_diff_with_type(&before, &core_options, &diff_read_type)?;
             let after_stream =
@@ -646,11 +687,13 @@ impl<'a> PaimonTableRead<'a> {
         let before = before.to_vec();
         let after = after.to_vec();
         let parquet_read_budget = self.parquet_read_budget()?;
+        let blob_parallelism = self.blob_parallelism;
 
         Ok(Box::pin(async_stream::try_stream! {
             let core_options = CoreOptions::new(table.schema().options());
             let pair_read = PaimonTableRead::new(&table, diff_read_type.clone(), data_predicates)
-                .with_parquet_read_budget(parquet_read_budget);
+                .with_parquet_read_budget(parquet_read_budget)
+                .with_blob_parallelism(blob_parallelism);
             let before_stream = pair_read.read_pk_sorted_for_diff_with_type(
                 &before,
                 &core_options,
@@ -738,6 +781,7 @@ impl<'a> PaimonTableRead<'a> {
                 // a row-group permit across yielded batches can otherwise let
                 // the first side block the second side indefinitely.
                 parquet_read_budget: None,
+                mosaic_prefetch: configured_mosaic_prefetch(self.table)?,
             },
         );
         reader.read(splits)
@@ -959,6 +1003,7 @@ impl<'a> PaimonTableRead<'a> {
                     && core_options.deletion_vectors_merge_on_read())
                 .then_some(MAX_MERGE_INPUT_STREAMS),
                 parquet_read_budget: Some(self.parquet_read_budget()?),
+                mosaic_prefetch: configured_mosaic_prefetch(self.table)?,
             },
         );
         reader.read(splits)
@@ -984,7 +1029,9 @@ impl<'a> PaimonTableRead<'a> {
             self.table.rest_env().cloned(),
         )?
         .with_batch_size(Some(core_options.read_batch_size()?))
+        .with_blob_parallelism(self.blob_parallelism)
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
+        .with_mosaic_prefetch(configured_mosaic_prefetch(self.table)?)
         .with_read_timing(self.data_file_read_timing.clone());
         reader.read(data_splits)
     }
@@ -1006,7 +1053,9 @@ impl<'a> PaimonTableRead<'a> {
         )
         .with_file_index_read_enabled(core_options.file_index_read_enabled())
         .with_batch_size(Some(core_options.read_batch_size()?))
+        .with_blob_parallelism(self.blob_parallelism)
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
+        .with_mosaic_prefetch(configured_mosaic_prefetch(self.table)?)
         .with_read_timing(self.data_file_read_timing.clone());
         // The engine decoder filter is safe only on the plain append/raw path.
         // This constructor is also used by raw-convertible primary-key splits,
@@ -2185,8 +2234,46 @@ mod tests {
             ));
 
             let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new())
-                .with_parquet_read_budget(Arc::new(ParquetReadBudget::default()));
+                .with_parquet_read_budget(Arc::new(ReadBudget::default()));
             assert!(read.to_arrow(&[]).is_ok());
+        }
+    }
+
+    fn table_with_mosaic_prefetch_options(row_groups: &str, max_bytes: &str) -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("mosaic.read.prefetch-row-groups", row_groups)
+            .option("mosaic.read.prefetch-max-bytes", max_bytes);
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "mosaic_prefetch_t"),
+            "memory:/mosaic_prefetch_t".to_string(),
+            TableSchema::new(0, &schema.build().unwrap()),
+            None,
+        )
+    }
+
+    #[test]
+    fn test_mosaic_prefetch_options_come_from_table_options() {
+        let table = table_with_mosaic_prefetch_options("0", "16 mb");
+        assert_eq!(
+            configured_mosaic_prefetch(&table).unwrap(),
+            MosaicPrefetchOptions {
+                row_groups: 0,
+                max_bytes: 16 * 1024 * 1024,
+            }
+        );
+        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+        assert!(read.to_arrow(&[]).is_ok());
+
+        for (row_groups, max_bytes) in [("-1", "64 mb"), ("8", "0")] {
+            let table = table_with_mosaic_prefetch_options(row_groups, max_bytes);
+            let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
+            assert!(matches!(
+                read.to_arrow(&[]),
+                Err(crate::Error::DataInvalid { ref message, .. })
+                    if message.contains("mosaic.read.prefetch")
+            ));
         }
     }
 

@@ -19,10 +19,11 @@
 
 use super::data_file_reader::DataFileReader;
 use super::read_builder::split_scan_predicates;
-use super::table_read::configured_parquet_read_budget;
+use super::table_read::{configured_mosaic_prefetch, configured_parquet_read_budget};
 use super::{ArrowRecordBatchStream, Table};
+use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::partition::partition_array;
-use crate::arrow::{build_target_arrow_schema, ParquetReadBudget};
+use crate::arrow::{build_target_arrow_schema, ReadBudget};
 use crate::spec::{DataField, Predicate};
 use crate::{DataSplit, Error};
 use arrow_array::{RecordBatch, RecordBatchOptions};
@@ -36,8 +37,9 @@ pub(crate) struct FormatTableRead<'a> {
     read_type: Vec<DataField>,
     data_predicates: Vec<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
-    parquet_read_budget: Option<Arc<ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
     limit: Option<usize>,
+    blob_parallelism: usize,
 }
 
 impl<'a> FormatTableRead<'a> {
@@ -54,6 +56,7 @@ impl<'a> FormatTableRead<'a> {
             row_filter_factory: None,
             parquet_read_budget: None,
             limit,
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
         }
     }
 
@@ -82,12 +85,17 @@ impl<'a> FormatTableRead<'a> {
         self
     }
 
-    pub(crate) fn with_parquet_read_budget(mut self, budget: Arc<ParquetReadBudget>) -> Self {
+    pub(crate) fn with_parquet_read_budget(mut self, budget: Arc<ReadBudget>) -> Self {
         self.parquet_read_budget = Some(budget);
         self
     }
 
-    fn parquet_read_budget(&self) -> crate::Result<Arc<ParquetReadBudget>> {
+    pub(crate) fn with_blob_parallelism(mut self, blob_parallelism: usize) -> Self {
+        self.blob_parallelism = blob_parallelism;
+        self
+    }
+
+    fn parquet_read_budget(&self) -> crate::Result<Arc<ReadBudget>> {
         match &self.parquet_read_budget {
             Some(budget) => Ok(Arc::clone(budget)),
             None => configured_parquet_read_budget(self.table),
@@ -127,8 +135,10 @@ impl<'a> FormatTableRead<'a> {
         let schema_id = self.table.schema().id();
         let mut remaining = self.limit;
         let batch_size = Some(core_options.read_batch_size()?);
+        let mosaic_prefetch = configured_mosaic_prefetch(self.table)?;
         let row_filter_factory = self.row_filter_factory.clone();
         let parquet_read_budget = Some(self.parquet_read_budget()?);
+        let blob_parallelism = self.blob_parallelism;
 
         Ok(try_stream! {
             for split in splits {
@@ -145,7 +155,9 @@ impl<'a> FormatTableRead<'a> {
                     data_predicates.clone(),
                 )
                 .with_batch_size(batch_size)
-                .with_parquet_read_budget(parquet_read_budget.clone());
+                .with_blob_parallelism(blob_parallelism)
+                .with_parquet_read_budget(parquet_read_budget.clone())
+                .with_mosaic_prefetch(mosaic_prefetch);
                 if let Some(factory) = &row_filter_factory {
                     reader = reader.with_row_filter_factory(Arc::clone(factory));
                 }

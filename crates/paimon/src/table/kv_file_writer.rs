@@ -31,8 +31,8 @@ use crate::arrow::format::create_format_writer;
 use crate::io::FileIO;
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
-    extract_datum_from_arrow, AggregationConfig, BinaryRowBuilder, CoreOptions, DataFileMeta,
-    DataType, MergeEngine, PartialUpdateConfig, RowKind, EMPTY_SERIALIZED_ROW,
+    bucket_path_under, extract_datum_from_arrow, AggregationConfig, BinaryRowBuilder, CoreOptions,
+    DataFileMeta, DataType, MergeEngine, PartialUpdateConfig, RowKind, EMPTY_SERIALIZED_ROW,
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::prepared_files::PreparedFiles;
@@ -408,17 +408,11 @@ impl KeyValueFileWriter {
             write.file_ordinal,
             write.file_format,
         );
-        let bucket_dir = if self.config.partition_path.is_empty() {
-            format!(
-                "{}/bucket-{}",
-                self.config.table_location, self.config.bucket
-            )
-        } else {
-            format!(
-                "{}/{}/bucket-{}",
-                self.config.table_location, self.config.partition_path, self.config.bucket
-            )
-        };
+        let bucket_dir = bucket_path_under(
+            &self.config.table_location,
+            &self.config.partition_path,
+            self.config.bucket,
+        );
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
         let file_path = format!("{bucket_dir}/{file_name}");
         let output = self.file_io.new_output(&file_path)?;

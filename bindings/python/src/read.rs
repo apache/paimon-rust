@@ -16,14 +16,14 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::pyarrow::ToPyArrow;
 use futures::TryStreamExt;
 use paimon::spec::Predicate;
-use paimon::table::{DataSplit, IncrementalScanMode, RowRange, Table};
+use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
@@ -112,6 +112,7 @@ pub struct PyReadBuilder {
     filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
+    blob_parallelism: Option<usize>,
 }
 
 impl PyReadBuilder {
@@ -123,6 +124,7 @@ impl PyReadBuilder {
             filter: None,
             row_ranges: None,
             case_sensitive: true,
+            blob_parallelism: None,
         }
     }
 
@@ -168,6 +170,7 @@ impl PyReadBuilder {
             filter: None,
             row_ranges: None,
             case_sensitive: true,
+            blob_parallelism: None,
         })
     }
 }
@@ -182,6 +185,20 @@ impl PyReadBuilder {
     fn with_limit(mut slf: PyRefMut<'_, Self>, limit: usize) -> PyRefMut<'_, Self> {
         slf.limit = Some(limit);
         slf
+    }
+
+    /// Set the maximum number of concurrent BLOB range reads for this read.
+    fn with_blob_parallelism(
+        mut slf: PyRefMut<'_, Self>,
+        blob_parallelism: usize,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        if blob_parallelism == 0 {
+            return Err(PyValueError::new_err(
+                "blob_parallelism must be greater than zero",
+            ));
+        }
+        slf.blob_parallelism = Some(blob_parallelism);
+        Ok(slf)
     }
 
     /// Set whether column-name matching (projection and predicate resolution) is
@@ -256,6 +273,7 @@ impl PyReadBuilder {
             limit: self.limit,
             filter: self.filter.clone(),
             case_sensitive: self.case_sensitive,
+            blob_parallelism: self.blob_parallelism,
         }
     }
 }
@@ -378,39 +396,99 @@ pub struct PyTableRead {
     limit: Option<usize>,
     filter: Option<Predicate>,
     case_sensitive: bool,
+    blob_parallelism: Option<usize>,
+}
+
+impl PyTableRead {
+    fn read_stream(
+        &self,
+        py: Python<'_>,
+        splits: &Bound<'_, PyAny>,
+    ) -> PyResult<ArrowRecordBatchStream> {
+        let splits = extract_splits(splits)?;
+        py.detach(|| {
+            let mut builder = self.table.new_read_builder();
+            apply_read_config(
+                &mut builder,
+                &self.projection,
+                self.limit,
+                &self.filter,
+                self.case_sensitive,
+            )?;
+            if let Some(blob_parallelism) = self.blob_parallelism {
+                builder
+                    .with_blob_parallelism(blob_parallelism)
+                    .map_err(to_py_err)?;
+            }
+            // Validate config (e.g. projection) before the empty-splits fast
+            // path so an invalid projection fails consistently regardless of
+            // how many splits are passed.
+            let read = builder.new_read().map_err(to_py_err)?;
+            read.to_arrow(&splits).map_err(to_py_err)
+        })
+    }
 }
 
 #[pymethods]
 impl PyTableRead {
+    /// Lazily read the given splits as an iterator of PyArrow RecordBatches.
+    fn read_arrow(
+        &self,
+        py: Python<'_>,
+        splits: &Bound<'_, PyAny>,
+    ) -> PyResult<PyRecordBatchReader> {
+        Ok(PyRecordBatchReader {
+            stream: Mutex::new(self.read_stream(py, splits)?),
+        })
+    }
+
     /// Read the given splits into a list of PyArrow RecordBatches.
     fn read(&self, py: Python<'_>, splits: &Bound<'_, PyAny>) -> PyResult<Vec<Py<PyAny>>> {
-        let splits = extract_splits(splits)?;
+        let stream = self.read_stream(py, splits)?;
         let rt = runtime();
         let batches = py.detach(|| {
-            rt.block_on(async {
-                let mut builder = self.table.new_read_builder();
-                apply_read_config(
-                    &mut builder,
-                    &self.projection,
-                    self.limit,
-                    &self.filter,
-                    self.case_sensitive,
-                )?;
-                // Validate config (e.g. projection) before the empty-splits fast
-                // path so an invalid projection fails consistently regardless of
-                // how many splits are passed.
-                let read = builder.new_read().map_err(to_py_err)?;
-                if splits.is_empty() {
-                    return Ok(Vec::new());
-                }
-                let stream = read.to_arrow(&splits).map_err(to_py_err)?;
-                stream.try_collect::<Vec<_>>().await.map_err(to_py_err)
-            })
+            rt.block_on(stream.try_collect::<Vec<_>>())
+                .map_err(to_py_err)
         })?;
         batches
             .iter()
             .map(|batch| Ok(batch.to_pyarrow(py)?.unbind()))
             .collect()
+    }
+}
+
+#[pyclass(name = "RecordBatchReader", module = "pypaimon_rust.datafusion")]
+pub struct PyRecordBatchReader {
+    stream: Mutex<ArrowRecordBatchStream>,
+}
+
+impl PyRecordBatchReader {
+    fn next_batch(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        let batch = py.detach(|| {
+            let mut stream = self
+                .stream
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("native record batch reader lock poisoned"))?;
+            runtime().block_on(stream.try_next()).map_err(to_py_err)
+        })?;
+        batch
+            .map(|batch| Ok(batch.to_pyarrow(py)?.unbind()))
+            .transpose()
+    }
+}
+
+#[pymethods]
+impl PyRecordBatchReader {
+    fn read_next_batch(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.next_batch(py)
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.next_batch(py)
     }
 }
 

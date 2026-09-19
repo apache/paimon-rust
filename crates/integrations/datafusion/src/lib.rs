@@ -46,6 +46,7 @@ mod filter_pushdown;
 mod format_partition_analyze;
 mod format_partition_ddl;
 mod format_partition_repair;
+mod format_table_truncate;
 #[cfg(feature = "fulltext")]
 mod full_text_search;
 mod hybrid_search;

@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, Int32Array, Int64Array, LargeBinaryArray, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use axum::http::StatusCode;
 use futures::TryStreamExt;
@@ -132,7 +132,7 @@ fn blob_batch(ids: Vec<i32>, names: Vec<&str>, pictures: Vec<Vec<u8>>) -> Record
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", ArrowDataType::Int32, false),
         ArrowField::new("name", ArrowDataType::Utf8, true),
-        ArrowField::new("picture", ArrowDataType::Binary, true),
+        ArrowField::new("picture", ArrowDataType::LargeBinary, true),
     ]));
     let picture_refs = pictures
         .iter()
@@ -143,7 +143,7 @@ fn blob_batch(ids: Vec<i32>, names: Vec<&str>, pictures: Vec<Vec<u8>>) -> Record
         vec![
             Arc::new(Int32Array::from(ids)),
             Arc::new(StringArray::from(names)),
-            Arc::new(BinaryArray::from(picture_refs)),
+            Arc::new(LargeBinaryArray::from(picture_refs)),
         ],
     )
     .unwrap()
@@ -180,7 +180,7 @@ fn collect_blob_rows(batches: &[RecordBatch]) -> Vec<(i32, String, Option<Vec<u8
         let pictures = batch
             .column(2)
             .as_any()
-            .downcast_ref::<BinaryArray>()
+            .downcast_ref::<LargeBinaryArray>()
             .unwrap();
         for row in 0..batch.num_rows() {
             rows.push((

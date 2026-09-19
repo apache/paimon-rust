@@ -913,6 +913,9 @@ A partition the catalog holds at a custom location (the partition option `path`)
 read from that location yet: a scan that reaches it fails rather than reading the table
 directory in its place.
 
+No statement of this client writes rows into a Format Table. `INSERT`, `UPDATE`, `DELETE`
+and `MERGE INTO` are all refused, whether or not the catalog manages the partitions.
+
 ### SHOW PARTITIONS
 
 ```sql
@@ -1020,6 +1023,28 @@ listings and footer reads alike. Set it for the session:
 SET 'paimon.format-table.statistics.parallelism' = '16';
 ```
 
+### TRUNCATE TABLE
+
+```sql
+TRUNCATE TABLE paimon.my_db.events;
+TRUNCATE TABLE paimon.my_db.events PARTITION (dt = '2024-01-01');
+```
+
+Unlike the statements above, this works on any Format Table, including one that discovers
+its partitions from the directory layout. It deletes data files only: partition directories
+and catalog registrations stay. Every non-hidden file in a partition directory is deleted,
+whatever its extension, because other engines read those files too; staging entries such as
+`_temporary` are left alone.
+
+With catalog-managed partitions, the statement empties the registered partitions and
+reports zero statistics for each of them, replacing what the catalog holds. A directory
+nobody registered is not part of the table and is not touched. Without them, it empties the
+partition directories found below the table, and an unpartitioned table loses the data
+files in its table directory. `PARTITION (...)` must give values for a leading run of the
+partition keys, as in `ANALYZE TABLE`, but a column named without a value is rejected
+rather than read as every value. It is an error when no partition matches. A selected partition at a custom location fails the statement before
+anything is deleted.
+
 ## Procedures
 
 Use `CALL` to invoke built-in procedures. All procedures are under the `sys` namespace.
@@ -1077,7 +1102,7 @@ CALL sys.create_global_index(
   table => 'paimon.my_db.my_table',
   index_column => 'id',
   index_type => 'btree',
-  options => 'btree-index.block-size=64kb,btree-index.compression=zstd,btree-index.compression-level=1'
+  options => 'btree-index.block-size=64kb,btree-index.bloom-filter.enabled=true,btree-index.compression=zstd,btree-index.compression-level=1'
 );
 
 CALL sys.create_global_index(
@@ -1114,8 +1139,9 @@ row are indexed once. All three sorted index types accept
 are `btree-index.block-size`, `bitmap-index.dictionary-block-size`, or
 `multivalue-index.dictionary-block-size`, together with the corresponding
 `*.compression` (`none`, `zstd`, `lz4`, or `lzo`) and `*.compression-level`
-options. Per-call options override table options. Bitmap and multivalue global
-indexes use Java-compatible bitmap files.
+options. BTree additionally accepts `btree-index.bloom-filter.enabled` (default
+`false`) to accelerate equality and `IN` lookups. Per-call options override table
+options. Bitmap and multivalue global indexes use Java-compatible bitmap files.
 
 FM global indexes support character-string columns and exact byte-substring
 `contains`, `IS NULL`, and `IS NOT NULL` predicates. They use the
@@ -2404,6 +2430,7 @@ deletion vectors enabled.
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
 | `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, or FM global-index file range; falls back to legacy `btree-index.records-per-range`. |
 | `btree-index.block-size` | `64kb` | Target BTree data-block size. |
+| `btree-index.bloom-filter.enabled` | `false` | Writes a Bloom filter used to avoid BTree data-block reads for missing equality and `IN` keys. |
 | `btree-index.compression` | `none` | BTree block compression: `none`, `zstd`, `lz4`, or `lzo`. |
 | `btree-index.compression-level` | `1` | BTree compression level (used by codecs that support levels). |
 | `bitmap-index.dictionary-block-size` | `16kb` | Target bitmap dictionary-block size. |
@@ -2460,10 +2487,17 @@ the normal physical format without wrapping the writer.
 | `'sequence.field' = 'col'` | Sequence field used to determine which record wins during deduplication |
 | `'row-tracking.enabled' = 'true'` | Enable stable row ids |
 | `'data-evolution.enabled' = 'true'` | Enable data evolution (partial-column writes, row-level UPDATE/MERGE/DELETE) |
+| `'manifest.sidecar.enabled' = 'true'` | Write and read manifest block sidecars for partition, row-id, and bucket pruning; when unset, inherits `manifest-sort.enabled` |
 | `'global-index.enabled' = 'true'` | Enable global index metadata and reads |
 | `'deletion-vectors.enabled' = 'true'` | Enable deletion vectors |
 | `'deletion-vectors.merge-on-read' = 'true'` | Include and key-merge uncompacted level-0 files in DV-enabled deduplicate batch reads |
 | `'changelog-producer' = 'input'` | Changelog producer; primary-key tables support reads and writes in this mode |
+
+Manifest sidecars use the Java-compatible `<manifest-name>.avro.sidecar`
+format and are published through the manifest metadata's `_EXTRA_FILES` list.
+Missing, corrupt, unsupported, or mismatched sidecars fall back to reading the
+complete manifest. Entry filters and ADD/DELETE reconciliation still run after
+block selection.
 
 Cross-partition updates are not configured by an option: a primary-key table is
 in cross-partition update mode when `'bucket' = '-1'` and the primary key does

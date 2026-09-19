@@ -33,5 +33,7 @@ pub(crate) mod file_index_result;
 pub(crate) mod file_index_writer;
 #[allow(dead_code)]
 pub(crate) mod file_indexer_factory;
+#[allow(dead_code)]
+pub(crate) mod range_bitmap;
 
 pub use file_index_format::*;

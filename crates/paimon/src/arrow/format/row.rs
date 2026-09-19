@@ -31,14 +31,14 @@ use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-    Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, StringBuilder,
-    Time32MillisecondBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
-    TimestampNanosecondBuilder,
+    Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, LargeBinaryBuilder,
+    StringBuilder, Time32MillisecondBuilder, TimestampMicrosecondBuilder,
+    TimestampMillisecondBuilder, TimestampNanosecondBuilder,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, RecordBatch,
-    RecordBatchOptions, StringArray, StructArray, Time32MillisecondArray,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray,
+    MapArray, RecordBatch, RecordBatchOptions, StringArray, StructArray, Time32MillisecondArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -411,10 +411,8 @@ fn validate_arrow_type_for_row_field(
         | (ArrowDataType::Float32, DataType::Float(_))
         | (ArrowDataType::Float64, DataType::Double(_))
         | (ArrowDataType::Utf8, DataType::Char(_) | DataType::VarChar(_))
-        | (
-            ArrowDataType::Binary,
-            DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_),
-        )
+        | (ArrowDataType::Binary, DataType::Binary(_) | DataType::VarBinary(_))
+        | (ArrowDataType::LargeBinary, DataType::Blob(_))
         | (ArrowDataType::Date32, DataType::Date(_))
         | (ArrowDataType::Time32(TimeUnit::Millisecond), DataType::Time(_)) => true,
         (ArrowDataType::Struct(fields), DataType::Variant(_)) => is_variant_arrow_fields(fields),
@@ -671,9 +669,13 @@ fn write_field_value(
                 .value(row_idx)
                 .as_bytes(),
         ),
-        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_) => write_bytes(
+        DataType::Binary(_) | DataType::VarBinary(_) => write_bytes(
             out,
             downcast::<BinaryArray>(array, data_type)?.value(row_idx),
+        ),
+        DataType::Blob(_) => write_bytes(
+            out,
+            downcast::<LargeBinaryArray>(array, data_type)?.value(row_idx),
         ),
         DataType::Variant(_) => {
             let row = downcast::<StructArray>(array, data_type)?;
@@ -1168,6 +1170,7 @@ enum ColumnBuilder {
     F64(Float64Builder),
     String(StringBuilder),
     Binary(BinaryBuilder),
+    LargeBinary(LargeBinaryBuilder),
     Date(Date32Builder),
     Time(Time32MillisecondBuilder),
     TimestampMs(TimestampMillisecondBuilder),
@@ -1207,9 +1210,8 @@ impl ColumnBuilder {
             DataType::Float(_) => Self::F32(Float32Builder::with_capacity(capacity)),
             DataType::Double(_) => Self::F64(Float64Builder::with_capacity(capacity)),
             DataType::Char(_) | DataType::VarChar(_) => Self::String(StringBuilder::new()),
-            DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_) => {
-                Self::Binary(BinaryBuilder::new())
-            }
+            DataType::Binary(_) | DataType::VarBinary(_) => Self::Binary(BinaryBuilder::new()),
+            DataType::Blob(_) => Self::LargeBinary(LargeBinaryBuilder::new()),
             DataType::Variant(_) => Self::Row {
                 fields: variant_arrow_fields(),
                 columns: vec![
@@ -1308,6 +1310,7 @@ impl ColumnBuilder {
             Self::F64(b) => b.append_null(),
             Self::String(b) => b.append_null(),
             Self::Binary(b) => b.append_null(),
+            Self::LargeBinary(b) => b.append_null(),
             Self::Date(b) => b.append_null(),
             Self::Time(b) => b.append_null(),
             Self::TimestampMs(b) => b.append_null(),
@@ -1363,9 +1366,10 @@ impl ColumnBuilder {
                 })?;
                 b.append_value(value);
             }
-            (Self::Binary(b), DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_)) => {
+            (Self::Binary(b), DataType::Binary(_) | DataType::VarBinary(_)) => {
                 b.append_value(input.read_bytes()?);
             }
+            (Self::LargeBinary(b), DataType::Blob(_)) => b.append_value(input.read_bytes()?),
             (Self::Date(b), DataType::Date(_)) => b.append_value(input.read_i32()?),
             (Self::Time(b), DataType::Time(_)) => b.append_value(input.read_i32()?),
             (Self::TimestampMs(b), DataType::Timestamp(_) | DataType::LocalZonedTimestamp(_)) => {
@@ -1492,6 +1496,7 @@ impl ColumnBuilder {
             Self::F64(mut b) => Arc::new(b.finish()),
             Self::String(mut b) => Arc::new(b.finish()),
             Self::Binary(mut b) => Arc::new(b.finish()),
+            Self::LargeBinary(mut b) => Arc::new(b.finish()),
             Self::Date(mut b) => Arc::new(b.finish()),
             Self::Time(mut b) => Arc::new(b.finish()),
             Self::TimestampMs(mut b) => Arc::new(b.finish()),
@@ -2335,9 +2340,9 @@ mod tests {
     use crate::btree::test_util::BytesFileRead;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        ArrayType, BigIntType, BooleanType, DataType, DateType, Datum, DecimalType, DoubleType,
-        FloatType, IntType, MapType, MultisetType, Predicate, PredicateOperator, RowType, TimeType,
-        TimestampType, VarBinaryType, VarCharType, VariantType,
+        ArrayType, BigIntType, BlobType, BooleanType, DataType, DateType, Datum, DecimalType,
+        DoubleType, FloatType, IntType, MapType, MultisetType, Predicate, PredicateOperator,
+        RowType, TimeType, TimestampType, VarBinaryType, VarCharType, VariantType,
     };
     use crate::variant::GenericVariant;
     use futures::TryStreamExt;
@@ -2634,6 +2639,68 @@ mod tests {
             .unwrap();
         assert!(names.is_null(0));
         assert_eq!(names.value(1), "ccc");
+    }
+
+    #[tokio::test]
+    async fn row_writer_reader_preserves_binary_and_large_binary_types() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/row-binary-types/data.row";
+        let fields = vec![
+            DataField::new(
+                0,
+                "bytes".to_string(),
+                DataType::VarBinary(
+                    VarBinaryType::try_new(true, VarBinaryType::MAX_LENGTH).unwrap(),
+                ),
+            ),
+            DataField::new(1, "blob".to_string(), DataType::Blob(BlobType::new())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let output = file_io.new_output(path).unwrap();
+        let mut writer = RowFormatWriter::new(&output, schema.clone(), fields.clone(), 1)
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BinaryArray::from(vec![Some(b"bytes".as_slice()), None])),
+                Arc::new(LargeBinaryArray::from(vec![Some(b"blob".as_slice()), None])),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        Box::new(writer).close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let batches = RowFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone())),
+                bytes.len() as u64,
+                &fields,
+                None,
+                Some(8),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = &batches[0];
+        let binary = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let blob = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(binary.value(0), b"bytes");
+        assert!(binary.is_null(1));
+        assert_eq!(blob.value(0), b"blob");
+        assert!(blob.is_null(1));
     }
 
     #[tokio::test]

@@ -26,6 +26,7 @@ use super::incremental_scan::{IncrementalScan, IncrementalScanMode};
 use super::partition_filter::PartitionFilter;
 use super::table_read::{configured_parquet_read_budget, TableRead};
 use super::{Table, TableScan};
+use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::{Error, Result};
@@ -237,12 +238,28 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
+    /// Set the maximum number of concurrent BLOB range reads for the resulting read.
+    pub fn with_blob_parallelism(&mut self, blob_parallelism: usize) -> Result<&mut Self> {
+        if blob_parallelism == 0 {
+            return Err(Error::DataInvalid {
+                message: "BLOB read parallelism must be greater than zero".to_string(),
+                source: None,
+            });
+        }
+        match &mut self.0 {
+            ReadBuilderKind::Paimon(builder) => {
+                builder.with_blob_parallelism(blob_parallelism);
+            }
+            ReadBuilderKind::Format(builder) => {
+                builder.with_blob_parallelism(blob_parallelism);
+            }
+        }
+        Ok(self)
+    }
+
     /// Inject a Parquet budget shared with sibling scan partitions.
     #[doc(hidden)]
-    pub fn with_parquet_read_budget(
-        &mut self,
-        budget: Arc<crate::arrow::ParquetReadBudget>,
-    ) -> &mut Self {
+    pub fn with_parquet_read_budget(&mut self, budget: Arc<crate::arrow::ReadBudget>) -> &mut Self {
         match &mut self.0 {
             ReadBuilderKind::Paimon(builder) => {
                 builder.with_parquet_read_budget(budget);
@@ -316,7 +333,8 @@ struct PaimonReadBuilder<'a> {
     /// Kept apart so neither setter discards the other's constraint.
     derived_row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
-    parquet_read_budget: Option<Arc<crate::arrow::ParquetReadBudget>>,
+    parquet_read_budget: Option<Arc<crate::arrow::ReadBudget>>,
+    blob_parallelism: usize,
 }
 
 impl<'a> PaimonReadBuilder<'a> {
@@ -331,6 +349,7 @@ impl<'a> PaimonReadBuilder<'a> {
             derived_row_ranges: None,
             case_sensitive: true,
             parquet_read_budget: None,
+            blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
         }
     }
 
@@ -463,11 +482,13 @@ impl<'a> PaimonReadBuilder<'a> {
         self
     }
 
-    fn with_parquet_read_budget(
-        &mut self,
-        budget: Arc<crate::arrow::ParquetReadBudget>,
-    ) -> &mut Self {
+    fn with_parquet_read_budget(&mut self, budget: Arc<crate::arrow::ReadBudget>) -> &mut Self {
         self.parquet_read_budget = Some(budget);
+        self
+    }
+
+    fn with_blob_parallelism(&mut self, blob_parallelism: usize) -> &mut Self {
+        self.blob_parallelism = blob_parallelism;
         self
     }
 
@@ -531,10 +552,9 @@ impl<'a> PaimonReadBuilder<'a> {
             Some(budget) => Arc::clone(budget),
             None => configured_parquet_read_budget(self.table)?,
         };
-        Ok(
-            TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
-                .with_parquet_read_budget(parquet_read_budget),
-        )
+        TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
+            .with_parquet_read_budget(parquet_read_budget)
+            .with_blob_parallelism(self.blob_parallelism)
     }
 
     /// Resolve the effective read type, deferring projection name resolution to

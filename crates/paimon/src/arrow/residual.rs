@@ -50,8 +50,9 @@ use crate::Error;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array,
     FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-    LargeListArray, ListArray, RecordBatch, Scalar, StringArray, Time32MillisecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    LargeBinaryArray, LargeListArray, ListArray, RecordBatch, Scalar, StringArray,
+    Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray,
 };
 use arrow_ord::cmp::{
     eq as arrow_eq, gt as arrow_gt, gt_eq as arrow_gt_eq, lt as arrow_lt, lt_eq as arrow_lt_eq,
@@ -1047,8 +1048,14 @@ pub(crate) fn literal_scalar_for_arrow_filter(
             Datum::String(value) => Arc::new(StringArray::new_scalar(value.as_str()).into_inner()),
             _ => return Ok(None),
         },
-        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_) => match literal {
+        DataType::Binary(_) | DataType::VarBinary(_) => match literal {
             Datum::Bytes(value) => Arc::new(BinaryArray::new_scalar(value.as_slice()).into_inner()),
+            _ => return Ok(None),
+        },
+        DataType::Blob(_) => match literal {
+            Datum::Bytes(value) => {
+                Arc::new(LargeBinaryArray::new_scalar(value.as_slice()).into_inner())
+            }
             _ => return Ok(None),
         },
         DataType::Date(_) => match literal {
@@ -1519,6 +1526,21 @@ mod tests {
         assert_eq!(
             mask.iter().collect::<Vec<_>>(),
             vec![Some(true), Some(false), Some(false), Some(true)]
+        );
+    }
+
+    #[test]
+    fn test_blob_literal_uses_large_binary_scalar() {
+        let scalar = literal_scalar_for_arrow_filter(
+            &Datum::Bytes(b"blob".to_vec()),
+            &DataType::Blob(crate::spec::BlobType::new()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            scalar.get().0.data_type(),
+            &arrow_schema::DataType::LargeBinary
         );
     }
 

@@ -31,9 +31,9 @@ use crate::variant::{
 use crate::{Error, Result};
 use arrow_array::{
     new_null_array, Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
-    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray,
-    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
+    ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields, TimeUnit};
@@ -1002,7 +1002,7 @@ fn array_from_values(values: &[Option<ShreddedValue>], data_type: &DataType) -> 
                 })
                 .collect::<Vec<_>>(),
         ))),
-        DataType::VarBinary(_) | DataType::Binary(_) | DataType::Blob(_) => {
+        DataType::VarBinary(_) | DataType::Binary(_) => {
             let values = values
                 .iter()
                 .map(|value| match value {
@@ -1011,6 +1011,16 @@ fn array_from_values(values: &[Option<ShreddedValue>], data_type: &DataType) -> 
                 })
                 .collect::<Vec<_>>();
             Ok(Arc::new(BinaryArray::from(values)))
+        }
+        DataType::Blob(_) => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    Some(ShreddedValue::Binary(v)) => Some(v.as_slice()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            Ok(Arc::new(LargeBinaryArray::from(values)))
         }
         DataType::Date(_) => Ok(Arc::new(Date32Array::from(
             values
@@ -1196,13 +1206,16 @@ fn value_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Optio
                 .value(row)
                 .to_string(),
         )),
-        DataType::VarBinary(_) | DataType::Binary(_) | DataType::Blob(_) => {
-            Some(ShreddedValue::Binary(
-                downcast_array::<BinaryArray>(array, "Binary")?
-                    .value(row)
-                    .to_vec(),
-            ))
-        }
+        DataType::VarBinary(_) | DataType::Binary(_) => Some(ShreddedValue::Binary(
+            downcast_array::<BinaryArray>(array, "Binary")?
+                .value(row)
+                .to_vec(),
+        )),
+        DataType::Blob(_) => Some(ShreddedValue::Binary(
+            downcast_array::<LargeBinaryArray>(array, "LargeBinary")?
+                .value(row)
+                .to_vec(),
+        )),
         DataType::Date(_) => Some(ShreddedValue::Date32(
             downcast_array::<Date32Array>(array, "Date")?.value(row),
         )),
@@ -1323,7 +1336,7 @@ fn null_buffer(validities: Vec<bool>) -> NullBuffer {
 mod tests {
     use super::*;
     use crate::arrow::variant_arrow_type;
-    use crate::spec::{variant_extraction_row, IntType, VarCharType, VariantType};
+    use crate::spec::{variant_extraction_row, BlobType, IntType, VarCharType, VariantType};
 
     fn variant_array_for_test(values: &[GenericVariant]) -> ArrayRef {
         let value_items = values
@@ -1349,6 +1362,20 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn blob_typed_values_use_large_binary() {
+        let data_type = DataType::Blob(BlobType::new());
+        let values = vec![Some(ShreddedValue::Binary(b"blob".to_vec())), None];
+        let array = array_from_values(&values, &data_type).unwrap();
+
+        assert_eq!(array.data_type(), &ArrowDataType::LargeBinary);
+        assert_eq!(
+            value_at(array.as_ref(), 0, &data_type).unwrap(),
+            Some(ShreddedValue::Binary(b"blob".to_vec()))
+        );
+        assert_eq!(value_at(array.as_ref(), 1, &data_type).unwrap(), None);
     }
 
     #[test]

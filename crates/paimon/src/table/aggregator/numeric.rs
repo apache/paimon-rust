@@ -42,11 +42,12 @@ use std::sync::Arc;
 
 use arrow_array::builder::Decimal128Builder;
 use arrow_array::{
-    Array, ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, StringArray, Time32MillisecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+    Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray,
 };
-use arrow_schema::TimeUnit;
+use arrow_schema::{DataType as ArrowDataType, TimeUnit};
 
 use super::{unsupported_type_error, FieldAggregator};
 use crate::spec::DataType;
@@ -386,6 +387,7 @@ impl FieldAggregator for ProductAgg {
 /// `None` means "no non-null value seen yet for the current group".
 #[derive(Debug)]
 enum MinMaxState {
+    Bool(Option<bool>),
     I8(Option<i8>),
     I16(Option<i16>),
     I32(Option<i32>),
@@ -401,11 +403,20 @@ enum MinMaxState {
     /// Paimon `TIME` is encoded as Arrow `Time32(Millisecond)` regardless of
     /// declared precision, so a single accumulator variant suffices.
     Time32Ms(Option<i32>),
+    /// Covers `TIMESTAMP` and `TIMESTAMP WITH LOCAL TIME ZONE`, which Java
+    /// compares through the same `Timestamp#compareTo` branch. `timezone` is
+    /// `Some("UTC")` for the latter, mirroring `paimon_type_to_arrow`, and has to
+    /// be carried here because the result array must still match the field's
+    /// Arrow type.
     Timestamp {
         unit: TimeUnit,
+        timezone: Option<Arc<str>>,
         acc: Option<i64>,
     },
     Utf8(Option<String>),
+    /// `BINARY` and `VARBINARY`. Not `BLOB`, which Arrow also maps to `Binary`
+    /// but Java's `TypeCheckUtils#isComparable` excludes.
+    Binary(Option<Vec<u8>>),
 }
 
 fn make_minmax_state(
@@ -414,6 +425,7 @@ fn make_minmax_state(
     op: &str,
 ) -> crate::Result<MinMaxState> {
     Ok(match data_type {
+        DataType::Boolean(_) => MinMaxState::Bool(None),
         DataType::TinyInt(_) => MinMaxState::I8(None),
         DataType::SmallInt(_) => MinMaxState::I16(None),
         DataType::Int(_) => MinMaxState::I32(None),
@@ -429,11 +441,35 @@ fn make_minmax_state(
         DataType::Time(_) => MinMaxState::Time32Ms(None),
         DataType::Timestamp(t) => MinMaxState::Timestamp {
             unit: timestamp_time_unit(t.precision())?,
+            timezone: arrow_timestamp_timezone(field_name, data_type)?,
+            acc: None,
+        },
+        DataType::LocalZonedTimestamp(t) => MinMaxState::Timestamp {
+            unit: timestamp_time_unit(t.precision())?,
+            timezone: arrow_timestamp_timezone(field_name, data_type)?,
             acc: None,
         },
         DataType::Char(_) | DataType::VarChar(_) => MinMaxState::Utf8(None),
+        DataType::Binary(_) | DataType::VarBinary(_) => MinMaxState::Binary(None),
         other => return Err(unsupported_type_error(op, field_name, other)),
     })
+}
+
+/// Read the Arrow timezone back out of the very mapping the read schema is built
+/// with, so a min/max result array cannot drift from its field's Arrow type.
+fn arrow_timestamp_timezone(
+    field_name: &str,
+    data_type: &DataType,
+) -> crate::Result<Option<Arc<str>>> {
+    match crate::arrow::paimon_type_to_arrow(data_type)? {
+        ArrowDataType::Timestamp(_, timezone) => Ok(timezone),
+        other => Err(crate::Error::DataInvalid {
+            message: format!(
+                "Aggregate column '{field_name}' maps to Arrow type {other:?}, expected a timestamp"
+            ),
+            source: None,
+        }),
+    }
 }
 
 fn timestamp_time_unit(precision: u32) -> crate::Result<TimeUnit> {
@@ -525,6 +561,36 @@ fn agg_minmax(
         }};
     }
     match state {
+        MinMaxState::Bool(acc) => {
+            // Java compares BOOLEAN with `Boolean.compare`, i.e. false < true
+            // (`InternalRowUtils#compare`), which is what Rust's `bool: Ord` does.
+            let v = downcast::<BooleanArray>(array, field_name)?.value(row_idx);
+            *acc = Some(match acc.take() {
+                None => v,
+                Some(prev) => {
+                    // Ordering rather than `<`/`>`: comparing bools with order
+                    // operators is what `clippy::bool_comparison` objects to, and
+                    // this keeps the tie handling identical to the other arms.
+                    let ordering = v.cmp(&prev);
+                    let take_new = if keep_smaller {
+                        if reversed {
+                            ordering.is_lt()
+                        } else {
+                            ordering.is_le()
+                        }
+                    } else if reversed {
+                        ordering.is_ge()
+                    } else {
+                        ordering.is_gt()
+                    };
+                    if take_new {
+                        v
+                    } else {
+                        prev
+                    }
+                }
+            });
+        }
         MinMaxState::I8(acc) => update_primitive!(acc, Int8Array),
         MinMaxState::I16(acc) => update_primitive!(acc, Int16Array),
         MinMaxState::I32(acc) => update_primitive!(acc, Int32Array),
@@ -534,7 +600,7 @@ fn agg_minmax(
         MinMaxState::Decimal128 { acc, .. } => update_primitive!(acc, Decimal128Array),
         MinMaxState::Date32(acc) => update_primitive!(acc, Date32Array),
         MinMaxState::Time32Ms(acc) => update_primitive!(acc, Time32MillisecondArray),
-        MinMaxState::Timestamp { unit, acc } => match unit {
+        MinMaxState::Timestamp { unit, acc, .. } => match unit {
             TimeUnit::Millisecond => update_primitive!(acc, TimestampMillisecondArray),
             TimeUnit::Microsecond => update_primitive!(acc, TimestampMicrosecondArray),
             TimeUnit::Nanosecond => update_primitive!(acc, TimestampNanosecondArray),
@@ -571,12 +637,39 @@ fn agg_minmax(
                 }
             });
         }
+        MinMaxState::Binary(acc) => {
+            // Java's `byteArrayCompare` is unsigned lexicographic with a length
+            // tiebreak, which is exactly `[u8]: Ord`.
+            let v = downcast::<BinaryArray>(array, field_name)?.value(row_idx);
+            *acc = Some(match acc.take() {
+                None => v.to_vec(),
+                Some(prev) => {
+                    let take_new = if keep_smaller {
+                        if reversed {
+                            v < prev.as_slice()
+                        } else {
+                            v <= prev.as_slice()
+                        }
+                    } else if reversed {
+                        v >= prev.as_slice()
+                    } else {
+                        v > prev.as_slice()
+                    };
+                    if take_new {
+                        v.to_vec()
+                    } else {
+                        prev
+                    }
+                }
+            });
+        }
     }
     Ok(())
 }
 
 fn minmax_result(state: &MinMaxState, agg_name: &str, field_name: &str) -> crate::Result<ArrayRef> {
     Ok(match state {
+        MinMaxState::Bool(acc) => Arc::new(BooleanArray::from(vec![*acc])),
         MinMaxState::I8(acc) => Arc::new(Int8Array::from(vec![*acc])),
         MinMaxState::I16(acc) => Arc::new(Int16Array::from(vec![*acc])),
         MinMaxState::I32(acc) => Arc::new(Int32Array::from(vec![*acc])),
@@ -590,10 +683,22 @@ fn minmax_result(state: &MinMaxState, agg_name: &str, field_name: &str) -> crate
         } => decimal_array(*precision, *scale, *acc, agg_name, field_name)?,
         MinMaxState::Date32(acc) => Arc::new(Date32Array::from(vec![*acc])),
         MinMaxState::Time32Ms(acc) => Arc::new(Time32MillisecondArray::from(vec![*acc])),
-        MinMaxState::Timestamp { unit, acc } => match unit {
-            TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from(vec![*acc])),
-            TimeUnit::Microsecond => Arc::new(TimestampMicrosecondArray::from(vec![*acc])),
-            TimeUnit::Nanosecond => Arc::new(TimestampNanosecondArray::from(vec![*acc])),
+        MinMaxState::Timestamp {
+            unit,
+            timezone,
+            acc,
+        } => match unit {
+            // `with_timezone_opt` keeps the result array's Arrow type equal to the
+            // field's, which `RecordBatch::try_new` checks.
+            TimeUnit::Millisecond => Arc::new(
+                TimestampMillisecondArray::from(vec![*acc]).with_timezone_opt(timezone.clone()),
+            ),
+            TimeUnit::Microsecond => Arc::new(
+                TimestampMicrosecondArray::from(vec![*acc]).with_timezone_opt(timezone.clone()),
+            ),
+            TimeUnit::Nanosecond => Arc::new(
+                TimestampNanosecondArray::from(vec![*acc]).with_timezone_opt(timezone.clone()),
+            ),
             other => {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
@@ -604,11 +709,13 @@ fn minmax_result(state: &MinMaxState, agg_name: &str, field_name: &str) -> crate
             }
         },
         MinMaxState::Utf8(acc) => Arc::new(StringArray::from(vec![acc.clone()])),
+        MinMaxState::Binary(acc) => Arc::new(BinaryArray::from_opt_vec(vec![acc.as_deref()])),
     })
 }
 
 fn reset_minmax(state: &mut MinMaxState) {
     match state {
+        MinMaxState::Bool(acc) => *acc = None,
         MinMaxState::I8(acc) => *acc = None,
         MinMaxState::I16(acc) => *acc = None,
         MinMaxState::I32(acc) => *acc = None,
@@ -620,6 +727,7 @@ fn reset_minmax(state: &mut MinMaxState) {
         MinMaxState::Time32Ms(acc) => *acc = None,
         MinMaxState::Timestamp { acc, .. } => *acc = None,
         MinMaxState::Utf8(acc) => *acc = None,
+        MinMaxState::Binary(acc) => *acc = None,
     }
 }
 
@@ -808,8 +916,9 @@ fn decimal_array(
 mod tests {
     use super::*;
     use crate::spec::{
-        BigIntType, CharType, DateType, DecimalType, DoubleType, FloatType, IntType, SmallIntType,
-        TimeType, TimestampType, TinyIntType, VarCharType,
+        BigIntType, BinaryType, CharType, DateType, DecimalType, DoubleType, FloatType, IntType,
+        LocalZonedTimestampType, SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType,
+        VarCharType,
     };
     use arrow_array::builder::Decimal128Builder;
 
@@ -838,6 +947,24 @@ mod tests {
             None
         } else {
             Some(a.value(0))
+        }
+    }
+
+    fn collect_bool(arr: ArrayRef) -> Option<bool> {
+        let a = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+        if a.is_null(0) {
+            None
+        } else {
+            Some(a.value(0))
+        }
+    }
+
+    fn collect_binary(arr: ArrayRef) -> Option<Vec<u8>> {
+        let a = arr.as_any().downcast_ref::<BinaryArray>().unwrap();
+        if a.is_null(0) {
+            None
+        } else {
+            Some(a.value(0).to_vec())
         }
     }
 
@@ -1260,10 +1387,80 @@ mod tests {
 
     #[test]
     fn test_min_rejects_unsupported_type() {
-        // Boolean has no <, > defined for min/max in Paimon basic mode.
-        let err =
-            MinAgg::new("v", &DataType::Boolean(crate::spec::BooleanType::new())).unwrap_err();
+        // Java's `TypeCheckUtils#isComparable` rejects exactly MAP, MULTISET, ROW,
+        // ARRAY, VECTOR, VARIANT and BLOB. BINARY and VARBINARY remain comparable,
+        // while BLOB is intentionally rejected even though it is represented as LargeBinary.
+        let err = MinAgg::new("v", &DataType::Blob(crate::spec::BlobType::new())).unwrap_err();
         assert!(matches!(err, crate::Error::ConfigInvalid { message } if message.contains("min")));
+    }
+
+    #[test]
+    fn test_min_max_boolean() {
+        // `Boolean.compare` in Java's `InternalRowUtils#compare`: false < true.
+        let arr = BooleanArray::from(vec![Some(true), Some(false), Some(true)]);
+        let mut min = min_agg(DataType::Boolean(crate::spec::BooleanType::new()));
+        let mut max = max_agg(DataType::Boolean(crate::spec::BooleanType::new()));
+        for i in 0..arr.len() {
+            min.agg(&arr, i).unwrap();
+            max.agg(&arr, i).unwrap();
+        }
+        assert_eq!(collect_bool(min.result().unwrap()), Some(false));
+        assert_eq!(collect_bool(max.result().unwrap()), Some(true));
+    }
+
+    #[test]
+    fn test_min_max_binary_compares_bytes_as_unsigned() {
+        // `byteArrayCompare` masks with 0xff, so 0x80 is above 0x7f, and a prefix
+        // sorts before the longer value it prefixes.
+        let arr = BinaryArray::from_opt_vec(vec![
+            Some(&[0x7fu8, 0x01][..]),
+            Some(&[0x80u8][..]),
+            Some(&[0x7fu8][..]),
+        ]);
+        for dt in [
+            DataType::Binary(BinaryType::new(2).unwrap()),
+            DataType::VarBinary(VarBinaryType::new(8).unwrap()),
+        ] {
+            let mut min = min_agg(dt.clone());
+            let mut max = max_agg(dt);
+            for i in 0..arr.len() {
+                min.agg(&arr, i).unwrap();
+                max.agg(&arr, i).unwrap();
+            }
+            assert_eq!(collect_binary(min.result().unwrap()), Some(vec![0x7f]));
+            assert_eq!(collect_binary(max.result().unwrap()), Some(vec![0x80]));
+        }
+    }
+
+    #[test]
+    fn test_min_max_local_zoned_timestamp_keeps_its_arrow_timezone() {
+        let dt = DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap());
+        let arr = TimestampMillisecondArray::from(vec![Some(30), Some(10), Some(20)])
+            .with_timezone_opt(Some("UTC"));
+        let mut min = min_agg(dt.clone());
+        let mut max = max_agg(dt.clone());
+        for i in 0..arr.len() {
+            min.agg(&arr, i).unwrap();
+            max.agg(&arr, i).unwrap();
+        }
+        let min_result = min.result().unwrap();
+        assert_eq!(
+            min_result
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .value(0),
+            10
+        );
+
+        // The trap: an accumulator that dropped the timezone still holds the right
+        // number, but the field's Arrow type no longer matches and the batch the
+        // merge engine builds is rejected.
+        let arrow_type = crate::arrow::paimon_type_to_arrow(&dt).unwrap();
+        assert_eq!(min_result.data_type(), &arrow_type);
+        let schema =
+            arrow_schema::Schema::new(vec![arrow_schema::Field::new("v", arrow_type, true)]);
+        arrow_array::RecordBatch::try_new(Arc::new(schema), vec![max.result().unwrap()]).unwrap();
     }
 
     #[test]

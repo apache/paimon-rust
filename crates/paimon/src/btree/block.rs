@@ -71,6 +71,11 @@ impl BlockCompressionType {
 /// Compress a Java Paimon block, including the outer uncompressed-size varint
 /// and the LZ4/LZO codec envelope when applicable. Compression is retained only
 /// when it saves at least 12.5%, matching Java's block writer.
+///
+/// The varint belongs to the SST and bitmap-index *block formats*, not to the
+/// codec: Java writes it in `SstFileWriter#writeBlock` and
+/// `BitmapGlobalIndexFormat#encodeBlock`. Formats that store `BlockCompressor`
+/// output verbatim want [`compress_codec_block`] instead.
 pub(crate) fn compress_block(
     data: &[u8],
     compression_type: BlockCompressionType,
@@ -80,25 +85,57 @@ pub(crate) fn compress_block(
         return Ok((Cow::Borrowed(data), BlockCompressionType::None));
     }
 
+    let mut encoded = Vec::with_capacity(5);
+    encode_var_int(&mut encoded, block_length(data.len())?)?;
+    append_codec_envelope(&mut encoded, data, compression_type, compression_level)?;
+    Ok(retain_if_smaller(encoded, data, compression_type))
+}
+
+/// Compress a block the way a format that stores `BlockCompressor` output
+/// verbatim expects: the LZ4/LZO codec header when applicable, and no outer
+/// uncompressed-size varint. Java's `FMIndexFile#writeBlock` stores the
+/// compressor's bytes unchanged and records `storedLength = compressedLength`.
+pub(crate) fn compress_codec_block(
+    data: &[u8],
+    compression_type: BlockCompressionType,
+    compression_level: i32,
+) -> io::Result<(Cow<'_, [u8]>, BlockCompressionType)> {
+    if compression_type == BlockCompressionType::None {
+        return Ok((Cow::Borrowed(data), BlockCompressionType::None));
+    }
+
+    let mut encoded = Vec::new();
+    append_codec_envelope(&mut encoded, data, compression_type, compression_level)?;
+    Ok(retain_if_smaller(encoded, data, compression_type))
+}
+
+fn block_length(len: usize) -> io::Result<i32> {
+    i32::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Block is larger than i32::MAX"))
+}
+
+/// Append what Java's `BlockCompressor#compress` writes: for LZ4 and LZO the
+/// `[le32 compressedLength][le32 srcLen]` header and then the payload, for ZSTD
+/// the bare frame.
+fn append_codec_envelope(
+    encoded: &mut Vec<u8>,
+    data: &[u8],
+    compression_type: BlockCompressionType,
+    compression_level: i32,
+) -> io::Result<()> {
     let payload = match compression_type {
-        BlockCompressionType::None => unreachable!("handled above"),
+        BlockCompressionType::None => unreachable!("callers handle None"),
         BlockCompressionType::Zstd => zstd::bulk::compress(data, compression_level)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
         BlockCompressionType::Lz4 => lz4_flex::block::compress(data),
         BlockCompressionType::Lzo => lzokay_native::compress(data)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
     };
-    let mut encoded = Vec::with_capacity(13 + payload.len());
-    encode_var_int(
-        &mut encoded,
-        i32::try_from(data.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "Block is larger than i32::MAX")
-        })?,
-    )?;
     if matches!(
         compression_type,
         BlockCompressionType::Lz4 | BlockCompressionType::Lzo
     ) {
+        encoded.reserve(8 + payload.len());
         encoded.extend_from_slice(
             &i32::try_from(payload.len())
                 .map_err(|_| {
@@ -109,51 +146,36 @@ pub(crate) fn compress_block(
                 })?
                 .to_le_bytes(),
         );
-        encoded.extend_from_slice(
-            &i32::try_from(data.len())
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Block is larger than i32::MAX")
-                })?
-                .to_le_bytes(),
-        );
+        encoded.extend_from_slice(&block_length(data.len())?.to_le_bytes());
+    } else {
+        encoded.reserve(payload.len());
     }
     encoded.extend_from_slice(&payload);
+    Ok(())
+}
+
+/// Java keeps the compressed form only when it saves at least 12.5%; both
+/// `SstFileWriter#writeBlock` and `FMIndexFile#writeBlock` compare against the
+/// bytes they are about to store, so each caller applies this to its own output.
+fn retain_if_smaller<'a>(
+    encoded: Vec<u8>,
+    data: &'a [u8],
+    compression_type: BlockCompressionType,
+) -> (Cow<'a, [u8]>, BlockCompressionType) {
     if encoded.len() < data.len() - (data.len() / 8) {
-        Ok((Cow::Owned(encoded), compression_type))
+        (Cow::Owned(encoded), compression_type)
     } else {
-        Ok((Cow::Borrowed(data), BlockCompressionType::None))
+        (Cow::Borrowed(data), BlockCompressionType::None)
     }
 }
 
 /// Decode the payload written by [`compress_block`] or Java's corresponding
-/// block compressors.
+/// block compressors: an uncompressed-size varint followed by the codec block.
 pub(crate) fn decompress_block(
     data: &[u8],
     compression_type: BlockCompressionType,
 ) -> io::Result<Vec<u8>> {
-    decompress_block_inner(data, compression_type, None)
-}
-
-pub(crate) fn decompress_block_with_expected_size(
-    data: &[u8],
-    compression_type: BlockCompressionType,
-    expected_size: usize,
-) -> io::Result<Vec<u8>> {
-    decompress_block_inner(data, compression_type, Some(expected_size))
-}
-
-fn decompress_block_inner(
-    data: &[u8],
-    compression_type: BlockCompressionType,
-    expected_size: Option<usize>,
-) -> io::Result<Vec<u8>> {
     if compression_type == BlockCompressionType::None {
-        if expected_size.is_some_and(|expected_size| expected_size != data.len()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Uncompressed block size does not match its metadata",
-            ));
-        }
         return Ok(data.to_vec());
     }
 
@@ -164,16 +186,41 @@ fn decompress_block_inner(
             "Invalid negative uncompressed block size",
         )
     })?;
-    if expected_size.is_some_and(|expected_size| expected_size != uncompressed_size) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Compressed block size does not match its metadata",
-        ));
-    }
     let compressed_start = cursor.position() as usize;
-    let compressed = &data[compressed_start..];
+    decompress_codec_payload(
+        &data[compressed_start..],
+        compression_type,
+        uncompressed_size,
+    )
+}
+
+/// Decode a codec block stored without the outer uncompressed-size varint, the
+/// way Java's `FMIndexFile#decodeStoredBlock` reads it. The decoded size comes
+/// from the caller's own metadata, so it also bounds the allocation.
+pub(crate) fn decompress_codec_block(
+    data: &[u8],
+    compression_type: BlockCompressionType,
+    uncompressed_size: usize,
+) -> io::Result<Vec<u8>> {
+    if compression_type == BlockCompressionType::None {
+        if uncompressed_size != data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Uncompressed block size does not match its metadata",
+            ));
+        }
+        return Ok(data.to_vec());
+    }
+    decompress_codec_payload(data, compression_type, uncompressed_size)
+}
+
+fn decompress_codec_payload(
+    compressed: &[u8],
+    compression_type: BlockCompressionType,
+    uncompressed_size: usize,
+) -> io::Result<Vec<u8>> {
     match compression_type {
-        BlockCompressionType::None => unreachable!("handled above"),
+        BlockCompressionType::None => unreachable!("callers handle None"),
         BlockCompressionType::Zstd => {
             let mut decompressed = vec![0u8; uncompressed_size];
             let actual = zstd::bulk::decompress_to_buffer(compressed, &mut decompressed)
@@ -681,13 +728,63 @@ mod tests {
     fn constrained_decompression_rejects_header_size_before_decoding() {
         let source = vec![0u8; 4096];
         let (compressed, compression) =
-            compress_block(&source, BlockCompressionType::Zstd, 1).unwrap();
+            compress_codec_block(&source, BlockCompressionType::Zstd, 1).unwrap();
         assert_eq!(compression, BlockCompressionType::Zstd);
 
-        let error = decompress_block_with_expected_size(&compressed, compression, 64)
-            .expect_err("the validated outer size must constrain allocation");
+        let error = decompress_codec_block(&compressed, compression, 64)
+            .expect_err("the caller's metadata size must constrain allocation");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("does not match its metadata"));
+    }
+
+    #[test]
+    fn codec_block_is_the_varint_block_without_its_prefix() {
+        // Java's FM index stores `BlockCompressor` output verbatim, while the SST and
+        // bitmap formats prepend an uncompressed-size varint to the same bytes.
+        let source: Vec<u8> = (0..32768u32).map(|value| (value / 97) as u8).collect();
+        for compression in [
+            BlockCompressionType::Zstd,
+            BlockCompressionType::Lz4,
+            BlockCompressionType::Lzo,
+        ] {
+            let (with_prefix, kept) = compress_block(&source, compression, 1).unwrap();
+            assert_eq!(kept, compression, "{compression:?} must stay compressed");
+            let (codec_only, kept) = compress_codec_block(&source, compression, 1).unwrap();
+            assert_eq!(kept, compression, "{compression:?} must stay compressed");
+
+            let mut prefix = Vec::new();
+            encode_var_int(&mut prefix, source.len() as i32).unwrap();
+            assert_eq!(
+                with_prefix.as_ref(),
+                [prefix.as_slice(), codec_only.as_ref()].concat(),
+                "{compression:?}"
+            );
+            assert_eq!(
+                decompress_codec_block(codec_only.as_ref(), compression, source.len()).unwrap(),
+                source,
+                "{compression:?}"
+            );
+            assert_eq!(
+                decompress_block(with_prefix.as_ref(), compression).unwrap(),
+                source,
+                "{compression:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_block_rejects_the_varint_prefixed_form() {
+        // Reading a Java FM block with the SST reader, or the reverse, must fail
+        // rather than silently return the wrong bytes.
+        let source = vec![7u8; 4096];
+        let (with_prefix, _) = compress_block(&source, BlockCompressionType::Lz4, 1).unwrap();
+        assert!(decompress_codec_block(
+            with_prefix.as_ref(),
+            BlockCompressionType::Lz4,
+            source.len()
+        )
+        .is_err());
+        let (codec_only, _) = compress_codec_block(&source, BlockCompressionType::Lz4, 1).unwrap();
+        assert!(decompress_block(codec_only.as_ref(), BlockCompressionType::Lz4).is_err());
     }
 
     #[test]
