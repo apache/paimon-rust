@@ -222,9 +222,7 @@ impl SearchResultReadBuilder<'_> {
                     read_type,
                     Vec::new(),
                 )
-                .with_parquet_page_index_enabled(
-                    core_options.parquet_filter_column_index_enabled()?,
-                );
+                .with_table_options(table.schema().options().clone());
                 materialize_positions(positions, splits, &reader).await
             }
         }

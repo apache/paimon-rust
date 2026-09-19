@@ -69,14 +69,27 @@ impl Default for ParquetFormatReader {
 }
 
 impl ParquetFormatReader {
-    pub(crate) fn with_read_budget(read_budget: Arc<ReadBudget>) -> Self {
+    pub(crate) fn with_options(
+        options: &HashMap<String, String>,
+        read_budget: Option<Arc<ReadBudget>>,
+    ) -> crate::Result<Self> {
+        Ok(Self {
+            read_budget,
+            page_index_enabled: crate::spec::CoreOptions::new(options)
+                .parquet_filter_column_index_enabled()?,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_read_budget(read_budget: Arc<ReadBudget>) -> Self {
         Self {
             read_budget: Some(read_budget),
             ..Default::default()
         }
     }
 
-    pub(crate) fn with_page_index_enabled(mut self, enabled: bool) -> Self {
+    #[cfg(test)]
+    fn with_page_index_enabled(mut self, enabled: bool) -> Self {
         self.page_index_enabled = enabled;
         self
     }

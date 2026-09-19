@@ -17,9 +17,7 @@
 
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
-use crate::arrow::format::{
-    create_format_reader_with_options, FormatReaderOptions, MosaicPrefetchOptions,
-};
+use crate::arrow::format::{create_format_reader_with_budget, MosaicPrefetchOptions};
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::arrow::ReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
@@ -38,6 +36,7 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 use async_stream::try_stream;
 use futures::StreamExt;
 use roaring::RoaringBitmap;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -123,7 +122,7 @@ pub(crate) struct DataFileReader {
     blob_parallelism: usize,
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
-    parquet_page_index_enabled: bool,
+    table_options: Arc<HashMap<String, String>>,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
@@ -150,7 +149,7 @@ impl DataFileReader {
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             batch_size: None,
             parquet_read_budget: None,
-            parquet_page_index_enabled: true,
+            table_options: Arc::new(HashMap::new()),
             mosaic_prefetch: MosaicPrefetchOptions::default(),
             read_timing: None,
         }
@@ -185,8 +184,11 @@ impl DataFileReader {
         self
     }
 
-    pub(crate) fn with_parquet_page_index_enabled(mut self, enabled: bool) -> Self {
-        self.parquet_page_index_enabled = enabled;
+    pub(crate) fn with_table_options(
+        mut self,
+        options: impl Into<Arc<HashMap<String, String>>>,
+    ) -> Self {
+        self.table_options = options.into();
         self
     }
 
@@ -473,13 +475,11 @@ impl DataFileReader {
         let file_io = self.file_io.clone();
         let split = split.clone();
         let batch_size = self.batch_size;
-        let format_reader_options = FormatReaderOptions {
-            blob_as_descriptor: self.blob_as_descriptor,
-            blob_parallelism: self.blob_parallelism,
-            parquet_read_budget: self.parquet_read_budget.clone(),
-            parquet_page_index_enabled: self.parquet_page_index_enabled,
-            mosaic_prefetch: self.mosaic_prefetch,
-        };
+        let blob_as_descriptor = self.blob_as_descriptor;
+        let blob_parallelism = self.blob_parallelism;
+        let parquet_read_budget = self.parquet_read_budget.clone();
+        let table_options = Arc::clone(&self.table_options);
+        let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
 
         let target_schema = build_target_arrow_schema(&read_type)?;
@@ -534,10 +534,14 @@ impl DataFileReader {
         Ok(try_stream! {
             let schema_open_start = read_timing.as_ref().map(|_| Instant::now());
             let path_to_read = split.data_file_path(&file_meta);
-            let format_reader = create_format_reader_with_options(
+            let format_reader = create_format_reader_with_budget(
                 &path_to_read,
+                blob_as_descriptor,
                 &format_read_fields,
-                format_reader_options,
+                &table_options,
+                parquet_read_budget,
+                blob_parallelism,
+                mosaic_prefetch,
             )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let open_start = read_timing.as_ref().map(|_| Instant::now());
@@ -744,13 +748,11 @@ impl DataFileReader {
         let predicates = self.predicates.clone();
         let file_io = self.file_io.clone();
         let split = split.clone();
-        let format_reader_options = FormatReaderOptions {
-            blob_as_descriptor: self.blob_as_descriptor,
-            blob_parallelism: self.blob_parallelism,
-            parquet_read_budget: self.parquet_read_budget.clone(),
-            parquet_page_index_enabled: self.parquet_page_index_enabled,
-            mosaic_prefetch: self.mosaic_prefetch,
-        };
+        let blob_as_descriptor = self.blob_as_descriptor;
+        let blob_parallelism = self.blob_parallelism;
+        let parquet_read_budget = self.parquet_read_budget.clone();
+        let table_options = Arc::clone(&self.table_options);
+        let mosaic_prefetch = self.mosaic_prefetch;
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
@@ -810,10 +812,14 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let path_to_read = split.data_file_path(&file_meta);
-            let format_reader = create_format_reader_with_options(
+            let format_reader = create_format_reader_with_budget(
                 &path_to_read,
+                blob_as_descriptor,
                 &format_read_fields,
-                format_reader_options,
+                &table_options,
+                parquet_read_budget,
+                blob_parallelism,
+                mosaic_prefetch,
             )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let file_reader = input_file.reader().await?;

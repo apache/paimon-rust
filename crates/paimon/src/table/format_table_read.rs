@@ -130,7 +130,7 @@ impl<'a> FormatTableRead<'a> {
         let mosaic_prefetch = configured_mosaic_prefetch(self.table)?;
         let row_filter_factory = self.row_filter_factory.clone();
         let parquet_read_budget = Some(self.parquet_read_budget()?);
-        let parquet_page_index_enabled = core_options.parquet_filter_column_index_enabled()?;
+        let table_options = self.table.schema().options().clone();
         let blob_parallelism = self.blob_parallelism;
 
         Ok(try_stream! {
@@ -150,7 +150,7 @@ impl<'a> FormatTableRead<'a> {
                 .with_batch_size(batch_size)
                 .with_blob_parallelism(blob_parallelism)
                 .with_parquet_read_budget(parquet_read_budget.clone())
-                .with_parquet_page_index_enabled(parquet_page_index_enabled)
+                .with_table_options(table_options.clone())
                 .with_mosaic_prefetch(mosaic_prefetch);
                 if let Some(factory) = &row_filter_factory {
                     reader = reader.with_row_filter_factory(Arc::clone(factory));

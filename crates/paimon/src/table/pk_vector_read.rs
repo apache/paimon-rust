@@ -301,7 +301,7 @@ async fn search_pk_raw_candidates_batch_with_plan(
         vec![vector_field.clone()],
         Vec::new(),
     )
-    .with_parquet_page_index_enabled(core.parquet_filter_column_index_enabled()?);
+    .with_table_options(table.schema().options().clone());
 
     // Real ANN scorer + loader. Each segment source is opened lazily inside its
     // bucket leaf and dropped after scoring. Lumina keeps its buffered-byte path;
@@ -449,7 +449,7 @@ async fn search_pk_raw_candidates_batch_with_plan(
                     residual_read_type,
                     Vec::new(),
                 )
-                .with_parquet_page_index_enabled(core.parquet_filter_column_index_enabled()?);
+                .with_table_options(table.schema().options().clone());
                 let mut per_split = Vec::with_capacity(plan.splits.len());
                 for (index, split) in plan.splits.iter().enumerate() {
                     // The plan's selection for this split, so the residual is
@@ -614,7 +614,7 @@ async fn search_pk_candidates_batch_with_plan(
                 vec![vector_field.clone()],
                 Vec::new(),
             )
-            .with_parquet_page_index_enabled(core.parquet_filter_column_index_enabled()?);
+            .with_table_options(table.schema().options().clone());
             rerank_indexed_positional(
                 &rerank_reader,
                 search.indexed,

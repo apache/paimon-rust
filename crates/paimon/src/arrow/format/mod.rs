@@ -87,26 +87,6 @@ pub(crate) trait FormatFileReader: Send + Sync {
     ) -> crate::Result<ArrowRecordBatchStream>;
 }
 
-pub(crate) struct FormatReaderOptions {
-    pub(crate) blob_as_descriptor: bool,
-    pub(crate) blob_parallelism: usize,
-    pub(crate) parquet_read_budget: Option<Arc<ReadBudget>>,
-    pub(crate) parquet_page_index_enabled: bool,
-    pub(crate) mosaic_prefetch: MosaicPrefetchOptions,
-}
-
-impl Default for FormatReaderOptions {
-    fn default() -> Self {
-        Self {
-            blob_as_descriptor: false,
-            blob_parallelism: blob::DEFAULT_BLOB_READ_PARALLELISM,
-            parquet_read_budget: None,
-            parquet_page_index_enabled: true,
-            mosaic_prefetch: MosaicPrefetchOptions::default(),
-        }
-    }
-}
-
 /// Format-agnostic file writer that streams Arrow RecordBatches directly to storage.
 ///
 /// Each implementation (Parquet, ORC, ...) handles format-specific encoding.
@@ -211,35 +191,37 @@ pub(crate) fn create_format_reader(
     blob_as_descriptor: bool,
     read_fields: &[DataField],
 ) -> crate::Result<Box<dyn FormatFileReader>> {
-    create_format_reader_with_options(
+    create_format_reader_with_budget(
         path,
+        blob_as_descriptor,
         read_fields,
-        FormatReaderOptions {
-            blob_as_descriptor,
-            ..Default::default()
-        },
+        &HashMap::new(),
+        None,
+        blob::DEFAULT_BLOB_READ_PARALLELISM,
+        MosaicPrefetchOptions::default(),
     )
 }
 
-/// Create a format reader with format-specific read options.
-pub(crate) fn create_format_reader_with_options(
+/// Create a format reader with table options and runtime read resources.
+pub(crate) fn create_format_reader_with_budget(
     path: &str,
+    blob_as_descriptor: bool,
     read_fields: &[DataField],
-    options: FormatReaderOptions,
+    table_options: &HashMap<String, String>,
+    parquet_read_budget: Option<Arc<ReadBudget>>,
+    blob_parallelism: usize,
+    mosaic_prefetch: MosaicPrefetchOptions,
 ) -> crate::Result<Box<dyn FormatFileReader>> {
     let lower = path.to_ascii_lowercase();
     let reader: Box<dyn FormatFileReader> = if lower.ends_with(".parquet") {
-        Box::new(
-            match options.parquet_read_budget {
-                Some(read_budget) => parquet::ParquetFormatReader::with_read_budget(read_budget),
-                None => parquet::ParquetFormatReader::default(),
-            }
-            .with_page_index_enabled(options.parquet_page_index_enabled),
-        )
+        Box::new(parquet::ParquetFormatReader::with_options(
+            table_options,
+            parquet_read_budget,
+        )?)
     } else if lower.ends_with(".blob") {
         Box::new(
-            blob::BlobFormatReader::new(path.to_string(), options.blob_as_descriptor)
-                .with_blob_parallelism(options.blob_parallelism),
+            blob::BlobFormatReader::new(path.to_string(), blob_as_descriptor)
+                .with_blob_parallelism(blob_parallelism),
         )
     } else if lower.ends_with(".orc") {
         Box::new(orc::OrcFormatReader)
@@ -250,9 +232,7 @@ pub(crate) fn create_format_reader_with_options(
     } else {
         if lower.ends_with(".mosaic") {
             return Ok(shredding::maybe_wrap_reader(
-                Box::new(mosaic::MosaicFormatReader::with_prefetch(
-                    options.mosaic_prefetch,
-                )),
+                Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch)),
                 read_fields,
             ));
         }
