@@ -23,6 +23,7 @@ use crate::file_index::bitmap::BitmapFileIndexReader;
 use crate::file_index::bloom_filter::{BloomFilterReader, BloomFilterWriter};
 use crate::file_index::file_index_reader::FileIndexReader;
 use crate::file_index::file_index_writer::FileIndexWriter;
+use crate::file_index::range_bitmap::writer::RangeBitmapFileIndexWriter;
 use crate::file_index::range_bitmap::RangeBitmapFileIndexReader;
 use crate::spec::DataType;
 use crate::{Error, Result};
@@ -69,7 +70,10 @@ impl FileIndexerFactory {
 
     /// Reader support does not imply that the index can be generated.
     pub(crate) fn is_write_supported(identifier: &str) -> bool {
-        matches!(identifier, BITMAP_INDEX | BLOOM_FILTER_INDEX)
+        matches!(
+            identifier,
+            BITMAP_INDEX | BLOOM_FILTER_INDEX | RANGE_BITMAP_INDEX
+        )
     }
 
     pub(crate) fn create_writer(
@@ -84,9 +88,9 @@ impl FileIndexerFactory {
             BuiltinFileIndexer::BloomFilter => {
                 Ok(Box::new(BloomFilterWriter::try_new(data_type, options)?))
             }
-            BuiltinFileIndexer::RangeBitmap => Err(Error::Unsupported {
-                message: "Writing range-bitmap indexes is not supported yet".to_string(),
-            }),
+            BuiltinFileIndexer::RangeBitmap => Ok(Box::new(RangeBitmapFileIndexWriter::try_new(
+                data_type, options,
+            )?)),
         }
     }
 
@@ -133,7 +137,7 @@ mod tests {
 
     #[test]
     fn test_builtin_writers_track_empty_rows_consistently() {
-        for identifier in [BITMAP_INDEX, BLOOM_FILTER_INDEX] {
+        for identifier in [BITMAP_INDEX, BLOOM_FILTER_INDEX, RANGE_BITMAP_INDEX] {
             assert!(FileIndexerFactory::is_write_supported(identifier));
             let mut writer =
                 FileIndexerFactory::create_writer(identifier, int_type(), &Options::new()).unwrap();
@@ -185,12 +189,8 @@ mod tests {
     #[test]
     fn test_unknown_identifier_is_rejected() {
         assert!(FileIndexerFactory::is_supported(RANGE_BITMAP_INDEX));
-        assert!(!FileIndexerFactory::is_write_supported(RANGE_BITMAP_INDEX));
+        assert!(FileIndexerFactory::is_write_supported(RANGE_BITMAP_INDEX));
         assert!(!FileIndexerFactory::is_write_supported("unknown"));
-        assert!(matches!(
-            FileIndexerFactory::create_writer(RANGE_BITMAP_INDEX, int_type(), &Options::new()),
-            Err(Error::Unsupported { .. })
-        ));
         assert!(matches!(
             FileIndexerFactory::create_writer("unknown", int_type(), &Options::new()),
             Err(Error::Unsupported { .. })
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_writer_rejects_mismatched_datum() {
-        for identifier in [BITMAP_INDEX, BLOOM_FILTER_INDEX] {
+        for identifier in [BITMAP_INDEX, BLOOM_FILTER_INDEX, RANGE_BITMAP_INDEX] {
             let mut writer =
                 FileIndexerFactory::create_writer(identifier, int_type(), &Options::new()).unwrap();
 
