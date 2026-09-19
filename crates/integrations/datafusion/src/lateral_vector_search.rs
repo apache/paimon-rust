@@ -107,6 +107,10 @@ pub(crate) fn optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
         Arc::new(RewriteLateralVectorSearch::new()),
     ];
     rules.extend(Optimizer::default().rules);
+    // After the default rules, so filters have already been pushed into the scan.
+    rules.push(Arc::new(
+        crate::partition_count_pushdown::PushDownPartitionCount,
+    ));
     rules
 }
 
