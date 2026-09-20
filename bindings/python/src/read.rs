@@ -773,6 +773,19 @@ impl PySplit {
         Ok(PyBytes::new(py, &bytes))
     }
 
+    /// Reconstruct a native split from the stable, cross-language
+    /// `SplitSerializer` v1 wire format.
+    ///
+    /// This is deliberately separate from the constructor used by pickle:
+    /// pickle bytes are an opaque Rust JSON encoding, while this method accepts
+    /// Java/Python-compatible DataSplit and score-free IndexedSplit frames.
+    #[staticmethod]
+    fn deserialize(state: &Bound<'_, PyBytes>) -> PyResult<Self> {
+        Ok(Self {
+            inner: DataSplit::deserialize_split_v1(state.as_bytes()).map_err(to_py_err)?,
+        })
+    }
+
     /// Reduce to `Split(bytes)` for pickle/copy. The bytes are an opaque,
     /// implementation-detail encoding; only same/compatible-version round-trip
     /// is guaranteed.
