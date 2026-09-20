@@ -45,7 +45,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const MIN_STRATA: usize = 256;
@@ -82,10 +82,28 @@ enum AddItem {
     Spilled(Vec<i64>, MutableBuffer),
 }
 
-type SpillTask = JoinHandle<std::io::Result<(std::fs::File, u64, Duration)>>;
-type ConsumerTask = JoinHandle<Result<(VectorIndexWriter, usize, usize, Duration)>>;
+type SpillTask = oneshot::Receiver<std::io::Result<(std::fs::File, u64, Duration)>>;
+type ConsumerTask = oneshot::Receiver<Result<(VectorIndexWriter, usize, usize, Duration)>>;
 type TrainingTask = JoinHandle<std::io::Result<(VectorIndexTraining, Duration)>>;
 type ReplayTask = JoinHandle<std::io::Result<(usize, Duration)>>;
+
+fn spawn_channel_worker<T, F>(name: &'static str, worker: F) -> Result<oneshot::Receiver<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = oneshot::channel();
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _ = sender.send(worker());
+        })
+        .map_err(|e| Error::UnexpectedError {
+            message: format!("Failed to spawn {name} worker: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+    Ok(receiver)
+}
 
 struct SpillWriter {
     sender: mpsc::Sender<SpillRecord>,
@@ -113,7 +131,7 @@ fn spawn_spill_writer(timing_enabled: bool) -> Result<SpillWriter> {
         source: Some(Box::new(e)),
     })?;
     let (sender, mut receiver) = mpsc::channel::<SpillRecord>(QUEUE_CAPACITY);
-    let task = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+    let task = spawn_channel_worker("paimon-vindex-spill", move || -> std::io::Result<_> {
         let mut writer = BufWriter::with_capacity(BUFFER_BYTES, file);
         let mut spill_bytes = 0u64;
         let mut spill_write = Duration::ZERO;
@@ -140,7 +158,7 @@ fn spawn_spill_writer(timing_enabled: bool) -> Result<SpillWriter> {
             spill_write = spill_write.saturating_add(start.elapsed());
         }
         Ok((file, spill_bytes, spill_write))
-    });
+    })?;
     Ok(SpillWriter { sender, task })
 }
 
@@ -162,8 +180,8 @@ fn spawn_add_consumer(
     index_column: String,
     dimension: usize,
     timing_enabled: bool,
-) -> ConsumerTask {
-    tokio::task::spawn_blocking(move || -> Result<_> {
+) -> Result<ConsumerTask> {
+    spawn_channel_worker("paimon-vindex-add", move || -> Result<_> {
         let mut writer = writer;
         let mut rows_added = 0usize;
         let mut replay_rows = 0usize;
@@ -250,7 +268,7 @@ async fn start_live_pipeline(
         index_column,
         dimension,
         timing_enabled,
-    );
+    )?;
     let replay = spawn_replay(file, sender.clone(), dimension, timing_enabled);
     Ok((
         LivePipeline {
@@ -1558,6 +1576,72 @@ mod tests {
         assert!(!granules_partition_shard(&granules, &shard_range));
         granules.truncate(1);
         assert!(granules_partition_shard(&granules, &shard_range));
+    }
+
+    #[test]
+    fn live_pipeline_completes_with_one_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let vectors = vec![0.0f32, 0.0, 1.0, 1.0, 2.0, 2.0];
+                let ids = vec![0, 1, 2];
+                let config =
+                    paimon_vindex_core::index::VectorIndexConfig::from_options(&HashMap::from([
+                        ("index.type".to_string(), "ivf_flat".to_string()),
+                        ("dimension".to_string(), "2".to_string()),
+                        ("nlist".to_string(), "1".to_string()),
+                        ("metric".to_string(), "l2".to_string()),
+                    ]))
+                    .unwrap();
+                let mut trainer = VectorIndexTrainer::new(config).unwrap();
+                trainer
+                    .add_training_vectors_mut(&vectors, ids.len())
+                    .unwrap();
+
+                let spill = spawn_spill_writer(false).unwrap();
+                for _ in 0..2 {
+                    spill
+                        .sender
+                        .send(SpillRecord {
+                            ids: Vec::new(),
+                            bytes: Vec::new(),
+                        })
+                        .await
+                        .unwrap();
+                }
+                spill
+                    .sender
+                    .send(SpillRecord {
+                        ids,
+                        bytes: vectors
+                            .iter()
+                            .flat_map(|value| value.to_ne_bytes())
+                            .collect(),
+                    })
+                    .await
+                    .unwrap();
+                let training = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+                    Ok((trainer.finish()?, Duration::ZERO))
+                });
+
+                let (pipeline, _) =
+                    start_live_pipeline(training, spill, "embedding".to_string(), 2, false)
+                        .await
+                        .unwrap();
+                let (consumer, replay, _, _) = finish_live_pipeline(pipeline).await;
+                let (_, rows_added, consumer_replay_rows, _) = consumer.unwrap();
+                let (replay_rows, _) = replay.unwrap();
+                assert_eq!((rows_added, consumer_replay_rows, replay_rows), (3, 3, 3));
+            })
+            .await
+            .expect("vindex live pipeline deadlocked on the shared blocking pool");
+        });
     }
 
     #[tokio::test]
