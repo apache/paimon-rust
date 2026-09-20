@@ -106,8 +106,12 @@ pub(crate) async fn parquet_granules(
     reader: Box<dyn FileRead>,
     file_size: u64,
     column_name: &str,
+    page_index_enabled: bool,
 ) -> crate::Result<(Vec<ParquetGranule>, bool)> {
-    let options = ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional);
+    let mut options = ArrowReaderOptions::new();
+    if page_index_enabled {
+        options = options.with_offset_index_policy(PageIndexPolicy::Optional);
+    }
     let mut reader = ArrowFileReader::new(file_size, reader.into());
     let metadata = reader.get_metadata(Some(&options)).await?;
     let columns = metadata
@@ -3855,6 +3859,7 @@ mod tests {
             Box::new(TrackingFileRead::new(bytes.clone())),
             bytes.len() as u64,
             "value",
+            true,
         )
         .await
         .unwrap();
@@ -3878,6 +3883,7 @@ mod tests {
             Box::new(TrackingFileRead::new(bytes.clone())),
             bytes.len() as u64,
             "value",
+            true,
         )
         .await
         .unwrap();
@@ -3889,6 +3895,32 @@ mod tests {
                 .map(|granule| granule.row_count)
                 .sum::<i64>(),
             30
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_granules_uses_row_groups_when_page_index_disabled() {
+        let bytes = Bytes::from(write_multi_page_parquet(10, 80).await);
+        let metadata = load_metadata_with_page_index(&bytes, true);
+        assert!(metadata.offset_index().is_some());
+        let (granules, page_level) = parquet_granules(
+            Box::new(TrackingFileRead::new(bytes.clone())),
+            bytes.len() as u64,
+            "value",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(!page_level);
+        assert_eq!(granules.len(), 1);
+        assert_eq!(granules[0].first_row, 0);
+        assert_eq!(granules[0].row_count, 80);
+        // Charge the complete projected column chunk, not individual selected pages.
+        let (start, length) = metadata.row_group(0).column(1).byte_range();
+        assert_eq!(
+            granules[0].byte_ranges,
+            std::iter::once(start..start + length).collect::<Vec<_>>()
         );
     }
 

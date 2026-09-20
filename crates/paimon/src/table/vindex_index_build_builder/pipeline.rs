@@ -689,6 +689,11 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         }
 
         if !use_whole_shard && !parquet_files.is_empty() {
+            let page_index_enabled = self
+                .table
+                .schema()
+                .core_options()
+                .parquet_filter_column_index_enabled()?;
             let concurrency = self
                 .table
                 .schema()
@@ -702,7 +707,8 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                         let input = file_io.new_input(&path)?;
                         let reader = Box::new(input.reader().await?);
                         let (granules, _) =
-                            parquet_granules(reader, file_size, index_column).await?;
+                            parquet_granules(reader, file_size, index_column, page_index_enabled)
+                                .await?;
                         Ok::<_, Error>((file_index, file_start, file_end, granules))
                     },
                 )

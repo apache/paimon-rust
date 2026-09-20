@@ -959,6 +959,7 @@ async fn vindex_granule_training_sees_one_oversized_row_group() {
             Box::new(input.reader().await.unwrap()),
             large_file.file_size as u64,
             "embedding",
+            true,
         )
         .await
         .unwrap();
