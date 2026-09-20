@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{DataSplit, Plan, SnapshotManager, Table, TableScan};
+use super::{ChunkShuffle, DataSplit, Plan, SnapshotManager, Table, TableScan};
 use crate::spec::{CommitKind, CoreOptions};
 
 /// Batch incremental scan mode.
@@ -256,11 +256,17 @@ impl<'a> IncrementalScan<'a> {
         Ok(self)
     }
 
+    /// Repack the combined APPEND-delta batch into deterministic chunks.
+    pub fn with_chunk_shuffle(mut self, config: ChunkShuffle) -> crate::Result<Self> {
+        self.scan = self.scan.with_chunk_shuffle(config)?;
+        Ok(self)
+    }
+
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
         crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        if self.scan.has_row_position_selection() {
+        if self.scan.has_row_position_selection() || self.scan.has_chunk_shuffle() {
             return Err(crate::Error::Unsupported {
-                message: "Incremental row-position selection requires combined delta planning"
+                message: "Incremental row-position selection and chunk_shuffle require combined delta planning"
                     .into(),
             });
         }

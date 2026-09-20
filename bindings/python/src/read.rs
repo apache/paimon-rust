@@ -23,7 +23,9 @@ use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use paimon::spec::{DataField, DataType, Predicate, RowType};
-use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
+use paimon::table::{
+    ArrowRecordBatchStream, ChunkShuffle, DataSplit, IncrementalScanMode, RowRange, Table,
+};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -412,6 +414,7 @@ impl PyReadBuilder {
             incremental_range: None,
             row_position_slice: None,
             row_position_shard: None,
+            chunk_shuffle: None,
         }
     }
 
@@ -449,6 +452,14 @@ pub struct PyTableScan {
     incremental_range: Option<(i64, i64)>,
     row_position_slice: Option<(u64, u64)>,
     row_position_shard: Option<(u64, u64)>,
+    chunk_shuffle: Option<PyChunkShuffle>,
+}
+
+#[derive(Clone)]
+struct PyChunkShuffle {
+    seed: String,
+    chunk_size: u64,
+    shard: Option<(usize, usize)>,
 }
 
 impl PyTableScan {
@@ -463,6 +474,15 @@ impl PyTableScan {
             scan = scan
                 .with_row_position_shard(index, count)
                 .map_err(to_py_err)?;
+        }
+        if let Some(chunk_shuffle) = &self.chunk_shuffle {
+            let mut config =
+                ChunkShuffle::from_decimal_seed(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
+                    .map_err(to_py_err)?;
+            if let Some((index, count)) = chunk_shuffle.shard {
+                config = config.with_shard(index, count).map_err(to_py_err)?;
+            }
+            scan = scan.with_chunk_shuffle(config).map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -484,6 +504,15 @@ impl PyTableScan {
             scan = scan
                 .with_row_position_shard(index, count)
                 .map_err(to_py_err)?;
+        }
+        if let Some(chunk_shuffle) = &self.chunk_shuffle {
+            let mut config =
+                ChunkShuffle::from_decimal_seed(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
+                    .map_err(to_py_err)?;
+            if let Some((index, count)) = chunk_shuffle.shard {
+                config = config.with_shard(index, count).map_err(to_py_err)?;
+            }
+            scan = scan.with_chunk_shuffle(config).map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -530,6 +559,42 @@ impl PyTableScan {
             .with_row_position_shard(index, count)
             .map_err(to_py_err)?;
         slf.row_position_shard = Some((index, count));
+        Ok(slf)
+    }
+
+    /// Deterministically shuffle fixed-live-row chunks, optionally selecting
+    /// one balanced worker shard. `seed` is a decimal Python integer string so
+    /// arbitrarily large seeds retain Python's `random.Random` semantics.
+    #[pyo3(signature = (seed, chunk_size, shard_index=None, shard_count=None))]
+    fn with_chunk_shuffle(
+        mut slf: PyRefMut<'_, Self>,
+        seed: String,
+        chunk_size: u64,
+        shard_index: Option<usize>,
+        shard_count: Option<usize>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let shard = match (shard_index, shard_count) {
+            (None, None) => None,
+            (Some(index), Some(count)) => Some((index, count)),
+            _ => {
+                return Err(PyValueError::new_err(
+                    "chunk_shuffle shard_index and shard_count must be set together",
+                ));
+            }
+        };
+        let mut config = ChunkShuffle::from_decimal_seed(&seed, chunk_size).map_err(to_py_err)?;
+        if let Some((index, count)) = shard {
+            config = config.with_shard(index, count).map_err(to_py_err)?;
+        }
+        // Validate every combination immediately, not only when plan() runs.
+        slf.core_scan()?
+            .with_chunk_shuffle(config)
+            .map_err(to_py_err)?;
+        slf.chunk_shuffle = Some(PyChunkShuffle {
+            seed,
+            chunk_size,
+            shard,
+        });
         Ok(slf)
     }
 
@@ -771,6 +836,40 @@ impl PySplit {
     fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = self.inner.serialize_split_v1().map_err(to_py_err)?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Serialize only the Java-compatible metadata view. Native-only file
+    /// ranges remain on this object and must be used for physical reading.
+    fn serialize_metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self
+            .inner
+            .serialize_split_v1_metadata_view()
+            .map_err(to_py_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Per-file local half-open ranges carried by native chunk planning.
+    fn file_row_ranges(&self) -> Option<HashMap<String, (i64, i64)>> {
+        let ranges = self.inner.file_row_ranges()?;
+        Some(
+            self.inner
+                .data_files()
+                .iter()
+                .zip(ranges)
+                .filter_map(|(file, range)| {
+                    range.as_ref().map(|range| {
+                        (
+                            file.file_name.clone(),
+                            (range.from(), range.to().saturating_add(1)),
+                        )
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn exact_merged_row_count(&self) -> Option<i64> {
+        self.inner.exact_merged_row_count()
     }
 
     /// Reconstruct a native split from the stable, cross-language

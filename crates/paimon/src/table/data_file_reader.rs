@@ -278,7 +278,7 @@ impl DataFileReader {
                 // Create DV factory for this split only.
                 let dv_factory = reader.build_split_dv_factory(&split).await?;
 
-                for file_meta in split.data_files().to_vec() {
+                for (file_index, file_meta) in split.data_files().to_vec().into_iter().enumerate() {
                     let dv = DataFileReader::deletion_vector_for_file(
                         dv_factory.as_ref(),
                         &file_meta.file_name,
@@ -310,13 +310,24 @@ impl DataFileReader {
                         FileIndexResult::Remain
                     };
 
-                    let split_ranges = split.row_ranges().map(|ranges| {
+                    let global_ranges = split.row_ranges().map(|ranges| {
                         to_local_row_ranges(
                             ranges,
                             file_meta.first_row_id.unwrap_or(0),
                             file_meta.row_count,
                         )
                     });
+                    let local_ranges = split
+                        .file_row_range(file_index)
+                        .map(|range| vec![range.clone()]);
+                    let split_ranges = match (global_ranges, local_ranges) {
+                        (Some(global), Some(local)) => {
+                            Some(intersect_sorted_ranges(&global, &local))
+                        }
+                        (Some(global), None) => Some(global),
+                        (None, Some(local)) => Some(local),
+                        (None, None) => None,
+                    };
                     let selected_ranges = match file_index_result {
                         FileIndexResult::Remain => split_ranges,
                         FileIndexResult::Skip => Some(Vec::new()),

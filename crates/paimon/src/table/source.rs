@@ -496,6 +496,17 @@ pub struct DataSplit {
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
     data_deletion_files: Option<Arc<[Option<DeletionFile>]>>,
     row_ranges: Option<Arc<[RowRange]>>,
+    /// Optional file-local inclusive row range for each data file. `None` at
+    /// index `i` means the complete file. This is native-only planning
+    /// metadata used by chunk-shuffled append scans; Java's split wire format
+    /// cannot represent it.
+    #[serde(default)]
+    file_row_ranges: Option<Arc<[Option<RowRange>]>>,
+    /// Exact number of visible rows when planning had to inspect deletion
+    /// vectors. This is a planning hint, not part of the stable split wire
+    /// format.
+    #[serde(default)]
+    exact_merged_row_count: Option<i64>,
     /// Whether the split can be read raw, without the merge reader: its
     /// physical rows are exactly its logical rows (modulo deletion files).
     /// Mirrors Java `DataSplit#rawConvertible`.
@@ -537,6 +548,23 @@ impl DataSplit {
 
     pub fn row_ranges(&self) -> Option<&[RowRange]> {
         self.row_ranges.as_deref()
+    }
+
+    /// File-local inclusive row ranges aligned with [`Self::data_files`].
+    pub fn file_row_ranges(&self) -> Option<&[Option<RowRange>]> {
+        self.file_row_ranges.as_deref()
+    }
+
+    /// File-local range for the data file at `index`; `None` means full file.
+    pub fn file_row_range(&self, index: usize) -> Option<&RowRange> {
+        self.file_row_ranges
+            .as_deref()
+            .and_then(|ranges| ranges.get(index))
+            .and_then(Option::as_ref)
+    }
+
+    pub fn exact_merged_row_count(&self) -> Option<i64> {
+        self.exact_merged_row_count
     }
 
     /// Whether this split can be read raw (no sort-merge needed); see the
@@ -619,6 +647,9 @@ impl DataSplit {
     ///
     /// Reference: [DataSplit.mergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L133)
     pub fn merged_row_count(&self) -> Option<i64> {
+        if let Some(count) = self.exact_merged_row_count {
+            return Some(count);
+        }
         if !self.row_counts_known() {
             return None;
         }
@@ -694,6 +725,19 @@ impl DataSplit {
     /// Byte-compatible with `compatibility/datasplit-v9`. Row ranges are not part of the
     /// format; `serialize_split_v1` wraps a row-range split as an `IndexedSplit` instead.
     pub fn serialize(&self) -> crate::Result<Vec<u8>> {
+        if self.file_row_ranges.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "Java DataSplit serialization cannot represent file-local row ranges"
+                    .to_string(),
+            });
+        }
+        self.serialize_metadata_view()
+    }
+
+    /// Serialize the Java-compatible base split while intentionally omitting
+    /// native-only planning metadata. Callers must retain the original native
+    /// split for physical reading.
+    pub fn serialize_metadata_view(&self) -> crate::Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_MAGIC.to_be_bytes());
         out.extend_from_slice(&SPLIT_VERSION.to_be_bytes());
@@ -849,20 +893,31 @@ impl DataSplit {
     /// `IndexedSplit` (type 3) wrapping the DataSplit body plus the ranges. Byte-compatible with
     /// `compatibility/split-v1-data` / `split-v1-indexed`.
     pub fn serialize_split_v1(&self) -> crate::Result<Vec<u8>> {
+        if self.file_row_ranges.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "SplitSerializer v1 cannot represent file-local row ranges".to_string(),
+            });
+        }
+        self.serialize_split_v1_metadata_view()
+    }
+
+    /// Serialize a cross-language metadata view of this split. Native-only
+    /// file ranges and exact row counts are intentionally omitted.
+    pub fn serialize_split_v1_metadata_view(&self) -> crate::Result<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
         out.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
         match &self.row_ranges {
             None => {
                 out.extend_from_slice(&SPLIT_SER_TYPE_DATA_SPLIT.to_be_bytes());
-                out.extend_from_slice(&self.serialize()?);
+                out.extend_from_slice(&self.serialize_metadata_view()?);
             }
             Some(ranges) => {
                 out.extend_from_slice(&SPLIT_SER_TYPE_INDEXED_SPLIT.to_be_bytes());
                 // IndexedSplit#serialize: magic + version + DataSplit body + ranges + scores.
                 out.extend_from_slice(&INDEXED_SPLIT_MAGIC.to_be_bytes());
                 out.extend_from_slice(&INDEXED_SPLIT_VERSION.to_be_bytes());
-                out.extend_from_slice(&self.serialize()?);
+                out.extend_from_slice(&self.serialize_metadata_view()?);
                 out.extend_from_slice(&(ranges.len() as i32).to_be_bytes());
                 for r in ranges.iter() {
                     out.extend_from_slice(&r.from().to_be_bytes());
@@ -1165,6 +1220,8 @@ pub struct DataSplitBuilder {
     /// Same length as data_files; `None` at index i = no deletion file for data_files[i].
     data_deletion_files: Option<Vec<Option<DeletionFile>>>,
     row_ranges: Option<Vec<RowRange>>,
+    file_row_ranges: Option<Vec<Option<RowRange>>>,
+    exact_merged_row_count: Option<i64>,
     raw_convertible: bool,
     is_streaming: bool,
 }
@@ -1180,6 +1237,8 @@ impl DataSplitBuilder {
             data_files: None,
             data_deletion_files: None,
             row_ranges: None,
+            file_row_ranges: None,
+            exact_merged_row_count: None,
             // Splits with no merge semantics (append tables, single-file
             // utility splits) are raw by nature; the merge-tree and
             // data-evolution scan paths set this explicitly per split group.
@@ -1224,6 +1283,18 @@ impl DataSplitBuilder {
 
     pub fn with_row_ranges(mut self, row_ranges: Vec<RowRange>) -> Self {
         self.row_ranges = Some(row_ranges);
+        self
+    }
+
+    /// Set file-local inclusive ranges aligned with `data_files`. `None`
+    /// selects the whole file at that position.
+    pub fn with_file_row_ranges(mut self, ranges: Vec<Option<RowRange>>) -> Self {
+        self.file_row_ranges = Some(ranges);
+        self
+    }
+
+    pub fn with_exact_merged_row_count(mut self, count: i64) -> Self {
+        self.exact_merged_row_count = Some(count);
         self
     }
 
@@ -1282,6 +1353,40 @@ impl DataSplitBuilder {
                 });
             }
         }
+        if let Some(ranges) = &self.file_row_ranges {
+            if ranges.len() != data_files.len() {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "file_row_ranges length {} does not match data_files length {}",
+                        ranges.len(),
+                        data_files.len()
+                    ),
+                    source: None,
+                });
+            }
+            for (file, range) in data_files.iter().zip(ranges) {
+                if let Some(range) = range {
+                    if range.from() < 0 || range.to() >= file.row_count {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "file-local row range [{}, {}] is outside file '{}' row count {}",
+                                range.from(),
+                                range.to(),
+                                file.file_name,
+                                file.row_count
+                            ),
+                            source: None,
+                        });
+                    }
+                }
+            }
+        }
+        if self.exact_merged_row_count.is_some_and(|count| count < 0) {
+            return Err(crate::Error::DataInvalid {
+                message: "exact_merged_row_count must be non-negative".to_string(),
+                source: None,
+            });
+        }
         Ok(DataSplit {
             snapshot_id: self.snapshot_id,
             partition: Arc::new(partition),
@@ -1291,6 +1396,8 @@ impl DataSplitBuilder {
             data_files: data_files.into(),
             data_deletion_files: self.data_deletion_files.map(Into::into),
             row_ranges: self.row_ranges.map(Into::into),
+            file_row_ranges: self.file_row_ranges.map(Into::into),
+            exact_merged_row_count: self.exact_merged_row_count,
             raw_convertible: self.raw_convertible,
             is_streaming: self.is_streaming,
         })
@@ -2228,6 +2335,45 @@ mod tests {
             split.serialize_split_v1().unwrap().as_slice(),
             &expected[..]
         );
+    }
+
+    #[test]
+    fn native_file_ranges_are_validated_preserved_and_never_silently_serialized() {
+        let split = v1_data_split_builder()
+            .with_file_row_ranges(vec![Some(RowRange::new(2, 5)), None])
+            .with_exact_merged_row_count(15)
+            .build()
+            .unwrap();
+        assert_eq!(split.file_row_range(0), Some(&RowRange::new(2, 5)));
+        assert_eq!(split.merged_row_count(), Some(15));
+        assert!(matches!(
+            split.serialize_split_v1(),
+            Err(crate::Error::Unsupported { .. })
+        ));
+
+        let metadata = split.serialize_split_v1_metadata_view().unwrap();
+        let decoded = DataSplit::deserialize_split_v1(&metadata).unwrap();
+        assert!(decoded.file_row_ranges().is_none());
+        assert_eq!(decoded.exact_merged_row_count(), None);
+        assert_eq!(decoded.data_files(), split.data_files());
+
+        let pickle = serde_json::to_vec(&split).unwrap();
+        let restored: DataSplit = serde_json::from_slice(&pickle).unwrap();
+        assert_eq!(restored, split);
+
+        assert!(v1_data_split_builder()
+            .with_file_row_ranges(vec![Some(RowRange::new(0, 10))])
+            .build()
+            .is_err());
+        assert!(v1_data_split_builder()
+            .with_file_row_ranges(vec![Some(RowRange::new(0, 100)), None])
+            .build()
+            .is_err());
+        assert!(v1_data_split_builder()
+            .with_file_row_ranges(vec![Some(RowRange::new(0, 10)), None])
+            .with_exact_merged_row_count(-1)
+            .build()
+            .is_err());
     }
 
     #[test]
