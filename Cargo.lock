@@ -4843,9 +4843,9 @@ dependencies = [
 
 [[package]]
 name = "paimon-vindex-core"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d3073770e80f3d82edf50a11ac4ff1f50133d2828d74532c9021c5eb3c2439c"
+checksum = "9e7541c9afa7804c8e68c0b7795f05cefa41a6403548a8b86f79088f7045301a"
 dependencies = [
  "half",
  "matrixmultiply",
