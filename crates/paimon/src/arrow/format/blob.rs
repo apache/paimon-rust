@@ -171,6 +171,8 @@ const DEFAULT_BATCH_SIZE: usize = 128;
 pub(crate) const DEFAULT_BLOB_READ_PARALLELISM: usize = 8;
 const BLOB_RANGE_MERGE_GAP: u64 = 1024 * 1024;
 const BLOB_RANGE_MERGE_MAX_SPAN: u64 = 8 * 1024 * 1024;
+// Never fetch more than twice the unique selected entry bytes in a merged span.
+const BLOB_RANGE_MERGE_MAX_AMPLIFICATION: u64 = 2;
 const BLOB_ARRAY_MAGIC_NUMBER: i32 = 1094861634;
 const BLOB_ARRAY_VERSION: u8 = 1;
 const BLOB_ARRAY_HEADER_SIZE: u64 = 9;
@@ -714,6 +716,7 @@ struct BlobEntryRead {
 struct MergedBlobEntryRead {
     range: Range<u64>,
     entries: Vec<BlobEntryRead>,
+    selected_bytes: u64,
 }
 
 struct ResolvedBlobEntryRead {
@@ -731,6 +734,7 @@ async fn read_merged_blob_entries(
     let resolved: Vec<Vec<ResolvedBlobEntryRead>> =
         futures::stream::iter(merged_reads.into_iter().map(|merged_read| async move {
             let expected_length = merged_read.range.end - merged_read.range.start;
+            let copy_entries = expected_length > merged_read.selected_bytes;
             let data = reader.read(merged_read.range.clone()).await?;
             if data.len() as u64 != expected_length {
                 return Err(Error::DataInvalid {
@@ -757,10 +761,17 @@ async fn read_merged_blob_entries(
                             message: "Blob entry offset exceeds usize".to_string(),
                             source: Some(Box::new(e)),
                         })?;
+                    // Bytes::slice keeps the complete merged response alive. Copy entries from a
+                    // gapped span so unselected bytes can be released as soon as this read resolves.
+                    let entry = if copy_entries {
+                        Bytes::copy_from_slice(&data[start..end])
+                    } else {
+                        data.slice(start..end)
+                    };
                     Ok(ResolvedBlobEntryRead {
                         result_index: entry_read.result_index,
                         range: entry_read.range,
-                        entry: data.slice(start..end),
+                        entry,
                     })
                 })
                 .collect::<crate::Result<Vec<_>>>()
@@ -795,24 +806,35 @@ fn merge_blob_entry_reads(mut reads: Vec<BlobEntryRead>) -> Vec<MergedBlobEntryR
     let first = reads.next().unwrap();
     let mut current = MergedBlobEntryRead {
         range: first.range.clone(),
+        selected_bytes: first.range.end - first.range.start,
         entries: vec![first],
     };
     let mut merged = Vec::new();
     for read in reads {
         let merged_end = current.range.end.max(read.range.end);
+        let added_selected_bytes = read
+            .range
+            .end
+            .saturating_sub(read.range.start.max(current.range.end));
+        let selected_bytes = current.selected_bytes.saturating_add(added_selected_bytes);
+        let merged_span = merged_end - current.range.start;
         let close_enough = read
             .range
             .start
             .checked_sub(current.range.end)
             .map(|gap| gap <= BLOB_RANGE_MERGE_GAP)
             .unwrap_or(true);
-        if close_enough && merged_end - current.range.start <= BLOB_RANGE_MERGE_MAX_SPAN {
+        let amplification_bounded =
+            merged_span <= selected_bytes.saturating_mul(BLOB_RANGE_MERGE_MAX_AMPLIFICATION);
+        if close_enough && merged_span <= BLOB_RANGE_MERGE_MAX_SPAN && amplification_bounded {
             current.range.end = merged_end;
+            current.selected_bytes = selected_bytes;
             current.entries.push(read);
         } else {
             merged.push(current);
             current = MergedBlobEntryRead {
                 range: read.range.clone(),
+                selected_bytes: read.range.end - read.range.start,
                 entries: vec![read],
             };
         }
@@ -2850,6 +2872,115 @@ mod tests {
             .filter(|range| range.start < payload_end && range.end > 0)
             .collect::<Vec<_>>();
         assert_eq!(payload_reads, vec![0..payload_end]);
+    }
+
+    #[tokio::test]
+    async fn test_blob_reader_limits_sparse_read_amplification() {
+        let selected = vec![b's'; 4 * 1024];
+        let skipped = vec![b'g'; 64 * 1024];
+        let rows = vec![
+            Some(selected.as_slice()),
+            Some(skipped.as_slice()),
+            Some(selected.as_slice()),
+            Some(skipped.as_slice()),
+            Some(selected.as_slice()),
+        ];
+        let file_bytes = blob_test_utils::build_blob_file_bytes(&rows);
+        let selected_entry_length = BLOB_ENTRY_OVERHEAD + selected.len() as u64;
+        let skipped_entry_length = BLOB_ENTRY_OVERHEAD + skipped.len() as u64;
+        let selected_ranges = vec![
+            0..selected_entry_length,
+            selected_entry_length + skipped_entry_length
+                ..2 * selected_entry_length + skipped_entry_length,
+            2 * (selected_entry_length + skipped_entry_length)
+                ..3 * selected_entry_length + 2 * skipped_entry_length,
+        ];
+        let reader = TrackingFileRead::new(Bytes::from(file_bytes));
+        let planned_reads = selected_ranges
+            .iter()
+            .cloned()
+            .map(PlannedBlobRead::Entry)
+            .collect();
+
+        let values = fetch_blob_values(&reader, planned_reads, 1).await.unwrap();
+
+        assert_eq!(values.len(), 3);
+        assert!(values.into_iter().all(|value| matches!(
+            value,
+            BlobReadValue::Value(bytes) if bytes.as_ref() == selected.as_slice()
+        )));
+        let ranges = reader.ranges();
+        assert_eq!(ranges, selected_ranges);
+        let read_bytes = ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<u64>();
+        assert!(read_bytes <= 2 * selected_entry_length * 3);
+    }
+
+    #[test]
+    fn test_blob_range_merge_rejects_reported_sparse_layout() {
+        let entry_length = BLOB_ENTRY_OVERHEAD + 4 * 1024;
+        let stride = entry_length + BLOB_RANGE_MERGE_GAP;
+        let reads = (0..128)
+            .map(|result_index| {
+                let start = result_index as u64 * stride;
+                BlobEntryRead {
+                    result_index,
+                    range: start..start + entry_length,
+                }
+            })
+            .collect();
+
+        let merged = merge_blob_entry_reads(reads);
+
+        assert_eq!(merged.len(), 128);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|read| read.range.end - read.range.start)
+                .sum::<u64>(),
+            128 * entry_length
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blob_reader_copies_selected_entries_from_gapped_span() {
+        let first = vec![b'a'; 4 * 1024];
+        let skipped = vec![b'g'; 1024];
+        let second = vec![b'b'; 4 * 1024];
+        let rows = vec![
+            Some(first.as_slice()),
+            Some(skipped.as_slice()),
+            Some(second.as_slice()),
+        ];
+        let file_bytes = blob_test_utils::build_blob_file_bytes(&rows);
+        let first_end = BLOB_ENTRY_OVERHEAD + first.len() as u64;
+        let second_start = first_end + BLOB_ENTRY_OVERHEAD + skipped.len() as u64;
+        let second_end = second_start + BLOB_ENTRY_OVERHEAD + second.len() as u64;
+        let reader = TrackingFileRead::new(Bytes::from(file_bytes));
+
+        let values = fetch_blob_values(
+            &reader,
+            vec![
+                PlannedBlobRead::Entry(0..first_end),
+                PlannedBlobRead::Entry(second_start..second_end),
+            ],
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reader.ranges(), vec![0..second_end]);
+        for value in values {
+            let BlobReadValue::Value(value) = value else {
+                panic!("Expected scalar BLOB value");
+            };
+            assert!(
+                value.is_unique(),
+                "selected values must not retain the merged span buffer"
+            );
+        }
     }
 
     #[test]
