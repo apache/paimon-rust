@@ -288,25 +288,28 @@ impl TableProvider for PartitionRowCountProvider {
             if table.travel_snapshot().is_some() {
                 return Ok(Some(table));
             }
-            let table = table.copy_with_time_travel_strict(HashMap::new()).await?;
-            if table.travel_snapshot().is_some() {
-                return Ok(Some(table));
-            }
-            let Some(snapshot) = table.snapshot_manager().get_latest_snapshot().await? else {
-                return Ok(None);
+            let selected = table.copy_with_time_travel_strict(HashMap::new()).await?;
+            let snapshot = match selected.travel_snapshot() {
+                Some(snapshot) => snapshot.clone(),
+                None => {
+                    let Some(snapshot) = table.snapshot_manager().get_latest_snapshot().await?
+                    else {
+                        return Ok(None);
+                    };
+                    snapshot
+                }
             };
-            table
-                .copy_with_time_travel_strict(HashMap::from([(
-                    "scan.snapshot-id".to_string(),
-                    snapshot.id().to_string(),
-                )]))
-                .await
-                .map(Some)
+            // Pin data, not the snapshot's schema: DDL may have changed field
+            // positions since the latest data commit or since logical planning.
+            Ok(Some(table.copy_with_pinned_snapshot(&snapshot)))
         })
         .await
         .map_err(to_datafusion_error)?;
-        let fallback_provider = match &table {
-            Some(table) => self.fallback_provider.clone().with_table(table.clone()),
+        let fallback_provider = match table.as_ref().and_then(Table::travel_snapshot) {
+            Some(snapshot) => self
+                .fallback_provider
+                .clone()
+                .with_pinned_snapshot(snapshot),
             None => self.fallback_provider.clone(),
         };
         Ok(Arc::new(PartitionRowCountExec::new(

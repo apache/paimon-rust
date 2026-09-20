@@ -279,6 +279,21 @@ async fn test_grouped_count_shapes() {
 }
 
 #[tokio::test]
+async fn test_count_preserves_query_schema_after_ddl() {
+    let (_tmp, _catalog, ctx) = setup().await;
+    // DDL advances the table schema but leaves the latest data snapshot on the
+    // old schema. Dropping a column moves the partition column's field index.
+    exec(&ctx, "ALTER TABLE paimon.test_db.t DROP COLUMN name").await;
+    let sql = "SELECT dt, COUNT(*) FROM paimon.test_db.t \
+               WHERE dt = '2024-01-01' GROUP BY dt";
+    let oracle = "SELECT dt, COUNT(id) FROM paimon.test_db.t \
+                  WHERE dt = '2024-01-01' GROUP BY dt";
+    assert_eq!(rows(&ctx, oracle).await, vec![row("2024-01-01", 3)]);
+    assert!(!scans_table(&ctx, sql).await);
+    assert_eq!(rows(&ctx, sql).await, rows(&ctx, oracle).await);
+}
+
+#[tokio::test]
 async fn test_ineligible_counts_still_scan() {
     let (_tmp, _catalog, ctx) = setup().await;
 
@@ -427,6 +442,28 @@ async fn test_deletion_vector_zero_groups_and_unknown_cardinality_fallback() {
     assert!(!scans_table(&ctx, sql).await);
     assert_eq!(rows(&ctx, sql).await, expected);
 
+    // Both fields are strings: reading the old snapshot's `name` column at the
+    // new schema's `dt` index would silently produce a wrong grouping key.
+    exec(&ctx, "ALTER TABLE paimon.test_db.t DROP COLUMN name").await;
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT dt, COUNT(id) FROM paimon.test_db.t GROUP BY dt"
+        )
+        .await,
+        expected
+    );
+    assert_eq!(rows(&ctx, sql).await, expected);
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT dt, COUNT(*) FROM paimon.test_db.t \
+             WHERE dt = '2024-01-01' GROUP BY dt"
+        )
+        .await,
+        expected
+    );
+
     // The lazily planned fallback must use the same pinned snapshot.
     let plan = ctx
         .sql(sql)
@@ -437,7 +474,7 @@ async fn test_deletion_vector_zero_groups_and_unknown_cardinality_fallback() {
         .unwrap();
     exec(
         &ctx,
-        "INSERT INTO paimon.test_db.t (id, name, dt) VALUES (4, 'd', '2099-01-01')",
+        "INSERT INTO paimon.test_db.t (id, dt) VALUES (4, '2099-01-01')",
     )
     .await;
     let batches = datafusion::physical_plan::collect(plan, ctx.ctx().task_ctx())

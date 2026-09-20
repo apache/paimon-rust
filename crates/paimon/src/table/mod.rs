@@ -512,6 +512,23 @@ impl Table {
     /// same snapshot. The snapshot's schema is loaded when it differs from the
     /// current table schema.
     pub(crate) async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
+        let mut table = self.copy_with_pinned_snapshot(snapshot);
+        if snapshot.schema_id() != self.schema.id() {
+            table.schema = self
+                .schema_manager
+                .schema(snapshot.schema_id())
+                .await?
+                .copy_with_replaced_options(table.schema.options().clone());
+        }
+        Ok(table)
+    }
+
+    /// Create a read-only copy pinned to a snapshot from this table and branch,
+    /// preserving the current read schema and options other than scan selectors.
+    ///
+    /// Unlike time travel, pinning must not change the fields used by an already
+    /// planned query. The resolved snapshot is cached without additional I/O.
+    pub fn copy_with_pinned_snapshot(&self, snapshot: &Snapshot) -> Self {
         let mut options = self.schema.options().clone();
         for selector in [
             SCAN_TIMESTAMP_MILLIS_OPTION,
@@ -527,26 +544,12 @@ impl Table {
             snapshot.id().to_string(),
         );
 
-        let schema = if snapshot.schema_id() == self.schema.id() {
-            self.schema.copy_with_replaced_options(options)
-        } else {
-            self.schema_manager
-                .schema(snapshot.schema_id())
-                .await?
-                .copy_with_replaced_options(options)
-        };
-        Ok(Self {
-            file_io: self.file_io.clone(),
-            identifier: self.identifier.clone(),
-            location: self.location.clone(),
-            schema,
-            schema_manager: self.schema_manager.clone(),
-            branch: self.branch.clone(),
-            branch_reference: self.branch_reference,
-            rest_env: self.rest_env.clone(),
+        Self {
+            schema: self.schema.copy_with_replaced_options(options),
             time_traveled: true,
             travel_snapshot: Some(snapshot.clone()),
-        })
+            ..self.clone()
+        }
     }
 
     /// Create a copy of this table with extra options merged in, switching to

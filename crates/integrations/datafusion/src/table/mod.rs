@@ -32,7 +32,7 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use paimon::spec::{
-    BigIntType, CoreOptions, DataField, DataType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+    BigIntType, CoreOptions, DataField, DataType, Snapshot, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
 };
 use paimon::table::Table;
 
@@ -174,8 +174,8 @@ impl PaimonTableProvider {
         &self.table
     }
 
-    pub(crate) fn with_table(mut self, table: Table) -> Self {
-        self.table = table;
+    pub(crate) fn with_pinned_snapshot(mut self, snapshot: &Snapshot) -> Self {
+        self.table = self.table.copy_with_pinned_snapshot(snapshot);
         self
     }
 }
