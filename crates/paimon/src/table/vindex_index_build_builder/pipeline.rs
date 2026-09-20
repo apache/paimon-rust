@@ -360,8 +360,40 @@ fn spawn_replay(
     })
 }
 
-fn pick_indices(total: usize, count: usize) -> impl Iterator<Item = usize> {
-    (0..count).map(move |index| ((2 * index + 1) * total) / (2 * count))
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn shard_seed(shard: &VindexIndexShard) -> u64 {
+    let mut seed = 0u64;
+    let mut absorb = |value: u64| {
+        let mut state = seed ^ value;
+        seed = splitmix64(&mut state);
+    };
+    absorb(shard.snapshot_id as u64);
+    absorb(shard.source_bucket as u64);
+    absorb(shard.row_range_start as u64);
+    absorb(shard.row_range_end as u64);
+    absorb(shard.partition_bytes.len() as u64);
+    for chunk in shard.partition_bytes.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        absorb(u64::from_le_bytes(word));
+    }
+    seed
+}
+
+fn pick_indices(total: usize, count: usize, seed: u64) -> impl Iterator<Item = usize> {
+    let mut state = seed;
+    (0..count).map(move |index| {
+        let start = index * total / count;
+        let end = (index + 1) * total / count;
+        start + (splitmix64(&mut state) % (end - start) as u64) as usize
+    })
 }
 
 fn granule_bytes(granules: &[Granule], selected: Option<&HashSet<usize>>) -> u64 {
@@ -380,26 +412,25 @@ fn granule_bytes(granules: &[Granule], selected: Option<&HashSet<usize>>) -> u64
         .sum()
 }
 
-fn select_first(granules: &[Granule], training_rows: usize) -> HashSet<usize> {
-    let target = training_rows
+fn select_first(granules: &[Granule], training_rows: usize, seed: u64) -> HashSet<usize> {
+    let mut target = training_rows
         .div_ceil(ROWS_PER_STRATUM)
         .max(MIN_STRATA)
         .min(granules.len());
-    let mut selected = pick_indices(granules.len(), target).collect::<HashSet<_>>();
-    let mut rows = selected
-        .iter()
-        .map(|index| granules[*index].range.count() as usize)
-        .sum::<usize>();
-    if rows < training_rows {
-        for (index, granule) in granules.iter().enumerate() {
-            if selected.insert(index) {
-                rows += granule.range.count() as usize;
-                if rows >= training_rows {
-                    break;
-                }
-            }
+    let (selected, rows) = loop {
+        let selected = pick_indices(granules.len(), target, seed).collect::<HashSet<_>>();
+        let rows = selected
+            .iter()
+            .map(|index| granules[*index].range.count() as usize)
+            .sum::<usize>();
+        if rows >= training_rows || target == granules.len() {
+            break (selected, rows);
         }
-    }
+        target = target
+            .saturating_mul(training_rows)
+            .div_ceil(rows.max(1))
+            .clamp(target + 1, granules.len());
+    };
     let first_bytes = granule_bytes(granules, Some(&selected));
     let total_bytes = granule_bytes(granules, None);
     if selected.len() < MIN_STRATA.min(granules.len())
@@ -625,7 +656,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
             }];
         }
 
-        let selected = select_first(&granules, training_rows);
+        let selected = select_first(&granules, training_rows, shard_seed(shard));
         let mut first = Vec::with_capacity(selected.len());
         let mut rest = Vec::with_capacity(granules.len() - selected.len());
         let mut first_rows = 0usize;
@@ -1010,10 +1041,124 @@ mod tests {
                 byte_ranges: std::iter::once(0..1).collect(),
             })
             .collect::<Vec<_>>();
-        let selected = select_first(&granules, 256);
+        let selected = select_first(&granules, 256, 7);
         assert_eq!(selected.len(), 256);
-        assert!(selected.contains(&1));
-        assert!(selected.contains(&998));
+        for stratum in 0..256 {
+            let (start, end) = (stratum * 1_000 / 256, (stratum + 1) * 1_000 / 256);
+            assert_eq!(
+                (start..end)
+                    .filter(|index| selected.contains(index))
+                    .count(),
+                1,
+                "stratum {stratum}"
+            );
+        }
+        assert_eq!(selected, select_first(&granules, 256, 7));
+        assert_ne!(selected, select_first(&granules, 256, 8));
+    }
+
+    #[test]
+    fn shard_seed_follows_the_whole_shard_identity() {
+        let shard = VindexIndexShard {
+            partition: crate::spec::BinaryRow::new(0),
+            partition_bytes: vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            files: Vec::new(),
+            row_range_start: 0,
+            row_range_end: 999,
+            snapshot_id: 3,
+            source_bucket: 0,
+            total_buckets: 2,
+            bucket_path: "memory:/t/bucket-0".to_string(),
+        };
+        let picks = |shard: &VindexIndexShard| {
+            pick_indices(4_096, 512, shard_seed(shard)).collect::<Vec<_>>()
+        };
+        assert_eq!(picks(&shard), picks(&shard.clone()));
+
+        let mut others = vec![shard.clone(); 5];
+        others[0].partition_bytes = vec![1, 2, 3, 4, 5, 6, 7, 8, 10];
+        others[1].partition_bytes = Vec::new();
+        others[2].source_bucket = 1;
+        others[3].snapshot_id = 4;
+        others[4].row_range_end = 1_999;
+        for other in &others {
+            assert_ne!(picks(&shard), picks(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn first_picks_do_not_alias_with_periodic_granule_order() {
+        for seed in 0..32u64 {
+            let picks = pick_indices(4_096, 512, seed).collect::<Vec<_>>();
+            assert!(picks.windows(2).all(|pair| pair[0] < pair[1]));
+            for period in [2usize, 4, 8, 16] {
+                let mut hits = vec![0usize; period];
+                for pick in &picks {
+                    hits[pick % period] += 1;
+                }
+                let expected = 512 / period;
+                assert!(
+                    hits.iter()
+                        .all(|count| *count * 4 > expected && *count < expected * 2),
+                    "seed {seed} period {period}: {hits:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unequal_granules_are_sampled_in_proportion() {
+        let mut next_row = 0i64;
+        let granules = (0..4_096usize)
+            .map(|index| {
+                let rows = if index % 8 == 4 { 16 } else { 256 };
+                let range = RowRange::new(next_row, next_row + rows - 1);
+                next_row += rows;
+                Granule {
+                    range,
+                    file_index: index,
+                    byte_ranges: std::iter::once(0..rows as u64).collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let short_share = 16.0 / (16.0 + 7.0 * 256.0);
+        for seed in 0..32u64 {
+            let selected = select_first(&granules, 65_536, seed);
+            assert!(selected.len() < granules.len() / 4, "seed {seed}");
+            let (mut rows, mut short_rows) = (0i64, 0i64);
+            for index in &selected {
+                let count = granules[*index].range.count();
+                rows += count;
+                if index % 8 == 4 {
+                    short_rows += count;
+                }
+            }
+            assert!(rows >= 65_536, "seed {seed}: {rows}");
+            let share = short_rows as f64 / rows as f64;
+            assert!(
+                share > short_share / 2.0 && share < short_share * 2.0,
+                "seed {seed}: {share}"
+            );
+        }
+    }
+
+    #[test]
+    fn short_granules_widen_the_pick_instead_of_filling_from_the_head() {
+        let granules = (0..4_096i64)
+            .map(|index| Granule {
+                range: RowRange::new(index * 64, index * 64 + 63),
+                file_index: index as usize,
+                byte_ranges: std::iter::once(0..64).collect(),
+            })
+            .collect::<Vec<_>>();
+        let selected = select_first(&granules, 32_768, 7);
+        assert_eq!(selected.len(), 512);
+        for quarter in 0..4 {
+            let picked = (quarter * 1_024..(quarter + 1) * 1_024)
+                .filter(|index| selected.contains(index))
+                .count();
+            assert_eq!(picked, 128, "quarter {quarter}");
+        }
     }
 
     #[test]
@@ -1026,7 +1171,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(select_first(&granules, 256).len(), granules.len());
+        assert_eq!(select_first(&granules, 256, 7).len(), granules.len());
     }
 
     #[test]
@@ -1038,7 +1183,7 @@ mod tests {
                 byte_ranges: std::iter::once(row as u64..row as u64 + 1).collect(),
             })
             .collect::<Vec<_>>();
-        assert_eq!(select_first(&granules, 8).len(), granules.len());
+        assert_eq!(select_first(&granules, 8, 7).len(), granules.len());
     }
 
     #[test]
@@ -1059,7 +1204,7 @@ mod tests {
         append_shard_granules(&mut granules, 0, 0, &shard_range, file_granules).unwrap();
 
         assert_eq!(granules.len(), 300);
-        assert_eq!(select_first(&granules, 250).len(), granules.len());
+        assert_eq!(select_first(&granules, 250, 7).len(), granules.len());
     }
 
     #[test]

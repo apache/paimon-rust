@@ -776,6 +776,84 @@ async fn vindex_small_training_sample_preserves_tail_cluster_recall() {
     );
 }
 
+/// Every eighth data file holds a cluster the other files do not. With 4,096 one-page
+/// files the granule planner reads 512 of them first, one per stratum of eight, so a
+/// fixed position in the stratum would train without ever seeing that cluster.
+#[tokio::test]
+async fn vindex_granule_training_sees_file_periodic_cluster() {
+    const FILES: usize = 4_096;
+    const ROWS_PER_FILE: usize = 256;
+    let table_path = "memory:/test_vindex_granule_periodic_cluster";
+    let mut options = table_options("2000000");
+    for (key, value) in [
+        ("ivf-sq.dimension", "1"),
+        ("ivf-sq.nlist", "1"),
+        ("ivf-sq.metric", "l2"),
+        ("target-file-size", "1b"),
+    ] {
+        options.insert(key.to_string(), value.to_string());
+    }
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        table_path,
+        vindex_schema_builder(options).build().unwrap(),
+    );
+    setup_dirs(table.file_io(), table_path).await;
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    for file in 0..FILES {
+        let value = if file % 8 == 7 {
+            100.0
+        } else {
+            (file % 2) as f32
+        };
+        let first_id = (file * ROWS_PER_FILE) as i32;
+        table_write
+            .write_arrow_batch(&build_vector_batch(
+                (first_id..first_id + ROWS_PER_FILE as i32).collect(),
+                vec![vec![value]; ROWS_PER_FILE],
+            ))
+            .await
+            .unwrap();
+    }
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        table
+            .new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![100.0])
+        .with_limit(10)
+        .with_options(HashMap::from([(
+            "ivf-sq.nprobe".to_string(),
+            "1".to_string(),
+        )]))
+        .execute()
+        .await
+        .unwrap();
+    let row_ids = &result.row_ids().unwrap().row_ids;
+    assert_eq!(row_ids.len(), 10);
+    // Equal-distance IDs need not have a stable order; all hits must be in the periodic cluster.
+    assert!(
+        row_ids
+            .iter()
+            .all(|row_id| (*row_id as usize / ROWS_PER_FILE) % 8 == 7),
+        "{result:?}"
+    );
+}
+
 #[tokio::test]
 async fn vindex_build_cleans_written_shards_when_later_shard_fails() {
     let table_path = "memory:/test_vindex_abort_written_shard";
