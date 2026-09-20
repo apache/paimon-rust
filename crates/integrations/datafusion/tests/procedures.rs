@@ -361,6 +361,12 @@ async fn test_global_index_procedures_echo_raw_unsupported_type() {
 
 #[tokio::test]
 async fn test_create_global_index_builds_btree_and_filter_reads() {
+    for version in [1, 2] {
+        assert_btree_sql_version(version).await;
+    }
+}
+
+async fn assert_btree_sql_version(version: u32) {
     let (_tmp, sql_context) = setup_btree_global_index_table("btree_build").await;
     exec(
         &sql_context,
@@ -370,12 +376,12 @@ async fn test_create_global_index_builds_btree_and_filter_reads() {
 
     exec(
         &sql_context,
-        "CALL sys.create_global_index(\
+        &format!("CALL sys.create_global_index(\
             table => 'test_db.btree_build', \
             index_column => 'id', \
             index_type => 'btree', \
-            options => 'btree-index.block-size=1kb,btree-index.compression=lz4,btree-index.compression-level=1'\
-        )",
+            options => 'btree-index.file-version={version},btree-index.block-size=1kb,btree-index.compression=lz4,btree-index.compression-level=1'\
+        )"),
     )
     .await;
 
@@ -394,6 +400,25 @@ async fn test_create_global_index_builds_btree_and_filter_reads() {
     )
     .await;
     assert_eq!(rows, vec![(2, "bob".to_string())]);
+    for (condition, expected) in [
+        ("id >= 0 AND id = 2", vec![(2, "bob".to_string())]),
+        (
+            "id >= 0 AND id > 1 AND id < 3 AND id <= 4",
+            vec![(2, "bob".to_string())],
+        ),
+        ("id > 2 AND id < 2", vec![]),
+        (
+            "(id > 2 AND id < 2) OR id = 3",
+            vec![(3, "carol".to_string())],
+        ),
+    ] {
+        let rows = collect_id_name(
+            &sql_context,
+            &format!("SELECT id, name FROM paimon.test_db.btree_build WHERE {condition}"),
+        )
+        .await;
+        assert_eq!(rows, expected, "V{version}: {condition}");
+    }
 }
 
 #[tokio::test]

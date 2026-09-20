@@ -96,6 +96,115 @@ fn test_intersect_sorted_ranges() {
 }
 
 #[test]
+fn test_bitmap_ranges_across_containers_and_high_keys() {
+    for run in [1u64, 9, 31, 64, 256, 65536] {
+        let start = (1u64 << 32) - 10000;
+        let expected: Vec<_> = (0..100)
+            .map(|i| {
+                let from = start + i * (run + 1);
+                RowRange::new(from as i64, (from + run - 1) as i64)
+            })
+            .collect();
+        let mut bitmap = RoaringTreemap::new();
+        for range in &expected {
+            bitmap.insert_range(range.from() as u64..=range.to() as u64);
+        }
+        assert_eq!(bitmap_to_ranges(&bitmap), expected);
+        bitmap.optimize();
+        assert_eq!(bitmap_to_ranges(&bitmap), expected);
+    }
+    let mut bitmap = RoaringTreemap::new();
+    bitmap.insert_range((1u64 << 32) - 10..=(1u64 << 32) + 10);
+    bitmap.insert(i64::MAX as u64);
+    assert_eq!(
+        bitmap_to_ranges(&bitmap),
+        vec![
+            RowRange::new((1i64 << 32) - 10, (1i64 << 32) + 10),
+            RowRange::new(i64::MAX, i64::MAX),
+        ]
+    );
+}
+
+#[test]
+#[ignore = "manual release benchmark; no wall-clock assertions"]
+fn benchmark_bitmap_range_transport() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    fn baseline(bitmap: &RoaringTreemap, offset: u64) -> Vec<RowRange> {
+        let mut shifted = RoaringTreemap::new();
+        for id in bitmap {
+            shifted.insert(id + offset);
+        }
+        let mut ranges = Vec::new();
+        let mut current: Option<(i64, i64)> = None;
+        for id in shifted {
+            let id = id as i64;
+            match current {
+                Some((start, end)) if id == end + 1 => current = Some((start, id)),
+                Some((start, end)) => {
+                    ranges.push(RowRange::new(start, end));
+                    current = Some((id, id));
+                }
+                None => current = Some((id, id)),
+            }
+        }
+        if let Some((start, end)) = current {
+            ranges.push(RowRange::new(start, end));
+        }
+        ranges
+    }
+    fn optimized(bitmap: &RoaringTreemap, offset: u64) -> Vec<RowRange> {
+        crate::table::merge_row_ranges(
+            bitmap_to_ranges(bitmap)
+                .into_iter()
+                .map(|r| RowRange::new(r.from() + offset as i64, r.to() + offset as i64))
+                .collect(),
+        )
+    }
+    for (name, count, run) in [
+        ("continuous", 12_000_000u64, 12_000_000),
+        ("nine-hit-one-gap", 1_200_000, 9),
+        ("singletons", 1_200_000, 1),
+    ] {
+        let mut bitmap = RoaringTreemap::new();
+        let step = if run == 1 { 10 } else { run + 1 };
+        for start in (0..count).step_by(step as usize) {
+            bitmap.insert_range(start..(start + run).min(count));
+        }
+        bitmap.optimize();
+        let offset = (1u64 << 32) - 10000;
+        let expected = baseline(&bitmap, offset);
+        assert_eq!(optimized(&bitmap, offset), expected);
+        for _ in 0..3 {
+            black_box(baseline(&bitmap, offset));
+            black_box(optimized(&bitmap, offset));
+        }
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..7 {
+            for index in [round % 2, 1 - round % 2] {
+                let started = Instant::now();
+                black_box(if index == 0 {
+                    baseline(&bitmap, offset)
+                } else {
+                    optimized(&bitmap, offset)
+                });
+                times[index].push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        for samples in &mut times {
+            samples.sort_by(f64::total_cmp);
+        }
+        println!(
+            "RANGE_BENCH {name} rows={} ranges={} before_ms={:.3} after_ms={:.3}",
+            bitmap.len(),
+            expected.len(),
+            times[0][3],
+            times[1][3]
+        );
+    }
+}
+
+#[test]
 fn test_intersect_no_overlap() {
     let a = vec![RowRange::new(0, 5)];
     let b = vec![RowRange::new(10, 20)];
@@ -496,6 +605,7 @@ fn test_mixed_fm_and_btree_select_compatible_index_family() {
         file_name: "name.btree".to_string(),
         index_type: GlobalIndexFileKind::BTree,
         file_size: 1,
+        row_count: 10,
         row_range_start: 0,
         row_range_end: 9,
         external_path: None,
@@ -505,6 +615,7 @@ fn test_mixed_fm_and_btree_select_compatible_index_family() {
         file_name: "name.fm".to_string(),
         index_type: GlobalIndexFileKind::FM,
         file_size: 1,
+        row_count: 10,
         row_range_start: 0,
         row_range_end: 9,
         external_path: None,
@@ -613,6 +724,535 @@ fn int_eq(column: &str, index: usize, value: i32) -> Predicate {
         op: PredicateOperator::Eq,
         literals: vec![Datum::Int(value)],
     }
+}
+
+#[tokio::test]
+async fn test_btree_all_match_without_index_io() {
+    let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+    let fields = int_schema_fields();
+    let meta = BTreeIndexMeta::new(
+        Some(7i32.to_le_bytes().to_vec()),
+        Some(7i32.to_le_bytes().to_vec()),
+        false,
+    );
+    let mut entry = make_global_index_entry("not-created.index", 1, 100, 109, &meta);
+    entry.index_file.row_count = 10;
+    entry.index_file.file_size = i64::MAX;
+    for (op, values) in [
+        (PredicateOperator::Eq, vec![7]),
+        (PredicateOperator::Lt, vec![8]),
+        (PredicateOperator::LtEq, vec![7]),
+        (PredicateOperator::Gt, vec![6]),
+        (PredicateOperator::GtEq, vec![7]),
+        (PredicateOperator::Between, vec![7, 7]),
+    ] {
+        let predicate = Predicate::Leaf {
+            column: "id".into(),
+            index: 0,
+            data_type: fields[0].data_type().clone(),
+            op,
+            literals: values.into_iter().map(Datum::Int).collect(),
+        };
+        let ranges = evaluate_global_index_fast_with_fallback_size(
+            &io,
+            "memory:/absent",
+            std::slice::from_ref(&entry),
+            &[predicate],
+            &fields,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ranges, Some(vec![RowRange::new(100, 109)]), "{op}");
+    }
+    for ops in [
+        vec![PredicateOperator::Lt],
+        vec![PredicateOperator::Gt],
+        vec![PredicateOperator::Eq, PredicateOperator::Gt],
+    ] {
+        let predicates = ops
+            .into_iter()
+            .map(|op| Predicate::Leaf {
+                column: "id".into(),
+                index: 0,
+                data_type: fields[0].data_type().clone(),
+                op,
+                literals: vec![Datum::Int(7)],
+            })
+            .collect();
+        assert_eq!(
+            evaluate_global_index_fast(
+                &io,
+                "memory:/absent",
+                std::slice::from_ref(&entry),
+                &[Predicate::and(predicates)],
+                &fields,
+            )
+            .await
+            .unwrap(),
+            Some(vec![])
+        );
+    }
+    // Matching value bounds alone must not invent rows for incomplete/unknown coverage.
+    for count in [-1, 0, 9, 11] {
+        entry.index_file.row_count = count;
+        assert!(evaluate_global_index_fast(
+            &io,
+            "memory:/absent",
+            std::slice::from_ref(&entry),
+            &[int_eq("id", 0, 7)],
+            &fields
+        )
+        .await
+        .is_err());
+    }
+}
+
+#[tokio::test]
+async fn test_all_match_does_not_hide_partial_shard_over_budget() {
+    let (io, path, file, tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let fields = int_schema_fields();
+    let mut all = make_global_index_entry(
+        "absent.index",
+        1,
+        100,
+        199,
+        &BTreeIndexMeta::new(Some(le_int_key(7)), Some(le_int_key(7)), false),
+    );
+    all.index_file.row_count = 100;
+    all.index_file.file_size = i64::MAX;
+    let mut partial = make_global_index_entry(
+        &file,
+        1,
+        300,
+        399,
+        &BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false),
+    );
+    let size = std::fs::metadata(tmp.path().join("index").join(&file))
+        .unwrap()
+        .len() as i64;
+    partial.index_file.file_size = size;
+    partial.index_file.row_count = 100;
+    let entries = vec![all, partial];
+    for between in [false, true] {
+        let mut predicates = vec![Predicate::Leaf {
+            column: "id".into(),
+            index: 0,
+            data_type: fields[0].data_type().clone(),
+            op: PredicateOperator::Lt,
+            literals: vec![Datum::Int(11)],
+        }];
+        if between {
+            predicates.push(Predicate::Leaf {
+                column: "id".into(),
+                index: 0,
+                data_type: fields[0].data_type().clone(),
+                op: PredicateOperator::Gt,
+                literals: vec![Datum::Int(2)],
+            });
+        }
+        for budget in [size, size - 1] {
+            let actual = evaluate_global_index_fast_with_fallback_size(
+                &io,
+                &path,
+                &entries,
+                &[Predicate::and(predicates.clone())],
+                &fields,
+                budget,
+                i64::MAX,
+            )
+            .await
+            .unwrap();
+            let expected = (budget == size).then(|| {
+                vec![
+                    RowRange::new(100, 199),
+                    RowRange::new(if between { 302 } else { 300 }, 305),
+                ]
+            });
+            assert_eq!(actual, expected, "between={between}, budget={budget}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_all_match_requires_every_key_shard() {
+    let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+    let path = "memory:/all_match_key_shards";
+    let mut entries = Vec::new();
+    for (key, rows) in [(7, 0..40), (9, 40..100)] {
+        let name = format!("key-{key}.index");
+        let buf = VecFileWrite::new();
+        let mut writer =
+            BTreeIndexWriter::new(Box::new(buf.clone()), 64, BlockCompressionType::None);
+        for id in rows {
+            writer.write(Some(&le_int_key(key)), id).await.unwrap();
+        }
+        let result = writer.finish().await.unwrap();
+        io.new_output(&format!("{path}/index/{name}"))
+            .unwrap()
+            .write(bytes::Bytes::from(buf.to_vec()))
+            .await
+            .unwrap();
+        let mut entry = make_global_index_entry(&name, 1, 100, 199, &result.meta);
+        entry.index_file.row_count = result.row_count as i64;
+        entries.push(entry);
+    }
+    assert_eq!(
+        evaluate_global_index_fast(
+            &io,
+            path,
+            &entries,
+            &[int_eq("id", 0, 7)],
+            &int_schema_fields()
+        )
+        .await
+        .unwrap(),
+        Some(vec![RowRange::new(100, 139)])
+    );
+}
+
+#[tokio::test]
+async fn test_btree_all_match_coverage_nulls_and_boolean_siblings() {
+    let (io, path, file, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let meta = BTreeIndexMeta::new(Some(le_int_key(7)), Some(le_int_key(7)), false);
+    let mut all = make_global_index_entry("absent.index", 1, 100, 199, &meta);
+    all.index_file.row_count = 100;
+    let selective = make_global_index_entry(
+        &file,
+        2,
+        100,
+        199,
+        &BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false),
+    );
+    let fields = two_field_schema_fields();
+    let predicates = vec![int_eq("id", 0, 7), int_eq("value", 1, 18)];
+    let entries = vec![all.clone(), selective];
+    assert_eq!(
+        evaluate_global_index_fast(
+            &io,
+            &path,
+            &entries,
+            &[Predicate::and(predicates.clone())],
+            &fields
+        )
+        .await
+        .unwrap(),
+        Some(vec![RowRange::new(109, 109)])
+    );
+    assert_eq!(
+        evaluate_global_index_fast(&io, &path, &entries, &[Predicate::or(predicates)], &fields)
+            .await
+            .unwrap(),
+        Some(vec![RowRange::new(100, 199)])
+    );
+
+    for (mode, expected) in [
+        (GlobalIndexSearchMode::Fast, vec![RowRange::new(100, 199)]),
+        (GlobalIndexSearchMode::Full, vec![RowRange::new(0, 219)]),
+        (GlobalIndexSearchMode::Detail, vec![RowRange::new(100, 209)]),
+    ] {
+        let actual = evaluate_global_index(GlobalIndexEvaluation {
+            file_io: &io,
+            table_path: &path,
+            index_entries: std::slice::from_ref(&all),
+            predicates: &[int_eq("id", 0, 7)],
+            schema_fields: &fields,
+            search_mode: mode,
+            global_index_thread_num: 2,
+            btree_fallback_scan_max_size: 0,
+            bitmap_fallback_scan_max_size: 0,
+            fm_read_options: FMReadOptions::default(),
+            next_row_id: Some(220),
+            data_ranges: &[RowRange::new(100, 209)],
+        })
+        .await
+        .unwrap();
+        assert_eq!(actual, Some(expected));
+    }
+
+    // Two key-partitioned files share a source domain; neither alone is complete.
+    let mut first = all.clone();
+    first.index_file.row_count = 40;
+    let mut second = all.clone();
+    second.index_file.file_name = "also-absent.index".into();
+    second.index_file.row_count = 60;
+    assert_eq!(
+        evaluate_global_index_fast(
+            &io,
+            &path,
+            &[first.clone(), second.clone()],
+            &[int_eq("id", 0, 7)],
+            &fields
+        )
+        .await
+        .unwrap(),
+        Some(vec![RowRange::new(100, 199)])
+    );
+    assert!(
+        evaluate_global_index_fast(&io, &path, &[first], &[int_eq("id", 0, 7)], &fields)
+            .await
+            .is_err()
+    );
+    let nullable = BTreeIndexMeta::new(Some(le_int_key(7)), Some(le_int_key(7)), true);
+    all.index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .index_meta = Some(nullable.serialize());
+    assert!(
+        evaluate_global_index_fast(&io, &path, &[all], &[int_eq("id", 0, 7)], &fields)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn test_bounded_range_all_endpoints_and_predicate_orders() {
+    let (io, path, file, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let fields = int_schema_fields();
+    let entries = vec![make_global_index_entry(
+        &file,
+        1,
+        100,
+        199,
+        &BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false),
+    )];
+    for (low, low_inclusive) in [
+        (PredicateOperator::Gt, false),
+        (PredicateOperator::GtEq, true),
+    ] {
+        for (high, high_inclusive) in [
+            (PredicateOperator::Lt, false),
+            (PredicateOperator::LtEq, true),
+        ] {
+            for (lower, upper) in [(30, 40), (30, 30), (40, 30)] {
+                for reverse in [false, true] {
+                    let mut predicates: Vec<_> = [(low, lower), (high, upper)]
+                        .into_iter()
+                        .map(|(op, v)| Predicate::Leaf {
+                            column: "id".into(),
+                            index: 0,
+                            data_type: fields[0].data_type().clone(),
+                            op,
+                            literals: vec![Datum::Int(v)],
+                        })
+                        .collect();
+                    if reverse {
+                        predicates.reverse();
+                    }
+                    let actual = evaluate_global_index_fast(
+                        &io,
+                        &path,
+                        &entries,
+                        &[Predicate::and(predicates)],
+                        &fields,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    let expected: Vec<_> = (0..100)
+                        .filter(|id| {
+                            let key = *id * 2;
+                            (key > lower || low_inclusive && key == lower)
+                                && (key < upper || high_inclusive && key == upper)
+                        })
+                        .map(|id| id as i64 + 100)
+                        .collect();
+                    let actual: Vec<_> = actual.iter().flat_map(|r| r.from()..=r.to()).collect();
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_scalar_optimization_query_counts() {
+    let (io, path, file, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let fields = int_schema_fields();
+    let mut entry = make_global_index_entry(
+        &file,
+        1,
+        100,
+        199,
+        &BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false),
+    );
+    entry.index_file.row_count = 100;
+    let leaf = |op, value| Predicate::Leaf {
+        column: "id".into(),
+        index: 0,
+        data_type: fields[0].data_type().clone(),
+        op,
+        literals: vec![Datum::Int(value)],
+    };
+    for (conditions, expected, query_counts) in [
+        (
+            vec![
+                leaf(PredicateOperator::GtEq, 0),
+                leaf(PredicateOperator::Eq, 50),
+            ],
+            vec![RowRange::new(125, 125)],
+            (1, 0),
+        ),
+        (
+            vec![
+                leaf(PredicateOperator::GtEq, 10),
+                leaf(PredicateOperator::LtEq, 180),
+                leaf(PredicateOperator::Gt, 30),
+                leaf(PredicateOperator::Lt, 40),
+            ],
+            vec![RowRange::new(116, 119)],
+            (0, 1),
+        ),
+        (
+            vec![
+                leaf(PredicateOperator::Gt, 40),
+                leaf(PredicateOperator::Lt, 30),
+            ],
+            vec![],
+            (0, 0),
+        ),
+        (
+            vec![
+                leaf(PredicateOperator::Gt, 30),
+                leaf(PredicateOperator::LtEq, 30),
+            ],
+            vec![],
+            (0, 0),
+        ),
+    ] {
+        for reverse in [false, true] {
+            let mut conditions = conditions.clone();
+            if reverse {
+                conditions.reverse();
+            }
+            let mut scanner = GlobalIndexScanner::create(
+                &io,
+                &path,
+                2,
+                i64::MAX,
+                i64::MAX,
+                std::slice::from_ref(&entry),
+                &fields,
+            )
+            .unwrap()
+            .unwrap();
+            let probe = Arc::new(QueryIoProbe::default());
+            scanner.query_io_probe = Some(probe.clone());
+            let result = scanner
+                .evaluate(&Predicate::and(conditions))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.row_ranges, expected);
+            assert_eq!(
+                (
+                    probe.predicate_queries.load(TestOrdering::SeqCst),
+                    probe.range_queries.load(TestOrdering::SeqCst)
+                ),
+                query_counts
+            );
+            if query_counts == (0, 0) {
+                assert_eq!(probe.peak(), 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_scalar_optimization_empty_range_never_opens_index() {
+    let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+    let fields = int_schema_fields();
+    let entry = make_global_index_entry(
+        "must-not-open.index",
+        1,
+        100,
+        199,
+        &BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false),
+    );
+    for (from, to) in [(40, 30), (30, 30)] {
+        let predicates: Vec<_> = [(PredicateOperator::Gt, from), (PredicateOperator::LtEq, to)]
+            .into_iter()
+            .map(|(op, v)| Predicate::Leaf {
+                column: "id".into(),
+                index: 0,
+                data_type: fields[0].data_type().clone(),
+                op,
+                literals: vec![Datum::Int(v)],
+            })
+            .collect();
+        for (mode, expected) in [
+            (GlobalIndexSearchMode::Fast, vec![]),
+            (
+                GlobalIndexSearchMode::Full,
+                vec![RowRange::new(0, 99), RowRange::new(200, 219)],
+            ),
+            (GlobalIndexSearchMode::Detail, vec![RowRange::new(200, 209)]),
+        ] {
+            let actual = evaluate_global_index(GlobalIndexEvaluation {
+                file_io: &io,
+                table_path: "memory:/absent",
+                index_entries: std::slice::from_ref(&entry),
+                predicates: &[Predicate::and(predicates.clone())],
+                schema_fields: &fields,
+                search_mode: mode,
+                global_index_thread_num: 2,
+                btree_fallback_scan_max_size: 0,
+                bitmap_fallback_scan_max_size: 0,
+                fm_read_options: FMReadOptions::default(),
+                next_row_id: Some(220),
+                data_ranges: &[RowRange::new(100, 209)],
+            })
+            .await
+            .unwrap();
+            assert_eq!(actual, Some(expected));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_all_matching_conjunct_keeps_domain_when_other_conjunct_declines() {
+    let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+    let fields = string_schema_fields();
+    let mut entry = make_global_index_entry(
+        "must-not-open.index",
+        1,
+        100,
+        109,
+        &BTreeIndexMeta::new(Some(b"hit".to_vec()), Some(b"miss".to_vec()), false),
+    );
+    entry.index_file.row_count = 10;
+    entry.index_file.file_size = 100;
+    let predicates = [
+        (PredicateOperator::Lt, "z"),
+        (PredicateOperator::Contains, "hit"),
+    ]
+    .into_iter()
+    .map(|(op, value)| Predicate::Leaf {
+        column: "name".into(),
+        index: 0,
+        data_type: fields[0].data_type().clone(),
+        op,
+        literals: vec![Datum::String(value.into())],
+    })
+    .collect();
+    let actual = evaluate_global_index_fast_with_fallback_size(
+        &io,
+        "memory:/absent",
+        &[entry],
+        &[Predicate::and(predicates)],
+        &fields,
+        0,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        actual,
+        Some(vec![RowRange::new(100, 109)]),
+        "retain candidates for residual filtering, not empty"
+    );
 }
 
 #[test]
@@ -1189,6 +1829,99 @@ async fn test_bitmap_nan_equality_uses_direct_lookup_with_fallback_scan_disabled
         Datum::Double(0.0),
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_bitmap_floating_bound_fusion_preserves_candidates_and_fallback() {
+    for (ty, low, high, zero, minus_one) in [
+        (
+            DataType::Float(crate::spec::FloatType::new()),
+            Datum::Float(f32::from_bits(0xffc0_0001)),
+            Datum::Float(f32::from_bits(0x7fc0_0001)),
+            Datum::Float(0.0),
+            Datum::Float(-1.0),
+        ),
+        (
+            DataType::Double(crate::spec::DoubleType::new()),
+            Datum::Double(f64::from_bits(0xfff8_0000_0000_0001)),
+            Datum::Double(f64::from_bits(0x7ff8_0000_0000_0001)),
+            Datum::Double(0.0),
+            Datum::Double(-1.0),
+        ),
+    ] {
+        let output = VecFileWrite::new();
+        let mut writer = BitmapGlobalIndexWriter::new(
+            Box::new(output.clone()),
+            1,
+            BlockCompressionType::None,
+            make_bitmap_key_comparator(&ty),
+        );
+        writer
+            .write(Some(&serialize_bitmap_datum(&zero, &ty)), 0)
+            .unwrap();
+        writer.write(None, 1).unwrap();
+        let result = writer.finish().await.unwrap();
+        let bytes = output.to_vec();
+        let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/bitmap_bound_fusion";
+        io.new_output(&format!("{path}/index/bitmap.index"))
+            .unwrap()
+            .write(bytes::Bytes::from(bytes.clone()))
+            .await
+            .unwrap();
+        let mut entry = make_global_index_entry_with_type(
+            BITMAP_GLOBAL_INDEX_TYPE,
+            "bitmap.index",
+            1,
+            100,
+            101,
+            &result.meta,
+        );
+        entry.index_file.file_size = bytes.len() as i64;
+        let fields = vec![DataField::new(1, "id".into(), ty.clone())];
+        let leaf = |op, value: Datum| Predicate::Leaf {
+            column: "id".into(),
+            index: 0,
+            data_type: ty.clone(),
+            op,
+            literals: vec![value],
+        };
+        for extra_bound in [false, true] {
+            for reverse in [false, true] {
+                let mut conditions = vec![
+                    leaf(PredicateOperator::Gt, low.clone()),
+                    leaf(PredicateOperator::Lt, high.clone()),
+                ];
+                if extra_bound {
+                    conditions.push(leaf(PredicateOperator::Gt, minus_one.clone()));
+                }
+                if reverse {
+                    conditions.reverse();
+                }
+                for budget in [i64::MAX, 0] {
+                    let actual = evaluate_global_index_fast_with_fallback_size(
+                        &io,
+                        path,
+                        std::slice::from_ref(&entry),
+                        &[Predicate::and(conditions.clone())],
+                        &fields,
+                        0,
+                        budget,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        actual,
+                        if budget == 0 {
+                            None
+                        } else {
+                            Some(vec![RowRange::new(100, 100)])
+                        }
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn legacy_floating_comparator(data_type: &DataType) -> BoxedCmp {

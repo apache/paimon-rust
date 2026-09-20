@@ -140,6 +140,13 @@ impl BTreeFileFooter {
             ));
         }
 
+        if !matches!(version, 1 | 2) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported BTree index version: {version}"),
+            ));
+        }
+
         let mut pos = 0;
 
         // bloom filter handle

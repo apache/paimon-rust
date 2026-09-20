@@ -112,7 +112,12 @@ impl SortedGlobalIndexBuildBuilder<'_> {
                         write_options.compression_level,
                         write_options.bloom_filter_enabled,
                         cmp,
-                    );
+                    )
+                    .with_file_version(write_options.btree_file_version)
+                    .map_err(|error| Error::DataInvalid {
+                        message: "Invalid BTree file version".to_string(),
+                        source: Some(Box::new(error)),
+                    })?;
                     for (key, local_row_id) in &rows {
                         writer
                             .write(key.as_deref(), *local_row_id)

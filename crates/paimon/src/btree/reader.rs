@@ -27,13 +27,13 @@ use crate::btree::block::{BlockHandle, BlockReader};
 use crate::btree::bloom_filter::BloomFilter;
 use crate::btree::footer::{BTreeFileFooter, BloomFilterHandle, BTREE_FOOTER_ENCODED_LENGTH};
 use crate::btree::meta::BTreeIndexMeta;
+use crate::btree::posting_list;
 use crate::btree::sst_file::{read_block_from_bytes, SstFileReader};
-use crate::btree::var_len::{decode_var_int, decode_var_long};
 use crate::io::FileRead;
 use crate::spec::murmur_hash::hash_bytes;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
-use std::io::{self, Cursor};
+use std::io;
 use tokio::sync::OnceCell;
 
 struct LazyBloomFilter {
@@ -50,6 +50,7 @@ pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> Ordering> {
     max_key: Option<Vec<u8>>,
     key_comparator: F,
     bloom_filter: Option<LazyBloomFilter>,
+    file_version: u32,
 }
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
@@ -105,6 +106,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
             max_key: meta.last_key.clone(),
             key_comparator,
             bloom_filter,
+            file_version: footer.version,
         })
     }
 
@@ -149,7 +151,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
                 let (key, value, next_offset) = block.read_entry_at(offset);
                 offset = next_offset;
                 if predicate(key) {
-                    insert_row_ids_into(value, &mut result)?;
+                    posting_list::add_to(value, self.file_version, &mut result)?;
                 }
             }
         }
@@ -168,6 +170,12 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
     ) -> io::Result<RoaringTreemap> {
         let cmp = &self.key_comparator;
         let mut result = RoaringTreemap::new();
+
+        match cmp(from, to) {
+            Ordering::Greater => return Ok(result),
+            Ordering::Equal if !from_inclusive || !to_inclusive => return Ok(result),
+            _ => {}
+        }
 
         // Seek in index block to find the first data block that may contain `from`
         let index_block = self.sst_reader.index_block();
@@ -246,7 +254,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
                 return Ok(true);
             }
 
-            insert_row_ids_into(value, result)?;
+            posting_list::add_to(value, self.file_version, result)?;
         }
         Ok(false)
     }
@@ -334,7 +342,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         let (found, mut entry_iter) = block.seek_and_iter(key, cmp);
         let mut result = RoaringTreemap::new();
         if let (true, Some((_entry_key, value))) = (found, entry_iter.next()) {
-            insert_row_ids_into(value, &mut result)?;
+            posting_list::add_to(value, self.file_version, &mut result)?;
         }
         Ok(result)
     }
@@ -457,7 +465,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
             for key in block_keys {
                 let (found, mut entry_iter) = block.seek_and_iter(key, cmp);
                 if let (true, Some((_entry_key, value))) = (found, entry_iter.next()) {
-                    insert_row_ids_into(value, &mut result)?;
+                    posting_list::add_to(value, self.file_version, &mut result)?;
                 }
             }
         }
@@ -508,22 +516,6 @@ fn verify_null_bitmap_crc(bitmap_bytes: &[u8], crc_bytes: &[u8]) -> io::Result<(
                 expected_crc, actual_crc
             ),
         ));
-    }
-    Ok(())
-}
-
-/// Deserialize row ids from value bytes and insert directly into bitmap.
-fn insert_row_ids_into(data: &[u8], bitmap: &mut RoaringTreemap) -> io::Result<()> {
-    let mut cursor = Cursor::new(data);
-    let count = decode_var_int(&mut cursor)?;
-    if count < 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Invalid row id count: {count}"),
-        ));
-    }
-    for _ in 0..count {
-        bitmap.insert(decode_var_long(&mut cursor)? as u64);
     }
     Ok(())
 }
