@@ -52,7 +52,7 @@ use arrow_array::{
     FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
     LargeBinaryArray, LargeListArray, ListArray, RecordBatch, Scalar, StringArray,
     Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_ord::cmp::{
     eq as arrow_eq, gt as arrow_gt, gt_eq as arrow_gt_eq, lt as arrow_lt, lt_eq as arrow_lt_eq,
@@ -1114,7 +1114,15 @@ fn timestamp_scalar(
     timezone: Option<&'static str>,
 ) -> crate::Result<Option<ArrayRef>> {
     let array: ArrayRef = match precision {
-        0..=3 => {
+        0 => {
+            let value = millis.div_euclid(1_000);
+            let array = TimestampSecondArray::new_scalar(value).into_inner();
+            match timezone {
+                Some(tz) => Arc::new(array.with_timezone(tz)),
+                None => Arc::new(array),
+            }
+        }
+        1..=3 => {
             let array = TimestampMillisecondArray::new_scalar(millis).into_inner();
             match timezone {
                 Some(tz) => Arc::new(array.with_timezone(tz)),

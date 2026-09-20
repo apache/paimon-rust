@@ -149,7 +149,8 @@ pub fn paimon_type_to_arrow(dt: &PaimonDataType) -> crate::Result<ArrowDataType>
 
 fn timestamp_time_unit(precision: u32) -> crate::Result<TimeUnit> {
     match precision {
-        0..=3 => Ok(TimeUnit::Millisecond),
+        0 => Ok(TimeUnit::Second),
+        1..=3 => Ok(TimeUnit::Millisecond),
         4..=6 => Ok(TimeUnit::Microsecond),
         7..=9 => Ok(TimeUnit::Nanosecond),
         _ => Err(crate::Error::Unsupported {
@@ -518,6 +519,15 @@ mod tests {
 
     #[test]
     fn test_timestamp_roundtrip() {
+        // second precision
+        let ts0 = PaimonDataType::Timestamp(TimestampType::new(0).unwrap());
+        assert_paimon_to_arrow(&ts0, &ArrowDataType::Timestamp(TimeUnit::Second, None));
+        assert_arrow_to_paimon(
+            &ArrowDataType::Timestamp(TimeUnit::Second, None),
+            true,
+            &ts0,
+        );
+
         // millisecond precision
         let ts3 = PaimonDataType::Timestamp(TimestampType::new(3).unwrap());
         assert_paimon_to_arrow(&ts3, &ArrowDataType::Timestamp(TimeUnit::Millisecond, None));
@@ -548,6 +558,11 @@ mod tests {
 
     #[test]
     fn test_local_zoned_timestamp() {
+        let lzts0 = PaimonDataType::LocalZonedTimestamp(LocalZonedTimestampType::new(0).unwrap());
+        let arrow0 = ArrowDataType::Timestamp(TimeUnit::Second, Some("UTC".into()));
+        assert_paimon_to_arrow(&lzts0, &arrow0);
+        assert_arrow_to_paimon(&arrow0, true, &lzts0);
+
         let lzts = PaimonDataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap());
         let arrow = ArrowDataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
         assert_paimon_to_arrow(&lzts, &arrow);

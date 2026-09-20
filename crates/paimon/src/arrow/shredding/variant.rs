@@ -33,7 +33,7 @@ use arrow_array::{
     new_null_array, Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
     Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
     ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields, TimeUnit};
@@ -1052,7 +1052,8 @@ fn timestamp_array(
         })
         .collect::<Vec<_>>();
     Ok(match precision {
-        0..=3 => Arc::new(TimestampMillisecondArray::from(values).with_timezone_opt(tz)),
+        0 => Arc::new(TimestampSecondArray::from(values).with_timezone_opt(tz)),
+        1..=3 => Arc::new(TimestampMillisecondArray::from(values).with_timezone_opt(tz)),
         4..=6 => Arc::new(TimestampMicrosecondArray::from(values).with_timezone_opt(tz)),
         _ => Arc::new(TimestampNanosecondArray::from(values).with_timezone_opt(tz)),
     })
@@ -1261,6 +1262,9 @@ fn value_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Optio
 
 fn timestamp_value_at(array: &dyn Array, row: usize) -> Result<i64> {
     match array.data_type() {
+        ArrowDataType::Timestamp(TimeUnit::Second, _) => {
+            Ok(downcast_array::<TimestampSecondArray>(array, "TimestampS")?.value(row))
+        }
         ArrowDataType::Timestamp(TimeUnit::Millisecond, _) => {
             Ok(downcast_array::<TimestampMillisecondArray>(array, "TimestampMs")?.value(row))
         }
