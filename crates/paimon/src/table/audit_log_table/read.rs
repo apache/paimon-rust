@@ -110,6 +110,7 @@ impl<'a> AuditLogRead<'a> {
             .with_file_index_read_enabled(core_options.file_index_read_enabled())
             .with_batch_size(Some(core_options.read_batch_size()?))
             .with_parquet_read_budget(Some(Arc::clone(&parquet_read_budget)))
+            .with_table_options(self.read.table.schema().options().clone())
             .read(&raw_splits)?;
             let merge_stream = KeyValueFileReader::new(
                 self.read.table.file_io.clone(),

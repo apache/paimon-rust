@@ -94,8 +94,344 @@ async fn test_write_read_roundtrip() {
     assert_eq!(all.len(), 100);
 }
 
+#[tokio::test]
+async fn test_tightest_bounds_across_key_types_and_versions() {
+    use crate::btree::query::extract_between;
+    use crate::btree::{make_key_comparator, serialize_datum};
+    use crate::spec::*;
+    let cases = vec![
+        (
+            DataType::TinyInt(TinyIntType::new()),
+            (0..6).map(Datum::TinyInt).collect::<Vec<_>>(),
+        ),
+        (
+            DataType::SmallInt(SmallIntType::new()),
+            (0..6).map(Datum::SmallInt).collect(),
+        ),
+        (
+            DataType::Int(IntType::new()),
+            (0..6).map(Datum::Int).collect(),
+        ),
+        (
+            DataType::BigInt(BigIntType::new()),
+            (0..6).map(Datum::Long).collect(),
+        ),
+        (
+            DataType::Float(FloatType::new()),
+            (0..6).map(|v| Datum::Float(v as f32)).collect(),
+        ),
+        (
+            DataType::Double(DoubleType::new()),
+            (0..6).map(|v| Datum::Double(v as f64)).collect(),
+        ),
+        (
+            DataType::VarChar(VarCharType::string_type()),
+            (0..6).map(|v| Datum::String(v.to_string())).collect(),
+        ),
+        (
+            DataType::Date(DateType::new()),
+            (0..6).map(Datum::Date).collect(),
+        ),
+        (
+            DataType::Time(TimeType::new(3).unwrap()),
+            (0..6).map(Datum::Time).collect(),
+        ),
+        (
+            DataType::Timestamp(TimestampType::new(9).unwrap()),
+            (0..6)
+                .map(|v| Datum::Timestamp {
+                    millis: 0,
+                    nanos: v,
+                })
+                .collect(),
+        ),
+        (
+            DataType::Decimal(DecimalType::new(10, 0).unwrap()),
+            (0..6)
+                .map(|v| Datum::Decimal {
+                    unscaled: v,
+                    precision: 10,
+                    scale: 0,
+                })
+                .collect(),
+        ),
+        (
+            DataType::Decimal(DecimalType::new(30, 0).unwrap()),
+            (0..6)
+                .map(|v| Datum::Decimal {
+                    unscaled: v,
+                    precision: 30,
+                    scale: 0,
+                })
+                .collect(),
+        ),
+    ];
+    for (ty, values) in cases {
+        for version in [1, 2] {
+            let buf = VecFileWrite::new();
+            let mut writer =
+                BTreeIndexWriter::new(Box::new(buf.clone()), 64, BlockCompressionType::None)
+                    .with_file_version(version)
+                    .unwrap();
+            writer.write(None, 6).await.unwrap();
+            for (row, value) in values.iter().enumerate() {
+                writer
+                    .write(Some(&serialize_datum(value, &ty)), row as i64)
+                    .await
+                    .unwrap();
+            }
+            let result = writer.finish().await.unwrap();
+            let reader = write_and_open(&buf, &result, make_key_comparator(&ty)).await;
+            for reverse in [false, true] {
+                // A native Between plus multiple pairs, with strictness ties.
+                let native = vec![values[0].clone(), values[5].clone()];
+                let mut predicates = vec![
+                    (PredicateOperator::Between, native.as_slice(), &ty),
+                    (PredicateOperator::GtEq, &values[1..2], &ty),
+                    (PredicateOperator::LtEq, &values[4..5], &ty),
+                    (PredicateOperator::Gt, &values[1..2], &ty),
+                    (PredicateOperator::Lt, &values[4..5], &ty),
+                    (PredicateOperator::IsNotNull, &values[0..0], &ty),
+                ];
+                if reverse {
+                    predicates.reverse();
+                }
+                let (range, remaining) = extract_between(&predicates);
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].0, PredicateOperator::IsNotNull);
+                let range = range.unwrap();
+                assert!(!range.is_empty());
+                let actual = reader
+                    .range_query(
+                        &serialize_datum(range.from, &ty),
+                        &serialize_datum(range.to, &ty),
+                        range.from_inclusive,
+                        range.to_inclusive,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    actual.iter().collect::<Vec<_>>(),
+                    vec![2, 3],
+                    "{ty:?}, V{version}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_empty_range_does_not_read_data_blocks() {
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::new(Box::new(buf.clone()), 64, BlockCompressionType::None);
+    for row in 0..100 {
+        writer.write(Some(&int_key(row)), row as i64).await.unwrap();
+    }
+    let result = writer.finish().await.unwrap();
+    let data = Bytes::from(buf.to_vec());
+    let reads = Arc::new(Mutex::new(Vec::new()));
+    let reader = BTreeIndexReader::open(
+        Box::new(RecordingFileRead {
+            data: data.clone(),
+            ranges: reads.clone(),
+        }),
+        data.len() as u64,
+        &result.meta,
+        int_cmp,
+    )
+    .await
+    .unwrap();
+    reads.lock().unwrap().clear();
+    for (from, to, lower, upper) in [
+        (50, 40, true, true),
+        (50, 50, false, true),
+        (50, 50, true, false),
+        (50, 50, false, false),
+    ] {
+        assert!(reader
+            .range_query(&int_key(from), &int_key(to), lower, upper)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    assert!(reads.lock().unwrap().is_empty());
+}
+
 fn read_footer(data: &[u8]) -> BTreeFileFooter {
     BTreeFileFooter::read_footer(&data[data.len() - BTREE_FOOTER_ENCODED_LENGTH..]).unwrap()
+}
+
+#[tokio::test]
+async fn test_java_v2_posting_encodings() {
+    // Existing low-level tests use arbitrary big-endian keys. Java's INT key
+    // serializer uses little-endian bytes, so use the production codec here.
+    let data_type = DataType::Int(crate::spec::IntType::new());
+    let int_key = |v| crate::btree::serialize_datum(&Datum::Int(v), &data_type);
+    for fixture in [
+        include_bytes!("../../testdata/btree/btree_v2_java_none.bin").as_slice(),
+        include_bytes!("../../testdata/btree/btree_v2_java_lz4.bin").as_slice(),
+    ] {
+        let reader = BTreeIndexReader::open(
+            Box::new(BytesFileRead(Bytes::copy_from_slice(fixture))),
+            fixture.len() as u64,
+            &BTreeIndexMeta::new(Some(int_key(0)), Some(int_key(5)), true),
+            crate::btree::make_key_comparator(&data_type),
+        )
+        .await
+        .unwrap();
+        let expected = [
+            [7].into_iter().collect::<roaring::RoaringTreemap>(),
+            [2, 130, 65538, (1u64 << 32) + 5].into_iter().collect(),
+            (60000..140000).collect(),
+            ((1u64 << 32) - 10..(1u64 << 32) + 10000).collect(),
+            [i64::MAX as u64].into_iter().collect(),
+            (0..4096).map(|id| (1u64 << 40) + id * 128).collect(),
+        ];
+        for (key, rows) in expected.iter().enumerate() {
+            assert_eq!(
+                reader.query_equal(&int_key(key as i32)).await.unwrap(),
+                *rows
+            );
+        }
+        assert_eq!(
+            reader.null_bitmap().iter().collect::<Vec<_>>(),
+            vec![4, (1u64 << 32) + 20000]
+        );
+        assert_eq!(
+            reader.query_in(&[&int_key(1), &int_key(3)]).await.unwrap(),
+            &expected[1] | &expected[3]
+        );
+        assert_eq!(
+            reader
+                .range_query(&int_key(1), &int_key(3), false, false)
+                .await
+                .unwrap(),
+            expected[2]
+        );
+        assert_eq!(
+            reader.scan_entries(|key| key == int_key(2)).await.unwrap(),
+            expected[2]
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_v2_writer_matches_java_fixture() {
+    let data_type = DataType::Int(crate::spec::IntType::new());
+    let int_key = |v| crate::btree::serialize_datum(&Datum::Int(v), &data_type);
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::with_comparator(
+        Box::new(buf.clone()),
+        64,
+        BlockCompressionType::None,
+        crate::btree::make_key_comparator(&data_type),
+    )
+    .with_file_version(2)
+    .unwrap();
+    writer.write(Some(&int_key(0)), 7).await.unwrap();
+    for row in [2, 130, 65538, (1i64 << 32) + 5] {
+        writer.write(Some(&int_key(1)), row).await.unwrap();
+    }
+    for row in 60000..140000 {
+        writer.write(Some(&int_key(2)), row).await.unwrap();
+    }
+    for row in (1i64 << 32) - 10..(1i64 << 32) + 10000 {
+        writer.write(Some(&int_key(3)), row).await.unwrap();
+    }
+    writer.write(Some(&int_key(4)), i64::MAX).await.unwrap();
+    for id in 0..4096 {
+        writer
+            .write(Some(&int_key(5)), (1i64 << 40) + id * 128)
+            .await
+            .unwrap();
+    }
+    writer.write(None, 4).await.unwrap();
+    writer.write(None, (1i64 << 32) + 20000).await.unwrap();
+    writer.finish().await.unwrap();
+    assert_eq!(
+        buf.to_vec(),
+        include_bytes!("../../testdata/btree/btree_v2_java_none.bin")
+    );
+    assert!(
+        include_bytes!("../../testdata/btree/btree_v2_java_lz4.bin").len()
+            < include_bytes!("../../testdata/btree/btree_v2_java_none.bin").len()
+    );
+}
+
+#[test]
+fn test_unsupported_version_is_rejected() {
+    for version in [0u32, 3, u32::MAX] {
+        let mut bytes = include_bytes!("../../testdata/btree/btree_v2_java_none.bin").to_vec();
+        let pos = bytes.len() - 8;
+        bytes[pos..pos + 4].copy_from_slice(&version.to_le_bytes());
+        assert!(BTreeFileFooter::read_footer(&bytes[bytes.len() - 52..]).is_err());
+        assert!(BTreeIndexWriter::new(
+            Box::new(VecFileWrite::new()),
+            64,
+            BlockCompressionType::None
+        )
+        .with_file_version(version)
+        .is_err());
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual release benchmark; no wall-clock assertions"]
+async fn benchmark_btree_v1_v2_postings() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let count = 1_200_000;
+    let mut readers = Vec::new();
+    for version in [1, 2] {
+        let buf = VecFileWrite::new();
+        let mut writer =
+            BTreeIndexWriter::new(Box::new(buf.clone()), 64 * 1024, BlockCompressionType::None)
+                .with_file_version(version)
+                .unwrap();
+        for key in [0, 1] {
+            for id in 0..count {
+                if (id % 10 != 0) as i32 == key {
+                    writer.write(Some(&int_key(key)), id).await.unwrap();
+                }
+            }
+        }
+        writer.write(Some(&int_key(2)), count).await.unwrap();
+        let result = writer.finish().await.unwrap();
+        let reader = write_and_open(&buf, &result, int_cmp).await;
+        println!(
+            "BTREE_BENCH version={version} file_bytes={}",
+            buf.to_vec().len()
+        );
+        readers.push(reader);
+    }
+    for (key, expected) in [(0, count / 10), (1, count * 9 / 10), (2, 1)] {
+        for reader in &readers {
+            for _ in 0..3 {
+                assert_eq!(
+                    reader.query_equal(&int_key(key)).await.unwrap().len(),
+                    expected as u64
+                );
+            }
+        }
+        let mut times = [Vec::new(), Vec::new()];
+        for round in 0..7 {
+            for version in [round % 2, 1 - round % 2] {
+                let start = Instant::now();
+                let rows = readers[version].query_equal(&int_key(key)).await.unwrap();
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(rows.len(), expected as u64);
+                black_box(rows);
+                times[version].push(elapsed);
+            }
+        }
+        for samples in &mut times {
+            samples.sort_by(f64::total_cmp);
+        }
+        println!(
+            "BTREE_BENCH key={key} rows={expected} v1_ms={:.3} v2_ms={:.3}",
+            times[0][3], times[1][3]
+        );
+    }
 }
 
 #[tokio::test]

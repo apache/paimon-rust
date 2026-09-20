@@ -2526,6 +2526,27 @@ mod tests {
     }
 
     #[test]
+    fn a_dynamic_copy_can_disable_parquet_page_indexes() {
+        let stored = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("parquet.filter.columnindex.enabled", "true")
+                .build()
+                .unwrap(),
+        );
+        let copied = stored.copy_with_options(HashMap::from([(
+            "parquet.filter.columnindex.enabled".to_string(),
+            "false".to_string(),
+        )]));
+
+        assert!(!copied
+            .core_options()
+            .parquet_filter_column_index_enabled()
+            .unwrap());
+    }
+
+    #[test]
     fn test_copy_with_replaced_options() {
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))

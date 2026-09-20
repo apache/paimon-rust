@@ -30,6 +30,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const BLOB_RANGE_MERGE_GAP: u64 = 64 * 1024;
 const BLOB_RANGE_MERGE_MAX_SPAN: u64 = 8 * 1024 * 1024;
+const BLOB_RANGE_MERGE_MAX_AMPLIFICATION: u64 = 2;
 pub(crate) const BLOB_DESCRIPTOR_READ_CONCURRENCY: usize = DEFAULT_BLOB_READ_PARALLELISM;
 const BLOB_DESCRIPTOR_READ_BYTE_UNIT: u64 = 1024 * 1024;
 const BLOB_DESCRIPTOR_READ_MAX_IN_FLIGHT_BYTES: u64 = 64 * 1024 * 1024;
@@ -505,37 +506,8 @@ pub(crate) async fn resolve_blob_column(
         });
     }
 
-    for ResolvedMergedBlobRead { merged, data } in read_blob_groups(read_groups, limiter).await? {
-        for request in merged.requests {
-            let start = usize::try_from(request.offset - merged.start).map_err(|e| {
-                crate::Error::DataInvalid {
-                    message: format!(
-                        "BlobDescriptor slice offset exceeds usize: offset={}, merged_start={}",
-                        request.offset, merged.start
-                    ),
-                    source: Some(Box::new(e)),
-                }
-            })?;
-            let length =
-                usize::try_from(request.length).map_err(|e| crate::Error::DataInvalid {
-                    message: format!(
-                        "BlobDescriptor slice length exceeds usize: {}",
-                        request.length
-                    ),
-                    source: Some(Box::new(e)),
-                })?;
-            let end = start
-                .checked_add(length)
-                .filter(|end| *end <= data.len())
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!(
-                        "BlobDescriptor slice exceeds read data: start={start}, length={length}, actual={}",
-                        data.len()
-                    ),
-                    source: None,
-                })?;
-            cells[request.row] = ResolvedBlobCell::Value(data.slice(start..end));
-        }
+    for resolved in read_blob_groups(read_groups, limiter).await? {
+        cells[resolved.row] = ResolvedBlobCell::Value(resolved.data);
     }
 
     let mut builder = LargeBinaryBuilder::with_capacity(col.len(), value_capacity);
@@ -573,10 +545,11 @@ struct MergedBlobRead {
     start: u64,
     end: u64,
     requests: Vec<BlobReadRequest>,
+    selected_bytes: u64,
 }
 
-struct ResolvedMergedBlobRead {
-    merged: MergedBlobRead,
+struct ResolvedBlobRead {
+    row: usize,
     data: Bytes,
 }
 
@@ -589,9 +562,9 @@ struct BlobReadGroup {
 async fn read_blob_groups(
     groups: Vec<BlobReadGroup>,
     limiter: BlobReadLimiter,
-) -> Result<Vec<ResolvedMergedBlobRead>> {
+) -> Result<Vec<ResolvedBlobRead>> {
     let blob_parallelism = limiter.parallelism();
-    let grouped_results: Vec<Vec<ResolvedMergedBlobRead>> =
+    let grouped_results: Vec<Vec<ResolvedBlobRead>> =
         stream::iter(groups)
             .map(|group| {
                 let limiter = limiter.clone();
@@ -610,7 +583,7 @@ async fn read_merged_blob_ranges(
     reader: Arc<dyn FileRead>,
     reads: Vec<MergedBlobRead>,
     limiter: BlobReadLimiter,
-) -> Result<Vec<ResolvedMergedBlobRead>> {
+) -> Result<Vec<ResolvedBlobRead>> {
     let blob_parallelism = limiter.parallelism();
     stream::iter(reads)
         .map(|merged| {
@@ -618,8 +591,10 @@ async fn read_merged_blob_ranges(
             let reader = reader.clone();
             let limiter = limiter.clone();
             async move {
+                let expected_len = merged.end - merged.start;
+                let copy_values = expected_len > merged.selected_bytes;
                 let _permits = limiter
-                    .acquire_read(merged.end - merged.start, &uri)
+                    .acquire_read(expected_len, &uri)
                     .await?;
                 let data = reader
                     .read(merged.start..merged.end)
@@ -631,7 +606,6 @@ async fn read_merged_blob_ranges(
                         ),
                         source: Some(Box::new(e)),
                     })?;
-                let expected_len = merged.end - merged.start;
                 let actual_len = data.len() as u64;
                 if actual_len != expected_len {
                     return Err(crate::Error::DataInvalid {
@@ -642,12 +616,55 @@ async fn read_merged_blob_ranges(
                         source: None,
                     });
                 }
-                Ok(ResolvedMergedBlobRead { merged, data })
+                merged
+                    .requests
+                    .into_iter()
+                    .map(|request| {
+                        let start = usize::try_from(request.offset - merged.start).map_err(|e| {
+                            crate::Error::DataInvalid {
+                                message: format!(
+                                    "BlobDescriptor slice offset exceeds usize: offset={}, merged_start={}",
+                                    request.offset, merged.start
+                                ),
+                                source: Some(Box::new(e)),
+                            }
+                        })?;
+                        let length = usize::try_from(request.length).map_err(|e| {
+                            crate::Error::DataInvalid {
+                                message: format!(
+                                    "BlobDescriptor slice length exceeds usize: {}",
+                                    request.length
+                                ),
+                                source: Some(Box::new(e)),
+                            }
+                        })?;
+                        let end = start
+                            .checked_add(length)
+                            .filter(|end| *end <= data.len())
+                            .ok_or_else(|| crate::Error::DataInvalid {
+                                message: format!(
+                                    "BlobDescriptor slice exceeds read data: start={start}, length={length}, actual={}",
+                                    data.len()
+                                ),
+                                source: None,
+                            })?;
+                        let value = if copy_values {
+                            Bytes::copy_from_slice(&data[start..end])
+                        } else {
+                            data.slice(start..end)
+                        };
+                        Ok(ResolvedBlobRead {
+                            row: request.row,
+                            data: value,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
             }
         })
         .buffer_unordered(blob_parallelism)
         .try_collect()
         .await
+        .map(|results: Vec<Vec<ResolvedBlobRead>>| results.into_iter().flatten().collect())
 }
 
 fn merge_blob_read_requests(mut requests: Vec<BlobReadRequest>) -> Vec<MergedBlobRead> {
@@ -660,25 +677,32 @@ fn merge_blob_read_requests(mut requests: Vec<BlobReadRequest>) -> Vec<MergedBlo
     let mut current = MergedBlobRead {
         start: requests[0].offset,
         end: requests[0].offset + requests[0].length,
+        selected_bytes: requests[0].length,
         requests: vec![requests[0].clone()],
     };
 
     for request in requests.into_iter().skip(1) {
         let request_end = request.offset + request.length;
+        let added_selected_bytes = request_end.saturating_sub(request.offset.max(current.end));
+        let selected_bytes = current.selected_bytes.saturating_add(added_selected_bytes);
         let close_enough = current
             .end
             .checked_add(BLOB_RANGE_MERGE_GAP)
             .is_some_and(|merge_limit| request.offset <= merge_limit);
         let merged_end = current.end.max(request_end);
         let merged_span = merged_end - current.start;
-        if close_enough && merged_span <= BLOB_RANGE_MERGE_MAX_SPAN {
+        let amplification_bounded =
+            merged_span <= selected_bytes.saturating_mul(BLOB_RANGE_MERGE_MAX_AMPLIFICATION);
+        if close_enough && merged_span <= BLOB_RANGE_MERGE_MAX_SPAN && amplification_bounded {
             current.end = merged_end;
+            current.selected_bytes = selected_bytes;
             current.requests.push(request);
         } else {
             merged.push(current);
             current = MergedBlobRead {
                 start: request.offset,
                 end: request_end,
+                selected_bytes: request.length,
                 requests: vec![request],
             };
         }
@@ -764,6 +788,7 @@ mod tests {
             .map(|row| MergedBlobRead {
                 start: row,
                 end: row + 1,
+                selected_bytes: 1,
                 requests: vec![BlobReadRequest {
                     row: row as usize,
                     offset: row,
@@ -793,6 +818,7 @@ mod tests {
             .map(|row| MergedBlobRead {
                 start: row,
                 end: row + 1,
+                selected_bytes: 1,
                 requests: vec![BlobReadRequest {
                     row: row as usize,
                     offset: row,
@@ -821,6 +847,7 @@ mod tests {
             MergedBlobRead {
                 start: 4,
                 end: 8,
+                selected_bytes: 4,
                 requests: vec![BlobReadRequest {
                     row: 0,
                     offset: 4,
@@ -830,6 +857,7 @@ mod tests {
             MergedBlobRead {
                 start: 0,
                 end: 4,
+                selected_bytes: 4,
                 requests: vec![BlobReadRequest {
                     row: 1,
                     offset: 0,
@@ -849,7 +877,7 @@ mod tests {
 
         let mut by_row = results
             .into_iter()
-            .map(|result| (result.merged.requests[0].row, result.data))
+            .map(|result| (result.row, result.data))
             .collect::<Vec<_>>();
         by_row.sort_by_key(|(row, _)| *row);
         assert_eq!(by_row[0], (0, Bytes::from_static(b"efgh")));
@@ -875,6 +903,7 @@ mod tests {
                 reads: vec![MergedBlobRead {
                     start: 0,
                     end: 1,
+                    selected_bytes: 1,
                     requests: vec![BlobReadRequest {
                         row,
                         offset: 0,
@@ -947,8 +976,40 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 3);
         assert_eq!(reader.ranges(), vec![0..8]);
+    }
+
+    #[tokio::test]
+    async fn test_gapped_merged_ranges_copy_selected_values() {
+        let reader = TrackingFileRead::new(Bytes::from_static(b"abcd--efgh"));
+        let reads = merge_blob_read_requests(vec![
+            BlobReadRequest {
+                row: 0,
+                offset: 0,
+                length: 4,
+            },
+            BlobReadRequest {
+                row: 1,
+                offset: 6,
+                length: 4,
+            },
+        ]);
+
+        let mut results = read_merged_blob_ranges(
+            "memory:/blob.bin",
+            Arc::new(reader.clone()),
+            reads,
+            BlobReadLimiter::new(),
+        )
+        .await
+        .unwrap();
+        results.sort_unstable_by_key(|result| result.row);
+
+        assert_eq!(reader.ranges(), vec![0..10]);
+        assert_eq!(results[0].data, Bytes::from_static(b"abcd"));
+        assert_eq!(results[1].data, Bytes::from_static(b"efgh"));
+        assert!(results.iter().all(|result| result.data.is_unique()));
     }
 
     #[tokio::test]
@@ -959,6 +1020,7 @@ mod tests {
             vec![MergedBlobRead {
                 start: 4,
                 end: 8,
+                selected_bytes: 4,
                 requests: vec![BlobReadRequest {
                     row: 0,
                     offset: 4,
@@ -979,7 +1041,7 @@ mod tests {
         let merged = merge_blob_read_requests(vec![
             BlobReadRequest {
                 row: 2,
-                offset: 120,
+                offset: 20,
                 length: 5,
             },
             BlobReadRequest {
@@ -1001,7 +1063,7 @@ mod tests {
 
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].start, 0);
-        assert_eq!(merged[0].end, 125);
+        assert_eq!(merged[0].end, 25);
         assert_eq!(
             merged[0]
                 .requests
@@ -1012,6 +1074,27 @@ mod tests {
         );
         assert_eq!(merged[1].start, BLOB_RANGE_MERGE_MAX_SPAN + 1);
         assert_eq!(merged[1].end, BLOB_RANGE_MERGE_MAX_SPAN + 5);
+    }
+
+    #[test]
+    fn test_merge_blob_read_requests_rejects_sparse_ranges() {
+        let value_length = 4 * 1024;
+        let stride = value_length + BLOB_RANGE_MERGE_GAP;
+        let requests = (0..128)
+            .map(|row| BlobReadRequest {
+                row,
+                offset: row as u64 * stride,
+                length: value_length,
+            })
+            .collect();
+
+        let merged = merge_blob_read_requests(requests);
+
+        assert_eq!(merged.len(), 128);
+        assert_eq!(
+            merged.iter().map(|read| read.end - read.start).sum::<u64>(),
+            128 * value_length
+        );
     }
 
     fn java_v2_descriptor(uri: &str, offset: i64, length: i64) -> Vec<u8> {

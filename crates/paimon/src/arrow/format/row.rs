@@ -33,13 +33,14 @@ use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
     Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, LargeBinaryBuilder,
     StringBuilder, Time32MillisecondBuilder, TimestampMicrosecondBuilder,
-    TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+    TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray,
     MapArray, RecordBatch, RecordBatchOptions, StringArray, StructArray, Time32MillisecondArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field, Fields, SchemaRef, TimeUnit};
@@ -292,6 +293,9 @@ impl FormatFileReader for RowFormatReader {
             })?;
         index.validate_for_file(total_rows, index_start)?;
         validate_row_selection(total_rows, row_selection.as_deref())?;
+        // Public callers may supply unordered or overlapping ranges. Normalize
+        // once so every block can seek directly to its overlapping window.
+        let row_selection = row_selection.map(crate::table::merge_row_ranges);
 
         let schema = build_target_arrow_schema(read_fields)?;
         let row_type = read_fields.to_vec();
@@ -507,7 +511,8 @@ fn validate_arrow_map_entries(
 
 fn timestamp_time_unit_for_precision(precision: u32) -> TimeUnit {
     match precision {
-        0..=3 => TimeUnit::Millisecond,
+        0 => TimeUnit::Second,
+        1..=3 => TimeUnit::Millisecond,
         4..=6 => TimeUnit::Microsecond,
         _ => TimeUnit::Nanosecond,
     }
@@ -901,6 +906,16 @@ fn write_timestamp(
     precision: u32,
 ) -> crate::Result<()> {
     let (millis, nanos_of_milli) = match array.data_type() {
+        ArrowDataType::Timestamp(TimeUnit::Second, _) => (
+            downcast::<TimestampSecondArray>(array, &DataType::Timestamp(Default::default()))?
+                .value(row_idx)
+                .checked_mul(1_000)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: ".row timestamp second conversion overflow".to_string(),
+                    source: None,
+                })?,
+            0,
+        ),
         ArrowDataType::Timestamp(TimeUnit::Millisecond, _) => (
             downcast::<TimestampMillisecondArray>(array, &DataType::Timestamp(Default::default()))?
                 .value(row_idx),
@@ -1173,6 +1188,7 @@ enum ColumnBuilder {
     LargeBinary(LargeBinaryBuilder),
     Date(Date32Builder),
     Time(Time32MillisecondBuilder),
+    TimestampS(TimestampSecondBuilder),
     TimestampMs(TimestampMillisecondBuilder),
     TimestampUs(TimestampMicrosecondBuilder),
     TimestampNs(TimestampNanosecondBuilder),
@@ -1313,6 +1329,7 @@ impl ColumnBuilder {
             Self::LargeBinary(b) => b.append_null(),
             Self::Date(b) => b.append_null(),
             Self::Time(b) => b.append_null(),
+            Self::TimestampS(b) => b.append_null(),
             Self::TimestampMs(b) => b.append_null(),
             Self::TimestampUs(b) => b.append_null(),
             Self::TimestampNs(b) => b.append_null(),
@@ -1372,6 +1389,9 @@ impl ColumnBuilder {
             (Self::LargeBinary(b), DataType::Blob(_)) => b.append_value(input.read_bytes()?),
             (Self::Date(b), DataType::Date(_)) => b.append_value(input.read_i32()?),
             (Self::Time(b), DataType::Time(_)) => b.append_value(input.read_i32()?),
+            (Self::TimestampS(b), DataType::Timestamp(_) | DataType::LocalZonedTimestamp(_)) => {
+                b.append_value(read_timestamp_value(input, TimeUnit::Second)?);
+            }
             (Self::TimestampMs(b), DataType::Timestamp(_) | DataType::LocalZonedTimestamp(_)) => {
                 b.append_value(read_timestamp_value(input, TimeUnit::Millisecond)?);
             }
@@ -1499,6 +1519,7 @@ impl ColumnBuilder {
             Self::LargeBinary(mut b) => Arc::new(b.finish()),
             Self::Date(mut b) => Arc::new(b.finish()),
             Self::Time(mut b) => Arc::new(b.finish()),
+            Self::TimestampS(mut b) => Arc::new(b.finish()),
             Self::TimestampMs(mut b) => Arc::new(b.finish()),
             Self::TimestampUs(mut b) => Arc::new(b.finish()),
             Self::TimestampNs(mut b) => Arc::new(b.finish()),
@@ -1750,7 +1771,15 @@ fn map_entries_field(
 
 fn timestamp_builder(precision: u32, timezone: bool, capacity: usize) -> ColumnBuilder {
     match precision {
-        0..=3 => {
+        0 => {
+            let builder = TimestampSecondBuilder::with_capacity(capacity);
+            if timezone {
+                ColumnBuilder::TimestampS(builder.with_timezone("UTC"))
+            } else {
+                ColumnBuilder::TimestampS(builder)
+            }
+        }
+        1..=3 => {
             let builder = TimestampMillisecondBuilder::with_capacity(capacity);
             if timezone {
                 ColumnBuilder::TimestampMs(builder.with_timezone("UTC"))
@@ -1801,7 +1830,7 @@ fn read_timestamp_value(input: &mut BlockInput<'_>, unit: TimeUnit) -> crate::Re
                 source: None,
             })?
         }
-        TimeUnit::Second => millis / 1_000,
+        TimeUnit::Second => millis.div_euclid(1_000),
     })
 }
 
@@ -2268,11 +2297,8 @@ fn blocks_to_read(
         } else {
             total_rows
         };
-        let intersects = selection.is_none_or(|ranges| {
-            ranges
-                .iter()
-                .any(|r| (r.from() as usize) < end && (r.to() as usize) >= start)
-        });
+        let intersects =
+            selection.is_none_or(|ranges| !overlapping_ranges(ranges, start, end).is_empty());
         if intersects {
             result.push(block_idx);
         }
@@ -2289,7 +2315,7 @@ fn selected_local_indices(
         None => (0..block_end - block_start).collect(),
         Some(ranges) => {
             let mut result = Vec::new();
-            for range in ranges {
+            for range in overlapping_ranges(ranges, block_start, block_end) {
                 let start = (range.from() as usize).max(block_start);
                 let end = ((range.to() as usize) + 1).min(block_end);
                 if start < end {
@@ -2299,6 +2325,15 @@ fn selected_local_indices(
             result
         }
     }
+}
+
+/// Input is sorted, disjoint and nonnegative; `end` is exclusive.
+/// Never rescan a large prefix for each successive data block.
+fn overlapping_ranges(ranges: &[RowRange], start: usize, end: usize) -> &[RowRange] {
+    let first = ranges.partition_point(|range| (range.to() as usize) < start);
+    let suffix = &ranges[first..];
+    let count = suffix.partition_point(|range| (range.from() as usize) < end);
+    &suffix[..count]
 }
 
 fn i128_to_java_bigint_bytes(value: i128) -> Vec<u8> {
@@ -2341,8 +2376,9 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::{
         ArrayType, BigIntType, BlobType, BooleanType, DataType, DateType, Datum, DecimalType,
-        DoubleType, FloatType, IntType, MapType, MultisetType, Predicate, PredicateOperator,
-        RowType, TimeType, TimestampType, VarBinaryType, VarCharType, VariantType,
+        DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType, MultisetType, Predicate,
+        PredicateOperator, RowType, TimeType, TimestampType, VarBinaryType, VarCharType,
+        VariantType,
     };
     use crate::variant::GenericVariant;
     use futures::TryStreamExt;
@@ -2615,7 +2651,11 @@ mod tests {
                 &fields,
                 None,
                 Some(8),
-                Some(vec![RowRange::new(1, 2)]),
+                Some(vec![
+                    RowRange::new(2, 2),
+                    RowRange::new(1, 2),
+                    RowRange::new(1, 1),
+                ]),
             )
             .await
             .unwrap()
@@ -2639,6 +2679,71 @@ mod tests {
             .unwrap();
         assert!(names.is_null(0));
         assert_eq!(names.value(1), "ccc");
+    }
+
+    #[tokio::test]
+    async fn row_writer_reader_roundtrip_timestamp_zero_as_seconds() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/row-timestamp-zero/data.row";
+        let output = file_io.new_output(path).unwrap();
+        let fields = vec![
+            DataField::new(
+                0,
+                "ts".to_string(),
+                DataType::Timestamp(TimestampType::new(0).unwrap()),
+            ),
+            DataField::new(
+                1,
+                "ts_ltz".to_string(),
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(0).unwrap()),
+            ),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let mut writer = RowFormatWriter::new(&output, schema.clone(), fields.clone(), 1)
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![Some(-1), Some(2), None])),
+                Arc::new(
+                    TimestampSecondArray::from(vec![Some(-1), Some(2), None]).with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        Box::new(writer).close().await.unwrap();
+
+        let input = file_io.new_input(path).unwrap();
+        let bytes = input.read().await.unwrap();
+        let actual = RowFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone())),
+                bytes.len() as u64,
+                &fields,
+                None,
+                Some(8),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].schema().as_ref(), batch.schema().as_ref());
+        for column in 0..2 {
+            let values = actual[0]
+                .column(column)
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap();
+            assert_eq!(values.value(0), -1);
+            assert_eq!(values.value(1), 2);
+            assert!(values.is_null(2));
+        }
     }
 
     #[tokio::test]
@@ -2885,6 +2990,106 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; exact selection oracle, no timing assertions"]
+    fn benchmark_scalar_row_selection() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let rows = 1_200_000;
+        let block_rows = 1024;
+        let starts: Vec<_> = (0..rows).step_by(block_rows).map(|id| id as i64).collect();
+        let index =
+            RowBlockIndex::new(vec![1; starts.len()], vec![1; starts.len()], starts).unwrap();
+        for (name, run, stride) in [
+            ("90pct", 9, 10),
+            ("10pct", 1, 10),
+            ("contiguous", rows, rows),
+        ] {
+            let ranges: Vec<_> = (0..rows)
+                .step_by(stride)
+                .map(|id| RowRange::new(id as i64, (id + run - 1) as i64))
+                .collect();
+            let run_selection = || {
+                let blocks = blocks_to_read(&index, rows, Some(&ranges));
+                let mut selected = Vec::new();
+                for block in blocks {
+                    let start = index.block_row_start(block);
+                    let end = (start + block_rows).min(rows);
+                    selected.extend(
+                        selected_local_indices(start, end, Some(&ranges))
+                            .into_iter()
+                            .map(|id| start + id),
+                    );
+                }
+                selected
+            };
+            let expected: Vec<_> = ranges
+                .iter()
+                .flat_map(|r| r.from() as usize..=r.to() as usize)
+                .collect();
+            for _ in 0..3 {
+                assert_eq!(run_selection(), expected);
+            }
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let start = Instant::now();
+                let selected = run_selection();
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(selected, expected);
+                black_box(selected);
+                samples.push(elapsed);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "ROW_SELECTION_BENCH case={name} ranges={} blocks={} median_ms={:.3}",
+                ranges.len(),
+                index.block_count(),
+                samples[3]
+            );
+        }
+    }
+
+    #[test]
+    fn row_selection_windows_match_independent_row_oracle() {
+        let index = RowBlockIndex::new(vec![1; 4], vec![1; 4], vec![0, 10, 20, 30]).unwrap();
+        for selection in [
+            None,
+            Some(vec![]),
+            Some(vec![RowRange::new(9, 11), RowRange::new(29, 39)]),
+            Some(vec![RowRange::new(0, 0), RowRange::new(39, 39)]),
+            Some(vec![RowRange::new(0, 39)]),
+        ] {
+            let expected: Vec<_> = (0..40)
+                .filter(|row| {
+                    selection.as_ref().is_none_or(|ranges| {
+                        ranges
+                            .iter()
+                            .any(|range| range.from() <= *row as i64 && *row as i64 <= range.to())
+                    })
+                })
+                .collect();
+            let blocks = blocks_to_read(&index, 40, selection.as_deref());
+            let mut actual = Vec::new();
+            for block in blocks {
+                actual.extend(
+                    selected_local_indices(block * 10, (block + 1) * 10, selection.as_deref())
+                        .into_iter()
+                        .map(|row| block * 10 + row),
+                );
+            }
+            assert_eq!(actual, expected);
+        }
+        let ranges: Vec<_> = (0..1_200_000)
+            .step_by(10)
+            .map(|row| RowRange::new(row, row))
+            .collect();
+        assert_eq!(
+            overlapping_ranges(&ranges, 1_199_989, 1_200_000),
+            &[RowRange::new(1_199_990, 1_199_990)]
+        );
+        assert!(overlapping_ranges(&ranges, 1_199_991, 1_200_000).is_empty());
     }
 
     #[tokio::test]

@@ -113,6 +113,12 @@ impl GlobalIndexScanner {
         let mut file_result = None;
 
         if plan.between_matches && plan.between_evaluated {
+            #[cfg(test)]
+            if let Some(probe) = &self.query_io_probe {
+                probe
+                    .range_queries
+                    .fetch_add(1, super::TestOrdering::SeqCst);
+            }
             let between = between.expect("evaluated between query is present");
             let serialize_key = match entry.index_type {
                 GlobalIndexFileKind::BTree => serialize_datum,
@@ -139,6 +145,12 @@ impl GlobalIndexScanner {
         }
 
         for &idx in &plan.matching_predicates {
+            #[cfg(test)]
+            if let Some(probe) = &self.query_io_probe {
+                probe
+                    .predicate_queries
+                    .fetch_add(1, super::TestOrdering::SeqCst);
+            }
             let (op, literals, data_type) = &effective_predicates[idx];
             let Some(bitmap) = reader
                 .as_ref()

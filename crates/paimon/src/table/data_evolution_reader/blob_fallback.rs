@@ -334,7 +334,7 @@ mod tests {
     use arrow_array::{Array, LargeBinaryArray};
     use bytes::Bytes;
     use std::ops::Range;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[test]
     fn test_row_id_batch_cursor_honors_batch_size() {
@@ -356,13 +356,13 @@ mod tests {
     #[derive(Clone)]
     struct TrackingFileRead {
         bytes: Bytes,
-        reads: Arc<AtomicUsize>,
+        ranges: Arc<Mutex<Vec<Range<u64>>>>,
     }
 
     #[async_trait::async_trait]
     impl FileRead for TrackingFileRead {
         async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
-            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.ranges.lock().unwrap().push(range.clone());
             Ok(self.bytes.slice(range.start as usize..range.end as usize))
         }
     }
@@ -371,14 +371,14 @@ mod tests {
         file_name: &str,
         first_row_id: i64,
         values: &[BlobFixtureValue<'_>],
-    ) -> (LazyBlobFile, Arc<AtomicUsize>) {
+    ) -> (LazyBlobFile, Arc<Mutex<Vec<Range<u64>>>>) {
         let bytes = Bytes::from(build_blob_file_bytes_with_values(values));
         let file_size = bytes.len() as u64;
-        let reads = Arc::new(AtomicUsize::new(0));
+        let ranges = Arc::new(Mutex::new(Vec::new()));
         let reader = IndexedBlobReader::open(
             Box::new(TrackingFileRead {
                 bytes,
-                reads: reads.clone(),
+                ranges: ranges.clone(),
             }),
             file_size,
             file_name.to_string(),
@@ -386,7 +386,7 @@ mod tests {
         )
         .await
         .unwrap();
-        reads.store(0, Ordering::SeqCst);
+        ranges.lock().unwrap().clear();
 
         let last_row_id = first_row_id + i64::try_from(values.len()).unwrap() - 1;
         (
@@ -398,7 +398,7 @@ mod tests {
                 row_count: i64::try_from(values.len()).unwrap(),
                 reader: Some(reader),
             },
-            reads,
+            ranges,
         )
     }
 
@@ -406,9 +406,9 @@ mod tests {
     async fn test_resolve_batch_skips_payloads_for_resolved_rows() {
         use BlobFixtureValue::{Null, Placeholder, Value};
 
-        let (latest, latest_reads) =
+        let (latest, latest_ranges) =
             tracking_blob_file("latest.blob", 0, &[Value(b"new-0"), Null, Placeholder]).await;
-        let (older, older_reads) = tracking_blob_file(
+        let (older, older_ranges) = tracking_blob_file(
             "older.blob",
             0,
             &[
@@ -419,7 +419,7 @@ mod tests {
             ],
         )
         .await;
-        let (oldest, oldest_reads) = tracking_blob_file(
+        let (oldest, oldest_ranges) = tracking_blob_file(
             "oldest.blob",
             0,
             &[
@@ -464,8 +464,15 @@ mod tests {
         assert!(values.is_null(1));
         assert_eq!(values.value(2), b"old-2");
         assert_eq!(values.value(3), b"old-3");
-        assert_eq!(latest_reads.load(Ordering::SeqCst), 1);
-        assert_eq!(older_reads.load(Ordering::SeqCst), 2);
-        assert_eq!(oldest_reads.load(Ordering::SeqCst), 0);
+        let blob_entry_overhead = 4 + 8 + 4;
+        let latest_entry_end = (blob_entry_overhead + b"new-0".len()) as u64;
+        assert_eq!(*latest_ranges.lock().unwrap(), vec![0..latest_entry_end]);
+
+        let older_entry_length = (blob_entry_overhead + b"old-0".len()) as u64;
+        assert_eq!(
+            *older_ranges.lock().unwrap(),
+            vec![2 * older_entry_length..4 * older_entry_length]
+        );
+        assert!(oldest_ranges.lock().unwrap().is_empty());
     }
 }

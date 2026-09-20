@@ -237,6 +237,17 @@ async fn audit_log_delta_scan_preserves_pk_row_kinds() {
             ("-U".to_string(), 2, 20),
         ]
     );
+
+    let splits = plan.data_splits();
+    assert!(splits.iter().all(|split| split.is_streaming()));
+    let read = table.new_read_builder().new_read().unwrap();
+    let direct: Vec<RecordBatch> = read
+        .to_arrow_with_row_kind(&splits)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(collect_audit_rows(&direct), collect_audit_rows(&batches));
 }
 
 #[test]
@@ -318,6 +329,26 @@ async fn audit_log_exposes_sequence_number_when_enabled() {
     let rows = collect_audit_rows_with_sequence(&batches);
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|(_, seq, _, _)| *seq >= 0));
+
+    let direct: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow_with_row_kind(&plan.data_splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        direct[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>(),
+        vec!["rowkind".to_string(), "id".to_string(), "value".to_string()],
+        "the Python-compatible row-kind read must not leak the audit-only sequence column",
+    );
 }
 
 #[tokio::test]

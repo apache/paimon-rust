@@ -290,7 +290,8 @@ impl<'a> FullTextSearchBuilder<'a> {
             self.table.schema().fields().to_vec(),
             self.table.schema().fields().to_vec(),
             Vec::new(),
-        );
+        )
+        .with_table_options(self.table.schema().options().clone());
         let read = PrimaryKeyFullTextRead::new(
             self.table.file_io().clone(),
             materialize_reader,

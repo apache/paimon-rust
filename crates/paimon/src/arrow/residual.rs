@@ -52,7 +52,7 @@ use arrow_array::{
     FixedSizeListArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
     LargeBinaryArray, LargeListArray, ListArray, RecordBatch, Scalar, StringArray,
     Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_ord::cmp::{
     eq as arrow_eq, gt as arrow_gt, gt_eq as arrow_gt_eq, lt as arrow_lt, lt_eq as arrow_lt_eq,
@@ -336,6 +336,19 @@ pub(crate) fn evaluate_exact_leaf_predicate(
     ) {
         return evaluate_array_membership_predicate(array, data_type, op, literals);
     }
+    // TIMESTAMP(0) is exposed as Arrow seconds, while Parquet keeps Paimon's
+    // millisecond physical representation. Compare both representations in
+    // i128 nanoseconds so the decoded array's unit cannot disagree with the
+    // literal scalar and a fractional literal (for example 1.5 seconds) is not
+    // rounded down to the column precision.
+    if matches!(
+        data_type,
+        DataType::Timestamp(_) | DataType::LocalZonedTimestamp(_)
+    ) && matches!(array.data_type(), arrow_schema::DataType::Timestamp(_, _))
+        && !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull)
+    {
+        return evaluate_timestamp_leaf(array, data_type, op, literals);
+    }
     // Decimals are compared by mathematical value across scales (Paimon
     // `datum_cmp`/`decimal_cmp`). Arrow scalar comparison requires the literal to
     // be representable at the column scale, which fails for a finer-scale literal
@@ -391,6 +404,152 @@ pub(crate) fn evaluate_exact_leaf_predicate(
         | PredicateOperator::ArraysOverlap
         | PredicateOperator::ArrayContainsAll => unreachable!("handled before scalar dispatch"),
     }
+}
+
+/// Evaluate timestamps independently of their decoded Arrow unit.
+///
+/// Paimon's [`Datum`] stores epoch milliseconds plus nanoseconds within that
+/// millisecond. Converting both the Arrow value and the literal to `i128`
+/// epoch nanoseconds is lossless for every Arrow timestamp unit and avoids the
+/// range loss that casting a seconds column to Arrow nanoseconds would cause.
+fn evaluate_timestamp_leaf(
+    array: &ArrayRef,
+    data_type: &DataType,
+    op: PredicateOperator,
+    literals: &[Datum],
+) -> Result<BooleanArray, ArrowError> {
+    use std::cmp::Ordering;
+
+    let local_zoned = match data_type {
+        DataType::Timestamp(_) => false,
+        DataType::LocalZonedTimestamp(_) => true,
+        _ => unreachable!("guarded by caller"),
+    };
+    let literal_nanos = |literal: &Datum| -> Result<i128, ArrowError> {
+        let (millis, nanos) = match (local_zoned, literal) {
+            (false, Datum::Timestamp { millis, nanos })
+            | (true, Datum::LocalZonedTimestamp { millis, nanos }) => (*millis, *nanos),
+            _ => {
+                return Err(ArrowError::ComputeError(
+                    "timestamp column compared against a non-matching timestamp literal"
+                        .to_string(),
+                ))
+            }
+        };
+        if !(0..1_000_000).contains(&nanos) {
+            return Err(ArrowError::ComputeError(format!(
+                "timestamp nanos-of-millisecond is out of range: {nanos}"
+            )));
+        }
+        Ok(i128::from(millis) * 1_000_000 + i128::from(nanos))
+    };
+    let value_nanos = |row: usize| -> Result<i128, ArrowError> {
+        let value = match array.data_type() {
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Second, _) => {
+                i128::from(
+                    array
+                        .as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .expect("Arrow timestamp unit matches array type")
+                        .value(row),
+                ) * 1_000_000_000
+            }
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
+                i128::from(
+                    array
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .expect("Arrow timestamp unit matches array type")
+                        .value(row),
+                ) * 1_000_000
+            }
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
+                i128::from(
+                    array
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .expect("Arrow timestamp unit matches array type")
+                        .value(row),
+                ) * 1_000
+            }
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => i128::from(
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("Arrow timestamp unit matches array type")
+                    .value(row),
+            ),
+            other => {
+                return Err(ArrowError::ComputeError(format!(
+                    "timestamp predicate expects an Arrow timestamp column, got {other:?}"
+                )))
+            }
+        };
+        Ok(value)
+    };
+
+    let literal_values = literals
+        .iter()
+        .map(literal_nanos)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut result = Vec::with_capacity(array.len());
+    for row in 0..array.len() {
+        if array.is_null(row) {
+            result.push(false);
+            continue;
+        }
+        let value = value_nanos(row)?;
+        let keep = match op {
+            PredicateOperator::Eq
+            | PredicateOperator::NotEq
+            | PredicateOperator::Lt
+            | PredicateOperator::LtEq
+            | PredicateOperator::Gt
+            | PredicateOperator::GtEq => {
+                let literal = literal_values
+                    .first()
+                    .ok_or_else(|| unconvertible_literal_error(op, data_type))?;
+                let ordering = value.cmp(literal);
+                match op {
+                    PredicateOperator::Eq => ordering == Ordering::Equal,
+                    PredicateOperator::NotEq => ordering != Ordering::Equal,
+                    PredicateOperator::Lt => ordering == Ordering::Less,
+                    PredicateOperator::LtEq => ordering != Ordering::Greater,
+                    PredicateOperator::Gt => ordering == Ordering::Greater,
+                    PredicateOperator::GtEq => ordering != Ordering::Less,
+                    _ => unreachable!(),
+                }
+            }
+            PredicateOperator::In | PredicateOperator::NotIn => {
+                let contains = literal_values.contains(&value);
+                if matches!(op, PredicateOperator::In) {
+                    contains
+                } else {
+                    !contains
+                }
+            }
+            PredicateOperator::Between | PredicateOperator::NotBetween => {
+                let (Some(low), Some(high)) = (literal_values.first(), literal_values.get(1))
+                else {
+                    return Err(unconvertible_literal_error(op, data_type));
+                };
+                let within =
+                    value.cmp(low) != Ordering::Less && value.cmp(high) != Ordering::Greater;
+                if matches!(op, PredicateOperator::Between) {
+                    within
+                } else {
+                    !within
+                }
+            }
+            _ => {
+                return Err(ArrowError::ComputeError(format!(
+                    "operator {op:?} is not a timestamp value comparison"
+                )))
+            }
+        };
+        result.push(keep);
+    }
+    Ok(BooleanArray::from(result))
 }
 
 fn evaluate_array_membership_predicate(
@@ -545,6 +704,12 @@ fn evaluate_array_element_equality(
             PredicateOperator::Eq,
             std::slice::from_ref(literal),
         )?)),
+        DataType::Timestamp(_) | DataType::LocalZonedTimestamp(_) => evaluate_timestamp_leaf(
+            values,
+            element_type,
+            PredicateOperator::Eq,
+            std::slice::from_ref(literal),
+        ),
         _ => {
             let Some(scalar) = literal_scalar_for_arrow_filter(literal, element_type)
                 .map_err(|error| ArrowError::ComputeError(error.to_string()))?
@@ -1114,7 +1279,15 @@ fn timestamp_scalar(
     timezone: Option<&'static str>,
 ) -> crate::Result<Option<ArrayRef>> {
     let array: ArrayRef = match precision {
-        0..=3 => {
+        0 => {
+            let value = millis.div_euclid(1_000);
+            let array = TimestampSecondArray::new_scalar(value).into_inner();
+            match timezone {
+                Some(tz) => Arc::new(array.with_timezone(tz)),
+                None => Arc::new(array),
+            }
+        }
+        1..=3 => {
             let array = TimestampMillisecondArray::new_scalar(millis).into_inner();
             match timezone {
                 Some(tz) => Arc::new(array.with_timezone(tz)),
@@ -1179,13 +1352,13 @@ fn float64_literal(literal: &Datum) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::spec::{
-        row_id_leaf, ArrayType, DecimalType, DoubleType, FloatType, IntType, VarCharType,
-        ROW_ID_FIELD_NAME,
+        row_id_leaf, ArrayType, DecimalType, DoubleType, FloatType, IntType,
+        LocalZonedTimestampType, TimestampType, VarCharType, ROW_ID_FIELD_NAME,
     };
     use arrow_array::builder::{
         Decimal128Builder, Float32Builder, Float64Builder, Int32Builder, ListBuilder,
     };
-    use arrow_array::{Int32Array, StringArray};
+    use arrow_array::{Int32Array, StringArray, TimestampMillisecondArray, TimestampSecondArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
 
@@ -1263,6 +1436,66 @@ mod tests {
 
     fn bool_values(mask: &BooleanArray) -> Vec<bool> {
         mask.iter().map(|value| value.unwrap_or(false)).collect()
+    }
+
+    #[test]
+    fn test_timestamp_zero_predicates_preserve_fractional_literals_and_physical_units() {
+        let cases = [
+            (
+                Arc::new(TimestampSecondArray::from(vec![Some(1), Some(2)])) as ArrayRef,
+                DataType::Timestamp(TimestampType::new(0).unwrap()),
+                Datum::Timestamp {
+                    millis: 1_500,
+                    nanos: 0,
+                },
+            ),
+            (
+                Arc::new(TimestampSecondArray::from(vec![Some(1), Some(2)]).with_timezone("UTC"))
+                    as ArrayRef,
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(0).unwrap()),
+                Datum::LocalZonedTimestamp {
+                    millis: 1_500,
+                    nanos: 0,
+                },
+            ),
+        ];
+
+        for (array, data_type, literal) in cases {
+            let equal = evaluate_exact_leaf_predicate(
+                &array,
+                &data_type,
+                PredicateOperator::Eq,
+                std::slice::from_ref(&literal),
+            )
+            .unwrap();
+            assert_eq!(bool_values(&equal), vec![false, false]);
+
+            let greater_or_equal = evaluate_exact_leaf_predicate(
+                &array,
+                &data_type,
+                PredicateOperator::GtEq,
+                std::slice::from_ref(&literal),
+            )
+            .unwrap();
+            assert_eq!(bool_values(&greater_or_equal), vec![false, true]);
+        }
+
+        let existing_millis: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![
+            Some(-1_000),
+            Some(2_000),
+            Some(3_000),
+        ]));
+        let equal = evaluate_exact_leaf_predicate(
+            &existing_millis,
+            &DataType::Timestamp(TimestampType::new(0).unwrap()),
+            PredicateOperator::Eq,
+            &[Datum::Timestamp {
+                millis: 2_000,
+                nanos: 0,
+            }],
+        )
+        .unwrap();
+        assert_eq!(bool_values(&equal), vec![false, true, false]);
     }
 
     #[test]

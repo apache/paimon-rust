@@ -27,7 +27,7 @@ use arrow_array::{
     BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
     Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray, MapArray,
     RecordBatch, StringArray, StructArray, Time32MillisecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::SchemaRef;
@@ -433,7 +433,16 @@ fn build_timestamp_column(
         .map(|i| get_field_at(&records[i], idx).and_then(value_as_i64))
         .collect();
     match precision {
-        0..=3 => Arc::new(TimestampMillisecondArray::from(values).with_timezone_opt(tz)),
+        0 => Arc::new(
+            TimestampSecondArray::from(
+                values
+                    .into_iter()
+                    .map(|value| value.map(|value| value.div_euclid(1_000)))
+                    .collect::<Vec<_>>(),
+            )
+            .with_timezone_opt(tz),
+        ),
+        1..=3 => Arc::new(TimestampMillisecondArray::from(values).with_timezone_opt(tz)),
         4..=6 => Arc::new(TimestampMicrosecondArray::from(values).with_timezone_opt(tz)),
         _ => Arc::new(TimestampNanosecondArray::from(values).with_timezone_opt(tz)),
     }

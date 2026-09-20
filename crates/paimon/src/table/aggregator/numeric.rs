@@ -45,7 +45,7 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
     Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_schema::{DataType as ArrowDataType, TimeUnit};
 
@@ -474,7 +474,8 @@ fn arrow_timestamp_timezone(
 
 fn timestamp_time_unit(precision: u32) -> crate::Result<TimeUnit> {
     match precision {
-        0..=3 => Ok(TimeUnit::Millisecond),
+        0 => Ok(TimeUnit::Second),
+        1..=3 => Ok(TimeUnit::Millisecond),
         4..=6 => Ok(TimeUnit::Microsecond),
         7..=9 => Ok(TimeUnit::Nanosecond),
         other => Err(crate::Error::Unsupported {
@@ -601,17 +602,10 @@ fn agg_minmax(
         MinMaxState::Date32(acc) => update_primitive!(acc, Date32Array),
         MinMaxState::Time32Ms(acc) => update_primitive!(acc, Time32MillisecondArray),
         MinMaxState::Timestamp { unit, acc, .. } => match unit {
+            TimeUnit::Second => update_primitive!(acc, TimestampSecondArray),
             TimeUnit::Millisecond => update_primitive!(acc, TimestampMillisecondArray),
             TimeUnit::Microsecond => update_primitive!(acc, TimestampMicrosecondArray),
             TimeUnit::Nanosecond => update_primitive!(acc, TimestampNanosecondArray),
-            other => {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Timestamp with unit {other:?} not expected for field '{field_name}'"
-                    ),
-                    source: None,
-                });
-            }
         },
         MinMaxState::Utf8(acc) => {
             let v = downcast::<StringArray>(array, field_name)?.value(row_idx);
@@ -690,6 +684,9 @@ fn minmax_result(state: &MinMaxState, agg_name: &str, field_name: &str) -> crate
         } => match unit {
             // `with_timezone_opt` keeps the result array's Arrow type equal to the
             // field's, which `RecordBatch::try_new` checks.
+            TimeUnit::Second => {
+                Arc::new(TimestampSecondArray::from(vec![*acc]).with_timezone_opt(timezone.clone()))
+            }
             TimeUnit::Millisecond => Arc::new(
                 TimestampMillisecondArray::from(vec![*acc]).with_timezone_opt(timezone.clone()),
             ),
@@ -699,14 +696,6 @@ fn minmax_result(state: &MinMaxState, agg_name: &str, field_name: &str) -> crate
             TimeUnit::Nanosecond => Arc::new(
                 TimestampNanosecondArray::from(vec![*acc]).with_timezone_opt(timezone.clone()),
             ),
-            other => {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Timestamp with unit {other:?} not expected for field '{field_name}'"
-                    ),
-                    source: None,
-                });
-            }
         },
         MinMaxState::Utf8(acc) => Arc::new(StringArray::from(vec![acc.clone()])),
         MinMaxState::Binary(acc) => Arc::new(BinaryArray::from_opt_vec(vec![acc.as_deref()])),
@@ -1461,6 +1450,36 @@ mod tests {
         let schema =
             arrow_schema::Schema::new(vec![arrow_schema::Field::new("v", arrow_type, true)]);
         arrow_array::RecordBatch::try_new(Arc::new(schema), vec![max.result().unwrap()]).unwrap();
+    }
+
+    #[test]
+    fn test_min_max_timestamp_zero_uses_seconds() {
+        let dt = DataType::Timestamp(TimestampType::new(0).unwrap());
+        let arr = TimestampSecondArray::from(vec![Some(30), Some(10), Some(20)]);
+        let mut min = min_agg(dt.clone());
+        let mut max = max_agg(dt);
+        for i in 0..arr.len() {
+            min.agg(&arr, i).unwrap();
+            max.agg(&arr, i).unwrap();
+        }
+        assert_eq!(
+            min.result()
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .value(0),
+            10
+        );
+        assert_eq!(
+            max.result()
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .value(0),
+            30
+        );
     }
 
     #[test]

@@ -122,6 +122,13 @@ cross-backend rename is rejected.
 with `with_provider` on the same builder. Without a provider, property-based
 storage configuration behaves as before.
 
+## Parquet Page Pruning
+
+Parquet Page Index pruning is enabled by default. Set
+`parquet.filter.columnindex.enabled=false` to avoid fine-grained range requests;
+this may reduce request count while increasing bytes read. The option does not
+change Page Index generation.
+
 ## Mosaic File Format
 
 Mosaic data file reads are always available. The current Mosaic support is read-only: Paimon Rust can read existing `.mosaic` data files, including array and map columns, in a Paimon table, but it does not write Mosaic data files yet.

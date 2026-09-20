@@ -195,28 +195,29 @@ pub(crate) fn create_format_reader(
         path,
         blob_as_descriptor,
         read_fields,
+        &HashMap::new(),
         None,
         blob::DEFAULT_BLOB_READ_PARALLELISM,
         MosaicPrefetchOptions::default(),
     )
 }
 
-/// Create a format reader with a scan-shared Parquet resource budget and the
-/// per-file Mosaic prefetch settings.
+/// Create a format reader with table options and runtime read resources.
 pub(crate) fn create_format_reader_with_budget(
     path: &str,
     blob_as_descriptor: bool,
     read_fields: &[DataField],
+    table_options: &HashMap<String, String>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
     blob_parallelism: usize,
     mosaic_prefetch: MosaicPrefetchOptions,
 ) -> crate::Result<Box<dyn FormatFileReader>> {
     let lower = path.to_ascii_lowercase();
     let reader: Box<dyn FormatFileReader> = if lower.ends_with(".parquet") {
-        Box::new(match parquet_read_budget {
-            Some(read_budget) => parquet::ParquetFormatReader::with_read_budget(read_budget),
-            None => parquet::ParquetFormatReader::default(),
-        })
+        Box::new(parquet::ParquetFormatReader::with_options(
+            table_options,
+            parquet_read_budget,
+        )?)
     } else if lower.ends_with(".blob") {
         Box::new(
             blob::BlobFormatReader::new(path.to_string(), blob_as_descriptor)
@@ -327,6 +328,53 @@ pub(crate) async fn create_format_writer(
                 supported_write_formats().join(", ")
             ),
         })
+    }
+}
+
+fn timestamp_millis_schema(schema: &SchemaRef) -> SchemaRef {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(timestamp_millis_field)
+        .collect::<Vec<_>>();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
+fn timestamp_millis_field(field: &arrow_schema::FieldRef) -> arrow_schema::FieldRef {
+    let data_type = timestamp_millis_data_type(field.data_type());
+    if &data_type == field.data_type() {
+        field.clone()
+    } else {
+        Arc::new(field.as_ref().clone().with_data_type(data_type))
+    }
+}
+
+fn timestamp_millis_data_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
+    use arrow_schema::DataType as ArrowDataType;
+
+    match data_type {
+        ArrowDataType::Timestamp(arrow_schema::TimeUnit::Second, timezone) => {
+            ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, timezone.clone())
+        }
+        ArrowDataType::List(field) => ArrowDataType::List(timestamp_millis_field(field)),
+        ArrowDataType::LargeList(field) => ArrowDataType::LargeList(timestamp_millis_field(field)),
+        ArrowDataType::FixedSizeList(field, size) => {
+            ArrowDataType::FixedSizeList(timestamp_millis_field(field), *size)
+        }
+        ArrowDataType::Struct(fields) => ArrowDataType::Struct(
+            fields
+                .iter()
+                .map(timestamp_millis_field)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        ArrowDataType::Map(field, sorted) => {
+            ArrowDataType::Map(timestamp_millis_field(field), *sorted)
+        }
+        _ => data_type.clone(),
     }
 }
 

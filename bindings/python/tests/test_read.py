@@ -21,7 +21,7 @@ import tempfile
 import pyarrow as pa
 import pytest
 
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
+from pypaimon_rust.datafusion import PaimonCatalog, Split, SQLContext
 
 
 def _make_table_with_data(warehouse):
@@ -172,6 +172,50 @@ def test_split_pickle_roundtrip():
         split = splits[0]
         restored = pickle.loads(pickle.dumps(split))
         assert restored.row_count() == split.row_count()
+
+
+def test_split_wire_roundtrip_reads_same_rows():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder()
+        split = builder.new_scan().plan().splits()[0]
+
+        restored = Split.deserialize(split.serialize())
+
+        assert restored.row_count() == split.row_count()
+        original = pa.Table.from_batches(builder.new_read().read([split]))
+        roundtrip = pa.Table.from_batches(builder.new_read().read([restored]))
+        assert roundtrip.equals(original)
+
+
+def test_indexed_split_wire_roundtrip_preserves_row_ranges():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("""CREATE TABLE paimon.rdb.de (id INT, name STRING) WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true')""")
+        ctx.sql("""INSERT INTO paimon.rdb.de (id, name)
+            VALUES (1, 'a'), (2, 'b'), (3, 'c')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.de")
+        builder = table.new_read_builder().with_row_ranges([(1, 1)])
+        split = builder.new_scan().plan().splits()[0]
+
+        restored = Split.deserialize(split.serialize())
+        rows = pa.Table.from_batches(builder.new_read().read([restored]))
+
+        assert restored.row_count() == 3
+        assert rows.column("id").to_pylist() == [2]
+
+
+@pytest.mark.parametrize("payload, message", [
+    (b"", "buffer underrun"),
+    (b"not-a-split", "magic"),
+])
+def test_split_wire_deserialize_rejects_malformed_input(payload, message):
+    with pytest.raises(ValueError, match=message):
+        Split.deserialize(payload)
 
 
 def _make_partitioned_table(warehouse):
@@ -615,6 +659,19 @@ def test_read_arrow_streams_expected_rows():
         batches = list(reader)
         assert pa.Table.from_batches(batches).to_pydict() == {"id": [1, 2, 3]}
         assert reader.read_next_batch() is None
+
+
+def test_read_arrow_close_is_idempotent_and_stops_iteration():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder()
+        splits = builder.new_scan().plan().splits()
+        reader = builder.new_read().read_arrow(splits)
+
+        reader.close()
+        assert reader.read_next_batch() is None
+        assert list(reader) == []
+        reader.close()
 
 
 def test_read_empty_splits():

@@ -17,6 +17,7 @@
 
 //! Predicate orchestration and index-query planning.
 
+use super::all_match::all_matching_entries;
 use super::entry::{
     bitmap_meta_may_match, bitmap_meta_may_match_between, multivalue_meta_may_match,
     sorted_entry_meta, GlobalIndexEntry, GlobalIndexFileKind,
@@ -43,7 +44,6 @@ use crate::table::bitmap_global_index_format::{
 use crate::table::RowRange;
 use crate::{Error, Result};
 use futures::{StreamExt, TryStreamExt};
-use roaring::RoaringTreemap;
 use std::collections::HashSet;
 use std::future::Future;
 
@@ -299,15 +299,60 @@ impl GlobalIndexScanner {
             })
             .collect::<Result<Vec<_>>>()?;
         let predicates = normalized_predicates.as_slice();
-
         // Try to detect between pattern and split into (between, remaining)
         let (between, remaining) = extract_between(predicates);
+
+        let coverage = || {
+            crate::table::merge_row_ranges(
+                entries
+                    .iter()
+                    .map(|entry| RowRange::new(entry.row_range_start, entry.row_range_end))
+                    .collect(),
+            )
+        };
+        if between.as_ref().is_some_and(|range| range.is_empty()) {
+            return Ok(Some((Vec::new(), coverage())));
+        }
 
         let effective_predicates = if between.is_some() {
             &remaining
         } else {
             predicates
         };
+        // A redundant conjunct is an identity independently of the other
+        // predicates on this field. Do not decode its entire posting list.
+        let predicate_all_matches = all_matching_entries(entries, effective_predicates);
+        let between_all_matches = between
+            .as_ref()
+            .map(|range| {
+                let endpoints = [
+                    (
+                        if range.from_inclusive {
+                            PredicateOperator::GtEq
+                        } else {
+                            PredicateOperator::Gt
+                        },
+                        std::slice::from_ref(range.from),
+                        range.data_type,
+                    ),
+                    (
+                        if range.to_inclusive {
+                            PredicateOperator::LtEq
+                        } else {
+                            PredicateOperator::Lt
+                        },
+                        std::slice::from_ref(range.to),
+                        range.data_type,
+                    ),
+                ];
+                let matches = all_matching_entries(entries, &endpoints);
+                matches[0]
+                    .iter()
+                    .zip(&matches[1])
+                    .map(|(lower, upper)| *lower && *upper)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![false; entries.len()]);
 
         // Pre-compute comparators and serialized keys for file-level pruning per predicate
         let pruning_info: Vec<_> = effective_predicates
@@ -367,8 +412,16 @@ impl GlobalIndexScanner {
             .iter()
             .enumerate()
             .map(|(i, (op, _, _))| {
-                requires_fallback_scan(*op)
-                    .then(|| self.fallback_scan_plan(entries, &predicate_matches[i]))
+                requires_fallback_scan(*op).then(|| {
+                    self.fallback_scan_plan(
+                        entries,
+                        &predicate_matches[i]
+                            .iter()
+                            .zip(&predicate_all_matches[i])
+                            .map(|(matches, all)| *matches && !all)
+                            .collect::<Vec<_>>(),
+                    )
+                })
             })
             .collect();
 
@@ -399,19 +452,36 @@ impl GlobalIndexScanner {
                 }
                 None => Vec::new(),
             };
-        let between_fallback_plan = between
-            .as_ref()
-            .map(|_| self.fallback_scan_plan(entries, &between_matches_by_entry));
+        let between_fallback_plan = between.as_ref().map(|_| {
+            self.fallback_scan_plan(
+                entries,
+                &between_matches_by_entry
+                    .iter()
+                    .zip(&between_all_matches)
+                    .map(|(matches, all)| *matches && !all)
+                    .collect::<Vec<_>>(),
+            )
+        });
 
         let mut query_plans = Vec::with_capacity(entries.len());
+        let mut all_matching_ranges = Vec::new();
         for (entry_idx, entry) in entries.iter().enumerate() {
+            if (between.is_none() || between_all_matches[entry_idx])
+                && predicate_all_matches
+                    .iter()
+                    .all(|matches| matches[entry_idx])
+            {
+                all_matching_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
+                continue;
+            }
             // Also check if between range may match
             let between_matches = between
                 .as_ref()
                 .is_some_and(|_| between_matches_by_entry[entry_idx]);
-            let between_evaluated_for_entry = between_fallback_plan.is_some_and(|plan| {
-                fallback_plan_evaluates_entry(plan, entry.index_type, between_matches)
-            });
+            let between_evaluated_for_entry = between_all_matches[entry_idx]
+                || between_fallback_plan.is_some_and(|plan| {
+                    fallback_plan_evaluates_entry(plan, entry.index_type, between_matches)
+                });
 
             // When a Between conjunct exists but the file does not overlap its
             // range, the whole AND cannot match — drop the file regardless of
@@ -430,6 +500,10 @@ impl GlobalIndexScanner {
                 between_matches && !between_evaluated_for_entry && between_fallback_plan.is_some();
             let matching_predicates: Vec<usize> = (0..effective_predicates.len())
                 .filter(|&i| {
+                    if predicate_all_matches[i][entry_idx] {
+                        file_evaluated = true;
+                        return false;
+                    }
                     let predicate_matches_entry = predicate_matches[i][entry_idx];
                     let predicate_evaluated_for_entry =
                         predicate_fallback_plans[i].is_none_or(|plan| {
@@ -461,10 +535,18 @@ impl GlobalIndexScanner {
                 continue;
             }
 
+            let query_between = between_evaluated_for_entry && !between_all_matches[entry_idx];
+            if !query_between && matching_predicates.is_empty() {
+                // Only a proven identity remains (other conjuncts may have
+                // declined their budget). Preserve its indexed domain and
+                // leave the residual filter to the ordinary table reader.
+                all_matching_ranges.push(RowRange::new(entry.row_range_start, entry.row_range_end));
+                continue;
+            }
             query_plans.push(EntryQueryPlan {
                 entry_idx,
                 between_matches,
-                between_evaluated: between_evaluated_for_entry,
+                between_evaluated: query_between,
                 matching_predicates,
             });
         }
@@ -495,21 +577,30 @@ impl GlobalIndexScanner {
                 let result = self
                     .query_entry(entry, data_type, between, &plan, effective_predicates)
                     .await?;
-                Ok((entry.row_range_start, result))
+                let ranges = result.bitmap.as_ref().map(|bitmap| {
+                    bitmap_to_ranges(bitmap)
+                        .into_iter()
+                        .map(|range| {
+                            RowRange::new(
+                                range.from() + entry.row_range_start,
+                                range.to() + entry.row_range_start,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                Ok((ranges, result.declined))
             });
-        let (all_row_ids, declined) = try_fold_bounded(
+        let (all_ranges, declined) = try_fold_bounded(
             futures,
             self.global_index_thread_num,
-            (RoaringTreemap::new(), false),
-            |(all_row_ids, declined), (row_range_start, file_result)| {
-                if file_result.declined {
+            (all_matching_ranges, false),
+            |(all_ranges, declined), (ranges, file_declined)| {
+                if file_declined {
                     *declined = true;
                     return;
                 }
-                if let Some(bitmap) = file_result.bitmap {
-                    for row_id in bitmap.iter() {
-                        all_row_ids.insert(row_id + row_range_start as u64);
-                    }
+                if let Some(ranges) = ranges {
+                    all_ranges.extend(ranges);
                 }
             },
         )
@@ -519,13 +610,10 @@ impl GlobalIndexScanner {
             return Ok(None);
         }
 
-        let coverage = crate::table::merge_row_ranges(
-            entries
-                .iter()
-                .map(|entry| RowRange::new(entry.row_range_start, entry.row_range_end))
-                .collect(),
-        );
-        Ok(Some((bitmap_to_ranges(&all_row_ids), coverage)))
+        Ok(Some((
+            crate::table::merge_row_ranges(all_ranges),
+            coverage(),
+        )))
     }
 
     fn find_field_id_by_name(&self, column: &str) -> Result<Option<i32>> {
