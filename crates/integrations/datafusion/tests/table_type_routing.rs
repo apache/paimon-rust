@@ -309,6 +309,10 @@ async fn setup() -> TestEnv {
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse);
     let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    fs_catalog
+        .create_database(DB, false, HashMap::new())
+        .await
+        .unwrap();
     let typed_catalog = Arc::new(TypedTestCatalog {
         inner: fs_catalog,
         declared_types: HashMap::from([
@@ -319,9 +323,6 @@ async fn setup() -> TestEnv {
     });
     let mut ctx = SQLContext::new();
     ctx.register_catalog(CATALOG, typed_catalog).await.unwrap();
-    ctx.sql(&format!("CREATE SCHEMA {CATALOG}.{DB}"))
-        .await
-        .unwrap();
     ctx.sql(&format!(
         "CREATE TABLE {CATALOG}.{DB}.pt (id INT NOT NULL, name STRING)"
     ))
@@ -571,14 +572,22 @@ async fn system_tables_on_routed_tables_error() {
 }
 
 #[tokio::test]
-async fn table_exist_agrees_with_routed_table_resolution() {
+async fn registered_engine_none_is_not_found() {
     let env = setup().await;
     let provider = env.ctx.ctx().catalog(CATALOG).unwrap();
     let schema = provider.schema(DB).unwrap();
-    assert!(schema.table_exist("it"));
-    assert!(schema.table_exist("ghost"));
-    assert!(schema.table("ghost").await.unwrap().is_some());
-    assert!(!schema.table_exist("it$snapshots"));
+    assert!(schema.table("ghost").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn table_exist_derives_system_table_from_snapshotted_base_table() {
+    let env = setup().await;
+    let provider = env.ctx.ctx().catalog(CATALOG).unwrap();
+    let schema = provider.schema(DB).unwrap();
+
+    assert!(schema.table_exist("pt$snapshots"));
+    assert!(!schema.table_exist("missing$snapshots"));
+    assert!(!schema.table_exist("pt$not_a_system_table"));
 }
 
 #[tokio::test]
@@ -1025,15 +1034,16 @@ async fn unregistered_external_table_does_not_break_information_schema_columns()
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse);
     let fs_catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    fs_catalog
+        .create_database(DB, false, HashMap::new())
+        .await
+        .unwrap();
     let typed_catalog = Arc::new(TypedTestCatalog {
         inner: fs_catalog,
         declared_types: HashMap::from([("external".to_string(), TableType::IcebergTable)]),
     });
     let mut ctx = SQLContext::new();
     ctx.register_catalog(CATALOG, typed_catalog).await.unwrap();
-    ctx.sql(&format!("CREATE SCHEMA {CATALOG}.{DB}"))
-        .await
-        .unwrap();
     ctx.sql(&format!(
         "CREATE TABLE {CATALOG}.{DB}.pt (id INT NOT NULL, name STRING)"
     ))

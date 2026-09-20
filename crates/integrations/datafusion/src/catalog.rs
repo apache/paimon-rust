@@ -67,7 +67,7 @@ struct DatabaseMetadata {
 struct CatalogMetadataState {
     snapshot: RwLock<Arc<CatalogMetadataSnapshot>>,
     next_generation: AtomicU64,
-    published_generation: AtomicU64,
+    database_generations: RwLock<HashMap<String, u64>>,
 }
 
 impl Default for CatalogMetadataState {
@@ -75,7 +75,7 @@ impl Default for CatalogMetadataState {
         Self {
             snapshot: RwLock::new(Arc::new(CatalogMetadataSnapshot::default())),
             next_generation: AtomicU64::new(0),
-            published_generation: AtomicU64::new(0),
+            database_generations: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -93,30 +93,68 @@ impl CatalogMetadataState {
         self.next_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    fn publish(&self, generation: u64, next: Arc<CatalogMetadataSnapshot>) {
+    fn publish(&self, generation: u64, refreshed: CatalogMetadataSnapshot) {
         let mut current = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
-        if generation >= self.published_generation.load(Ordering::Acquire) {
-            *current = next;
-            self.published_generation
-                .store(generation, Ordering::Release);
+        let mut database_generations = self
+            .database_generations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut next = (**current).clone();
+        let refreshed_names: HashSet<_> = refreshed.databases.keys().cloned().collect();
+
+        let removed_names: HashSet<_> = next
+            .databases
+            .keys()
+            .chain(database_generations.keys())
+            .filter(|name| !refreshed_names.contains(*name))
+            .cloned()
+            .collect();
+        for name in removed_names {
+            if database_generations.get(&name).copied().unwrap_or_default() <= generation {
+                next.databases.shift_remove(&name);
+                database_generations.insert(name, generation);
+            }
         }
+        for (name, metadata) in refreshed.databases {
+            if database_generations.get(&name).copied().unwrap_or_default() <= generation {
+                next.databases.insert(name.clone(), metadata);
+                database_generations.insert(name, generation);
+            }
+        }
+        *current = Arc::new(next);
     }
 
-    fn publish_update(&self, generation: u64, update: impl FnOnce(&mut CatalogMetadataSnapshot)) {
+    fn publish_database(&self, generation: u64, database: String, metadata: Arc<DatabaseMetadata>) {
         let mut current = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
-        if generation < self.published_generation.load(Ordering::Acquire) {
+        let mut database_generations = self
+            .database_generations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if database_generations
+            .get(&database)
+            .copied()
+            .unwrap_or_default()
+            > generation
+        {
             return;
         }
         let mut next = (**current).clone();
-        update(&mut next);
+        next.databases.insert(database.clone(), metadata);
         *current = Arc::new(next);
-        self.published_generation
-            .store(generation, Ordering::Release);
+        database_generations.insert(database, generation);
     }
 
-    fn mutate(&self, update: impl FnOnce(&mut CatalogMetadataSnapshot)) {
+    fn mutate_database(&self, database: &str, update: impl FnOnce(&mut CatalogMetadataSnapshot)) {
         let generation = self.begin_refresh();
-        self.publish_update(generation, update);
+        let mut current = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
+        let mut database_generations = self
+            .database_generations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut next = (**current).clone();
+        update(&mut next);
+        *current = Arc::new(next);
+        database_generations.insert(database.to_string(), generation);
     }
 }
 
@@ -495,8 +533,8 @@ impl PaimonCatalogProvider {
             })
             .collect();
 
-        let next = Arc::new(CatalogMetadataSnapshot { databases });
-        self.metadata.publish(generation, next);
+        self.metadata
+            .publish(generation, CatalogMetadataSnapshot { databases });
         Ok(())
     }
 
@@ -505,10 +543,11 @@ impl PaimonCatalogProvider {
         let generation = self.metadata.begin_refresh();
         let database_metadata =
             load_database_metadata(self.catalog.as_ref(), database, true).await?;
-        self.metadata.publish_update(generation, |next| {
-            next.databases
-                .insert(database.to_string(), Arc::new(database_metadata));
-        });
+        self.metadata.publish_database(
+            generation,
+            database.to_string(),
+            Arc::new(database_metadata),
+        );
         Ok(())
     }
 
@@ -570,6 +609,52 @@ impl PaimonCatalogProvider {
             .databases
             .get(database)
             .is_some_and(|metadata| metadata.objects.contains_key(&object_name))
+    }
+
+    pub(crate) fn record_object_created(&self, database: &str, name: &str, table_type: TableType) {
+        self.metadata.mutate_database(database, |next| {
+            let database = next
+                .databases
+                .entry(database.to_string())
+                .or_insert_with(|| Arc::new(DatabaseMetadata::default()));
+            Arc::make_mut(database)
+                .objects
+                .insert(name.to_string(), table_type);
+        });
+    }
+
+    pub(crate) fn record_database_created(&self, database: &str) {
+        self.metadata.mutate_database(database, |next| {
+            next.databases
+                .entry(database.to_string())
+                .or_insert_with(|| Arc::new(DatabaseMetadata::default()));
+        });
+    }
+
+    pub(crate) fn record_database_dropped(&self, database: &str) {
+        self.metadata.mutate_database(database, |next| {
+            next.databases.shift_remove(database);
+        });
+    }
+
+    pub(crate) fn record_object_dropped(&self, database: &str, name: &str) {
+        self.metadata.mutate_database(database, |next| {
+            if let Some(metadata) = next.databases.get_mut(database) {
+                Arc::make_mut(metadata).objects.shift_remove(name);
+            }
+        });
+    }
+
+    pub(crate) fn record_table_renamed(&self, database: &str, from: &str, to: &str) {
+        self.metadata.mutate_database(database, |next| {
+            let metadata = next
+                .databases
+                .entry(database.to_string())
+                .or_insert_with(|| Arc::new(DatabaseMetadata::default()));
+            let objects = &mut Arc::make_mut(metadata).objects;
+            let table_type = objects.shift_remove(from).unwrap_or(TableType::Base);
+            objects.insert(to.to_string(), table_type);
+        });
     }
 
     fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
@@ -655,7 +740,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .create_database(&name, false, HashMap::new())
                     .await
                     .map_err(to_datafusion_error)?;
-                metadata.mutate(|next| {
+                metadata.mutate_database(&name, |next| {
                     next.databases
                         .entry(name.clone())
                         .or_insert_with(|| Arc::new(DatabaseMetadata::default()));
@@ -699,7 +784,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .drop_database(&name, false, cascade)
                     .await
                     .map_err(to_datafusion_error)?;
-                metadata.mutate(|next| {
+                metadata.mutate_database(&name, |next| {
                     next.databases.shift_remove(&name);
                 });
                 Ok(Some(Arc::new(
@@ -914,10 +999,8 @@ impl PaimonSchemaProvider {
             ignore_missing_views_endpoint,
         )
         .await?;
-        self.metadata.publish_update(generation, |next| {
-            next.databases
-                .insert(self.database.clone(), Arc::new(database));
-        });
+        self.metadata
+            .publish_database(generation, self.database.clone(), Arc::new(database));
         Ok(())
     }
 
@@ -1034,16 +1117,16 @@ impl SchemaProvider for PaimonSchemaProvider {
                             identifier.full_name()
                         ));
                     }
-                    let metadata_schema = match external.fields() {
-                        Some(fields) => crate::table::datafusion_arrow_schema(
-                            fields,
-                            schema_force_view_types,
-                        )?,
-                        None => Arc::new(datafusion::arrow::datatypes::Schema::empty()),
-                    };
                     let Some(resolver) = table_engines.get(&declared) else {
+                        let schema = match external.fields() {
+                            Some(fields) => crate::table::datafusion_arrow_schema(
+                                fields,
+                                schema_force_view_types,
+                            )?,
+                            None => Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+                        };
                         return Ok(Some(Arc::new(UnavailableEngineTableProvider {
-                            schema: metadata_schema,
+                            schema,
                             error_message: format!(
                                 "no table engine is registered for '{declared}' tables ('{}')",
                                 identifier.full_name()
@@ -1068,19 +1151,12 @@ impl SchemaProvider for PaimonSchemaProvider {
                             declared,
                         ))
                         .await?;
-                    Ok(Some(match resolved {
-                        Some(inner) => Arc::new(ReadOnlyTableProvider {
+                    Ok(resolved.map(|inner| {
+                        Arc::new(ReadOnlyTableProvider {
                             inner,
                             declared,
                             table_name: identifier.full_name(),
-                        }) as Arc<dyn TableProvider>,
-                        None => Arc::new(UnavailableEngineTableProvider {
-                            schema: metadata_schema,
-                            error_message: format!(
-                                "registered table engine did not resolve '{declared}' table '{}'",
-                                identifier.full_name()
-                            ),
-                        }) as Arc<dyn TableProvider>,
+                        }) as Arc<dyn TableProvider>
                     }))
                 }
                 Ok(paimon::catalog::LoadedTable::Paimon(table)) => {
@@ -1214,13 +1290,9 @@ impl SchemaProvider for PaimonSchemaProvider {
         {
             return false;
         }
-        if object.system_table().is_some() {
-            return false;
-        }
-
-        // This callback cannot await an external engine resolver. Treat a catalog
-        // declaration as existing and let async `table()` surface resolver absence
-        // or unsupported system-table access during planning.
+        // System tables derive their existence from a snapshotted base table.
+        // This callback cannot await an external engine resolver, so async
+        // `table()` remains responsible for surfacing unsupported routed tables.
         self.metadata
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -1258,7 +1330,7 @@ impl SchemaProvider for PaimonSchemaProvider {
                     .drop_table(&identifier, false)
                     .await
                     .map_err(to_datafusion_error)?;
-                metadata.mutate(|next| {
+                metadata.mutate_database(&database, |next| {
                     if let Some(database) = next.databases.get_mut(&database) {
                         Arc::make_mut(database).objects.shift_remove(&name);
                     }

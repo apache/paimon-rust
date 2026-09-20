@@ -45,7 +45,7 @@
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::{
@@ -61,7 +61,7 @@ use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, Volatility};
+use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, TableType, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
@@ -107,7 +107,7 @@ pub struct SQLContext {
     blob_reader_registry: BlobReaderRegistry,
     /// Last successful refresh used to resolve a missing object, keyed by database.
     missing_object_refreshes: Mutex<HashMap<(String, String), Instant>>,
-    metadata_refresh_gate: tokio::sync::Mutex<()>,
+    metadata_refresh_gates: Mutex<HashMap<MetadataRefreshTarget, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 const MISSING_OBJECT_REFRESH_TTL: Duration = Duration::from_secs(1);
@@ -184,7 +184,7 @@ impl SQLContextBuilder {
             dynamic_options: Default::default(),
             blob_reader_registry: BlobReaderRegistry::default(),
             missing_object_refreshes: Mutex::new(HashMap::new()),
-            metadata_refresh_gate: tokio::sync::Mutex::new(()),
+            metadata_refresh_gates: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -489,16 +489,31 @@ impl SQLContext {
             ));
         }
 
-        let refresh_metadata_after = self.metadata_change_targets(&statements[0], false)?;
-        let metadata_mutation_targets = self.metadata_change_targets(&statements[0], true)?;
-        {
-            let _refresh_guard = self.metadata_refresh_gate.lock().await;
-            let mut metadata_to_refresh = self.metadata_refresh_targets(&statements[0])?;
-            metadata_to_refresh.retain(|target| !metadata_mutation_targets.contains(target));
-            if !metadata_to_refresh.is_empty() {
-                self.refresh_metadata_targets(metadata_to_refresh).await?;
+        let metadata_mutation_targets = self.metadata_change_targets(&statements[0])?;
+        let (mut metadata_to_refresh, best_effort_targets) =
+            self.metadata_refresh_targets(&statements[0])?;
+        metadata_to_refresh.retain(|target| !metadata_mutation_targets.contains(target));
+        let statement = &statements[0];
+        let metadata_mutation_targets = &metadata_mutation_targets;
+        let best_effort_targets = &best_effort_targets;
+        futures::future::try_join_all(metadata_to_refresh.into_iter().map(|target| async move {
+            let refresh_gate = self.metadata_refresh_gate(&target);
+            let _refresh_guard = refresh_gate.lock().await;
+            let (mut current_targets, _) = self.metadata_refresh_targets(statement)?;
+            current_targets.retain(|target| !metadata_mutation_targets.contains(target));
+            if current_targets.contains(&target) {
+                let best_effort = best_effort_targets.contains(&target);
+                if let Err(error) = self.refresh_metadata_targets([target]).await {
+                    if best_effort {
+                        log::warn!("information schema metadata refresh failed: {error}");
+                    } else {
+                        return Err(error);
+                    }
+                }
             }
-        }
+            Ok::<(), DataFusionError>(())
+        }))
+        .await?;
 
         let result = match &statements[0] {
             Statement::ShowDatabases {
@@ -809,10 +824,8 @@ impl SQLContext {
             _ => self.ctx.sql(sql).await,
         };
 
-        if result.is_ok() && !refresh_metadata_after.is_empty() {
-            if let Err(error) = self.refresh_metadata_targets(refresh_metadata_after).await {
-                log::warn!("catalog metadata refresh after DDL failed: {error}");
-            }
+        if result.is_ok() {
+            self.apply_metadata_change(&statements[0])?;
         }
         result
     }
@@ -820,15 +833,19 @@ impl SQLContext {
     fn metadata_refresh_targets(
         &self,
         statement: &Statement,
-    ) -> DFResult<HashSet<MetadataRefreshTarget>> {
+    ) -> DFResult<(
+        HashSet<MetadataRefreshTarget>,
+        HashSet<MetadataRefreshTarget>,
+    )> {
         let mut targets = HashSet::new();
+        let mut best_effort_targets = HashSet::new();
         if matches!(statement, Statement::ShowTables { .. }) {
             let state = self.ctx.state();
             targets.insert(MetadataRefreshTarget::Database {
                 catalog: self.current_catalog_name(),
                 database: state.config_options().catalog.default_schema.clone(),
             });
-            return Ok(targets);
+            return Ok((targets, best_effort_targets));
         }
         if let Statement::ShowColumns { show_options, .. } = statement {
             if let Some(show_in) = &show_options.show_in {
@@ -842,10 +859,10 @@ impl SQLContext {
                     }
                 }
             }
-            return Ok(targets);
+            return Ok((targets, best_effort_targets));
         }
         if matches!(statement, Statement::ShowFunctions { .. }) {
-            return Ok(targets);
+            return Ok((targets, best_effort_targets));
         }
 
         let statement = datafusion::sql::parser::Statement::Statement(Box::new(statement.clone()));
@@ -869,7 +886,13 @@ impl SQLContext {
                     ))
                 })?;
             if schema.eq_ignore_ascii_case("information_schema") {
-                targets.insert(MetadataRefreshTarget::Catalog(catalog_name.to_string()));
+                let catalogs = self
+                    .catalogs
+                    .keys()
+                    .cloned()
+                    .map(MetadataRefreshTarget::Catalog);
+                targets.extend(catalogs.clone());
+                best_effort_targets.extend(catalogs);
             } else if !provider.metadata_contains_object(schema, reference.table()) {
                 let target = MetadataRefreshTarget::Database {
                     catalog: catalog_name.to_string(),
@@ -880,13 +903,12 @@ impl SQLContext {
                 }
             }
         }
-        Ok(targets)
+        Ok((targets, best_effort_targets))
     }
 
     fn metadata_change_targets(
         &self,
         statement: &Statement,
-        include_temporary: bool,
     ) -> DFResult<HashSet<MetadataRefreshTarget>> {
         let mut targets = HashSet::new();
         let mut add_database = |name: &ObjectName| -> DFResult<()> {
@@ -914,12 +936,8 @@ impl SQLContext {
                 let (_, catalog, _) = self.resolve_catalog_and_database(name)?;
                 targets.insert(MetadataRefreshTarget::Catalog(catalog));
             }
-            Statement::CreateTable(create) if include_temporary || !create.temporary => {
-                add_database(&create.name)?
-            }
-            Statement::CreateView(create) if include_temporary || !create.temporary => {
-                add_database(&create.name)?
-            }
+            Statement::CreateTable(create) => add_database(&create.name)?,
+            Statement::CreateView(create) => add_database(&create.name)?,
             Statement::AlterTable(alter) => add_database(&alter.name)?,
             Statement::Drop {
                 object_type: ObjectType::Database | ObjectType::Schema,
@@ -935,9 +953,8 @@ impl SQLContext {
             Statement::Drop {
                 object_type: ObjectType::Table | ObjectType::View,
                 names,
-                temporary,
                 ..
-            } if include_temporary || !temporary => {
+            } => {
                 for name in names {
                     add_database(name)?;
                 }
@@ -945,6 +962,129 @@ impl SQLContext {
             _ => {}
         }
         Ok(targets)
+    }
+
+    fn apply_metadata_change(&self, statement: &Statement) -> DFResult<()> {
+        match statement {
+            Statement::CreateDatabase { db_name, .. } => {
+                let (_, catalog_name, database) = self.resolve_catalog_and_database(db_name)?;
+                self.update_catalog_metadata(&catalog_name, |provider| {
+                    provider.record_database_created(&database)
+                })?;
+                Ok(())
+            }
+            Statement::CreateSchema {
+                schema_name: SchemaName::Simple(name),
+                ..
+            } => {
+                let (_, catalog_name, database) = self.resolve_catalog_and_database(name)?;
+                self.update_catalog_metadata(&catalog_name, |provider| {
+                    provider.record_database_created(&database)
+                })?;
+                Ok(())
+            }
+            Statement::CreateTable(create) if !create.temporary => {
+                let table_ref: TableReference = create.name.to_string().as_str().into();
+                if !self.is_paimon_catalog_ref(&table_ref) {
+                    return Ok(());
+                }
+                let (_, catalog_name, identifier) = self.resolve_catalog_and_table(&create.name)?;
+                self.update_catalog_metadata(&catalog_name, |provider| {
+                    provider.record_object_created(
+                        identifier.database(),
+                        identifier.object(),
+                        TableType::Base,
+                    )
+                })?;
+                Ok(())
+            }
+            Statement::CreateView(create) if !create.temporary => {
+                let table_ref: TableReference = create.name.to_string().as_str().into();
+                if !self.is_paimon_catalog_ref(&table_ref) {
+                    return Ok(());
+                }
+                let (_, catalog_name, identifier) = self.resolve_catalog_and_table(&create.name)?;
+                self.update_catalog_metadata(&catalog_name, |provider| {
+                    provider.record_object_created(
+                        identifier.database(),
+                        identifier.object(),
+                        TableType::View,
+                    )
+                })?;
+                Ok(())
+            }
+            Statement::AlterTable(alter) => {
+                let (_, catalog_name, identifier) = self.resolve_catalog_and_table(&alter.name)?;
+                for operation in &alter.operations {
+                    if let AlterTableOperation::RenameTable { table_name } = operation {
+                        let name = match table_name {
+                            RenameTableNameKind::To(name) | RenameTableNameKind::As(name) => {
+                                object_name_to_string(name)
+                            }
+                        };
+                        self.update_catalog_metadata(&catalog_name, |provider| {
+                            provider.record_table_renamed(
+                                identifier.database(),
+                                identifier.object(),
+                                &name,
+                            )
+                        })?;
+                    }
+                }
+                Ok(())
+            }
+            Statement::Drop {
+                object_type: ObjectType::Database | ObjectType::Schema,
+                names,
+                temporary: false,
+                ..
+            } => {
+                for name in names {
+                    let (_, catalog_name, database) = self.resolve_catalog_and_database(name)?;
+                    self.update_catalog_metadata(&catalog_name, |provider| {
+                        provider.record_database_dropped(&database)
+                    })?;
+                }
+                Ok(())
+            }
+            Statement::Drop {
+                object_type: ObjectType::Table | ObjectType::View,
+                names,
+                temporary: false,
+                ..
+            } => {
+                for name in names {
+                    let table_ref: TableReference = name.to_string().as_str().into();
+                    if !self.is_paimon_catalog_ref(&table_ref) {
+                        continue;
+                    }
+                    let (_, catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
+                    self.update_catalog_metadata(&catalog_name, |provider| {
+                        provider.record_object_dropped(identifier.database(), identifier.object())
+                    })?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn update_catalog_metadata(
+        &self,
+        catalog_name: &str,
+        update: impl FnOnce(&crate::catalog::PaimonCatalogProvider),
+    ) -> DFResult<()> {
+        let provider = self
+            .ctx
+            .catalog(catalog_name)
+            .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
+        let provider = provider
+            .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!("Catalog '{catalog_name}' is not a Paimon catalog"))
+            })?;
+        update(provider);
+        Ok(())
     }
 
     async fn refresh_metadata_targets(
@@ -1005,6 +1145,20 @@ impl SQLContext {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(catalog.clone(), database.clone()))
             .is_some_and(|refreshed| refreshed.elapsed() < MISSING_OBJECT_REFRESH_TTL)
+    }
+
+    fn metadata_refresh_gate(&self, target: &MetadataRefreshTarget) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self
+            .metadata_refresh_gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(target).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(target.clone(), Arc::downgrade(&gate));
+        gate
     }
 
     /// Handle SQL queries containing time-travel syntax (`VERSION AS OF` / `TIMESTAMP AS OF`).
