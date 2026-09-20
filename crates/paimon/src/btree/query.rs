@@ -189,80 +189,89 @@ pub(crate) struct BetweenInfo<'a> {
     pub data_type: &'a DataType,
 }
 
+impl BetweenInfo<'_> {
+    pub(crate) fn is_empty(&self) -> bool {
+        let cmp = crate::btree::make_key_comparator(self.data_type);
+        match cmp(
+            &serialize_datum(self.from, self.data_type),
+            &serialize_datum(self.to, self.data_type),
+        ) {
+            Ordering::Greater => true,
+            Ordering::Equal => !self.from_inclusive || !self.to_inclusive,
+            Ordering::Less => false,
+        }
+    }
+}
+
 pub(crate) type ExtractBetweenResult<'a> = (
     Option<BetweenInfo<'a>>,
     Vec<(PredicateOperator, &'a [Datum], &'a DataType)>,
 );
 
-/// Try to extract a between pattern (lower + upper bound) from predicates.
+/// Tighten all lower/upper bounds on one field into a single range query.
 /// Returns (between_info, remaining_predicates).
 ///
-/// Recognizes two shapes:
-/// 1. A native `Between` leaf with two literals — preferred and emitted by the
-///    DataFusion translator since Stage 3.
-/// 2. A `GtEq` / `Gt` paired with a `LtEq` / `Lt` on the same column —
-///    legacy shape, kept for direct `PredicateBuilder` users that still build
-///    the conjunction explicitly.
+/// Native `Between` leaves and explicit comparisons participate together.
+/// Float comparisons intentionally follow the residual filter's bit-preserving
+/// total order, not bitmap dictionary ordering (which canonicalizes all NaNs).
+/// Bitmap floating ranges conservatively return all non-null candidates.
 pub(crate) fn extract_between<'a>(
     predicates: &[(PredicateOperator, &'a [Datum], &'a DataType)],
 ) -> ExtractBetweenResult<'a> {
-    // Shape 1: native Between leaf — single tuple is enough.
-    for (i, (op, literals, dt)) in predicates.iter().enumerate() {
-        if matches!(op, PredicateOperator::Between) && literals.len() == 2 {
-            let between = BetweenInfo {
-                from: &literals[0],
-                to: &literals[1],
-                from_inclusive: true,
-                to_inclusive: true,
-                data_type: dt,
-            };
-            let remaining: Vec<_> = predicates
-                .iter()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, p)| *p)
-                .collect();
-            return (Some(between), remaining);
-        }
-    }
-
-    if predicates.len() < 2 {
+    let Some((_, _, data_type)) = predicates.first() else {
+        return (None, Vec::new());
+    };
+    if predicates.len() == 1 && predicates[0].0 != PredicateOperator::Between {
         return (None, predicates.to_vec());
     }
-
-    let mut lower: Option<(usize, bool)> = None; // (index, inclusive)
-    let mut upper: Option<(usize, bool)> = None;
-
-    for (i, (op, literals, _)) in predicates.iter().enumerate() {
-        if literals.len() != 1 {
+    let cmp = crate::btree::make_key_comparator(data_type);
+    let mut lower: Option<(&Datum, Vec<u8>, bool)> = None;
+    let mut upper: Option<(&Datum, Vec<u8>, bool)> = None;
+    let mut remaining = Vec::new();
+    for &(op, literals, ty) in predicates {
+        if ty != *data_type {
+            remaining.push((op, literals, ty));
             continue;
         }
-        match op {
-            PredicateOperator::GtEq if lower.is_none() => lower = Some((i, true)),
-            PredicateOperator::Gt if lower.is_none() => lower = Some((i, false)),
-            PredicateOperator::LtEq if upper.is_none() => upper = Some((i, true)),
-            PredicateOperator::Lt if upper.is_none() => upper = Some((i, false)),
-            _ => {}
+        let (from, to) = match (op, literals) {
+            (PredicateOperator::GtEq, [value]) => (Some((value, true)), None),
+            (PredicateOperator::Gt, [value]) => (Some((value, false)), None),
+            (PredicateOperator::LtEq, [value]) => (None, Some((value, true))),
+            (PredicateOperator::Lt, [value]) => (None, Some((value, false))),
+            (PredicateOperator::Between, [from, to]) => (Some((from, true)), Some((to, true))),
+            _ => {
+                remaining.push((op, literals, ty));
+                continue;
+            }
+        };
+        for (candidate, bound, tighter) in [
+            (from, &mut lower, Ordering::Greater),
+            (to, &mut upper, Ordering::Less),
+        ] {
+            if let Some((value, inclusive)) = candidate {
+                let key = serialize_datum(value, data_type);
+                match bound {
+                    Some((_, existing, current_inclusive)) => match cmp(&key, existing) {
+                        Ordering::Equal => *current_inclusive &= inclusive,
+                        order if order == tighter => *bound = Some((value, key, inclusive)),
+                        _ => {}
+                    },
+                    None => *bound = Some((value, key, inclusive)),
+                }
+            }
         }
     }
-
     match (lower, upper) {
-        (Some((li, from_inclusive)), Some((ui, to_inclusive))) => {
-            let between = BetweenInfo {
-                from: &predicates[li].1[0],
-                to: &predicates[ui].1[0],
+        (Some((from, _, from_inclusive)), Some((to, _, to_inclusive))) => (
+            Some(BetweenInfo {
+                from,
+                to,
                 from_inclusive,
                 to_inclusive,
-                data_type: predicates[li].2,
-            };
-            let remaining: Vec<_> = predicates
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != li && *i != ui)
-                .map(|(_, p)| *p)
-                .collect();
-            (Some(between), remaining)
-        }
+                data_type,
+            }),
+            remaining,
+        ),
         _ => (None, predicates.to_vec()),
     }
 }

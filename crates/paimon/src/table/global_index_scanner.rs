@@ -20,6 +20,7 @@
 //!
 //! Reference: [org.apache.paimon.index.GlobalIndexScanner](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/index/GlobalIndexScanner.java)
 
+mod all_match;
 mod deletion_vectors;
 mod entry;
 mod evaluator;
@@ -62,6 +63,8 @@ const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 struct QueryIoProbe {
     active: TestAtomicUsize,
     peak: TestAtomicUsize,
+    predicate_queries: TestAtomicUsize,
+    range_queries: TestAtomicUsize,
 }
 
 #[cfg(test)]
@@ -262,6 +265,7 @@ impl GlobalIndexScanner {
                 file_name: entry.index_file.file_name.clone(),
                 index_type: kind,
                 file_size: entry.index_file.file_size,
+                row_count: entry.index_file.row_count,
                 row_range_start: global_meta.row_range_start,
                 row_range_end: global_meta.row_range_end,
                 external_path: entry.index_file.external_path.clone(),

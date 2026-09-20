@@ -24,8 +24,8 @@
 use crate::btree::block::{BlockCompressionType, BlockHandle};
 use crate::btree::footer::BTreeFileFooter;
 use crate::btree::meta::BTreeIndexMeta;
+use crate::btree::posting_list;
 use crate::btree::sst_file::SstFileWriter;
-use crate::btree::var_len::{encode_var_int, encode_var_long};
 use crate::io::FileWrite;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
@@ -46,6 +46,7 @@ pub struct BTreeIndexWriter<F: Fn(&[u8], &[u8]) -> Ordering> {
     null_bitmap: Option<RoaringTreemap>,
     row_count: u64,
     key_comparator: F,
+    file_version: u32,
 }
 
 /// Result of finishing a BTree index write.
@@ -84,6 +85,7 @@ impl BTreeIndexWriter<fn(&[u8], &[u8]) -> Ordering> {
             null_bitmap: None,
             row_count: 0,
             key_comparator: |a, b| a.cmp(b),
+            file_version: 1,
         }
     }
 }
@@ -139,13 +141,34 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
             null_bitmap: None,
             row_count: 0,
             key_comparator: cmp,
+            file_version: 1,
         }
+    }
+
+    /// Select the on-disk version before writing any rows. V1 remains the default;
+    /// V2 requires readers that support adaptive postings.
+    pub fn with_file_version(mut self, version: u32) -> io::Result<Self> {
+        if !matches!(version, 1 | 2) || self.row_count != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BTree file version must be 1 or 2 and set before writing",
+            ));
+        }
+        self.file_version = version;
+        Ok(self)
     }
 
     /// Write a key and its associated row id.
     /// If key is None, the row id is added to the null bitmap.
     /// Keys must be written in sorted order; entries with the same key are combined.
+    /// In V2, row IDs for the same key must also be strictly increasing.
     pub async fn write(&mut self, key: Option<&[u8]>, row_id: i64) -> io::Result<()> {
+        if row_id < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BTree row ID must be non-negative",
+            ));
+        }
         self.row_count += 1;
 
         match key {
@@ -177,12 +200,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
             return Ok(());
         }
 
-        // Serialize row id list: var_len_int(count) + var_len_long(id) * count
-        let mut value_buf = Vec::with_capacity(self.current_row_ids.len() * 9 + 5);
-        encode_var_int(&mut value_buf, self.current_row_ids.len() as i32)?;
-        for &row_id in &self.current_row_ids {
-            encode_var_long(&mut value_buf, row_id)?;
-        }
+        let value_buf = posting_list::serialize(&self.current_row_ids, self.file_version)?;
         self.current_row_ids.clear();
 
         if let Some(ref key) = self.last_key {
@@ -237,8 +255,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
         let index_block_handle = self.sst_writer.write_index_block().await?;
 
         // Write footer
-        let footer =
+        let mut footer =
             BTreeFileFooter::new(bloom_filter_handle, index_block_handle, null_bitmap_handle);
+        footer.version = self.file_version;
         let footer_bytes = footer.write_footer();
         self.sst_writer.write_raw(&footer_bytes).await?;
 

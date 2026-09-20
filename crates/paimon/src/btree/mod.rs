@@ -41,6 +41,7 @@ mod bloom_filter;
 mod footer;
 pub(crate) mod key_serde;
 mod meta;
+mod posting_list;
 pub(crate) mod query;
 mod reader;
 mod sst_file;

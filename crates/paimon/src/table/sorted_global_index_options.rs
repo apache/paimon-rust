@@ -24,6 +24,7 @@ use crate::{Error, Result};
 use std::collections::HashMap;
 
 pub(crate) const BTREE_BLOCK_SIZE_OPTION: &str = "btree-index.block-size";
+pub(crate) const BTREE_FILE_VERSION_OPTION: &str = "btree-index.file-version";
 pub(crate) const BTREE_BLOOM_FILTER_ENABLED_OPTION: &str = "btree-index.bloom-filter.enabled";
 pub(crate) const BTREE_COMPRESSION_OPTION: &str = "btree-index.compression";
 pub(crate) const BTREE_COMPRESSION_LEVEL_OPTION: &str = "btree-index.compression-level";
@@ -45,6 +46,7 @@ pub(crate) struct SortedIndexWriteOptions {
     pub(crate) compression_type: BlockCompressionType,
     pub(crate) compression_level: i32,
     pub(crate) bloom_filter_enabled: bool,
+    pub(crate) btree_file_version: u32,
 }
 
 impl SortedIndexWriteOptions {
@@ -76,6 +78,26 @@ impl SortedIndexWriteOptions {
             };
 
         Ok(Self {
+            btree_file_version: if index_type == BTREE_GLOBAL_INDEX_TYPE {
+                match options
+                    .get(BTREE_FILE_VERSION_OPTION)
+                    .map(|s| s.trim())
+                    .unwrap_or("1")
+                {
+                    "1" => 1,
+                    "2" => 2,
+                    raw => {
+                        return Err(Error::DataInvalid {
+                            message: format!(
+                                "Option '{BTREE_FILE_VERSION_OPTION}' must be 1 or 2, got: {raw}"
+                            ),
+                            source: None,
+                        })
+                    }
+                }
+            } else {
+                1
+            },
             block_size: parse_block_size(options, block_size_option, default_block_size)?,
             compression_type: parse_compression(options, compression_option)?,
             compression_level: parse_compression_level(
@@ -185,6 +207,7 @@ mod tests {
                 compression_type: BlockCompressionType::None,
                 compression_level: 1,
                 bloom_filter_enabled: false,
+                btree_file_version: 1,
             }
         );
         for index_type in [BITMAP_GLOBAL_INDEX_TYPE, MULTIVALUE_GLOBAL_INDEX_TYPE] {
@@ -195,6 +218,7 @@ mod tests {
                     compression_type: BlockCompressionType::None,
                     compression_level: 1,
                     bloom_filter_enabled: false,
+                    btree_file_version: 1,
                 }
             );
         }
@@ -234,6 +258,7 @@ mod tests {
                     compression_type: BlockCompressionType::Lz4,
                     compression_level: 7,
                     bloom_filter_enabled: false,
+                    btree_file_version: 1,
                 }
             );
         }
@@ -253,6 +278,13 @@ mod tests {
     fn test_invalid_options() {
         for (index_type, option, value) in [
             (BTREE_GLOBAL_INDEX_TYPE, BTREE_BLOCK_SIZE_OPTION, "0"),
+            (BTREE_GLOBAL_INDEX_TYPE, BTREE_FILE_VERSION_OPTION, "0"),
+            (BTREE_GLOBAL_INDEX_TYPE, BTREE_FILE_VERSION_OPTION, "3"),
+            (
+                BTREE_GLOBAL_INDEX_TYPE,
+                BTREE_FILE_VERSION_OPTION,
+                "invalid",
+            ),
             (
                 BITMAP_GLOBAL_INDEX_TYPE,
                 BITMAP_DICTIONARY_BLOCK_SIZE_OPTION,
