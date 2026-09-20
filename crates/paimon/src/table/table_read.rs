@@ -205,6 +205,25 @@ impl<'a> TableRead<'a> {
         }
     }
 
+    /// Returns rows with a leading `rowkind` column.
+    ///
+    /// Materialized snapshot rows are inserts (`+I`). Streaming primary-key
+    /// splits retain their physical `_VALUE_KIND` values so change events are
+    /// exposed as `+I`, `-U`, `+U`, or `-D` without merge reconciliation.
+    pub fn to_arrow_with_row_kind(
+        &self,
+        data_splits: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.ensure_query_auth_allowed()?;
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.to_arrow_with_row_kind(data_splits),
+            TableReadKind::Format(read) => {
+                let schema = audit_schema_for_read_type(read.read_type(), false)?;
+                prepend_insert_row_kind_stream(read.to_arrow(data_splits)?, schema)
+            }
+        }
+    }
+
     /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
     ///
     /// Delta/Changelog use [`IncrementalSplit::Data`]. Diff uses
@@ -415,16 +434,57 @@ impl<'a> PaimonTableRead<'a> {
         }
     }
 
+    fn to_arrow_with_row_kind(
+        &self,
+        data_splits: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let schema = audit_schema_for_read_type(&self.read_type, false)?;
+        let (streaming, materialized): (Vec<_>, Vec<_>) = data_splits
+            .iter()
+            .cloned()
+            .partition(DataSplit::is_streaming);
+        let mut streams = Vec::with_capacity(2);
+        if !materialized.is_empty() {
+            streams.push(prepend_insert_row_kind_stream(
+                self.to_arrow(&materialized)?,
+                Arc::clone(&schema),
+            )?);
+        }
+        if !streaming.is_empty() {
+            if self.table.schema().primary_keys().is_empty() {
+                streams.push(prepend_insert_row_kind_stream(
+                    self.to_arrow(&streaming)?,
+                    Arc::clone(&schema),
+                )?);
+            } else {
+                streams.push(self.audit_raw_data_splits(&streaming, true, false)?);
+            }
+        }
+        Ok(Box::pin(stream::select_all(streams)))
+    }
+
     fn audit_raw_stream(
         &self,
         plan: &IncrementalPlan,
         has_value_kind: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
         plan.validate()?;
-        let core_options = self.table.schema().core_options();
         let data_splits = plan.data_splits();
+        self.audit_raw_data_splits(
+            &data_splits,
+            has_value_kind,
+            audit_sequence_number_enabled(self.table),
+        )
+    }
+
+    fn audit_raw_data_splits(
+        &self,
+        data_splits: &[DataSplit],
+        has_value_kind: bool,
+        include_sequence: bool,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let core_options = self.table.schema().core_options();
         let user_read_type = self.read_type.clone();
-        let include_sequence = audit_sequence_number_enabled(self.table);
         let audit_schema = audit_schema_for_read_type(&user_read_type, include_sequence)?;
 
         let mut read_type = user_read_type.clone();
@@ -460,7 +520,7 @@ impl<'a> PaimonTableRead<'a> {
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
         .with_table_options(self.table.schema().options().clone())
         .with_mosaic_prefetch(configured_mosaic_prefetch(self.table)?);
-        let raw_stream = reader.read(&data_splits)?;
+        let raw_stream = reader.read(data_splits)?;
 
         Ok(Box::pin(async_stream::try_stream! {
             futures::pin_mut!(raw_stream);
@@ -980,6 +1040,34 @@ impl<'a> PaimonTableRead<'a> {
         }
         Ok(reader)
     }
+}
+
+fn prepend_insert_row_kind_stream(
+    stream: ArrowRecordBatchStream,
+    schema: Arc<ArrowSchema>,
+) -> crate::Result<ArrowRecordBatchStream> {
+    Ok(Box::pin(async_stream::try_stream! {
+        futures::pin_mut!(stream);
+        while let Some(batch) = stream.next().await {
+            yield prepend_insert_row_kind(batch?, Arc::clone(&schema))?;
+        }
+    }))
+}
+
+fn prepend_insert_row_kind(
+    batch: RecordBatch,
+    schema: Arc<ArrowSchema>,
+) -> crate::Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(batch.num_columns() + 1);
+    columns.push(Arc::new(StringArray::from(vec!["+I"; batch.num_rows()])) as ArrayRef);
+    columns.extend(batch.columns().iter().cloned());
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(schema, columns, &options).map_err(|error| {
+        crate::Error::UnexpectedError {
+            message: format!("Failed to prepend row kind column: {error}"),
+            source: Some(Box::new(error)),
+        }
+    })
 }
 
 fn audit_schema_for_read_type(
@@ -1568,6 +1656,32 @@ mod tests {
     use crate::table::query_auth_table;
     use crate::table::source::DataSplitBuilder;
     use futures::TryStreamExt;
+
+    #[test]
+    fn test_prepend_insert_row_kind_preserves_zero_column_row_count() {
+        let batch = RecordBatch::try_new_with_options(
+            Arc::new(ArrowSchema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(3)),
+        )
+        .unwrap();
+
+        let actual =
+            prepend_insert_row_kind(batch, audit_schema_for_read_type(&[], false).unwrap())
+                .unwrap();
+
+        assert_eq!(actual.num_rows(), 3);
+        assert_eq!(actual.schema().fields()[0].name(), ROW_KIND_FIELD_NAME);
+        let kinds = actual
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            kinds.iter().collect::<Vec<_>>(),
+            vec![Some("+I"), Some("+I"), Some("+I")]
+        );
+    }
 
     pub(super) fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
         DataFileMeta {
