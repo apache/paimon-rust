@@ -87,6 +87,9 @@ def test_chunk_shuffle_takes_seed_and_chunk_size_before_optional_shard():
         scan = builder.new_scan()
         assert scan.with_chunk_shuffle(str(2 ** 70), 2) is scan
         plan = scan.plan()
+        for split in plan.splits():
+            restored = Split.deserialize(split.serialize())
+            assert restored.row_count() == split.row_count()
         chunks = [
             pa.Table.from_batches(builder.new_read().read([split]))
             .column("id").to_pylist()
@@ -100,7 +103,7 @@ def test_chunk_shuffle_takes_seed_and_chunk_size_before_optional_shard():
             shard = (
                 builder.new_scan()
                 .with_chunk_shuffle(str(2 ** 70), 2)
-                .with_chunk_shuffle_shard(index, 2)
+                .with_shard(index, 2)
                 .plan()
             )
             sharded.extend(
@@ -110,8 +113,64 @@ def test_chunk_shuffle_takes_seed_and_chunk_size_before_optional_shard():
             )
         assert sharded == chunks
 
-        with pytest.raises(ValueError, match="requires with_chunk_shuffle first"):
-            builder.new_scan().with_chunk_shuffle_shard(0, 2)
+        # Shard is scan-level state, so it may be configured before shuffle.
+        before_shuffle = (
+            builder.new_scan()
+            .with_shard(0, 2)
+            .with_chunk_shuffle(str(2 ** 70), 2)
+            .plan()
+        )
+        before_rows = [
+            pa.Table.from_batches(builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in before_shuffle.splits()
+        ]
+        after_rows = [
+            pa.Table.from_batches(builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in (
+                builder.new_scan()
+                .with_chunk_shuffle(str(2 ** 70), 2)
+                .with_shard(0, 2)
+                .plan()
+                .splits()
+            )
+        ]
+        assert before_rows == after_rows
+
+        with pytest.raises(ValueError, match="count must be positive"):
+            builder.new_scan().with_shard(0, 0)
+        with pytest.raises(RuntimeError, match="requires chunk_shuffle"):
+            builder.new_scan().with_shard(0, 2).plan()
+
+
+def test_chunk_shuffle_reads_split_local_ranges_across_files():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("CREATE TABLE paimon.rdb.t (id INT)")
+        ctx.sql("INSERT INTO paimon.rdb.t VALUES (1), (2)")
+        ctx.sql("INSERT INTO paimon.rdb.t VALUES (3), (4)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.t")
+        builder = table.new_read_builder().with_projection(["id"])
+        splits = (
+            builder.new_scan()
+            .with_chunk_shuffle("7", 3)
+            .plan()
+            .splits()
+        )
+
+        chunks = []
+        for split in splits:
+            restored = Split.deserialize(split.serialize())
+            chunks.append(
+                pa.Table.from_batches(builder.new_read().read([restored]))
+                .column("id").to_pylist()
+            )
+
+        assert sorted(len(chunk) for chunk in chunks) == [1, 3]
+        assert sorted(value for chunk in chunks for value in chunk) == [1, 2, 3, 4]
 
 
 def test_with_row_ranges():
@@ -240,7 +299,7 @@ def test_indexed_split_wire_roundtrip_preserves_row_ranges():
         restored = Split.deserialize(split.serialize())
         rows = pa.Table.from_batches(builder.new_read().read([restored]))
 
-        assert restored.row_count() == 3
+        assert restored.row_count() == 1
         assert rows.column("id").to_pylist() == [2]
 
 

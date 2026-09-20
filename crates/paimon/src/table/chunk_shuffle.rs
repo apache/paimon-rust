@@ -27,7 +27,7 @@ use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::spec::{BinaryRow, DataField, DataFileMeta, Datum};
 use crate::table::source::{data_evolution_anchor_file, is_data_evolution_normal_file};
 use crate::table::stats_filter::group_by_overlapping_row_id;
-use crate::table::{DataSplit, DataSplitBuilder, DeletionFile, RowRange, Table};
+use crate::table::{merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, RowRange, Table};
 
 /// Native chunk-shuffle configuration. The seed is stored as the unsigned
 /// little-endian 32-bit words consumed by CPython's MT19937 initializer.
@@ -35,7 +35,6 @@ use crate::table::{DataSplit, DataSplitBuilder, DeletionFile, RowRange, Table};
 pub(crate) struct ChunkShuffle {
     seed_words: Vec<u32>,
     chunk_size: i64,
-    shard: Option<(usize, usize)>,
 }
 
 impl ChunkShuffle {
@@ -55,20 +54,7 @@ impl ChunkShuffle {
         Ok(Self {
             seed_words: decimal_seed_words(seed)?,
             chunk_size,
-            shard: None,
         })
-    }
-
-    pub(crate) fn set_shard(&mut self, index: usize, count: usize) -> crate::Result<()> {
-        if count == 0 || index >= count {
-            return Err(crate::Error::DataInvalid {
-                message: "chunk_shuffle shard count must be positive and index less than count"
-                    .to_string(),
-                source: None,
-            });
-        }
-        self.shard = Some((index, count));
-        Ok(())
     }
 }
 
@@ -92,15 +78,13 @@ struct InputGroup {
 #[derive(Debug)]
 struct AppendSegment {
     input: InputFile,
-    range: Option<RowRange>,
-    live_rows: i64,
+    ranges: Vec<RowRange>,
 }
 
 #[derive(Debug)]
 struct EvolutionSegment {
     files: Vec<InputFile>,
-    range: RowRange,
-    live_rows: i64,
+    ranges: Vec<RowRange>,
 }
 
 /// Repack planned files into shuffled, fixed-live-row chunks. Normal scan
@@ -110,16 +94,14 @@ pub(crate) async fn chunk_shuffle_splits(
     table: &Table,
     splits: Vec<DataSplit>,
     config: &ChunkShuffle,
+    shard: Option<(usize, usize)>,
 ) -> crate::Result<Vec<DataSplit>> {
     if !table.schema().primary_keys().is_empty() {
         return Err(crate::Error::Unsupported {
             message: "chunk_shuffle only supports append tables".to_string(),
         });
     }
-    if splits
-        .iter()
-        .any(|split| split.row_ranges().is_some() || split.file_row_ranges().is_some())
-    {
+    if splits.iter().any(|split| split.row_ranges().is_some()) {
         return Err(crate::Error::Unsupported {
             message: "chunk_shuffle cannot combine with row-range selection".to_string(),
         });
@@ -161,7 +143,7 @@ pub(crate) async fn chunk_shuffle_splits(
     }
 
     PythonRandom::new(&config.seed_words).shuffle(&mut chunks);
-    if let Some((index, count)) = config.shard {
+    if let Some((index, count)) = shard {
         let (start, end) = shard_range(chunks.len(), index, count);
         chunks = chunks.drain(start..end).collect();
     }
@@ -278,16 +260,10 @@ async fn append_chunks(
             let Some(slice) = slicer.take(chunk_size - current_rows)? else {
                 break;
             };
-            let range = if slice.start == 0 && slice.end == input.file.row_count {
-                None
-            } else {
-                Some(RowRange::new(slice.start, slice.end - 1))
-            };
             current_rows += slice.live_rows;
             current.push(AppendSegment {
                 input: input.clone(),
-                range,
-                live_rows: slice.live_rows,
+                ranges: slice.ranges,
             });
         }
     }
@@ -305,27 +281,25 @@ fn build_append_split(
     group: &InputGroup,
     segments: Vec<AppendSegment>,
 ) -> crate::Result<DataSplit> {
-    let exact_count = segments.iter().map(|segment| segment.live_rows).sum();
-    let files = segments
-        .iter()
-        .map(|segment| segment.input.file.clone())
-        .collect();
-    let deletion_files: Vec<_> = segments
-        .iter()
-        .map(|segment| segment.input.deletion_file.clone())
-        .collect();
-    let file_ranges: Vec<_> = segments
-        .iter()
-        .map(|segment| segment.range.clone())
-        .collect();
-    let has_ranges = file_ranges.iter().any(Option::is_some);
+    let mut files = Vec::with_capacity(segments.len());
+    let mut deletion_files = Vec::with_capacity(segments.len());
+    let mut ranges = Vec::new();
+    let mut split_offset = 0;
+    for segment in segments {
+        ranges.extend(
+            segment
+                .ranges
+                .into_iter()
+                .map(|range| RowRange::new(split_offset + range.from(), split_offset + range.to())),
+        );
+        split_offset += segment.input.file.row_count;
+        files.push(segment.input.file);
+        deletion_files.push(segment.input.deletion_file);
+    }
 
-    let mut builder = base_builder(group, files, true).with_exact_merged_row_count(exact_count);
+    let mut builder = base_builder(group, files, true).with_row_ranges(merge_row_ranges(ranges));
     if deletion_files.iter().any(Option::is_some) {
         builder = builder.with_data_deletion_files(deletion_files);
-    }
-    if has_ranges {
-        builder = builder.with_file_row_ranges(file_ranges);
     }
     builder.build()
 }
@@ -431,8 +405,13 @@ async fn evolution_chunks(
             current_rows += slice.live_rows;
             current.push(EvolutionSegment {
                 files: inputs.clone(),
-                range: RowRange::new(first_row_id + slice.start, first_row_id + slice.end - 1),
-                live_rows: slice.live_rows,
+                ranges: slice
+                    .ranges
+                    .into_iter()
+                    .map(|range| {
+                        RowRange::new(first_row_id + range.from(), first_row_id + range.to())
+                    })
+                    .collect(),
             });
         }
     }
@@ -450,21 +429,17 @@ fn build_evolution_split(
     group: &InputGroup,
     segments: Vec<EvolutionSegment>,
 ) -> crate::Result<DataSplit> {
-    let exact_count = segments.iter().map(|segment| segment.live_rows).sum();
     let mut files = Vec::new();
     let mut deletion_files = Vec::new();
     let mut ranges = Vec::new();
     for segment in segments {
-        ranges.push(segment.range);
+        ranges.extend(segment.ranges);
         for input in segment.files {
             files.push(input.file);
             deletion_files.push(input.deletion_file);
         }
     }
-    ranges.sort_by_key(RowRange::from);
-    let mut builder = base_builder(group, files, false)
-        .with_row_ranges(ranges)
-        .with_exact_merged_row_count(exact_count);
+    let mut builder = base_builder(group, files, false).with_row_ranges(merge_row_ranges(ranges));
     if deletion_files.iter().any(Option::is_some) {
         builder = builder.with_data_deletion_files(deletion_files);
     }
@@ -485,8 +460,7 @@ fn base_builder(group: &InputGroup, files: Vec<DataFileMeta>, raw: bool) -> Data
 
 #[derive(Debug)]
 struct PhysicalSlice {
-    start: i64,
-    end: i64,
+    ranges: Vec<RowRange>,
     live_rows: i64,
 }
 
@@ -542,39 +516,37 @@ impl LiveRowSlicer {
         if self.position >= self.physical_count {
             return Ok(None);
         }
-        let start = self.position;
         let mut live_rows = 0;
+        let mut ranges = Vec::new();
         while self.position < self.physical_count {
             let next_deleted = self.deleted.get(self.deleted_index).copied();
             if let Some(deleted) = next_deleted {
                 let live_run = deleted - self.position;
                 let take = (expected_live_rows - live_rows).min(live_run);
-                self.position += take;
-                live_rows += take;
+                if take > 0 {
+                    ranges.push(RowRange::new(self.position, self.position + take - 1));
+                    self.position += take;
+                    live_rows += take;
+                }
             } else {
                 let take =
                     (expected_live_rows - live_rows).min(self.physical_count - self.position);
-                self.position += take;
-                live_rows += take;
+                if take > 0 {
+                    ranges.push(RowRange::new(self.position, self.position + take - 1));
+                    self.position += take;
+                    live_rows += take;
+                }
             }
             if live_rows == expected_live_rows {
                 self.skip_deleted_at_cursor();
-                return Ok(Some(PhysicalSlice {
-                    start,
-                    end: self.position,
-                    live_rows,
-                }));
+                return Ok(Some(PhysicalSlice { ranges, live_rows }));
             }
             self.skip_deleted_at_cursor();
         }
         if live_rows == 0 {
             Ok(None)
         } else {
-            Ok(Some(PhysicalSlice {
-                start,
-                end: self.position,
-                live_rows,
-            }))
+            Ok(Some(PhysicalSlice { ranges, live_rows }))
         }
     }
 
@@ -841,17 +813,40 @@ mod tests {
     }
 
     #[test]
-    fn live_row_slicer_counts_visible_rows_and_attaches_boundary_deletes() {
+    fn live_row_slicer_returns_only_visible_physical_ranges() {
         let mut slicer = LiveRowSlicer::new(12, vec![0, 3, 4, 8, 11])
             .unwrap()
             .unwrap();
         let first = slicer.take(3).unwrap().unwrap();
-        assert_eq!((first.start, first.end, first.live_rows), (0, 6, 3));
+        assert_eq!(
+            (first.ranges, first.live_rows),
+            (vec![RowRange::new(1, 2), RowRange::new(5, 5)], 3)
+        );
         let second = slicer.take(3).unwrap().unwrap();
-        assert_eq!((second.start, second.end, second.live_rows), (6, 10, 3));
+        assert_eq!(
+            (second.ranges, second.live_rows),
+            (vec![RowRange::new(6, 7), RowRange::new(9, 9)], 3)
+        );
         let last = slicer.take(3).unwrap().unwrap();
-        assert_eq!((last.start, last.end, last.live_rows), (10, 12, 1));
+        assert_eq!(
+            (last.ranges, last.live_rows),
+            (vec![RowRange::new(10, 10)], 1)
+        );
         assert!(slicer.take(1).unwrap().is_none());
+
+        let mut alternating = LiveRowSlicer::new(8, vec![1, 3, 5, 7]).unwrap().unwrap();
+        assert_eq!(
+            alternating.take(3).unwrap().unwrap().ranges,
+            vec![
+                RowRange::new(0, 0),
+                RowRange::new(2, 2),
+                RowRange::new(4, 4)
+            ]
+        );
+        assert_eq!(
+            alternating.take(3).unwrap().unwrap().ranges,
+            vec![RowRange::new(6, 6)]
+        );
     }
 
     #[test]
@@ -869,23 +864,38 @@ mod tests {
             true,
         );
         let config = ChunkShuffle::from_decimal_seed("42", 3).unwrap();
-        let chunks = chunk_shuffle_splits(&table, vec![input.clone()], &config)
+        let chunks = chunk_shuffle_splits(&table, vec![input.clone()], &config, None)
             .await
             .unwrap();
         assert_eq!(chunks.len(), 3);
         assert!(chunks
             .iter()
-            .all(|chunk| chunk.exact_merged_row_count() == Some(3)));
+            .all(|chunk| chunk.row_count() == 3 && chunk.merged_row_count() == Some(3)));
 
         let mut covered = Vec::new();
         for chunk in &chunks {
-            for (index, file) in chunk.data_files().iter().enumerate() {
-                let (from, to) = chunk
-                    .file_row_range(index)
-                    .map(|range| (range.from(), range.to()))
-                    .unwrap_or((0, file.row_count - 1));
-                covered.push((file.file_name.clone(), from, to));
+            let mut split_offset = 0;
+            for file in chunk.data_files() {
+                for range in chunk.row_ranges().unwrap() {
+                    let from = range.from().max(split_offset);
+                    let to = range.to().min(split_offset + file.row_count - 1);
+                    if from <= to {
+                        covered.push((
+                            file.file_name.clone(),
+                            from - split_offset,
+                            to - split_offset,
+                        ));
+                    }
+                }
+                split_offset += file.row_count;
             }
+            let serialized = chunk.serialize_split_v1().unwrap();
+            assert_eq!(
+                DataSplit::deserialize_split_v1(&serialized)
+                    .unwrap()
+                    .row_ranges(),
+                chunk.row_ranges()
+            );
         }
         covered.sort();
         assert_eq!(
@@ -898,20 +908,12 @@ mod tests {
             ]
         );
 
-        let left = chunk_shuffle_splits(&table, vec![input.clone()], &{
-            let mut sharded = config.clone();
-            sharded.set_shard(0, 2).unwrap();
-            sharded
-        })
-        .await
-        .unwrap();
-        let right = chunk_shuffle_splits(&table, vec![input], &{
-            let mut sharded = config.clone();
-            sharded.set_shard(1, 2).unwrap();
-            sharded
-        })
-        .await
-        .unwrap();
+        let left = chunk_shuffle_splits(&table, vec![input.clone()], &config, Some((0, 2)))
+            .await
+            .unwrap();
+        let right = chunk_shuffle_splits(&table, vec![input], &config, Some((1, 2)))
+            .await
+            .unwrap();
         assert_eq!([left, right].concat(), chunks);
     }
 
@@ -930,13 +932,14 @@ mod tests {
             &table,
             vec![input],
             &ChunkShuffle::from_decimal_seed("0", 3).unwrap(),
+            None,
         )
         .await
         .unwrap();
         assert_eq!(chunks.len(), 3);
         assert!(chunks
             .iter()
-            .all(|chunk| chunk.exact_merged_row_count() == Some(3)));
+            .all(|chunk| chunk.row_count() == 3 && chunk.merged_row_count() == Some(3)));
 
         let mut ranges: Vec<_> = chunks
             .iter()

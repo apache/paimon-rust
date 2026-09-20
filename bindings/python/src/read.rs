@@ -413,6 +413,7 @@ impl PyReadBuilder {
             row_position_slice: None,
             row_position_shard: None,
             chunk_shuffle: None,
+            shard: None,
         }
     }
 
@@ -451,13 +452,13 @@ pub struct PyTableScan {
     row_position_slice: Option<(u64, u64)>,
     row_position_shard: Option<(u64, u64)>,
     chunk_shuffle: Option<PyChunkShuffle>,
+    shard: Option<(usize, usize)>,
 }
 
 #[derive(Clone)]
 struct PyChunkShuffle {
     seed: String,
     chunk_size: u64,
-    shard: Option<(usize, usize)>,
 }
 
 impl PyTableScan {
@@ -477,11 +478,9 @@ impl PyTableScan {
             scan = scan
                 .with_chunk_shuffle(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
                 .map_err(to_py_err)?;
-            if let Some((index, count)) = chunk_shuffle.shard {
-                scan = scan
-                    .with_chunk_shuffle_shard(index, count)
-                    .map_err(to_py_err)?;
-            }
+        }
+        if let Some((index, count)) = self.shard {
+            scan = scan.with_shard(index, count).map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -508,11 +507,9 @@ impl PyTableScan {
             scan = scan
                 .with_chunk_shuffle(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
                 .map_err(to_py_err)?;
-            if let Some((index, count)) = chunk_shuffle.shard {
-                scan = scan
-                    .with_chunk_shuffle_shard(index, count)
-                    .map_err(to_py_err)?;
-            }
+        }
+        if let Some((index, count)) = self.shard {
+            scan = scan.with_shard(index, count).map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -574,27 +571,20 @@ impl PyTableScan {
         slf.core_scan()?
             .with_chunk_shuffle(&seed, chunk_size)
             .map_err(to_py_err)?;
-        slf.chunk_shuffle = Some(PyChunkShuffle {
-            seed,
-            chunk_size,
-            shard: None,
-        });
+        slf.chunk_shuffle = Some(PyChunkShuffle { seed, chunk_size });
         Ok(slf)
     }
 
-    /// Select one balanced worker shard after chunk shuffling.
-    fn with_chunk_shuffle_shard(
+    /// Select one balanced worker shard for a distributed scan.
+    fn with_shard(
         mut slf: PyRefMut<'_, Self>,
         index: usize,
         count: usize,
     ) -> PyResult<PyRefMut<'_, Self>> {
         slf.core_scan()?
-            .with_chunk_shuffle_shard(index, count)
+            .with_shard(index, count)
             .map_err(to_py_err)?;
-        let chunk_shuffle = slf.chunk_shuffle.as_mut().ok_or_else(|| {
-            PyValueError::new_err("with_chunk_shuffle_shard requires with_chunk_shuffle first")
-        })?;
-        chunk_shuffle.shard = Some((index, count));
+        slf.shard = Some((index, count));
         Ok(slf)
     }
 
@@ -821,7 +811,8 @@ impl PySplit {
 
 #[pymethods]
 impl PySplit {
-    /// Physical row count: sum of data-file row counts (not a logical result count).
+    /// Selected row count for IndexedSplit-compatible row ranges, otherwise
+    /// the sum of physical data-file row counts.
     fn row_count(&self) -> i64 {
         self.inner.row_count()
     }
@@ -836,40 +827,6 @@ impl PySplit {
     fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = self.inner.serialize_split_v1().map_err(to_py_err)?;
         Ok(PyBytes::new(py, &bytes))
-    }
-
-    /// Serialize only the Java-compatible metadata view. Native-only file
-    /// ranges remain on this object and must be used for physical reading.
-    fn serialize_metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self
-            .inner
-            .serialize_split_v1_metadata_view()
-            .map_err(to_py_err)?;
-        Ok(PyBytes::new(py, &bytes))
-    }
-
-    /// Per-file local half-open ranges carried by native chunk planning.
-    fn file_row_ranges(&self) -> Option<HashMap<String, (i64, i64)>> {
-        let ranges = self.inner.file_row_ranges()?;
-        Some(
-            self.inner
-                .data_files()
-                .iter()
-                .zip(ranges)
-                .filter_map(|(file, range)| {
-                    range.as_ref().map(|range| {
-                        (
-                            file.file_name.clone(),
-                            (range.from(), range.to().saturating_add(1)),
-                        )
-                    })
-                })
-                .collect(),
-        )
-    }
-
-    fn exact_merged_row_count(&self) -> Option<i64> {
-        self.inner.exact_merged_row_count()
     }
 
     /// Reconstruct a native split from the stable, cross-language

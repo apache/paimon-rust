@@ -1147,22 +1147,40 @@ impl<'a> TableScan<'a> {
         self.with_chunk_shuffle_config(config)
     }
 
-    /// Select one balanced worker shard after chunk shuffling.
-    pub fn with_chunk_shuffle_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
+    /// Select one balanced worker shard for a distributed scan.
+    ///
+    /// Sharding is scan-level state, independent of the selected planning
+    /// strategy, so callers may configure it before or after chunk shuffling.
+    pub fn with_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
+        if count == 0 || index >= count {
+            return Err(crate::Error::DataInvalid {
+                message: "shard count must be positive and index less than count".to_string(),
+                source: None,
+            });
+        }
         match &mut self.0 {
-            TableScanKind::Paimon(scan) => match scan.split_selection.as_deref_mut() {
-                Some(ScanSplitSelection::ChunkShuffle(config)) => {
-                    config.set_shard(index, count)?;
-                    Ok(self)
+            TableScanKind::Paimon(scan) => {
+                if scan.row_position_selection().is_some() {
+                    return Err(crate::Error::DataInvalid {
+                        message:
+                            "with_shard and row-position selection cannot be used simultaneously"
+                                .to_string(),
+                        source: None,
+                    });
                 }
-                _ => Err(crate::Error::DataInvalid {
-                    message: "with_chunk_shuffle_shard requires with_chunk_shuffle first"
-                        .to_string(),
-                    source: None,
-                }),
-            },
+                match scan.split_selection.as_deref_mut() {
+                    Some(selection) => selection.shard = Some((index, count)),
+                    None => {
+                        scan.split_selection = Some(Box::new(ScanSplitSelection {
+                            mode: None,
+                            shard: Some((index, count)),
+                        }));
+                    }
+                }
+                Ok(self)
+            }
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "format tables do not support chunk_shuffle".to_string(),
+                message: "format tables do not support sharding".to_string(),
             }),
         }
     }
@@ -1192,7 +1210,10 @@ impl<'a> TableScan<'a> {
                         message: "chunk_shuffle only supports partition predicates".to_string(),
                     });
                 }
-                scan.split_selection = Some(Box::new(ScanSplitSelection::ChunkShuffle(config)));
+                scan.split_selection = Some(Box::new(ScanSplitSelection {
+                    mode: Some(ScanSplitMode::ChunkShuffle(config)),
+                    shard: scan.shard(),
+                }));
                 Ok(Self(TableScanKind::Paimon(scan)))
             }
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
@@ -1212,6 +1233,10 @@ impl<'a> TableScan<'a> {
         matches!(&self.0, TableScanKind::Paimon(scan) if scan.chunk_shuffle().is_some())
     }
 
+    pub(crate) fn has_shard(&self) -> bool {
+        matches!(&self.0, TableScanKind::Paimon(scan) if scan.shard().is_some())
+    }
+
     fn with_row_position_selection(self, selection: RowPositionSelection) -> crate::Result<Self> {
         match self.0 {
             TableScanKind::Paimon(mut scan)
@@ -1221,6 +1246,14 @@ impl<'a> TableScan<'a> {
                     return Err(crate::Error::DataInvalid {
                         message:
                             "row-position selection and chunk_shuffle cannot be used simultaneously"
+                                .into(),
+                        source: None,
+                    });
+                }
+                if scan.shard().is_some() {
+                    return Err(crate::Error::DataInvalid {
+                        message:
+                            "row-position selection and with_shard cannot be used simultaneously"
                                 .into(),
                         source: None,
                     });
@@ -1235,7 +1268,10 @@ impl<'a> TableScan<'a> {
                         source: None,
                     });
                 }
-                scan.split_selection = Some(Box::new(ScanSplitSelection::RowPosition(selection)));
+                scan.split_selection = Some(Box::new(ScanSplitSelection {
+                    mode: Some(ScanSplitMode::RowPosition(selection)),
+                    shard: None,
+                }));
                 Ok(Self(TableScanKind::Paimon(scan)))
             }
             _ => Err(crate::Error::Unsupported {
@@ -1342,9 +1378,15 @@ impl<'a> TableScan<'a> {
 ///
 /// Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_scan.py)
 #[derive(Debug, Clone)]
-enum ScanSplitSelection {
+enum ScanSplitMode {
     RowPosition(RowPositionSelection),
     ChunkShuffle(ChunkShuffle),
+}
+
+#[derive(Debug, Clone)]
+struct ScanSplitSelection {
+    mode: Option<ScanSplitMode>,
+    shard: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1374,17 +1416,31 @@ struct PaimonTableScan<'a> {
 
 impl<'a> PaimonTableScan<'a> {
     fn row_position_selection(&self) -> Option<RowPositionSelection> {
-        match self.split_selection.as_deref() {
-            Some(ScanSplitSelection::RowPosition(selection)) => Some(*selection),
+        match self
+            .split_selection
+            .as_deref()
+            .and_then(|selection| selection.mode.as_ref())
+        {
+            Some(ScanSplitMode::RowPosition(selection)) => Some(*selection),
             _ => None,
         }
     }
 
     fn chunk_shuffle(&self) -> Option<&ChunkShuffle> {
-        match self.split_selection.as_deref() {
-            Some(ScanSplitSelection::ChunkShuffle(config)) => Some(config),
+        match self
+            .split_selection
+            .as_deref()
+            .and_then(|selection| selection.mode.as_ref())
+        {
+            Some(ScanSplitMode::ChunkShuffle(config)) => Some(config),
             _ => None,
         }
+    }
+
+    fn shard(&self) -> Option<(usize, usize)> {
+        self.split_selection
+            .as_deref()
+            .and_then(|selection| selection.shard)
     }
 
     fn is_streaming(&self) -> bool {
@@ -1468,6 +1524,7 @@ impl<'a> PaimonTableScan<'a> {
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
+        self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let snapshot = match super::time_travel::resolve_snapshot(self.table).await? {
             Some(snapshot) => snapshot,
@@ -1480,6 +1537,7 @@ impl<'a> PaimonTableScan<'a> {
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         self.ensure_query_auth_allowed()?;
+        self.validate_shard_strategy()?;
         let mut trace = ScanTrace {
             limit: self.limit,
             ..Default::default()
@@ -1506,6 +1564,15 @@ impl<'a> PaimonTableScan<'a> {
     /// exposes file paths, row counts, and stats the client can't authorize.
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
+    }
+
+    fn validate_shard_strategy(&self) -> crate::Result<()> {
+        if self.shard().is_some() && self.chunk_shuffle().is_none() {
+            return Err(crate::Error::Unsupported {
+                message: "with_shard currently requires chunk_shuffle".to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn projected_read_field_ids(&self) -> crate::Result<Option<HashSet<i32>>> {
@@ -1864,6 +1931,7 @@ impl<'a> PaimonTableScan<'a> {
         end_snapshot: &Snapshot,
     ) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
+        self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut scan = self.clone();
         scan.incremental_split_mode = Some(IncrementalSplitMode::Batch);
@@ -2658,7 +2726,7 @@ impl<'a> PaimonTableScan<'a> {
                 (splits, split_candidates_built, false)
             };
         let splits = if let Some(config) = self.chunk_shuffle() {
-            chunk_shuffle_splits(self.table, splits, config).await?
+            chunk_shuffle_splits(self.table, splits, config, self.shard()).await?
         } else {
             splits
         };
@@ -3793,17 +3861,36 @@ mod tests {
             .is_err());
         assert!(reader
             .new_scan()
-            .with_chunk_shuffle(0, 1)
+            .with_row_position_shard(0, 1)
+            .unwrap()
+            .with_shard(0, 1)
+            .is_err());
+        assert!(reader
+            .new_scan()
+            .with_shard(0, 1)
             .unwrap()
             .with_row_position_shard(0, 1)
             .is_err());
-        assert!(reader.new_scan().with_chunk_shuffle_shard(0, 1).is_err());
         assert!(reader
             .new_scan()
             .with_chunk_shuffle(0, 1)
             .unwrap()
-            .with_chunk_shuffle_shard(0, 1)
+            .with_row_position_shard(0, 1)
+            .is_err());
+        assert!(reader
+            .new_scan()
+            .with_shard(0, 1)
+            .unwrap()
+            .with_chunk_shuffle(0, 1)
             .is_ok());
+        assert!(reader
+            .new_scan()
+            .with_chunk_shuffle(0, 1)
+            .unwrap()
+            .with_shard(0, 1)
+            .is_ok());
+        assert!(reader.new_scan().with_shard(0, 0).is_err());
+        assert!(reader.new_scan().with_shard(1, 1).is_err());
     }
 
     #[tokio::test]

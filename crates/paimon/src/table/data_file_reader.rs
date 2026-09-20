@@ -277,8 +277,11 @@ impl DataFileReader {
             for split in splits {
                 // Create DV factory for this split only.
                 let dv_factory = reader.build_split_dv_factory(&split).await?;
+                let data_evolution =
+                    crate::spec::CoreOptions::new(&reader.table_options).data_evolution_enabled();
+                let mut split_file_offset = 0;
 
-                for (file_index, file_meta) in split.data_files().to_vec().into_iter().enumerate() {
+                for file_meta in split.data_files().to_vec() {
                     let dv = DataFileReader::deletion_vector_for_file(
                         dv_factory.as_ref(),
                         &file_meta.file_name,
@@ -310,24 +313,19 @@ impl DataFileReader {
                         FileIndexResult::Remain
                     };
 
-                    let global_ranges = split.row_ranges().map(|ranges| {
+                    let range_base = if data_evolution {
+                        file_meta.first_row_id.unwrap_or(0)
+                    } else {
+                        split_file_offset
+                    };
+                    let split_ranges = split.row_ranges().map(|ranges| {
                         to_local_row_ranges(
                             ranges,
-                            file_meta.first_row_id.unwrap_or(0),
+                            range_base,
                             file_meta.row_count,
                         )
                     });
-                    let local_ranges = split
-                        .file_row_range(file_index)
-                        .map(|range| vec![range.clone()]);
-                    let split_ranges = match (global_ranges, local_ranges) {
-                        (Some(global), Some(local)) => {
-                            Some(intersect_sorted_ranges(&global, &local))
-                        }
-                        (Some(global), None) => Some(global),
-                        (None, Some(local)) => Some(local),
-                        (None, None) => None,
-                    };
+                    split_file_offset += file_meta.row_count;
                     let selected_ranges = match file_index_result {
                         FileIndexResult::Remain => split_ranges,
                         FileIndexResult::Skip => Some(Vec::new()),
@@ -1035,7 +1033,9 @@ fn is_row_file(file_meta: &DataFileMeta) -> bool {
             .is_some_and(|path| path.to_ascii_lowercase().ends_with(".row"))
 }
 
-/// Convert absolute RowRanges to normalized file-local 0-based ranges.
+/// Convert ranges from their read-path coordinate system to file-local ranges.
+/// `first_row_id` is a stable row ID for data evolution, or the file's
+/// cumulative split-local physical offset for raw append reads.
 fn to_local_row_ranges(
     row_ranges: &[RowRange],
     first_row_id: i64,
@@ -1701,6 +1701,19 @@ mod tests {
     use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use roaring::RoaringBitmap;
     use std::io;
+
+    #[test]
+    fn split_local_ranges_map_across_file_boundaries() {
+        let ranges = [RowRange::new(3, 4), RowRange::new(5, 7)];
+        assert_eq!(
+            to_local_row_ranges(&ranges, 0, 5),
+            vec![RowRange::new(3, 4)]
+        );
+        assert_eq!(
+            to_local_row_ranges(&ranges, 5, 4),
+            vec![RowRange::new(0, 2)]
+        );
+    }
 
     #[test]
     fn test_data_file_read_timing_aggregates_file_waits() {
