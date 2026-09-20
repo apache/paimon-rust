@@ -519,7 +519,17 @@ impl FormatFileReader for ParquetFormatReader {
             })
             .collect();
 
-        let mask = ProjectionMask::roots(&parquet_schema, root_indices);
+        // Build the MAP plan before the projection mask: a selected-key MAP
+        // can then decode only __field_mapping plus the direct/overflow
+        // children which may contain the requested keys.
+        let map_read_plan =
+            MapShreddingReadPlan::create(&scan_fields, batch_stream_builder.schema())?
+                .map(Arc::new);
+        let mask = if let Some(plan) = map_read_plan.as_deref() {
+            map_shredding_projection_mask(&parquet_schema, &root_indices, plan)
+        } else {
+            ProjectionMask::roots(&parquet_schema, root_indices)
+        };
         batch_stream_builder = batch_stream_builder.with_projection(mask.clone());
 
         let mut decoder_predicates = build_parquet_row_filter(&parquet_schema, preds, file_fields)?
@@ -613,14 +623,6 @@ impl FormatFileReader for ParquetFormatReader {
         if let Some(size) = batch_size {
             batch_stream_builder = batch_stream_builder.with_batch_size(size);
         }
-
-        // MAP shared-shredding read plan, built from the per-field metadata
-        // committed into the file footer at write time. `None` when no scanned
-        // field is shared-shredded. Assembly must happen before any residual
-        // predicate evaluation so predicates see logical MAP columns.
-        let map_read_plan =
-            MapShreddingReadPlan::create(&scan_fields, batch_stream_builder.schema())?
-                .map(Arc::new);
 
         // A normal Parquet stream fetches and decodes row groups one by one.
         // For remote object stores, a full scan of a compacted file can
@@ -782,6 +784,32 @@ impl FormatFileReader for ParquetFormatReader {
         });
         Ok(stream.boxed())
     }
+}
+
+fn map_shredding_projection_mask(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    selected_roots: &[usize],
+    plan: &MapShreddingReadPlan,
+) -> ProjectionMask {
+    let selected_roots: std::collections::HashSet<usize> = selected_roots.iter().copied().collect();
+    let root_fields = parquet_schema.root_schema().get_fields();
+    let leaves = (0..parquet_schema.num_columns()).filter(|leaf_index| {
+        let root_index = parquet_schema.get_column_root_idx(*leaf_index);
+        if !selected_roots.contains(&root_index) {
+            return false;
+        }
+        let root_name = root_fields[root_index].name();
+        let Some(children) = plan.projected_physical_children(root_name) else {
+            return true;
+        };
+        parquet_schema
+            .column(*leaf_index)
+            .path()
+            .parts()
+            .get(1)
+            .is_some_and(|child| children.contains(child))
+    });
+    ProjectionMask::leaves(parquet_schema, leaves)
 }
 
 fn projected_row_group_bytes(row_group: &RowGroupMetaData, projection: &ProjectionMask) -> u64 {
@@ -4932,6 +4960,15 @@ mod tests {
         ids: &[i32],
         max_columns: usize,
     ) -> (String, crate::io::FileIO, u64, Vec<DataField>) {
+        write_map_shredding_file_with_compression(rows, ids, max_columns, "zstd").await
+    }
+
+    async fn write_map_shredding_file_with_compression(
+        rows: &[Option<Vec<(&str, Option<i64>)>>],
+        ids: &[i32],
+        max_columns: usize,
+        compression: &str,
+    ) -> (String, crate::io::FileIO, u64, Vec<DataField>) {
         let fields = map_shredding_fields();
         let options = HashMap::from([
             (
@@ -4959,7 +4996,7 @@ mod tests {
         let mut writer = create_format_writer(
             &output,
             logical_schema,
-            "zstd",
+            compression,
             1,
             None,
             Some(&fields),
@@ -5048,6 +5085,161 @@ mod tests {
             .downcast_ref::<MapArray>()
             .unwrap();
         assert_int64_map_rows(tags, &rows);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_map_shredding_selected_key_prunes_and_assembles() {
+        let rows: Vec<Option<Vec<(&str, Option<i64>)>>> = vec![
+            Some(vec![("a", Some(10)), ("b", None), ("c", Some(30))]),
+            None,
+            Some(vec![]),
+            Some(vec![("b", Some(40)), ("a", Some(50))]),
+        ];
+        let ids = vec![1, 2, 3, 4];
+        let (path, file_io, file_size, fields) = write_map_shredding_file(&rows, &ids, 2).await;
+        let selected_fields = vec![
+            fields[0].clone(),
+            fields[1].clone().with_description(Some(format!(
+                "{}c",
+                crate::arrow::shredding::map::SELECTED_KEYS_PREFIX
+            ))),
+        ];
+
+        let input = file_io.new_input(&path).unwrap();
+        let file_reader = input.reader().await.unwrap();
+        let reader = create_format_reader(&path, false, &selected_fields).unwrap();
+        let batches = reader
+            .read_batch_stream(
+                Box::new(file_reader),
+                file_size,
+                &selected_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let tags = batches[0]
+            .column_by_name("tags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_int64_map_rows(
+            tags,
+            &[
+                Some(vec![("c", Some(30))]),
+                None,
+                Some(vec![]),
+                Some(vec![]),
+            ],
+        );
+
+        let missing_fields = vec![fields[1].clone().with_description(Some(format!(
+            "{}missing",
+            crate::arrow::shredding::map::SELECTED_KEYS_PREFIX
+        )))];
+        let missing_reader = file_io.new_input(&path).unwrap().reader().await.unwrap();
+        let missing = create_format_reader(&path, false, &missing_fields)
+            .unwrap()
+            .read_batch_stream(
+                Box::new(missing_reader),
+                file_size,
+                &missing_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_int64_map_rows(
+            missing[0]
+                .column_by_name("tags")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .unwrap(),
+            &[Some(vec![]), None, Some(vec![]), Some(vec![])],
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parquet_map_shredding_selected_key_reduces_data_io() {
+        const ROWS: usize = 100_000;
+        let rows = (0..ROWS)
+            .map(|row| {
+                Some(vec![
+                    ("a", Some((row as i64).wrapping_mul(982_451_653))),
+                    ("b", Some((row as i64).wrapping_mul(961_748_941))),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let ids = (0..ROWS as i32).collect::<Vec<_>>();
+        let (path, file_io, file_size, fields) =
+            write_map_shredding_file_with_compression(&rows, &ids, 2, "none").await;
+        let data = file_io.new_input(&path).unwrap().read().await.unwrap();
+
+        let selected_fields = vec![fields[1].clone().with_description(Some(format!(
+            "{}a",
+            crate::arrow::shredding::map::SELECTED_KEYS_PREFIX
+        )))];
+        let selected_reader = TrackingFileRead::new(data.clone());
+        let selected_tracker = selected_reader.clone();
+        let selected_stream = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(selected_reader),
+                file_size,
+                &selected_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        selected_tracker.reset();
+        let selected_rows = selected_stream
+            .try_fold(0usize, |count, batch| async move {
+                Ok(count + batch.num_rows())
+            })
+            .await
+            .unwrap();
+        let selected_bytes = selected_tracker.bytes_read();
+
+        let full_reader = TrackingFileRead::new(data);
+        let full_tracker = full_reader.clone();
+        let full_stream = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(full_reader),
+                file_size,
+                &fields[1..],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        full_tracker.reset();
+        let full_rows = full_stream
+            .try_fold(0usize, |count, batch| async move {
+                Ok(count + batch.num_rows())
+            })
+            .await
+            .unwrap();
+        let full_bytes = full_tracker.bytes_read();
+
+        assert_eq!(selected_rows, ROWS);
+        assert_eq!(full_rows, ROWS);
+        assert!(
+            selected_bytes * 5 < full_bytes * 4,
+            "selected-key read used {selected_bytes} bytes; full MAP read used {full_bytes} bytes"
+        );
     }
 
     #[tokio::test]

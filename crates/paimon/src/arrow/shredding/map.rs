@@ -37,7 +37,7 @@ use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Fields, Schema as ArrowSchema};
 use arrow_select::interleave::interleave;
 use arrow_select::take::take;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -55,6 +55,11 @@ const FIELD_COLUMNS_KEY: &str = "paimon.map.shared-shredding.field-columns";
 const OVERFLOW_SET_KEY: &str = "paimon.map.shared-shredding.overflow-set";
 const NUM_COLUMNS_KEY: &str = "paimon.map.shared-shredding.num-columns";
 const MAX_ROW_WIDTH_KEY: &str = "paimon.map.shared-shredding.max-row-width";
+
+/// Temporary read-field description used by Java/Python to request literal
+/// MAP keys without changing the logical MAP output type.
+pub(crate) const SELECTED_KEYS_PREFIX: &str = "__PAIMON_MAP_SELECTED_KEYS:";
+const SELECTED_KEYS_DELIMITER: char = ';';
 
 const FIELD_MAPPING_NAME: &str = "__field_mapping";
 const OVERFLOW_NAME: &str = "__overflow";
@@ -1017,6 +1022,9 @@ pub(crate) struct MapShreddingReadPlan {
 struct MapReadContext {
     num_columns: usize,
     name_by_id: HashMap<i32, String>,
+    selected_names: Option<HashSet<String>>,
+    selected_columns: BTreeSet<usize>,
+    include_overflow: bool,
 }
 
 impl MapShreddingReadPlan {
@@ -1052,6 +1060,21 @@ impl MapShreddingReadPlan {
                         DataField::new(field.id(), field.name().to_string(), physical_type)
                             .with_description(field.description().map(ToString::to_string)),
                     );
+                    let selected_names = selected_map_keys(field)?;
+                    let mut selected_columns = BTreeSet::new();
+                    let mut include_overflow = true;
+                    if let Some(names) = selected_names.as_ref() {
+                        include_overflow = false;
+                        for name in names {
+                            let Some(field_id) = field_meta.name_to_id.get(name) else {
+                                continue;
+                            };
+                            if let Some(columns) = field_meta.field_to_columns.get(field_id) {
+                                selected_columns.extend(columns.iter().copied());
+                            }
+                            include_overflow |= field_meta.overflow_set.contains(field_id);
+                        }
+                    }
                     contexts.insert(
                         index,
                         MapReadContext {
@@ -1061,6 +1084,9 @@ impl MapShreddingReadPlan {
                                 .iter()
                                 .map(|(name, &id)| (id, name.clone()))
                                 .collect(),
+                            selected_names,
+                            selected_columns,
+                            include_overflow,
                         },
                     );
                     converted = true;
@@ -1078,6 +1104,57 @@ impl MapShreddingReadPlan {
             contexts,
         }))
     }
+
+    /// Return the physical struct children needed for one logical field.
+    /// `None` means the whole root field must be decoded.
+    pub(crate) fn projected_physical_children(&self, field_name: &str) -> Option<HashSet<String>> {
+        let field_index = self
+            .logical_fields
+            .iter()
+            .position(|field| field.name() == field_name)?;
+        let ctx = self.contexts.get(&field_index)?;
+        ctx.selected_names.as_ref()?;
+
+        let mut children = HashSet::from([FIELD_MAPPING_NAME.to_string()]);
+        children.extend(
+            ctx.selected_columns
+                .iter()
+                .map(|index| physical_column_name(*index)),
+        );
+        if ctx.include_overflow {
+            children.insert(OVERFLOW_NAME.to_string());
+        }
+        Some(children)
+    }
+}
+
+fn selected_map_keys(field: &DataField) -> Result<Option<HashSet<String>>> {
+    let Some(description) = field.description() else {
+        return Ok(None);
+    };
+    let Some(encoded) = description.strip_prefix(SELECTED_KEYS_PREFIX) else {
+        return Ok(None);
+    };
+    if encoded.is_empty() {
+        return Err(Error::DataInvalid {
+            message: format!("Selected-key MAP field '{}' has no keys", field.name()),
+            source: None,
+        });
+    }
+    let keys: HashSet<String> = encoded
+        .split(SELECTED_KEYS_DELIMITER)
+        .map(ToString::to_string)
+        .collect();
+    if keys.len() != encoded.split(SELECTED_KEYS_DELIMITER).count() {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Selected-key MAP field '{}' contains duplicate keys",
+                field.name()
+            ),
+            source: None,
+        });
+    }
+    Ok(Some(keys))
 }
 
 fn validate_physical_struct_children(
@@ -1345,19 +1422,18 @@ fn struct_array_to_logical_map(
 ) -> Result<ArrayRef> {
     let num_rows = array.len();
     let k = ctx.num_columns;
-    if array.num_columns() < k + 1 {
-        return Err(Error::DataInvalid {
+    let field_mapping_index = array
+        .fields()
+        .iter()
+        .position(|field| field.name() == FIELD_MAPPING_NAME)
+        .ok_or_else(|| Error::DataInvalid {
             message: format!(
-                "Shared-shredding physical column '{column_name}' has {} children, expected at least {}",
-                array.num_columns(),
-                k + 1
+                "Shared-shredding physical column '{column_name}' is missing {FIELD_MAPPING_NAME}"
             ),
             source: None,
-        });
-    }
-
+        })?;
     let field_mapping = array
-        .column(0)
+        .column(field_mapping_index)
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| Error::DataInvalid {
@@ -1397,11 +1473,13 @@ fn struct_array_to_logical_map(
     };
     let logical_value_type = entry_fields[1].data_type();
 
-    let has_overflow_column = array.num_columns() > k + 1;
-    let overflow = if has_overflow_column {
-        Some(
+    let overflow = array
+        .fields()
+        .iter()
+        .position(|field| field.name() == OVERFLOW_NAME)
+        .map(|index| {
             array
-                .column(k + 1)
+                .column(index)
                 .as_any()
                 .downcast_ref::<MapArray>()
                 .ok_or_else(|| Error::DataInvalid {
@@ -1409,11 +1487,9 @@ fn struct_array_to_logical_map(
                         "Shared-shredding __overflow of '{column_name}' must be MapArray"
                     ),
                     source: None,
-                })?,
-        )
-    } else {
-        None
-    };
+                })
+        })
+        .transpose()?;
 
     let normalize_source = |value: &dyn Array| {
         arrow_cast::cast(value, logical_value_type).map_err(|e| Error::UnexpectedError {
@@ -1427,9 +1503,31 @@ fn struct_array_to_logical_map(
     // Normalize each physical source once. For metadata-only differences this
     // rebuilds nested Arrow wrappers while reusing their value buffers. The
     // final interleave then copies only entries referenced by the mapping.
-    let mut value_sources = Vec::with_capacity(k + usize::from(overflow.is_some()));
-    for i in 0..k {
-        value_sources.push(normalize_source(array.column(i + 1).as_ref())?);
+    let mut value_sources = Vec::with_capacity(array.num_columns());
+    let mut direct_source_indices = vec![None; k];
+    for (position, physical_field) in array.fields().iter().enumerate() {
+        let Some(suffix) = physical_field.name().strip_prefix("__col_") else {
+            continue;
+        };
+        let physical_index = suffix.parse::<usize>().map_err(|_| Error::DataInvalid {
+            message: format!(
+                "Shared-shredding physical column '{column_name}' has invalid child '{}'",
+                physical_field.name()
+            ),
+            source: None,
+        })?;
+        if physical_index >= k {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Shared-shredding physical column '{column_name}' child '{}' exceeds metadata column count {k}",
+                    physical_field.name()
+                ),
+                source: None,
+            });
+        }
+        let source_index = value_sources.len();
+        value_sources.push(normalize_source(array.column(position).as_ref())?);
+        direct_source_indices[physical_index] = Some(source_index);
     }
     let overflow_source_index = if let Some(overflow) = overflow {
         let index = value_sources.len();
@@ -1438,6 +1536,9 @@ fn struct_array_to_logical_map(
     } else {
         None
     };
+    if value_sources.is_empty() {
+        value_sources.push(arrow_array::new_empty_array(logical_value_type));
+    }
 
     let mut key_builder = arrow_array::builder::StringBuilder::new();
     let mut value_indices: Vec<(usize, usize)> = Vec::new();
@@ -1466,7 +1567,7 @@ fn struct_array_to_logical_map(
                 source: None,
             });
         }
-        for i in 0..k {
+        for (i, direct_source_index) in direct_source_indices.iter().enumerate() {
             let field_id = if mapping_values.is_null(fm_start + i) {
                 -1
             } else {
@@ -1478,8 +1579,21 @@ fn struct_array_to_logical_map(
             let Some(name) = ctx.name_by_id.get(&field_id) else {
                 continue;
             };
+            if ctx
+                .selected_names
+                .as_ref()
+                .is_some_and(|selected| !selected.contains(name))
+            {
+                continue;
+            }
+            let source_index = (*direct_source_index).ok_or_else(|| Error::DataInvalid {
+                message: format!(
+                    "Shared-shredding physical column '{column_name}' is missing __col_{i} required for key '{name}'"
+                ),
+                source: None,
+            })?;
             key_builder.append_value(name);
-            value_indices.push((i, row));
+            value_indices.push((source_index, row));
             count += 1;
         }
 
@@ -1502,6 +1616,13 @@ fn struct_array_to_logical_map(
                     let Some(name) = ctx.name_by_id.get(&field_id) else {
                         continue;
                     };
+                    if ctx
+                        .selected_names
+                        .as_ref()
+                        .is_some_and(|selected| !selected.contains(name))
+                    {
+                        continue;
+                    }
                     key_builder.append_value(name);
                     value_indices.push((overflow_source_index.expect("overflow source exists"), j));
                     count += 1;
@@ -1732,6 +1853,9 @@ mod tests {
             &MapReadContext {
                 num_columns,
                 name_by_id,
+                selected_names: None,
+                selected_columns: BTreeSet::new(),
+                include_overflow: true,
             },
             &MapType::new(string_type(), value_type),
             "nested",
