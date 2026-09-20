@@ -16,7 +16,9 @@
 // under the License.
 
 use super::shredding::PhysicalFormatWriterFactory;
-use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
+use super::{
+    timestamp_millis_schema, FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult,
+};
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
 use crate::arrow::read_budget::ReadPermit;
 use crate::arrow::shredding::map::MapShreddingReadPlan;
@@ -205,7 +207,7 @@ impl ParquetFormatWriter {
         let codec = parse_compression(compression, zstd_level)?;
         let async_write = output.async_writer().await?;
         let input_schema = schema;
-        let schema = parquet_write_schema(&input_schema);
+        let schema = timestamp_millis_schema(&input_schema);
         let inner = create_parquet_arrow_writer(async_write, schema.clone(), codec)?;
         let core_options = CoreOptions::new(format_options);
         let stats_modes = write_fields
@@ -399,57 +401,6 @@ impl FormatFileWriter for ParquetFormatWriter {
         } else {
             Ok(FormatWriteResult::new(file_size))
         }
-    }
-}
-
-/// Parquet has timestamp logical annotations for milliseconds and finer units,
-/// but not seconds. Paimon's persisted representation for precision <= 3 has
-/// always been epoch milliseconds, so keep that stable while exposing
-/// TIMESTAMP(0) as Arrow seconds at the API boundary.
-fn parquet_write_schema(schema: &arrow_schema::SchemaRef) -> arrow_schema::SchemaRef {
-    let fields = schema
-        .fields()
-        .iter()
-        .map(parquet_write_field)
-        .collect::<Vec<_>>();
-    Arc::new(arrow_schema::Schema::new_with_metadata(
-        fields,
-        schema.metadata().clone(),
-    ))
-}
-
-fn parquet_write_field(field: &arrow_schema::FieldRef) -> arrow_schema::FieldRef {
-    let data_type = parquet_write_data_type(field.data_type());
-    if &data_type == field.data_type() {
-        field.clone()
-    } else {
-        Arc::new(field.as_ref().clone().with_data_type(data_type))
-    }
-}
-
-fn parquet_write_data_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
-    use arrow_schema::DataType as ArrowDataType;
-
-    match data_type {
-        ArrowDataType::Timestamp(arrow_schema::TimeUnit::Second, timezone) => {
-            ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, timezone.clone())
-        }
-        ArrowDataType::List(field) => ArrowDataType::List(parquet_write_field(field)),
-        ArrowDataType::LargeList(field) => ArrowDataType::LargeList(parquet_write_field(field)),
-        ArrowDataType::FixedSizeList(field, size) => {
-            ArrowDataType::FixedSizeList(parquet_write_field(field), *size)
-        }
-        ArrowDataType::Struct(fields) => ArrowDataType::Struct(
-            fields
-                .iter()
-                .map(parquet_write_field)
-                .collect::<Vec<_>>()
-                .into(),
-        ),
-        ArrowDataType::Map(field, sorted) => {
-            ArrowDataType::Map(parquet_write_field(field), *sorted)
-        }
-        _ => data_type.clone(),
     }
 }
 
