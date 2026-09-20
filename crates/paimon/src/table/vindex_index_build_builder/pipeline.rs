@@ -474,10 +474,6 @@ fn select_first(
         return Ok(whole_shard());
     }
     let units = sampling_units(granules);
-    let ends = units
-        .iter()
-        .map(|unit| (granules[unit.end - 1].range.to() - range.from() + 1) as usize)
-        .collect::<Vec<_>>();
     let strata = retained
         .div_ceil(ROWS_PER_STRATUM)
         .max(MIN_STRATA)
@@ -490,7 +486,9 @@ fn select_first(
         })?;
     let mut quotas = vec![0usize; units.len()];
     for row in pick_indices(rows, strata, &mut seed) {
-        quotas[ends.partition_point(|end| *end <= row)] += ROWS_PER_STRATUM;
+        let row_id = range.from() + row as i64;
+        let unit = units.partition_point(|unit| granules[unit.end - 1].range.to() < row_id);
+        quotas[unit] += ROWS_PER_STRATUM;
     }
     let mut selected = HashSet::new();
     for (unit, quota) in units.iter().zip(&quotas) {
@@ -584,19 +582,15 @@ fn append_shard_granules(
 }
 
 fn granules_partition_shard(granules: &[Granule], shard_range: &RowRange) -> bool {
-    if granules
-        .windows(2)
-        .any(|pair| pair[1].range.from() <= pair[0].range.to())
-    {
-        return false;
-    }
-    let coverage = merge_row_ranges(
-        granules
-            .iter()
-            .map(|granule| granule.range.clone())
-            .collect(),
-    );
-    coverage.len() == 1 && coverage.first() == Some(shard_range)
+    granules
+        .first()
+        .is_some_and(|granule| granule.range.from() == shard_range.from())
+        && granules
+            .last()
+            .is_some_and(|granule| granule.range.to() == shard_range.to())
+        && granules
+            .windows(2)
+            .all(|pair| pair[0].range.to().checked_add(1) == Some(pair[1].range.from()))
 }
 
 fn local_ids(row_ids: &[i64], start: i64, row_count: usize) -> Result<Vec<i64>> {
@@ -1493,6 +1487,46 @@ mod tests {
             .unwrap()
             .training
             .is_none());
+    }
+
+    #[test]
+    fn granule_partition_requires_exact_contiguous_coverage() {
+        for (ranges, shard, expected) in [
+            (vec![], (0, 9), false),
+            (vec![(0, 9)], (0, 9), true),
+            (vec![(0, 4), (5, 9)], (0, 9), true),
+            (vec![(0, 4), (6, 9)], (0, 9), false),
+            (vec![(0, 5), (5, 9)], (0, 9), false),
+            (vec![(1, 9)], (0, 9), false),
+            (vec![(0, 8)], (0, 9), false),
+            (vec![(0, 9), (0, 9)], (0, 9), false),
+            (vec![(0, 2), (6, 7), (3, 5), (8, 9)], (0, 9), false),
+            (vec![(i64::MAX, i64::MAX)], (i64::MAX, i64::MAX), true),
+            (
+                vec![(i64::MAX - 1, i64::MAX - 1), (i64::MAX, i64::MAX)],
+                (i64::MAX - 1, i64::MAX),
+                true,
+            ),
+            (
+                vec![(i64::MAX, i64::MAX), (i64::MAX, i64::MAX)],
+                (i64::MAX, i64::MAX),
+                false,
+            ),
+        ] {
+            let granules = ranges
+                .iter()
+                .map(|&(from, to)| Granule {
+                    range: RowRange::new(from, to),
+                    file_index: 0,
+                    byte_ranges: vec![],
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                granules_partition_shard(&granules, &RowRange::new(shard.0, shard.1)),
+                expected,
+                "ranges={ranges:?}, shard={shard:?}"
+            );
+        }
     }
 
     #[test]
