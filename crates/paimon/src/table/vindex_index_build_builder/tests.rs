@@ -855,6 +855,171 @@ async fn vindex_granule_training_sees_file_periodic_cluster() {
 }
 
 #[tokio::test]
+async fn vindex_granule_training_sees_one_oversized_row_group() {
+    use crate::arrow::format::parquet::parquet_granules;
+    use parquet::arrow::AsyncArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+
+    const FILES: usize = 4_096;
+    const SMALL_ROWS: usize = 128;
+    const LARGE_ROWS: usize = 524_288;
+    let total_rows = (FILES - 1) * SMALL_ROWS + LARGE_ROWS;
+    // Reuse physical file contents; logical row IDs are assigned by the commit.
+    let mut contents = Vec::new();
+    for (rows, value) in [(SMALL_ROWS, 0.0), (SMALL_ROWS, 1.0), (LARGE_ROWS, 100.0)] {
+        let batch = build_vector_batch((0..rows as i32).collect(), vec![vec![value]; rows]);
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows))
+            .set_offset_index_disabled(true)
+            .set_dictionary_enabled(false)
+            .set_compression(Compression::UNCOMPRESSED)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            AsyncArrowWriter::try_new(&mut bytes, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        contents.push(bytes::Bytes::from(bytes));
+    }
+
+    // The control uses full spill. Three real snapshot identities exercise the
+    // production seed derivation, without adding a seed override to the builder.
+    for (granule_enabled, snapshots) in [(false, 1), (true, 1), (true, 2), (true, 3)] {
+        let table_path = format!("memory:/oversized_granule_{granule_enabled}_{snapshots}");
+        let mut options = table_options("2000000");
+        for (key, value) in [
+            ("ivf-sq.dimension", "1"),
+            ("ivf-sq.nlist", "1"),
+            ("ivf-sq.metric", "l2"),
+        ] {
+            options.insert(key.to_string(), value.to_string());
+        }
+        let table = test_table_with_io(
+            FileIOBuilder::new("memory").build().unwrap(),
+            &table_path,
+            vindex_schema_builder(options).build().unwrap(),
+        );
+        setup_dirs(table.file_io(), &table_path).await;
+        let mut files = Vec::new();
+        for index in 0..FILES {
+            let large = index == FILES - 1;
+            let bytes = &contents[if large { 2 } else { index % 2 }];
+            let name = format!("data-{index:04}.parquet");
+            table
+                .file_io()
+                .new_output(&format!("{table_path}/bucket-0/{name}"))
+                .unwrap()
+                .write(bytes.clone())
+                .await
+                .unwrap();
+            let mut file = data_file(
+                &name,
+                None,
+                if large { LARGE_ROWS } else { SMALL_ROWS } as i64,
+            );
+            file.file_size = bytes.len() as i64;
+            file.file_source = Some(0); // APPEND: the commit assigns row IDs.
+            files.push(file);
+        }
+        for group in files.chunks(FILES.div_ceil(snapshots)) {
+            TableCommit::new(table.clone(), "test-user".to_string())
+                .commit(vec![CommitMessage::new(
+                    BinaryRow::new(0).to_serialized_bytes(),
+                    0,
+                    group.to_vec(),
+                )])
+                .await
+                .unwrap();
+        }
+        let snapshot = SnapshotManager::new(table.file_io().clone(), table_path.clone())
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.id(), snapshots as i64);
+        let entries = table
+            .new_read_builder()
+            .new_scan()
+            .with_scan_all_files()
+            .plan_manifest_entries(&snapshot)
+            .await
+            .unwrap();
+        let large_file = entries
+            .iter()
+            .find(|entry| entry.file().row_count == LARGE_ROWS as i64)
+            .unwrap()
+            .file();
+        let (large_start, large_end) = large_file.row_id_range().unwrap();
+        let input = table
+            .file_io()
+            .new_input(&large_file.data_file_path(&format!("{table_path}/bucket-0")))
+            .unwrap();
+        let (physical_granules, has_offset_index) = parquet_granules(
+            Box::new(input.reader().await.unwrap()),
+            large_file.file_size as u64,
+            "embedding",
+        )
+        .await
+        .unwrap();
+        assert!(!has_offset_index);
+        assert_eq!(physical_granules.len(), 1);
+        assert_eq!(physical_granules[0].row_count, LARGE_ROWS as i64);
+
+        let mut builder = table.new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER);
+        builder
+            .with_index_column("embedding")
+            .with_options(HashMap::from([(
+                "vindex.build.granule.enabled".to_string(),
+                granule_enabled.to_string(),
+            )]));
+        if granule_enabled {
+            let shards = plan_vindex_shards(
+                table.location(),
+                table.schema().partition_keys(),
+                table.schema().fields(),
+                &CoreOptions::new(table.schema().options()),
+                snapshot.id(),
+                entries,
+                2_000_000,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(shards.len(), 1);
+            let plan = builder
+                .plan_granules(&shards[0], "embedding", total_rows, 65_536)
+                .await
+                .unwrap();
+            // The independently trained cluster occupies half the logical rows
+            // and projected bytes, so selecting it must trigger the byte gate.
+            assert!(plan.rest.is_empty(), "snapshot {}", snapshot.id());
+            assert_eq!(plan.first, vec![RowRange::new(0, total_rows as i64 - 1)]);
+        }
+        assert_eq!(builder.execute().await.unwrap(), 1);
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![100.0])
+            .with_limit(10)
+            .with_options(HashMap::from([(
+                "ivf-sq.nprobe".to_string(),
+                "1".to_string(),
+            )]))
+            .execute()
+            .await
+            .unwrap();
+        let row_ids = &result.row_ids().unwrap().row_ids;
+        assert_eq!(row_ids.len(), 10);
+        assert!(
+            row_ids
+                .iter()
+                .all(|row| (large_start as u64..=large_end as u64).contains(row)),
+            "granule={granule_enabled}, snapshot={snapshots}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn vindex_build_cleans_written_shards_when_later_shard_fails() {
     let table_path = "memory:/test_vindex_abort_written_shard";
     let table = vindex_e2e_table(table_path, "2");
