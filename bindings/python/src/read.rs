@@ -23,9 +23,7 @@ use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use paimon::spec::{DataField, DataType, Predicate, RowType};
-use paimon::table::{
-    ArrowRecordBatchStream, ChunkShuffle, DataSplit, IncrementalScanMode, RowRange, Table,
-};
+use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -476,13 +474,14 @@ impl PyTableScan {
                 .map_err(to_py_err)?;
         }
         if let Some(chunk_shuffle) = &self.chunk_shuffle {
-            let mut config =
-                ChunkShuffle::from_decimal_seed(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
-                    .map_err(to_py_err)?;
+            scan = scan
+                .with_chunk_shuffle(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
+                .map_err(to_py_err)?;
             if let Some((index, count)) = chunk_shuffle.shard {
-                config = config.with_shard(index, count).map_err(to_py_err)?;
+                scan = scan
+                    .with_chunk_shuffle_shard(index, count)
+                    .map_err(to_py_err)?;
             }
-            scan = scan.with_chunk_shuffle(config).map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -506,13 +505,14 @@ impl PyTableScan {
                 .map_err(to_py_err)?;
         }
         if let Some(chunk_shuffle) = &self.chunk_shuffle {
-            let mut config =
-                ChunkShuffle::from_decimal_seed(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
-                    .map_err(to_py_err)?;
+            scan = scan
+                .with_chunk_shuffle(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
+                .map_err(to_py_err)?;
             if let Some((index, count)) = chunk_shuffle.shard {
-                config = config.with_shard(index, count).map_err(to_py_err)?;
+                scan = scan
+                    .with_chunk_shuffle_shard(index, count)
+                    .map_err(to_py_err)?;
             }
-            scan = scan.with_chunk_shuffle(config).map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -562,39 +562,39 @@ impl PyTableScan {
         Ok(slf)
     }
 
-    /// Deterministically shuffle fixed-live-row chunks, optionally selecting
-    /// one balanced worker shard. `seed` is a decimal Python integer string so
-    /// arbitrarily large seeds retain Python's `random.Random` semantics.
-    #[pyo3(signature = (seed, chunk_size, shard_index=None, shard_count=None))]
+    /// Deterministically shuffle fixed-live-row chunks. `seed` is a decimal
+    /// Python integer string so arbitrarily large seeds retain Python's
+    /// `random.Random` semantics.
     fn with_chunk_shuffle(
         mut slf: PyRefMut<'_, Self>,
         seed: String,
         chunk_size: u64,
-        shard_index: Option<usize>,
-        shard_count: Option<usize>,
     ) -> PyResult<PyRefMut<'_, Self>> {
-        let shard = match (shard_index, shard_count) {
-            (None, None) => None,
-            (Some(index), Some(count)) => Some((index, count)),
-            _ => {
-                return Err(PyValueError::new_err(
-                    "chunk_shuffle shard_index and shard_count must be set together",
-                ));
-            }
-        };
-        let mut config = ChunkShuffle::from_decimal_seed(&seed, chunk_size).map_err(to_py_err)?;
-        if let Some((index, count)) = shard {
-            config = config.with_shard(index, count).map_err(to_py_err)?;
-        }
         // Validate every combination immediately, not only when plan() runs.
         slf.core_scan()?
-            .with_chunk_shuffle(config)
+            .with_chunk_shuffle(&seed, chunk_size)
             .map_err(to_py_err)?;
         slf.chunk_shuffle = Some(PyChunkShuffle {
             seed,
             chunk_size,
-            shard,
+            shard: None,
         });
+        Ok(slf)
+    }
+
+    /// Select one balanced worker shard after chunk shuffling.
+    fn with_chunk_shuffle_shard(
+        mut slf: PyRefMut<'_, Self>,
+        index: usize,
+        count: usize,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.core_scan()?
+            .with_chunk_shuffle_shard(index, count)
+            .map_err(to_py_err)?;
+        let chunk_shuffle = slf.chunk_shuffle.as_mut().ok_or_else(|| {
+            PyValueError::new_err("with_chunk_shuffle_shard requires with_chunk_shuffle first")
+        })?;
+        chunk_shuffle.shard = Some((index, count));
         Ok(slf)
     }
 

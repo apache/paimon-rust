@@ -32,7 +32,7 @@ use crate::table::{DataSplit, DataSplitBuilder, DeletionFile, RowRange, Table};
 /// Native chunk-shuffle configuration. The seed is stored as the unsigned
 /// little-endian 32-bit words consumed by CPython's MT19937 initializer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkShuffle {
+pub(crate) struct ChunkShuffle {
     seed_words: Vec<u32>,
     chunk_size: i64,
     shard: Option<(usize, usize)>,
@@ -41,7 +41,7 @@ pub struct ChunkShuffle {
 impl ChunkShuffle {
     /// Build from a Python integer's decimal spelling. Negative integers use
     /// their absolute value, matching `random.Random`.
-    pub fn from_decimal_seed(seed: &str, chunk_size: u64) -> crate::Result<Self> {
+    pub(crate) fn from_decimal_seed(seed: &str, chunk_size: u64) -> crate::Result<Self> {
         let chunk_size = i64::try_from(chunk_size).map_err(|_| crate::Error::DataInvalid {
             message: format!("chunk_shuffle chunk_size {chunk_size} exceeds i64::MAX"),
             source: None,
@@ -59,7 +59,7 @@ impl ChunkShuffle {
         })
     }
 
-    pub fn with_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
+    pub(crate) fn set_shard(&mut self, index: usize, count: usize) -> crate::Result<()> {
         if count == 0 || index >= count {
             return Err(crate::Error::DataInvalid {
                 message: "chunk_shuffle shard count must be positive and index less than count"
@@ -68,7 +68,7 @@ impl ChunkShuffle {
             });
         }
         self.shard = Some((index, count));
-        Ok(self)
+        Ok(())
     }
 }
 
@@ -898,18 +898,18 @@ mod tests {
             ]
         );
 
-        let left = chunk_shuffle_splits(
-            &table,
-            vec![input.clone()],
-            &config.clone().with_shard(0, 2).unwrap(),
-        )
+        let left = chunk_shuffle_splits(&table, vec![input.clone()], &{
+            let mut sharded = config.clone();
+            sharded.set_shard(0, 2).unwrap();
+            sharded
+        })
         .await
         .unwrap();
-        let right = chunk_shuffle_splits(
-            &table,
-            vec![input],
-            &config.clone().with_shard(1, 2).unwrap(),
-        )
+        let right = chunk_shuffle_splits(&table, vec![input], &{
+            let mut sharded = config.clone();
+            sharded.set_shard(1, 2).unwrap();
+            sharded
+        })
         .await
         .unwrap();
         assert_eq!([left, right].concat(), chunks);

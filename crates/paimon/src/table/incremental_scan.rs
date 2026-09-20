@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{ChunkShuffle, DataSplit, Plan, SnapshotManager, Table, TableScan};
+use super::{DataSplit, Plan, SnapshotManager, Table, TableScan};
 use crate::spec::{CommitKind, CoreOptions};
 
 /// Batch incremental scan mode.
@@ -257,8 +257,18 @@ impl<'a> IncrementalScan<'a> {
     }
 
     /// Repack the combined APPEND-delta batch into deterministic chunks.
-    pub fn with_chunk_shuffle(mut self, config: ChunkShuffle) -> crate::Result<Self> {
-        self.scan = self.scan.with_chunk_shuffle(config)?;
+    pub fn with_chunk_shuffle(
+        mut self,
+        seed: impl ToString,
+        chunk_size: u64,
+    ) -> crate::Result<Self> {
+        self.scan = self.scan.with_chunk_shuffle(seed, chunk_size)?;
+        Ok(self)
+    }
+
+    /// Select one balanced worker shard after chunk shuffling.
+    pub fn with_chunk_shuffle_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
+        self.scan = self.scan.with_chunk_shuffle_shard(index, count)?;
         Ok(self)
     }
 

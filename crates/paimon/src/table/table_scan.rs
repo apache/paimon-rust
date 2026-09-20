@@ -1138,7 +1138,36 @@ impl<'a> TableScan<'a> {
     }
 
     /// Repack an append scan into deterministic fixed-live-row chunks.
-    pub fn with_chunk_shuffle(self, config: ChunkShuffle) -> crate::Result<Self> {
+    ///
+    /// `seed` must render as a decimal integer. Accepting any `ToString` seed
+    /// keeps ordinary Rust integer calls ergonomic while allowing language
+    /// bindings to preserve arbitrary-precision integer seeds.
+    pub fn with_chunk_shuffle(self, seed: impl ToString, chunk_size: u64) -> crate::Result<Self> {
+        let config = ChunkShuffle::from_decimal_seed(&seed.to_string(), chunk_size)?;
+        self.with_chunk_shuffle_config(config)
+    }
+
+    /// Select one balanced worker shard after chunk shuffling.
+    pub fn with_chunk_shuffle_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
+        match &mut self.0 {
+            TableScanKind::Paimon(scan) => match scan.split_selection.as_deref_mut() {
+                Some(ScanSplitSelection::ChunkShuffle(config)) => {
+                    config.set_shard(index, count)?;
+                    Ok(self)
+                }
+                _ => Err(crate::Error::DataInvalid {
+                    message: "with_chunk_shuffle_shard requires with_chunk_shuffle first"
+                        .to_string(),
+                    source: None,
+                }),
+            },
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "format tables do not support chunk_shuffle".to_string(),
+            }),
+        }
+    }
+
+    fn with_chunk_shuffle_config(self, config: ChunkShuffle) -> crate::Result<Self> {
         match self.0 {
             TableScanKind::Paimon(mut scan) => {
                 if !scan.table.schema().primary_keys().is_empty() {
@@ -2657,8 +2686,8 @@ mod tests {
         prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
         retain_index_manifest_entry_for_scan, retain_manifest_buckets,
         retain_manifest_entry_row_ranges, retain_manifest_row_ranges, scan_predicate_field_ids,
-        should_skip_level_zero_for_scan, split_row_ranges_for_files, ChunkShuffle,
-        LimitPushdownAccumulator, PaimonTableScan, RowRangeIndex, TableScan,
+        should_skip_level_zero_for_scan, split_row_ranges_for_files, LimitPushdownAccumulator,
+        PaimonTableScan, RowRangeIndex, TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
@@ -3760,14 +3789,21 @@ mod tests {
             .new_scan()
             .with_row_position_shard(0, 1)
             .unwrap()
-            .with_chunk_shuffle(ChunkShuffle::from_decimal_seed("0", 1).unwrap())
+            .with_chunk_shuffle(0, 1)
             .is_err());
         assert!(reader
             .new_scan()
-            .with_chunk_shuffle(ChunkShuffle::from_decimal_seed("0", 1).unwrap())
+            .with_chunk_shuffle(0, 1)
             .unwrap()
             .with_row_position_shard(0, 1)
             .is_err());
+        assert!(reader.new_scan().with_chunk_shuffle_shard(0, 1).is_err());
+        assert!(reader
+            .new_scan()
+            .with_chunk_shuffle(0, 1)
+            .unwrap()
+            .with_chunk_shuffle_shard(0, 1)
+            .is_ok());
     }
 
     #[tokio::test]

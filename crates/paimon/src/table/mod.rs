@@ -131,7 +131,6 @@ pub use audit_log_table::AuditLogTable;
 pub use batch_vector_search_builder::BatchVectorSearchBuilder;
 pub use blob_resolver::{BlobReader, BlobStream};
 pub use branch_manager::BranchManager;
-pub use chunk_shuffle::ChunkShuffle;
 pub use commit_message::CommitMessage;
 pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};

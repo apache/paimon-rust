@@ -79,6 +79,41 @@ def test_with_blob_parallelism():
             table.new_read_builder().with_blob_parallelism(0)
 
 
+def test_chunk_shuffle_takes_seed_and_chunk_size_before_optional_shard():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+
+        scan = builder.new_scan()
+        assert scan.with_chunk_shuffle(str(2 ** 70), 2) is scan
+        plan = scan.plan()
+        chunks = [
+            pa.Table.from_batches(builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in plan.splits()
+        ]
+        assert sorted(value for chunk in chunks for value in chunk) == [1, 2, 3]
+        assert all(0 < len(chunk) <= 2 for chunk in chunks)
+
+        sharded = []
+        for index in range(2):
+            shard = (
+                builder.new_scan()
+                .with_chunk_shuffle(str(2 ** 70), 2)
+                .with_chunk_shuffle_shard(index, 2)
+                .plan()
+            )
+            sharded.extend(
+                pa.Table.from_batches(builder.new_read().read([split]))
+                .column("id").to_pylist()
+                for split in shard.splits()
+            )
+        assert sharded == chunks
+
+        with pytest.raises(ValueError, match="requires with_chunk_shuffle first"):
+            builder.new_scan().with_chunk_shuffle_shard(0, 2)
+
+
 def test_with_row_ranges():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
