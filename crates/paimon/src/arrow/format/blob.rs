@@ -697,8 +697,38 @@ async fn fetch_blob_values(
         }
     }
 
+    for resolved in read_merged_blob_entries(reader, entry_reads, blob_parallelism).await? {
+        let value = decode_blob_entry(resolved.entry, resolved.range)?;
+        values[resolved.result_index] = Some(BlobReadValue::Value(value));
+    }
+    collect_blob_read_values(values)
+}
+
+#[derive(Debug)]
+struct BlobEntryRead {
+    result_index: usize,
+    range: Range<u64>,
+}
+
+#[derive(Debug)]
+struct MergedBlobEntryRead {
+    range: Range<u64>,
+    entries: Vec<BlobEntryRead>,
+}
+
+struct ResolvedBlobEntryRead {
+    result_index: usize,
+    range: Range<u64>,
+    entry: Bytes,
+}
+
+async fn read_merged_blob_entries(
+    reader: &dyn FileRead,
+    entry_reads: Vec<BlobEntryRead>,
+    blob_parallelism: usize,
+) -> crate::Result<Vec<ResolvedBlobEntryRead>> {
     let merged_reads = merge_blob_entry_reads(entry_reads);
-    let resolved_reads: Vec<Vec<(usize, BlobReadValue)>> =
+    let resolved: Vec<Vec<ResolvedBlobEntryRead>> =
         futures::stream::iter(merged_reads.into_iter().map(|merged_read| async move {
             let expected_length = merged_read.range.end - merged_read.range.start;
             let data = reader.read(merged_read.range.clone()).await?;
@@ -727,21 +757,23 @@ async fn fetch_blob_values(
                             message: "Blob entry offset exceeds usize".to_string(),
                             source: Some(Box::new(e)),
                         })?;
-                    let value = decode_blob_entry(
-                        data.slice(start..end),
-                        entry_read.range.clone(),
-                    )?;
-                    Ok((entry_read.result_index, BlobReadValue::Value(value)))
+                    Ok(ResolvedBlobEntryRead {
+                        result_index: entry_read.result_index,
+                        range: entry_read.range,
+                        entry: data.slice(start..end),
+                    })
                 })
                 .collect::<crate::Result<Vec<_>>>()
         }))
         .buffer_unordered(blob_parallelism)
         .try_collect()
         .await?;
+    Ok(resolved.into_iter().flatten().collect())
+}
 
-    for (result_index, value) in resolved_reads.into_iter().flatten() {
-        values[result_index] = Some(value);
-    }
+fn collect_blob_read_values(
+    values: Vec<Option<BlobReadValue>>,
+) -> crate::Result<Vec<BlobReadValue>> {
     values
         .into_iter()
         .map(|value| {
@@ -751,18 +783,6 @@ async fn fetch_blob_values(
             })
         })
         .collect()
-}
-
-#[derive(Debug)]
-struct BlobEntryRead {
-    result_index: usize,
-    range: Range<u64>,
-}
-
-#[derive(Debug)]
-struct MergedBlobEntryRead {
-    range: Range<u64>,
-    entries: Vec<BlobEntryRead>,
 }
 
 fn merge_blob_entry_reads(mut reads: Vec<BlobEntryRead>) -> Vec<MergedBlobEntryRead> {
@@ -865,6 +885,42 @@ fn decode_blob_entry(entry: Bytes, entry_range: Range<u64>) -> crate::Result<Byt
     Ok(entry.slice(BLOB_INLINE_HEADER_SIZE as usize..length_offset))
 }
 
+struct InMemoryBlobEntryReader {
+    entry_range: Range<u64>,
+    entry: Bytes,
+}
+
+#[async_trait]
+impl FileRead for InMemoryBlobEntryReader {
+    async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        if range.start > range.end
+            || range.start < self.entry_range.start
+            || range.end > self.entry_range.end
+        {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Blob entry memory read {range:?} is outside {:?}",
+                    self.entry_range
+                ),
+                source: None,
+            });
+        }
+        let start = usize::try_from(range.start - self.entry_range.start).map_err(|e| {
+            Error::DataInvalid {
+                message: "Blob entry memory offset exceeds usize".to_string(),
+                source: Some(Box::new(e)),
+            }
+        })?;
+        let end = usize::try_from(range.end - self.entry_range.start).map_err(|e| {
+            Error::DataInvalid {
+                message: "Blob entry memory offset exceeds usize".to_string(),
+                source: Some(Box::new(e)),
+            }
+        })?;
+        Ok(self.entry.slice(start..end))
+    }
+}
+
 fn plan_blob_array_reads(
     blob_index: &BlobFileIndex,
     positions: &[usize],
@@ -898,17 +954,23 @@ async fn fetch_blob_array_values(
     descriptor_mode: bool,
     blob_parallelism: usize,
 ) -> crate::Result<Vec<BlobReadValue>> {
+    if !descriptor_mode {
+        return fetch_inline_nested_blob_values(
+            reader,
+            planned_reads,
+            blob_parallelism,
+            InlineNestedBlobKind::Array,
+        )
+        .await;
+    }
+
     futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
         match planned_read {
             PlannedBlobArrayRead::Null => Ok(BlobReadValue::Null),
             PlannedBlobArrayRead::Placeholder => Ok(BlobReadValue::Placeholder),
             PlannedBlobArrayRead::Read(payload_range) => {
-                if descriptor_mode {
-                    let metadata = read_blob_array_metadata(reader, payload_range).await?;
-                    build_blob_array_descriptors(metadata, file_path)
-                } else {
-                    read_inline_blob_array_entry(reader, payload_range).await
-                }
+                let metadata = read_blob_array_metadata(reader, payload_range).await?;
+                build_blob_array_descriptors(metadata, file_path)
             }
         }
     }))
@@ -1201,6 +1263,19 @@ async fn fetch_blob_map_values(
     key_type: &DataType,
     blob_parallelism: usize,
 ) -> crate::Result<Vec<BlobReadValue>> {
+    if !descriptor_mode {
+        return fetch_inline_nested_blob_values(
+            reader,
+            planned_reads,
+            blob_parallelism,
+            InlineNestedBlobKind::Map {
+                file_path,
+                key_type,
+            },
+        )
+        .await;
+    }
+
     futures::stream::iter(planned_reads.into_iter().map(|planned_read| async move {
         match planned_read {
             PlannedBlobArrayRead::Null => Ok(BlobReadValue::Null),
@@ -1214,6 +1289,62 @@ async fn fetch_blob_map_values(
     .buffered(blob_parallelism)
     .try_collect()
     .await
+}
+
+#[derive(Clone, Copy)]
+enum InlineNestedBlobKind<'a> {
+    Array,
+    Map {
+        file_path: &'a str,
+        key_type: &'a DataType,
+    },
+}
+
+async fn fetch_inline_nested_blob_values(
+    reader: &dyn FileRead,
+    planned_reads: Vec<PlannedBlobArrayRead>,
+    blob_parallelism: usize,
+    kind: InlineNestedBlobKind<'_>,
+) -> crate::Result<Vec<BlobReadValue>> {
+    let mut values = Vec::with_capacity(planned_reads.len());
+    let mut entry_reads = Vec::new();
+    for (result_index, planned_read) in planned_reads.into_iter().enumerate() {
+        match planned_read {
+            PlannedBlobArrayRead::Null => values.push(Some(BlobReadValue::Null)),
+            PlannedBlobArrayRead::Placeholder => values.push(Some(BlobReadValue::Placeholder)),
+            PlannedBlobArrayRead::Read(payload_range) => {
+                values.push(None);
+                entry_reads.push(BlobEntryRead {
+                    result_index,
+                    range: blob_entry_range(&payload_range),
+                });
+            }
+        }
+    }
+
+    for resolved in read_merged_blob_entries(reader, entry_reads, blob_parallelism).await? {
+        let result_index = resolved.result_index;
+        let payload_range =
+            resolved.range.start + BLOB_INLINE_HEADER_SIZE..resolved.range.end - BLOB_TRAILER_SIZE;
+        let memory_reader = InMemoryBlobEntryReader {
+            entry_range: resolved.range,
+            entry: resolved.entry,
+        };
+        let value = match kind {
+            InlineNestedBlobKind::Array => {
+                read_inline_blob_array_entry(&memory_reader, payload_range).await?
+            }
+            InlineNestedBlobKind::Map {
+                file_path,
+                key_type,
+            } => {
+                read_blob_map_entry(&memory_reader, payload_range, file_path, false, key_type)
+                    .await?
+            }
+        };
+        values[result_index] = Some(value);
+    }
+    collect_blob_read_values(values)
 }
 
 async fn read_blob_map_entry(
@@ -2273,6 +2404,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_inline_blob_map_reader_coalesces_adjacent_entries() {
+        let first = build_blob_map_payload(&[("first", Some(b"alpha"))]);
+        let second = build_blob_map_payload(&[("second", Some(b"beta"))]);
+        let file_bytes = blob_test_utils::build_blob_file_bytes(&[
+            Some(first.as_slice()),
+            Some(second.as_slice()),
+        ]);
+        let reader = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
+
+        let batches = BlobFormatReader::new(String::new(), false)
+            .read_batch_stream(
+                Box::new(reader.clone()),
+                file_bytes.len() as u64,
+                &blob_map_read_fields(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            collect_blob_map_values(&batches[0]),
+            vec![
+                Some(vec![("first".to_string(), Some(b"alpha".to_vec()))]),
+                Some(vec![("second".to_string(), Some(b"beta".to_vec()))]),
+            ]
+        );
+        let payload_end = BLOB_ENTRY_OVERHEAD * 2 + first.len() as u64 + second.len() as u64;
+        let payload_reads = reader
+            .ranges()
+            .into_iter()
+            .filter(|range| range.start < payload_end && range.end > 0)
+            .collect::<Vec<_>>();
+        assert_eq!(payload_reads, vec![0..payload_end]);
+    }
+
+    #[tokio::test]
     async fn test_blob_map_descriptor_read_skips_values() {
         let file_path = "file:///tmp/map.blob";
         let payload =
@@ -2530,11 +2702,13 @@ mod tests {
                 range.start < element_data_range.end && element_data_range.start < range.end
             })
             .collect::<Vec<_>>();
-        assert_eq!(overlapping_reads, vec![0..expected_entry_end]);
+        assert_eq!(overlapping_reads.len(), 1);
+        assert_eq!(overlapping_reads[0].start, 0);
+        assert!(overlapping_reads[0].end >= expected_entry_end);
     }
 
     #[tokio::test]
-    async fn test_blob_array_reader_preserves_order_with_bounded_parallelism() {
+    async fn test_blob_array_reader_preserves_order_after_coalescing() {
         let payloads = (0_u8..12)
             .map(|value| build_blob_array_payload(&[value], &[1]))
             .collect::<Vec<_>>();
@@ -2567,8 +2741,7 @@ mod tests {
                 .map(|value| Some(vec![Some(vec![value])]))
                 .collect::<Vec<_>>()
         );
-        assert!(reader.max_in_flight() > 1);
-        assert!(reader.max_in_flight() <= DEFAULT_BLOB_READ_PARALLELISM);
+        assert_eq!(reader.max_in_flight(), 1);
     }
 
     #[tokio::test]
