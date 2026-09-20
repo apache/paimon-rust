@@ -219,6 +219,25 @@ impl VindexVectorIndexOptions {
                 }
             }
         }
+        for key in [
+            "ivf.coarse-assignment",
+            "ivf.pq-encoding",
+            "ivf.train.max-points-per-centroid",
+            "pq.train.max-points-per-centroid",
+        ] {
+            if is_allowed_native_key(key, index_type) {
+                if let Some(value) = optional_value(
+                    table_options,
+                    user_options,
+                    field.name(),
+                    index_type,
+                    key,
+                    key,
+                ) {
+                    native_options.insert(key.to_string(), value);
+                }
+            }
+        }
 
         let config = VectorIndexConfig::from_options(&native_options).map_err(|e| {
             crate::Error::DataInvalid {
@@ -317,6 +336,13 @@ fn is_allowed_native_key(key: &str, index_type: &str) -> bool {
             matches!(index_type, IVF_RQ_IDENTIFIER | DISKANN_IDENTIFIER)
         }
         "pq.m" if index_type == IVF_PQ_IDENTIFIER => true,
+        "ivf.coarse-assignment" | "ivf.train.max-points-per-centroid" => {
+            index_type != DISKANN_IDENTIFIER
+        }
+        "ivf.pq-encoding" => index_type == IVF_PQ_IDENTIFIER,
+        "pq.train.max-points-per-centroid" => {
+            matches!(index_type, IVF_PQ_IDENTIFIER | DISKANN_IDENTIFIER)
+        }
         _ => {
             index_type == DISKANN_IDENTIFIER
                 && DISKANN_OPTION_KEYS
@@ -337,6 +363,10 @@ fn is_allowed_paimon_suffix(suffix: &str, index_type: &str) -> bool {
             matches!(index_type, IVF_RQ_IDENTIFIER | DISKANN_IDENTIFIER)
         }
         "pq.m" if index_type == IVF_PQ_IDENTIFIER => true,
+        "ivf.coarse-assignment"
+        | "ivf.pq-encoding"
+        | "ivf.train.max-points-per-centroid"
+        | "pq.train.max-points-per-centroid" => is_allowed_native_key(suffix, index_type),
         _ => {
             index_type == DISKANN_IDENTIFIER
                 && DISKANN_OPTION_KEYS
@@ -554,6 +584,71 @@ mod tests {
         assert_eq!(
             options.native_options.get("use-opq").map(String::as_str),
             Some("true")
+        );
+    }
+
+    #[test]
+    fn test_vindex_options_map_build_options() {
+        let user_options = HashMap::from([
+            (
+                "ivf-pq.ivf.coarse-assignment".to_string(),
+                "exact".to_string(),
+            ),
+            (
+                "fields.embedding.ivf.pq-encoding".to_string(),
+                "canonical".to_string(),
+            ),
+            (
+                "ivf-pq.ivf.train.max-points-per-centroid".to_string(),
+                "32".to_string(),
+            ),
+            (
+                "fields.embedding.pq.train.max-points-per-centroid".to_string(),
+                "64".to_string(),
+            ),
+        ]);
+
+        let options = VindexVectorIndexOptions::new(
+            &HashMap::new(),
+            &user_options,
+            IVF_PQ_IDENTIFIER,
+            &array_float_field(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            options
+                .native_options
+                .get("ivf.coarse-assignment")
+                .map(String::as_str),
+            Some("exact")
+        );
+        assert_eq!(
+            options
+                .native_options
+                .get("ivf.pq-encoding")
+                .map(String::as_str),
+            Some("canonical")
+        );
+        let resolved = options.config.resolved();
+        assert!(!resolved.use_approximate_coarse_assignment);
+        assert!(resolved.canonical_pq_encoding);
+        assert_eq!(resolved.ivf_train_max_points_per_centroid, Some(32));
+        assert_eq!(resolved.pq_train_max_points_per_centroid, Some(64));
+
+        let diskann = VindexVectorIndexOptions::new(
+            &HashMap::new(),
+            &HashMap::from([(
+                "diskann.pq.train.max-points-per-centroid".to_string(),
+                "16".to_string(),
+            )]),
+            DISKANN_IDENTIFIER,
+            &array_float_field(),
+        )
+        .unwrap();
+        assert_eq!(
+            diskann.config.resolved().pq_train_max_points_per_centroid,
+            Some(16)
         );
     }
 
@@ -947,8 +1042,18 @@ mod tests {
     fn test_vindex_options_reject_non_applicable_user_options() {
         for (index_type, key) in [
             (IVF_FLAT_IDENTIFIER, "ivf-flat.pq.m"),
+            (IVF_FLAT_IDENTIFIER, "ivf-flat.ivf.pq-encoding"),
+            (
+                IVF_FLAT_IDENTIFIER,
+                "ivf-flat.pq.train.max-points-per-centroid",
+            ),
             (IVF_FLAT_IDENTIFIER, "diskann.max-degree"),
             (DISKANN_IDENTIFIER, "diskann.nlist"),
+            (DISKANN_IDENTIFIER, "diskann.ivf.coarse-assignment"),
+            (
+                DISKANN_IDENTIFIER,
+                "diskann.ivf.train.max-points-per-centroid",
+            ),
         ] {
             let user_options = HashMap::from([(key.to_string(), "2".to_string())]);
             let err = VindexVectorIndexOptions::new(

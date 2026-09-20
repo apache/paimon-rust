@@ -1244,9 +1244,13 @@ Supported vindex options:
 | `<index-type>.dimension` | `128` | all vindex types | Vector dimension for `ARRAY<FLOAT>` columns. Existing `VECTOR<FLOAT,N>` columns use `N` from the type. |
 | `<index-type>.distance.metric` | `inner_product` | all vindex types | Distance metric: `inner_product`, `cosine`, or `l2`. |
 | `<index-type>.nlist` | `256` | all IVF types | Number of IVF lists. DiskANN rejects this option. |
+| `<index-type>.ivf.coarse-assignment` | `auto` | all IVF types | Build-time list assignment mode: `auto` uses Vamana for large centroid matrices; `exact` always uses exact assignment. |
+| `<index-type>.ivf.train.max-points-per-centroid` | `256` | all IVF types | Positive limit on coarse K-means training data: at most `nlist × value` vectors. |
 | `<index-type>.train.sample-ratio` or `fields.<field>.train.sample-ratio` | `1.0` | all vindex types | Fraction of shard rows selected evenly for training. Must be in `(0, 1]`; all rows are still added to the index. The field-specific option takes precedence. |
 | `<index-type>.pq.m` | `16` | `ivf-pq` | Number of product-quantization sub-vectors. The dimension must be divisible by this value. |
 | `<index-type>.pq.use-opq` | `false` | `ivf-pq` | Whether to enable OPQ before PQ encoding. |
+| `ivf-pq.ivf.pq-encoding` | `auto` | `ivf-pq` | Build-time PQ encoding mode: `auto` selects an accelerated backend when supported; `canonical` uses the canonical encoder. |
+| `<index-type>.pq.train.max-points-per-centroid` | `256` | `ivf-pq`, `diskann` | Positive limit on PQ training data: at most `2^pq.bits × value` vectors per subquantizer. |
 | `ivf-rq.rq.bits` | `4`, or inferred | `ivf-rq` | Residual-quantization width in the range `1` to `8`. When omitted, `ivf-rq.max-bytes-per-vector` can select it. |
 | `ivf-rq.max-bytes-per-vector` | unset | `ivf-rq` | Optional positive persisted-code budget used to infer `rq.bits`. |
 
@@ -1274,7 +1278,9 @@ dimension. DiskANN accepts these build options:
 For procedure calls, prefer the index-prefixed option names shown above. Native
 vindex aliases are also accepted in the `options` string: `dimension`, `metric`,
 `nlist`, `pq.m`, `use-opq`, `rq.bits`, `max-bytes-per-vector`,
-`deployment-profile`, `target-recall`, `pq.code-ratio`, `pq.bits`, and the
+`deployment-profile`, `target-recall`, `pq.code-ratio`, `pq.bits`,
+`ivf.coarse-assignment`, `ivf.pq-encoding`,
+`ivf.train.max-points-per-centroid`, `pq.train.max-points-per-centroid`, and the
 `diskann.*` build keys listed in the table. Build options for another index
 family are rejected rather than ignored.
 
