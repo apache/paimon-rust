@@ -41,9 +41,10 @@ datafusion = { workspace = true }
 log = "0.4"
 paimon = { workspace = true }
 futures = "0.3"
+indexmap = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { workspace = true, features = ["rt", "time", "fs"] }
+tokio = { workspace = true, features = ["rt", "time", "fs", "sync"] }
 lexical-write-float = "1.0.6"
 uuid = { version = "1", features = ["v4"] }
 

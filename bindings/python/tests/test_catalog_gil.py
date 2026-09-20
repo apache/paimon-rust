@@ -19,6 +19,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+from datafusion import SessionContext
 
 from pypaimon_rust.datafusion import PaimonCatalog
 
@@ -84,3 +85,23 @@ def test_rest_catalog_calls_release_gil(rest_server, monkeypatch):
     assert catalog.list_tables("db") == ["table"]
     with pytest.raises(ValueError, match="does not exist"):
         catalog.get_table("db.missing")
+
+
+def test_rest_catalog_without_views_registers_datafusion_provider(
+    rest_server, monkeypatch
+):
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1")
+    monkeypatch.setenv("no_proxy", "localhost,127.0.0.1")
+    catalog = PaimonCatalog(
+        {
+            "metastore": "rest",
+            "uri": rest_server,
+            "warehouse": "warehouse",
+            "token.provider": "bear",
+            "token": "test-token",
+        }
+    )
+
+    SessionContext().register_catalog_provider("paimon", catalog)
+    with pytest.raises(ValueError, match="Resource not found"):
+        catalog.refresh_metadata()

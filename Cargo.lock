@@ -4752,6 +4752,7 @@ dependencies = [
  "datafusion",
  "flate2",
  "futures",
+ "indexmap 2.14.0",
  "lexical-write-float",
  "log",
  "paimon",

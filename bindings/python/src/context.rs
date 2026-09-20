@@ -121,20 +121,16 @@ impl PaimonCatalog {
     #[new]
     fn new(py: Python<'_>, catalog_options: HashMap<String, String>) -> PyResult<Self> {
         let catalog = py.detach(|| build_paimon_catalog(catalog_options))?;
-        let provider = {
-            let catalog = Arc::clone(&catalog);
-            py.detach(|| {
-                runtime().block_on(PaimonCatalogProvider::try_new(
-                    None,
-                    catalog,
-                    Default::default(),
-                    Default::default(),
-                    None,
-                ))
-            })
-            .map_err(df_to_py_err)?
-        };
-        let provider = Arc::new(provider.with_schema_force_view_types(false));
+        let provider = Arc::new(
+            PaimonCatalogProvider::new_uninitialized(
+                None,
+                Arc::clone(&catalog),
+                Default::default(),
+                Default::default(),
+                None,
+            )
+            .with_schema_force_view_types(false),
+        );
         Ok(Self { catalog, provider })
     }
 
@@ -151,6 +147,9 @@ impl PaimonCatalog {
         py: Python<'py>,
         session: Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
+        let provider = Arc::clone(&self.provider);
+        py.detach(|| runtime().block_on(provider.initialize_metadata()))
+            .map_err(df_to_py_err)?;
         let name = cr"datafusion_catalog_provider".into();
         let provider = Arc::clone(&self.provider) as Arc<dyn CatalogProvider + Send>;
         let codec = ffi_logical_codec_from_pycapsule(session)?;

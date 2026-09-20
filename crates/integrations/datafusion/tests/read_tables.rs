@@ -763,7 +763,9 @@ async fn test_missing_database_returns_no_schema() {
         Default::default(),
         Default::default(),
         None,
-    );
+    )
+    .await
+    .unwrap();
 
     assert!(
         provider.schema("definitely_missing_database").is_none(),

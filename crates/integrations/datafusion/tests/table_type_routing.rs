@@ -571,13 +571,14 @@ async fn system_tables_on_routed_tables_error() {
 }
 
 #[tokio::test]
-async fn table_exist_uses_catalog_declarations_without_resolving_engines() {
+async fn table_exist_agrees_with_routed_table_resolution() {
     let env = setup().await;
     let provider = env.ctx.ctx().catalog(CATALOG).unwrap();
     let schema = provider.schema(DB).unwrap();
     assert!(schema.table_exist("it"));
     assert!(schema.table_exist("ghost"));
-    assert!(schema.table_exist("it$snapshots"));
+    assert!(schema.table("ghost").await.unwrap().is_some());
+    assert!(!schema.table_exist("it$snapshots"));
 }
 
 #[tokio::test]

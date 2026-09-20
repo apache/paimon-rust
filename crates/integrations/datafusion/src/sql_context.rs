@@ -45,7 +45,8 @@
 //! - `TRUNCATE TABLE db.t PARTITION (col = val, ...)`
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::{
     new_null_array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
@@ -104,6 +105,17 @@ pub struct SQLContext {
     /// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
     dynamic_options: DynamicOptions,
     blob_reader_registry: BlobReaderRegistry,
+    /// Last successful refresh used to resolve a missing object, keyed by database.
+    missing_object_refreshes: Mutex<HashMap<(String, String), Instant>>,
+    metadata_refresh_gate: tokio::sync::Mutex<()>,
+}
+
+const MISSING_OBJECT_REFRESH_TTL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum MetadataRefreshTarget {
+    Catalog(String),
+    Database { catalog: String, database: String },
 }
 
 /// Builder for [`SQLContext`].
@@ -171,6 +183,8 @@ impl SQLContextBuilder {
             catalogs: HashMap::new(),
             dynamic_options: Default::default(),
             blob_reader_registry: BlobReaderRegistry::default(),
+            missing_object_refreshes: Mutex::new(HashMap::new()),
+            metadata_refresh_gate: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -475,11 +489,17 @@ impl SQLContext {
             ));
         }
 
-        if self.statement_needs_catalog_metadata(&statements[0])? {
-            self.refresh_all_catalog_metadata().await?;
+        let refresh_metadata_after = self.metadata_change_targets(&statements[0], false)?;
+        let metadata_mutation_targets = self.metadata_change_targets(&statements[0], true)?;
+        {
+            let _refresh_guard = self.metadata_refresh_gate.lock().await;
+            let mut metadata_to_refresh = self.metadata_refresh_targets(&statements[0])?;
+            metadata_to_refresh.retain(|target| !metadata_mutation_targets.contains(target));
+            if !metadata_to_refresh.is_empty() {
+                self.refresh_metadata_targets(metadata_to_refresh).await?;
+            }
         }
 
-        let refresh_metadata_after = statement_changes_catalog_metadata(&statements[0]);
         let result = match &statements[0] {
             Statement::ShowDatabases {
                 terse,
@@ -789,22 +809,43 @@ impl SQLContext {
             _ => self.ctx.sql(sql).await,
         };
 
-        if refresh_metadata_after && result.is_ok() {
-            if let Err(error) = self.refresh_all_catalog_metadata().await {
+        if result.is_ok() && !refresh_metadata_after.is_empty() {
+            if let Err(error) = self.refresh_metadata_targets(refresh_metadata_after).await {
                 log::warn!("catalog metadata refresh after DDL failed: {error}");
             }
         }
         result
     }
 
-    fn statement_needs_catalog_metadata(&self, statement: &Statement) -> DFResult<bool> {
-        if matches!(
-            statement,
-            Statement::ShowTables { .. }
-                | Statement::ShowColumns { .. }
-                | Statement::ShowFunctions { .. }
-        ) {
-            return Ok(true);
+    fn metadata_refresh_targets(
+        &self,
+        statement: &Statement,
+    ) -> DFResult<HashSet<MetadataRefreshTarget>> {
+        let mut targets = HashSet::new();
+        if matches!(statement, Statement::ShowTables { .. }) {
+            let state = self.ctx.state();
+            targets.insert(MetadataRefreshTarget::Database {
+                catalog: self.current_catalog_name(),
+                database: state.config_options().catalog.default_schema.clone(),
+            });
+            return Ok(targets);
+        }
+        if let Statement::ShowColumns { show_options, .. } = statement {
+            if let Some(show_in) = &show_options.show_in {
+                if show_in.parent_type.is_none() {
+                    if let Some(name) = &show_in.parent_name {
+                        let (_, catalog, identifier) = self.resolve_catalog_and_table(name)?;
+                        targets.insert(MetadataRefreshTarget::Database {
+                            catalog,
+                            database: identifier.database().to_string(),
+                        });
+                    }
+                }
+            }
+            return Ok(targets);
+        }
+        if matches!(statement, Statement::ShowFunctions { .. }) {
+            return Ok(targets);
         }
 
         let statement = datafusion::sql::parser::Statement::Statement(Box::new(statement.clone()));
@@ -813,10 +854,6 @@ impl SQLContext {
         let default_schema = state.config_options().catalog.default_schema.clone();
         for reference in state.resolve_table_references(&statement)? {
             let schema = reference.schema().unwrap_or(&default_schema);
-            if schema.eq_ignore_ascii_case("information_schema") {
-                return Ok(true);
-            }
-
             let catalog_name = reference.catalog().unwrap_or(&default_catalog);
             if !self.catalogs.contains_key(catalog_name) {
                 continue;
@@ -831,17 +868,109 @@ impl SQLContext {
                         "Catalog '{catalog_name}' is not a Paimon catalog"
                     ))
                 })?;
-            if !provider.metadata_contains_object(schema, reference.table()) {
-                return Ok(true);
+            if schema.eq_ignore_ascii_case("information_schema") {
+                targets.insert(MetadataRefreshTarget::Catalog(catalog_name.to_string()));
+            } else if !provider.metadata_contains_object(schema, reference.table()) {
+                let target = MetadataRefreshTarget::Database {
+                    catalog: catalog_name.to_string(),
+                    database: schema.to_string(),
+                };
+                if !self.missing_object_refresh_is_recent(&target) {
+                    targets.insert(target);
+                }
             }
         }
-        Ok(false)
+        Ok(targets)
     }
 
-    async fn refresh_all_catalog_metadata(&self) -> DFResult<()> {
-        let catalog_names: Vec<_> = self.catalogs.keys().cloned().collect();
-        for catalog_name in catalog_names {
-            let provider = self.ctx.catalog(&catalog_name).ok_or_else(|| {
+    fn metadata_change_targets(
+        &self,
+        statement: &Statement,
+        include_temporary: bool,
+    ) -> DFResult<HashSet<MetadataRefreshTarget>> {
+        let mut targets = HashSet::new();
+        let mut add_database = |name: &ObjectName| -> DFResult<()> {
+            let table_ref: TableReference = name.to_string().as_str().into();
+            if !self.is_paimon_catalog_ref(&table_ref) {
+                return Ok(());
+            }
+            let (_, catalog, identifier) = self.resolve_catalog_and_table(name)?;
+            targets.insert(MetadataRefreshTarget::Database {
+                catalog,
+                database: identifier.database().to_string(),
+            });
+            Ok(())
+        };
+
+        match statement {
+            Statement::CreateDatabase { db_name, .. } => {
+                let (_, catalog, _) = self.resolve_catalog_and_database(db_name)?;
+                targets.insert(MetadataRefreshTarget::Catalog(catalog));
+            }
+            Statement::CreateSchema {
+                schema_name: SchemaName::Simple(name),
+                ..
+            } => {
+                let (_, catalog, _) = self.resolve_catalog_and_database(name)?;
+                targets.insert(MetadataRefreshTarget::Catalog(catalog));
+            }
+            Statement::CreateTable(create) if include_temporary || !create.temporary => {
+                add_database(&create.name)?
+            }
+            Statement::CreateView(create) if include_temporary || !create.temporary => {
+                add_database(&create.name)?
+            }
+            Statement::AlterTable(alter) => add_database(&alter.name)?,
+            Statement::Drop {
+                object_type: ObjectType::Database | ObjectType::Schema,
+                names,
+                temporary: false,
+                ..
+            } => {
+                for name in names {
+                    let (_, catalog, _) = self.resolve_catalog_and_database(name)?;
+                    targets.insert(MetadataRefreshTarget::Catalog(catalog));
+                }
+            }
+            Statement::Drop {
+                object_type: ObjectType::Table | ObjectType::View,
+                names,
+                temporary,
+                ..
+            } if include_temporary || !temporary => {
+                for name in names {
+                    add_database(name)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(targets)
+    }
+
+    async fn refresh_metadata_targets(
+        &self,
+        targets: impl IntoIterator<Item = MetadataRefreshTarget>,
+    ) -> DFResult<()> {
+        let targets: HashSet<_> = targets.into_iter().collect();
+        let full_catalogs: HashSet<_> = targets
+            .iter()
+            .filter_map(|target| match target {
+                MetadataRefreshTarget::Catalog(catalog) => Some(catalog.clone()),
+                MetadataRefreshTarget::Database { .. } => None,
+            })
+            .collect();
+
+        for target in targets {
+            let (catalog_name, database) = match &target {
+                MetadataRefreshTarget::Catalog(catalog) => (catalog.as_str(), None),
+                MetadataRefreshTarget::Database { catalog, database } => {
+                    if full_catalogs.contains(catalog.as_str()) {
+                        continue;
+                    }
+                    (catalog.as_str(), Some(database.as_str()))
+                }
+            };
+            let provider = self.ctx.catalog(catalog_name).ok_or_else(|| {
                 DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'"))
             })?;
             let provider = provider
@@ -851,9 +980,31 @@ impl SQLContext {
                         "Catalog '{catalog_name}' is not a Paimon catalog"
                     ))
                 })?;
-            provider.refresh_metadata().await?;
+            if let Some(database) = database {
+                provider.refresh_database_metadata(database).await?;
+                self.missing_object_refreshes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        (catalog_name.to_string(), database.to_string()),
+                        Instant::now(),
+                    );
+            } else {
+                provider.initialize_metadata().await?;
+            }
         }
         Ok(())
+    }
+
+    fn missing_object_refresh_is_recent(&self, target: &MetadataRefreshTarget) -> bool {
+        let MetadataRefreshTarget::Database { catalog, database } = target else {
+            return false;
+        };
+        self.missing_object_refreshes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(catalog.clone(), database.clone()))
+            .is_some_and(|refreshed| refreshed.elapsed() < MISSING_OBJECT_REFRESH_TTL)
     }
 
     /// Handle SQL queries containing time-travel syntax (`VERSION AS OF` / `TIMESTAMP AS OF`).
@@ -2403,23 +2554,6 @@ impl SQLContext {
     fn resolve_table_name(&self, name: &ObjectName) -> DFResult<Identifier> {
         let (_catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
         Ok(identifier)
-    }
-}
-
-fn statement_changes_catalog_metadata(statement: &Statement) -> bool {
-    match statement {
-        Statement::CreateDatabase { .. }
-        | Statement::CreateSchema { .. }
-        | Statement::AlterTable(_)
-        | Statement::Drop {
-            object_type:
-                ObjectType::Database | ObjectType::Schema | ObjectType::Table | ObjectType::View,
-            temporary: false,
-            ..
-        } => true,
-        Statement::CreateTable(create) => !create.temporary,
-        Statement::CreateView(create) => !create.temporary,
-        _ => false,
     }
 }
 

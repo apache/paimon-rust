@@ -34,6 +34,7 @@ use paimon::table::{BranchManager, SnapshotManager, TagManager};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
 use tempfile::TempDir;
+use tokio::sync::Notify;
 
 fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -55,6 +56,21 @@ struct MetadataListingCatalog {
     metadata_calls: AtomicUsize,
     reject_remote_calls: AtomicBool,
     fail_list_tables: AtomicBool,
+    fail_list_tables_database: Mutex<Option<String>>,
+    database_names: Mutex<Vec<String>>,
+    list_tables_by_database: Mutex<std::collections::HashMap<String, usize>>,
+    race_refreshes: AtomicBool,
+    racing_list_tables_calls: AtomicUsize,
+    stale_refresh_started: Notify,
+    release_stale_refresh: Notify,
+    require_parallel_object_listing: AtomicBool,
+    view_listing_started: Notify,
+    require_parallel_database_listing: AtomicBool,
+    database_listings_started: AtomicUsize,
+    parallel_database_listing_started: Notify,
+    block_next_list_tables: AtomicBool,
+    blocked_list_tables_started: Notify,
+    release_blocked_list_tables: Notify,
     table_names: Mutex<Vec<String>>,
 }
 
@@ -65,8 +81,30 @@ impl MetadataListingCatalog {
             metadata_calls: AtomicUsize::new(0),
             reject_remote_calls: AtomicBool::new(false),
             fail_list_tables: AtomicBool::new(false),
+            fail_list_tables_database: Mutex::new(None),
+            database_names: Mutex::new(vec!["default".to_string()]),
+            list_tables_by_database: Mutex::new(std::collections::HashMap::new()),
+            race_refreshes: AtomicBool::new(false),
+            racing_list_tables_calls: AtomicUsize::new(0),
+            stale_refresh_started: Notify::new(),
+            release_stale_refresh: Notify::new(),
+            require_parallel_object_listing: AtomicBool::new(false),
+            view_listing_started: Notify::new(),
+            require_parallel_database_listing: AtomicBool::new(false),
+            database_listings_started: AtomicUsize::new(0),
+            parallel_database_listing_started: Notify::new(),
+            block_next_list_tables: AtomicBool::new(false),
+            blocked_list_tables_started: Notify::new(),
+            release_blocked_list_tables: Notify::new(),
             table_names: Mutex::new(vec!["metadata_only".to_string()]),
         }
+    }
+
+    fn with_databases(databases: Vec<&str>) -> Self {
+        let catalog = Self::new();
+        *catalog.database_names.lock().unwrap() =
+            databases.into_iter().map(ToString::to_string).collect();
+        catalog
     }
 
     fn get_table_calls(&self) -> usize {
@@ -89,6 +127,38 @@ impl MetadataListingCatalog {
         self.fail_list_tables.store(true, Ordering::SeqCst);
     }
 
+    fn fail_list_tables_for(&self, database: &str) {
+        *self.fail_list_tables_database.lock().unwrap() = Some(database.to_string());
+    }
+
+    fn list_tables_calls_for(&self, database: &str) -> usize {
+        self.list_tables_by_database
+            .lock()
+            .unwrap()
+            .get(database)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn race_next_refreshes(&self) {
+        self.racing_list_tables_calls.store(0, Ordering::SeqCst);
+        self.race_refreshes.store(true, Ordering::SeqCst);
+    }
+
+    fn require_parallel_object_listing(&self) {
+        self.require_parallel_object_listing
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn require_parallel_database_listing(&self) {
+        self.require_parallel_database_listing
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn block_next_list_tables(&self) {
+        self.block_next_list_tables.store(true, Ordering::SeqCst);
+    }
+
     fn record_remote_call(&self) {
         assert!(
             !self.reject_remote_calls.load(Ordering::SeqCst),
@@ -102,7 +172,7 @@ impl MetadataListingCatalog {
 impl Catalog for MetadataListingCatalog {
     async fn list_databases(&self) -> paimon::Result<Vec<String>> {
         self.record_remote_call();
-        Ok(vec!["default".to_string()])
+        Ok(self.database_names.lock().unwrap().clone())
     }
 
     async fn create_database(
@@ -140,18 +210,73 @@ impl Catalog for MetadataListingCatalog {
         })
     }
 
-    async fn list_tables(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
+    async fn list_tables(&self, database_name: &str) -> paimon::Result<Vec<String>> {
         self.record_remote_call();
-        if self.fail_list_tables.load(Ordering::SeqCst) {
+        *self
+            .list_tables_by_database
+            .lock()
+            .unwrap()
+            .entry(database_name.to_string())
+            .or_default() += 1;
+        if self.fail_list_tables.load(Ordering::SeqCst)
+            || self.fail_list_tables_database.lock().unwrap().as_deref() == Some(database_name)
+        {
             return Err(paimon::Error::Unsupported {
                 message: "simulated metadata refresh failure".to_string(),
             });
+        }
+        if self.race_refreshes.load(Ordering::SeqCst) {
+            let call = self.racing_list_tables_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.stale_refresh_started.notify_one();
+                self.release_stale_refresh.notified().await;
+                return Ok(vec!["stale".to_string()]);
+            }
+            return Ok(vec!["fresh".to_string()]);
+        }
+        if self.require_parallel_object_listing.load(Ordering::SeqCst) {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                self.view_listing_started.notified(),
+            )
+            .await
+            .map_err(|_| paimon::Error::Unsupported {
+                message: "list_views did not run concurrently".to_string(),
+            })?;
+        }
+        if self
+            .require_parallel_database_listing
+            .load(Ordering::SeqCst)
+        {
+            let started = self
+                .database_listings_started
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            if started == 1 {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    self.parallel_database_listing_started.notified(),
+                )
+                .await
+                .map_err(|_| paimon::Error::Unsupported {
+                    message: "databases were not listed concurrently".to_string(),
+                })?;
+            } else {
+                self.parallel_database_listing_started.notify_waiters();
+            }
+        }
+        if self.block_next_list_tables.swap(false, Ordering::SeqCst) {
+            self.blocked_list_tables_started.notify_one();
+            self.release_blocked_list_tables.notified().await;
         }
         Ok(self.table_names.lock().unwrap().clone())
     }
 
     async fn list_views(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
         self.record_remote_call();
+        if self.require_parallel_object_listing.load(Ordering::SeqCst) {
+            self.view_listing_started.notify_one();
+        }
         Ok(vec!["metadata_view".to_string()])
     }
 
@@ -194,7 +319,7 @@ impl Catalog for MetadataListingCatalog {
 #[tokio::test]
 async fn test_refreshed_catalog_callbacks_do_not_access_remote_catalog() {
     let catalog = Arc::new(MetadataListingCatalog::new());
-    let provider = PaimonCatalogProvider::new(
+    let provider = PaimonCatalogProvider::new_uninitialized(
         Some("paimon".to_string()),
         catalog.clone(),
         Default::default(),
@@ -213,6 +338,22 @@ async fn test_refreshed_catalog_callbacks_do_not_access_remote_catalog() {
     assert!(schema.table_exist("metadata_view"));
     assert!(!schema.table_exist("missing"));
     assert_eq!(catalog.metadata_calls(), calls_after_refresh);
+}
+
+#[tokio::test]
+async fn test_public_catalog_constructor_returns_ready_provider() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let provider = PaimonCatalogProvider::new(
+        Some("paimon".to_string()),
+        catalog,
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(provider.schema_names(), vec!["default"]);
 }
 
 #[tokio::test]
@@ -237,10 +378,118 @@ async fn test_failed_catalog_refresh_preserves_last_good_snapshot() {
     assert_eq!(schema.table_names(), vec!["metadata_only", "metadata_view"]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_older_refresh_cannot_overwrite_newer_snapshot() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let provider = Arc::new(
+        PaimonCatalogProvider::try_new(
+            Some("paimon".to_string()),
+            catalog.clone(),
+            Default::default(),
+            Default::default(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    catalog.race_next_refreshes();
+
+    let stale_provider = Arc::clone(&provider);
+    let stale_refresh = tokio::spawn(async move { stale_provider.refresh_metadata().await });
+    catalog.stale_refresh_started.notified().await;
+
+    let fresh_provider = Arc::clone(&provider);
+    tokio::spawn(async move { fresh_provider.refresh_metadata().await })
+        .await
+        .unwrap()
+        .unwrap();
+
+    catalog.release_stale_refresh.notify_one();
+    stale_refresh.await.unwrap().unwrap();
+
+    let schema = provider.schema("default").unwrap();
+    assert_eq!(schema.table_names(), vec!["fresh", "metadata_view"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_stale_refresh_cannot_overwrite_local_schema_registration() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let provider = Arc::new(
+        PaimonCatalogProvider::try_new(
+            Some("paimon".to_string()),
+            catalog.clone(),
+            Default::default(),
+            Default::default(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    catalog.race_next_refreshes();
+
+    let stale_provider = Arc::clone(&provider);
+    let stale_refresh = tokio::spawn(async move { stale_provider.refresh_metadata().await });
+    catalog.stale_refresh_started.notified().await;
+
+    provider
+        .register_schema(
+            "local",
+            Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+        )
+        .unwrap();
+    assert!(provider.schema("local").is_some());
+
+    catalog.release_stale_refresh.notify_one();
+    stale_refresh.await.unwrap().unwrap();
+
+    assert!(provider.schema("local").is_some());
+}
+
+#[tokio::test]
+async fn test_refresh_lists_tables_and_views_concurrently() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    catalog.require_parallel_object_listing();
+
+    let provider = PaimonCatalogProvider::try_new(
+        Some("paimon".to_string()),
+        catalog,
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        provider.schema("default").unwrap().table_names(),
+        vec!["metadata_only", "metadata_view"]
+    );
+}
+
+#[tokio::test]
+async fn test_refresh_lists_databases_concurrently() {
+    let catalog = Arc::new(MetadataListingCatalog::with_databases(vec![
+        "first", "second",
+    ]));
+    catalog.require_parallel_database_listing();
+
+    let provider = PaimonCatalogProvider::try_new(
+        Some("paimon".to_string()),
+        catalog,
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(provider.schema_names(), vec!["first", "second"]);
+}
+
 #[tokio::test]
 async fn test_temp_table_registration_does_not_access_remote_catalog() {
     let catalog = Arc::new(MetadataListingCatalog::new());
-    let provider = PaimonCatalogProvider::new(
+    let provider = PaimonCatalogProvider::new_uninitialized(
         Some("paimon".to_string()),
         catalog.clone(),
         Default::default(),
@@ -527,6 +776,168 @@ async fn test_show_tables_refreshes_catalog_metadata() {
 
     assert!(table_names.contains(&"added_after_registration".to_string()));
     assert!(!table_names.contains(&"metadata_only".to_string()));
+}
+
+#[tokio::test]
+async fn test_show_tables_does_not_refresh_unrelated_catalogs() {
+    let healthy = Arc::new(MetadataListingCatalog::new());
+    let unavailable = Arc::new(MetadataListingCatalog::new());
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("healthy", healthy.clone())
+        .await
+        .unwrap();
+    sql_context
+        .register_catalog("unavailable", unavailable.clone())
+        .await
+        .unwrap();
+
+    healthy.set_table_names(vec!["current"]);
+    unavailable.fail_list_tables();
+    let unavailable_calls = unavailable.metadata_calls();
+
+    let table_names = collect_string_column(&sql_context, "SHOW TABLES", "table_name").await;
+
+    assert!(table_names.contains(&"current".to_string()));
+    assert_eq!(unavailable.metadata_calls(), unavailable_calls);
+}
+
+#[tokio::test]
+async fn test_show_tables_only_refreshes_current_database() {
+    let catalog = Arc::new(MetadataListingCatalog::with_databases(vec![
+        "default",
+        "unavailable",
+    ]));
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+
+    catalog.set_table_names(vec!["current"]);
+    catalog.fail_list_tables_for("unavailable");
+    let unavailable_calls = catalog.list_tables_calls_for("unavailable");
+
+    let table_names = collect_string_column(&sql_context, "SHOW TABLES", "table_name").await;
+
+    assert!(table_names.contains(&"current".to_string()));
+    assert_eq!(
+        catalog.list_tables_calls_for("unavailable"),
+        unavailable_calls
+    );
+}
+
+#[tokio::test]
+async fn test_show_columns_refreshes_qualified_database() {
+    let catalog = Arc::new(MetadataListingCatalog::with_databases(vec![
+        "default",
+        "analytics",
+    ]));
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+
+    let default_calls = catalog.list_tables_calls_for("default");
+    let analytics_calls = catalog.list_tables_calls_for("analytics");
+    assert!(sql_context
+        .sql("SHOW COLUMNS IN paimon.analytics.metadata_only")
+        .await
+        .is_err());
+
+    assert_eq!(catalog.list_tables_calls_for("default"), default_calls);
+    assert_eq!(
+        catalog.list_tables_calls_for("analytics"),
+        analytics_calls + 1
+    );
+}
+
+#[tokio::test]
+async fn test_show_functions_does_not_refresh_catalog_metadata() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+
+    catalog.fail_list_tables();
+    let list_calls = catalog.list_tables_calls_for("default");
+    sql_context.sql("SHOW FUNCTIONS").await.unwrap();
+
+    assert_eq!(catalog.list_tables_calls_for("default"), list_calls);
+}
+
+#[tokio::test]
+async fn test_create_table_does_not_refresh_unrelated_catalogs() {
+    let healthy = Arc::new(MetadataListingCatalog::new());
+    let unrelated = Arc::new(MetadataListingCatalog::new());
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("healthy", healthy)
+        .await
+        .unwrap();
+    sql_context
+        .register_catalog("unrelated", unrelated.clone())
+        .await
+        .unwrap();
+    let unrelated_calls = unrelated.metadata_calls();
+
+    sql_context
+        .sql("CREATE TABLE created (id BIGINT)")
+        .await
+        .unwrap();
+
+    assert_eq!(unrelated.metadata_calls(), unrelated_calls);
+}
+
+#[tokio::test]
+async fn test_repeated_missing_tables_share_negative_refresh_ttl() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+    let list_calls = catalog.list_tables_calls_for("default");
+
+    assert!(sql_context
+        .sql("SELECT * FROM first_missing")
+        .await
+        .is_err());
+    assert!(sql_context
+        .sql("SELECT * FROM second_missing")
+        .await
+        .is_err());
+
+    assert_eq!(catalog.list_tables_calls_for("default"), list_calls + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_concurrent_missing_tables_share_single_refresh() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+    let sql_context = Arc::new(sql_context);
+    let list_calls = catalog.list_tables_calls_for("default");
+    catalog.block_next_list_tables();
+
+    let first_context = Arc::clone(&sql_context);
+    let first = tokio::spawn(async move { first_context.sql("SELECT * FROM missing_a").await });
+    catalog.blocked_list_tables_started.notified().await;
+
+    let second_context = Arc::clone(&sql_context);
+    let second = tokio::spawn(async move { second_context.sql("SELECT * FROM missing_b").await });
+    tokio::task::yield_now().await;
+    catalog.release_blocked_list_tables.notify_one();
+
+    assert!(first.await.unwrap().is_err());
+    assert!(second.await.unwrap().is_err());
+    assert_eq!(catalog.list_tables_calls_for("default"), list_calls + 1);
 }
 
 #[tokio::test]
