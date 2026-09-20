@@ -52,23 +52,56 @@ async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
 
 struct MetadataListingCatalog {
     get_table_calls: AtomicUsize,
+    metadata_calls: AtomicUsize,
+    reject_remote_calls: AtomicBool,
+    fail_list_tables: AtomicBool,
+    table_names: Mutex<Vec<String>>,
 }
 
 impl MetadataListingCatalog {
     fn new() -> Self {
         Self {
             get_table_calls: AtomicUsize::new(0),
+            metadata_calls: AtomicUsize::new(0),
+            reject_remote_calls: AtomicBool::new(false),
+            fail_list_tables: AtomicBool::new(false),
+            table_names: Mutex::new(vec!["metadata_only".to_string()]),
         }
     }
 
     fn get_table_calls(&self) -> usize {
         self.get_table_calls.load(Ordering::SeqCst)
     }
+
+    fn metadata_calls(&self) -> usize {
+        self.metadata_calls.load(Ordering::SeqCst)
+    }
+
+    fn reject_remote_calls(&self) {
+        self.reject_remote_calls.store(true, Ordering::SeqCst);
+    }
+
+    fn set_table_names(&self, names: Vec<&str>) {
+        *self.table_names.lock().unwrap() = names.into_iter().map(ToString::to_string).collect();
+    }
+
+    fn fail_list_tables(&self) {
+        self.fail_list_tables.store(true, Ordering::SeqCst);
+    }
+
+    fn record_remote_call(&self) {
+        assert!(
+            !self.reject_remote_calls.load(Ordering::SeqCst),
+            "synchronous provider callback accessed the remote catalog"
+        );
+        self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
 impl Catalog for MetadataListingCatalog {
     async fn list_databases(&self) -> paimon::Result<Vec<String>> {
+        self.record_remote_call();
         Ok(vec!["default".to_string()])
     }
 
@@ -82,6 +115,7 @@ impl Catalog for MetadataListingCatalog {
     }
 
     async fn get_database(&self, name: &str) -> paimon::Result<paimon::catalog::Database> {
+        self.record_remote_call();
         Ok(paimon::catalog::Database::new(
             name.to_string(),
             std::collections::HashMap::new(),
@@ -99,6 +133,7 @@ impl Catalog for MetadataListingCatalog {
     }
 
     async fn get_table(&self, _identifier: &Identifier) -> paimon::Result<paimon::table::Table> {
+        self.record_remote_call();
         self.get_table_calls.fetch_add(1, Ordering::SeqCst);
         Err(paimon::Error::Unsupported {
             message: "table loading is unavailable".to_string(),
@@ -106,10 +141,17 @@ impl Catalog for MetadataListingCatalog {
     }
 
     async fn list_tables(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
-        Ok(vec!["metadata_only".to_string()])
+        self.record_remote_call();
+        if self.fail_list_tables.load(Ordering::SeqCst) {
+            return Err(paimon::Error::Unsupported {
+                message: "simulated metadata refresh failure".to_string(),
+            });
+        }
+        Ok(self.table_names.lock().unwrap().clone())
     }
 
     async fn list_views(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
+        self.record_remote_call();
         Ok(vec!["metadata_view".to_string()])
     }
 
@@ -147,6 +189,74 @@ impl Catalog for MetadataListingCatalog {
     ) -> paimon::Result<()> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn test_refreshed_catalog_callbacks_do_not_access_remote_catalog() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let provider = PaimonCatalogProvider::new(
+        Some("paimon".to_string()),
+        catalog.clone(),
+        Default::default(),
+        Default::default(),
+        None,
+    );
+
+    provider.refresh_metadata().await.unwrap();
+    let calls_after_refresh = catalog.metadata_calls();
+    catalog.reject_remote_calls();
+
+    assert_eq!(provider.schema_names(), vec!["default"]);
+    let schema = provider.schema("default").unwrap();
+    assert_eq!(schema.table_names(), vec!["metadata_only", "metadata_view"]);
+    assert!(schema.table_exist("metadata_only"));
+    assert!(schema.table_exist("metadata_view"));
+    assert!(!schema.table_exist("missing"));
+    assert_eq!(catalog.metadata_calls(), calls_after_refresh);
+}
+
+#[tokio::test]
+async fn test_failed_catalog_refresh_preserves_last_good_snapshot() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let provider = PaimonCatalogProvider::try_new(
+        Some("paimon".to_string()),
+        catalog.clone(),
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    catalog.set_table_names(vec!["not_committed"]);
+    catalog.fail_list_tables();
+    assert!(provider.refresh_metadata().await.is_err());
+
+    assert_eq!(provider.schema_names(), vec!["default"]);
+    let schema = provider.schema("default").unwrap();
+    assert_eq!(schema.table_names(), vec!["metadata_only", "metadata_view"]);
+}
+
+#[tokio::test]
+async fn test_temp_table_registration_does_not_access_remote_catalog() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let provider = PaimonCatalogProvider::new(
+        Some("paimon".to_string()),
+        catalog.clone(),
+        Default::default(),
+        Default::default(),
+        None,
+    );
+    provider.refresh_metadata().await.unwrap();
+    let calls_after_refresh = catalog.metadata_calls();
+    catalog.reject_remote_calls();
+
+    let table = MemTable::try_new(Arc::new(Schema::empty()), vec![vec![]]).unwrap();
+    provider
+        .register_temp_table("default", "metadata_only", Arc::new(table))
+        .unwrap();
+
+    assert_eq!(catalog.metadata_calls(), calls_after_refresh);
 }
 
 struct PartitionCatalog {
@@ -401,6 +511,22 @@ async fn test_show_tables_does_not_load_table_providers() {
         .await
         .is_err());
     assert!(catalog.get_table_calls() > 0);
+}
+
+#[tokio::test]
+async fn test_show_tables_refreshes_catalog_metadata() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+
+    catalog.set_table_names(vec!["added_after_registration"]);
+    let table_names = collect_string_column(&sql_context, "SHOW TABLES", "table_name").await;
+
+    assert!(table_names.contains(&"added_after_registration".to_string()));
+    assert!(!table_names.contains(&"metadata_only".to_string()));
 }
 
 #[tokio::test]
@@ -960,14 +1086,6 @@ async fn test_drop_schema() {
 #[tokio::test]
 async fn test_schema_names_via_catalog_provider() {
     let (_tmp, catalog) = create_test_env();
-    let provider = PaimonCatalogProvider::new(
-        None,
-        catalog.clone(),
-        Default::default(),
-        Default::default(),
-        None,
-    );
-
     catalog
         .create_database("db_a", false, Default::default())
         .await
@@ -976,6 +1094,16 @@ async fn test_schema_names_via_catalog_provider() {
         .create_database("db_b", false, Default::default())
         .await
         .unwrap();
+
+    let provider = PaimonCatalogProvider::try_new(
+        None,
+        catalog.clone(),
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
 
     let names = provider.schema_names();
     assert!(names.contains(&"db_a".to_string()));

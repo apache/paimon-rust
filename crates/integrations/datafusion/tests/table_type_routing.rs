@@ -571,13 +571,13 @@ async fn system_tables_on_routed_tables_error() {
 }
 
 #[tokio::test]
-async fn table_exist_mirrors_the_resolver() {
+async fn table_exist_uses_catalog_declarations_without_resolving_engines() {
     let env = setup().await;
     let provider = env.ctx.ctx().catalog(CATALOG).unwrap();
     let schema = provider.schema(DB).unwrap();
     assert!(schema.table_exist("it"));
-    assert!(!schema.table_exist("ghost"));
-    assert!(!schema.table_exist("it$snapshots"));
+    assert!(schema.table_exist("ghost"));
+    assert!(schema.table_exist("it$snapshots"));
 }
 
 #[tokio::test]
@@ -676,13 +676,17 @@ async fn an_unsupported_time_travel_clause_on_a_paimon_table_is_rejected() {
     let ctx = SessionContext::new();
     ctx.register_catalog(
         CATALOG,
-        Arc::new(PaimonCatalogProvider::new(
-            Some(CATALOG.to_string()),
-            fs_catalog,
-            Default::default(),
-            Default::default(),
-            None,
-        )),
+        Arc::new(
+            PaimonCatalogProvider::try_new(
+                Some(CATALOG.to_string()),
+                fs_catalog,
+                Default::default(),
+                Default::default(),
+                None,
+            )
+            .await
+            .unwrap(),
+        ),
     );
     paimon_datafusion::register_catalog_table_engine(
         &ctx,
@@ -949,13 +953,17 @@ async fn registering_on_a_raw_session_installs_the_planner() {
     let ctx = SessionContext::new();
     ctx.register_catalog(
         CATALOG,
-        Arc::new(PaimonCatalogProvider::new(
-            Some(CATALOG.to_string()),
-            typed_catalog,
-            Default::default(),
-            Default::default(),
-            None,
-        )),
+        Arc::new(
+            PaimonCatalogProvider::try_new(
+                Some(CATALOG.to_string()),
+                typed_catalog,
+                Default::default(),
+                Default::default(),
+                None,
+            )
+            .await
+            .unwrap(),
+        ),
     );
     register_catalog_table_engine(
         &ctx,

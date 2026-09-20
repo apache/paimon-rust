@@ -49,6 +49,53 @@ pub(crate) type SessionStateProvider = Arc<dyn Fn() -> Option<SessionState> + Se
 /// providers, so registrations stay visible to schemas obtained earlier.
 type TableEngines = Arc<RwLock<HashMap<PaimonTableType, Arc<dyn TableEngineResolver>>>>;
 
+#[derive(Clone, Debug, Default)]
+struct CatalogMetadataSnapshot {
+    database_names: Vec<String>,
+    databases: HashMap<String, DatabaseMetadata>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DatabaseMetadata {
+    object_names: Vec<String>,
+    object_types: HashMap<String, TableType>,
+}
+
+type SharedCatalogMetadata = Arc<RwLock<Arc<CatalogMetadataSnapshot>>>;
+
+async fn load_database_metadata(
+    catalog: &dyn Catalog,
+    database: &str,
+) -> DFResult<DatabaseMetadata> {
+    let table_names = catalog
+        .list_tables(database)
+        .await
+        .map_err(to_datafusion_error)?;
+    let view_names = match catalog.list_views(database).await {
+        Ok(names) => names,
+        Err(paimon::Error::Unsupported { .. }) => vec![],
+        Err(error) => return Err(to_datafusion_error(error)),
+    };
+
+    let mut object_names = Vec::with_capacity(table_names.len() + view_names.len());
+    let mut object_types = HashMap::with_capacity(object_names.capacity());
+    for name in table_names {
+        if object_types.insert(name.clone(), TableType::Base).is_none() {
+            object_names.push(name);
+        }
+    }
+    for name in view_names {
+        if !object_types.contains_key(&name) {
+            object_types.insert(name.clone(), TableType::View);
+            object_names.push(name);
+        }
+    }
+    Ok(DatabaseMetadata {
+        object_names,
+        object_types,
+    })
+}
+
 /// What an engine is asked to resolve. Non-exhaustive so later releases can
 /// carry more of the request — a snapshot selector, say — without breaking
 /// existing resolvers.
@@ -232,8 +279,10 @@ pub fn register_catalog_table_engine(
 /// Provides an interface to manage and access multiple schemas (databases)
 /// within a Paimon [`Catalog`].
 ///
-/// This provider uses lazy loading - databases and tables are fetched
-/// on-demand from the catalog, ensuring data is always fresh.
+/// Database and object listings are refreshed asynchronously and served from an
+/// in-memory snapshot because DataFusion's catalog discovery callbacks are
+/// synchronous. Concrete tables are still loaded lazily by the async
+/// [`SchemaProvider::table`] callback.
 ///
 /// # Table-version clauses
 ///
@@ -265,6 +314,8 @@ pub struct PaimonCatalogProvider {
     /// Engines for table types served elsewhere, keyed by declared
     /// [`PaimonTableType`]. Same poison-recovery stance as `temp_tables`.
     table_engines: TableEngines,
+    /// Remotely refreshed metadata used by DataFusion's synchronous catalog callbacks.
+    metadata: SharedCatalogMetadata,
 }
 
 impl Debug for PaimonCatalogProvider {
@@ -275,6 +326,10 @@ impl Debug for PaimonCatalogProvider {
 
 impl PaimonCatalogProvider {
     /// Creates a new [`PaimonCatalogProvider`].
+    ///
+    /// The provider starts with an empty metadata snapshot. Call
+    /// [`Self::refresh_metadata`] before exposing it to DataFusion, or prefer
+    /// [`Self::try_new`] when an async construction boundary is available.
     pub fn new(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
@@ -291,7 +346,56 @@ impl PaimonCatalogProvider {
             session_state,
             schema_force_view_types: true,
             table_engines: Arc::new(RwLock::new(HashMap::new())),
+            metadata: Arc::new(RwLock::new(Arc::new(CatalogMetadataSnapshot::default()))),
         }
+    }
+
+    /// Creates a provider and initializes its metadata snapshot before returning it.
+    pub async fn try_new(
+        catalog_name: Option<String>,
+        catalog: Arc<dyn Catalog>,
+        dynamic_options: DynamicOptions,
+        blob_reader_registry: BlobReaderRegistry,
+        session_state: Option<SessionStateProvider>,
+    ) -> DFResult<Self> {
+        let provider = Self::new(
+            catalog_name,
+            catalog,
+            dynamic_options,
+            blob_reader_registry,
+            session_state,
+        );
+        provider.refresh_metadata().await?;
+        Ok(provider)
+    }
+
+    /// Refresh the metadata consumed by DataFusion's synchronous catalog callbacks.
+    ///
+    /// Remote calls finish before the shared snapshot is replaced, so readers either
+    /// observe the previous complete snapshot or the new complete snapshot.
+    pub async fn refresh_metadata(&self) -> DFResult<()> {
+        let mut database_names = self
+            .catalog
+            .list_databases()
+            .await
+            .map_err(to_datafusion_error)?;
+        let mut seen_databases = HashSet::new();
+        database_names.retain(|name| seen_databases.insert(name.clone()));
+
+        let mut databases = HashMap::with_capacity(database_names.len());
+        for database in &database_names {
+            databases.insert(
+                database.clone(),
+                load_database_metadata(self.catalog.as_ref(), database).await?,
+            );
+        }
+
+        let next = Arc::new(CatalogMetadataSnapshot {
+            database_names,
+            databases,
+        });
+        *self.metadata.write().unwrap_or_else(|e| e.into_inner()) = next;
+        Ok(())
     }
 
     /// Configure whether table schemas use Arrow view types when available.
@@ -333,79 +437,73 @@ impl PaimonCatalogProvider {
         Arc::clone(&self.table_engines)
     }
 
-    fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        let catalog = Arc::clone(&self.catalog);
-        let table_engines = self.table_engines();
-        let dynamic_options = Arc::clone(&self.dynamic_options);
-        let blob_reader_registry = self.blob_reader_registry.clone();
-        let catalog_name = self.catalog_name.clone();
-        let session_state = self.session_state.clone();
-        let schema_force_view_types = self.schema_force_view_types;
-        let name = name.to_string();
+    pub(crate) fn metadata_contains_object(&self, database: &str, name: &str) -> bool {
+        let object_name = system_tables::parse_object_name_for_datafusion(name)
+            .map(|object| object.table().to_string())
+            .unwrap_or_else(|_| name.to_string());
+        self.metadata
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .databases
+            .get(database)
+            .is_some_and(|metadata| metadata.object_types.contains_key(&object_name))
+    }
 
+    fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
         let temp_provider = {
             let databases = self.temp_tables.read().unwrap_or_else(|e| e.into_inner());
-            databases.get(&name).cloned()
+            databases.get(name).cloned()
         };
+        let catalog_has_database = self
+            .metadata
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .databases
+            .contains_key(name);
+        if !catalog_has_database && temp_provider.is_none() {
+            return None;
+        }
 
-        block_on_with_runtime(
-            async move {
-                match catalog.get_database(&name).await {
-                    Ok(_) => Some(Arc::new(
-                        PaimonSchemaProvider::new(
-                            catalog_name,
-                            Arc::clone(&catalog),
-                            name,
-                            dynamic_options,
-                            temp_provider,
-                            blob_reader_registry,
-                            session_state,
-                        )
-                        .with_schema_force_view_types(schema_force_view_types)
-                        .with_table_engines(Arc::clone(&table_engines)),
-                    ) as Arc<dyn SchemaProvider>),
-                    Err(paimon::Error::DatabaseNotExist { .. }) => {
-                        if temp_provider.is_some() {
-                            Some(Arc::new(
-                                PaimonSchemaProvider::new(
-                                    catalog_name,
-                                    Arc::clone(&catalog),
-                                    name,
-                                    dynamic_options,
-                                    temp_provider,
-                                    blob_reader_registry,
-                                    session_state,
-                                )
-                                .with_schema_force_view_types(schema_force_view_types)
-                                .with_table_engines(Arc::clone(&table_engines)),
-                            ) as Arc<dyn SchemaProvider>)
-                        } else {
-                            None
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("failed to get database '{}': {e}", name);
-                        None
-                    }
-                }
-            },
-            "paimon catalog access thread panicked",
-        )
+        Some(Arc::new(
+            PaimonSchemaProvider::new(
+                self.catalog_name.clone(),
+                Arc::clone(&self.catalog),
+                name.to_string(),
+                Arc::clone(&self.dynamic_options),
+                temp_provider,
+                self.blob_reader_registry.clone(),
+                self.session_state.clone(),
+            )
+            .with_schema_force_view_types(self.schema_force_view_types)
+            .with_table_engines(self.table_engines())
+            .with_metadata_snapshot(Arc::clone(&self.metadata)),
+        ) as Arc<dyn SchemaProvider>)
     }
 }
 
 impl CatalogProvider for PaimonCatalogProvider {
     fn schema_names(&self) -> Vec<String> {
-        let catalog = Arc::clone(&self.catalog);
-        block_on_with_runtime(
-            async move {
-                catalog.list_databases().await.unwrap_or_else(|e| {
-                    log::error!("failed to list databases: {e}");
-                    vec![]
-                })
-            },
-            "paimon catalog access thread panicked",
-        )
+        let mut names = self
+            .metadata
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .database_names
+            .clone();
+        let mut temp_names: Vec<_> = self
+            .temp_tables
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        temp_names.sort_unstable();
+        let mut seen: HashSet<_> = names.iter().cloned().collect();
+        names.extend(
+            temp_names
+                .into_iter()
+                .filter(|name| seen.insert(name.clone())),
+        );
+        names
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
@@ -423,6 +521,8 @@ impl CatalogProvider for PaimonCatalogProvider {
         let catalog_name = self.catalog_name.clone();
         let session_state = self.session_state.clone();
         let schema_force_view_types = self.schema_force_view_types;
+        let table_engines = self.table_engines();
+        let metadata = Arc::clone(&self.metadata);
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -430,6 +530,15 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .create_database(&name, false, HashMap::new())
                     .await
                     .map_err(to_datafusion_error)?;
+                {
+                    let mut current = metadata.write().unwrap_or_else(|e| e.into_inner());
+                    let mut next = (**current).clone();
+                    if !next.database_names.contains(&name) {
+                        next.database_names.push(name.clone());
+                    }
+                    next.databases.entry(name.clone()).or_default();
+                    *current = Arc::new(next);
+                }
                 Ok(Some(Arc::new(
                     PaimonSchemaProvider::new(
                         catalog_name,
@@ -440,7 +549,9 @@ impl CatalogProvider for PaimonCatalogProvider {
                         blob_reader_registry,
                         session_state,
                     )
-                    .with_schema_force_view_types(schema_force_view_types),
+                    .with_schema_force_view_types(schema_force_view_types)
+                    .with_table_engines(table_engines)
+                    .with_metadata_snapshot(metadata),
                 ) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
@@ -458,6 +569,8 @@ impl CatalogProvider for PaimonCatalogProvider {
         let catalog_name = self.catalog_name.clone();
         let session_state = self.session_state.clone();
         let schema_force_view_types = self.schema_force_view_types;
+        let table_engines = self.table_engines();
+        let metadata = Arc::clone(&self.metadata);
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -465,6 +578,13 @@ impl CatalogProvider for PaimonCatalogProvider {
                     .drop_database(&name, false, cascade)
                     .await
                     .map_err(to_datafusion_error)?;
+                {
+                    let mut current = metadata.write().unwrap_or_else(|e| e.into_inner());
+                    let mut next = (**current).clone();
+                    next.database_names.retain(|database| database != &name);
+                    next.databases.remove(&name);
+                    *current = Arc::new(next);
+                }
                 Ok(Some(Arc::new(
                     PaimonSchemaProvider::new(
                         catalog_name,
@@ -475,7 +595,9 @@ impl CatalogProvider for PaimonCatalogProvider {
                         blob_reader_registry,
                         session_state,
                     )
-                    .with_schema_force_view_types(schema_force_view_types),
+                    .with_schema_force_view_types(schema_force_view_types)
+                    .with_table_engines(table_engines)
+                    .with_metadata_snapshot(metadata),
                 ) as Arc<dyn SchemaProvider>))
             },
             "paimon catalog access thread panicked",
@@ -495,21 +617,15 @@ impl PaimonCatalogProvider {
         table_name: &str,
         table: Arc<dyn TableProvider>,
     ) -> DFResult<()> {
-        // Warn if this shadows a real Paimon table (outside the lock — not critical)
-        let catalog = Arc::clone(&self.catalog);
-        let db = database.to_string();
-        let tbl = table_name.to_string();
-        let identifier = Identifier::new(db, tbl);
-        if let Ok(true) = block_on_with_runtime(
-            async move {
-                match catalog.get_table(&identifier).await {
-                    Ok(_) => Ok::<bool, paimon::Error>(true),
-                    Err(paimon::Error::TableNotExist { .. }) => Ok(false),
-                    Err(_) => Ok(false),
-                }
-            },
-            "paimon catalog access thread panicked",
-        ) {
+        // The warning is best-effort and must not turn this synchronous API into remote I/O.
+        if self
+            .metadata
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .databases
+            .get(database)
+            .is_some_and(|metadata| metadata.object_types.contains_key(table_name))
+        {
             log::warn!(
                 "Temporary table '{database}.{table_name}' shadows an existing Paimon table"
             );
@@ -575,8 +691,8 @@ pub struct PaimonSchemaProvider {
     dynamic_options: DynamicOptions,
     /// Optional temporary in-memory provider for temp tables and views.
     temp_provider: Option<Arc<MemorySchemaProvider>>,
-    /// Table types populated together with `table_names` for metadata-only lookups.
-    catalog_table_types: RwLock<HashMap<String, TableType>>,
+    /// Shared metadata used by synchronous schema callbacks.
+    metadata: SharedCatalogMetadata,
     blob_reader_registry: BlobReaderRegistry,
     session_state: Option<SessionStateProvider>,
     schema_force_view_types: bool,
@@ -595,6 +711,10 @@ impl Debug for PaimonSchemaProvider {
 
 impl PaimonSchemaProvider {
     /// Creates a new [`PaimonSchemaProvider`].
+    ///
+    /// The provider starts with an empty metadata snapshot. Call
+    /// [`Self::refresh_metadata`] before exposing it to DataFusion, or prefer
+    /// [`Self::try_new`] when an async construction boundary is available.
     pub fn new(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
@@ -610,12 +730,48 @@ impl PaimonSchemaProvider {
             database,
             dynamic_options,
             temp_provider,
-            catalog_table_types: RwLock::new(HashMap::new()),
+            metadata: Arc::new(RwLock::new(Arc::new(CatalogMetadataSnapshot::default()))),
             blob_reader_registry,
             session_state,
             schema_force_view_types: true,
             table_engines: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Creates a schema provider and initializes its metadata snapshot.
+    pub async fn try_new(
+        catalog_name: Option<String>,
+        catalog: Arc<dyn Catalog>,
+        database: String,
+        dynamic_options: DynamicOptions,
+        temp_provider: Option<Arc<MemorySchemaProvider>>,
+        blob_reader_registry: BlobReaderRegistry,
+        session_state: Option<SessionStateProvider>,
+    ) -> DFResult<Self> {
+        let provider = Self::new(
+            catalog_name,
+            catalog,
+            database,
+            dynamic_options,
+            temp_provider,
+            blob_reader_registry,
+            session_state,
+        );
+        provider.refresh_metadata().await?;
+        Ok(provider)
+    }
+
+    /// Refresh this database in the snapshot used by synchronous callbacks.
+    pub async fn refresh_metadata(&self) -> DFResult<()> {
+        let database = load_database_metadata(self.catalog.as_ref(), &self.database).await?;
+        let mut current = self.metadata.write().unwrap_or_else(|e| e.into_inner());
+        let mut next = (**current).clone();
+        if !next.database_names.contains(&self.database) {
+            next.database_names.push(self.database.clone());
+        }
+        next.databases.insert(self.database.clone(), database);
+        *current = Arc::new(next);
+        Ok(())
     }
 
     fn with_schema_force_view_types(mut self, schema_force_view_types: bool) -> Self {
@@ -627,52 +783,24 @@ impl PaimonSchemaProvider {
         self.table_engines = table_engines;
         self
     }
+
+    fn with_metadata_snapshot(mut self, metadata: SharedCatalogMetadata) -> Self {
+        self.metadata = metadata;
+        self
+    }
 }
 
 #[async_trait]
 impl SchemaProvider for PaimonSchemaProvider {
     fn table_names(&self) -> Vec<String> {
-        let catalog = Arc::clone(&self.catalog);
-        let database = self.database.clone();
-        let (mut names, views) = block_on_with_runtime(
-            {
-                let db = database.clone();
-                async move {
-                    let names = match catalog.list_tables(&db).await {
-                        Ok(names) => names,
-                        Err(e) => {
-                            log::error!("failed to list tables in '{}': {e}", db);
-                            vec![]
-                        }
-                    };
-                    let views = match catalog.list_views(&db).await {
-                        Ok(views) => views,
-                        Err(paimon::Error::Unsupported { .. }) => vec![],
-                        Err(error) => {
-                            log::error!("failed to list views in '{}': {error}", db);
-                            vec![]
-                        }
-                    };
-                    (names, views)
-                }
-            },
-            "paimon catalog access thread panicked",
-        );
-
-        let mut catalog_table_types = HashMap::with_capacity(names.len() + views.len());
-        for name in &names {
-            catalog_table_types.insert(name.clone(), TableType::Base);
-        }
-        for view in views {
-            catalog_table_types
-                .entry(view.clone())
-                .or_insert(TableType::View);
-            names.push(view);
-        }
-        *self
-            .catalog_table_types
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = catalog_table_types;
+        let mut names = self
+            .metadata
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .databases
+            .get(&self.database)
+            .map(|database| database.object_names.clone())
+            .unwrap_or_default();
 
         if let Some(temp) = &self.temp_provider {
             names.extend(temp.table_names());
@@ -897,10 +1025,12 @@ impl SchemaProvider for PaimonSchemaProvider {
         }
 
         if let Some(table_type) = self
-            .catalog_table_types
+            .metadata
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(name)
+            .databases
+            .get(&self.database)
+            .and_then(|database| database.object_types.get(name))
         {
             return Ok(Some(*table_type));
         }
@@ -924,101 +1054,22 @@ impl SchemaProvider for PaimonSchemaProvider {
                 return false;
             }
         };
-        if let Some(system_name) = object.system_table() {
-            if !system_tables::is_registered(system_name) {
-                return false;
-            }
+        if object
+            .system_table()
+            .is_some_and(|system_name| !system_tables::is_registered(system_name))
+        {
+            return false;
         }
 
-        let catalog = Arc::clone(&self.catalog);
-        let identifier = Identifier::new(self.database.clone(), object.table().to_string());
-        let branch = object.branch().map(str::to_string);
-        let is_branches_table = object
-            .system_table()
-            .is_some_and(|name| name.eq_ignore_ascii_case("branches"));
-        let has_system_suffix = object.system_table().is_some();
-        let engines: HashMap<PaimonTableType, Arc<dyn TableEngineResolver>> = self
-            .table_engines
+        // This callback cannot await an external engine resolver. Treat a catalog
+        // declaration as existing and let async `table()` surface resolver absence
+        // or unsupported system-table access during planning.
+        self.metadata
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        block_on_with_runtime(
-            async move {
-                match catalog.load_table(&identifier).await {
-                    Ok(paimon::catalog::LoadedTable::Object(_)) => {
-                        branch.is_none() && !has_system_suffix
-                    }
-                    Ok(paimon::catalog::LoadedTable::External(external)) => {
-                        let declared = external.declared();
-                        // Paimon-only; `table()` rejects them here too.
-                        if branch.is_some() || has_system_suffix {
-                            return false;
-                        }
-                        match engines.get(&declared) {
-                            Some(resolver) => match resolver
-                                .resolve_table(&EngineTableRequest::new(
-                                    identifier.database().to_string(),
-                                    identifier.object().to_string(),
-                                    declared,
-                                ))
-                                .await
-                            {
-                                Ok(table) => table.is_some(),
-                                // Report failures as existing so `table()`
-                                // surfaces the real error.
-                                Err(err) => {
-                                    log::warn!(
-                                        "failed to probe engine table existence for '{}': {err}",
-                                        identifier.full_name()
-                                    );
-                                    true
-                                }
-                            },
-                            // `table()` returns a metadata-only provider in this
-                            // case, so the SchemaProvider existence contract
-                            // requires the same answer here.
-                            None => true,
-                        }
-                    }
-                    Ok(paimon::catalog::LoadedTable::Paimon(table)) => {
-                        if let Some(branch) = branch.as_deref() {
-                            if is_branches_table {
-                                return true;
-                            }
-                            (*table).copy_with_branch(branch).await.is_ok()
-                        } else {
-                            true
-                        }
-                    }
-                    Err(paimon::Error::TableNotExist { .. }) => {
-                        if branch.is_some() {
-                            return false;
-                        }
-                        match catalog.get_view(&identifier).await {
-                            Ok(_) => true,
-                            Err(paimon::Error::ViewNotExist { .. })
-                            | Err(paimon::Error::Unsupported { .. }) => false,
-                            Err(error) => {
-                                log::error!("failed to check view '{}': {error}", identifier);
-                                false
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("failed to check table '{}': {e}", identifier);
-                        false
-                    }
-                    Ok(_) => {
-                        log::error!(
-                            "catalog returned an unsupported loaded table kind for '{}'",
-                            identifier
-                        );
-                        false
-                    }
-                }
-            },
-            "paimon catalog access thread panicked",
-        )
+            .databases
+            .get(&self.database)
+            .is_some_and(|database| database.object_types.contains_key(object.table()))
     }
 
     fn register_table(
@@ -1033,7 +1084,10 @@ impl SchemaProvider for PaimonSchemaProvider {
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let catalog = Arc::clone(&self.catalog);
-        let identifier = Identifier::new(self.database.clone(), name);
+        let database = self.database.clone();
+        let identifier = Identifier::new(database.clone(), name);
+        let metadata = Arc::clone(&self.metadata);
+        let name = name.to_string();
         block_on_with_runtime(
             async move {
                 // Try to get the table first so we can return it.
@@ -1047,6 +1101,15 @@ impl SchemaProvider for PaimonSchemaProvider {
                     .drop_table(&identifier, false)
                     .await
                     .map_err(to_datafusion_error)?;
+                {
+                    let mut current = metadata.write().unwrap_or_else(|e| e.into_inner());
+                    let mut next = (**current).clone();
+                    if let Some(database) = next.databases.get_mut(&database) {
+                        database.object_names.retain(|object| object != &name);
+                        database.object_types.remove(&name);
+                    }
+                    *current = Arc::new(next);
+                }
                 Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>))
             },
             "paimon catalog access thread panicked",

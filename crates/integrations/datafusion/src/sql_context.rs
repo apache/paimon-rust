@@ -67,8 +67,9 @@ use datafusion::sql::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, BinaryLength, CharacterLength, ColumnDef,
     ColumnOption, CreateFunction, CreateFunctionBody, CreateTable, CreateTableOptions, CreateView,
     Delete, Expr as SqlExpr, FromTable, FunctionBehavior, FunctionReturnType, Ident, Insert, Merge,
-    ObjectName, ObjectType, RenameTableNameKind, Reset, ResetStatement, Set, ShowCreateObject,
-    SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Use, Value as SqlValue,
+    ObjectName, ObjectType, RenameTableNameKind, Reset, ResetStatement, SchemaName, Set,
+    ShowCreateObject, SqlOption, Statement, TableFactor, TableObject, Truncate, Update, Use,
+    Value as SqlValue,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -252,16 +253,17 @@ impl SQLContext {
         let weak_state = self.ctx.state_weak_ref();
         let session_state: crate::catalog::SessionStateProvider =
             Arc::new(move || weak_state.upgrade().map(|state| state.read().clone()));
-        self.ctx.register_catalog(
-            &catalog_name,
-            Arc::new(crate::catalog::PaimonCatalogProvider::new(
+        let provider = Arc::new(
+            crate::catalog::PaimonCatalogProvider::try_new(
                 Some(catalog_name.clone()),
                 catalog.clone(),
                 self.dynamic_options.clone(),
                 self.blob_reader_registry.clone(),
                 Some(session_state),
-            )),
+            )
+            .await?,
         );
+        self.ctx.register_catalog(&catalog_name, provider);
         register_table_functions(
             &self.ctx,
             &catalog,
@@ -473,7 +475,12 @@ impl SQLContext {
             ));
         }
 
-        match &statements[0] {
+        if self.statement_needs_catalog_metadata(&statements[0])? {
+            self.refresh_all_catalog_metadata().await?;
+        }
+
+        let refresh_metadata_after = statement_changes_catalog_metadata(&statements[0]);
+        let result = match &statements[0] {
             Statement::ShowDatabases {
                 terse,
                 history,
@@ -515,6 +522,29 @@ impl SQLContext {
                 }
                 self.handle_create_database(db_name, *if_not_exists).await
             }
+            Statement::CreateSchema {
+                schema_name: SchemaName::Simple(schema_name),
+                if_not_exists,
+                with,
+                options,
+                default_collate_spec,
+                clone,
+            } => {
+                if with.as_ref().is_some_and(|options| !options.is_empty())
+                    || options.as_ref().is_some_and(|options| !options.is_empty())
+                    || default_collate_spec.is_some()
+                    || clone.is_some()
+                {
+                    return Err(DataFusionError::Plan(
+                        "CREATE SCHEMA options are not supported".to_string(),
+                    ));
+                }
+                self.handle_create_database(schema_name, *if_not_exists)
+                    .await
+            }
+            Statement::CreateSchema { .. } => Err(DataFusionError::Plan(
+                "CREATE SCHEMA AUTHORIZATION is not supported".to_string(),
+            )),
             Statement::Use(Use::Object(name)) => self.handle_use_database(name).await,
             Statement::CreateTable(create_table) => {
                 if create_table.temporary {
@@ -641,7 +671,7 @@ impl SQLContext {
                 }
             }
             Statement::Drop {
-                object_type: ObjectType::Database,
+                object_type: object_type @ (ObjectType::Database | ObjectType::Schema),
                 if_exists,
                 names,
                 cascade,
@@ -650,15 +680,21 @@ impl SQLContext {
                 temporary,
                 table,
             } => {
+                let object_name = if *object_type == ObjectType::Database {
+                    "DATABASE"
+                } else {
+                    "SCHEMA"
+                };
                 let [name] = names.as_slice() else {
-                    return Err(DataFusionError::Plan(
-                        "DROP DATABASE requires exactly one database".to_string(),
-                    ));
+                    return Err(DataFusionError::Plan(format!(
+                        "DROP {object_name} requires exactly one {}",
+                        object_name.to_ascii_lowercase()
+                    )));
                 };
                 if *restrict || *purge || *temporary || table.is_some() {
-                    return Err(DataFusionError::Plan(
-                        "DROP DATABASE options are not supported".to_string(),
-                    ));
+                    return Err(DataFusionError::Plan(format!(
+                        "DROP {object_name} options are not supported"
+                    )));
                 }
                 self.handle_drop_database(name, *if_exists, *cascade).await
             }
@@ -751,7 +787,73 @@ impl SQLContext {
                 self.ctx.sql(&expanded.to_string()).await
             }
             _ => self.ctx.sql(sql).await,
+        };
+
+        if refresh_metadata_after && result.is_ok() {
+            if let Err(error) = self.refresh_all_catalog_metadata().await {
+                log::warn!("catalog metadata refresh after DDL failed: {error}");
+            }
         }
+        result
+    }
+
+    fn statement_needs_catalog_metadata(&self, statement: &Statement) -> DFResult<bool> {
+        if matches!(
+            statement,
+            Statement::ShowTables { .. }
+                | Statement::ShowColumns { .. }
+                | Statement::ShowFunctions { .. }
+        ) {
+            return Ok(true);
+        }
+
+        let statement = datafusion::sql::parser::Statement::Statement(Box::new(statement.clone()));
+        let state = self.ctx.state();
+        let default_catalog = state.config_options().catalog.default_catalog.clone();
+        let default_schema = state.config_options().catalog.default_schema.clone();
+        for reference in state.resolve_table_references(&statement)? {
+            let schema = reference.schema().unwrap_or(&default_schema);
+            if schema.eq_ignore_ascii_case("information_schema") {
+                return Ok(true);
+            }
+
+            let catalog_name = reference.catalog().unwrap_or(&default_catalog);
+            if !self.catalogs.contains_key(catalog_name) {
+                continue;
+            }
+            let provider = self.ctx.catalog(catalog_name).ok_or_else(|| {
+                DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'"))
+            })?;
+            let provider = provider
+                .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Catalog '{catalog_name}' is not a Paimon catalog"
+                    ))
+                })?;
+            if !provider.metadata_contains_object(schema, reference.table()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn refresh_all_catalog_metadata(&self) -> DFResult<()> {
+        let catalog_names: Vec<_> = self.catalogs.keys().cloned().collect();
+        for catalog_name in catalog_names {
+            let provider = self.ctx.catalog(&catalog_name).ok_or_else(|| {
+                DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'"))
+            })?;
+            let provider = provider
+                .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Catalog '{catalog_name}' is not a Paimon catalog"
+                    ))
+                })?;
+            provider.refresh_metadata().await?;
+        }
+        Ok(())
     }
 
     /// Handle SQL queries containing time-travel syntax (`VERSION AS OF` / `TIMESTAMP AS OF`).
@@ -2301,6 +2403,23 @@ impl SQLContext {
     fn resolve_table_name(&self, name: &ObjectName) -> DFResult<Identifier> {
         let (_catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
         Ok(identifier)
+    }
+}
+
+fn statement_changes_catalog_metadata(statement: &Statement) -> bool {
+    match statement {
+        Statement::CreateDatabase { .. }
+        | Statement::CreateSchema { .. }
+        | Statement::AlterTable(_)
+        | Statement::Drop {
+            object_type:
+                ObjectType::Database | ObjectType::Schema | ObjectType::Table | ObjectType::View,
+            temporary: false,
+            ..
+        } => true,
+        Statement::CreateTable(create) => !create.temporary,
+        Statement::CreateView(create) => !create.temporary,
+        _ => false,
     }
 }
 
@@ -3905,7 +4024,24 @@ mod tests {
     #[async_trait]
     impl Catalog for MockCatalog {
         async fn list_databases(&self) -> paimon::Result<Vec<String>> {
-            Ok(vec![])
+            let mut databases = vec!["default".to_string()];
+            databases.extend(
+                self.functions
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .map(|identifier| identifier.database().to_string()),
+            );
+            databases.extend(
+                self.views
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .map(|identifier| identifier.database().to_string()),
+            );
+            databases.sort_unstable();
+            databases.dedup();
+            Ok(databases)
         }
         async fn create_database(
             &self,
@@ -6053,11 +6189,8 @@ mod tests {
 
         assert_eq!(
             catalog.table_identifiers(),
-            vec![
-                "analytics.vector_search",
-                "analytics.documents"
-            ],
-            "DataFusion may preload the UDTF name, then the function must resolve its table argument"
+            vec!["analytics.documents"],
+            "synchronous catalog callbacks must not probe the remote catalog for the UDTF name"
         );
         assert_eq!(
             catalog.get_view_count(),

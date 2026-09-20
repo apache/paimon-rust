@@ -520,6 +520,37 @@ def test_query_simple_table_via_catalog_provider():
     ]
 
 
+def test_catalog_provider_initializes_information_schema_snapshot():
+    with tempfile.TemporaryDirectory() as warehouse:
+        writer = SQLContext()
+        writer.register_catalog("paimon", {"warehouse": warehouse})
+        writer.sql("CREATE TABLE paimon.default.users (id INT, name STRING)")
+
+        catalog = PaimonCatalog({"warehouse": warehouse})
+        ctx = SessionContext()
+        ctx.register_catalog_provider("paimon", catalog)
+        batches = ctx.sql(
+            "SELECT column_name FROM paimon.information_schema.columns "
+            "WHERE table_schema = 'default' AND table_name = 'users'"
+        ).collect()
+
+        assert set(pa.Table.from_batches(batches)["column_name"].to_pylist()) == {
+            "id",
+            "name",
+        }
+
+        writer.sql("CREATE TABLE paimon.default.orders (order_id BIGINT)")
+        catalog.refresh_metadata()
+        batches = ctx.sql(
+            "SELECT table_name FROM paimon.information_schema.tables "
+            "WHERE table_schema = 'default'"
+        ).collect()
+        assert set(pa.Table.from_batches(batches)["table_name"].to_pylist()) == {
+            "orders",
+            "users",
+        }
+
+
 def test_catalog_provider_returns_pyarrow_compatible_strings():
     with tempfile.TemporaryDirectory() as warehouse:
         writer = SQLContext()

@@ -121,17 +121,28 @@ impl PaimonCatalog {
     #[new]
     fn new(py: Python<'_>, catalog_options: HashMap<String, String>) -> PyResult<Self> {
         let catalog = py.detach(|| build_paimon_catalog(catalog_options))?;
-        let provider = Arc::new(
-            PaimonCatalogProvider::new(
-                None,
-                Arc::clone(&catalog),
-                Default::default(),
-                Default::default(),
-                None,
-            )
-            .with_schema_force_view_types(false),
-        );
+        let provider = {
+            let catalog = Arc::clone(&catalog);
+            py.detach(|| {
+                runtime().block_on(PaimonCatalogProvider::try_new(
+                    None,
+                    catalog,
+                    Default::default(),
+                    Default::default(),
+                    None,
+                ))
+            })
+            .map_err(df_to_py_err)?
+        };
+        let provider = Arc::new(provider.with_schema_force_view_types(false));
         Ok(Self { catalog, provider })
+    }
+
+    /// Refresh the metadata snapshot used by synchronous DataFusion callbacks.
+    fn refresh_metadata(&self, py: Python<'_>) -> PyResult<()> {
+        let provider = Arc::clone(&self.provider);
+        py.detach(|| runtime().block_on(provider.refresh_metadata()))
+            .map_err(df_to_py_err)
     }
 
     /// Export this catalog as a DataFusion catalog provider PyCapsule.
