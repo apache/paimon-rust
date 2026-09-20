@@ -36,6 +36,7 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 use async_stream::try_stream;
 use futures::StreamExt;
 use roaring::RoaringBitmap;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -121,6 +122,7 @@ pub(crate) struct DataFileReader {
     blob_parallelism: usize,
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
+    table_options: Arc<HashMap<String, String>>,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
@@ -147,6 +149,7 @@ impl DataFileReader {
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             batch_size: None,
             parquet_read_budget: None,
+            table_options: Arc::new(HashMap::new()),
             mosaic_prefetch: MosaicPrefetchOptions::default(),
             read_timing: None,
         }
@@ -178,6 +181,14 @@ impl DataFileReader {
         parquet_read_budget: Option<Arc<ReadBudget>>,
     ) -> Self {
         self.parquet_read_budget = parquet_read_budget;
+        self
+    }
+
+    pub(crate) fn with_table_options(
+        mut self,
+        options: impl Into<Arc<HashMap<String, String>>>,
+    ) -> Self {
+        self.table_options = options.into();
         self
     }
 
@@ -463,10 +474,11 @@ impl DataFileReader {
             .flatten();
         let file_io = self.file_io.clone();
         let split = split.clone();
+        let batch_size = self.batch_size;
         let blob_as_descriptor = self.blob_as_descriptor;
         let blob_parallelism = self.blob_parallelism;
-        let batch_size = self.batch_size;
         let parquet_read_budget = self.parquet_read_budget.clone();
+        let table_options = Arc::clone(&self.table_options);
         let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
 
@@ -526,6 +538,7 @@ impl DataFileReader {
                 &path_to_read,
                 blob_as_descriptor,
                 &format_read_fields,
+                &table_options,
                 parquet_read_budget,
                 blob_parallelism,
                 mosaic_prefetch,
@@ -738,6 +751,7 @@ impl DataFileReader {
         let blob_as_descriptor = self.blob_as_descriptor;
         let blob_parallelism = self.blob_parallelism;
         let parquet_read_budget = self.parquet_read_budget.clone();
+        let table_options = Arc::clone(&self.table_options);
         let mosaic_prefetch = self.mosaic_prefetch;
 
         let target_schema = build_target_arrow_schema(&read_type)?;
@@ -802,6 +816,7 @@ impl DataFileReader {
                 &path_to_read,
                 blob_as_descriptor,
                 &format_read_fields,
+                &table_options,
                 parquet_read_budget,
                 blob_parallelism,
                 mosaic_prefetch,

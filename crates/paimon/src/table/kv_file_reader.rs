@@ -592,6 +592,7 @@ impl KeyValueFileReader {
                         )
                         .with_batch_size(Some(config.read_batch_size))
                         .with_parquet_read_budget(group_parquet_read_budget.clone())
+                        .with_table_options(config.table_options.clone())
                         .with_mosaic_prefetch(config.mosaic_prefetch);
                         let run_schema_manager = config.schema_manager.clone();
                         let run_file_io = file_io.clone();
