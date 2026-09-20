@@ -1106,26 +1106,6 @@ impl SQLContext {
                 })?;
                 Ok(())
             }
-            Statement::AlterTable(alter) => {
-                let (_, catalog_name, identifier) = self.resolve_catalog_and_table(&alter.name)?;
-                for operation in &alter.operations {
-                    if let AlterTableOperation::RenameTable { table_name } = operation {
-                        let name = match table_name {
-                            RenameTableNameKind::To(name) | RenameTableNameKind::As(name) => {
-                                object_name_to_string(name)
-                            }
-                        };
-                        self.update_catalog_metadata(&catalog_name, |provider| {
-                            provider.record_table_renamed(
-                                identifier.database(),
-                                identifier.object(),
-                                &name,
-                            )
-                        })?;
-                    }
-                }
-                Ok(())
-            }
             Statement::Drop {
                 object_type: ObjectType::Database | ObjectType::Schema,
                 names,
@@ -1838,7 +1818,7 @@ impl SQLContext {
         } else {
             Self::ensure_main_branch_write_target(name, "ALTER TABLE")?;
         }
-        let identifier = self.resolve_table_name(name)?;
+        let (_, catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
 
         if operations.len() > 1
             && operations
@@ -1967,10 +1947,24 @@ impl SQLContext {
         }
 
         if let Some(new_identifier) = rename_to {
-            catalog
-                .rename_table(&identifier, &new_identifier, if_exists)
+            match catalog
+                .rename_table(&identifier, &new_identifier, false)
                 .await
-                .map_err(to_datafusion_error)?;
+            {
+                Ok(()) => self.update_catalog_metadata(&catalog_name, |provider| {
+                    provider.record_table_renamed(
+                        identifier.database(),
+                        identifier.object(),
+                        new_identifier.object(),
+                    )
+                })?,
+                Err(paimon::Error::TableNotExist { .. }) if if_exists => {
+                    self.update_catalog_metadata(&catalog_name, |provider| {
+                        provider.record_object_dropped(identifier.database(), identifier.object())
+                    })?;
+                }
+                Err(error) => return Err(to_datafusion_error(error)),
+            }
         }
 
         if !changes.is_empty() {
@@ -7576,7 +7570,7 @@ mod tests {
             ignore_if_not_exists,
         } = &calls[0]
         {
-            assert!(ignore_if_not_exists);
+            assert!(!ignore_if_not_exists);
             assert_eq!(from.object(), "t1");
             assert_eq!(to.object(), "t2");
         } else {

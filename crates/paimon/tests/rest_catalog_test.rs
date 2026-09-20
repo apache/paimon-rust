@@ -36,7 +36,7 @@ use paimon::catalog::{Catalog, Function, FunctionDefinition, Identifier, RESTCat
 use paimon::common::Options;
 use paimon::spec::{
     BigIntType, BlobType, BlobViewStruct, DataField, DataType, Datum, IntType, PartitionStatistics,
-    PredicateBuilder, Schema, SchemaChange, VarCharType,
+    PredicateBuilder, Schema, SchemaChange, TableType, VarCharType,
 };
 use paimon::{CatalogOptions, FileSystemCatalog, Table};
 
@@ -835,6 +835,38 @@ async fn test_catalog_list_tables_empty() {
         tables.is_empty(),
         "expected empty tables list, got: {tables:?}"
     );
+}
+
+#[tokio::test]
+async fn test_catalog_lists_declared_table_types() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let table_schema = test_schema();
+    let object_schema = Schema::builder()
+        .column("ignored", DataType::Int(IntType::new()))
+        .option("type", "object-table")
+        .build()
+        .unwrap();
+    ctx.server.add_table_with_schema(
+        "default",
+        "plain",
+        table_schema,
+        "file:///tmp/test_warehouse/default.db/plain",
+    );
+    ctx.server.add_table_with_schema(
+        "default",
+        "objects",
+        object_schema,
+        "file:///tmp/test_warehouse/default.db/objects",
+    );
+
+    let table_types = ctx
+        .catalog
+        .list_table_types("default", &["plain".to_string(), "objects".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(table_types.get("plain"), Some(&TableType::Table));
+    assert_eq!(table_types.get("objects"), Some(&TableType::ObjectTable));
 }
 
 #[tokio::test]

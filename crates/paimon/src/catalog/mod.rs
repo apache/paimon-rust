@@ -444,6 +444,23 @@ pub trait Catalog: Send + Sync {
     /// * [`crate::Error::DatabaseNotExist`] - database does not exist.
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>>;
 
+    /// Return the declared type for the requested tables.
+    ///
+    /// Catalogs that can contain non-Paimon table types should override this method with an
+    /// implementation backed by their metadata store. The default preserves compatibility for
+    /// catalogs that only implement the original Paimon-only [`Self::list_tables`] contract.
+    async fn list_table_types(
+        &self,
+        _database_name: &str,
+        table_names: &[String],
+    ) -> Result<HashMap<String, TableType>> {
+        Ok(table_names
+            .iter()
+            .cloned()
+            .map(|name| (name, TableType::Table))
+            .collect())
+    }
+
     /// Create a table.
     ///
     /// * `ignore_if_exists` - if true, do nothing when the table already exists;

@@ -60,11 +60,20 @@ struct CatalogMetadataSnapshot {
 #[derive(Clone, Debug, Default)]
 struct DatabaseMetadata {
     objects: IndexMap<String, TableType>,
+    system_table_capabilities: HashMap<String, SystemTableCapability>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SystemTableCapability {
+    Paimon,
+    Unsupported,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ObjectResolution {
     Paimon,
+    Object,
     Routed,
     Unavailable,
 }
@@ -255,6 +264,16 @@ impl CatalogMetadataState {
             .copied()
     }
 
+    fn system_table_capabilities(&self, database: &str) -> HashMap<String, SystemTableCapability> {
+        self.snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .databases
+            .get(database)
+            .map(|metadata| metadata.system_table_capabilities.clone())
+            .unwrap_or_default()
+    }
+
     fn remove_object_resolution(&self, database: &str, object: &str) {
         self.object_resolutions
             .write()
@@ -348,6 +367,7 @@ async fn load_database_metadata(
     catalog: &dyn Catalog,
     database: &str,
     ignore_missing_views_endpoint: bool,
+    known_capabilities: HashMap<String, SystemTableCapability>,
 ) -> DFResult<DatabaseMetadata> {
     let tables = async {
         catalog
@@ -375,14 +395,51 @@ async fn load_database_metadata(
     };
     let (table_names, view_names) = futures::try_join!(tables, views)?;
 
+    let unresolved_names: Vec<_> = table_names
+        .iter()
+        .filter(|name| !known_capabilities.contains_key(*name))
+        .cloned()
+        .collect();
+    let declared_types = if unresolved_names.is_empty() {
+        HashMap::new()
+    } else {
+        match catalog.list_table_types(database, &unresolved_names).await {
+            Ok(types) => types,
+            Err(error) => {
+                log::debug!(
+                    "unable to classify table types while refreshing database '{database}': \
+                     {error}"
+                );
+                HashMap::new()
+            }
+        }
+    };
+
     let mut objects = IndexMap::with_capacity(table_names.len() + view_names.len());
+    let mut system_table_capabilities = HashMap::with_capacity(table_names.len());
     for name in table_names {
+        let capability = known_capabilities.get(&name).copied().unwrap_or_else(|| {
+            declared_types
+                .get(&name)
+                .map(|table_type| {
+                    if table_type.requires_table_engine() {
+                        SystemTableCapability::Unsupported
+                    } else {
+                        SystemTableCapability::Paimon
+                    }
+                })
+                .unwrap_or(SystemTableCapability::Unknown)
+        });
+        system_table_capabilities.insert(name.clone(), capability);
         objects.entry(name).or_insert(TableType::Base);
     }
     for name in view_names {
         objects.entry(name).or_insert(TableType::View);
     }
-    Ok(DatabaseMetadata { objects })
+    Ok(DatabaseMetadata {
+        objects,
+        system_table_capabilities,
+    })
 }
 
 /// What an engine is asked to resolve. Non-exhaustive so later releases can
@@ -611,26 +668,6 @@ impl Debug for PaimonCatalogProvider {
 impl PaimonCatalogProvider {
     /// Creates a provider with an empty metadata snapshot.
     ///
-    /// This preserves the original synchronous constructor signature. New callers should use
-    /// [`Self::try_new`] so discovery callbacks are not exposed before metadata is initialized.
-    pub fn new(
-        catalog_name: Option<String>,
-        catalog: Arc<dyn Catalog>,
-        dynamic_options: DynamicOptions,
-        blob_reader_registry: BlobReaderRegistry,
-        session_state: Option<SessionStateProvider>,
-    ) -> Self {
-        Self::new_uninitialized(
-            catalog_name,
-            catalog,
-            dynamic_options,
-            blob_reader_registry,
-            session_state,
-        )
-    }
-
-    /// Creates a provider with an empty metadata snapshot.
-    ///
     /// Callers must refresh it before exposing synchronous discovery callbacks.
     pub fn new_uninitialized(
         catalog_name: Option<String>,
@@ -653,6 +690,26 @@ impl PaimonCatalogProvider {
     }
 
     /// Creates a provider with an initialized metadata snapshot.
+    ///
+    /// The old synchronous `new` entry point is intentionally unavailable because it cannot
+    /// return a ready metadata snapshot. Use this constructor, or choose
+    /// [`Self::new_uninitialized`] explicitly and call [`Self::initialize_metadata`] before
+    /// exposing synchronous discovery callbacks.
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// use paimon::Catalog;
+    /// use paimon_datafusion::PaimonCatalogProvider;
+    ///
+    /// let catalog: Arc<dyn Catalog> = todo!();
+    /// let _ = PaimonCatalogProvider::new(
+    ///     None,
+    ///     catalog,
+    ///     Default::default(),
+    ///     Default::default(),
+    ///     None,
+    /// );
+    /// ```
     pub async fn try_new(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
@@ -695,14 +752,18 @@ impl PaimonCatalogProvider {
         database_names.retain(|name| seen_databases.insert(name.clone()));
 
         let entries: HashMap<_, _> = stream::iter(database_names.iter().cloned())
-            .map(|database| async move {
-                let metadata = load_database_metadata(
-                    self.catalog.as_ref(),
-                    database.as_str(),
-                    ignore_missing_views_endpoint,
-                )
-                .await?;
-                Ok::<_, datafusion::error::DataFusionError>((database, metadata))
+            .map(|database| {
+                let known_capabilities = self.metadata.system_table_capabilities(&database);
+                async move {
+                    let metadata = load_database_metadata(
+                        self.catalog.as_ref(),
+                        database.as_str(),
+                        ignore_missing_views_endpoint,
+                        known_capabilities,
+                    )
+                    .await?;
+                    Ok::<_, datafusion::error::DataFusionError>((database, metadata))
+                }
             })
             .buffer_unordered(MAX_CONCURRENT_METADATA_LISTINGS)
             .try_collect()
@@ -761,6 +822,7 @@ impl PaimonCatalogProvider {
                 self.catalog.as_ref(),
                 database,
                 ignore_missing_views_endpoint,
+                self.metadata.system_table_capabilities(database),
             )
             .await?;
             if self.metadata.publish_database(
@@ -842,9 +904,15 @@ impl PaimonCatalogProvider {
                 .databases
                 .entry(database.to_string())
                 .or_insert_with(|| Arc::new(DatabaseMetadata::default()));
-            Arc::make_mut(database)
-                .objects
-                .insert(name.to_string(), table_type);
+            let database = Arc::make_mut(database);
+            database.objects.insert(name.to_string(), table_type);
+            if table_type == TableType::Base {
+                database
+                    .system_table_capabilities
+                    .insert(name.to_string(), SystemTableCapability::Paimon);
+            } else {
+                database.system_table_capabilities.remove(name);
+            }
         });
         if table_type == TableType::Base {
             self.metadata
@@ -872,7 +940,9 @@ impl PaimonCatalogProvider {
     pub(crate) fn record_object_dropped(&self, database: &str, name: &str) {
         self.metadata.mutate_database(database, |next| {
             if let Some(metadata) = next.databases.get_mut(database) {
-                Arc::make_mut(metadata).objects.shift_remove(name);
+                let metadata = Arc::make_mut(metadata);
+                metadata.objects.shift_remove(name);
+                metadata.system_table_capabilities.remove(name);
             }
         });
         self.metadata.remove_object_resolution(database, name);
@@ -882,9 +952,15 @@ impl PaimonCatalogProvider {
         let mut renamed = false;
         self.metadata.mutate_database(database, |next| {
             if let Some(metadata) = next.databases.get_mut(database) {
-                let objects = &mut Arc::make_mut(metadata).objects;
+                let metadata = Arc::make_mut(metadata);
+                let objects = &mut metadata.objects;
                 if let Some(table_type) = objects.shift_remove(from) {
                     objects.insert(to.to_string(), table_type);
+                    if let Some(capability) = metadata.system_table_capabilities.remove(from) {
+                        metadata
+                            .system_table_capabilities
+                            .insert(to.to_string(), capability);
+                    }
                     renamed = true;
                 }
             }
@@ -1150,31 +1226,7 @@ impl Debug for PaimonSchemaProvider {
 
 impl PaimonSchemaProvider {
     /// Creates a schema provider with an empty metadata snapshot.
-    ///
-    /// This preserves the original synchronous constructor signature. New callers should use
-    /// [`Self::try_new`] so discovery callbacks are not exposed before metadata is initialized.
-    pub fn new(
-        catalog_name: Option<String>,
-        catalog: Arc<dyn Catalog>,
-        database: String,
-        dynamic_options: DynamicOptions,
-        temp_provider: Option<Arc<MemorySchemaProvider>>,
-        blob_reader_registry: BlobReaderRegistry,
-        session_state: Option<SessionStateProvider>,
-    ) -> Self {
-        Self::new_uninitialized(
-            catalog_name,
-            catalog,
-            database,
-            dynamic_options,
-            temp_provider,
-            blob_reader_registry,
-            session_state,
-        )
-    }
-
-    /// Creates a schema provider with an empty metadata snapshot.
-    fn new_uninitialized(
+    pub fn new_uninitialized(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         database: String,
@@ -1198,6 +1250,28 @@ impl PaimonSchemaProvider {
     }
 
     /// Creates a schema provider with initialized metadata.
+    ///
+    /// The old synchronous `new` entry point is intentionally unavailable because it cannot
+    /// return a ready metadata snapshot. Use this constructor, or choose
+    /// [`Self::new_uninitialized`] explicitly and call [`Self::initialize_metadata`] before
+    /// exposing synchronous discovery callbacks.
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// use paimon::Catalog;
+    /// use paimon_datafusion::PaimonSchemaProvider;
+    ///
+    /// let catalog: Arc<dyn Catalog> = todo!();
+    /// let _ = PaimonSchemaProvider::new(
+    ///     None,
+    ///     catalog,
+    ///     "default".to_string(),
+    ///     Default::default(),
+    ///     None,
+    ///     Default::default(),
+    ///     None,
+    /// );
+    /// ```
     pub async fn try_new(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
@@ -1236,6 +1310,7 @@ impl PaimonSchemaProvider {
             self.catalog.as_ref(),
             &self.database,
             ignore_missing_views_endpoint,
+            self.metadata.system_table_capabilities(&self.database),
         )
         .await?;
         if !self.metadata.publish_database(
@@ -1341,7 +1416,7 @@ impl SchemaProvider for PaimonSchemaProvider {
                     metadata.set_object_resolution(
                         identifier.database(),
                         identifier.object(),
-                        ObjectResolution::Paimon,
+                        ObjectResolution::Object,
                     );
                     if branch.is_some() {
                         return Err(plan_datafusion_err!(
@@ -1565,14 +1640,22 @@ impl SchemaProvider for PaimonSchemaProvider {
         {
             return false;
         }
-        let table_type = self
+        let (table_type, snapshot_capability) = self
             .metadata
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .databases
             .get(&self.database)
-            .and_then(|database| database.objects.get(object.table()))
-            .copied();
+            .map(|database| {
+                (
+                    database.objects.get(object.table()).copied(),
+                    database
+                        .system_table_capabilities
+                        .get(object.table())
+                        .copied(),
+                )
+            })
+            .unwrap_or((None, None));
         let resolution = self
             .metadata
             .object_resolution(&self.database, object.table());
@@ -1580,8 +1663,16 @@ impl SchemaProvider for PaimonSchemaProvider {
             return false;
         }
         if object.system_table().is_some() {
-            return table_type == Some(TableType::Base)
-                && resolution != Some(ObjectResolution::Routed);
+            let supports_system_tables = match resolution {
+                Some(ObjectResolution::Paimon) => true,
+                Some(
+                    ObjectResolution::Object
+                    | ObjectResolution::Routed
+                    | ObjectResolution::Unavailable,
+                ) => false,
+                None => snapshot_capability == Some(SystemTableCapability::Paimon),
+            };
+            return table_type == Some(TableType::Base) && supports_system_tables;
         }
         table_type.is_some()
     }

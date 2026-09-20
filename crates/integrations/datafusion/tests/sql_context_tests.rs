@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, Int64Array};
-use datafusion::catalog::CatalogProvider;
+use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::MemTable;
 use paimon::catalog::{list_partitions_from_file_system, Identifier};
 use paimon::spec::{
@@ -74,10 +74,13 @@ struct MetadataListingCatalog {
     release_blocked_list_tables: Notify,
     table_names: Mutex<Vec<String>>,
     table_names_by_database: Mutex<std::collections::HashMap<String, Vec<String>>>,
+    list_table_types_calls: AtomicUsize,
     listing_concurrency: Option<Arc<MetadataListingConcurrency>>,
     block_drop_response: AtomicBool,
     drop_committed: Notify,
     release_drop_response: Notify,
+    rename_source_missing: AtomicBool,
+    rename_ignore_flags: Mutex<Vec<bool>>,
 }
 
 #[derive(Default)]
@@ -129,10 +132,13 @@ impl MetadataListingCatalog {
             release_blocked_list_tables: Notify::new(),
             table_names: Mutex::new(vec!["metadata_only".to_string()]),
             table_names_by_database: Mutex::new(std::collections::HashMap::new()),
+            list_table_types_calls: AtomicUsize::new(0),
             listing_concurrency: None,
             block_drop_response: AtomicBool::new(false),
             drop_committed: Notify::new(),
             release_drop_response: Notify::new(),
+            rename_source_missing: AtomicBool::new(false),
+            rename_ignore_flags: Mutex::new(Vec::new()),
         }
     }
 
@@ -195,6 +201,10 @@ impl MetadataListingCatalog {
             .unwrap_or_default()
     }
 
+    fn list_table_types_calls(&self) -> usize {
+        self.list_table_types_calls.load(Ordering::SeqCst)
+    }
+
     fn race_next_refreshes(&self) {
         self.racing_list_tables_calls.store(0, Ordering::SeqCst);
         self.race_refreshes.store(true, Ordering::SeqCst);
@@ -220,6 +230,14 @@ impl MetadataListingCatalog {
 
     fn block_next_drop_response(&self) {
         self.block_drop_response.store(true, Ordering::SeqCst);
+    }
+
+    fn mark_rename_source_missing(&self) {
+        self.rename_source_missing.store(true, Ordering::SeqCst);
+    }
+
+    fn rename_ignore_flags(&self) -> Vec<bool> {
+        self.rename_ignore_flags.lock().unwrap().clone()
     }
 
     fn record_remote_call(&self) {
@@ -360,6 +378,19 @@ impl Catalog for MetadataListingCatalog {
         Ok(table_names)
     }
 
+    async fn list_table_types(
+        &self,
+        _database_name: &str,
+        table_names: &[String],
+    ) -> paimon::Result<std::collections::HashMap<String, paimon::spec::TableType>> {
+        self.list_table_types_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(table_names
+            .iter()
+            .cloned()
+            .map(|name| (name, paimon::spec::TableType::Table))
+            .collect())
+    }
+
     async fn list_views(&self, _database_name: &str) -> paimon::Result<Vec<String>> {
         self.record_remote_call();
         if self.require_parallel_object_listing.load(Ordering::SeqCst) {
@@ -391,10 +422,22 @@ impl Catalog for MetadataListingCatalog {
 
     async fn rename_table(
         &self,
-        _from: &Identifier,
+        from: &Identifier,
         _to: &Identifier,
-        _ignore_if_not_exists: bool,
+        ignore_if_not_exists: bool,
     ) -> paimon::Result<()> {
+        self.rename_ignore_flags
+            .lock()
+            .unwrap()
+            .push(ignore_if_not_exists);
+        if self.rename_source_missing.load(Ordering::SeqCst) {
+            if ignore_if_not_exists {
+                return Ok(());
+            }
+            return Err(paimon::Error::TableNotExist {
+                full_name: from.full_name(),
+            });
+        }
         Ok(())
     }
 
@@ -446,19 +489,52 @@ async fn test_public_catalog_constructor_returns_ready_provider() {
     .unwrap();
 
     assert_eq!(provider.schema_names(), vec!["default"]);
+    assert_eq!(
+        provider.schema("default").unwrap().table_names(),
+        vec!["metadata_only", "metadata_view"]
+    );
 }
 
-#[test]
-fn test_public_provider_constructors_remain_synchronous() {
+#[tokio::test]
+async fn test_metadata_refresh_classifies_only_new_objects() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    catalog.set_table_names(vec!["existing"]);
+    let provider = PaimonCatalogProvider::try_new(
+        Some("paimon".to_string()),
+        catalog.clone(),
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(catalog.list_table_types_calls(), 1);
+
+    provider.refresh_metadata().await.unwrap();
+    assert_eq!(catalog.list_table_types_calls(), 1);
+
+    catalog.set_table_names(vec!["existing", "discovered"]);
+    provider.refresh_metadata().await.unwrap();
+    assert_eq!(catalog.list_table_types_calls(), 2);
+    provider.refresh_metadata().await.unwrap();
+    assert_eq!(catalog.list_table_types_calls(), 2);
+}
+
+#[tokio::test]
+async fn test_explicit_uninitialized_providers_require_metadata_initialization() {
     let catalog: Arc<dyn Catalog> = Arc::new(MetadataListingCatalog::new());
-    let _: PaimonCatalogProvider = PaimonCatalogProvider::new(
+    let catalog_provider = PaimonCatalogProvider::new_uninitialized(
         Some("paimon".to_string()),
         Arc::clone(&catalog),
         Default::default(),
         Default::default(),
         None,
     );
-    let _: PaimonSchemaProvider = PaimonSchemaProvider::new(
+    assert!(catalog_provider.schema_names().is_empty());
+    catalog_provider.initialize_metadata().await.unwrap();
+    assert_eq!(catalog_provider.schema_names(), vec!["default"]);
+
+    let schema_provider = PaimonSchemaProvider::new_uninitialized(
         Some("paimon".to_string()),
         catalog,
         "default".to_string(),
@@ -466,6 +542,12 @@ fn test_public_provider_constructors_remain_synchronous() {
         None,
         Default::default(),
         None,
+    );
+    assert!(schema_provider.table_names().is_empty());
+    schema_provider.initialize_metadata().await.unwrap();
+    assert_eq!(
+        schema_provider.table_names(),
+        vec!["metadata_only", "metadata_view"]
     );
 }
 
@@ -1214,6 +1296,30 @@ async fn test_alter_table_if_exists_does_not_create_phantom_rename_delta() {
     let schema = provider.schema("default").unwrap();
     assert!(!schema.table_exist("missing"));
     assert!(!schema.table_exist("phantom"));
+}
+
+#[tokio::test]
+async fn test_alter_table_if_exists_reconciles_stale_positive_rename_source() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    catalog.set_table_names(vec!["source"]);
+    let mut sql_context = SQLContext::new();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+
+    catalog.set_table_names(vec![]);
+    catalog.mark_rename_source_missing();
+    sql_context
+        .sql("ALTER TABLE IF EXISTS source RENAME TO phantom")
+        .await
+        .unwrap();
+
+    let provider = sql_context.ctx().catalog("paimon").unwrap();
+    let schema = provider.schema("default").unwrap();
+    assert!(!schema.table_exist("source"));
+    assert!(!schema.table_exist("phantom"));
+    assert_eq!(catalog.rename_ignore_flags(), vec![false]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

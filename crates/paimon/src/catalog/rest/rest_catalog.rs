@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::{stream, StreamExt, TryStreamExt};
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
@@ -37,7 +38,7 @@ use crate::catalog::{
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
-use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange};
+use crate::spec::{CoreOptions, Partition, PartitionStatistics, Schema, SchemaChange, TableType};
 use crate::table::{RESTEnv, Table};
 use crate::Result;
 
@@ -324,6 +325,32 @@ impl Catalog for RESTCatalog {
             .list_tables(database_name)
             .await
             .map_err(|e| map_rest_error_for_database(e, database_name))
+    }
+
+    async fn list_table_types(
+        &self,
+        database_name: &str,
+        table_names: &[String],
+    ) -> Result<HashMap<String, TableType>> {
+        stream::iter(table_names.iter().cloned())
+            .map(|table_name| async move {
+                let identifier = Identifier::new(database_name, &table_name);
+                let response = self
+                    .api
+                    .get_table(&identifier)
+                    .await
+                    .map_err(|error| map_rest_error_for_table(error, &identifier))?;
+                let table_type = response
+                    .schema
+                    .as_ref()
+                    .map(|schema| CoreOptions::new(schema.options()).table_type())
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok((table_name, table_type))
+            })
+            .buffer_unordered(16)
+            .try_collect()
+            .await
     }
 
     async fn create_table(

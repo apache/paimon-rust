@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{Array, Int32Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use paimon::catalog::{Catalog, Database, Identifier, LoadedTable};
@@ -614,6 +615,59 @@ async fn table_exist_derives_system_table_from_snapshotted_base_table() {
     assert!(!schema.table_exist("it$snapshots"));
     assert!(!schema.table_exist("missing$snapshots"));
     assert!(!schema.table_exist("pt$not_a_system_table"));
+}
+
+#[tokio::test]
+async fn object_table_does_not_advertise_paimon_system_tables_before_table_load() {
+    let paimon_dir = TempDir::new().unwrap();
+    let warehouse = format!("file://{}", paimon_dir.path().display());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    catalog
+        .create_database(DB, false, HashMap::new())
+        .await
+        .unwrap();
+
+    let schema = PaimonSchema::builder()
+        .column(
+            "id",
+            paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+        )
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&Identifier::new(DB, "pt"), schema.clone(), false)
+        .await
+        .unwrap();
+    let object_schema = PaimonSchema::builder()
+        .column(
+            "ignored",
+            paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+        )
+        .option("type", "object-table")
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&Identifier::new(DB, "objects"), object_schema, false)
+        .await
+        .unwrap();
+
+    let provider = PaimonCatalogProvider::try_new(
+        Some(CATALOG.to_string()),
+        catalog,
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let schema = provider.schema(DB).unwrap();
+
+    assert!(schema.table_exist("objects"));
+    assert!(!schema.table_exist("objects$snapshots"));
+    assert!(schema.table("objects$snapshots").await.is_err());
+    assert!(schema.table_exist("pt$snapshots"));
 }
 
 #[tokio::test]
