@@ -17,18 +17,17 @@
 
 //! Paimon catalog integration for DataFusion.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, MemorySchemaProvider, SchemaProvider};
 use datafusion::common::{plan_datafusion_err, Column};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{expr_fn::cast, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
@@ -63,11 +62,20 @@ struct DatabaseMetadata {
     objects: IndexMap<String, TableType>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObjectResolution {
+    Paimon,
+    Routed,
+    Unavailable,
+}
+
 #[derive(Debug)]
 struct CatalogMetadataState {
     snapshot: RwLock<Arc<CatalogMetadataSnapshot>>,
     next_generation: AtomicU64,
     database_generations: RwLock<HashMap<String, u64>>,
+    active_refreshes: Mutex<BTreeSet<u64>>,
+    object_resolutions: RwLock<HashMap<(String, String), ObjectResolution>>,
 }
 
 impl Default for CatalogMetadataState {
@@ -76,7 +84,26 @@ impl Default for CatalogMetadataState {
             snapshot: RwLock::new(Arc::new(CatalogMetadataSnapshot::default())),
             next_generation: AtomicU64::new(0),
             database_generations: RwLock::new(HashMap::new()),
+            active_refreshes: Mutex::new(BTreeSet::new()),
+            object_resolutions: RwLock::new(HashMap::new()),
         }
+    }
+}
+
+struct RefreshGeneration<'a> {
+    generation: u64,
+    state: &'a CatalogMetadataState,
+}
+
+impl RefreshGeneration<'_> {
+    fn get(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for RefreshGeneration<'_> {
+    fn drop(&mut self) {
+        self.state.finish_refresh(self.generation);
     }
 }
 
@@ -89,17 +116,50 @@ impl Deref for CatalogMetadataState {
 }
 
 impl CatalogMetadataState {
-    fn begin_refresh(&self) -> u64 {
+    fn next_generation(&self) -> u64 {
         self.next_generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    fn publish(&self, generation: u64, refreshed: CatalogMetadataSnapshot) {
+    fn begin_refresh(&self) -> RefreshGeneration<'_> {
+        let generation = self.next_generation();
+        self.active_refreshes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(generation);
+        RefreshGeneration {
+            generation,
+            state: self,
+        }
+    }
+
+    fn finish_refresh(&self, generation: u64) {
+        let mut active_refreshes = self
+            .active_refreshes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        active_refreshes.remove(&generation);
+        let oldest_active = active_refreshes.first().copied();
+        let current = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
+        let mut database_generations = self
+            .database_generations
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        Self::prune_database_generations(
+            current.as_ref(),
+            &mut database_generations,
+            oldest_active,
+        );
+    }
+
+    fn publish(&self, generation: u64, refreshed: CatalogMetadataSnapshot) -> HashSet<String> {
         let mut current = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
         let mut database_generations = self
             .database_generations
             .write()
             .unwrap_or_else(|e| e.into_inner());
         let mut next = (**current).clone();
+        let mut conflicts = HashSet::new();
+        let mut published_databases = HashSet::new();
         let refreshed_names: HashSet<_> = refreshed.databases.keys().cloned().collect();
 
         let removed_names: HashSet<_> = next
@@ -112,19 +172,33 @@ impl CatalogMetadataState {
         for name in removed_names {
             if database_generations.get(&name).copied().unwrap_or_default() <= generation {
                 next.databases.shift_remove(&name);
-                database_generations.insert(name, generation);
+                database_generations.insert(name.clone(), generation);
+                published_databases.insert(name);
+            } else {
+                conflicts.insert(name);
             }
         }
         for (name, metadata) in refreshed.databases {
             if database_generations.get(&name).copied().unwrap_or_default() <= generation {
                 next.databases.insert(name.clone(), metadata);
-                database_generations.insert(name, generation);
+                database_generations.insert(name.clone(), generation);
+                published_databases.insert(name);
+            } else {
+                conflicts.insert(name);
             }
         }
         *current = Arc::new(next);
+        self.retain_object_resolutions(current.as_ref());
+        self.clear_unavailable_resolutions(&published_databases);
+        conflicts
     }
 
-    fn publish_database(&self, generation: u64, database: String, metadata: Arc<DatabaseMetadata>) {
+    fn publish_database(
+        &self,
+        generation: u64,
+        database: String,
+        metadata: Arc<DatabaseMetadata>,
+    ) -> bool {
         let mut current = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
         let mut database_generations = self
             .database_generations
@@ -136,16 +210,24 @@ impl CatalogMetadataState {
             .unwrap_or_default()
             > generation
         {
-            return;
+            return false;
         }
         let mut next = (**current).clone();
         next.databases.insert(database.clone(), metadata);
         *current = Arc::new(next);
+        self.retain_object_resolutions(current.as_ref());
+        self.clear_unavailable_resolution_for_database(&database);
         database_generations.insert(database, generation);
+        true
     }
 
     fn mutate_database(&self, database: &str, update: impl FnOnce(&mut CatalogMetadataSnapshot)) {
-        let generation = self.begin_refresh();
+        let generation = self.next_generation();
+        let active_refreshes = self
+            .active_refreshes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let oldest_active = active_refreshes.first().copied();
         let mut current = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
         let mut database_generations = self
             .database_generations
@@ -153,14 +235,114 @@ impl CatalogMetadataState {
             .unwrap_or_else(|e| e.into_inner());
         let mut next = (**current).clone();
         update(&mut next);
-        *current = Arc::new(next);
         database_generations.insert(database.to_string(), generation);
+        Self::prune_database_generations(&next, &mut database_generations, oldest_active);
+        *current = Arc::new(next);
+    }
+
+    fn set_object_resolution(&self, database: &str, object: &str, resolution: ObjectResolution) {
+        self.object_resolutions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((database.to_string(), object.to_string()), resolution);
+    }
+
+    fn object_resolution(&self, database: &str, object: &str) -> Option<ObjectResolution> {
+        self.object_resolutions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(database.to_string(), object.to_string()))
+            .copied()
+    }
+
+    fn remove_object_resolution(&self, database: &str, object: &str) {
+        self.object_resolutions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(database.to_string(), object.to_string()));
+    }
+
+    fn remove_database_resolutions(&self, database: &str) {
+        self.object_resolutions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(resolved_database, _), _| resolved_database != database);
+    }
+
+    fn rename_object_resolution(&self, database: &str, from: &str, to: &str) {
+        let mut resolutions = self
+            .object_resolutions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(resolution) = resolutions.remove(&(database.to_string(), from.to_string())) {
+            resolutions.insert((database.to_string(), to.to_string()), resolution);
+        }
+    }
+
+    fn retain_object_resolutions(&self, snapshot: &CatalogMetadataSnapshot) {
+        self.object_resolutions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(database, object), _| {
+                snapshot
+                    .databases
+                    .get(database)
+                    .is_some_and(|metadata| metadata.objects.contains_key(object))
+            });
+    }
+
+    fn clear_unavailable_resolutions(&self, databases: &HashSet<String>) {
+        self.object_resolutions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(database, _), resolution| {
+                *resolution != ObjectResolution::Unavailable || !databases.contains(database)
+            });
+    }
+
+    fn clear_unavailable_resolution_for_database(&self, database: &str) {
+        self.object_resolutions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(resolved_database, _), resolution| {
+                *resolution != ObjectResolution::Unavailable || resolved_database != database
+            });
+    }
+
+    fn prune_database_generations(
+        snapshot: &CatalogMetadataSnapshot,
+        database_generations: &mut HashMap<String, u64>,
+        oldest_active: Option<u64>,
+    ) {
+        database_generations.retain(|database, generation| {
+            !snapshot.databases.contains_key(database)
+                || oldest_active.is_some_and(|oldest| *generation >= oldest)
+        });
+
+        let mut evictable_tombstones: Vec<_> = database_generations
+            .iter()
+            .filter(|(database, generation)| {
+                !snapshot.databases.contains_key(*database)
+                    && !oldest_active.is_some_and(|oldest| **generation >= oldest)
+            })
+            .map(|(database, generation)| (database.clone(), *generation))
+            .collect();
+        if evictable_tombstones.len() > MAX_RETAINED_DATABASE_TOMBSTONES {
+            evictable_tombstones.sort_unstable_by_key(|(_, generation)| *generation);
+            let remove_count = evictable_tombstones.len() - MAX_RETAINED_DATABASE_TOMBSTONES;
+            for (database, _) in evictable_tombstones.into_iter().take(remove_count) {
+                database_generations.remove(&database);
+            }
+        }
     }
 }
 
 type SharedCatalogMetadata = Arc<CatalogMetadataState>;
 
 const MAX_CONCURRENT_METADATA_LISTINGS: usize = 16;
+// Recent tombstones guard against eventually consistent database listings. Tombstones still
+// needed by an active older refresh are exempt from this bound until that refresh completes.
+const MAX_RETAINED_DATABASE_TOMBSTONES: usize = 1024;
 
 async fn load_database_metadata(
     catalog: &dyn Catalog,
@@ -427,23 +609,24 @@ impl Debug for PaimonCatalogProvider {
 }
 
 impl PaimonCatalogProvider {
-    /// Creates a provider with an initialized metadata snapshot.
-    pub async fn new(
+    /// Creates a provider with an empty metadata snapshot.
+    ///
+    /// This preserves the original synchronous constructor signature. New callers should use
+    /// [`Self::try_new`] so discovery callbacks are not exposed before metadata is initialized.
+    pub fn new(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         dynamic_options: DynamicOptions,
         blob_reader_registry: BlobReaderRegistry,
         session_state: Option<SessionStateProvider>,
-    ) -> DFResult<Self> {
-        let provider = Self::new_uninitialized(
+    ) -> Self {
+        Self::new_uninitialized(
             catalog_name,
             catalog,
             dynamic_options,
             blob_reader_registry,
             session_state,
-        );
-        provider.initialize_metadata().await?;
-        Ok(provider)
+        )
     }
 
     /// Creates a provider with an empty metadata snapshot.
@@ -469,7 +652,7 @@ impl PaimonCatalogProvider {
         }
     }
 
-    /// Backward-compatible alias for [`Self::new`].
+    /// Creates a provider with an initialized metadata snapshot.
     pub async fn try_new(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
@@ -477,14 +660,15 @@ impl PaimonCatalogProvider {
         blob_reader_registry: BlobReaderRegistry,
         session_state: Option<SessionStateProvider>,
     ) -> DFResult<Self> {
-        Self::new(
+        let provider = Self::new_uninitialized(
             catalog_name,
             catalog,
             dynamic_options,
             blob_reader_registry,
             session_state,
-        )
-        .await
+        );
+        provider.initialize_metadata().await?;
+        Ok(provider)
     }
 
     /// Refresh the metadata consumed by DataFusion's synchronous catalog callbacks.
@@ -533,22 +717,63 @@ impl PaimonCatalogProvider {
             })
             .collect();
 
-        self.metadata
-            .publish(generation, CatalogMetadataSnapshot { databases });
+        let mut conflicts = self
+            .metadata
+            .publish(generation.get(), CatalogMetadataSnapshot { databases });
+        if !conflicts.is_empty() {
+            let current_databases: HashSet<_> = self
+                .catalog
+                .list_databases()
+                .await
+                .map_err(to_datafusion_error)?
+                .into_iter()
+                .collect();
+            conflicts.retain(|database| current_databases.contains(database));
+        }
+        stream::iter(conflicts)
+            .map(|database| async move {
+                self.refresh_database_metadata_inner(
+                    database.as_str(),
+                    ignore_missing_views_endpoint,
+                )
+                .await
+            })
+            .buffer_unordered(MAX_CONCURRENT_METADATA_LISTINGS)
+            .try_collect::<Vec<_>>()
+            .await?;
         Ok(())
     }
 
     /// Refresh one database in the metadata snapshot.
     pub(crate) async fn refresh_database_metadata(&self, database: &str) -> DFResult<()> {
-        let generation = self.metadata.begin_refresh();
-        let database_metadata =
-            load_database_metadata(self.catalog.as_ref(), database, true).await?;
-        self.metadata.publish_database(
-            generation,
-            database.to_string(),
-            Arc::new(database_metadata),
-        );
-        Ok(())
+        self.refresh_database_metadata_inner(database, true).await
+    }
+
+    async fn refresh_database_metadata_inner(
+        &self,
+        database: &str,
+        ignore_missing_views_endpoint: bool,
+    ) -> DFResult<()> {
+        const MAX_PUBLICATION_ATTEMPTS: usize = 3;
+        for _ in 0..MAX_PUBLICATION_ATTEMPTS {
+            let generation = self.metadata.begin_refresh();
+            let database_metadata = load_database_metadata(
+                self.catalog.as_ref(),
+                database,
+                ignore_missing_views_endpoint,
+            )
+            .await?;
+            if self.metadata.publish_database(
+                generation.get(),
+                database.to_string(),
+                Arc::new(database_metadata),
+            ) {
+                return Ok(());
+            }
+        }
+        Err(DataFusionError::Execution(format!(
+            "metadata for database '{database}' changed during {MAX_PUBLICATION_ATTEMPTS} refresh attempts"
+        )))
     }
 
     /// Configure whether table schemas use Arrow view types when available.
@@ -621,6 +846,12 @@ impl PaimonCatalogProvider {
                 .objects
                 .insert(name.to_string(), table_type);
         });
+        if table_type == TableType::Base {
+            self.metadata
+                .set_object_resolution(database, name, ObjectResolution::Paimon);
+        } else {
+            self.metadata.remove_object_resolution(database, name);
+        }
     }
 
     pub(crate) fn record_database_created(&self, database: &str) {
@@ -635,6 +866,7 @@ impl PaimonCatalogProvider {
         self.metadata.mutate_database(database, |next| {
             next.databases.shift_remove(database);
         });
+        self.metadata.remove_database_resolutions(database);
     }
 
     pub(crate) fn record_object_dropped(&self, database: &str, name: &str) {
@@ -643,18 +875,23 @@ impl PaimonCatalogProvider {
                 Arc::make_mut(metadata).objects.shift_remove(name);
             }
         });
+        self.metadata.remove_object_resolution(database, name);
     }
 
     pub(crate) fn record_table_renamed(&self, database: &str, from: &str, to: &str) {
+        let mut renamed = false;
         self.metadata.mutate_database(database, |next| {
-            let metadata = next
-                .databases
-                .entry(database.to_string())
-                .or_insert_with(|| Arc::new(DatabaseMetadata::default()));
-            let objects = &mut Arc::make_mut(metadata).objects;
-            let table_type = objects.shift_remove(from).unwrap_or(TableType::Base);
-            objects.insert(to.to_string(), table_type);
+            if let Some(metadata) = next.databases.get_mut(database) {
+                let objects = &mut Arc::make_mut(metadata).objects;
+                if let Some(table_type) = objects.shift_remove(from) {
+                    objects.insert(to.to_string(), table_type);
+                    renamed = true;
+                }
+            }
         });
+        if renamed {
+            self.metadata.rename_object_resolution(database, from, to);
+        }
     }
 
     fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
@@ -912,8 +1149,11 @@ impl Debug for PaimonSchemaProvider {
 }
 
 impl PaimonSchemaProvider {
-    /// Creates a schema provider with initialized metadata.
-    pub async fn new(
+    /// Creates a schema provider with an empty metadata snapshot.
+    ///
+    /// This preserves the original synchronous constructor signature. New callers should use
+    /// [`Self::try_new`] so discovery callbacks are not exposed before metadata is initialized.
+    pub fn new(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
         database: String,
@@ -921,8 +1161,8 @@ impl PaimonSchemaProvider {
         temp_provider: Option<Arc<MemorySchemaProvider>>,
         blob_reader_registry: BlobReaderRegistry,
         session_state: Option<SessionStateProvider>,
-    ) -> DFResult<Self> {
-        let provider = Self::new_uninitialized(
+    ) -> Self {
+        Self::new_uninitialized(
             catalog_name,
             catalog,
             database,
@@ -930,9 +1170,7 @@ impl PaimonSchemaProvider {
             temp_provider,
             blob_reader_registry,
             session_state,
-        );
-        provider.initialize_metadata().await?;
-        Ok(provider)
+        )
     }
 
     /// Creates a schema provider with an empty metadata snapshot.
@@ -959,7 +1197,7 @@ impl PaimonSchemaProvider {
         }
     }
 
-    /// Backward-compatible alias for [`Self::new`].
+    /// Creates a schema provider with initialized metadata.
     pub async fn try_new(
         catalog_name: Option<String>,
         catalog: Arc<dyn Catalog>,
@@ -969,7 +1207,7 @@ impl PaimonSchemaProvider {
         blob_reader_registry: BlobReaderRegistry,
         session_state: Option<SessionStateProvider>,
     ) -> DFResult<Self> {
-        Self::new(
+        let provider = Self::new_uninitialized(
             catalog_name,
             catalog,
             database,
@@ -977,8 +1215,9 @@ impl PaimonSchemaProvider {
             temp_provider,
             blob_reader_registry,
             session_state,
-        )
-        .await
+        );
+        provider.initialize_metadata().await?;
+        Ok(provider)
     }
 
     /// Refresh this database in the snapshot used by synchronous callbacks.
@@ -999,8 +1238,16 @@ impl PaimonSchemaProvider {
             ignore_missing_views_endpoint,
         )
         .await?;
-        self.metadata
-            .publish_database(generation, self.database.clone(), Arc::new(database));
+        if !self.metadata.publish_database(
+            generation.get(),
+            self.database.clone(),
+            Arc::new(database),
+        ) {
+            return Err(DataFusionError::Execution(format!(
+                "metadata for database '{}' changed during refresh",
+                self.database
+            )));
+        }
         Ok(())
     }
 
@@ -1072,6 +1319,7 @@ impl SchemaProvider for PaimonSchemaProvider {
         let catalog_name = self.catalog_name.clone();
         let session_state = self.session_state.clone();
         let schema_force_view_types = self.schema_force_view_types;
+        let metadata = Arc::clone(&self.metadata);
         let identifier = Identifier::new(self.database.clone(), object.table().to_string());
         let branch = object.branch().map(str::to_string);
         if branch.is_none()
@@ -1090,6 +1338,11 @@ impl SchemaProvider for PaimonSchemaProvider {
         await_with_runtime(async move {
             match catalog.load_table(&identifier).await {
                 Ok(paimon::catalog::LoadedTable::Object(table)) => {
+                    metadata.set_object_resolution(
+                        identifier.database(),
+                        identifier.object(),
+                        ObjectResolution::Paimon,
+                    );
                     if branch.is_some() {
                         return Err(plan_datafusion_err!(
                             "branches are not supported for 'object-table' tables ('{}')",
@@ -1110,6 +1363,11 @@ impl SchemaProvider for PaimonSchemaProvider {
                 }
                 Ok(paimon::catalog::LoadedTable::External(external)) => {
                     let declared = external.declared();
+                    metadata.set_object_resolution(
+                        identifier.database(),
+                        identifier.object(),
+                        ObjectResolution::Routed,
+                    );
                     if branch.is_some() {
                         return Err(plan_datafusion_err!(
                             "branches are not supported for '{}' tables ('{}')",
@@ -1151,6 +1409,13 @@ impl SchemaProvider for PaimonSchemaProvider {
                             declared,
                         ))
                         .await?;
+                    if resolved.is_none() {
+                        metadata.set_object_resolution(
+                            identifier.database(),
+                            identifier.object(),
+                            ObjectResolution::Unavailable,
+                        );
+                    }
                     Ok(resolved.map(|inner| {
                         Arc::new(ReadOnlyTableProvider {
                             inner,
@@ -1160,6 +1425,11 @@ impl SchemaProvider for PaimonSchemaProvider {
                     }))
                 }
                 Ok(paimon::catalog::LoadedTable::Paimon(table)) => {
+                    metadata.set_object_resolution(
+                        identifier.database(),
+                        identifier.object(),
+                        ObjectResolution::Paimon,
+                    );
                     let mut table = *table;
                     if let Some(branch) = branch.as_deref() {
                         table = table
@@ -1253,6 +1523,11 @@ impl SchemaProvider for PaimonSchemaProvider {
                 return Ok(Some(table_type));
             }
         }
+        if self.metadata.object_resolution(&self.database, name)
+            == Some(ObjectResolution::Unavailable)
+        {
+            return Ok(None);
+        }
 
         if let Some(table_type) = self
             .metadata
@@ -1290,15 +1565,25 @@ impl SchemaProvider for PaimonSchemaProvider {
         {
             return false;
         }
-        // System tables derive their existence from a snapshotted base table.
-        // This callback cannot await an external engine resolver, so async
-        // `table()` remains responsible for surfacing unsupported routed tables.
-        self.metadata
+        let table_type = self
+            .metadata
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .databases
             .get(&self.database)
-            .is_some_and(|database| database.objects.contains_key(object.table()))
+            .and_then(|database| database.objects.get(object.table()))
+            .copied();
+        let resolution = self
+            .metadata
+            .object_resolution(&self.database, object.table());
+        if resolution == Some(ObjectResolution::Unavailable) {
+            return false;
+        }
+        if object.system_table().is_some() {
+            return table_type == Some(TableType::Base)
+                && resolution != Some(ObjectResolution::Routed);
+        }
+        table_type.is_some()
     }
 
     fn register_table(
@@ -1619,6 +1904,57 @@ fn find_view_dependency_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_generation_tombstones_are_bounded() {
+        let metadata = CatalogMetadataState::default();
+        for index in 0..2048 {
+            let database = format!("deleted_{index}");
+            metadata.mutate_database(&database, |snapshot| {
+                snapshot.databases.shift_remove(&database);
+            });
+        }
+
+        assert_eq!(
+            metadata
+                .database_generations
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            MAX_RETAINED_DATABASE_TOMBSTONES
+        );
+    }
+
+    #[test]
+    fn active_refresh_protects_tombstones_from_bounded_eviction() {
+        let metadata = CatalogMetadataState::default();
+        let refresh = metadata.begin_refresh();
+        for index in 0..(MAX_RETAINED_DATABASE_TOMBSTONES * 2) {
+            let database = format!("deleted_{index}");
+            metadata.mutate_database(&database, |snapshot| {
+                snapshot.databases.shift_remove(&database);
+            });
+        }
+
+        assert_eq!(
+            metadata
+                .database_generations
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            MAX_RETAINED_DATABASE_TOMBSTONES * 2
+        );
+
+        drop(refresh);
+        assert_eq!(
+            metadata
+                .database_generations
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            MAX_RETAINED_DATABASE_TOMBSTONES
+        );
+    }
 
     #[test]
     fn relation_identifiers_follow_datafusion_normalization() {

@@ -28,7 +28,9 @@ use paimon::catalog::{Catalog, Database, Identifier, LoadedTable};
 use paimon::spec::{Schema as PaimonSchema, SchemaChange, TableType};
 use paimon::table::Table;
 use paimon::{CatalogOptions, FileSystemCatalog, Options, Result as PaimonResult};
-use paimon_datafusion::{EngineTableRequest, SQLContext, TableEngineResolver};
+use paimon_datafusion::{
+    EngineTableRequest, PaimonCatalogProvider, SQLContext, TableEngineResolver,
+};
 use tempfile::TempDir;
 
 const CATALOG: &str = "cat";
@@ -577,6 +579,27 @@ async fn registered_engine_none_is_not_found() {
     let provider = env.ctx.ctx().catalog(CATALOG).unwrap();
     let schema = provider.schema(DB).unwrap();
     assert!(schema.table("ghost").await.unwrap().is_none());
+    assert!(!schema.table_exist("ghost"));
+    assert!(!schema.table_exist("ghost$snapshots"));
+    assert!(schema.table_type("ghost").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn metadata_refresh_clears_registered_engine_miss() {
+    let env = setup().await;
+    let provider = env.ctx.ctx().catalog(CATALOG).unwrap();
+    let schema = provider.schema(DB).unwrap();
+    assert!(schema.table("ghost").await.unwrap().is_none());
+    assert!(!schema.table_exist("ghost"));
+
+    provider
+        .downcast_ref::<PaimonCatalogProvider>()
+        .unwrap()
+        .refresh_metadata()
+        .await
+        .unwrap();
+
+    assert!(provider.schema(DB).unwrap().table_exist("ghost"));
 }
 
 #[tokio::test]
@@ -586,6 +609,9 @@ async fn table_exist_derives_system_table_from_snapshotted_base_table() {
     let schema = provider.schema(DB).unwrap();
 
     assert!(schema.table_exist("pt$snapshots"));
+    assert!(schema.table("it").await.unwrap().is_some());
+    assert!(schema.table_exist("it"));
+    assert!(!schema.table_exist("it$snapshots"));
     assert!(!schema.table_exist("missing$snapshots"));
     assert!(!schema.table_exist("pt$not_a_system_table"));
 }

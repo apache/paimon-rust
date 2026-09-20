@@ -107,12 +107,23 @@ pub struct SQLContext {
     blob_reader_registry: BlobReaderRegistry,
     /// Last successful refresh used to resolve a missing object, keyed by database.
     missing_object_refreshes: Mutex<HashMap<(String, String), Instant>>,
+    /// Last successful full metadata refresh, keyed by catalog.
+    catalog_refreshes: Mutex<HashMap<String, Instant>>,
+    /// Last failed automatic full metadata refresh, keyed by catalog.
+    catalog_refresh_failures: Mutex<HashMap<String, Instant>>,
     metadata_refresh_gates: Mutex<HashMap<MetadataRefreshTarget, Weak<tokio::sync::Mutex<()>>>>,
+    catalog_metadata_refresh_ttl: Duration,
+    catalog_metadata_refresh_timeout: Duration,
+    catalog_metadata_refresh_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 const MISSING_OBJECT_REFRESH_TTL: Duration = Duration::from_secs(1);
+const CATALOG_METADATA_REFRESH_TTL: Duration = Duration::from_secs(1);
+const CATALOG_METADATA_REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
+const DEFAULT_CATALOG_METADATA_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_CONCURRENT_CATALOG_METADATA_REFRESHES: usize = 4;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum MetadataRefreshTarget {
     Catalog(String),
     Database { catalog: String, database: String },
@@ -145,6 +156,9 @@ enum MetadataRefreshTarget {
 #[derive(Default)]
 pub struct SQLContextBuilder {
     runtime_env: Option<Arc<RuntimeEnv>>,
+    catalog_metadata_refresh_ttl: Option<Duration>,
+    catalog_metadata_refresh_timeout: Option<Duration>,
+    max_concurrent_catalog_metadata_refreshes: Option<usize>,
 }
 
 impl SQLContextBuilder {
@@ -156,6 +170,28 @@ impl SQLContextBuilder {
     /// Uses the provided DataFusion runtime environment.
     pub fn with_runtime_env(mut self, runtime_env: Arc<RuntimeEnv>) -> Self {
         self.runtime_env = Some(runtime_env);
+        self
+    }
+
+    /// Bounds each best-effort full catalog refresh triggered by SQL metadata queries.
+    pub fn with_catalog_metadata_refresh_timeout(mut self, timeout: Duration) -> Self {
+        self.catalog_metadata_refresh_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets how long automatic SQL metadata queries reuse a successful full refresh.
+    pub fn with_catalog_metadata_refresh_ttl(mut self, ttl: Duration) -> Self {
+        self.catalog_metadata_refresh_ttl = Some(ttl);
+        self
+    }
+
+    /// Limits concurrent full catalog refreshes triggered by SQL metadata queries.
+    pub fn with_max_concurrent_catalog_metadata_refreshes(mut self, maximum: usize) -> Self {
+        assert!(
+            maximum > 0,
+            "catalog metadata refresh concurrency must be positive"
+        );
+        self.max_concurrent_catalog_metadata_refreshes = Some(maximum);
         self
     }
 
@@ -184,7 +220,19 @@ impl SQLContextBuilder {
             dynamic_options: Default::default(),
             blob_reader_registry: BlobReaderRegistry::default(),
             missing_object_refreshes: Mutex::new(HashMap::new()),
+            catalog_refreshes: Mutex::new(HashMap::new()),
+            catalog_refresh_failures: Mutex::new(HashMap::new()),
             metadata_refresh_gates: Mutex::new(HashMap::new()),
+            catalog_metadata_refresh_ttl: self
+                .catalog_metadata_refresh_ttl
+                .unwrap_or(CATALOG_METADATA_REFRESH_TTL),
+            catalog_metadata_refresh_timeout: self
+                .catalog_metadata_refresh_timeout
+                .unwrap_or(DEFAULT_CATALOG_METADATA_REFRESH_TIMEOUT),
+            catalog_metadata_refresh_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                self.max_concurrent_catalog_metadata_refreshes
+                    .unwrap_or(DEFAULT_MAX_CONCURRENT_CATALOG_METADATA_REFRESHES),
+            )),
         }
     }
 }
@@ -285,6 +333,10 @@ impl SQLContext {
             self.dynamic_options.clone(),
         );
         self.catalogs.insert(catalog_name.clone(), catalog);
+        self.catalog_refreshes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(catalog_name.clone(), Instant::now());
         if is_first {
             self.set_current_catalog(catalog_name).await?;
             if let Some(default_db) = default_db {
@@ -503,8 +555,38 @@ impl SQLContext {
             current_targets.retain(|target| !metadata_mutation_targets.contains(target));
             if current_targets.contains(&target) {
                 let best_effort = best_effort_targets.contains(&target);
-                if let Err(error) = self.refresh_metadata_targets([target]).await {
+                let refresh = async {
+                    let _permit = if best_effort {
+                        Some(
+                            self.catalog_metadata_refresh_semaphore
+                                .acquire()
+                                .await
+                                .map_err(|_| {
+                                    DataFusionError::Execution(
+                                        "catalog metadata refresh coordinator closed".to_string(),
+                                    )
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+                    self.refresh_metadata_targets([target.clone()]).await
+                };
+                let refresh_result = if best_effort {
+                    match tokio::time::timeout(self.catalog_metadata_refresh_timeout, refresh).await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(DataFusionError::Execution(format!(
+                            "catalog metadata refresh timed out after {:?}",
+                            self.catalog_metadata_refresh_timeout
+                        ))),
+                    }
+                } else {
+                    refresh.await
+                };
+                if let Err(error) = refresh_result {
                     if best_effort {
+                        self.record_catalog_refresh_failure(&target);
                         log::warn!("information schema metadata refresh failed: {error}");
                     } else {
                         return Err(error);
@@ -514,6 +596,17 @@ impl SQLContext {
             Ok::<(), DataFusionError>(())
         }))
         .await?;
+
+        let mut ordered_mutation_targets: Vec<_> = metadata_mutation_targets.iter().collect();
+        ordered_mutation_targets.sort_unstable();
+        let mutation_gates: Vec<_> = ordered_mutation_targets
+            .into_iter()
+            .map(|target| self.metadata_refresh_gate(target))
+            .collect();
+        let mut _mutation_guards = Vec::with_capacity(mutation_gates.len());
+        for gate in &mutation_gates {
+            _mutation_guards.push(gate.lock().await);
+        }
 
         let result = match &statements[0] {
             Statement::ShowDatabases {
@@ -889,6 +982,7 @@ impl SQLContext {
                 let catalogs = self
                     .catalogs
                     .keys()
+                    .filter(|catalog| !self.catalog_refresh_is_recent(catalog))
                     .cloned()
                     .map(MetadataRefreshTarget::Catalog);
                 targets.extend(catalogs.clone());
@@ -923,18 +1017,17 @@ impl SQLContext {
             });
             Ok(())
         };
-
         match statement {
             Statement::CreateDatabase { db_name, .. } => {
-                let (_, catalog, _) = self.resolve_catalog_and_database(db_name)?;
-                targets.insert(MetadataRefreshTarget::Catalog(catalog));
+                let (_, catalog, database) = self.resolve_catalog_and_database(db_name)?;
+                targets.insert(MetadataRefreshTarget::Database { catalog, database });
             }
             Statement::CreateSchema {
                 schema_name: SchemaName::Simple(name),
                 ..
             } => {
-                let (_, catalog, _) = self.resolve_catalog_and_database(name)?;
-                targets.insert(MetadataRefreshTarget::Catalog(catalog));
+                let (_, catalog, database) = self.resolve_catalog_and_database(name)?;
+                targets.insert(MetadataRefreshTarget::Database { catalog, database });
             }
             Statement::CreateTable(create) => add_database(&create.name)?,
             Statement::CreateView(create) => add_database(&create.name)?,
@@ -946,8 +1039,8 @@ impl SQLContext {
                 ..
             } => {
                 for name in names {
-                    let (_, catalog, _) = self.resolve_catalog_and_database(name)?;
-                    targets.insert(MetadataRefreshTarget::Catalog(catalog));
+                    let (_, catalog, database) = self.resolve_catalog_and_database(name)?;
+                    targets.insert(MetadataRefreshTarget::Database { catalog, database });
                 }
             }
             Statement::Drop {
@@ -1131,6 +1224,14 @@ impl SQLContext {
                     );
             } else {
                 provider.initialize_metadata().await?;
+                self.catalog_refreshes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(catalog_name.to_string(), Instant::now());
+                self.catalog_refresh_failures
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(catalog_name);
             }
         }
         Ok(())
@@ -1145,6 +1246,32 @@ impl SQLContext {
             .unwrap_or_else(|e| e.into_inner())
             .get(&(catalog.clone(), database.clone()))
             .is_some_and(|refreshed| refreshed.elapsed() < MISSING_OBJECT_REFRESH_TTL)
+    }
+
+    fn catalog_refresh_is_recent(&self, catalog: &str) -> bool {
+        let recently_succeeded = self
+            .catalog_refreshes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(catalog)
+            .is_some_and(|refreshed| refreshed.elapsed() < self.catalog_metadata_refresh_ttl);
+        recently_succeeded
+            || self
+                .catalog_refresh_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(catalog)
+                .is_some_and(|failed| failed.elapsed() < CATALOG_METADATA_REFRESH_FAILURE_BACKOFF)
+    }
+
+    fn record_catalog_refresh_failure(&self, target: &MetadataRefreshTarget) {
+        let MetadataRefreshTarget::Catalog(catalog) = target else {
+            return;
+        };
+        self.catalog_refresh_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(catalog.clone(), Instant::now());
     }
 
     fn metadata_refresh_gate(&self, target: &MetadataRefreshTarget) -> Arc<tokio::sync::Mutex<()>> {

@@ -757,7 +757,7 @@ async fn test_query_via_catalog_provider() {
 #[tokio::test]
 async fn test_missing_database_returns_no_schema() {
     let catalog = create_catalog();
-    let provider = PaimonCatalogProvider::new(
+    let provider = PaimonCatalogProvider::try_new(
         None,
         Arc::new(catalog),
         Default::default(),
