@@ -2963,10 +2963,13 @@ mod vector_parquet_tests {
     use crate::arrow::format::ParquetFormatWriter;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{DataFileMeta, DataType, FloatType, VectorType};
+    use crate::spec::{
+        DataFileMeta, DataType, Datum, FloatType, LocalZonedTimestampType, PredicateBuilder,
+        TimestampType, VectorType,
+    };
     use crate::table::source::DataSplitBuilder;
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
-    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, TimestampSecondArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
     use futures::TryStreamExt;
 
@@ -3121,6 +3124,120 @@ mod vector_parquet_tests {
             .downcast_ref::<Float32Array>()
             .expect("child should be Float32Array");
         assert_eq!(floats2.values(), &[3.0, 4.0]);
+    }
+
+    #[tokio::test]
+    async fn test_datafilereader_timestamp_zero_parquet_roundtrip_and_filter() {
+        let read_fields = vec![
+            DataField::new(
+                0,
+                "ts".to_string(),
+                DataType::Timestamp(TimestampType::new(0).unwrap()),
+            ),
+            DataField::new(
+                1,
+                "ts_ltz".to_string(),
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(0).unwrap()),
+            ),
+        ];
+        let arrow_schema = build_target_arrow_schema(&read_fields).unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![-1, 2, 3])),
+                Arc::new(TimestampSecondArray::from(vec![-1, 2, 3]).with_timezone("UTC")),
+            ],
+        )
+        .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/timestamp_zero_parquet_e2e";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.parquet";
+        let file_path = format!("{bucket_path}/{file_name}");
+        let output = file_io.new_output(&file_path).unwrap();
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(
+                &output,
+                arrow_schema.clone(),
+                "zstd",
+                1,
+                Some(&read_fields),
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
+
+        let schema_id = 1;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file(file_name, file_size as i64, 3, schema_id)])
+            .build()
+            .unwrap();
+        let predicates = vec![
+            PredicateBuilder::new(&read_fields)
+                .equal(
+                    "ts",
+                    Datum::Timestamp {
+                        millis: 2_000,
+                        nanos: 0,
+                    },
+                )
+                .unwrap(),
+            PredicateBuilder::new(&read_fields)
+                .equal(
+                    "ts_ltz",
+                    Datum::LocalZonedTimestamp {
+                        millis: 2_000,
+                        nanos: 0,
+                    },
+                )
+                .unwrap(),
+        ];
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            schema_id,
+            read_fields.clone(),
+            read_fields,
+            predicates,
+        );
+        let batches = reader
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].schema().as_ref(), arrow_schema.as_ref());
+        assert_eq!(
+            batches[0]
+                .column_by_name("ts")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .values(),
+            &[2]
+        );
+        assert_eq!(
+            batches[0]
+                .column_by_name("ts_ltz")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .values(),
+            &[2]
+        );
     }
 }
 

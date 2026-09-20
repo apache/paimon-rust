@@ -31,6 +31,7 @@ use crate::spec::{
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::{BooleanArray, RecordBatch};
+use arrow_cast::cast;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -137,6 +138,8 @@ fn row_filter_required_bytes(
 /// Streams data directly to storage via `AsyncArrowWriter` + opendal.
 pub(crate) struct ParquetFormatWriter {
     inner: AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>,
+    /// Logical Arrow schema accepted from the Paimon write path.
+    input_schema: arrow_schema::SchemaRef,
     /// Physical Arrow schema the writer was created with; re-encoded with the
     /// shredding field metadata at close time.
     schema: arrow_schema::SchemaRef,
@@ -201,6 +204,8 @@ impl ParquetFormatWriter {
         // Reject a bad codec before allocating the writer.
         let codec = parse_compression(compression, zstd_level)?;
         let async_write = output.async_writer().await?;
+        let input_schema = schema;
+        let schema = parquet_write_schema(&input_schema);
         let inner = create_parquet_arrow_writer(async_write, schema.clone(), codec)?;
         let core_options = CoreOptions::new(format_options);
         let stats_modes = write_fields
@@ -208,6 +213,7 @@ impl ParquetFormatWriter {
             .transpose()?;
         Ok(Self {
             inner,
+            input_schema,
             schema,
             write_fields: write_fields.map(|fields| fields.to_vec()),
             stats_modes,
@@ -289,6 +295,23 @@ fn parse_compression(codec: &str, zstd_level: i32) -> crate::Result<Compression>
 #[async_trait]
 impl FormatFileWriter for ParquetFormatWriter {
     async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
+        if batch.schema().as_ref() != self.input_schema.as_ref() {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Parquet write batch schema {:?} does not match writer schema {:?}",
+                    batch.schema(),
+                    self.input_schema
+                ),
+                source: None,
+            });
+        }
+        let physical_batch;
+        let batch = if self.input_schema.as_ref() == self.schema.as_ref() {
+            batch
+        } else {
+            physical_batch = cast_record_batch_to_schema(batch, &self.schema)?;
+            &physical_batch
+        };
         self.inner
             .write(batch)
             .await
@@ -377,6 +400,99 @@ impl FormatFileWriter for ParquetFormatWriter {
             Ok(FormatWriteResult::new(file_size))
         }
     }
+}
+
+/// Parquet has timestamp logical annotations for milliseconds and finer units,
+/// but not seconds. Paimon's persisted representation for precision <= 3 has
+/// always been epoch milliseconds, so keep that stable while exposing
+/// TIMESTAMP(0) as Arrow seconds at the API boundary.
+fn parquet_write_schema(schema: &arrow_schema::SchemaRef) -> arrow_schema::SchemaRef {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(parquet_write_field)
+        .collect::<Vec<_>>();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
+fn parquet_write_field(field: &arrow_schema::FieldRef) -> arrow_schema::FieldRef {
+    let data_type = parquet_write_data_type(field.data_type());
+    if &data_type == field.data_type() {
+        field.clone()
+    } else {
+        Arc::new(field.as_ref().clone().with_data_type(data_type))
+    }
+}
+
+fn parquet_write_data_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
+    use arrow_schema::DataType as ArrowDataType;
+
+    match data_type {
+        ArrowDataType::Timestamp(arrow_schema::TimeUnit::Second, timezone) => {
+            ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, timezone.clone())
+        }
+        ArrowDataType::List(field) => ArrowDataType::List(parquet_write_field(field)),
+        ArrowDataType::LargeList(field) => ArrowDataType::LargeList(parquet_write_field(field)),
+        ArrowDataType::FixedSizeList(field, size) => {
+            ArrowDataType::FixedSizeList(parquet_write_field(field), *size)
+        }
+        ArrowDataType::Struct(fields) => ArrowDataType::Struct(
+            fields
+                .iter()
+                .map(parquet_write_field)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        ArrowDataType::Map(field, sorted) => {
+            ArrowDataType::Map(parquet_write_field(field), *sorted)
+        }
+        _ => data_type.clone(),
+    }
+}
+
+fn cast_record_batch_to_schema(
+    batch: &RecordBatch,
+    target_schema: &arrow_schema::SchemaRef,
+) -> crate::Result<RecordBatch> {
+    if batch.num_columns() != target_schema.fields().len() {
+        return Err(crate::Error::DataInvalid {
+            message: format!(
+                "Parquet write batch has {} columns, expected {}",
+                batch.num_columns(),
+                target_schema.fields().len()
+            ),
+            source: None,
+        });
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(target_schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(column.clone())
+            } else {
+                cast(column, field.data_type()).map_err(|error| crate::Error::DataInvalid {
+                    message: format!(
+                        "Failed to convert Parquet column '{}' from {:?} to {:?}: {error}",
+                        field.name(),
+                        column.data_type(),
+                        field.data_type()
+                    ),
+                    source: Some(Box::new(error)),
+                })
+            }
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    RecordBatch::try_new(target_schema.clone(), columns).map_err(|error| {
+        crate::Error::DataInvalid {
+            message: format!("Failed to build Parquet physical batch: {error}"),
+            source: Some(Box::new(error)),
+        }
+    })
 }
 
 #[async_trait]
@@ -2336,14 +2452,15 @@ mod tests {
     use crate::arrow::{build_target_arrow_schema, variant_arrow_type, ReadBudget};
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        ArrayType, BigIntType, DataField, DataType, Datum, IntType, MapType, PredicateBuilder,
-        VarCharType, VariantType,
+        ArrayType, BigIntType, DataField, DataType, Datum, IntType, LocalZonedTimestampType,
+        MapType, PredicateBuilder, TimestampType, VarCharType, VariantType,
     };
     use crate::table::RowRange;
     use crate::variant::GenericVariant;
     use crate::Error;
     use arrow_array::{
-        Array, BinaryArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray,
+        Array, BinaryArray, Int32Array, Int64Array, MapArray, RecordBatch, StringArray,
+        StructArray, TimestampMillisecondArray, TimestampSecondArray,
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -3134,6 +3251,156 @@ mod tests {
             parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
         let total_rows: usize = reader.into_iter().map(|r| r.unwrap().num_rows()).sum();
         assert_eq!(total_rows, 5);
+    }
+
+    fn timestamp_zero_fields() -> Vec<DataField> {
+        vec![
+            DataField::new(
+                0,
+                "ts".to_string(),
+                DataType::Timestamp(TimestampType::new(0).unwrap()),
+            ),
+            DataField::new(
+                1,
+                "ts_ltz".to_string(),
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(0).unwrap()),
+            ),
+        ]
+    }
+
+    async fn assert_timestamp_zero_filters(bytes: Bytes, fields: &[DataField]) {
+        let cases = [
+            (
+                "ts",
+                Datum::Timestamp {
+                    millis: 2_000,
+                    nanos: 0,
+                },
+            ),
+            (
+                "ts_ltz",
+                Datum::LocalZonedTimestamp {
+                    millis: 2_000,
+                    nanos: 0,
+                },
+            ),
+        ];
+        for (column, literal) in cases {
+            let predicate = PredicateBuilder::new(fields)
+                .equal(column, literal)
+                .unwrap();
+            let predicates = FilePredicates {
+                predicates: vec![predicate],
+                row_filter_factory: None,
+                file_fields: fields.to_vec(),
+            };
+            let batches = ParquetFormatReader::default()
+                .read_batch_stream(
+                    Box::new(TrackingFileRead::new(bytes.clone())),
+                    bytes.len() as u64,
+                    fields,
+                    Some(&predicates),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                1,
+                "filter on {column}"
+            );
+            let array = batches[0]
+                .column_by_name(column)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            assert_eq!(array.value(0), 2_000, "filter on {column}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timestamp_zero_parquet_write_preserves_millis_encoding_and_filters() {
+        let fields = timestamp_zero_fields();
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![-1, 2, 3])),
+                Arc::new(TimestampSecondArray::from(vec![-1, 2, 3]).with_timezone("UTC")),
+            ],
+        )
+        .unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/timestamp_zero_millis_encoding.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(&output, schema, "zstd", 1, Some(&fields), &HashMap::new())
+                .await
+                .unwrap(),
+        );
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let metadata = load_metadata_with_page_index(&bytes, false);
+        for (index, adjusted_to_utc) in [(0, false), (1, true)] {
+            let column = metadata.file_metadata().schema_descr().column(index);
+            assert_eq!(column.physical_type(), parquet::basic::Type::INT64);
+            assert_eq!(
+                column.logical_type_ref(),
+                Some(&parquet::basic::LogicalType::Timestamp {
+                    is_adjusted_to_u_t_c: adjusted_to_utc,
+                    unit: parquet::basic::TimeUnit::MILLIS,
+                })
+            );
+            let ParquetStatistics::Int64(stats) =
+                metadata.row_group(0).column(index).statistics().unwrap()
+            else {
+                panic!("timestamp column must have INT64 statistics");
+            };
+            assert_eq!(stats.min_opt(), Some(&-1_000));
+            assert_eq!(stats.max_opt(), Some(&3_000));
+        }
+        assert_timestamp_zero_filters(bytes, &fields).await;
+    }
+
+    #[tokio::test]
+    async fn test_existing_millis_timestamp_zero_parquet_filters() {
+        let fields = timestamp_zero_fields();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(
+                "ts",
+                ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                true,
+            ),
+            ArrowField::new(
+                "ts_ltz",
+                ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![-1_000, 2_000, 3_000])),
+                Arc::new(
+                    TimestampMillisecondArray::from(vec![-1_000, 2_000, 3_000])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = AsyncArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+
+        assert_timestamp_zero_filters(Bytes::from(bytes), &fields).await;
     }
 
     #[tokio::test]
