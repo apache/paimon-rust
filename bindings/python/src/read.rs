@@ -16,9 +16,11 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::pyarrow::ToPyArrow;
+use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 use paimon::spec::Predicate;
 use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
@@ -26,6 +28,7 @@ use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use tokio::sync::Notify;
 
 use crate::error::to_py_err;
 use crate::predicate::dict_to_predicate;
@@ -438,7 +441,9 @@ impl PyTableRead {
         splits: &Bound<'_, PyAny>,
     ) -> PyResult<PyRecordBatchReader> {
         Ok(PyRecordBatchReader {
-            stream: Mutex::new(self.read_stream(py, splits)?),
+            stream: Mutex::new(Some(self.read_stream(py, splits)?)),
+            closed: AtomicBool::new(false),
+            close_notify: Notify::new(),
         })
     }
 
@@ -459,21 +464,55 @@ impl PyTableRead {
 
 #[pyclass(name = "RecordBatchReader", module = "pypaimon_rust.datafusion")]
 pub struct PyRecordBatchReader {
-    stream: Mutex<ArrowRecordBatchStream>,
+    stream: Mutex<Option<ArrowRecordBatchStream>>,
+    closed: AtomicBool,
+    close_notify: Notify,
 }
 
 impl PyRecordBatchReader {
+    fn next_record_batch(&self) -> PyResult<Option<RecordBatch>> {
+        let mut stream = self
+            .stream
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("native record batch reader lock poisoned"))?;
+        if self.closed.load(Ordering::Acquire) {
+            stream.take();
+            return Ok(None);
+        }
+        let result = match stream.as_mut() {
+            Some(stream) => runtime()
+                .block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = self.close_notify.notified() => Ok(None),
+                        batch = stream.try_next() => batch,
+                    }
+                })
+                .map_err(to_py_err),
+            None => Ok(None),
+        };
+        if self.closed.load(Ordering::Acquire) {
+            stream.take();
+        }
+        result
+    }
+
     fn next_batch(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        let batch = py.detach(|| {
-            let mut stream = self
-                .stream
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("native record batch reader lock poisoned"))?;
-            runtime().block_on(stream.try_next()).map_err(to_py_err)
-        })?;
+        let batch = py.detach(|| self.next_record_batch())?;
         batch
             .map(|batch| Ok(batch.to_pyarrow(py)?.unbind()))
             .transpose()
+    }
+
+    fn close_reader(&self) {
+        self.closed.store(true, Ordering::Release);
+        // notify_one stores a permit when next_record_batch has not started
+        // polling yet, avoiding a lost wake-up between its closed check and
+        // the select.
+        self.close_notify.notify_one();
+        if let Ok(mut stream) = self.stream.try_lock() {
+            stream.take();
+        }
     }
 }
 
@@ -481,6 +520,11 @@ impl PyRecordBatchReader {
 impl PyRecordBatchReader {
     fn read_next_batch(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         self.next_batch(py)
+    }
+
+    /// Stop an in-flight read and release the underlying stream. Idempotent.
+    fn close(&self) {
+        self.close_reader();
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -584,5 +628,51 @@ impl PySplit {
         Ok(Self {
             inner: Self::from_bytes(state.as_bytes())?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{mpsc, Arc};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn record_batch_reader_close_interrupts_pending_next() {
+        let (polled_tx, polled_rx) = mpsc::channel();
+        let mut announced = false;
+        let stream: ArrowRecordBatchStream = Box::pin(futures::stream::poll_fn(move |_cx| {
+            if !announced {
+                announced = true;
+                polled_tx.send(()).unwrap();
+            }
+            Poll::<Option<paimon::Result<RecordBatch>>>::Pending
+        }));
+        let reader = Arc::new(PyRecordBatchReader {
+            stream: Mutex::new(Some(stream)),
+            closed: AtomicBool::new(false),
+            close_notify: Notify::new(),
+        });
+        let worker_reader = Arc::clone(&reader);
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            result_tx
+                .send(matches!(worker_reader.next_record_batch(), Ok(None)))
+                .unwrap();
+        });
+
+        polled_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("stream was not polled");
+        reader.close_reader();
+
+        assert!(result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pending next was not interrupted"));
+        worker.join().unwrap();
+        assert!(matches!(reader.next_record_batch(), Ok(None)));
+        reader.close_reader();
     }
 }
