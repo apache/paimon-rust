@@ -524,7 +524,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         ranges: Vec<RowRange>,
         index_column: &str,
         read_timing: Option<&Arc<DataFileReadTiming>>,
-        parquet_read_budget: Option<&Arc<crate::arrow::ParquetReadBudget>>,
+        parquet_read_budget: Option<&Arc<crate::arrow::ReadBudget>>,
     ) -> Result<ArrowRecordBatchStream> {
         let split = data_split_for_shard_ranges(shard, ranges)?;
         let mut read_builder = self.table.new_read_builder();

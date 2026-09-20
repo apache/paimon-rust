@@ -3046,7 +3046,7 @@ mod tests {
             RowRange::new(258, 263),
             RowRange::new(380, 383),
         ];
-        let budget = Arc::new(ParquetReadBudget::new(2, 256 * 1024 * 1024).unwrap());
+        let budget = Arc::new(ReadBudget::new(2, 256 * 1024 * 1024).unwrap());
         budget.enable_diagnostics();
 
         let batches = ParquetFormatReader::with_read_budget(Arc::clone(&budget))
@@ -3118,7 +3118,7 @@ mod tests {
         let projected_bytes = super::projected_row_group_bytes(&row_group, &projection);
 
         assert_eq!(projected_bytes, 308 * MIB as u64);
-        let budget = ParquetReadBudget::new(8, 256 * MIB as u64).unwrap();
+        let budget = ReadBudget::new(8, 256 * MIB as u64).unwrap();
         budget.enable_diagnostics();
         let permit = budget.acquire(projected_bytes).await.unwrap();
         assert!(
@@ -3225,7 +3225,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parquet_diagnostics_include_reads_with_row_selection() {
-        let data = write_multi_row_group_parquet(32, 64, EnabledStatistics::Chunk).await;
+        let data = write_multi_row_group_parquet(32, 64, EnabledStatistics::Chunk, false).await;
         let budget = Arc::new(ReadBudget::new(8, 256 * 1024 * 1024).unwrap());
         budget.enable_diagnostics();
         let file_size = data.len() as u64;
@@ -4001,7 +4001,7 @@ mod tests {
             .collect::<Vec<_>>();
         for cancel in [false, true] {
             let tracker = TrackingFileRead::new(data.clone());
-            let budget = Arc::new(ParquetReadBudget::new(8, BUDGET as u64).unwrap());
+            let budget = Arc::new(ReadBudget::new(8, BUDGET as u64).unwrap());
             budget.enable_diagnostics();
             let mut stream = ParquetFormatReader::with_read_budget(Arc::clone(&budget))
                 .read_batch_stream(
