@@ -617,6 +617,19 @@ def test_read_arrow_streams_expected_rows():
         assert reader.read_next_batch() is None
 
 
+def test_read_arrow_close_is_idempotent_and_stops_iteration():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder()
+        splits = builder.new_scan().plan().splits()
+        reader = builder.new_read().read_arrow(splits)
+
+        reader.close()
+        assert reader.read_next_batch() is None
+        assert list(reader) == []
+        reader.close()
+
+
 def test_read_empty_splits():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
