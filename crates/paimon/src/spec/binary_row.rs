@@ -1166,7 +1166,21 @@ fn extract_timestamp_parts_from_arrow(
     expected: &str,
 ) -> crate::Result<(i64, i32)> {
     match precision {
-        0..=3 => {
+        0 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampSecondArray>()
+                .ok_or_else(|| type_mismatch_err(&format!("{expected}(s)"), col_idx))?;
+            let millis =
+                arr.value(row_idx)
+                    .checked_mul(1_000)
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("{expected}(s) value overflows milliseconds"),
+                        source: None,
+                    })?;
+            Ok((millis, 0))
+        }
+        1..=3 => {
             let arr = col
                 .as_any()
                 .downcast_ref::<arrow_array::TimestampMillisecondArray>()
@@ -1336,6 +1350,7 @@ enum TypedColumn<'a> {
     Decimal128(&'a arrow_array::Decimal128Array, u32, u32), // (array, precision, scale)
     Binary(&'a arrow_array::BinaryArray),
     Variant(&'a arrow_array::StructArray),
+    TimestampS(&'a arrow_array::TimestampSecondArray),
     TimestampMs(&'a arrow_array::TimestampMillisecondArray),
     TimestampUs(&'a arrow_array::TimestampMicrosecondArray),
     TimestampNs(&'a arrow_array::TimestampNanosecondArray),
@@ -1442,7 +1457,12 @@ fn downcast_columns<'a>(
                     TypedColumn::Variant(arr)
                 }
                 DataType::Timestamp(ts) => match ts.precision() {
-                    0..=3 => TypedColumn::TimestampMs(
+                    0 => TypedColumn::TimestampS(
+                        col.as_any()
+                            .downcast_ref()
+                            .ok_or_else(|| type_mismatch_err("Timestamp(s)", col_idx))?,
+                    ),
+                    1..=3 => TypedColumn::TimestampMs(
                         col.as_any()
                             .downcast_ref()
                             .ok_or_else(|| type_mismatch_err("Timestamp(ms)", col_idx))?,
@@ -1465,7 +1485,12 @@ fn downcast_columns<'a>(
                 },
                 DataType::LocalZonedTimestamp(ts) => {
                     match ts.precision() {
-                        0..=3 => TypedColumn::TimestampMs(col.as_any().downcast_ref().ok_or_else(
+                        0 => {
+                            TypedColumn::TimestampS(col.as_any().downcast_ref().ok_or_else(
+                                || type_mismatch_err("LocalZonedTimestamp(s)", col_idx),
+                            )?)
+                        }
+                        1..=3 => TypedColumn::TimestampMs(col.as_any().downcast_ref().ok_or_else(
                             || type_mismatch_err("LocalZonedTimestamp(ms)", col_idx),
                         )?),
                         4..=6 => TypedColumn::TimestampUs(col.as_any().downcast_ref().ok_or_else(
@@ -1658,6 +1683,19 @@ fn write_typed_value(
                         source: None,
                     });
                 }
+            }
+        }
+        TypedColumn::TimestampS(arr) => {
+            if arr.is_null(row_idx) {
+                builder.set_null_at(pos);
+            } else {
+                let millis = arr.value(row_idx).checked_mul(1_000).ok_or_else(|| {
+                    crate::Error::DataInvalid {
+                        message: "Timestamp(s) value overflows milliseconds".to_string(),
+                        source: None,
+                    }
+                })?;
+                builder.write_timestamp_compact(pos, millis);
             }
         }
         TypedColumn::TimestampMs(arr) => {

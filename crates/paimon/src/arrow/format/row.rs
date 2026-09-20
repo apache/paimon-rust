@@ -33,13 +33,14 @@ use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
     Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder, LargeBinaryBuilder,
     StringBuilder, Time32MillisecondBuilder, TimestampMicrosecondBuilder,
-    TimestampMillisecondBuilder, TimestampNanosecondBuilder,
+    TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
 };
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray,
     MapArray, RecordBatch, RecordBatchOptions, StringArray, StructArray, Time32MillisecondArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field, Fields, SchemaRef, TimeUnit};
@@ -507,7 +508,8 @@ fn validate_arrow_map_entries(
 
 fn timestamp_time_unit_for_precision(precision: u32) -> TimeUnit {
     match precision {
-        0..=3 => TimeUnit::Millisecond,
+        0 => TimeUnit::Second,
+        1..=3 => TimeUnit::Millisecond,
         4..=6 => TimeUnit::Microsecond,
         _ => TimeUnit::Nanosecond,
     }
@@ -901,6 +903,16 @@ fn write_timestamp(
     precision: u32,
 ) -> crate::Result<()> {
     let (millis, nanos_of_milli) = match array.data_type() {
+        ArrowDataType::Timestamp(TimeUnit::Second, _) => (
+            downcast::<TimestampSecondArray>(array, &DataType::Timestamp(Default::default()))?
+                .value(row_idx)
+                .checked_mul(1_000)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: ".row timestamp second conversion overflow".to_string(),
+                    source: None,
+                })?,
+            0,
+        ),
         ArrowDataType::Timestamp(TimeUnit::Millisecond, _) => (
             downcast::<TimestampMillisecondArray>(array, &DataType::Timestamp(Default::default()))?
                 .value(row_idx),
@@ -1173,6 +1185,7 @@ enum ColumnBuilder {
     LargeBinary(LargeBinaryBuilder),
     Date(Date32Builder),
     Time(Time32MillisecondBuilder),
+    TimestampS(TimestampSecondBuilder),
     TimestampMs(TimestampMillisecondBuilder),
     TimestampUs(TimestampMicrosecondBuilder),
     TimestampNs(TimestampNanosecondBuilder),
@@ -1313,6 +1326,7 @@ impl ColumnBuilder {
             Self::LargeBinary(b) => b.append_null(),
             Self::Date(b) => b.append_null(),
             Self::Time(b) => b.append_null(),
+            Self::TimestampS(b) => b.append_null(),
             Self::TimestampMs(b) => b.append_null(),
             Self::TimestampUs(b) => b.append_null(),
             Self::TimestampNs(b) => b.append_null(),
@@ -1372,6 +1386,9 @@ impl ColumnBuilder {
             (Self::LargeBinary(b), DataType::Blob(_)) => b.append_value(input.read_bytes()?),
             (Self::Date(b), DataType::Date(_)) => b.append_value(input.read_i32()?),
             (Self::Time(b), DataType::Time(_)) => b.append_value(input.read_i32()?),
+            (Self::TimestampS(b), DataType::Timestamp(_) | DataType::LocalZonedTimestamp(_)) => {
+                b.append_value(read_timestamp_value(input, TimeUnit::Second)?);
+            }
             (Self::TimestampMs(b), DataType::Timestamp(_) | DataType::LocalZonedTimestamp(_)) => {
                 b.append_value(read_timestamp_value(input, TimeUnit::Millisecond)?);
             }
@@ -1499,6 +1516,7 @@ impl ColumnBuilder {
             Self::LargeBinary(mut b) => Arc::new(b.finish()),
             Self::Date(mut b) => Arc::new(b.finish()),
             Self::Time(mut b) => Arc::new(b.finish()),
+            Self::TimestampS(mut b) => Arc::new(b.finish()),
             Self::TimestampMs(mut b) => Arc::new(b.finish()),
             Self::TimestampUs(mut b) => Arc::new(b.finish()),
             Self::TimestampNs(mut b) => Arc::new(b.finish()),
@@ -1750,7 +1768,15 @@ fn map_entries_field(
 
 fn timestamp_builder(precision: u32, timezone: bool, capacity: usize) -> ColumnBuilder {
     match precision {
-        0..=3 => {
+        0 => {
+            let builder = TimestampSecondBuilder::with_capacity(capacity);
+            if timezone {
+                ColumnBuilder::TimestampS(builder.with_timezone("UTC"))
+            } else {
+                ColumnBuilder::TimestampS(builder)
+            }
+        }
+        1..=3 => {
             let builder = TimestampMillisecondBuilder::with_capacity(capacity);
             if timezone {
                 ColumnBuilder::TimestampMs(builder.with_timezone("UTC"))
@@ -1801,7 +1827,7 @@ fn read_timestamp_value(input: &mut BlockInput<'_>, unit: TimeUnit) -> crate::Re
                 source: None,
             })?
         }
-        TimeUnit::Second => millis / 1_000,
+        TimeUnit::Second => millis.div_euclid(1_000),
     })
 }
 
@@ -2341,8 +2367,9 @@ mod tests {
     use crate::io::FileIOBuilder;
     use crate::spec::{
         ArrayType, BigIntType, BlobType, BooleanType, DataType, DateType, Datum, DecimalType,
-        DoubleType, FloatType, IntType, MapType, MultisetType, Predicate, PredicateOperator,
-        RowType, TimeType, TimestampType, VarBinaryType, VarCharType, VariantType,
+        DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType, MultisetType, Predicate,
+        PredicateOperator, RowType, TimeType, TimestampType, VarBinaryType, VarCharType,
+        VariantType,
     };
     use crate::variant::GenericVariant;
     use futures::TryStreamExt;
@@ -2639,6 +2666,71 @@ mod tests {
             .unwrap();
         assert!(names.is_null(0));
         assert_eq!(names.value(1), "ccc");
+    }
+
+    #[tokio::test]
+    async fn row_writer_reader_roundtrip_timestamp_zero_as_seconds() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/row-timestamp-zero/data.row";
+        let output = file_io.new_output(path).unwrap();
+        let fields = vec![
+            DataField::new(
+                0,
+                "ts".to_string(),
+                DataType::Timestamp(TimestampType::new(0).unwrap()),
+            ),
+            DataField::new(
+                1,
+                "ts_ltz".to_string(),
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(0).unwrap()),
+            ),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let mut writer = RowFormatWriter::new(&output, schema.clone(), fields.clone(), 1)
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![Some(-1), Some(2), None])),
+                Arc::new(
+                    TimestampSecondArray::from(vec![Some(-1), Some(2), None]).with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).await.unwrap();
+        Box::new(writer).close().await.unwrap();
+
+        let input = file_io.new_input(path).unwrap();
+        let bytes = input.read().await.unwrap();
+        let actual = RowFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone())),
+                bytes.len() as u64,
+                &fields,
+                None,
+                Some(8),
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0].schema().as_ref(), batch.schema().as_ref());
+        for column in 0..2 {
+            let values = actual[0]
+                .column(column)
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap();
+            assert_eq!(values.value(0), -1);
+            assert_eq!(values.value(1), 2);
+            assert!(values.is_null(2));
+        }
     }
 
     #[tokio::test]

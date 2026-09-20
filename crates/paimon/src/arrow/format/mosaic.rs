@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilePredicates, FormatFileReader};
+use super::{timestamp_millis_schema, FilePredicates, FormatFileReader};
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::filtering::{
     predicates_may_match_with_schema, remap_predicates_to_file, StatsAccessor,
@@ -320,7 +320,7 @@ fn read_mosaic_batches_blocking(
         row_filter_factory: None,
         file_fields: existing_scan_fields.clone(),
     });
-    let read_schema = build_target_arrow_schema(&existing_scan_fields)?;
+    let read_schema = timestamp_millis_schema(&build_target_arrow_schema(&existing_scan_fields)?);
     validate_mosaic_schema(&read_schema)?;
     let projected_names = existing_scan_fields
         .iter()

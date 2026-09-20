@@ -24,7 +24,7 @@ use arrow_array::{
     new_null_array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array,
     Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
     Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
 use std::sync::Arc;
 
@@ -121,7 +121,15 @@ fn timestamp_array(
     num_rows: usize,
 ) -> crate::Result<ArrayRef> {
     let array: ArrayRef = match precision {
-        0..=3 => {
+        0 => {
+            let value = millis.div_euclid(1_000);
+            let array = TimestampSecondArray::from(vec![Some(value); num_rows]);
+            match timezone {
+                Some(tz) => Arc::new(array.with_timezone(tz)),
+                None => Arc::new(array),
+            }
+        }
+        1..=3 => {
             let array = TimestampMillisecondArray::from(vec![Some(millis); num_rows]);
             match timezone {
                 Some(tz) => Arc::new(array.with_timezone(tz)),
@@ -178,6 +186,13 @@ mod tests {
                     nanos: 567890,
                 }),
                 DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(9).unwrap()),
+            ),
+            (
+                Some(Datum::LocalZonedTimestamp {
+                    millis: -1_000,
+                    nanos: 0,
+                }),
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(0).unwrap()),
             ),
         ];
         let datums: Vec<_> = values

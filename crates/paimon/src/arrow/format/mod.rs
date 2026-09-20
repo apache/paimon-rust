@@ -331,6 +331,53 @@ pub(crate) async fn create_format_writer(
     }
 }
 
+fn timestamp_millis_schema(schema: &SchemaRef) -> SchemaRef {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(timestamp_millis_field)
+        .collect::<Vec<_>>();
+    Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
+fn timestamp_millis_field(field: &arrow_schema::FieldRef) -> arrow_schema::FieldRef {
+    let data_type = timestamp_millis_data_type(field.data_type());
+    if &data_type == field.data_type() {
+        field.clone()
+    } else {
+        Arc::new(field.as_ref().clone().with_data_type(data_type))
+    }
+}
+
+fn timestamp_millis_data_type(data_type: &arrow_schema::DataType) -> arrow_schema::DataType {
+    use arrow_schema::DataType as ArrowDataType;
+
+    match data_type {
+        ArrowDataType::Timestamp(arrow_schema::TimeUnit::Second, timezone) => {
+            ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, timezone.clone())
+        }
+        ArrowDataType::List(field) => ArrowDataType::List(timestamp_millis_field(field)),
+        ArrowDataType::LargeList(field) => ArrowDataType::LargeList(timestamp_millis_field(field)),
+        ArrowDataType::FixedSizeList(field, size) => {
+            ArrowDataType::FixedSizeList(timestamp_millis_field(field), *size)
+        }
+        ArrowDataType::Struct(fields) => ArrowDataType::Struct(
+            fields
+                .iter()
+                .map(timestamp_millis_field)
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        ArrowDataType::Map(field, sorted) => {
+            ArrowDataType::Map(timestamp_millis_field(field), *sorted)
+        }
+        _ => data_type.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

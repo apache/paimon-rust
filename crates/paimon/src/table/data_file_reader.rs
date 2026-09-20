@@ -1966,6 +1966,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mosaic_timestamp_zero_read_filter_and_row_selection() {
+        use crate::spec::{LocalZonedTimestampType, MapType, TimestampType};
+        use arrow_array::builder::{ListBuilder, TimestampMillisecondBuilder};
+        use arrow_array::{ArrayRef, MapArray, StructArray, TimestampMillisecondArray};
+        use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+        use arrow_schema::DataType as ArrowDataType;
+
+        let fields_at_precision = |precision| {
+            let timestamp = DataType::Timestamp(TimestampType::new(precision).unwrap());
+            let timestamp_ltz =
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(precision).unwrap());
+            vec![
+                data_field(0, "ts", timestamp.clone()),
+                data_field(1, "ts_ltz", timestamp_ltz.clone()),
+                data_field(2, "timestamps", DataType::Array(ArrayType::new(timestamp))),
+                data_field(
+                    3,
+                    "timestamp_map",
+                    DataType::Map(MapType::new(
+                        DataType::VarChar(VarCharType::string_type()),
+                        timestamp_ltz,
+                    )),
+                ),
+            ]
+        };
+        let read_fields = fields_at_precision(0);
+        let output_schema = build_target_arrow_schema(&read_fields).unwrap();
+        let physical_schema = build_target_arrow_schema(&fields_at_precision(3)).unwrap();
+        let ArrowDataType::List(element) = physical_schema.field(2).data_type() else {
+            unreachable!()
+        };
+        let mut timestamps =
+            ListBuilder::new(TimestampMillisecondBuilder::new()).with_field(element.clone());
+        timestamps.values().append_value(-1_000);
+        timestamps.values().append_value(2_000);
+        timestamps.append(true);
+        timestamps.append(true);
+        timestamps.append(false);
+        timestamps.values().append_value(3_000);
+        timestamps.append(true);
+
+        let ArrowDataType::Map(entries_field, sorted) = physical_schema.field(3).data_type() else {
+            unreachable!()
+        };
+        let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
+            unreachable!()
+        };
+        let entries = StructArray::try_new(
+            entry_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["before", "after", "last"])),
+                Arc::new(
+                    TimestampMillisecondArray::from(vec![-1_000, 2_000, 3_000])
+                        .with_timezone("UTC"),
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        let timestamp_map = MapArray::try_new(
+            entries_field.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 2, 2, 2, 3])),
+            entries,
+            Some(NullBuffer::from(vec![true, true, false, true])),
+            *sorted,
+        )
+        .unwrap();
+        let timestamps_millis = vec![Some(-1_000), Some(2_000), None, Some(3_000)];
+        let physical_batch = RecordBatch::try_new(
+            physical_schema,
+            vec![
+                Arc::new(TimestampMillisecondArray::from(timestamps_millis.clone())),
+                Arc::new(TimestampMillisecondArray::from(timestamps_millis).with_timezone("UTC")),
+                Arc::new(timestamps.finish()),
+                Arc::new(timestamp_map),
+            ],
+        )
+        .unwrap();
+        let expected_columns = physical_batch
+            .columns()
+            .iter()
+            .zip(output_schema.fields())
+            .map(|(column, field)| arrow_cast::cast(column, field.data_type()).unwrap())
+            .collect::<Vec<ArrayRef>>();
+        let data = write_mosaic(&physical_batch);
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/mosaic_timestamp_zero";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.mosaic";
+        file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap()
+            .write(data.clone())
+            .await
+            .unwrap();
+        let builder = PredicateBuilder::new(&read_fields);
+        let cases = vec![
+            (Vec::new(), None, vec![0, 1, 2, 3]),
+            (
+                vec![builder
+                    .greater_or_equal(
+                        "ts",
+                        Datum::Timestamp {
+                            millis: 1_500,
+                            nanos: 0,
+                        },
+                    )
+                    .unwrap()],
+                None,
+                vec![1, 3],
+            ),
+            (
+                vec![builder
+                    .equal(
+                        "ts_ltz",
+                        Datum::LocalZonedTimestamp {
+                            millis: -1_000,
+                            nanos: 0,
+                        },
+                    )
+                    .unwrap()],
+                None,
+                vec![0],
+            ),
+            (
+                vec![builder
+                    .array_contains(
+                        "timestamps",
+                        Datum::Timestamp {
+                            millis: 2_000,
+                            nanos: 0,
+                        },
+                    )
+                    .unwrap()],
+                None,
+                vec![0],
+            ),
+            (
+                Vec::new(),
+                Some(vec![RowRange::new(0, 0), RowRange::new(3, 3)]),
+                vec![0, 3],
+            ),
+        ];
+        for row_groups in [0, 2] {
+            for (predicates, row_ranges, expected_rows) in &cases {
+                let mut split = DataSplitBuilder::new()
+                    .with_snapshot(1)
+                    .with_partition(crate::spec::BinaryRow::new(0))
+                    .with_bucket(0)
+                    .with_bucket_path(bucket_path.clone())
+                    .with_total_buckets(1)
+                    .with_data_files(vec![data_file(file_name, data.len() as i64, 4, 1)]);
+                if let Some(row_ranges) = row_ranges {
+                    split = split.with_row_ranges(row_ranges.clone());
+                }
+                let batches = DataFileReader::new(
+                    file_io.clone(),
+                    SchemaManager::new(file_io.clone(), table_path.to_string()),
+                    1,
+                    read_fields.clone(),
+                    read_fields.clone(),
+                    predicates.clone(),
+                )
+                .with_mosaic_prefetch(MosaicPrefetchOptions {
+                    row_groups,
+                    ..Default::default()
+                })
+                .read(&[split.build().unwrap()])
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+                let actual =
+                    arrow_select::concat::concat_batches(&output_schema, &batches).unwrap();
+                let expected_indices = arrow_array::UInt32Array::from(expected_rows.clone());
+                let expected = RecordBatch::try_new(
+                    output_schema.clone(),
+                    expected_columns
+                        .iter()
+                        .map(|column| {
+                            arrow_select::take::take(column, &expected_indices, None).unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "row_groups={row_groups}, predicates={predicates:?}, row_ranges={row_ranges:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_mosaic_physical_missing_column_is_null_filled() {
         let physical_fields = vec![
             data_field(0, "id", DataType::Int(IntType::with_nullable(false))),
@@ -2963,10 +3157,13 @@ mod vector_parquet_tests {
     use crate::arrow::format::ParquetFormatWriter;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
-    use crate::spec::{DataFileMeta, DataType, FloatType, VectorType};
+    use crate::spec::{
+        DataFileMeta, DataType, Datum, FloatType, LocalZonedTimestampType, PredicateBuilder,
+        TimestampType, VectorType,
+    };
     use crate::table::source::DataSplitBuilder;
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
-    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, TimestampSecondArray};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
     use futures::TryStreamExt;
 
@@ -3121,6 +3318,120 @@ mod vector_parquet_tests {
             .downcast_ref::<Float32Array>()
             .expect("child should be Float32Array");
         assert_eq!(floats2.values(), &[3.0, 4.0]);
+    }
+
+    #[tokio::test]
+    async fn test_datafilereader_timestamp_zero_parquet_roundtrip_and_filter() {
+        let read_fields = vec![
+            DataField::new(
+                0,
+                "ts".to_string(),
+                DataType::Timestamp(TimestampType::new(0).unwrap()),
+            ),
+            DataField::new(
+                1,
+                "ts_ltz".to_string(),
+                DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(0).unwrap()),
+            ),
+        ];
+        let arrow_schema = build_target_arrow_schema(&read_fields).unwrap();
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![-1, 2, 3])),
+                Arc::new(TimestampSecondArray::from(vec![-1, 2, 3]).with_timezone("UTC")),
+            ],
+        )
+        .unwrap();
+
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/timestamp_zero_parquet_e2e";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.parquet";
+        let file_path = format!("{bucket_path}/{file_name}");
+        let output = file_io.new_output(&file_path).unwrap();
+        let mut writer: Box<dyn FormatFileWriter> = Box::new(
+            ParquetFormatWriter::new(
+                &output,
+                arrow_schema.clone(),
+                "zstd",
+                1,
+                Some(&read_fields),
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size;
+
+        let schema_id = 1;
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![data_file(file_name, file_size as i64, 3, schema_id)])
+            .build()
+            .unwrap();
+        let predicates = vec![
+            PredicateBuilder::new(&read_fields)
+                .equal(
+                    "ts",
+                    Datum::Timestamp {
+                        millis: 2_000,
+                        nanos: 0,
+                    },
+                )
+                .unwrap(),
+            PredicateBuilder::new(&read_fields)
+                .equal(
+                    "ts_ltz",
+                    Datum::LocalZonedTimestamp {
+                        millis: 2_000,
+                        nanos: 0,
+                    },
+                )
+                .unwrap(),
+        ];
+        let reader = DataFileReader::new(
+            file_io.clone(),
+            SchemaManager::new(file_io, table_path.to_string()),
+            schema_id,
+            read_fields.clone(),
+            read_fields,
+            predicates,
+        );
+        let batches = reader
+            .read(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].schema().as_ref(), arrow_schema.as_ref());
+        assert_eq!(
+            batches[0]
+                .column_by_name("ts")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .values(),
+            &[2]
+        );
+        assert_eq!(
+            batches[0]
+                .column_by_name("ts_ltz")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .values(),
+            &[2]
+        );
     }
 }
 
