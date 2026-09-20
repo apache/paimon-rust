@@ -5168,6 +5168,45 @@ mod tests {
                 .unwrap(),
             &[Some(vec![]), None, Some(vec![]), Some(vec![])],
         );
+
+        // An empty encoded suffix is the selected-key protocol's encoding for
+        // the valid empty-string key, not an empty key set.
+        let empty_key_rows = vec![Some(vec![("", Some(10)), ("other", Some(11))])];
+        let (empty_path, empty_file_io, empty_file_size, empty_fields) =
+            write_map_shredding_file(&empty_key_rows, &[1], 2).await;
+        let selected_empty_fields = vec![empty_fields[1].clone().with_description(Some(
+            crate::arrow::shredding::map::SELECTED_KEYS_PREFIX.to_string(),
+        ))];
+        let empty_key_reader = empty_file_io
+            .new_input(&empty_path)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap();
+        let empty_key = create_format_reader(&empty_path, false, &selected_empty_fields)
+            .unwrap()
+            .read_batch_stream(
+                Box::new(empty_key_reader),
+                empty_file_size,
+                &selected_empty_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_int64_map_rows(
+            empty_key[0]
+                .column_by_name("tags")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .unwrap(),
+            &[Some(vec![("", Some(10))])],
+        );
     }
 
     #[tokio::test]

@@ -1135,12 +1135,6 @@ fn selected_map_keys(field: &DataField) -> Result<Option<HashSet<String>>> {
     let Some(encoded) = description.strip_prefix(SELECTED_KEYS_PREFIX) else {
         return Ok(None);
     };
-    if encoded.is_empty() {
-        return Err(Error::DataInvalid {
-            message: format!("Selected-key MAP field '{}' has no keys", field.name()),
-            source: None,
-        });
-    }
     let keys: HashSet<String> = encoded
         .split(SELECTED_KEYS_DELIMITER)
         .map(ToString::to_string)
