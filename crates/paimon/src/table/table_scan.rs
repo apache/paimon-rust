@@ -4073,7 +4073,7 @@ mod tests {
             .unwrap();
 
         let anchor = make_evo_file_with_cols("anchor.parquet", 1_000, 2, 0, &["id"]);
-        let mut replacement = CommitMessage::new(partition, 0, vec![anchor, deleted.clone()]);
+        let mut replacement = CommitMessage::new(partition, 0, vec![anchor]);
         replacement.deleted_files = vec![deleted];
         TableCommit::new(table.clone(), "delta-netting-replacement".to_string())
             .commit(vec![replacement])
