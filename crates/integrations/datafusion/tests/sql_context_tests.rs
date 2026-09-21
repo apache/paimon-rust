@@ -76,6 +76,7 @@ struct MetadataListingCatalog {
     table_names_by_database: Mutex<std::collections::HashMap<String, Vec<String>>>,
     list_table_types_calls: AtomicUsize,
     fail_next_list_table_types: AtomicBool,
+    fail_all_list_table_types: AtomicBool,
     listing_concurrency: Option<Arc<MetadataListingConcurrency>>,
     block_drop_response: AtomicBool,
     drop_committed: Notify,
@@ -135,6 +136,7 @@ impl MetadataListingCatalog {
             table_names_by_database: Mutex::new(std::collections::HashMap::new()),
             list_table_types_calls: AtomicUsize::new(0),
             fail_next_list_table_types: AtomicBool::new(false),
+            fail_all_list_table_types: AtomicBool::new(false),
             listing_concurrency: None,
             block_drop_response: AtomicBool::new(false),
             drop_committed: Notify::new(),
@@ -210,6 +212,10 @@ impl MetadataListingCatalog {
     fn fail_next_list_table_types(&self) {
         self.fail_next_list_table_types
             .store(true, Ordering::SeqCst);
+    }
+
+    fn fail_all_list_table_types(&self) {
+        self.fail_all_list_table_types.store(true, Ordering::SeqCst);
     }
 
     fn race_next_refreshes(&self) {
@@ -394,9 +400,10 @@ impl Catalog for MetadataListingCatalog {
         if let Some(listing_concurrency) = &self.listing_concurrency {
             listing_concurrency.observe().await;
         }
-        if self
-            .fail_next_list_table_types
-            .swap(false, Ordering::SeqCst)
+        if self.fail_all_list_table_types.load(Ordering::SeqCst)
+            || self
+                .fail_next_list_table_types
+                .swap(false, Ordering::SeqCst)
         {
             return Err(paimon::Error::Unsupported {
                 message: "simulated table type classification failure".to_string(),
@@ -551,6 +558,26 @@ async fn test_metadata_refresh_classifies_only_new_objects() {
 }
 
 #[tokio::test]
+async fn test_metadata_refresh_deduplicates_object_names_before_classification() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    catalog.set_table_names(vec!["duplicate", "duplicate"]);
+
+    let provider = PaimonCatalogProvider::try_new(
+        Some("paimon".to_string()),
+        catalog.clone(),
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(catalog.list_table_types_calls(), 1);
+    let names = provider.schema("default").unwrap().table_names();
+    assert_eq!(names.iter().filter(|name| *name == "duplicate").count(), 1);
+}
+
+#[tokio::test]
 async fn test_metadata_refresh_retries_unknown_table_types() {
     let catalog = Arc::new(MetadataListingCatalog::new());
     catalog.set_table_names(vec!["existing"]);
@@ -573,6 +600,32 @@ async fn test_metadata_refresh_retries_unknown_table_types() {
     assert_eq!(catalog.list_table_types_calls(), 2);
     let schema = provider.schema("default").unwrap();
     assert!(schema.table_exist("existing$snapshots"));
+}
+
+#[tokio::test]
+async fn test_metadata_refresh_limits_and_reports_persistent_classification_failures() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let table_names: Vec<_> = (0..100).map(|index| format!("table_{index}")).collect();
+    *catalog.table_names.lock().unwrap() = table_names;
+    catalog.fail_all_list_table_types();
+
+    let provider = PaimonCatalogProvider::try_new(
+        Some("paimon".to_string()),
+        catalog.clone(),
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(provider.schema("default").unwrap().table_names().len(), 101);
+    assert!(catalog.list_table_types_calls() <= 16);
+
+    let calls_before_refresh = catalog.list_table_types_calls();
+    let error = provider.refresh_metadata().await.unwrap_err();
+    assert!(error.to_string().contains("table type classification"));
+    assert!(catalog.list_table_types_calls() - calls_before_refresh <= 16);
 }
 
 #[tokio::test]
@@ -604,6 +657,24 @@ async fn test_explicit_uninitialized_providers_require_metadata_initialization()
         schema_provider.table_names(),
         vec!["metadata_only", "metadata_view"]
     );
+}
+
+#[tokio::test]
+async fn test_explicit_metadata_refresh_times_out_pending_remote_listing() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let provider = PaimonCatalogProvider::new_uninitialized(
+        Some("paimon".to_string()),
+        catalog.clone(),
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .with_metadata_refresh_timeout(std::time::Duration::from_millis(20));
+    catalog.block_next_list_tables();
+
+    let error = provider.refresh_metadata().await.unwrap_err();
+
+    assert!(error.to_string().contains("metadata refresh timed out"));
 }
 
 #[tokio::test]
@@ -1400,6 +1471,35 @@ async fn test_successful_rename_refreshes_target_when_source_was_not_snapshotted
     assert!(schema.table_exist("destination$snapshots"));
 }
 
+#[tokio::test]
+async fn test_successful_rename_records_unknown_target_before_bounded_refresh() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    catalog.set_table_names(vec![]);
+    let mut sql_context = SQLContext::builder()
+        .with_catalog_metadata_refresh_timeout(std::time::Duration::from_millis(20))
+        .build();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+    catalog.set_table_names(vec!["source"]);
+    catalog.block_next_list_tables();
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        sql_context.sql("ALTER TABLE source RENAME TO destination"),
+    )
+    .await
+    .expect("rename reconciliation must be time bounded")
+    .unwrap();
+
+    let provider = sql_context.ctx().catalog("paimon").unwrap();
+    let schema = provider.schema("default").unwrap();
+    assert!(!schema.table_exist("source"));
+    assert!(schema.table_exist("destination"));
+    assert!(!schema.table_exist("destination$snapshots"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_concurrent_ddl_delta_follows_serialized_commit_order() {
     let catalog = Arc::new(MetadataListingCatalog::new());
@@ -1739,6 +1839,34 @@ async fn test_information_schema_backs_off_after_catalog_refresh_failure() {
         .unwrap();
 
     assert_eq!(catalog.metadata_calls(), calls_after_failure);
+}
+
+#[tokio::test]
+async fn test_information_schema_backs_off_after_table_classification_failure() {
+    let catalog = Arc::new(MetadataListingCatalog::new());
+    let mut sql_context = SQLContext::builder()
+        .with_catalog_metadata_refresh_ttl(std::time::Duration::ZERO)
+        .build();
+    sql_context
+        .register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+    let table_names: Vec<_> = (0..100).map(|index| format!("table_{index}")).collect();
+    *catalog.table_names.lock().unwrap() = table_names;
+    catalog.fail_all_list_table_types();
+
+    sql_context
+        .sql("SELECT * FROM paimon.information_schema.tables")
+        .await
+        .unwrap();
+    let calls_after_failure = catalog.list_table_types_calls();
+
+    sql_context
+        .sql("SELECT * FROM paimon.information_schema.tables")
+        .await
+        .unwrap();
+
+    assert_eq!(catalog.list_table_types_calls(), calls_after_failure);
 }
 
 #[tokio::test]
@@ -2647,6 +2775,25 @@ async fn test_create_table_if_not_exists() {
 }
 
 #[tokio::test]
+async fn test_create_table_if_not_exists_classifies_new_paimon_table() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+
+    sql_context
+        .sql("CREATE TABLE IF NOT EXISTS paimon.mydb.records (id BIGINT)")
+        .await
+        .unwrap();
+
+    let provider = sql_context.ctx().catalog("paimon").unwrap();
+    let schema = provider.schema("mydb").unwrap();
+    assert!(schema.table_exist("records$snapshots"));
+}
+
+#[tokio::test]
 async fn test_create_object_table_delta_does_not_claim_system_table_support() {
     let (_tmp, catalog) = create_test_env();
     let sql_context = create_sql_context(catalog.clone()).await;
@@ -2696,6 +2843,33 @@ async fn test_create_table_if_not_exists_noop_does_not_overwrite_object_capabili
     let schema = provider.schema("mydb").unwrap();
     assert!(schema.table_exist("objects"));
     assert!(!schema.table_exist("objects$snapshots"));
+}
+
+#[tokio::test]
+async fn test_create_table_if_not_exists_noop_preserves_paimon_capability() {
+    let (_tmp, catalog) = create_test_env();
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+    let schema = paimon::spec::Schema::builder()
+        .column("id", paimon::spec::DataType::BigInt(Default::default()))
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&Identifier::new("mydb", "records"), schema, false)
+        .await
+        .unwrap();
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE TABLE IF NOT EXISTS paimon.mydb.records (id BIGINT)")
+        .await
+        .unwrap();
+
+    let provider = sql_context.ctx().catalog("paimon").unwrap();
+    let schema = provider.schema("mydb").unwrap();
+    assert!(schema.table_exist("records$snapshots"));
 }
 
 #[tokio::test]

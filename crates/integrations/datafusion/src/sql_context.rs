@@ -339,6 +339,7 @@ impl SQLContext {
                 self.blob_reader_registry.clone(),
                 Some(session_state),
                 Arc::clone(&self.catalog_metadata_request_semaphore),
+                self.catalog_metadata_refresh_timeout,
             )
             .await?,
         );
@@ -935,7 +936,7 @@ impl SQLContext {
         };
 
         if result.is_ok() {
-            self.apply_metadata_change(&statements[0])?;
+            self.apply_metadata_change(&statements[0]).await?;
         }
         result
     }
@@ -1074,7 +1075,7 @@ impl SQLContext {
         Ok(targets)
     }
 
-    fn apply_metadata_change(&self, statement: &Statement) -> DFResult<()> {
+    async fn apply_metadata_change(&self, statement: &Statement) -> DFResult<()> {
         match statement {
             Statement::CreateDatabase { db_name, .. } => {
                 let (_, catalog_name, database) = self.resolve_catalog_and_database(db_name)?;
@@ -1099,23 +1100,33 @@ impl SQLContext {
                     return Ok(());
                 }
                 let (_, catalog_name, identifier) = self.resolve_catalog_and_table(&create.name)?;
-                let declared_type = if create.if_not_exists {
-                    None
-                } else {
-                    let options: HashMap<_, _> = extract_options(&create.table_options)?
-                        .into_iter()
-                        .collect();
-                    Some(
-                        CoreOptions::new(&options)
-                            .table_type()
-                            .map_err(to_datafusion_error)?,
-                    )
-                };
+                if create.if_not_exists {
+                    let provider = self.ctx.catalog(&catalog_name).ok_or_else(|| {
+                        DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'"))
+                    })?;
+                    let provider = provider
+                        .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+                        .ok_or_else(|| {
+                            DataFusionError::Plan(format!(
+                                "Catalog '{catalog_name}' is not a Paimon catalog"
+                            ))
+                        })?;
+                    provider
+                        .reconcile_table_created(identifier.database(), identifier.object())
+                        .await;
+                    return Ok(());
+                }
+                let options: HashMap<_, _> = extract_options(&create.table_options)?
+                    .into_iter()
+                    .collect();
+                let declared_type = CoreOptions::new(&options)
+                    .table_type()
+                    .map_err(to_datafusion_error)?;
                 self.update_catalog_metadata(&catalog_name, |provider| {
                     provider.record_table_created(
                         identifier.database(),
                         identifier.object(),
-                        declared_type,
+                        Some(declared_type),
                     )
                 })?;
                 Ok(())
@@ -1244,7 +1255,7 @@ impl SQLContext {
                         Instant::now(),
                     );
             } else {
-                provider.initialize_metadata().await?;
+                provider.refresh_metadata_for_sql().await?;
                 self.catalog_refreshes
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())

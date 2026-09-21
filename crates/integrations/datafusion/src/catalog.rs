@@ -20,8 +20,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, MemorySchemaProvider, SchemaProvider};
@@ -359,10 +360,81 @@ impl CatalogMetadataState {
 type SharedCatalogMetadata = Arc<CatalogMetadataState>;
 
 const MAX_CONCURRENT_METADATA_LISTINGS: usize = 16;
+const MAX_TABLE_TYPE_CLASSIFICATION_FAILURES: usize = 16;
 pub(crate) const DEFAULT_MAX_CONCURRENT_METADATA_REQUESTS: usize = 16;
+const DEFAULT_METADATA_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 // Recent tombstones guard against eventually consistent database listings. Tombstones still
 // needed by an active older refresh are exempt from this bound until that refresh completes.
 const MAX_RETAINED_DATABASE_TOMBSTONES: usize = 1024;
+
+#[derive(Debug)]
+struct TableTypeClassificationBudget {
+    failure_permits: Arc<tokio::sync::Semaphore>,
+    failures: Mutex<Vec<String>>,
+    skipped: AtomicUsize,
+}
+
+impl TableTypeClassificationBudget {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            failure_permits: Arc::new(tokio::sync::Semaphore::new(
+                MAX_TABLE_TYPE_CLASSIFICATION_FAILURES,
+            )),
+            failures: Mutex::new(Vec::new()),
+            skipped: AtomicUsize::new(0),
+        })
+    }
+
+    async fn reserve_failure_permit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match Arc::clone(&self.failure_permits).acquire_owned().await {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                self.skipped.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    fn record_failure(&self, message: String, permit: tokio::sync::OwnedSemaphorePermit) {
+        let exhausted = {
+            let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+            failures.push(message);
+            failures.len() >= MAX_TABLE_TYPE_CLASSIFICATION_FAILURES
+        };
+        permit.forget();
+        if exhausted {
+            self.failure_permits.close();
+        }
+    }
+
+    fn error(&self) -> Option<DataFusionError> {
+        let failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        if failures.is_empty() {
+            return None;
+        }
+        let skipped = self.skipped.load(Ordering::Relaxed);
+        Some(DataFusionError::Execution(format!(
+            "table type classification failed for {} object(s); skipped {skipped} additional object(s) after the failure budget was exhausted: {}",
+            failures.len(),
+            failures.join("; ")
+        )))
+    }
+}
+
+fn finish_table_type_classification(
+    budget: &TableTypeClassificationBudget,
+    fail_on_error: bool,
+) -> DFResult<()> {
+    let Some(error) = budget.error() else {
+        return Ok(());
+    };
+    if fail_on_error {
+        Err(error)
+    } else {
+        log::warn!("metadata snapshot contains unclassified tables: {error}");
+        Ok(())
+    }
+}
 
 async fn load_database_metadata(
     catalog: &dyn Catalog,
@@ -370,6 +442,7 @@ async fn load_database_metadata(
     ignore_missing_views_endpoint: bool,
     known_capabilities: HashMap<String, SystemTableCapability>,
     metadata_io_semaphore: &tokio::sync::Semaphore,
+    classification_budget: Arc<TableTypeClassificationBudget>,
 ) -> DFResult<DatabaseMetadata> {
     let tables = async {
         let _permit = metadata_io_semaphore.acquire().await.map_err(|_| {
@@ -401,7 +474,11 @@ async fn load_database_metadata(
             Err(error) => Err(to_datafusion_error(error)),
         }
     };
-    let (table_names, view_names) = futures::try_join!(tables, views)?;
+    let (mut table_names, mut view_names) = futures::try_join!(tables, views)?;
+    let mut seen_tables = HashSet::new();
+    table_names.retain(|name| seen_tables.insert(name.clone()));
+    let mut seen_views = HashSet::new();
+    view_names.retain(|name| seen_views.insert(name.clone()));
 
     let unresolved_names: Vec<_> = table_names
         .iter()
@@ -414,20 +491,34 @@ async fn load_database_metadata(
         .cloned()
         .collect();
     let declared_types: HashMap<_, _> = stream::iter(unresolved_names)
-        .map(|name| async move {
-            let _permit = metadata_io_semaphore.acquire().await.map_err(|_| {
-                DataFusionError::Execution("metadata request limiter was closed".to_string())
-            })?;
-            match catalog
-                .list_table_types(database, std::slice::from_ref(&name))
-                .await
-            {
-                Ok(mut types) => Ok::<_, DataFusionError>(
-                    types.remove(&name).map(|table_type| (name, table_type)),
-                ),
-                Err(error) => {
-                    log::debug!("unable to classify table type for '{database}.{name}': {error}");
-                    Ok::<_, DataFusionError>(None)
+        .map(|name| {
+            let classification_budget = Arc::clone(&classification_budget);
+            async move {
+                let Some(failure_permit) = classification_budget.reserve_failure_permit().await
+                else {
+                    return Ok::<_, DataFusionError>(None);
+                };
+                let _permit = metadata_io_semaphore.acquire().await.map_err(|_| {
+                    DataFusionError::Execution("metadata request limiter was closed".to_string())
+                })?;
+                match catalog
+                    .list_table_types(database, std::slice::from_ref(&name))
+                    .await
+                {
+                    Ok(mut types) => match types.remove(&name) {
+                        Some(table_type) => Ok::<_, DataFusionError>(Some((name, table_type))),
+                        None => Ok(None),
+                    },
+                    Err(error) => {
+                        log::debug!(
+                            "unable to classify table type for '{database}.{name}': {error}"
+                        );
+                        classification_budget.record_failure(
+                            format!("'{database}.{name}': {error}"),
+                            failure_permit,
+                        );
+                        Ok(None)
+                    }
                 }
             }
         })
@@ -685,6 +776,7 @@ pub struct PaimonCatalogProvider {
     metadata: SharedCatalogMetadata,
     /// Shared bound for metadata requests issued by this session's providers.
     metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
+    metadata_refresh_timeout: Duration,
 }
 
 impl Debug for PaimonCatalogProvider {
@@ -713,6 +805,7 @@ impl PaimonCatalogProvider {
             Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_MAX_CONCURRENT_METADATA_REQUESTS,
             )),
+            DEFAULT_METADATA_REFRESH_TIMEOUT,
         )
     }
 
@@ -723,6 +816,7 @@ impl PaimonCatalogProvider {
         blob_reader_registry: BlobReaderRegistry,
         session_state: Option<SessionStateProvider>,
         metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
+        metadata_refresh_timeout: Duration,
     ) -> Self {
         PaimonCatalogProvider {
             catalog_name,
@@ -735,6 +829,7 @@ impl PaimonCatalogProvider {
             table_engines: Arc::new(RwLock::new(HashMap::new())),
             metadata: Arc::new(CatalogMetadataState::default()),
             metadata_io_semaphore,
+            metadata_refresh_timeout,
         }
     }
 
@@ -775,6 +870,7 @@ impl PaimonCatalogProvider {
             Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_MAX_CONCURRENT_METADATA_REQUESTS,
             )),
+            DEFAULT_METADATA_REFRESH_TIMEOUT,
         )
         .await
     }
@@ -786,6 +882,7 @@ impl PaimonCatalogProvider {
         blob_reader_registry: BlobReaderRegistry,
         session_state: Option<SessionStateProvider>,
         metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
+        metadata_refresh_timeout: Duration,
     ) -> DFResult<Self> {
         let provider = Self::new_uninitialized_with_metadata_io_semaphore(
             catalog_name,
@@ -794,6 +891,7 @@ impl PaimonCatalogProvider {
             blob_reader_registry,
             session_state,
             metadata_io_semaphore,
+            metadata_refresh_timeout,
         );
         provider.initialize_metadata().await?;
         Ok(provider)
@@ -804,16 +902,49 @@ impl PaimonCatalogProvider {
     /// Remote calls finish before the shared snapshot is replaced, so readers either
     /// observe the previous complete snapshot or the new complete snapshot.
     pub async fn refresh_metadata(&self) -> DFResult<()> {
-        self.refresh_metadata_inner(false).await
+        self.run_metadata_refresh(self.refresh_metadata_inner(false, true))
+            .await
     }
 
     /// Initialize metadata while tolerating a REST server without the optional views endpoint.
     pub async fn initialize_metadata(&self) -> DFResult<()> {
-        self.refresh_metadata_inner(true).await
+        self.run_metadata_refresh(self.refresh_metadata_inner(true, false))
+            .await
     }
 
-    async fn refresh_metadata_inner(&self, ignore_missing_views_endpoint: bool) -> DFResult<()> {
+    /// Refresh metadata for SQL planning while tolerating an optional missing views endpoint.
+    pub(crate) async fn refresh_metadata_for_sql(&self) -> DFResult<()> {
+        self.run_metadata_refresh(self.refresh_metadata_inner(true, true))
+            .await
+    }
+
+    async fn run_metadata_refresh<T>(
+        &self,
+        refresh: impl std::future::Future<Output = DFResult<T>>,
+    ) -> DFResult<T> {
+        tokio::time::timeout(self.metadata_refresh_timeout, refresh)
+            .await
+            .map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "metadata refresh timed out after {:?}",
+                    self.metadata_refresh_timeout
+                ))
+            })?
+    }
+
+    /// Set the maximum duration of one metadata initialization or refresh.
+    pub fn with_metadata_refresh_timeout(mut self, timeout: Duration) -> Self {
+        self.metadata_refresh_timeout = timeout;
+        self
+    }
+
+    async fn refresh_metadata_inner(
+        &self,
+        ignore_missing_views_endpoint: bool,
+        fail_on_classification_error: bool,
+    ) -> DFResult<()> {
         let generation = self.metadata.begin_refresh();
+        let classification_budget = TableTypeClassificationBudget::new();
         let mut database_names = {
             let _permit = self.metadata_io_semaphore.acquire().await.map_err(|_| {
                 DataFusionError::Execution("metadata request limiter was closed".to_string())
@@ -829,6 +960,7 @@ impl PaimonCatalogProvider {
         let entries: HashMap<_, _> = stream::iter(database_names.iter().cloned())
             .map(|database| {
                 let known_capabilities = self.metadata.system_table_capabilities(&database);
+                let classification_budget = Arc::clone(&classification_budget);
                 async move {
                     let metadata = load_database_metadata(
                         self.catalog.as_ref(),
@@ -836,6 +968,7 @@ impl PaimonCatalogProvider {
                         ignore_missing_views_endpoint,
                         known_capabilities,
                         self.metadata_io_semaphore.as_ref(),
+                        Arc::clone(&classification_budget),
                     )
                     .await?;
                     Ok::<_, datafusion::error::DataFusionError>((database, metadata))
@@ -872,28 +1005,43 @@ impl PaimonCatalogProvider {
             conflicts.retain(|database| current_databases.contains(database));
         }
         stream::iter(conflicts)
-            .map(|database| async move {
-                self.refresh_database_metadata_inner(
-                    database.as_str(),
-                    ignore_missing_views_endpoint,
-                )
-                .await
+            .map(|database| {
+                let classification_budget = Arc::clone(&classification_budget);
+                async move {
+                    self.refresh_database_metadata_inner(
+                        database.as_str(),
+                        ignore_missing_views_endpoint,
+                        classification_budget,
+                    )
+                    .await
+                }
             })
             .buffer_unordered(MAX_CONCURRENT_METADATA_LISTINGS)
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(())
+        finish_table_type_classification(
+            classification_budget.as_ref(),
+            fail_on_classification_error,
+        )
     }
 
     /// Refresh one database in the metadata snapshot.
     pub(crate) async fn refresh_database_metadata(&self, database: &str) -> DFResult<()> {
-        self.refresh_database_metadata_inner(database, true).await
+        let classification_budget = TableTypeClassificationBudget::new();
+        self.run_metadata_refresh(self.refresh_database_metadata_inner(
+            database,
+            true,
+            Arc::clone(&classification_budget),
+        ))
+        .await?;
+        finish_table_type_classification(classification_budget.as_ref(), true)
     }
 
     async fn refresh_database_metadata_inner(
         &self,
         database: &str,
         ignore_missing_views_endpoint: bool,
+        classification_budget: Arc<TableTypeClassificationBudget>,
     ) -> DFResult<()> {
         const MAX_PUBLICATION_ATTEMPTS: usize = 3;
         for _ in 0..MAX_PUBLICATION_ATTEMPTS {
@@ -904,6 +1052,7 @@ impl PaimonCatalogProvider {
                 ignore_missing_views_endpoint,
                 self.metadata.system_table_capabilities(database),
                 self.metadata_io_semaphore.as_ref(),
+                Arc::clone(&classification_budget),
             )
             .await?;
             if self.metadata.publish_database(
@@ -1016,6 +1165,37 @@ impl PaimonCatalogProvider {
         }
     }
 
+    pub(crate) async fn reconcile_table_created(&self, database: &str, name: &str) {
+        if self.metadata_contains_object(database, name) {
+            return;
+        }
+        let declared_type = self
+            .run_metadata_refresh(async {
+                let _permit = self.metadata_io_semaphore.acquire().await.map_err(|_| {
+                    DataFusionError::Execution("metadata request limiter was closed".to_string())
+                })?;
+                let mut types = self
+                    .catalog
+                    .list_table_types(database, &[name.to_string()])
+                    .await
+                    .map_err(to_datafusion_error)?;
+                Ok(types.remove(name))
+            })
+            .await;
+        if self.metadata_contains_object(database, name) {
+            return;
+        }
+        match declared_type {
+            Ok(declared_type) => self.record_table_created(database, name, declared_type),
+            Err(error) => {
+                log::warn!(
+                    "unable to reconcile created table '{database}.{name}' with remote metadata: {error}"
+                );
+                self.record_table_created(database, name, None);
+            }
+        }
+    }
+
     pub(crate) fn record_view_created(&self, database: &str, name: &str) {
         self.metadata.mutate_database(database, |next| {
             let database = next
@@ -1058,24 +1238,34 @@ impl PaimonCatalogProvider {
     pub(crate) fn record_table_renamed(&self, database: &str, from: &str, to: &str) -> bool {
         let mut renamed = false;
         self.metadata.mutate_database(database, |next| {
-            if let Some(metadata) = next.databases.get_mut(database) {
-                let metadata = Arc::make_mut(metadata);
-                let objects = &mut metadata.objects;
-                if let Some(table_type) = objects.shift_remove(from) {
-                    objects.insert(to.to_string(), table_type);
-                    let capability = metadata
-                        .system_table_capabilities
-                        .remove(from)
-                        .unwrap_or(SystemTableCapability::Unknown);
-                    metadata
-                        .system_table_capabilities
-                        .insert(to.to_string(), capability);
-                    renamed = true;
-                }
+            let metadata = next
+                .databases
+                .entry(database.to_string())
+                .or_insert_with(|| Arc::new(DatabaseMetadata::default()));
+            let metadata = Arc::make_mut(metadata);
+            let objects = &mut metadata.objects;
+            if let Some(table_type) = objects.shift_remove(from) {
+                objects.insert(to.to_string(), table_type);
+                let capability = metadata
+                    .system_table_capabilities
+                    .remove(from)
+                    .unwrap_or(SystemTableCapability::Unknown);
+                metadata
+                    .system_table_capabilities
+                    .insert(to.to_string(), capability);
+                renamed = true;
+            } else {
+                objects.insert(to.to_string(), TableType::Base);
+                metadata
+                    .system_table_capabilities
+                    .insert(to.to_string(), SystemTableCapability::Unknown);
             }
         });
         if renamed {
             self.metadata.rename_object_resolution(database, from, to);
+        } else {
+            self.metadata.remove_object_resolution(database, from);
+            self.metadata.remove_object_resolution(database, to);
         }
         renamed
     }
@@ -1106,6 +1296,7 @@ impl PaimonCatalogProvider {
                 self.session_state.clone(),
             )
             .with_metadata_io_semaphore(Arc::clone(&self.metadata_io_semaphore))
+            .with_metadata_refresh_timeout(self.metadata_refresh_timeout)
             .with_schema_force_view_types(self.schema_force_view_types)
             .with_table_engines(self.table_engines())
             .with_metadata_snapshot(Arc::clone(&self.metadata)),
@@ -1330,6 +1521,7 @@ pub struct PaimonSchemaProvider {
     table_engines: TableEngines,
     /// Shared bound for metadata requests issued by this session's providers.
     metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
+    metadata_refresh_timeout: Duration,
 }
 
 impl Debug for PaimonSchemaProvider {
@@ -1366,6 +1558,7 @@ impl PaimonSchemaProvider {
             metadata_io_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_MAX_CONCURRENT_METADATA_REQUESTS,
             )),
+            metadata_refresh_timeout: DEFAULT_METADATA_REFRESH_TIMEOUT,
         }
     }
 
@@ -1416,22 +1609,44 @@ impl PaimonSchemaProvider {
 
     /// Refresh this database in the snapshot used by synchronous callbacks.
     pub async fn refresh_metadata(&self) -> DFResult<()> {
-        self.refresh_metadata_inner(false).await
+        self.run_metadata_refresh(self.refresh_metadata_inner(false, true))
+            .await
     }
 
     /// Initialize metadata while tolerating a REST server without the optional views endpoint.
     pub async fn initialize_metadata(&self) -> DFResult<()> {
-        self.refresh_metadata_inner(true).await
+        self.run_metadata_refresh(self.refresh_metadata_inner(true, false))
+            .await
     }
 
-    async fn refresh_metadata_inner(&self, ignore_missing_views_endpoint: bool) -> DFResult<()> {
+    async fn run_metadata_refresh<T>(
+        &self,
+        refresh: impl std::future::Future<Output = DFResult<T>>,
+    ) -> DFResult<T> {
+        tokio::time::timeout(self.metadata_refresh_timeout, refresh)
+            .await
+            .map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "metadata refresh timed out after {:?}",
+                    self.metadata_refresh_timeout
+                ))
+            })?
+    }
+
+    async fn refresh_metadata_inner(
+        &self,
+        ignore_missing_views_endpoint: bool,
+        fail_on_classification_error: bool,
+    ) -> DFResult<()> {
         let generation = self.metadata.begin_refresh();
+        let classification_budget = TableTypeClassificationBudget::new();
         let database = load_database_metadata(
             self.catalog.as_ref(),
             &self.database,
             ignore_missing_views_endpoint,
             self.metadata.system_table_capabilities(&self.database),
             self.metadata_io_semaphore.as_ref(),
+            Arc::clone(&classification_budget),
         )
         .await?;
         if !self.metadata.publish_database(
@@ -1444,7 +1659,10 @@ impl PaimonSchemaProvider {
                 self.database
             )));
         }
-        Ok(())
+        finish_table_type_classification(
+            classification_budget.as_ref(),
+            fail_on_classification_error,
+        )
     }
 
     fn with_schema_force_view_types(mut self, schema_force_view_types: bool) -> Self {
@@ -1457,6 +1675,11 @@ impl PaimonSchemaProvider {
         metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
     ) -> Self {
         self.metadata_io_semaphore = metadata_io_semaphore;
+        self
+    }
+
+    fn with_metadata_refresh_timeout(mut self, timeout: Duration) -> Self {
+        self.metadata_refresh_timeout = timeout;
         self
     }
 
