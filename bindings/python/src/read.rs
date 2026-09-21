@@ -381,7 +381,15 @@ impl PyReadBuilder {
         let mut fields = slf.table.schema().fields().to_vec();
         // _ROW_ID is synthesized during read and absent from the table schema.
         // Appending it preserves every physical column's original predicate index.
-        if !fields.iter().any(|field| field.name() == ROW_ID_FIELD_NAME) {
+        // A real `_row_id` column takes precedence in case-insensitive mode.
+        let has_row_id_field = fields.iter().any(|field| {
+            if slf.case_sensitive {
+                field.name() == ROW_ID_FIELD_NAME
+            } else {
+                field.name().eq_ignore_ascii_case(ROW_ID_FIELD_NAME)
+            }
+        });
+        if !has_row_id_field {
             fields.push(DataField::new(
                 ROW_ID_FIELD_ID,
                 ROW_ID_FIELD_NAME.to_string(),
