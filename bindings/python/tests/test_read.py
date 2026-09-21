@@ -1201,11 +1201,99 @@ def test_row_position_selection_validates_parameters_and_combinations():
         ):
             with pytest.raises(ValueError, match="cannot be used simultaneously"):
                 getattr(scan, method)(*args)
+
+
+def _make_append_position_table(warehouse, row_tracking=False):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.appendpos")
+    options = " WITH ('source.split.target-size' = '1b'"
+    if row_tracking:
+        options += ", 'row-tracking.enabled' = 'true'"
+    options += ")"
+    ctx.sql("CREATE TABLE paimon.appendpos.t (id INT, value STRING)" + options)
+    for start in range(0, 9, 3):
+        values = ", ".join(
+            "(%d, '%s')" % (value, chr(ord('a') + value))
+            for value in range(start, start + 3)
+        )
+        ctx.sql("INSERT INTO paimon.appendpos.t VALUES " + values)
+    return PaimonCatalog({"warehouse": warehouse}).get_table("appendpos.t")
+
+
+@pytest.mark.parametrize("row_tracking", [False, True])
+def test_append_row_position_slices_and_shards_are_native_readable(row_tracking):
     with tempfile.TemporaryDirectory() as warehouse:
-        ordinary = _make_table_with_data(warehouse).new_read_builder()
+        table = _make_append_position_table(warehouse, row_tracking)
+        builder = table.new_read_builder().with_projection(["id"])
+
+        for start, end, expected in (
+            (0, 1, [0]),
+            (2, 7, [2, 3, 4, 5, 6]),
+            (7, 100, [7, 8]),
+            (20, 22, []),
+        ):
+            plan = builder.new_scan().with_row_position_slice(start, end).plan()
+            restored = [Split.deserialize(split.serialize()) for split in plan.splits()]
+            batches = builder.new_read().read(restored)
+            actual = pa.Table.from_batches(batches).column("id").to_pylist() if batches else []
+            assert actual == expected
+            assert plan.snapshot_id() == 3
+
+        shards = []
+        for index, expected in enumerate(([0, 1, 2], [3, 4], [5, 6], [7, 8])):
+            plan = builder.new_scan().with_row_position_shard(index, 4).plan()
+            actual = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+            values = actual.column("id").to_pylist()
+            assert values == expected
+            shards.extend(values)
+        assert shards == list(range(9))
+
+
+def test_append_row_positions_follow_stats_pruned_file_order_before_limit():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_append_position_table(warehouse)
+        builder = (
+            table.new_read_builder()
+            .with_projection(["id"])
+            .with_filter({"method": "greaterOrEqual", "field": "id", "literals": [3]})
+            .with_limit(2)
+        )
+        plan = builder.new_scan().with_row_position_slice(1, 5).plan()
+        actual = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        # with_limit is a planning hint in the Rust API. The complete selected
+        # range must survive planning; PyPaimon enforces the final two-row limit.
+        assert actual.column("id").to_pylist() == [4, 5, 6, 7]
+
+
+def test_append_incremental_row_positions_use_combined_delta_order():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_append_position_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+        for start_snapshot, end_snapshot, start, end, expected in (
+            (0, 3, 2, 7, [2, 3, 4, 5, 6]),
+            (1, 3, 1, 4, [4, 5, 6]),
+        ):
+            plan = (
+                builder.new_incremental_scan(start_snapshot, end_snapshot)
+                .with_row_position_slice(start, end)
+                .plan()
+            )
+            restored = [pickle.loads(pickle.dumps(split)) for split in plan.splits()]
+            actual = pa.Table.from_batches(builder.new_read().read(restored))
+            assert actual.column("id").to_pylist() == expected
+
+
+def test_primary_key_row_position_selection_remains_unsupported():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.pkpos")
+        ctx.sql("CREATE TABLE paimon.pkpos.t (id INT, value STRING, PRIMARY KEY (id) NOT ENFORCED)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("pkpos.t")
         for method in ("with_row_position_slice", "with_row_position_shard"):
-            with pytest.raises(NotImplementedError, match="data.evolution|Data Evolution"):
-                getattr(ordinary.new_scan(), method)(0, 1)
+            with pytest.raises(NotImplementedError, match="append tables"):
+                getattr(table.new_read_builder().new_scan(), method)(0, 1)
 
 
 def test_incremental_row_positions_use_combined_delta_batch():

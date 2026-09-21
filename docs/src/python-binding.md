@@ -169,22 +169,27 @@ to historical events. Builder filters, projections, and limits still apply.
 both batch and streaming splits to Java binary encoding, preserving the streaming
 flag.
 
-For Data Evolution tables, select half-open row positions or one balanced shard
-on a scan:
+For append and Data Evolution tables, select half-open row positions or one
+balanced shard on a scan:
 
 ```python
 plan = rb.new_scan().with_row_position_slice(10, 20).plan()
 plan = rb.new_scan().with_row_position_shard(1, 4).plan()
 ```
 
-Positions count candidate rows before explicit/global-index range pruning,
-group statistics, projection, and deletion-vector filtering. Column updates
+For ordinary append tables, positions follow the final stats-pruned split and
+file order. Row-tracked tables encode selected stable row IDs; tables without
+row tracking encode positions local to each filtered output split. Unselected
+files are removed, so the reader does not open them. For Data Evolution,
+positions count candidate rows before explicit/global-index range pruning,
+group statistics, projection, and deletion-vector filtering; column updates
 sharing row IDs count once. Explicit `with_row_ranges` and index-selected ranges
-intersect the positions after assignment, even when they exclude earlier files. Slices require `start < end`; shards require a positive
-count and `0 <= index < count`. Slice and shard selection are mutually exclusive
-and may also be applied to `new_incremental_scan` results, where positions count
-the combined APPEND-delta batch. The selection is encoded in the returned splits
-and survives serialization.
+intersect the positions after assignment, even when they exclude earlier files.
+Slices require `start < end`; shards require a positive count and
+`0 <= index < count`. Slice and shard selection are mutually exclusive and may
+also be applied to `new_incremental_scan` results, where positions count the
+combined APPEND-delta batch. The selection is encoded in the returned splits
+and survives serialization and direct native reads.
 
 Deletion-vector reads accept both Java and Python Avro array-item schemas.
 Historical Python bucket-local references are resolved from the table's index
