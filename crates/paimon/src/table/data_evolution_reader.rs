@@ -294,9 +294,15 @@ impl DataEvolutionReader {
             let descriptor_fields = self.descriptor_fields_to_resolve(resolve_blob_views);
             let filter_before_blob_resolution =
                 self.can_filter_before_blob_resolution(resolve_blob_views, &descriptor_fields);
-            let blob_view_lookup = self
-                .preload_blob_view_lookup(&splits, filter_before_blob_resolution)
-                .await?;
+            // LIMIT reads resolve views only after the surviving batch has
+            // been selected. Eagerly scanning every split here can fail on a
+            // reference beyond the quota and load unrelated upstream blobs.
+            let mut blob_view_lookup = if self.limit.is_some() && resolve_blob_views {
+                Some(BlobViewLookup::default())
+            } else {
+                self.preload_blob_view_lookup(&splits, filter_before_blob_resolution)
+                    .await?
+            };
             let descriptor_fields = self.descriptor_fields_to_resolve(blob_view_lookup.is_some());
             let filter_before_blob_resolution =
                 self.can_filter_before_blob_resolution(blob_view_lookup.is_some(), &descriptor_fields);
@@ -437,7 +443,7 @@ impl DataEvolutionReader {
                                 };
                                 yield self.finish_wide_batch(
                                     batch,
-                                    blob_view_lookup.as_ref(),
+                                    &mut blob_view_lookup,
                                     &descriptor_fields,
                                     filter_before_blob_resolution,
                                     &mut remaining,
@@ -519,7 +525,7 @@ impl DataEvolutionReader {
                             };
                             yield self.finish_wide_batch(
                                 batch,
-                                blob_view_lookup.as_ref(),
+                                &mut blob_view_lookup,
                                 &descriptor_fields,
                                 filter_before_blob_resolution,
                                 &mut remaining,
@@ -589,7 +595,7 @@ impl DataEvolutionReader {
     async fn finish_wide_batch(
         &self,
         batch: RecordBatch,
-        blob_view_lookup: Option<&BlobViewLookup>,
+        blob_view_lookup: &mut Option<BlobViewLookup>,
         descriptor_fields: &HashSet<String>,
         filter_before_blob_resolution: bool,
         remaining: &mut Option<usize>,
@@ -606,7 +612,16 @@ impl DataEvolutionReader {
             return self.project_output(batch);
         }
 
-        batch = self.resolve_blob_view_columns(batch, blob_view_lookup)?;
+        if self.limit.is_some() {
+            if let (Some(lookup), Some(rest_env)) =
+                (blob_view_lookup.as_mut(), self.blob_view_rest_env.clone())
+            {
+                lookup
+                    .load_missing(rest_env, &batch, &self.blob_view_fields)
+                    .await?;
+            }
+        }
+        batch = self.resolve_blob_view_columns(batch, blob_view_lookup.as_ref())?;
         let mut batch = if !self.blob_as_descriptor && !descriptor_fields.is_empty() {
             resolve_descriptor_columns(
                 batch,
@@ -1214,6 +1229,22 @@ struct BlobViewLookup {
 }
 
 impl BlobViewLookup {
+    async fn load_missing(
+        &mut self,
+        rest_env: RESTEnv,
+        batch: &RecordBatch,
+        blob_view_fields: &HashSet<String>,
+    ) -> crate::Result<()> {
+        let mut view_structs = HashSet::new();
+        collect_blob_view_structs(batch, blob_view_fields, &mut view_structs)?;
+        view_structs.retain(|view| !self.descriptors.contains_key(view));
+        if !view_structs.is_empty() {
+            let loaded = Self::load(rest_env, view_structs).await?;
+            self.descriptors.extend(loaded.descriptors);
+        }
+        Ok(())
+    }
+
     async fn load(rest_env: RESTEnv, view_structs: HashSet<BlobViewStruct>) -> crate::Result<Self> {
         if view_structs.is_empty() {
             return Ok(Self::default());
@@ -1341,7 +1372,7 @@ impl BlobViewLookup {
             .map(Option::as_ref)
             .ok_or_else(|| Error::DataInvalid {
                 message: format!(
-                    "BlobViewStruct not found in preloaded cache: identifier={}, field_id={}, row_id={}",
+                    "BlobViewStruct not found in lookup cache: identifier={}, field_id={}, row_id={}",
                     view_struct.identifier().full_name(),
                     view_struct.field_id(),
                     view_struct.row_id()
