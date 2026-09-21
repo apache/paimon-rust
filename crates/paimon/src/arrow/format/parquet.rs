@@ -98,7 +98,6 @@ impl ParquetFormatReader {
     }
 }
 
-#[derive(Debug, Clone)]
 pub(crate) struct ParquetGranule {
     pub(crate) first_row: i64,
     pub(crate) row_count: i64,
