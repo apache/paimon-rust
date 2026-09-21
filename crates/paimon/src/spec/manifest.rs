@@ -88,8 +88,7 @@ impl Manifest {
     }
 }
 
-/// Merge ADD/DELETE entries by file identifier, returning only the active ADD set.
-/// Mirrors Java [FileEntry.mergeEntries](https://github.com/apache/paimon/blob/release-1.4/paimon-core/src/main/java/org/apache/paimon/manifest/FileEntry.java).
+/// Resolve a complete manifest set to its active ADD entries.
 /// Return order is unspecified.
 pub(crate) fn merge_active_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
     use std::collections::HashMap;
@@ -109,12 +108,82 @@ pub(crate) fn merge_active_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestE
     map.into_values().collect()
 }
 
+/// Merge a partial manifest set while preserving unmatched DELETEs.
+/// Mirrors Java `FileEntry.mergeEntries`.
+pub(crate) fn merge_partial_manifest_entries(
+    entries: Vec<ManifestEntry>,
+) -> Result<Vec<ManifestEntry>> {
+    use indexmap::IndexMap;
+
+    use crate::spec::manifest_entry::Identifier;
+    let mut map: IndexMap<Identifier, ManifestEntry> = IndexMap::new();
+    for entry in entries {
+        let identifier = entry.identifier();
+        match entry.kind() {
+            FileKind::Add => {
+                if let Some(old) = map.get(&identifier) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Trying to add file {identifier:?} which is already in the map: {old:?}"
+                        ),
+                        source: None,
+                    });
+                }
+                map.insert(identifier, entry);
+            }
+            FileKind::Delete => {
+                if map.shift_remove(&identifier).is_none() {
+                    map.insert(identifier, entry);
+                }
+            }
+        }
+    }
+    Ok(map.into_values().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io::FileIO;
     use crate::spec::manifest_common::FileKind;
     use std::env::current_dir;
+
+    fn entry(
+        kind: FileKind,
+        partition: &[u8],
+        bucket: i32,
+        file_name: &str,
+        level: i32,
+    ) -> ManifestEntry {
+        use crate::spec::data_file::DataFileMeta;
+        use crate::spec::stats::BinaryTableStats;
+
+        let stats = BinaryTableStats::empty();
+        let file = DataFileMeta {
+            file_name: file_name.to_string(),
+            file_size: 100,
+            row_count: 10,
+            min_key: vec![],
+            max_key: vec![],
+            key_stats: stats.clone(),
+            value_stats: stats,
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level,
+            extra_files: vec![],
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            file_source: None,
+            value_stats_cols: None,
+            external_path: None,
+            first_row_id: None,
+            write_cols: None,
+            column_max_sequence_numbers: None,
+        };
+        ManifestEntry::new(kind, partition.to_vec(), bucket, 1, file, 2)
+    }
 
     #[tokio::test]
     async fn test_read_manifest_from_file() {
@@ -139,56 +208,70 @@ mod tests {
 
     #[test]
     fn test_merge_active_entries_cancels_add_then_delete() {
-        use crate::spec::data_file::DataFileMeta;
-        use crate::spec::stats::BinaryTableStats;
-        use crate::spec::ManifestEntry;
-
-        fn entry(kind: FileKind, file_name: &str, level: i32) -> ManifestEntry {
-            let stats = BinaryTableStats::empty();
-            let file = DataFileMeta {
-                file_name: file_name.to_string(),
-                file_size: 100,
-                row_count: 10,
-                min_key: vec![],
-                max_key: vec![],
-                key_stats: stats.clone(),
-                value_stats: stats,
-                min_sequence_number: 0,
-                max_sequence_number: 0,
-                schema_id: 0,
-                level,
-                extra_files: vec![],
-                creation_time: None,
-                delete_row_count: None,
-                embedded_index: None,
-                file_source: None,
-                value_stats_cols: None,
-                external_path: None,
-                first_row_id: None,
-                write_cols: None,
-                column_max_sequence_numbers: None,
-            };
-            ManifestEntry::new(kind, vec![], 0, 1, file, 2)
-        }
-
         let cancelled = merge_active_entries(vec![
-            entry(FileKind::Add, "f.parquet", 0),
-            entry(FileKind::Delete, "f.parquet", 0),
+            entry(FileKind::Add, &[], 0, "f.parquet", 0),
+            entry(FileKind::Delete, &[], 0, "f.parquet", 0),
         ]);
         assert!(cancelled.is_empty());
 
         let two_levels = merge_active_entries(vec![
-            entry(FileKind::Add, "f.parquet", 0),
-            entry(FileKind::Add, "f.parquet", 1),
+            entry(FileKind::Add, &[], 0, "f.parquet", 0),
+            entry(FileKind::Add, &[], 0, "f.parquet", 1),
         ]);
         assert_eq!(two_levels.len(), 2);
 
         let compacted = merge_active_entries(vec![
-            entry(FileKind::Add, "f.parquet", 0),
-            entry(FileKind::Delete, "f.parquet", 0),
-            entry(FileKind::Add, "f.parquet", 1),
+            entry(FileKind::Add, &[], 0, "f.parquet", 0),
+            entry(FileKind::Delete, &[], 0, "f.parquet", 0),
+            entry(FileKind::Add, &[], 0, "f.parquet", 1),
         ]);
         assert_eq!(compacted.len(), 1);
         assert_eq!(compacted[0].file().level, 1);
+    }
+
+    #[test]
+    fn test_merge_partial_manifest_entries_preserves_unmatched_delete() {
+        let merged = merge_partial_manifest_entries(vec![
+            entry(FileKind::Delete, &[], 0, "old.parquet", 0),
+            entry(FileKind::Add, &[], 0, "replacement.parquet", 0),
+        ])
+        .unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].kind(), &FileKind::Delete);
+        assert_eq!(merged[1].kind(), &FileKind::Add);
+
+        let delete_only =
+            merge_partial_manifest_entries(vec![entry(FileKind::Delete, &[], 0, "old.parquet", 0)])
+                .unwrap();
+        assert_eq!(delete_only.len(), 1);
+        assert_eq!(delete_only[0].kind(), &FileKind::Delete);
+
+        let cancelled = merge_partial_manifest_entries(vec![
+            entry(FileKind::Add, &[], 0, "old.parquet", 0),
+            entry(FileKind::Delete, &[], 0, "old.parquet", 0),
+        ])
+        .unwrap();
+        assert!(cancelled.is_empty());
+    }
+
+    #[test]
+    fn test_merge_partial_manifest_entries_uses_full_identifier() {
+        let merged = merge_partial_manifest_entries(vec![
+            entry(FileKind::Add, &[1], 0, "same.parquet", 0),
+            entry(FileKind::Delete, &[2], 0, "same.parquet", 0),
+            entry(FileKind::Delete, &[1], 1, "same.parquet", 0),
+            entry(FileKind::Delete, &[1], 0, "same.parquet", 1),
+        ])
+        .unwrap();
+        assert_eq!(merged.len(), 4);
+    }
+
+    #[test]
+    fn test_merge_partial_manifest_entries_rejects_duplicate_add() {
+        let result = merge_partial_manifest_entries(vec![
+            entry(FileKind::Add, &[], 0, "same.parquet", 0),
+            entry(FileKind::Add, &[], 0, "same.parquet", 0),
+        ]);
+        assert!(result.is_err());
     }
 }

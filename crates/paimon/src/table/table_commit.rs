@@ -24,11 +24,12 @@ use crate::io::FileIO;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::FileKind;
 use crate::spec::{
-    bucket_path, bucket_path_under, extract_datum, merge_active_entries, BinaryRow,
-    BinaryRowBuilder, CommitKind, CoreOptions, DataFileMeta, DataType, Datum,
-    GlobalIndexColumnUpdateAction, IndexManifest, IndexManifestEntry, Manifest, ManifestEntry,
-    ManifestFileMeta, ManifestList, PartitionComputer, PartitionStatistics, Predicate, Snapshot,
-    EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA, POSTPONE_BUCKET,
+    bucket_path, bucket_path_under, extract_datum, merge_active_entries,
+    merge_partial_manifest_entries, BinaryRow, BinaryRowBuilder, CommitKind, CoreOptions,
+    DataFileMeta, DataType, Datum, GlobalIndexColumnUpdateAction, IndexManifest,
+    IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList, PartitionComputer,
+    PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA,
+    POSTPONE_BUCKET,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::global_index_build_common::same_extra_field_ids;
@@ -1210,7 +1211,7 @@ impl TableCommit {
             entries.extend(Manifest::read(file_io, &path).await?);
         }
 
-        let merged_entries = merge_active_entries(entries);
+        let merged_entries = merge_partial_manifest_entries(entries)?;
         if merged_entries.is_empty() {
             return Ok(());
         }
@@ -6144,6 +6145,111 @@ mod tests {
             active_file_names,
             HashSet::from(["data-1.parquet".to_string(), "data-2.parquet".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn test_minor_compaction_preserves_delete_from_retained_manifest() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_minor_compaction_preserves_delete";
+        setup_dirs(&file_io, table_path).await;
+
+        let mut commit = setup_commit(&file_io, table_path);
+        let partition = vec![0, 0, 0, 0];
+        let old_file = test_data_file("old.parquet", 1);
+        let replacement_file = test_data_file("replacement.parquet", 1);
+        let mut initial_files = vec![old_file.clone()];
+        initial_files.extend(
+            (0..128)
+                .map(|_| test_data_file(&format!("filler-{}.parquet", uuid::Uuid::new_v4()), 1)),
+        );
+
+        commit
+            .commit(vec![CommitMessage::new(
+                partition.clone(),
+                0,
+                initial_files,
+            )])
+            .await
+            .unwrap();
+
+        let mut deletion = CommitMessage::new(partition.clone(), 0, vec![]);
+        deletion.deleted_files.push(old_file);
+        commit.commit(vec![deletion]).await.unwrap();
+
+        commit
+            .commit(vec![CommitMessage::new(
+                partition.clone(),
+                0,
+                vec![replacement_file],
+            )])
+            .await
+            .unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        let manifest_dir = format!("{table_path}/manifest");
+        let base_metas = ManifestList::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", snapshot.base_manifest_list()),
+        )
+        .await
+        .unwrap();
+        let delta_metas = ManifestList::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", snapshot.delta_manifest_list()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(base_metas.len(), 2);
+        assert_eq!(delta_metas.len(), 1);
+
+        let retained = base_metas
+            .iter()
+            .find(|meta| meta.num_added_files() > 1)
+            .unwrap();
+        let deletion = base_metas
+            .iter()
+            .find(|meta| meta.num_deleted_files() == 1)
+            .unwrap();
+        let replacement = &delta_metas[0];
+        let merge_target = deletion.file_size() + replacement.file_size() + 1;
+        assert!(retained.file_size() >= merge_target);
+        let mut expected_file_names = active_entries(&file_io, table_path, &snapshot)
+            .await
+            .into_iter()
+            .map(|entry| entry.file().file_name.clone())
+            .collect::<HashSet<_>>();
+        assert!(!expected_file_names.contains("old.parquet"));
+        expected_file_names.insert("unrelated.parquet".to_string());
+
+        commit.manifest_target_size = merge_target;
+        commit.manifest_merge_min_count = 2;
+        commit
+            .commit(vec![CommitMessage::new(
+                partition,
+                0,
+                vec![test_data_file("unrelated.parquet", 1)],
+            )])
+            .await
+            .unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        let base_metas = ManifestList::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", snapshot.base_manifest_list()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(base_metas.len(), 2);
+        assert!(base_metas
+            .iter()
+            .any(|meta| meta.num_added_files() == 1 && meta.num_deleted_files() == 1));
+
+        let active_file_names = active_entries(&file_io, table_path, &snapshot)
+            .await
+            .into_iter()
+            .map(|entry| entry.file().file_name.clone())
+            .collect::<HashSet<_>>();
+        assert_eq!(active_file_names, expected_file_names);
     }
 
     /// `write_manifest_file` must aggregate min/max bucket and level across entries so the

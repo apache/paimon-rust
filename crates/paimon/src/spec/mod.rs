@@ -74,8 +74,8 @@ pub use pk_index_source::*;
 mod index_manifest;
 pub use index_manifest::{IndexManifest, IndexManifestEntry};
 mod manifest;
-pub(crate) use manifest::merge_active_entries;
 pub use manifest::Manifest;
+pub(crate) use manifest::{merge_active_entries, merge_partial_manifest_entries};
 mod manifest_sidecar;
 pub use manifest_sidecar::{
     ManifestSidecar, ManifestSidecarBlock, ManifestSidecarBuilder, ManifestSidecarSelection,
