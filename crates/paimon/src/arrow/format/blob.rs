@@ -33,6 +33,7 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
+use lru::LruCache;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -60,7 +61,7 @@ impl BlobFormatReader {
 
 pub(crate) struct IndexedBlobReader {
     reader: Box<dyn FileRead>,
-    index: BlobFileIndex,
+    index: Arc<BlobFileIndex>,
     descriptor_mode: bool,
     file_path: String,
     blob_parallelism: usize,
@@ -92,7 +93,7 @@ impl IndexedBlobReader {
         blob_parallelism: usize,
     ) -> crate::Result<Self> {
         debug_assert!(blob_parallelism > 0);
-        let index = BlobFileIndex::load(reader.as_ref(), file_size).await?;
+        let index = BlobFileIndex::load_cached(reader.as_ref(), file_size, &file_path).await?;
         Ok(Self {
             reader,
             index,
@@ -162,6 +163,14 @@ pub(crate) enum BlobReadValue {
 
 const BLOB_FOOTER_SIZE: u64 = 5;
 const BLOB_FORMAT_VERSION: u8 = 1;
+const BLOB_INDEX_CACHE_CAPACITY: usize = 16;
+static BLOB_INDEX_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<LruCache<String, Arc<BlobFileIndex>>>,
+> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(LruCache::new(
+        std::num::NonZeroUsize::new(BLOB_INDEX_CACHE_CAPACITY).unwrap(),
+    ))
+});
 const BLOB_MAGIC_NUMBER: i32 = 1481511375;
 const BLOB_MAGIC_NUMBER_BYTES: [u8; 4] = BLOB_MAGIC_NUMBER.to_le_bytes();
 const BLOB_INLINE_HEADER_SIZE: u64 = 4;
@@ -1652,12 +1661,36 @@ struct BlobArrayLayout {
     element_index_range: Range<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct BlobFileIndex {
     entries: Vec<BlobEntry>,
 }
 
 impl BlobFileIndex {
+    async fn load_cached(
+        reader: &dyn FileRead,
+        file_size: u64,
+        file_path: &str,
+    ) -> crate::Result<Arc<Self>> {
+        if !file_path.is_empty() {
+            let mut cache = BLOB_INDEX_CACHE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(index) = cache.get(file_path) {
+                return Ok(index.clone());
+            }
+        }
+
+        let index = Arc::new(Self::load(reader, file_size).await?);
+        if !file_path.is_empty() {
+            BLOB_INDEX_CACHE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .put(file_path.to_string(), index.clone());
+        }
+        Ok(index)
+    }
+
     async fn load(reader: &dyn FileRead, file_size: u64) -> crate::Result<Self> {
         if file_size < BLOB_FOOTER_SIZE {
             return Err(Error::DataInvalid {
@@ -2296,6 +2329,35 @@ mod tests {
             collect_binary_values(&selected[0]),
             vec![Some(b"world".to_vec()), Some(Vec::new())]
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_reader_reuses_cached_index() {
+        let file_path = "file:///blob-index-cache-test/data.blob";
+        let file_bytes = load_blob_fixture("blob-basic.blob");
+        let first = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
+        let second = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
+
+        let first_reader = IndexedBlobReader::open(
+            Box::new(first.clone()),
+            file_bytes.len() as u64,
+            file_path.to_string(),
+            true,
+        )
+        .await
+        .unwrap();
+        let second_reader = IndexedBlobReader::open(
+            Box::new(second.clone()),
+            file_bytes.len() as u64,
+            file_path.to_string(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_reader.num_rows(), second_reader.num_rows());
+        assert_eq!(first.ranges().len(), 2);
+        assert!(second.ranges().is_empty());
     }
 
     #[tokio::test]
