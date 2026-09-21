@@ -157,6 +157,34 @@ async fn test_grouped_count_with_partition_filter_is_answered_from_manifests() {
 }
 
 #[tokio::test]
+async fn test_table_alias_preserves_count_pushdown_and_eligibility() {
+    let (_tmp, _catalog, ctx) = setup().await;
+    for sql in [
+        "SELECT p.dt, COUNT(*) FROM paimon.test_db.t AS p GROUP BY p.dt",
+        "SELECT p.dt AS day, COUNT(*) AS n, COUNT(*) AS n2 FROM paimon.test_db.t AS p \
+         WHERE p.content_key = 'head' GROUP BY p.dt ORDER BY day LIMIT 1",
+        "SELECT COUNT(*) FROM paimon.test_db.t AS p WHERE p.content_key = 'tail'",
+        "SELECT p.dt, COUNT(*) FROM paimon.test_db.t AS p WHERE p.dt = 'missing' GROUP BY p.dt",
+        "SELECT p.dt, COUNT(*) FROM paimon.test_db.t VERSION AS OF 1 AS p GROUP BY p.dt",
+    ] {
+        assert!(!scans_table(&ctx, sql).await, "{sql}");
+        assert_eq!(
+            rows(&ctx, sql).await,
+            rows(&ctx, &sql.replace("COUNT(*)", "COUNT(p.id)")).await,
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SELECT p.dt, COUNT(*) FROM paimon.test_db.t AS p WHERE p.id > 2 GROUP BY p.dt",
+        "SELECT p.name, COUNT(*) FROM paimon.test_db.t AS p GROUP BY p.name",
+        "SELECT p.dt, COUNT(*) FROM (SELECT * FROM paimon.test_db.t ORDER BY id LIMIT 2) AS p GROUP BY p.dt",
+    ] {
+        assert!(scans_table(&ctx, sql).await, "{sql}");
+        assert_eq!(rows(&ctx, sql).await, rows(&ctx, &sql.replace("COUNT(*)", "COUNT(p.id)")).await, "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn test_distinct_and_grouping_without_count_skip_rewrite() {
     let (_tmp, _catalog, ctx) = setup().await;
     for sql in [
@@ -661,8 +689,40 @@ impl paimon::io::FileBlockCache for ReadTrace {
     async fn invalidate_prefix(&self, _: &str) {}
 }
 
+struct FallbackWarnings(std::sync::Mutex<Vec<String>>);
+
+impl log::Log for FallbackWarnings {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() == log::Level::Warn
+            && metadata.target() == "paimon_datafusion::partition_count_pushdown"
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            self.0.lock().unwrap().push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static FALLBACK_WARNINGS: FallbackWarnings = FallbackWarnings(std::sync::Mutex::new(Vec::new()));
+
 #[tokio::test]
 async fn test_unknown_cardinality_falls_back_before_data_manifests() {
+    log::set_logger(&FALLBACK_WARNINGS).unwrap();
+    log::set_max_level(log::LevelFilter::Warn);
+    // Other tests may log concurrently, but only this test registers "observed".
+    let warnings = || {
+        FALLBACK_WARNINGS
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message.contains("table=observed,"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
     let (_tmp, catalog, _fixture_ctx) = setup_deletion_vectors("unknown").await;
     let table = catalog
         .get_table(&Identifier::new("test_db", "dv"))
@@ -743,11 +803,19 @@ async fn test_unknown_cardinality_falls_back_before_data_manifests() {
     let sql = "SELECT dt, COUNT(*) FROM observed GROUP BY dt";
     assert!(scans_table(&ctx, oracle).await);
     assert!(!scans_table(&ctx, sql).await);
+    assert!(
+        warnings().is_empty(),
+        "planning must not warn about a fallback"
+    );
     trace.0.lock().unwrap().clear();
     let expected = rows(&ctx, oracle).await;
     assert_eq!(expected, vec![row("known", 2), row("unknown", 1)]);
     let ordinary_reads = std::mem::take(&mut *trace.0.lock().unwrap());
     assert_eq!(rows(&ctx, sql).await, expected);
+    let messages = warnings();
+    assert_eq!(messages.len(), 1, "one warning per fallback execution");
+    assert!(messages[0].contains("metadata cannot determine exact counts"));
+    assert!(messages[0].contains(&format!("snapshot_id=Some({})", snapshot.id())));
     let optimized_reads = std::mem::take(&mut *trace.0.lock().unwrap());
     for manifest in manifests {
         let ordinary = ordinary_reads
@@ -780,4 +848,13 @@ async fn test_unknown_cardinality_falls_back_before_data_manifests() {
         .unwrap()
         .iter()
         .all(|path| !path.ends_with(".parquet")));
+    assert_eq!(warnings().len(), 1, "exact metadata must not warn");
+
+    // Alias qualification must also preserve filters in the deferred fallback.
+    let aliased = "SELECT src.dt, COUNT(*) FROM observed AS src \
+                   WHERE src.dt = 'unknown' GROUP BY src.dt";
+    assert!(!scans_table(&ctx, aliased).await);
+    assert_eq!(warnings().len(), 1);
+    assert_eq!(rows(&ctx, aliased).await, vec![row("unknown", 1)]);
+    assert_eq!(warnings().len(), 2);
 }

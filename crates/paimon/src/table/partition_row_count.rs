@@ -393,16 +393,34 @@ struct DeleteManifestSummary {
     adds: Option<Vec<RetainedAdd>>,
 }
 
+/// Reserve a whole manifest, so concurrent decoders cannot each retain a prefix
+/// then all abandon it when the shared budget runs out.
+fn reserve_retained_adds(budget: &AtomicI64, count: i64) -> Option<usize> {
+    let capacity = usize::try_from(count).ok()?;
+    budget
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |available| {
+            available
+                .checked_sub(count)
+                .filter(|remaining| *remaining >= 0)
+        })
+        .ok()
+        .map(|_| capacity)
+}
+
 fn summarize_delete_manifest(
     bytes: &[u8],
     cache: &SharedSchemaCache,
     budget: &AtomicI64,
+    num_added_files: i64,
     filter: Option<&PartitionFilter>,
 ) -> crate::Result<DeleteManifestSummary> {
+    // ponytail: the whole-manifest count can over-reserve under a partition
+    // filter and cause extra rereads; selected-entry reservations need profiling.
+    let reservation = reserve_retained_adds(budget, num_added_files);
     let mut matcher = PartitionMatcher::new(filter);
     let mut interner = PartitionInterner::default();
     let mut deletes = DeleteSet::default();
-    let mut adds = Some(Vec::new());
+    let mut adds = reservation.map(|_| Vec::new());
     visit_slim_manifest_entries(bytes, cache, &mut |entry| {
         if !matcher.matches(entry.partition)? {
             return Ok(());
@@ -411,7 +429,7 @@ fn summarize_delete_manifest(
             FileKind::Delete => deletes.insert(&entry),
             FileKind::Add => {
                 if let Some(retained) = adds.as_mut() {
-                    if budget.fetch_sub(1, Ordering::Relaxed) > 0 {
+                    if retained.len() < reservation.unwrap_or(0) {
                         retained.push(RetainedAdd {
                             partition: interner.intern(entry.partition),
                             file_name: Box::from(entry.file_name),
@@ -420,7 +438,8 @@ fn summarize_delete_manifest(
                             first_row_id: entry.first_row_id,
                         });
                     } else {
-                        budget.fetch_add(retained.len() as i64 + 1, Ordering::Relaxed);
+                        // An understated manifest count must not exceed the
+                        // reservation or make us lose ADDs: re-read instead.
                         adds = None;
                     }
                 }
@@ -428,6 +447,12 @@ fn summarize_delete_manifest(
         }
         Ok(())
     })?;
+    if let Some(reserved) = reservation {
+        let unused = reserved - adds.as_ref().map_or(0, Vec::len);
+        if unused > 0 {
+            budget.fetch_add(unused as i64, Ordering::Relaxed);
+        }
+    }
     Ok(DeleteManifestSummary { deletes, adds })
 }
 
@@ -471,7 +496,7 @@ fn read_manifests<T, F>(
 ) -> impl futures::Stream<Item = crate::Result<(ManifestFileMeta, T)>>
 where
     T: Send + 'static,
-    F: Fn(&[u8]) -> crate::Result<T> + Send + Sync + 'static,
+    F: Fn(&[u8], &ManifestFileMeta) -> crate::Result<T> + Send + Sync + 'static,
 {
     let file_io = file_io.clone();
     let manifest_dir = manifest_dir.to_string();
@@ -491,16 +516,15 @@ where
                         source: Some(Box::new(error)),
                     }
                 })?;
-                let decoded = tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    decode(&bytes)
+                    decode(&bytes, &meta).map(|decoded| (meta, decoded))
                 })
                 .await
                 .map_err(|error| crate::Error::UnexpectedError {
                     message: format!("manifest decode task failed: {error}"),
                     source: Some(Box::new(error)),
-                })??;
-                Ok((meta, decoded))
+                })?
             }
         })
         .buffer_unordered(MANIFEST_READ_CONCURRENCY)
@@ -521,7 +545,7 @@ async fn aggregate_manifests(
         .partition(|meta| meta.num_deleted_files() > 0);
 
     // Keep a bounded number of ADDs while collecting the global delete set.
-    // Only manifests that exceed the shared budget are fetched again.
+    // Manifests without a complete reservation are fetched again.
     let mut deletes = DeleteSet::default();
     let mut retained_adds = Vec::new();
     {
@@ -532,7 +556,15 @@ async fn aggregate_manifests(
             file_io,
             manifest_dir,
             with_deletes,
-            move |bytes| summarize_delete_manifest(bytes, &cache, &budget, filter.as_deref()),
+            move |bytes, meta| {
+                summarize_delete_manifest(
+                    bytes,
+                    &cache,
+                    &budget,
+                    meta.num_added_files(),
+                    filter.as_deref(),
+                )
+            },
         ));
         while let Some((meta, summary)) = summaries.try_next().await? {
             deletes.merge(summary.deletes);
@@ -567,7 +599,7 @@ async fn aggregate_manifests(
         file_io,
         manifest_dir,
         second_pass,
-        move |bytes| {
+        move |bytes, _| {
             aggregate_manifest(
                 bytes,
                 &cache,
@@ -843,6 +875,85 @@ mod tests {
             BinaryTableStats::empty(),
             0,
         )
+    }
+
+    #[test]
+    fn test_retained_add_budget_reserves_whole_manifests() {
+        let budget = AtomicI64::new(2);
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        reserve_retained_adds(&budget, 2)
+                    })
+                })
+                .collect();
+            assert_eq!(
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![2]
+            );
+        });
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+        assert_eq!(reserve_retained_adds(&budget, 0), Some(0));
+        assert_eq!(reserve_retained_adds(&budget, -1), None);
+        assert_eq!(reserve_retained_adds(&budget, i64::MAX), None);
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_retained_add_reservation_refunds_filtered_and_understated_counts() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        file_io.mkdirs(&format!("{MANIFEST_DIR}/")).await.unwrap();
+        let meta = write_manifest(
+            &file_io,
+            "reservation",
+            &[
+                add(partition(1), file("a", 0, 2, None)),
+                add(partition(2), file("b", 0, 3, None)),
+                delete(partition(1), file("old", 0, 1, None)),
+            ],
+        )
+        .await;
+        let bytes = file_io
+            .new_input(&format!("{MANIFEST_DIR}/{}", meta.file_name()))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let cache = SharedSchemaCache::new();
+        let filter = PartitionFilter::PartitionSet {
+            partitions: std::collections::HashSet::from([partition(1)]),
+            bounds: vec![],
+        };
+        let budget = AtomicI64::new(2);
+        let summary = summarize_delete_manifest(&bytes, &cache, &budget, 2, Some(&filter)).unwrap();
+        assert!(!summary.deletes.is_empty());
+        assert_eq!(summary.adds.unwrap().len(), 1);
+        assert_eq!(budget.load(Ordering::Relaxed), 1);
+
+        // The next whole-manifest reservation can use the refunded slot.
+        assert_eq!(reserve_retained_adds(&budget, 1), Some(1));
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+        for understated in [0, 1] {
+            let budget = AtomicI64::new(2);
+            let summary =
+                summarize_delete_manifest(&bytes, &cache, &budget, understated, None).unwrap();
+            assert!(summary.adds.is_none());
+            assert!(!summary.deletes.is_empty());
+            assert_eq!(budget.load(Ordering::Relaxed), 2);
+        }
+        // Document the conservative tradeoff: the selected ADD fits, but an
+        // oversized whole-manifest estimate cannot reserve even a partial slot.
+        let budget = AtomicI64::new(1);
+        let summary = summarize_delete_manifest(&bytes, &cache, &budget, 2, Some(&filter)).unwrap();
+        assert!(summary.adds.is_none());
+        assert!(!summary.deletes.is_empty());
+        assert_eq!(budget.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

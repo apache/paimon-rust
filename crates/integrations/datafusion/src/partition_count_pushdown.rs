@@ -109,8 +109,15 @@ impl OptimizerRule for PushDownPartitionCount {
 }
 
 fn rewrite_aggregate(aggregate: &Aggregate) -> DFResult<Option<LogicalPlan>> {
-    let LogicalPlan::TableScan(scan) = aggregate.input.as_ref() else {
-        return Ok(None);
+    let (scan, qualifier) = match aggregate.input.as_ref() {
+        LogicalPlan::TableScan(scan) => (scan, &scan.table_name),
+        LogicalPlan::SubqueryAlias(alias) => {
+            let LogicalPlan::TableScan(scan) = alias.input.as_ref() else {
+                return Ok(None);
+            };
+            (scan, &alias.alias)
+        }
+        _ => return Ok(None),
     };
     if scan.fetch.is_some()
         || aggregate.aggr_expr.is_empty()
@@ -183,15 +190,17 @@ fn rewrite_aggregate(aggregate: &Aggregate) -> DFResult<Option<LogicalPlan>> {
         table_name: scan.table_name.clone(),
         filters: scan.filters.clone(),
     };
+    // Only the synthetic scan changes qualifier; fallback filters still refer
+    // to the original scan's table name.
     let counts_scan = LogicalPlan::TableScan(TableScan::try_new(
-        scan.table_name.clone(),
+        qualifier.clone(),
         provider_as_source(Arc::new(counts)),
         None,
         vec![],
         None,
     )?);
 
-    let row_count = Expr::Column(Column::new(Some(scan.table_name.clone()), ROW_COUNT_COLUMN));
+    let row_count = Expr::Column(Column::new(Some(qualifier.clone()), ROW_COUNT_COLUMN));
     let summed = LogicalPlan::Aggregate(Aggregate::try_new(
         Arc::new(counts_scan),
         aggregate.group_expr.clone(),
@@ -393,6 +402,12 @@ impl PartitionRowCountStream {
         // Unknown DV cardinalities stop the metadata path before data manifests
         // are aggregated. Keep the fallback pinned to the same snapshot.
         let Some(mut counts) = counts else {
+            log::warn!(
+                "Partition count metadata cannot determine exact counts; falling back to a data scan \
+                 (table={}, snapshot_id={:?})",
+                self.table_name,
+                self.table.as_ref().and_then(Table::travel_snapshot).map(|snapshot| snapshot.id()),
+            );
             let plan = crate::runtime::await_with_runtime(self.scan_by_reading()).await?;
             if plan.schema() != self.output_schema {
                 return internal_err!(
