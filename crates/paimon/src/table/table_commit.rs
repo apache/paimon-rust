@@ -52,6 +52,28 @@ type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
 type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
 
+fn validate_unique_file_entries(entries: &[ManifestEntry]) -> Result<()> {
+    let mut adds = HashSet::new();
+    let mut deletes = HashSet::new();
+    for entry in entries {
+        let (kind, files) = match entry.kind() {
+            FileKind::Add => ("ADD", &mut adds),
+            FileKind::Delete => ("DELETE", &mut deletes),
+        };
+        if !files.insert(entry.identifier()) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Duplicate {kind} entry for file '{}' in bucket {}.",
+                    entry.file().file_name,
+                    entry.bucket(),
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_bucket_ownership(messages: &[CommitMessage]) -> Result<()> {
     let mut owners = HashSet::new();
     for message in messages {
@@ -1289,6 +1311,8 @@ impl TableCommit {
                 new_index_entries,
                 check_from_snapshot,
             } => {
+                validate_unique_file_entries(entries)?;
+
                 // Auto-promote to OVERWRITE when CoW rewrites produce Delete entries.
                 // This ensures the snapshot correctly reflects file replacements.
                 let has_delete = entries.iter().any(|e| *e.kind() == FileKind::Delete);
@@ -1365,6 +1389,8 @@ impl TableCommit {
                 let entries = self
                     .provide_overwrite_entries(plan, latest_snapshot)
                     .await?;
+                validate_unique_file_entries(&entries)?;
+
                 let (partition_filter, new_index_entries, check_from_snapshot) = match plan {
                     CommitEntriesPlan::Overwrite {
                         partition_filter,
@@ -3457,6 +3483,54 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(*entries[0].kind(), FileKind::Add);
         assert_eq!(entries[0].file().file_name, "data-0.parquet");
+    }
+
+    #[tokio::test]
+    async fn test_commit_rejects_duplicate_data_file_entries() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_duplicate_data_file_entries";
+        setup_dirs(&file_io, table_path).await;
+        let commit = setup_commit(&file_io, table_path);
+        let partition = EMPTY_SERIALIZED_ROW.clone();
+        let file = test_data_file("data-0.parquet", 100);
+
+        commit
+            .commit(vec![CommitMessage::new(
+                partition.clone(),
+                0,
+                vec![file.clone()],
+            )])
+            .await
+            .unwrap();
+
+        let mut duplicate_delete = CommitMessage::new(partition.clone(), 0, vec![]);
+        duplicate_delete.deleted_files = vec![file.clone(), file];
+        let error = commit
+            .commit(vec![duplicate_delete])
+            .await
+            .expect_err("duplicate DELETE entries must be rejected");
+        assert!(
+            error.to_string().contains("Duplicate DELETE"),
+            "unexpected error: {error}"
+        );
+
+        let duplicate_add = test_data_file("data-1.parquet", 200);
+        let error = commit
+            .commit(vec![CommitMessage::new(
+                partition,
+                0,
+                vec![duplicate_add.clone(), duplicate_add],
+            )])
+            .await
+            .expect_err("duplicate ADD entries must be rejected");
+        assert!(
+            error.to_string().contains("Duplicate ADD"),
+            "unexpected error: {error}"
+        );
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        assert_eq!(snapshot.id(), 1);
+        assert_eq!(snapshot.total_record_count(), Some(100));
     }
 
     #[tokio::test]
