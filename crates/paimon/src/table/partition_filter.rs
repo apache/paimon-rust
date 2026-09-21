@@ -21,8 +21,8 @@
 
 use crate::predicate_stats::data_leaf_may_match;
 use crate::spec::{
-    eval_row, extract_datum, BinaryRow, BinaryRowBuilder, DataField, Datum, Predicate,
-    PredicateBuilder, PredicateOperator,
+    eval_row, extract_datum, BinaryRow, BinaryRowBuilder, DataField, Datum, ManifestFileMeta,
+    Predicate, PredicateBuilder, PredicateOperator,
 };
 use crate::table::stats_filter::FileStatsRows;
 use std::collections::HashSet;
@@ -123,21 +123,31 @@ impl PartitionFilter {
 
     pub(super) fn matches_manifest(
         &self,
-        stats: &FileStatsRows,
+        meta: &ManifestFileMeta,
         partition_fields: &[DataField],
     ) -> bool {
+        if partition_fields.is_empty() {
+            return true;
+        }
+        let stats = meta.partition_stats();
+        let stats = FileStatsRows::for_manifest_partition(
+            meta.num_added_files() + meta.num_deleted_files(),
+            BinaryRow::from_serialized_bytes(stats.min_values()).ok(),
+            BinaryRow::from_serialized_bytes(stats.max_values()).ok(),
+            stats.null_counts().clone(),
+        );
         match self {
             PartitionFilter::PartitionSet { bounds, .. } => {
                 for b in bounds {
-                    if !predicate_may_match(&b.min, stats, partition_fields)
-                        || !predicate_may_match(&b.max, stats, partition_fields)
+                    if !predicate_may_match(&b.min, &stats, partition_fields)
+                        || !predicate_may_match(&b.max, &stats, partition_fields)
                     {
                         return false;
                     }
                 }
                 true
             }
-            PartitionFilter::Predicate(pred) => predicate_may_match(pred, stats, partition_fields),
+            PartitionFilter::Predicate(pred) => predicate_may_match(pred, &stats, partition_fields),
         }
     }
 }
@@ -326,6 +336,64 @@ mod tests {
             "dt".to_string(),
             DataType::VarChar(VarCharType::default()),
         )]
+    }
+
+    #[test]
+    fn test_manifest_pruning_uses_partition_statistics() {
+        use crate::spec::stats::BinaryTableStats;
+
+        let fields = partition_fields_dt();
+        let pb = PredicateBuilder::new(&fields);
+        let mut min = BinaryRowBuilder::new(1);
+        min.write_string(0, "2024-01-01");
+        let mut max = BinaryRowBuilder::new(1);
+        max.write_string(0, "2024-01-03");
+        let meta = ManifestFileMeta::new(
+            "manifest".into(),
+            1,
+            10,
+            5,
+            BinaryTableStats::new(
+                min.build_serialized(),
+                max.build_serialized(),
+                vec![Some(0)],
+            ),
+            0,
+        );
+        for (predicate, expected) in [
+            (
+                pb.equal("dt", Datum::String("2024-01-02".into())).unwrap(),
+                true,
+            ),
+            (
+                pb.equal("dt", Datum::String("2024-01-04".into())).unwrap(),
+                false,
+            ),
+            (
+                pb.greater_than("dt", Datum::String("2024-01-01".into()))
+                    .unwrap(),
+                true,
+            ),
+            (
+                pb.greater_than("dt", Datum::String("2024-01-03".into()))
+                    .unwrap(),
+                false,
+            ),
+            (pb.is_null("dt").unwrap(), false),
+        ] {
+            let filter = PartitionFilter::from_predicate(predicate, &fields);
+            assert_eq!(filter.matches_manifest(&meta, &fields), expected);
+            assert!(filter.matches_manifest(&meta, &[]));
+            let unknown = ManifestFileMeta::new(
+                "unknown-stats".into(),
+                1,
+                10,
+                5,
+                BinaryTableStats::new(vec![0xFF], vec![0xFF], vec![]),
+                0,
+            );
+            assert!(filter.matches_manifest(&unknown, &fields));
+        }
     }
 
     #[test]

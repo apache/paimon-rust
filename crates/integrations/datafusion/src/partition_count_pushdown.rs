@@ -112,7 +112,10 @@ fn rewrite_aggregate(aggregate: &Aggregate) -> DFResult<Option<LogicalPlan>> {
     let LogicalPlan::TableScan(scan) = aggregate.input.as_ref() else {
         return Ok(None);
     };
-    if scan.fetch.is_some() || !aggregate.aggr_expr.iter().all(is_count_star) {
+    if scan.fetch.is_some()
+        || aggregate.aggr_expr.is_empty()
+        || !aggregate.aggr_expr.iter().all(is_count_star)
+    {
         return Ok(None);
     }
     let Ok(provider) = source_as_provider(&scan.source) else {
@@ -343,7 +346,7 @@ struct PartitionRowCountStream {
     source: Arc<dyn TableSource>,
     table_name: TableReference,
     filters: Vec<Expr>,
-    state: SessionState,
+    state: Arc<SessionState>,
 }
 
 impl PartitionRowCountStream {
@@ -365,7 +368,7 @@ impl PartitionRowCountStream {
             source,
             table_name: provider.table_name.clone(),
             filters: provider.filters.clone(),
-            state,
+            state: Arc::new(state),
         })
     }
 

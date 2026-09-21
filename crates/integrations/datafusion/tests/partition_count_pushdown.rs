@@ -157,6 +157,30 @@ async fn test_grouped_count_with_partition_filter_is_answered_from_manifests() {
 }
 
 #[tokio::test]
+async fn test_distinct_and_grouping_without_count_skip_rewrite() {
+    let (_tmp, _catalog, ctx) = setup().await;
+    for sql in [
+        "SELECT DISTINCT dt FROM paimon.test_db.t",
+        "SELECT dt FROM paimon.test_db.t GROUP BY dt",
+    ] {
+        assert!(scans_table(&ctx, sql).await, "{sql}");
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let mut values = Vec::new();
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                values.push(array_value_to_string(batch.column(0), row).unwrap());
+            }
+        }
+        values.sort();
+        assert_eq!(values, ["2024-01-01", "2024-01-02", "2024-01-03"]);
+    }
+    // The outer COUNT needs no projected columns from the DISTINCT result.
+    let sql = "SELECT COUNT(*) FROM (SELECT DISTINCT dt FROM paimon.test_db.t) d";
+    assert!(scans_table(&ctx, sql).await);
+    assert_eq!(rows(&ctx, sql).await, vec![row("", 3)]);
+}
+
+#[tokio::test]
 async fn test_physical_plan_pins_snapshot() {
     let (_tmp, _catalog, ctx) = setup().await;
     let plan = ctx

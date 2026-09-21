@@ -77,7 +77,7 @@ pub(crate) fn read_nullable_string_field(
     Ok(Some(cursor.read_string()?.to_string()))
 }
 
-const EMPTY_PARTITION: [u8; 4] = [0, 0, 0, 0];
+pub(super) const EMPTY_PARTITION: &[u8] = &[0, 0, 0, 0];
 
 /// Null/missing/empty partition → valid empty BinaryRow (arity=0).
 pub(crate) fn normalize_partition(partition: Option<Vec<u8>>) -> Vec<u8> {

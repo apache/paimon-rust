@@ -47,12 +47,9 @@ use crate::spec::avro::{
     visit_slim_index_manifest_entries, visit_slim_manifest_entries, SharedSchemaCache,
     SlimManifestEntry,
 };
-use crate::spec::{
-    BinaryRow, CoreOptions, DataField, FileKind, ManifestFileMeta, ManifestList, Predicate,
-};
+use crate::spec::{BinaryRow, CoreOptions, FileKind, ManifestFileMeta, ManifestList, Predicate};
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::read_builder::split_scan_predicates;
-use crate::table::stats_filter::FileStatsRows;
 use crate::table::Table;
 
 /// Independent I/O and blocking decode limits for data manifests.
@@ -632,27 +629,6 @@ async fn read_deletion_vectors(
     })?
 }
 
-/// Drop manifests whose partition value range cannot match `filter`.
-fn retain_matching_manifests(
-    manifests: &mut Vec<ManifestFileMeta>,
-    filter: &PartitionFilter,
-    partition_fields: &[DataField],
-) {
-    if partition_fields.is_empty() {
-        return;
-    }
-    manifests.retain(|meta| {
-        let stats = meta.partition_stats();
-        let file_stats = FileStatsRows::for_manifest_partition(
-            meta.num_added_files() + meta.num_deleted_files(),
-            BinaryRow::from_serialized_bytes(stats.min_values()).ok(),
-            BinaryRow::from_serialized_bytes(stats.max_values()).ok(),
-            stats.null_counts().clone(),
-        );
-        filter.matches_manifest(&file_stats, partition_fields)
-    });
-}
-
 impl Table {
     /// Real row count of every partition in the latest (or time-travelled) snapshot.
     ///
@@ -767,7 +743,7 @@ impl Table {
         )?;
         manifests.extend(delta);
         if let Some(filter) = &partition_filter {
-            retain_matching_manifests(&mut manifests, filter, &partition_fields);
+            manifests.retain(|meta| filter.matches_manifest(meta, &partition_fields));
         }
 
         let totals = aggregate_manifests(
@@ -1258,6 +1234,108 @@ mod tests {
         .await
         .unwrap();
         assert!(totals[&partition(1)].row_count_unknown);
+    }
+
+    #[test]
+    fn test_missing_manifest_row_counts_are_unknown() {
+        use crate::spec::avro::{from_avro_bytes_fast, from_manifest_bytes_filtered, SchemaCache};
+        use apache_avro::types::Value;
+        use serde_json::json;
+
+        // Missing counts stay unknown, and absent file identities are rejected.
+        // Full and slim decoders must agree, including for nonstandard schemas.
+        for (case, expected) in [
+            ("missing_count", None),
+            ("null_count", None),
+            ("null_file", None),
+            ("null_deleted_file", None),
+            ("missing_file", None),
+            ("zero", Some(0)),
+            ("known", Some(2)),
+        ] {
+            let mut file_fields = vec![json!({"name": "_FILE_NAME", "type": "string"})];
+            let mut file_values = vec![("_FILE_NAME".into(), Value::String("data.parquet".into()))];
+            if case != "missing_count" {
+                file_fields.push(json!({"name": "_ROW_COUNT", "type": ["null", "long"]}));
+                file_values.push((
+                    "_ROW_COUNT".into(),
+                    match expected {
+                        Some(count) => Value::Union(1, Box::new(Value::Long(count))),
+                        None => Value::Union(0, Box::new(Value::Null)),
+                    },
+                ));
+            }
+            let partition = crate::spec::EMPTY_SERIALIZED_ROW.clone();
+            let mut fields = vec![
+                json!({"name": "_PARTITION", "type": "bytes"}),
+                json!({"name": "_KIND", "type": "int"}),
+            ];
+            let mut values = vec![
+                ("_PARTITION".into(), Value::Bytes(partition.clone())),
+                (
+                    "_KIND".into(),
+                    Value::Int(i32::from(case == "null_deleted_file")),
+                ),
+            ];
+            let null_file = matches!(case, "null_file" | "null_deleted_file");
+            if case != "missing_file" {
+                fields.push(json!({"name": "_FILE", "type": ["null", {
+                    "type": "record", "name": "file", "fields": file_fields
+                }]}));
+                values.push((
+                    "_FILE".into(),
+                    if null_file {
+                        Value::Union(0, Box::new(Value::Null))
+                    } else {
+                        Value::Union(1, Box::new(Value::Record(file_values)))
+                    },
+                ));
+            }
+            let schema = apache_avro::Schema::parse_str(
+                &json!({
+                    "type": "record", "name": "manifest", "fields": fields
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+            writer.append(Value::Record(values)).unwrap();
+            let bytes = writer.into_inner().unwrap();
+            let full = from_avro_bytes_fast::<ManifestEntry>(&bytes);
+            let filtered =
+                from_manifest_bytes_filtered(&bytes, &mut SchemaCache::new(), &mut |_, _, _, _| {
+                    true
+                });
+            let totals = aggregate_manifest(
+                &bytes,
+                &SharedSchemaCache::new(),
+                None,
+                None,
+                false,
+                &DeletionVectors::default(),
+            );
+            if null_file || case == "missing_file" {
+                for result in [full.map(|_| ()), filtered.map(|_| ()), totals.map(|_| ())] {
+                    assert!(
+                        matches!(result, Err(crate::Error::DataInvalid { .. })),
+                        "{case}"
+                    );
+                }
+                continue;
+            }
+            let full = full.unwrap();
+            assert_eq!(full, filtered.unwrap(), "{case}");
+            assert_eq!(
+                full[0].file().row_count,
+                expected.unwrap_or(DataFileMeta::ROW_COUNT_UNKNOWN),
+                "{case}"
+            );
+            assert_eq!(
+                totals.unwrap()[&partition].record_count(),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[test]

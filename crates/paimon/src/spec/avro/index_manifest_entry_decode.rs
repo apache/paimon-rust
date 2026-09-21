@@ -19,7 +19,7 @@ use super::cursor::AvroCursor;
 use super::decode::{neg_count_to_usize, AvroRecordDecode};
 use super::decode_helpers::{
     extract_record_schema, normalize_partition, read_bytes_field, read_int_field, read_long_field,
-    read_nullable_string_field, read_string_field,
+    read_nullable_string_field, read_string_field, EMPTY_PARTITION,
 };
 use super::schema::{skip_nullable_field, FieldSchema, WriterSchema};
 use crate::spec::index_manifest::IndexManifestEntry;
@@ -107,8 +107,6 @@ pub(crate) struct SlimIndexManifestEntry<'a> {
     /// replace earlier ones, just as in the full index-manifest decoder.
     pub deletion_vector_cardinalities: HashMap<&'a str, Option<i64>>,
 }
-
-const EMPTY_PARTITION: &[u8] = &[0, 0, 0, 0];
 
 pub(crate) fn decode_slim_index_manifest_entry<'a>(
     cursor: &mut AvroCursor<'a>,

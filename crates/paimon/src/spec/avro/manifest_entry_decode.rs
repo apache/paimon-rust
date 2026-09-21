@@ -19,7 +19,7 @@ use super::cursor::AvroCursor;
 use super::decode::{neg_count_to_usize, AvroRecordDecode};
 use super::decode_helpers::{
     extract_record_schema, normalize_partition, read_bytes_field, read_int_field, read_long_field,
-    read_string_field,
+    read_string_field, EMPTY_PARTITION,
 };
 use super::manifest_file_meta_decode::decode_nullable_binary_table_stats;
 use super::schema::{skip_nullable_field, FieldSchema, WriterSchema};
@@ -69,7 +69,7 @@ impl AvroRecordDecode for ManifestEntry {
             normalize_partition(partition),
             bucket.unwrap_or(0),
             total_buckets.unwrap_or(0),
-            file.unwrap_or_else(default_data_file_meta),
+            file.ok_or_else(missing_file_metadata)?,
             version.unwrap_or(0),
         ))
     }
@@ -162,7 +162,7 @@ where
         normalize_partition(partition),
         bucket.unwrap_or(0),
         total_buckets.unwrap_or(0),
-        file.unwrap_or_else(default_data_file_meta),
+        file.ok_or_else(missing_file_metadata)?,
         version.unwrap_or(0),
     )))
 }
@@ -184,8 +184,6 @@ pub(crate) struct SlimManifestEntry<'a> {
     pub embedded_index: Option<&'a [u8]>,
     pub external_path: Option<&'a str>,
 }
-
-const EMPTY_PARTITION: &[u8] = &[0, 0, 0, 0];
 
 /// Decode one manifest entry as a [`SlimManifestEntry`] borrowing from the block.
 pub(crate) fn decode_slim_manifest_entry<'a>(
@@ -209,12 +207,13 @@ pub(crate) fn decode_slim_manifest_entry<'a>(
         bucket: 0,
         level: 0,
         file_name: "",
-        row_count: 0,
+        row_count: DataFileMeta::ROW_COUNT_UNKNOWN,
         first_row_id: None,
         extra_files: Vec::new(),
         embedded_index: None,
         external_path: None,
     };
+    let mut file_present = false;
 
     for field in &writer_schema.fields {
         match field.name.as_str() {
@@ -251,6 +250,7 @@ pub(crate) fn decode_slim_manifest_entry<'a>(
                         source: None,
                     }
                 })?;
+                file_present = true;
                 for file_field in &record_schema.fields {
                     match file_field.name.as_str() {
                         "_FILE_NAME" => {
@@ -259,7 +259,8 @@ pub(crate) fn decode_slim_manifest_entry<'a>(
                             }
                         }
                         "_ROW_COUNT" => {
-                            entry.row_count = read_long_field(cursor, file_field.nullable)?
+                            entry.row_count = decode_nullable_long(cursor, file_field.nullable)?
+                                .unwrap_or(DataFileMeta::ROW_COUNT_UNKNOWN)
                         }
                         "_LEVEL" => entry.level = read_int_field(cursor, file_field.nullable)?,
                         "_EXTRA_FILES" => {
@@ -285,6 +286,9 @@ pub(crate) fn decode_slim_manifest_entry<'a>(
         }
     }
 
+    if !file_present {
+        return Err(missing_file_metadata());
+    }
     Ok(entry)
 }
 
@@ -395,7 +399,7 @@ fn decode_data_file_meta(
         match field.name.as_str() {
             "_FILE_NAME" => file_name = Some(read_string_field(cursor, field.nullable)?),
             "_FILE_SIZE" => file_size = Some(read_long_field(cursor, field.nullable)?),
-            "_ROW_COUNT" => row_count = Some(read_long_field(cursor, field.nullable)?),
+            "_ROW_COUNT" => row_count = decode_nullable_long(cursor, field.nullable)?,
             "_MIN_KEY" => min_key = Some(read_bytes_field(cursor, field.nullable)?),
             "_MAX_KEY" => max_key = Some(read_bytes_field(cursor, field.nullable)?),
             "_KEY_STATS" => {
@@ -439,7 +443,7 @@ fn decode_data_file_meta(
     Ok(DataFileMeta {
         file_name: file_name.unwrap_or_default(),
         file_size: file_size.unwrap_or(0),
-        row_count: row_count.unwrap_or(0),
+        row_count: row_count.unwrap_or(DataFileMeta::ROW_COUNT_UNKNOWN),
         min_key: min_key.unwrap_or_default(),
         max_key: max_key.unwrap_or_default(),
         key_stats: key_stats.unwrap_or_else(BinaryTableStats::empty),
@@ -606,28 +610,9 @@ fn decode_nullable_timestamp_millis(
     Ok(DateTime::from_timestamp(secs, nanos))
 }
 
-fn default_data_file_meta() -> DataFileMeta {
-    DataFileMeta {
-        file_name: String::new(),
-        file_size: 0,
-        row_count: 0,
-        min_key: vec![],
-        max_key: vec![],
-        key_stats: BinaryTableStats::empty(),
-        value_stats: BinaryTableStats::empty(),
-        min_sequence_number: 0,
-        max_sequence_number: 0,
-        schema_id: 0,
-        level: 0,
-        extra_files: vec![],
-        creation_time: None,
-        delete_row_count: None,
-        embedded_index: None,
-        file_source: None,
-        value_stats_cols: None,
-        external_path: None,
-        first_row_id: None,
-        write_cols: None,
-        column_max_sequence_numbers: None,
+fn missing_file_metadata() -> crate::Error {
+    crate::Error::DataInvalid {
+        message: "manifest entry is missing non-null _FILE metadata".into(),
+        source: None,
     }
 }
