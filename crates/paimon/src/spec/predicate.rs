@@ -1563,6 +1563,7 @@ fn validate_datum_matches_type(datum: &Datum, data_type: &DataType) -> Result<()
             | (Datum::Decimal { .. }, DataType::Decimal(_))
             | (Datum::Bytes(_), DataType::Binary(_))
             | (Datum::Bytes(_), DataType::VarBinary(_))
+            | (Datum::Bytes(_), DataType::Blob(_))
             | (Datum::Variant { .. }, DataType::Variant(_))
     );
     if !ok {
@@ -2080,6 +2081,23 @@ mod tests {
             }
             other => panic!("expected Leaf, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_builder_accepts_blob_bytes_without_accepting_wrong_literal_type() {
+        let fields = vec![DataField::new(
+            0,
+            "payload".to_string(),
+            DataType::Blob(BlobType::new()),
+        )];
+        let pb = PredicateBuilder::new(&fields);
+        let bytes = vec![0, 255, 0];
+        let predicate = pb.equal("payload", Datum::Bytes(bytes.clone())).unwrap();
+        assert!(matches!(predicate, Predicate::Leaf { literals, .. }
+            if literals == vec![Datum::Bytes(bytes)]));
+        assert!(pb
+            .equal("payload", Datum::String("wrong".to_string()))
+            .is_err());
     }
 
     #[test]

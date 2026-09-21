@@ -204,6 +204,49 @@ def test_with_row_ranges():
             table.new_read_builder().with_row_ranges([(2, 1)])
 
 
+@pytest.mark.parametrize("data_evolution", [False, True])
+@pytest.mark.parametrize("case_sensitive", [False, True])
+def test_row_id_filter_with_projection_and_data_predicate(data_evolution, case_sensitive):
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rid")
+        options = "'row-tracking.enabled' = 'true'"
+        if data_evolution:
+            options += ", 'data-evolution.enabled' = 'true'"
+        ctx.sql(f"CREATE TABLE paimon.rid.t (id INT, name STRING) WITH ({options})")
+        ctx.sql("INSERT INTO paimon.rid.t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rid.t")
+        builder = table.new_read_builder().with_case_sensitive(case_sensitive)
+        builder.with_projection(["name", "_ROW_ID"])
+        row_id_field = "_ROW_ID" if case_sensitive else "_row_id"
+        builder.with_filter({"method": "and", "children": [
+            {"method": "equal", "field": row_id_field, "literals": [1]},
+            {"method": "equal", "field": "id", "literals": [2]},
+        ]})
+        rows = pa.Table.from_batches(builder.new_read().read(
+            builder.new_scan().plan().splits()))
+        assert rows.to_pylist() == [{"name": "b", "_ROW_ID": 1}]
+
+
+@pytest.mark.parametrize("predicate_field", ["_row_id", "_ROW_ID"])
+def test_case_insensitive_filter_uses_real_lowercase_row_id_column(predicate_field):
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.realrowid")
+        ctx.sql("CREATE TABLE paimon.realrowid.t (_row_id BIGINT, id INT)")
+        ctx.sql("INSERT INTO paimon.realrowid.t VALUES (11, 1), (22, 2)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("realrowid.t")
+        builder = table.new_read_builder().with_case_sensitive(False)
+        builder.with_projection(["_row_id", "id"])
+        builder.with_filter({
+            "method": "equal", "field": predicate_field, "literals": [22],
+        })
+        batches = builder.new_read().read(builder.new_scan().plan().splits())
+        assert pa.Table.from_batches(batches).to_pylist() == [{"_row_id": 22, "id": 2}]
+
+
 def test_row_tracking_append_row_ranges_keep_global_row_ids():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
@@ -584,6 +627,30 @@ def test_filter_binary_literal_rejects_other_types(literal):
         with pytest.raises(ValueError, match="bytes or bytearray"):
             table.new_read_builder().with_filter(
                 {"method": "equal", "field": "payload", "literals": [literal]})
+
+
+def test_blob_predicate_with_limit_reads_matching_payload():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.blobpred")
+        ctx.sql("""CREATE TABLE paimon.blobpred.t (id INT, payload BLOB) WITH (
+            'row-tracking.enabled' = 'true',
+            'data-evolution.enabled' = 'true')""")
+        ctx.sql("""INSERT INTO paimon.blobpred.t (id, payload) VALUES
+            (1, X'01'), (2, X'02'), (3, X'03')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("blobpred.t")
+        builder = table.new_read_builder().with_limit(1).with_filter({
+            "method": "equal", "field": "payload", "literals": [b"\x02"],
+        })
+        batches = builder.new_read().read(builder.new_scan().plan().splits())
+        assert pa.Table.from_batches(batches).to_pylist() == [
+            {"id": 2, "payload": b"\x02"}]
+
+        with pytest.raises(ValueError, match="bytes or bytearray"):
+            table.new_read_builder().with_filter({
+                "method": "equal", "field": "payload", "literals": ["02"],
+            })
 
 
 def test_empty_plan_preserves_snapshot_id():
