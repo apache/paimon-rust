@@ -1126,13 +1126,16 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// Select a half-open range of logical positions in a data-evolution snapshot.
-    /// Positions are assigned before group statistics, projection and deletion vectors.
+    /// Select a half-open range of logical positions in an append snapshot.
+    ///
+    /// Data-evolution positions are assigned before group statistics, projection
+    /// and deletion vectors. Ordinary append positions follow the final
+    /// stats-pruned split and file order.
     pub fn with_row_position_slice(self, start: u64, end: u64) -> crate::Result<Self> {
         self.with_row_position_selection(RowPositionSelection::slice(start, end)?)
     }
 
-    /// Select a balanced contiguous shard of data-evolution row positions.
+    /// Select a balanced contiguous shard of append row positions.
     pub fn with_row_position_shard(self, index: u64, count: u64) -> crate::Result<Self> {
         self.with_row_position_selection(RowPositionSelection::shard(index, count)?)
     }
@@ -1235,9 +1238,7 @@ impl<'a> TableScan<'a> {
 
     fn with_row_position_selection(self, selection: RowPositionSelection) -> crate::Result<Self> {
         match self.0 {
-            TableScanKind::Paimon(mut scan)
-                if scan.table.schema().core_options().data_evolution_enabled() =>
-            {
+            TableScanKind::Paimon(mut scan) if scan.table.schema().primary_keys().is_empty() => {
                 if scan.chunk_shuffle().is_some() {
                     return Err(crate::Error::DataInvalid {
                         message:
@@ -1271,7 +1272,7 @@ impl<'a> TableScan<'a> {
                 Ok(Self(TableScanKind::Paimon(scan)))
             }
             _ => Err(crate::Error::Unsupported {
-                message: "row-position selection requires a data-evolution table".into(),
+                message: "row-position selection only supports append tables".into(),
             }),
         }
     }
@@ -2338,14 +2339,20 @@ impl<'a> PaimonTableScan<'a> {
         let open_file_cost = core_options.source_split_open_file_cost();
         let partition_keys = self.table.schema().partition_keys();
 
-        // Assign row positions using the full candidate file ranges, before
-        // group stats, projection or DVs change visible rows. Intersect explicit
-        // and index-selected ranges only after assigning the positional range.
-        let effective_row_ranges = if let Some(selection) = self.row_position_selection() {
-            Some(selection.select(&entries, effective_row_ranges.as_deref())?)
-        } else {
-            effective_row_ranges
-        };
+        let row_position_selection = self.row_position_selection();
+        let append_row_position_selection = (!data_evolution_enabled)
+            .then_some(row_position_selection)
+            .flatten();
+        // Data-evolution positions use the union of full candidate row-id
+        // ranges, before group stats, projection or DVs change visible rows.
+        // Ordinary append positions are selected from completed splits below,
+        // after stats pruning and packing establish their physical order.
+        let effective_row_ranges =
+            if let Some(selection) = row_position_selection.filter(|_| data_evolution_enabled) {
+                Some(selection.select(&entries, effective_row_ranges.as_deref())?)
+            } else {
+                effective_row_ranges
+            };
         if effective_row_ranges.as_ref().is_some_and(Vec::is_empty) {
             if let Some(trace) = trace {
                 trace.record_final_plan(0, 0, 0);
@@ -2463,7 +2470,10 @@ impl<'a> PaimonTableScan<'a> {
             .index_file_in_data_file_dir();
 
         let mut data_file_field_ids_cache = DataFileFieldIdsCache::new();
-        let can_push_down_limit = self.can_push_down_limit_hint(effective_row_ranges.as_deref());
+        // Positional distribution precedes LIMIT. Building too few ordinary
+        // append splits here could starve a later slice or shard.
+        let can_push_down_limit = append_row_position_selection.is_none()
+            && self.can_push_down_limit_hint(effective_row_ranges.as_deref());
         let mut limit_accumulator = match self.limit {
             Some(limit) if limit > 0 && can_push_down_limit => {
                 Some(LimitPushdownAccumulator::new(limit))
@@ -2721,6 +2731,11 @@ impl<'a> PaimonTableScan<'a> {
                 let split_candidates_built = splits.len();
                 (splits, split_candidates_built, false)
             };
+        let splits = if let Some(selection) = append_row_position_selection {
+            selection.select_append_splits(splits, core_options.row_tracking_enabled())?
+        } else {
+            splits
+        };
         let splits = if let Some(config) = self.chunk_shuffle() {
             chunk_shuffle_splits(self.table, splits, config, self.shard()).await?
         } else {
@@ -3819,13 +3834,13 @@ mod tests {
     }
 
     #[test]
-    fn test_row_position_selection_rejects_unsupported_and_mixed_modes() {
+    fn test_row_position_selection_accepts_append_and_rejects_mixed_modes() {
         let append = limit_test_table();
         assert!(append
             .new_read_builder()
             .new_scan()
             .with_row_position_shard(0, 1)
-            .is_err());
+            .is_ok());
         let table = data_evolution_test_table(
             "memory:/row_position_selection_validation",
             two_column_schema(0, "id", "name"),

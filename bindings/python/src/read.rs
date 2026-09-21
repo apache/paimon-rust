@@ -533,7 +533,7 @@ impl PyTableScan {
 
 #[pymethods]
 impl PyTableScan {
-    /// Select a half-open range of Data Evolution row positions.
+    /// Select a half-open range of append-table row positions.
     fn with_row_position_slice(
         mut slf: PyRefMut<'_, Self>,
         start: u64,
@@ -546,7 +546,7 @@ impl PyTableScan {
         Ok(slf)
     }
 
-    /// Select one Data Evolution row-position shard.
+    /// Select one balanced append-table row-position shard.
     fn with_row_position_shard(
         mut slf: PyRefMut<'_, Self>,
         index: u64,
