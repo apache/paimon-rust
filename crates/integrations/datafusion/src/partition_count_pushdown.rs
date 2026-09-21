@@ -42,7 +42,7 @@
 //! ```
 //!
 //! Physical planning pins the selected snapshot, then returns a lazy
-//! [`PartitionRowCountExec`]. `EXPLAIN` does not read manifests; manifest I/O starts
+//! [`StreamingTableExec`]. `EXPLAIN` does not read manifests; manifest I/O starts
 //! when execution polls the plan.
 
 use std::collections::HashMap;
@@ -66,12 +66,9 @@ use datafusion::logical_expr::{
     col, lit, Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, TableScan, TableSource,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-};
+use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
 use futures::{stream, TryStreamExt};
 use paimon::spec::{CoreOptions, DataField, Datum, Predicate};
@@ -238,7 +235,7 @@ fn is_count_star(expr: &Expr) -> bool {
 }
 
 /// One row per live partition: its typed partition values and its real row count.
-/// Planning pins the snapshot and constructs a lazy [`PartitionRowCountExec`].
+/// Planning pins the snapshot and constructs a lazy [`StreamingTableExec`].
 struct PartitionRowCountProvider {
     table: Table,
     partition_fields: Vec<DataField>,
@@ -316,33 +313,40 @@ impl TableProvider for PartitionRowCountProvider {
                 .with_pinned_snapshot(snapshot),
             None => self.fallback_provider.clone(),
         };
-        Ok(Arc::new(PartitionRowCountExec::new(
+        let partition: Arc<dyn PartitionStream> = Arc::new(PartitionRowCountStream::new(
             self,
             table,
             provider_as_source(Arc::new(fallback_provider)),
             projection.cloned(),
             state,
+        )?);
+        Ok(Arc::new(StreamingTableExec::try_new(
+            Arc::clone(partition.schema()),
+            vec![partition],
+            None,
+            std::iter::empty(),
+            false,
+            None,
         )?))
     }
 }
 
 #[derive(Clone)]
-struct PartitionRowCountExec {
+struct PartitionRowCountStream {
     /// The snapshot selected during physical planning, or `None` for an empty table.
     table: Option<Table>,
     partition_fields: Vec<DataField>,
     predicate: Option<Predicate>,
-    schema: SchemaRef,
+    unprojected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     source: Arc<dyn TableSource>,
     table_name: TableReference,
     filters: Vec<Expr>,
     state: SessionState,
-    plan_properties: Arc<PlanProperties>,
 }
 
-impl PartitionRowCountExec {
+impl PartitionRowCountStream {
     fn new(
         provider: &PartitionRowCountProvider,
         table: Option<Table>,
@@ -351,24 +355,17 @@ impl PartitionRowCountExec {
         state: SessionState,
     ) -> DFResult<Self> {
         let output_schema = project_schema(&provider.schema, projection.as_ref())?;
-        let plan_properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&output_schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
         Ok(Self {
             table,
             partition_fields: provider.partition_fields.clone(),
             predicate: provider.predicate.clone(),
-            schema: Arc::clone(&provider.schema),
+            unprojected_schema: Arc::clone(&provider.schema),
             projection,
             output_schema,
             source,
             table_name: provider.table_name.clone(),
             filters: provider.filters.clone(),
             state,
-            plan_properties,
         })
     }
 
@@ -417,7 +414,7 @@ impl PartitionRowCountExec {
         &self,
         counts: &[paimon::table::PartitionRowCount],
     ) -> DFResult<RecordBatch> {
-        let all_columns = (0..self.schema.fields().len()).collect::<Vec<_>>();
+        let all_columns = (0..self.unprojected_schema.fields().len()).collect::<Vec<_>>();
         let projection = self.projection.as_deref().unwrap_or(&all_columns);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
         for &index in projection {
@@ -429,7 +426,7 @@ impl PartitionRowCountExec {
             }
 
             let field = &self.partition_fields[index];
-            let arrow_type = self.schema.field(index).data_type();
+            let arrow_type = self.unprojected_schema.field(index).data_type();
             let mut values = Vec::with_capacity(counts.len());
             for count in counts {
                 let datum = count
@@ -502,60 +499,28 @@ impl PartitionRowCountExec {
     }
 }
 
-impl std::fmt::Debug for PartitionRowCountExec {
+impl std::fmt::Debug for PartitionRowCountStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PartitionRowCountExec")
+        f.debug_struct("PartitionRowCountStream")
             .field("table", &self.table_name)
             .field("predicate", &self.predicate)
             .finish()
     }
 }
 
-impl DisplayAs for PartitionRowCountExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "PartitionRowCountExec: table={}", self.table_name)
-    }
-}
-
-impl ExecutionPlan for PartitionRowCountExec {
-    fn name(&self) -> &str {
-        "PartitionRowCountExec"
+impl PartitionStream for PartitionRowCountStream {
+    fn schema(&self) -> &SchemaRef {
+        &self.output_schema
     }
 
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.plan_properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return internal_err!("PartitionRowCountExec is a leaf and takes no children");
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
-        if partition != 0 {
-            return internal_err!(
-                "PartitionRowCountExec has a single partition, got partition {partition}"
-            );
-        }
-        let exec = self.clone();
-        let stream = stream::once(async move { exec.execute_stream(context).await }).try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+    fn execute(&self, context: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let partition = self.clone();
+        let stream =
+            stream::once(async move { partition.execute_stream(context).await }).try_flatten();
+        Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.output_schema),
-            Box::pin(stream),
-        )))
+            stream,
+        ))
     }
 }
 

@@ -203,7 +203,7 @@ async fn test_manifest_reads_are_deferred_until_execution() {
         .await
         .unwrap();
     let rendered = displayable(plan.as_ref()).indent(true).to_string();
-    assert!(rendered.contains("PartitionRowCountExec"), "{rendered}");
+    assert!(rendered.contains("StreamingTableExec"), "{rendered}");
     assert!(!rendered.contains("PaimonTableScan"), "{rendered}");
 
     // If planning had already read the manifests, deleting the list now would
@@ -259,6 +259,11 @@ async fn test_grouped_count_shapes() {
         rows(&ctx, filtered).await,
         vec![row("head", 2), row("tail", 2)]
     );
+
+    // A fetch-capable source must not truncate partition counts below aggregation.
+    let limited = "SELECT dt, COUNT(*) FROM paimon.test_db.t \
+                   GROUP BY dt ORDER BY dt LIMIT 1";
+    assert_eq!(rows(&ctx, limited).await, vec![row("2024-01-01", 3)]);
 
     let ungrouped = "SELECT COUNT(*) FROM paimon.test_db.t WHERE content_key = 'tail'";
     assert!(!scans_table(&ctx, ungrouped).await);
