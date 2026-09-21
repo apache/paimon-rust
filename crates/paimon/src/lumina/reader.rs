@@ -103,6 +103,57 @@ fn ensure_search_list_size(search_options: &mut HashMap<String, String>, top_k: 
     }
 }
 
+/// Merge the table's Lumina options with the options recorded in the index.
+///
+/// Java's order at the searcher-open site is the table's options first, then
+/// `indexMeta.options()` on top (`LuminaVectorGlobalIndexReader:377-378`), so the
+/// index's own geometry wins. Per-query options are layered on top of that base at
+/// each search instead, in [`search_options_for_query`], reproducing Java's
+/// base -> indexMeta -> queryOptions order (`:253-255`).
+///
+/// The order is not cosmetic: the build side deliberately rewrites some of these keys
+/// before the index is written. `validate_and_cap_pq_m` caps `encoding.pq.m` at the
+/// column's dimension, and the capped value is what the index file was actually built
+/// with. Letting the table's raw value win would open the searcher with a PQ geometry
+/// the index does not have. `LuminaSearcher::create` takes only this map -- unlike
+/// Java's `LuminaIndex.fromStream`, which is also handed `indexMeta.dim()` and
+/// `indexMeta.metric()` as separate arguments -- so here the map is the sole channel.
+///
+/// `build_lumina_options` seeds every key of `ALL_OPTIONS_DEFAULTS` into the metadata,
+/// so a Rust-built index records the build-time `diskann.search.beam_width` and
+/// `search.parallel_number` too, and those now win over a table option, as they do in
+/// Java. It also folds in any other `lumina.*` key present at build time, so what the
+/// table layer can still supply is whatever was not set when the index was built. A
+/// query overrides any of it, in [`search_options_for_query`].
+fn merge_searcher_options(
+    table_options: &HashMap<String, String>,
+    index_meta: &LuminaIndexMeta,
+) -> HashMap<String, String> {
+    let mut merged = strip_lumina_options(table_options);
+    for (key, value) in index_meta.options() {
+        merged.insert(key.clone(), value.clone());
+    }
+    merged
+}
+
+/// Layer one query's own options over the searcher's base map, last, as Java's
+/// `buildSearchOptions` does (`LuminaVectorGlobalIndexReader:253-255`).
+///
+/// Both read paths fold the per-query map into the table options before building this
+/// reader (`de_vector_read.rs`, `pk_vector_read.rs`), so without this layer the index
+/// metadata would also win over a per-query override -- and for a Rust-built index it
+/// always would, since the metadata records every `ALL_OPTIONS_DEFAULTS` key.
+fn search_options_for_query(
+    search_options_base: &HashMap<String, String>,
+    vector_search: &VectorSearch,
+) -> HashMap<String, String> {
+    let mut search_opts = search_options_base.clone();
+    for (key, value) in strip_lumina_options(&vector_search.options) {
+        search_opts.insert(key, value);
+    }
+    search_opts
+}
+
 fn convert_distance_to_score(distance: f32, metric: LuminaVectorMetric) -> f32 {
     match metric {
         LuminaVectorMetric::L2 => 1.0 / (1.0 + distance),
@@ -408,10 +459,7 @@ impl LuminaVectorGlobalIndexReader {
         let index_meta = LuminaIndexMeta::deserialize(&self.io_meta.metadata)?;
 
         let max_filter_bytes = max_filter_bytes(&self.options)?;
-        let mut searcher_options = index_meta.options().clone();
-        for (k, v) in strip_lumina_options(&self.options) {
-            searcher_options.insert(k, v);
-        }
+        let searcher_options = merge_searcher_options(&self.options, &index_meta);
 
         let mut searcher = LuminaSearcher::create(&searcher_options)?;
 
@@ -492,7 +540,7 @@ fn search_lumina<S: LuminaSearch + ?Sized>(
         let ek = std::cmp::min(effective_k, filter_id_list.len());
         let mut distances = vec![0.0f32; ek];
         let mut labels = new_label_buffer(ek);
-        let mut search_opts: HashMap<String, String> = search_options_base.clone();
+        let mut search_opts = search_options_for_query(search_options_base, vector_search);
         search_opts.insert("search.thread_safe_filter".to_string(), "true".to_string());
         ensure_search_list_size(&mut search_opts, ek);
         searcher.search_with_filter(
@@ -508,7 +556,7 @@ fn search_lumina<S: LuminaSearch + ?Sized>(
     } else {
         let mut distances = vec![0.0f32; effective_k];
         let mut labels = new_label_buffer(effective_k);
-        let mut search_opts: HashMap<String, String> = search_options_base.clone();
+        let mut search_opts = search_options_for_query(search_options_base, vector_search);
         ensure_search_list_size(&mut search_opts, effective_k);
         searcher.search(
             &vector_search.vector,
@@ -616,7 +664,9 @@ fn search_lumina_batch<S: LuminaSearch + ?Sized>(
 
     let mut distances = vec![0.0f32; vector_searches.len() * effective_k];
     let mut labels = new_label_buffer(vector_searches.len() * effective_k);
-    let mut search_opts: HashMap<String, String> = search_options_base.clone();
+    // `de_vector_read` rejects a batch whose queries disagree on options, so the first
+    // query's map speaks for the batch, exactly as its `limit` already does above.
+    let mut search_opts = search_options_for_query(search_options_base, &vector_searches[0]);
     ensure_search_list_size(&mut search_opts, effective_k);
     if let Some(filter_ids) = filter_id_list {
         search_opts.insert("search.thread_safe_filter".to_string(), "true".to_string());
@@ -795,6 +845,7 @@ mod tests {
         count_calls: AtomicUsize,
         unfiltered_calls: Mutex<Vec<(Vec<f32>, i32, i32)>>,
         filtered_calls: Mutex<Vec<FilteredSearchCall>>,
+        search_options: Mutex<Vec<HashMap<String, String>>>,
     }
 
     impl RecordingSearcher {
@@ -804,6 +855,7 @@ mod tests {
                 count_calls: AtomicUsize::new(0),
                 unfiltered_calls: Mutex::new(Vec::new()),
                 filtered_calls: Mutex::new(Vec::new()),
+                search_options: Mutex::new(Vec::new()),
             }
         }
     }
@@ -816,8 +868,12 @@ mod tests {
             k: i32,
             distances: &mut [f32],
             labels: &mut [u64],
-            _options: &HashMap<String, String>,
+            options: &HashMap<String, String>,
         ) -> crate::Result<()> {
+            self.search_options
+                .lock()
+                .expect("search options lock")
+                .push(options.clone());
             self.unfiltered_calls
                 .lock()
                 .expect("unfiltered call lock")
@@ -839,8 +895,12 @@ mod tests {
             distances: &mut [f32],
             labels: &mut [u64],
             filter_ids: &[u64],
-            _options: &HashMap<String, String>,
+            options: &HashMap<String, String>,
         ) -> crate::Result<()> {
+            self.search_options
+                .lock()
+                .expect("search options lock")
+                .push(options.clone());
             self.filtered_calls
                 .lock()
                 .expect("filtered call lock")
@@ -870,6 +930,101 @@ mod tests {
             (KEY_DIMENSION.to_string(), dim.to_string()),
             (KEY_DISTANCE_METRIC.to_string(), "l2".to_string()),
         ]))
+    }
+
+    /// Table options that disagree with the built index must not reach the searcher.
+    /// `validate_and_cap_pq_m` capped `encoding.pq.m` to the column's 32 dimensions
+    /// when the index was built, so opening it with the table's raw 64 would hand the
+    /// searcher a PQ geometry the index file does not have.
+    #[test]
+    fn test_merge_searcher_options_lets_the_index_win_over_table_options() {
+        let table_options = HashMap::from([
+            ("lumina.encoding.type".to_string(), "pq".to_string()),
+            ("lumina.encoding.pq.m".to_string(), "64".to_string()),
+            ("lumina.distance.metric".to_string(), "cosine".to_string()),
+            (
+                "lumina.diskann.search.list_size".to_string(),
+                "64".to_string(),
+            ),
+            (
+                LUMINA_SEARCH_MAX_FILTER_BYTES_OPTION.to_string(),
+                "1 mb".to_string(),
+            ),
+        ]);
+        let index_meta = LuminaIndexMeta::new(HashMap::from([
+            (KEY_DIMENSION.to_string(), "32".to_string()),
+            (KEY_DISTANCE_METRIC.to_string(), "l2".to_string()),
+            ("encoding.type".to_string(), "pq".to_string()),
+            ("encoding.pq.m".to_string(), "32".to_string()),
+        ]));
+
+        let merged = merge_searcher_options(&table_options, &index_meta);
+
+        // The index's own geometry, not the table's.
+        assert_eq!(merged.get("encoding.pq.m").map(String::as_str), Some("32"));
+        // Scores are always converted with `index_meta.metric()`, so a table metric
+        // reaching the searcher would rank by one metric and score by another.
+        assert_eq!(
+            merged.get(KEY_DISTANCE_METRIC).map(String::as_str),
+            Some("l2")
+        );
+        // A key outside `ALL_OPTIONS_DEFAULTS` that this index was not built with
+        // still comes from the table.
+        assert_eq!(
+            merged.get("diskann.search.list_size").map(String::as_str),
+            Some("64")
+        );
+        // Rust-only reader budget, never a native option.
+        assert!(!merged.contains_key("search.max-filter-bytes"));
+        assert!(merged.keys().all(|key| !key.starts_with("lumina.")));
+    }
+
+    /// Java layers per-query options last (`LuminaVectorGlobalIndexReader:253-255`).
+    /// Letting the index win over the table must not also let it win over the query,
+    /// and a Rust-built index records `diskann.search.beam_width` for every index, so
+    /// the query layer is the only one left that can still tune it.
+    #[test]
+    fn test_per_query_options_still_override_the_merged_base() {
+        let searcher = RecordingSearcher::new(10);
+        let index_meta = LuminaIndexMeta::new(HashMap::from([
+            (KEY_DIMENSION.to_string(), "2".to_string()),
+            (KEY_DISTANCE_METRIC.to_string(), "l2".to_string()),
+            ("diskann.search.beam_width".to_string(), "4".to_string()),
+        ]));
+        let table_options = HashMap::from([(
+            "lumina.diskann.search.beam_width".to_string(),
+            "8".to_string(),
+        )]);
+        let base = merge_searcher_options(&table_options, &index_meta);
+        // The table lost to the index, which is the point of `merge_searcher_options`.
+        assert_eq!(
+            base.get("diskann.search.beam_width").map(String::as_str),
+            Some("4")
+        );
+
+        let mut search = VectorSearch::new(vec![1.0, 0.0], 2, "embedding".to_string()).unwrap();
+        search.options = HashMap::from([(
+            "lumina.diskann.search.beam_width".to_string(),
+            "32".to_string(),
+        )]);
+
+        search_lumina(
+            &searcher,
+            &index_meta,
+            &base,
+            &search,
+            DEFAULT_LUMINA_SEARCH_MAX_FILTER_BYTES,
+        )
+        .expect("search should succeed");
+
+        let recorded = searcher.search_options.lock().expect("search options lock");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0]
+                .get("diskann.search.beam_width")
+                .map(String::as_str),
+            Some("32")
+        );
     }
 
     #[test]
