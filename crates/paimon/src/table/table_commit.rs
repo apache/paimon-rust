@@ -5981,12 +5981,7 @@ mod tests {
         let table_path = "memory:/test_commit_preserves_manifest_history";
         setup_dirs(&file_io, table_path).await;
 
-        let table = test_table_with_options(
-            &file_io,
-            table_path,
-            HashMap::from([("manifest.merge-min-count".to_string(), "2".to_string())]),
-        );
-        let commit = TableCommit::new(table, "test-user".to_string());
+        let commit = setup_commit(&file_io, table_path);
 
         commit
             .commit(vec![CommitMessage::new(
