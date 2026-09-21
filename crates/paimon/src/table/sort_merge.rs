@@ -955,6 +955,7 @@ pub(crate) struct SortMergeReaderBuilder {
     value_kind_index: usize,
     /// Indices of user-defined sequence field columns in input_schema (if configured).
     user_sequence_indices: Vec<usize>,
+    user_sequence_descending: bool,
     /// Indices of user value columns in input_schema (output columns).
     value_indices: Vec<usize>,
     /// Output schema (key + value columns, no system columns).
@@ -983,6 +984,7 @@ impl SortMergeReaderBuilder {
             seq_index,
             value_kind_index,
             user_sequence_indices,
+            user_sequence_descending: false,
             value_indices,
             output_schema,
             merge_function,
@@ -993,6 +995,11 @@ impl SortMergeReaderBuilder {
     #[cfg(test)]
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    pub(crate) fn with_user_sequence_descending(mut self, descending: bool) -> Self {
+        self.user_sequence_descending = descending;
         self
     }
 
@@ -1016,6 +1023,7 @@ impl SortMergeReaderBuilder {
             self.seq_index,
             self.value_kind_index,
             self.user_sequence_indices,
+            self.user_sequence_descending,
             self.value_indices,
             self.output_schema,
             self.merge_function,
@@ -1067,6 +1075,7 @@ fn sort_merge_stream(
     seq_index: usize,
     value_kind_index: usize,
     user_sequence_indices: Vec<usize>,
+    user_sequence_descending: bool,
     value_indices: Vec<usize>,
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
@@ -1164,7 +1173,11 @@ fn sort_merge_stream(
                         row_idx: cursor.offset,
                         sequence_number: cursor.sequence_number(seq_index),
                         value_kind: cursor.value_kind(value_kind_index),
-                        user_sequences: user_sequence_indices.iter().map(|&idx| cursor.user_sequence(idx)).collect(),
+                        user_sequences: user_sequence_indices.iter().map(|&idx| {
+                            cursor.user_sequence(idx).map(|value| {
+                                if user_sequence_descending { -value } else { value }
+                            })
+                        }).collect(),
                     });
                 }
 
@@ -1828,6 +1841,58 @@ mod tests {
             })
             .collect();
         assert_eq!(values, vec!["winner_a", "winner_b"]);
+    }
+
+    #[tokio::test]
+    async fn test_descending_user_sequence_keeps_nulls_first() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("ts", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int8Array::from(vec![0, 0, 0])),
+                Arc::new(Int64Array::from(vec![Some(100), Some(50), None])),
+                Arc::new(StringArray::from(vec!["high", "low", "null"])),
+            ],
+        )
+        .unwrap();
+
+        let result = SortMergeReaderBuilder::new(
+            vec![stream_from_batches(vec![batch])],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![3],
+            vec![4],
+            output_schema,
+            Box::new(DeduplicateMergeFunction),
+        )
+        .with_user_sequence_descending(true)
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(result.len(), 1);
+        let values = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.value(0), "low");
     }
 
     #[tokio::test]

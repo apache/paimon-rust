@@ -25,7 +25,9 @@ use crate::file_index::evaluator::evaluate_file_index;
 use crate::file_index::file_index_result::FileIndexResult;
 use crate::io::{FileIO, FileRead};
 use crate::spec::{
-    is_variant_extraction_row_type, DataField, DataFileMeta, DataType, Predicate, ROW_ID_FIELD_NAME,
+    is_variant_extraction_row_type, BigIntType, DataField, DataFileMeta, DataType, Predicate,
+    TinyIntType, ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
+    VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
@@ -123,6 +125,7 @@ pub(crate) struct DataFileReader {
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
     table_options: Arc<HashMap<String, String>>,
+    row_key_names: Vec<String>,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
@@ -150,6 +153,7 @@ impl DataFileReader {
             batch_size: None,
             parquet_read_budget: None,
             table_options: Arc::new(HashMap::new()),
+            row_key_names: Vec::new(),
             mosaic_prefetch: MosaicPrefetchOptions::default(),
             read_timing: None,
         }
@@ -189,6 +193,12 @@ impl DataFileReader {
         options: impl Into<Arc<HashMap<String, String>>>,
     ) -> Self {
         self.table_options = options.into();
+        self
+    }
+
+    /// KV `.row` files store prefixed sort keys and system fields before values.
+    pub(crate) fn with_row_key_names(mut self, names: Vec<String>) -> Self {
+        self.row_key_names = names;
         self
     }
 
@@ -483,6 +493,7 @@ impl DataFileReader {
         let blob_parallelism = self.blob_parallelism;
         let parquet_read_budget = self.parquet_read_budget.clone();
         let table_options = Arc::clone(&self.table_options);
+        let row_key_names = self.row_key_names.clone();
         let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
 
@@ -501,7 +512,11 @@ impl DataFileReader {
                 .collect()
         };
         let format_read_fields = if is_row_file {
-            file_fields.clone()
+            row_format_read_fields(
+                &file_fields,
+                file_meta.write_cols.as_deref(),
+                &row_key_names,
+            )?
         } else {
             projected_read_fields
         };
@@ -777,6 +792,7 @@ impl DataFileReader {
         let blob_parallelism = self.blob_parallelism;
         let parquet_read_budget = self.parquet_read_budget.clone();
         let table_options = Arc::clone(&self.table_options);
+        let row_key_names = self.row_key_names.clone();
         let mosaic_prefetch = self.mosaic_prefetch;
 
         let target_schema = build_target_arrow_schema(&read_type)?;
@@ -794,7 +810,11 @@ impl DataFileReader {
                 .collect()
         };
         let format_read_fields = if is_row_file {
-            file_fields.clone()
+            row_format_read_fields(
+                &file_fields,
+                file_meta.write_cols.as_deref(),
+                &row_key_names,
+            )?
         } else {
             projected_read_fields
         };
@@ -1039,6 +1059,60 @@ fn prune_data_type(read_type: &DataType, data_type: &DataType) -> crate::Result<
 fn data_field_with_type(field: &DataField, data_type: DataType) -> DataField {
     DataField::new(field.id(), field.name().to_string(), data_type)
         .with_description(field.description().map(ToString::to_string))
+}
+
+fn row_format_read_fields(
+    file_fields: &[DataField],
+    write_cols: Option<&[String]>,
+    row_key_names: &[String],
+) -> crate::Result<Vec<DataField>> {
+    if let Some(write_cols) = write_cols {
+        return write_cols
+            .iter()
+            .map(|name| {
+                file_fields
+                    .iter()
+                    .find(|field| field.name() == name)
+                    .cloned()
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: format!(
+                            ".row write column '{name}' is absent from the file schema"
+                        ),
+                        source: None,
+                    })
+            })
+            .collect();
+    }
+    if row_key_names.is_empty() {
+        return Ok(file_fields.to_vec());
+    }
+    let mut physical = Vec::with_capacity(row_key_names.len() + 2 + file_fields.len());
+    for name in row_key_names {
+        let field = file_fields
+            .iter()
+            .find(|field| field.name() == name)
+            .ok_or_else(|| Error::DataInvalid {
+                message: format!("KV .row key field '{name}' is absent from the file schema"),
+                source: None,
+            })?;
+        physical.push(DataField::new(
+            field.id() + 1_000_000,
+            format!("_KEY_{name}"),
+            field.data_type().clone(),
+        ));
+    }
+    physical.push(DataField::new(
+        SEQUENCE_NUMBER_FIELD_ID,
+        SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+        DataType::BigInt(BigIntType::new()),
+    ));
+    physical.push(DataField::new(
+        VALUE_KIND_FIELD_ID,
+        VALUE_KIND_FIELD_NAME.to_string(),
+        DataType::TinyInt(TinyIntType::new()),
+    ));
+    physical.extend_from_slice(file_fields);
+    Ok(physical)
 }
 
 fn is_row_file(file_meta: &DataFileMeta) -> bool {
@@ -1376,6 +1450,26 @@ mod row_tests {
 
     fn field(id: i32, name: &str, data_type: DataType) -> DataField {
         DataField::new(id, name.to_string(), data_type)
+    }
+
+    #[test]
+    fn kv_row_physical_schema_includes_sort_keys_and_system_fields() {
+        let fields = vec![
+            field(1, "id", DataType::Int(IntType::new())),
+            field(2, "value", DataType::Int(IntType::new())),
+        ];
+        let physical = row_format_read_fields(&fields, None, &["id".to_string()]).unwrap();
+        assert_eq!(
+            physical.iter().map(DataField::name).collect::<Vec<_>>(),
+            vec!["_KEY_id", "_SEQUENCE_NUMBER", "_VALUE_KIND", "id", "value"]
+        );
+        assert_eq!(physical[0].id(), 1_000_001);
+        assert_eq!(physical[3].id(), fields[0].id());
+        let partial = row_format_read_fields(&fields, Some(&["value".to_string()]), &[]).unwrap();
+        assert_eq!(
+            partial.iter().map(DataField::name).collect::<Vec<_>>(),
+            vec!["value"]
+        );
     }
 
     fn data_file(file_name: &str, file_size: i64, row_count: i64, schema_id: i64) -> DataFileMeta {

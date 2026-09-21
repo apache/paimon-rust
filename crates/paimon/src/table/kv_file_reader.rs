@@ -72,7 +72,10 @@ pub(crate) struct KeyValueReadConfig {
     pub table_fields: Vec<DataField>,
     pub read_type: Vec<DataField>,
     pub predicates: Vec<Predicate>,
+    /// Physical key fields exclude partition columns for sort-merge.
     pub primary_keys: Vec<String>,
+    /// Full table keys also protect partition-PK fields from aggregation.
+    pub table_primary_keys: Vec<String>,
     pub merge_engine: MergeEngine,
     pub sequence_fields: Vec<String>,
     pub read_batch_size: usize,
@@ -307,7 +310,7 @@ impl KeyValueFileReader {
                 &config.table_options,
                 &config.table_name,
                 merge_output_fields,
-                &config.primary_keys,
+                &config.table_primary_keys,
                 &config.sequence_fields,
             )?)),
         }
@@ -593,6 +596,7 @@ impl KeyValueFileReader {
                         .with_batch_size(Some(config.read_batch_size))
                         .with_parquet_read_budget(group_parquet_read_budget.clone())
                         .with_table_options(config.table_options.clone())
+                        .with_row_key_names(config.primary_keys.clone())
                         .with_mosaic_prefetch(config.mosaic_prefetch);
                         let run_schema_manager = config.schema_manager.clone();
                         let run_file_io = file_io.clone();
@@ -657,6 +661,10 @@ impl KeyValueFileReader {
                         value_indices.clone(),
                         merge_output_schema.clone(),
                         merge_function(&config, &merge_output_fields)?,
+                    )
+                    .with_user_sequence_descending(
+                        !CoreOptions::new(&config.table_options)
+                            .sequence_field_sort_order_is_ascending(),
                     )
                     .build()?;
 
@@ -1477,6 +1485,7 @@ mod tests {
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
                 primary_keys: table.schema().trimmed_primary_keys(),
+                table_primary_keys: table.schema().primary_keys().to_vec(),
                 merge_engine: core_options.merge_engine().unwrap(),
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
@@ -1597,6 +1606,7 @@ mod tests {
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
                 primary_keys: table.schema().trimmed_primary_keys(),
+                table_primary_keys: table.schema().primary_keys().to_vec(),
                 merge_engine: core_options.merge_engine().unwrap(),
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
@@ -1801,6 +1811,7 @@ mod tests {
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
                 primary_keys: table.schema().trimmed_primary_keys(),
+                table_primary_keys: table.schema().primary_keys().to_vec(),
                 merge_engine: core_options.merge_engine().unwrap(),
                 sequence_fields: core_options
                     .sequence_fields()
@@ -1877,6 +1888,7 @@ mod tests {
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
                 primary_keys: table.schema().trimmed_primary_keys(),
+                table_primary_keys: table.schema().primary_keys().to_vec(),
                 merge_engine: core_options.merge_engine().unwrap(),
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
@@ -2070,6 +2082,7 @@ mod tests {
                     read_type: table.schema().fields().to_vec(),
                     predicates: Vec::new(),
                     primary_keys: table.schema().trimmed_primary_keys(),
+                    table_primary_keys: table.schema().primary_keys().to_vec(),
                     merge_engine: core_options.merge_engine().unwrap(),
                     sequence_fields: Vec::new(),
                     read_batch_size: core_options.read_batch_size().unwrap(),
@@ -2138,6 +2151,7 @@ mod tests {
                 read_type: table.schema().fields().to_vec(),
                 predicates: Vec::new(),
                 primary_keys: table.schema().trimmed_primary_keys(),
+                table_primary_keys: table.schema().primary_keys().to_vec(),
                 merge_engine: core_options.merge_engine().unwrap(),
                 sequence_fields: Vec::new(),
                 read_batch_size: core_options.read_batch_size().unwrap(),
