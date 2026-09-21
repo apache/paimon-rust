@@ -26,6 +26,7 @@ use crate::spec::index_manifest::IndexManifestEntry;
 use crate::spec::manifest_common::FileKind;
 use crate::spec::{DeletionVectorMeta, GlobalIndexMeta, IndexFileMeta};
 use indexmap::IndexMap;
+use std::collections::HashMap;
 
 impl AvroRecordDecode for IndexManifestEntry {
     fn decode(cursor: &mut AvroCursor, writer_schema: &WriterSchema) -> crate::Result<Self> {
@@ -96,13 +97,15 @@ impl AvroRecordDecode for IndexManifestEntry {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub(crate) struct SlimIndexManifestEntry<'a> {
     pub kind: FileKind,
     pub partition: &'a [u8],
+    pub bucket: i32,
     pub index_type: &'a str,
-    /// `None` means no ranges field; `Some(None)` means a missing cardinality.
-    pub deletion_vector_cardinality: Option<Option<i128>>,
+    /// File-name mappings, with `None` for an unknown cardinality. Later mappings
+    /// replace earlier ones, just as in the full index-manifest decoder.
+    pub deletion_vector_cardinalities: HashMap<&'a str, Option<i64>>,
 }
 
 const EMPTY_PARTITION: &[u8] = &[0, 0, 0, 0];
@@ -122,8 +125,9 @@ pub(crate) fn decode_slim_index_manifest_entry<'a>(
     let mut entry = SlimIndexManifestEntry {
         kind: FileKind::Add,
         partition: EMPTY_PARTITION,
+        bucket: 0,
         index_type: "",
-        deletion_vector_cardinality: None,
+        deletion_vector_cardinalities: HashMap::new(),
     };
     for field in &writer_schema.fields {
         match field.name.as_str() {
@@ -147,14 +151,15 @@ pub(crate) fn decode_slim_index_manifest_entry<'a>(
                     }
                 }
             }
+            "_BUCKET" => entry.bucket = read_int_field(cursor, field.nullable)?,
             "_INDEX_TYPE" => {
                 if !field.nullable || cursor.read_union_index()? != 0 {
                     entry.index_type = cursor.read_string()?;
                 }
             }
             "_DELETIONS_VECTORS_RANGES" | "_DELETION_VECTORS_RANGES" => {
-                entry.deletion_vector_cardinality =
-                    decode_nullable_dv_cardinality(cursor, field.nullable, &field.schema)?;
+                entry.deletion_vector_cardinalities =
+                    decode_nullable_dv_cardinalities(cursor, field.nullable, &field.schema)?;
             }
             _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
         }
@@ -162,13 +167,13 @@ pub(crate) fn decode_slim_index_manifest_entry<'a>(
     Ok(entry)
 }
 
-fn decode_nullable_dv_cardinality(
-    cursor: &mut AvroCursor<'_>,
+fn decode_nullable_dv_cardinalities<'a>(
+    cursor: &mut AvroCursor<'a>,
     nullable: bool,
     schema: &FieldSchema,
-) -> crate::Result<Option<Option<i128>>> {
+) -> crate::Result<HashMap<&'a str, Option<i64>>> {
     if nullable && cursor.read_union_index()? == 0 {
-        return Ok(None);
+        return Ok(HashMap::new());
     }
     let FieldSchema::Array(item_schema) = schema else {
         return Err(crate::Error::UnexpectedError {
@@ -176,7 +181,7 @@ fn decode_nullable_dv_cardinality(
             source: None,
         });
     };
-    let mut total = Some(0i128);
+    let mut cardinalities = HashMap::new();
     loop {
         let count = cursor.read_long()?;
         if count == 0 {
@@ -210,25 +215,27 @@ fn decode_nullable_dv_cardinality(
                     source: None,
                 });
             };
+            let mut file_name = "";
             let mut cardinality = None;
             for field in &record.fields {
-                if field.name == "_CARDINALITY" {
-                    if !field.nullable || cursor.read_union_index()? != 0 {
-                        cardinality = Some(cursor.read_long()?);
+                match field.name.as_str() {
+                    "f0" => {
+                        if !field.nullable || cursor.read_union_index()? != 0 {
+                            file_name = cursor.read_string()?;
+                        }
                     }
-                } else {
-                    skip_nullable_field(cursor, &field.schema, field.nullable)?;
+                    "_CARDINALITY" => {
+                        if !field.nullable || cursor.read_union_index()? != 0 {
+                            cardinality = Some(cursor.read_long()?);
+                        }
+                    }
+                    _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
                 }
             }
-            total = match (total, cardinality) {
-                (Some(total), Some(cardinality)) if cardinality >= 0 => {
-                    total.checked_add(i128::from(cardinality))
-                }
-                _ => None,
-            };
+            cardinalities.insert(file_name, cardinality.filter(|value| *value >= 0));
         }
     }
-    Ok(Some(total))
+    Ok(cardinalities)
 }
 
 fn decode_nullable_dv_ranges(

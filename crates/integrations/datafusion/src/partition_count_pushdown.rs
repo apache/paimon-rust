@@ -135,6 +135,10 @@ fn rewrite_aggregate(aggregate: &Aggregate) -> DFResult<Option<LogicalPlan>> {
     }
 
     let partition_keys = table_schema.partition_keys();
+    // The synthetic scan must not contain duplicate qualified field names.
+    if partition_keys.iter().any(|name| name == ROW_COUNT_COLUMN) {
+        return Ok(None);
+    }
     let groups_by_partition_columns = aggregate
         .group_expr
         .iter()
@@ -372,21 +376,23 @@ impl PartitionRowCountExec {
         &self,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let mut counts = match self.table.clone() {
+        let counts = match self.table.clone() {
             Some(table) => {
                 let predicate = self.predicate.clone();
                 crate::runtime::await_with_runtime(async move {
-                    table.partition_row_counts_with_filter(predicate).await
+                    table
+                        .exact_partition_row_counts_with_filter(predicate)
+                        .await
                 })
                 .await
                 .map_err(to_datafusion_error)?
             }
-            None => Vec::new(),
+            None => Some(Vec::new()),
         };
 
-        // A deletion vector without a recorded cardinality leaves a partition's
-        // count unknown to the manifests; only reading can answer then.
-        if counts.iter().any(|count| count.record_count.is_none()) {
+        // Unknown DV cardinalities stop the metadata path before data manifests
+        // are aggregated. Keep the fallback pinned to the same snapshot.
+        let Some(mut counts) = counts else {
             let plan = crate::runtime::await_with_runtime(self.scan_by_reading()).await?;
             if plan.schema() != self.output_schema {
                 return internal_err!(
@@ -396,7 +402,7 @@ impl PartitionRowCountExec {
                 );
             }
             return datafusion::physical_plan::execute_stream(plan, context);
-        }
+        };
 
         // A partition with no surviving rows must not create a GROUP BY key.
         counts.retain(|count| count.record_count != Some(0));

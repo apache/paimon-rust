@@ -503,3 +503,252 @@ async fn test_ungrouped_count_on_unpartitioned_and_empty_tables() {
     exec(&ctx, "INSERT INTO paimon.test_db.flat VALUES (3)").await;
     assert_eq!(rows(&ctx, sql).await, vec![row("", 3)]);
 }
+
+async fn setup_deletion_vectors(
+    second_partition: &str,
+) -> (TempDir, Arc<FileSystemCatalog>, SQLContext) {
+    let fixture = setup().await;
+    let ctx = &fixture.2;
+    exec(
+        ctx,
+        "CREATE TABLE paimon.test_db.dv (id INT NOT NULL, dt STRING) \
+        PARTITIONED BY (dt) WITH ('row-tracking.enabled'='true', \
+        'data-evolution.enabled'='true', 'deletion-vectors.enabled'='true')",
+    )
+    .await;
+    exec(
+        ctx,
+        "INSERT INTO paimon.test_db.dv (id, dt) VALUES (1, 'known'), (2, 'known')",
+    )
+    .await;
+    exec(ctx, &format!("INSERT INTO paimon.test_db.dv (id, dt) VALUES (3, '{second_partition}'), (4, '{second_partition}')")).await;
+    exec(
+        ctx,
+        "CREATE TEMPORARY TABLE paimon.test_db.del AS SELECT 3 AS id",
+    )
+    .await;
+    exec(
+        ctx,
+        "MERGE INTO paimon.test_db.dv t USING paimon.test_db.del s \
+        ON t.id = s.id WHEN MATCHED THEN DELETE",
+    )
+    .await;
+    fixture
+}
+
+#[tokio::test]
+async fn test_removed_file_deletion_vector_does_not_reduce_count() {
+    let (_tmp, catalog, ctx) = setup_deletion_vectors("known").await;
+    let sql = "SELECT dt, COUNT(*) FROM paimon.test_db.dv GROUP BY dt";
+    let oracle = "SELECT dt, COUNT(id) FROM paimon.test_db.dv GROUP BY dt";
+    assert_eq!(rows(&ctx, sql).await, vec![row("known", 3)]);
+    assert_eq!(rows(&ctx, oracle).await, vec![row("known", 3)]);
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "dv"))
+        .await
+        .unwrap();
+    let snapshots = SnapshotManager::new(table.file_io().clone(), table.location().to_owned());
+    let snapshot = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    let entries = IndexManifest::read(
+        table.file_io(),
+        &snapshots.manifest_path(snapshot.index_manifest().unwrap()),
+    )
+    .await
+    .unwrap();
+    let entry = entries
+        .iter()
+        .find(|entry| entry.index_file.deletion_vectors_ranges.is_some())
+        .unwrap();
+    let ranges = entry.index_file.deletion_vectors_ranges.as_ref().unwrap();
+    assert_eq!(ranges.len(), 1);
+    let (removed_name, vector) = ranges.iter().next().unwrap();
+    assert_eq!(vector.cardinality, Some(1));
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let removed = plan
+        .splits()
+        .iter()
+        .flat_map(|s| s.data_files())
+        .find(|f| &f.file_name == removed_name)
+        .unwrap()
+        .clone();
+    assert_eq!(removed.row_count, 2);
+
+    // The public commit API can remove a data file while retaining its DV index.
+    let mut message =
+        paimon::table::CommitMessage::new(entry.partition.clone(), entry.bucket, vec![]);
+    message.deleted_files.push(removed);
+    table
+        .new_write_builder()
+        .new_commit()
+        .commit(vec![message])
+        .await
+        .unwrap();
+    let after = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    assert_eq!(after.index_manifest(), snapshot.index_manifest());
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    assert!(plan
+        .splits()
+        .iter()
+        .flat_map(|s| s.data_files())
+        .all(|f| &f.file_name != removed_name));
+    assert!(scans_table(&ctx, oracle).await);
+    assert!(!scans_table(&ctx, sql).await);
+    let expected = rows(&ctx, oracle).await;
+    assert_eq!(expected, vec![row("known", 2)]);
+    assert_eq!(rows(&ctx, sql).await, expected);
+    let counts = table.partition_row_counts().await.unwrap();
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0].record_count, Some(2));
+}
+
+#[tokio::test]
+async fn test_internal_count_column_name_collision_skips_rewrite() {
+    let (_tmp, _catalog, ctx) = setup().await;
+    exec(&ctx, "CREATE TABLE paimon.test_db.collision (id INT NOT NULL, __paimon_partition_row_count STRING) PARTITIONED BY (__paimon_partition_row_count)").await;
+    exec(&ctx, "INSERT INTO paimon.test_db.collision VALUES (1, 'p')").await;
+    // The existing ungrouped-count optimization is still allowed to run.
+    let sql = "SELECT COUNT(*) FROM paimon.test_db.collision";
+    assert_eq!(rows(&ctx, sql).await, vec![row("", 1)]);
+    let grouped = "SELECT __paimon_partition_row_count, COUNT(*) \
+        FROM paimon.test_db.collision GROUP BY __paimon_partition_row_count";
+    assert!(scans_table(&ctx, grouped).await);
+    assert_eq!(rows(&ctx, grouped).await, vec![row("p", 1)]);
+}
+
+#[derive(Debug, Default)]
+struct ReadTrace(std::sync::Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl paimon::io::FileBlockCache for ReadTrace {
+    async fn get(&self, _: &str, _: std::ops::Range<u64>) -> Option<bytes::Bytes> {
+        None
+    }
+    async fn put(&self, path: &str, _: u64, _: bytes::Bytes) {
+        // Always miss: a put records one block actually fetched from the backend.
+        self.0.lock().unwrap().push(path.to_owned());
+    }
+    async fn invalidate_path(&self, _: &str) {}
+    async fn invalidate_prefix(&self, _: &str) {}
+}
+
+#[tokio::test]
+async fn test_unknown_cardinality_falls_back_before_data_manifests() {
+    let (_tmp, catalog, _fixture_ctx) = setup_deletion_vectors("unknown").await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "dv"))
+        .await
+        .unwrap();
+    let snapshots = SnapshotManager::new(table.file_io().clone(), table.location().to_owned());
+    let snapshot = snapshots.get_latest_snapshot().await.unwrap().unwrap();
+    let index_path = snapshots.manifest_path(snapshot.index_manifest().unwrap());
+    let mut entries = IndexManifest::read(table.file_io(), &index_path)
+        .await
+        .unwrap();
+    let mut erased = 0;
+    for vector in entries
+        .iter_mut()
+        .flat_map(|entry| entry.index_file.deletion_vectors_ranges.iter_mut())
+        .flat_map(|ranges| ranges.values_mut())
+    {
+        vector.cardinality = None;
+        erased += 1;
+    }
+    assert_eq!(erased, 1);
+    table.file_io().delete_file(&index_path).await.unwrap();
+    IndexManifest::write(table.file_io(), &index_path, &entries)
+        .await
+        .unwrap();
+    // The existing API still returns all partitions, including partial counts.
+    let counts = table.partition_row_counts().await.unwrap();
+    assert_eq!(counts.len(), 2);
+    assert_eq!(
+        counts.iter().filter(|c| c.record_count == Some(2)).count(),
+        1
+    );
+    assert_eq!(
+        counts.iter().filter(|c| c.record_count.is_none()).count(),
+        1
+    );
+
+    let mut manifests = Vec::new();
+    for list in [
+        snapshot.base_manifest_list(),
+        snapshot.delta_manifest_list(),
+    ] {
+        manifests.extend(
+            paimon::spec::ManifestList::read(table.file_io(), &snapshots.manifest_path(list))
+                .await
+                .unwrap(),
+        );
+    }
+    let trace = Arc::new(ReadTrace::default());
+    let observed = paimon::Table::new(
+        table
+            .file_io()
+            .clone()
+            .with_file_block_cache(trace.clone(), 1024 * 1024, "meta,data")
+            .unwrap(),
+        table.identifier().clone(),
+        table.location().to_owned(),
+        table.schema().clone(),
+        None,
+    );
+    assert!(observed
+        .exact_partition_row_counts_with_filter(None)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(trace.0.lock().unwrap().iter().all(|path| !manifests
+        .iter()
+        .any(|meta| path.ends_with(meta.file_name()))));
+
+    let ctx = SQLContext::new();
+    ctx.ctx()
+        .register_table(
+            "observed",
+            Arc::new(paimon_datafusion::PaimonTableProvider::try_new(observed).unwrap()),
+        )
+        .unwrap();
+    let oracle = "SELECT dt, COUNT(id) FROM observed GROUP BY dt";
+    let sql = "SELECT dt, COUNT(*) FROM observed GROUP BY dt";
+    assert!(scans_table(&ctx, oracle).await);
+    assert!(!scans_table(&ctx, sql).await);
+    trace.0.lock().unwrap().clear();
+    let expected = rows(&ctx, oracle).await;
+    assert_eq!(expected, vec![row("known", 2), row("unknown", 1)]);
+    let ordinary_reads = std::mem::take(&mut *trace.0.lock().unwrap());
+    assert_eq!(rows(&ctx, sql).await, expected);
+    let optimized_reads = std::mem::take(&mut *trace.0.lock().unwrap());
+    for manifest in manifests {
+        let ordinary = ordinary_reads
+            .iter()
+            .filter(|path| path.ends_with(manifest.file_name()))
+            .count();
+        let optimized = optimized_reads
+            .iter()
+            .filter(|path| path.ends_with(manifest.file_name()))
+            .count();
+        assert_eq!(ordinary, 1);
+        assert_eq!(
+            optimized, ordinary,
+            "fallback must not aggregate data manifests first"
+        );
+    }
+
+    // An unknown DV outside the selected partitions must not force a fallback.
+    assert_eq!(
+        rows(
+            &ctx,
+            "SELECT dt, COUNT(*) FROM observed WHERE dt = 'known' GROUP BY dt"
+        )
+        .await,
+        vec![row("known", 2)]
+    );
+    assert!(trace
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|path| !path.ends_with(".parquet")));
+}

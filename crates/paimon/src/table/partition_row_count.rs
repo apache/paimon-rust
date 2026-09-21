@@ -31,9 +31,10 @@
 //!   contain deletes, the same semantics as the scan's manifest merge.
 //!
 //! Peak memory is bounded by partitions, live DELETE entries, up to one million
-//! retained ADD identities, disjoint row-id ranges, and in-flight manifest buffers
-//! rather than all live file metadata and column statistics. Highly fragmented
-//! row-id space or large embedded indexes may still increase retained state.
+//! retained ADD identities, deletion-vector mappings, disjoint row-id ranges, and
+//! in-flight manifest buffers rather than all live file metadata and column
+//! statistics. Highly fragmented row-id space or large embedded indexes may still
+//! increase retained state.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -135,6 +136,7 @@ struct PartitionAccum {
     plain_rows: i128,
     /// Row-id ranges of files with a `first_row_id`.
     row_ranges: RowRangeSet,
+    deleted_rows: i128,
     row_count_unknown: bool,
 }
 
@@ -167,20 +169,48 @@ impl PartitionAccum {
     fn merge(&mut self, other: PartitionAccum) {
         self.plain_rows += other.plain_rows;
         self.row_ranges.merge(other.row_ranges);
+        self.deleted_rows += other.deleted_rows;
         self.row_count_unknown |= other.row_count_unknown;
     }
 
-    fn record_count(&self, deleted: Option<Option<i128>>) -> Option<i64> {
+    fn record_count(&self) -> Option<i64> {
         if self.row_count_unknown {
             return None;
         }
-        let deleted = deleted.unwrap_or(Some(0))?;
-        let rows = self.plain_rows + self.row_ranges.total() - deleted;
+        let rows = self.plain_rows + self.row_ranges.total() - self.deleted_rows;
         (rows >= 0).then(|| i64::try_from(rows).ok()).flatten()
     }
 }
 
 type PartitionAccums = HashMap<Vec<u8>, PartitionAccum>;
+
+/// Only DV mappings are retained, not metadata for every live data file.
+/// Matches the scan's (partition, bucket, file name) lookup and last-write wins.
+#[derive(Debug, Default)]
+struct DeletionVectors {
+    by_partition: HashMap<Box<[u8]>, DeletionVectorFiles>,
+}
+
+type DeletionVectorFiles = HashMap<i32, HashMap<Box<str>, Option<i64>>>;
+
+impl DeletionVectors {
+    fn cardinality(&self, partition: &[u8], bucket: i32, file_name: &str) -> Option<i64> {
+        self.by_partition
+            .get(partition)
+            .and_then(|buckets| buckets.get(&bucket))
+            .and_then(|files| files.get(file_name))
+            .copied()
+            .unwrap_or(Some(0))
+    }
+
+    fn has_unknown(&self) -> bool {
+        self.by_partition
+            .values()
+            .flat_map(HashMap::values)
+            .flat_map(HashMap::values)
+            .any(Option::is_none)
+    }
+}
 
 fn accumulate(
     accums: &mut PartitionAccums,
@@ -188,12 +218,17 @@ fn accumulate(
     row_count: i64,
     first_row_id: Option<i64>,
     data_evolution_enabled: bool,
+    deleted_rows: Option<i64>,
 ) {
     let accum = match accums.get_mut(partition) {
         Some(accum) => accum,
         None => accums.entry(partition.to_vec()).or_default(),
     };
     accum.add_file(row_count, first_row_id, data_evolution_enabled);
+    match deleted_rows {
+        Some(rows) => accum.deleted_rows += i128::from(rows),
+        None => accum.row_count_unknown = true,
+    }
 }
 
 /// Identifiers of deleted files, matching the full Paimon `Identifier` semantics.
@@ -407,6 +442,7 @@ fn aggregate_manifest(
     deletes: Option<&DeleteSet>,
     filter: Option<&PartitionFilter>,
     data_evolution_enabled: bool,
+    deletion_vectors: &DeletionVectors,
 ) -> crate::Result<PartitionAccums> {
     let mut matcher = PartitionMatcher::new(filter);
     let mut accums = PartitionAccums::new();
@@ -421,6 +457,7 @@ fn aggregate_manifest(
                 entry.row_count,
                 entry.first_row_id,
                 data_evolution_enabled,
+                deletion_vectors.cardinality(entry.partition, entry.bucket, entry.file_name),
             );
         }
         Ok(())
@@ -480,6 +517,7 @@ async fn aggregate_manifests(
     filter: Option<Arc<PartitionFilter>>,
     data_evolution_enabled: bool,
     retained_add_budget: i64,
+    deletion_vectors: Arc<DeletionVectors>,
 ) -> crate::Result<BTreeMap<Vec<u8>, PartitionAccum>> {
     let cache = SharedSchemaCache::new();
     let (with_deletes, mut second_pass): (Vec<_>, Vec<_>) = manifests
@@ -519,6 +557,7 @@ async fn aggregate_manifests(
                 add.row_count,
                 add.first_row_id,
                 data_evolution_enabled,
+                deletion_vectors.cardinality(&add.partition, add.identity.bucket, &add.file_name),
             );
         }
     }
@@ -539,6 +578,7 @@ async fn aggregate_manifests(
                 deletes.as_deref(),
                 filter.as_deref(),
                 data_evolution_enabled,
+                &deletion_vectors,
             )
         },
     ));
@@ -551,35 +591,37 @@ async fn aggregate_manifests(
     Ok(totals)
 }
 
-/// Deleted rows per matching partition from deletion vectors; `None` when some
-/// vector does not record its cardinality.
-async fn deleted_rows_by_partition(
+/// Load matching DV mappings before visiting data files, so only live files
+/// contribute deletions and exact-only callers can stop on unknown cardinalities.
+async fn read_deletion_vectors(
     file_io: &FileIO,
     index_manifest_path: &str,
     filter: Option<Arc<PartitionFilter>>,
-) -> crate::Result<HashMap<Vec<u8>, Option<i128>>> {
+) -> crate::Result<DeletionVectors> {
     let bytes = file_io.new_input(index_manifest_path)?.read().await?;
     tokio::task::spawn_blocking(move || {
         let mut matcher = PartitionMatcher::new(filter.as_deref());
-        let mut deleted: HashMap<Vec<u8>, Option<i128>> = HashMap::new();
+        let mut deleted = DeletionVectors::default();
         visit_slim_index_manifest_entries(&bytes, &SharedSchemaCache::new(), &mut |entry| {
             if entry.kind != FileKind::Add
                 || entry.index_type != DELETION_VECTORS_INDEX_TYPE
                 || !matcher.matches(entry.partition)?
+                || entry.deletion_vector_cardinalities.is_empty()
             {
                 return Ok(());
             }
-            let Some(cardinality) = entry.deletion_vector_cardinality else {
-                return Ok(());
-            };
-            let slot = match deleted.get_mut(entry.partition) {
-                Some(slot) => slot,
-                None => deleted.entry(entry.partition.to_vec()).or_insert(Some(0)),
-            };
-            *slot = match (*slot, cardinality) {
-                (Some(total), Some(cardinality)) => total.checked_add(cardinality),
-                _ => None,
-            };
+            let files = deleted
+                .by_partition
+                .entry(Box::from(entry.partition))
+                .or_default()
+                .entry(entry.bucket)
+                .or_default();
+            files.extend(
+                entry
+                    .deletion_vector_cardinalities
+                    .into_iter()
+                    .map(|(name, cardinality)| (Box::from(name), cardinality)),
+            );
             Ok(())
         })?;
         Ok(deleted)
@@ -617,8 +659,9 @@ impl Table {
     ///
     /// Reads manifests only — never data files — without retaining every live
     /// file or its column statistics. Memory is bounded by partitions, live
-    /// DELETE entries, up to one million retained ADD identities, disjoint
-    /// data-evolution row-id ranges, and in-flight manifest buffers.
+    /// DELETE entries, up to one million retained ADD identities, deletion-vector
+    /// mappings, disjoint data-evolution row-id ranges, and in-flight manifest
+    /// buffers.
     /// Data-evolution files sharing a row-id range contribute once. Results are
     /// ordered by serialized partition bytes.
     ///
@@ -636,6 +679,29 @@ impl Table {
         &self,
         filter: Option<Predicate>,
     ) -> crate::Result<Vec<PartitionRowCount>> {
+        Ok(self
+            .read_partition_row_counts(filter, false)
+            .await?
+            .expect("partial partition counts never stop early"))
+    }
+
+    /// Exact-only variant of [`Table::partition_row_counts_with_filter`].
+    /// Returns `None` when metadata cannot establish all counts. Unknown DV
+    /// cardinalities are checked before fetching data manifests, allowing callers
+    /// to fall back without first doing a full metadata aggregation. This may
+    /// conservatively return `None` for an unknown DV on a no-longer-live file.
+    pub async fn exact_partition_row_counts_with_filter(
+        &self,
+        filter: Option<Predicate>,
+    ) -> crate::Result<Option<Vec<PartitionRowCount>>> {
+        self.read_partition_row_counts(filter, true).await
+    }
+
+    async fn read_partition_row_counts(
+        &self,
+        filter: Option<Predicate>,
+        require_exact: bool,
+    ) -> crate::Result<Option<Vec<PartitionRowCount>>> {
         let schema = self.schema();
         let core = CoreOptions::new(schema.options());
         // Manifests carry partition values.
@@ -643,18 +709,10 @@ impl Table {
 
         let file_io = self.file_io();
         let Some(snapshot) = super::time_travel::resolve_snapshot(self).await? else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
 
         let manifest_sm = self.snapshot_manager();
-        let base_path = manifest_sm.manifest_path(snapshot.base_manifest_list());
-        let delta_path = manifest_sm.manifest_path(snapshot.delta_manifest_list());
-        let (mut manifests, delta) = futures::try_join!(
-            ManifestList::read(file_io, &base_path),
-            ManifestList::read(file_io, &delta_path),
-        )?;
-        manifests.extend(delta);
-
         let partition_fields = schema.partition_fields();
         let partition_filter = match filter {
             None => None,
@@ -670,41 +728,58 @@ impl Table {
                     .map(|predicate| PartitionFilter::from_predicate(predicate, &partition_fields))
             }
         };
+        let partition_filter = partition_filter.map(Arc::new);
+        let deletion_vectors = match snapshot.index_manifest() {
+            Some(index_manifest) if core.deletion_vectors_enabled() => {
+                read_deletion_vectors(
+                    file_io,
+                    &manifest_sm.manifest_path(index_manifest),
+                    partition_filter.clone(),
+                )
+                .await?
+            }
+            _ => DeletionVectors::default(),
+        };
+        // ponytail: unknown stale DVs can also fall back; check liveness first
+        // only if these conservative fallbacks become a measured bottleneck.
+        if require_exact && deletion_vectors.has_unknown() {
+            return Ok(None);
+        }
+
+        let base_path = manifest_sm.manifest_path(snapshot.base_manifest_list());
+        let delta_path = manifest_sm.manifest_path(snapshot.delta_manifest_list());
+        let (mut manifests, delta) = futures::try_join!(
+            ManifestList::read(file_io, &base_path),
+            ManifestList::read(file_io, &delta_path),
+        )?;
+        manifests.extend(delta);
         if let Some(filter) = &partition_filter {
             retain_matching_manifests(&mut manifests, filter, &partition_fields);
         }
 
-        let partition_filter = partition_filter.map(Arc::new);
         let totals = aggregate_manifests(
             file_io,
             &manifest_sm.manifest_dir(),
             manifests,
-            partition_filter.clone(),
+            partition_filter,
             core.data_evolution_enabled(),
             RETAINED_ADD_BUDGET,
+            Arc::new(deletion_vectors),
         )
         .await?;
 
-        let deleted_rows = match snapshot.index_manifest() {
-            Some(index_manifest) if core.deletion_vectors_enabled() => {
-                deleted_rows_by_partition(
-                    file_io,
-                    &manifest_sm.manifest_path(index_manifest),
-                    partition_filter,
-                )
-                .await?
-            }
-            _ => HashMap::new(),
-        };
-
         let mut out = Vec::with_capacity(totals.len());
         for (partition_bytes, accum) in totals {
+            let record_count = accum.record_count();
+            if require_exact && record_count.is_none() {
+                return Ok(None);
+            }
             out.push(PartitionRowCount {
                 partition_row: BinaryRow::from_serialized_bytes(&partition_bytes)?,
-                record_count: accum.record_count(deleted_rows.get(&partition_bytes).copied()),
+                record_count,
             });
         }
-        Ok(out)
+        Ok(Some(out))
     }
 }
 
@@ -816,11 +891,112 @@ mod tests {
             bounds: Vec::new(),
         };
 
-        let deleted = deleted_rows_by_partition(&file_io, &path, Some(Arc::new(filter)))
+        let deleted = read_deletion_vectors(&file_io, &path, Some(Arc::new(filter)))
             .await
             .unwrap();
 
-        assert_eq!(deleted, HashMap::from([(partition(1), Some(3))]));
+        assert_eq!(deleted.by_partition.len(), 1);
+        assert_eq!(deleted.cardinality(&partition(1), 0, "data-1"), Some(3));
+        assert_eq!(deleted.cardinality(&partition(2), 0, "data-2"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_deletion_vectors_match_live_partition_bucket_and_file() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        file_io.mkdirs(&format!("{MANIFEST_DIR}/")).await.unwrap();
+        let path = format!("{MANIFEST_DIR}/live-index-manifest");
+        let entry = |value, bucket, name: &str, cardinality| IndexManifestEntry {
+            version: 1,
+            kind: FileKind::Add,
+            partition: partition(value),
+            bucket,
+            index_file: IndexFileMeta {
+                index_type: DELETION_VECTORS_INDEX_TYPE.to_string(),
+                file_name: "index".to_string(),
+                file_size: 1,
+                row_count: 1,
+                deletion_vectors_ranges: Some(indexmap::IndexMap::from([(
+                    name.to_string(),
+                    DeletionVectorMeta {
+                        offset: 0,
+                        length: 1,
+                        cardinality,
+                    },
+                )])),
+                external_path: None,
+                global_index_meta: None,
+            },
+        };
+        IndexManifest::write(
+            &file_io,
+            &path,
+            &[
+                entry(1, 0, "a", None),
+                entry(1, 0, "a", Some(2)), // Last mapping wins, including unknown -> known.
+                entry(1, 1, "a", Some(4)),
+                entry(2, 0, "a", Some(5)),
+                entry(1, 0, "upgraded", Some(1)),
+                entry(1, 0, "removed", None), // An unknown DV must not poison live counts.
+            ],
+        )
+        .await
+        .unwrap();
+        let vectors = Arc::new(read_deletion_vectors(&file_io, &path, None).await.unwrap());
+        assert_eq!(vectors.cardinality(&partition(1), 0, "a"), Some(2));
+        let metas = vec![
+            write_manifest(
+                &file_io,
+                "live-0",
+                &[
+                    add(partition(1), file("a", 0, 10, None)),
+                    ManifestEntry::new(
+                        FileKind::Add,
+                        partition(1),
+                        1,
+                        2,
+                        file("a", 0, 12, None),
+                        2,
+                    ),
+                    add(partition(2), file("a", 0, 8, None)),
+                    add(partition(1), file("upgraded", 0, 3, None)),
+                    add(partition(1), file("removed", 0, 5, None)),
+                ],
+            )
+            .await,
+            write_manifest(
+                &file_io,
+                "live-1",
+                &[
+                    delete(partition(1), file("removed", 0, 5, None)),
+                    delete(partition(1), file("upgraded", 0, 3, None)),
+                    add(partition(1), file("upgraded", 1, 3, None)),
+                ],
+            )
+            .await,
+        ];
+        for budget in [RETAINED_ADD_BUDGET, 0, 1] {
+            let totals = aggregate_manifests(
+                &file_io,
+                MANIFEST_DIR,
+                metas.clone(),
+                None,
+                false,
+                budget,
+                Arc::clone(&vectors),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                totals[&partition(1)].record_count(),
+                Some(18),
+                "budget {budget}"
+            );
+            assert_eq!(
+                totals[&partition(2)].record_count(),
+                Some(3),
+                "budget {budget}"
+            );
+        }
     }
 
     async fn counts(
@@ -842,6 +1018,7 @@ mod tests {
             None,
             data_evolution_enabled,
             retained_add_budget,
+            Arc::new(DeletionVectors::default()),
         )
         .await
         .unwrap()
@@ -1003,6 +1180,7 @@ mod tests {
             None,
             false,
             RETAINED_ADD_BUDGET,
+            Arc::new(DeletionVectors::default()),
         )
         .await
         .unwrap();
@@ -1013,11 +1191,11 @@ mod tests {
     fn test_invalid_row_id_range_is_unknown() {
         let mut invalid = PartitionAccum::default();
         invalid.add_file(2, Some(i64::MAX), true);
-        assert_eq!(invalid.record_count(None), None);
+        assert_eq!(invalid.record_count(), None);
 
         let mut valid = PartitionAccum::default();
         valid.add_file(1, Some(i64::MAX), true);
-        assert_eq!(valid.record_count(None), Some(1));
+        assert_eq!(valid.record_count(), Some(1));
     }
 
     /// The slim decoder must agree with the full decoder on every field it reads.
