@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex};
 use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
-use paimon::spec::{DataField, DataType, Predicate, RowType};
+use paimon::spec::{
+    BigIntType, DataField, DataType, Predicate, RowType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME,
+};
 use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -376,7 +378,17 @@ impl PyReadBuilder {
         mut slf: PyRefMut<'py, Self>,
         predicate: &Bound<'_, PyDict>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let filter = dict_to_predicate(predicate, slf.table.schema().fields(), slf.case_sensitive)?;
+        let mut fields = slf.table.schema().fields().to_vec();
+        // _ROW_ID is synthesized during read and absent from the table schema.
+        // Appending it preserves every physical column's original predicate index.
+        if !fields.iter().any(|field| field.name() == ROW_ID_FIELD_NAME) {
+            fields.push(DataField::new(
+                ROW_ID_FIELD_ID,
+                ROW_ID_FIELD_NAME.to_string(),
+                DataType::BigInt(BigIntType::with_nullable(true)),
+            ));
+        }
+        let filter = dict_to_predicate(predicate, &fields, slf.case_sensitive)?;
         slf.filter = Some(filter);
         Ok(slf)
     }

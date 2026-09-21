@@ -47,7 +47,7 @@ use pyo3::types::{
 /// - `Decimal` accepts a `decimal.Decimal` or an `int`, rescaled losslessly to
 ///   the column's scale; anything needing rounding, exceeding the column's
 ///   precision, non-finite, or a binary `float` is rejected.
-/// - `Binary`/`VarBinary` accept Python `bytes` or `bytearray`, copied without
+/// - `Binary`/`VarBinary`/`Blob` accept Python `bytes` or `bytearray`, copied without
 ///   decoding or changing their length.
 /// - Complex types are not supported yet and raise
 ///   `NotImplementedError`.
@@ -82,7 +82,7 @@ pub(crate) fn py_to_datum(value: &Bound<'_, PyAny>, data_type: &DataType) -> PyR
                 .map_err(|_| PyValueError::new_err("expected a str literal for String field"))?;
             Ok(Datum::String(s.to_str()?.to_string()))
         }
-        DataType::Binary(_) | DataType::VarBinary(_) => {
+        DataType::Binary(_) | DataType::VarBinary(_) | DataType::Blob(_) => {
             let bytes = if let Ok(bytes) = value.cast::<PyBytes>() {
                 bytes.as_bytes().to_vec()
             } else if let Ok(bytes) = value.cast::<PyByteArray>() {
@@ -690,6 +690,28 @@ mod tests {
                 }
                 other => panic!("expected Leaf, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn blob_leaf_accepts_binary_literals() {
+        Python::attach(|py| {
+            let fields = vec![DataField::new(
+                0,
+                "payload".to_string(),
+                DataType::Blob(paimon::spec::BlobType::new()),
+            )];
+            let dict = PyDict::new(py);
+            dict.set_item("method", "equal").unwrap();
+            dict.set_item("field", "payload").unwrap();
+            dict.set_item("literals", vec![PyBytes::new(py, &[0, 255, 0])])
+                .unwrap();
+            let predicate = dict_to_predicate(&dict, &fields, true).unwrap();
+            assert!(matches!(predicate, Predicate::Leaf { literals, .. }
+                if literals == vec![Datum::Bytes(vec![0, 255, 0])]));
+
+            dict.set_item("literals", vec!["not bytes"]).unwrap();
+            assert!(dict_to_predicate(&dict, &fields, true).is_err());
         });
     }
 
