@@ -1144,7 +1144,40 @@ impl<'a> TableScan<'a> {
     /// bindings to preserve arbitrary-precision integer seeds.
     pub fn with_chunk_shuffle(self, seed: impl ToString, chunk_size: u64) -> crate::Result<Self> {
         let config = ChunkShuffle::from_decimal_seed(&seed.to_string(), chunk_size)?;
-        self.with_chunk_shuffle_config(config)
+        match self.0 {
+            TableScanKind::Paimon(mut scan) => {
+                if !scan.table.schema().primary_keys().is_empty() {
+                    return Err(crate::Error::Unsupported {
+                        message: "chunk_shuffle only supports append tables".to_string(),
+                    });
+                }
+                if scan.limit.is_some() {
+                    return Err(crate::Error::Unsupported {
+                        message: "chunk_shuffle cannot combine with limit".to_string(),
+                    });
+                }
+                if scan.row_ranges.is_some() || scan.row_position_selection().is_some() {
+                    return Err(crate::Error::Unsupported {
+                        message:
+                            "chunk_shuffle cannot combine with row ranges or positional selection"
+                                .to_string(),
+                    });
+                }
+                if !scan.data_predicates.is_empty() {
+                    return Err(crate::Error::Unsupported {
+                        message: "chunk_shuffle only supports partition predicates".to_string(),
+                    });
+                }
+                scan.split_selection = Some(Box::new(ScanSplitSelection {
+                    mode: Some(ScanSplitMode::ChunkShuffle(config)),
+                    shard: scan.shard(),
+                }));
+                Ok(Self(TableScanKind::Paimon(scan)))
+            }
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "format tables do not support chunk_shuffle".to_string(),
+            }),
+        }
     }
 
     /// Select one balanced worker shard for a distributed scan.
@@ -1181,43 +1214,6 @@ impl<'a> TableScan<'a> {
             }
             TableScanKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "format tables do not support sharding".to_string(),
-            }),
-        }
-    }
-
-    fn with_chunk_shuffle_config(self, config: ChunkShuffle) -> crate::Result<Self> {
-        match self.0 {
-            TableScanKind::Paimon(mut scan) => {
-                if !scan.table.schema().primary_keys().is_empty() {
-                    return Err(crate::Error::Unsupported {
-                        message: "chunk_shuffle only supports append tables".to_string(),
-                    });
-                }
-                if scan.limit.is_some() {
-                    return Err(crate::Error::Unsupported {
-                        message: "chunk_shuffle cannot combine with limit".to_string(),
-                    });
-                }
-                if scan.row_ranges.is_some() || scan.row_position_selection().is_some() {
-                    return Err(crate::Error::Unsupported {
-                        message:
-                            "chunk_shuffle cannot combine with row ranges or positional selection"
-                                .to_string(),
-                    });
-                }
-                if !scan.data_predicates.is_empty() {
-                    return Err(crate::Error::Unsupported {
-                        message: "chunk_shuffle only supports partition predicates".to_string(),
-                    });
-                }
-                scan.split_selection = Some(Box::new(ScanSplitSelection {
-                    mode: Some(ScanSplitMode::ChunkShuffle(config)),
-                    shard: scan.shard(),
-                }));
-                Ok(Self(TableScanKind::Paimon(scan)))
-            }
-            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "format tables do not support chunk_shuffle".to_string(),
             }),
         }
     }
