@@ -1078,6 +1078,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dv_merge_on_read_supports_partial_update_and_aggregation() {
+        for (engine, options, second_value, expected) in [
+            ("partial-update", vec![], None, 10),
+            (
+                "aggregation",
+                vec![("fields.value.aggregate-function", "sum")],
+                Some(5),
+                15,
+            ),
+        ] {
+            let file_io = test_file_io();
+            let table_path = format!("memory:/dv_merge_on_read_{engine}");
+            setup_dirs(&file_io, &table_path).await;
+            let mut table_options = vec![
+                ("merge-engine", engine),
+                ("source.split.target-size", "1b"),
+                ("source.split.open-file-cost", "1b"),
+            ];
+            table_options.extend(options);
+            let table = pk_table(&file_io, &table_path, &table_options);
+
+            write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
+            write_commit(&table, &int_batch(vec![1, 3], vec![second_value, Some(30)])).await;
+
+            // The Rust writer does not yet support DV compaction for these
+            // merge engines. Read the real L0 files through a DV-enabled view
+            // of the same table, as a Java-written table would be read.
+            let read_table = table.copy_with_options(HashMap::from([
+                ("deletion-vectors.enabled".to_string(), "true".to_string()),
+                (
+                    "deletion-vectors.merge-on-read".to_string(),
+                    "true".to_string(),
+                ),
+            ]));
+
+            let plan = read_table
+                .new_read_builder()
+                .new_scan()
+                .plan()
+                .await
+                .unwrap();
+            assert_eq!(plan.splits().len(), 1, "overlapping L0 files must merge");
+            assert!(!plan.splits()[0].raw_convertible());
+            let batches = read_rows(&read_table, None, None).await;
+            assert_eq!(int_column(&batches, "id"), vec![1, 2, 3]);
+            assert_eq!(int_column(&batches, "value"), vec![expected, 20, 30]);
+
+            let fields = read_table.schema().fields().to_vec();
+            let merged_filter = PredicateBuilder::new(&fields)
+                .equal("value", Datum::Int(expected))
+                .unwrap();
+            let filtered = read_rows(&read_table, Some(&["id"]), Some(merged_filter)).await;
+            assert_eq!(int_column(&filtered, "id"), vec![1]);
+            if engine == "aggregation" {
+                let input_filter = PredicateBuilder::new(&fields)
+                    .equal("value", Datum::Int(10))
+                    .unwrap();
+                let stale = read_rows(&read_table, None, Some(input_filter)).await;
+                assert_eq!(
+                    stale.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    0,
+                    "an unmerged input value must not leak"
+                );
+            }
+        }
+    }
+
+    /// A compacted file's DV must be applied before its surviving values are
+    /// merged with an L0 file, while a materialized compacted-only split stays
+    /// on the raw path. This exercises both routes for each merge function.
+    #[tokio::test]
+    async fn partial_update_and_aggregation_apply_dv_before_merge() {
+        for (engine, options, second_value, expected) in [
+            ("partial-update", vec![], None, 10),
+            (
+                "aggregation",
+                vec![("fields.value.aggregate-function", "sum")],
+                Some(5),
+                15,
+            ),
+        ] {
+            let file_io = test_file_io();
+            let table_path = format!("memory:/dv_compacted_and_l0_{engine}");
+            setup_dirs(&file_io, &table_path).await;
+            let mut table_options = vec![("merge-engine", engine)];
+            table_options.extend(options);
+            let table = pk_table(&file_io, &table_path, &table_options);
+            write_commit(&table, &int_batch(vec![1, 2], vec![Some(10), Some(20)])).await;
+            write_commit(&table, &int_batch(vec![1, 3], vec![second_value, Some(30)])).await;
+            write_commit(&table, &int_batch(vec![4], vec![Some(40)])).await;
+
+            let all_files = table
+                .new_read_builder()
+                .new_scan()
+                .with_scan_all_files()
+                .plan()
+                .await
+                .unwrap();
+            let mut files = all_files
+                .splits()
+                .iter()
+                .flat_map(|split| split.data_files().iter().cloned())
+                .collect::<Vec<_>>();
+            files.sort_by_key(|file| file.min_sequence_number);
+            assert_eq!(files.len(), 3);
+            files[0].level = 1;
+            files[2].level = 1;
+            let deletion_file = write_deletion_file(&file_io, &table_path, &[1]).await;
+            let split_builder = || {
+                DataSplitBuilder::new()
+                    .with_snapshot(2)
+                    .with_partition(BinaryRow::new(0))
+                    .with_bucket(0)
+                    .with_bucket_path(format!("{table_path}/bucket-0"))
+                    .with_total_buckets(1)
+            };
+            let read_table = table.copy_with_options(HashMap::from([(
+                "deletion-vectors.enabled".to_string(),
+                "true".to_string(),
+            )]));
+            let read = read_table.new_read_builder().new_read().unwrap();
+
+            let raw_split = split_builder()
+                .with_data_files(vec![files[0].clone()])
+                .with_data_deletion_files(vec![Some(deletion_file.clone())])
+                .with_raw_convertible(true)
+                .build()
+                .unwrap();
+            let raw_batches = read
+                .to_arrow(&[raw_split])
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(int_column(&raw_batches, "id"), vec![1]);
+            assert_eq!(int_column(&raw_batches, "value"), vec![10]);
+
+            let merge_split = split_builder()
+                .with_data_files(files[..2].to_vec())
+                .with_data_deletion_files(vec![Some(deletion_file), None])
+                .with_raw_convertible(false)
+                .build()
+                .unwrap();
+            let disjoint_raw_split = split_builder()
+                .with_data_files(vec![files[2].clone()])
+                .with_raw_convertible(true)
+                .build()
+                .unwrap();
+            let merged_batches = read
+                .to_arrow(&[merge_split, disjoint_raw_split])
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let mut rows = int_column(&merged_batches, "id")
+                .into_iter()
+                .zip(int_column(&merged_batches, "value"))
+                .collect::<Vec<_>>();
+            rows.sort_unstable_by_key(|row| row.0);
+            assert_eq!(rows, vec![(1, expected), (3, 30), (4, 40)]);
+        }
+    }
+
+    #[tokio::test]
     async fn dynamic_dv_merge_on_read_is_ignored_without_deletion_vectors() {
         let file_io = test_file_io();
         let table_path = "memory:/ignored_dynamic_dv_merge_on_read";

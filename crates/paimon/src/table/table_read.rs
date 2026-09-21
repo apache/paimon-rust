@@ -871,10 +871,9 @@ impl<'a> PaimonTableRead<'a> {
     /// Read PK table. For `Deduplicate` and `FirstRow`, raw-convertible splits from scan
     /// planning (mirrors Java `DataSplit#convertToRawFiles`) use the faster
     /// DataFileReader; the rest go through KeyValueFileReader for sort-merge
-    /// dedup. A fully materialized deletion-vector plan for `PartialUpdate` or
-    /// `Aggregation` can also be read raw because DVs already mask stale rows.
-    /// Plans that still need any per-key merge fail closed because mixing raw
-    /// and merged outputs would produce incorrect results.
+    /// dedup. Deletion-vector splits for any merge engine are read raw only
+    /// when their rows are fully materialized; otherwise the per-file DVs are
+    /// applied before the key merge.
     fn read_pk(
         &self,
         data_splits: &[DataSplit],
@@ -903,39 +902,9 @@ impl<'a> PaimonTableRead<'a> {
             return self.read_kv(data_splits, core_options);
         }
 
-        if matches!(
-            merge_engine,
-            MergeEngine::PartialUpdate | MergeEngine::Aggregation
-        ) {
-            let merge_engine_name = match merge_engine {
-                MergeEngine::PartialUpdate => "partial-update",
-                MergeEngine::Aggregation => "aggregation",
-                _ => unreachable!("guarded by partial-update/aggregation match"),
-            };
-            if core_options.deletion_vectors_merge_on_read() {
-                return Err(crate::Error::Unsupported {
-                    message: format!(
-                        "merge-engine={merge_engine_name} with deletion-vectors.merge-on-read=true is not supported"
-                    ),
-                });
-            }
-            if !data_splits
-                .iter()
-                .all(DataSplit::is_fully_materialized_pk_dv)
-            {
-                return Err(crate::Error::Unsupported {
-                    message: format!(
-                        "merge-engine={merge_engine_name} with deletion vectors can only read fully materialized compacted splits"
-                    ),
-                });
-            }
-            return self.read_raw(data_splits);
-        }
-
-        // Compacted deletion-vector splits read raw: their stale versions are
-        // masked directly by DVs. A split containing level-0 data goes through
-        // the key merge; KeyValueFileReader applies any attached per-file DVs
-        // before merging the uncompacted versions.
+        // Fully materialized deletion-vector splits read raw: their stale
+        // versions are masked directly by DVs. Other splits go through the key
+        // merge; KeyValueFileReader applies any attached per-file DVs first.
         let mut kv_splits = Vec::new();
         let mut raw_splits = Vec::new();
         for split in data_splits {
@@ -1643,12 +1612,12 @@ fn scalar_compare(
 /// planning treats the missing stat as "no deletes" for compatibility, so the
 /// read side must fall back to the merge reader, which drops them.
 ///
-/// Deletion-vector tables merge only splits containing level-0 files. Fully
-/// compacted splits stay on the raw path, while the merge reader applies any
-/// attached DVs before reconciling uncompacted key versions.
+/// Deletion-vector tables also merge any split that is not fully materialized,
+/// including level-0 data and legacy or retract-containing compacted files.
+/// The merge reader applies attached DVs before reconciling key versions.
 fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
     if dv_enabled {
-        return split.data_files().iter().any(|f| f.level == 0);
+        return !split.is_fully_materialized_pk_dv();
     }
     !split.raw_convertible()
         || split
@@ -1883,10 +1852,18 @@ mod tests {
         let legacy = split(vec![file("a", 5, None)], true);
         assert!(pk_split_needs_merge(&legacy, false));
 
-        // Deletion-vector tables dispatch on level 0 only.
+        // DV reads can only bypass the merge when the split is known to hold
+        // fully materialized rows. Level, raw-convertibility and retract-row
+        // metadata all matter, including for caller-constructed splits.
         let dv_l0 = split(vec![file("a", 0, None)], false);
         assert!(pk_split_needs_merge(&dv_l0, true));
-        let dv_compacted = split(vec![file("a", 5, None)], false);
+        let dv_non_raw = split(vec![file("a", 5, Some(0))], false);
+        assert!(pk_split_needs_merge(&dv_non_raw, true));
+        let dv_legacy = split(vec![file("a", 5, None)], true);
+        assert!(pk_split_needs_merge(&dv_legacy, true));
+        let dv_retracts = split(vec![file("a", 5, Some(1))], true);
+        assert!(pk_split_needs_merge(&dv_retracts, true));
+        let dv_compacted = split(vec![file("a", 5, Some(0))], true);
         assert!(!pk_split_needs_merge(&dv_compacted, true));
     }
 
