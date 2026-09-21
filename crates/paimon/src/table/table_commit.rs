@@ -5976,45 +5976,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_preserves_manifest_history() {
+    async fn test_commit_preserves_delete_outside_retained_manifest() {
         let file_io = test_file_io();
-        let table_path = "memory:/test_commit_preserves_manifest_history";
+        let table_path = "memory:/test_commit_preserves_delete";
         setup_dirs(&file_io, table_path).await;
 
-        let commit = setup_commit(&file_io, table_path);
+        let table = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([("manifest.merge-min-count".to_string(), "2".to_string())]),
+        );
+        let mut commit = TableCommit::new(table, "test-user".to_string());
+        let partition = vec![0, 0, 0, 0];
+        let old_file = test_data_file("old.parquet", 1);
+        let mut initial_files = vec![old_file.clone()];
+        initial_files.extend(
+            (0..128)
+                .map(|_| test_data_file(&format!("filler-{}.parquet", uuid::Uuid::new_v4()), 1)),
+        );
 
         commit
             .commit(vec![CommitMessage::new(
-                vec![],
+                partition.clone(),
                 0,
-                vec![test_data_file("data-0.parquet", 100)],
+                initial_files,
             )])
             .await
             .unwrap();
 
-        commit
-            .overwrite(
-                vec![CommitMessage::new(
-                    vec![],
-                    0,
-                    vec![test_data_file("data-1.parquet", 50)],
-                )],
-                None,
-            )
-            .await
-            .unwrap();
+        let mut deletion = CommitMessage::new(partition.clone(), 0, vec![]);
+        deletion.deleted_files.push(old_file);
+        commit.commit(vec![deletion]).await.unwrap();
 
         commit
             .commit(vec![CommitMessage::new(
-                vec![],
+                partition.clone(),
                 0,
-                vec![test_data_file("data-2.parquet", 25)],
+                vec![test_data_file("replacement.parquet", 1)],
             )])
             .await
             .unwrap();
 
         let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
-        assert_eq!(snapshot.id(), 3);
         let manifest_dir = format!("{table_path}/manifest");
         let base_metas = ManifestList::read(
             &file_io,
@@ -6023,17 +6026,51 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(base_metas.len(), 2);
-        assert!(base_metas.iter().any(|meta| meta.num_deleted_files() == 1));
+        let delta_metas = ManifestList::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", snapshot.delta_manifest_list()),
+        )
+        .await
+        .unwrap();
+        let retained = base_metas
+            .iter()
+            .find(|meta| meta.num_added_files() > 1)
+            .unwrap();
+        let deletion = base_metas
+            .iter()
+            .find(|meta| meta.num_deleted_files() == 1)
+            .unwrap();
+        let merge_target = deletion.file_size() + delta_metas[0].file_size() + 1;
+        assert!(retained.file_size() >= merge_target);
 
+        commit.manifest_target_size = merge_target;
+        commit
+            .commit(vec![CommitMessage::new(
+                partition,
+                0,
+                vec![test_data_file("unrelated.parquet", 1)],
+            )])
+            .await
+            .unwrap();
+
+        let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
+        let base_metas = ManifestList::read(
+            &file_io,
+            &format!("{manifest_dir}/{}", snapshot.base_manifest_list()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(base_metas.len(), 3);
+        assert!(base_metas.iter().any(|meta| meta.num_deleted_files() == 1));
         let active_file_names = active_entries(&file_io, table_path, &snapshot)
             .await
             .into_iter()
             .map(|entry| entry.file().file_name.clone())
             .collect::<HashSet<_>>();
-        assert_eq!(
-            active_file_names,
-            HashSet::from(["data-1.parquet".to_string(), "data-2.parquet".to_string()])
-        );
+        assert_eq!(active_file_names.len(), 130);
+        assert!(!active_file_names.contains("old.parquet"));
+        assert!(active_file_names.contains("replacement.parquet"));
+        assert!(active_file_names.contains("unrelated.parquet"));
     }
 
     /// `write_manifest_file` must aggregate min/max bucket and level across entries so the
