@@ -761,7 +761,7 @@ impl DataEvolutionReader {
         let anchor_deletion_vector = anchor_deletion_vector.clone();
         // Match the input cap so a LIMIT cannot resolve payloads for rows that
         // are only going to be discarded from the merge output.
-        let merge_batch_size = batch_size.unwrap_or(1024).min(1024).max(1);
+        let merge_batch_size = batch_size.unwrap_or(1024).clamp(1, 1024);
         let target_schema = build_target_arrow_schema(&read_type)?;
 
         Ok(try_stream! {
@@ -7067,7 +7067,7 @@ mod tests {
         builder.with_filter(predicate);
         let read = builder.new_read().unwrap();
         let batches = read
-            .to_arrow(&[split.clone()])
+            .to_arrow(std::slice::from_ref(&split))
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
