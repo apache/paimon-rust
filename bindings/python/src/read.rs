@@ -689,12 +689,6 @@ impl PyTableRead {
 
 #[pymethods]
 impl PyTableRead {
-    /// Capability marker for readers that stop DE BLOB I/O at the read limit.
-    #[staticmethod]
-    fn supports_pruning_blob_limit() -> bool {
-        true
-    }
-
     /// Lazily read the given splits as an iterator of PyArrow RecordBatches.
     fn read_arrow(
         &self,
