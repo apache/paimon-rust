@@ -303,7 +303,7 @@ mod tests {
                     DeletionVectorMeta {
                         offset: 17,
                         length: 31,
-                        cardinality: Some(2),
+                        cardinality: Some(-1),
                     },
                 )])),
                 external_path: Some("memory:/external/index".into()),
@@ -342,6 +342,15 @@ mod tests {
             "future".into(),
             Value::Array(vec![Value::String("ignored".into())]),
         ));
+        // Last duplicate wins: full decoding preserves the negative cardinality,
+        // while slim decoding must report it as unknown, not retain the earlier 2.
+        let last = Value::Union(1, Box::new(Value::Record(fields.clone())));
+        fields
+            .iter_mut()
+            .find(|(name, _)| name == "_CARDINALITY")
+            .unwrap()
+            .1 = Value::Union(1, Box::new(Value::Long(2)));
+        items.push(last);
         let mut writer = apache_avro::Writer::new(&schema, Vec::new());
         writer.append(value.resolve(&schema).unwrap()).unwrap();
         let bytes = writer.into_inner().unwrap();
@@ -355,7 +364,7 @@ mod tests {
                 assert_eq!(entry.bucket, 7);
                 assert_eq!(
                     entry.deletion_vector_cardinalities,
-                    std::collections::HashMap::from([("data.parquet", Some(2))])
+                    std::collections::HashMap::from([("data.parquet", None)])
                 );
                 seen += 1;
                 Ok(())

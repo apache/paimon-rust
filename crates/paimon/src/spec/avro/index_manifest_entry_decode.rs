@@ -172,69 +172,10 @@ fn decode_nullable_dv_cardinalities<'a>(
     nullable: bool,
     schema: &FieldSchema,
 ) -> crate::Result<HashMap<&'a str, Option<i64>>> {
-    if nullable && cursor.read_union_index()? == 0 {
-        return Ok(HashMap::new());
-    }
-    let FieldSchema::Array(item_schema) = schema else {
-        return Err(crate::Error::UnexpectedError {
-            message: "deletion vector ranges must be an Avro array".into(),
-            source: None,
-        });
-    };
     let mut cardinalities = HashMap::new();
-    loop {
-        let count = cursor.read_long()?;
-        if count == 0 {
-            break;
-        }
-        let count = if count < 0 {
-            cursor.skip_long()?;
-            neg_count_to_usize(count)?
-        } else {
-            count as usize
-        };
-        for _ in 0..count {
-            let item_schema = match item_schema.as_ref() {
-                FieldSchema::Union(branches) => {
-                    let index = cursor.read_union_index()?;
-                    branches
-                        .get(index as usize)
-                        .ok_or_else(|| crate::Error::UnexpectedError {
-                            message: format!("invalid deletion vector item union index: {index}"),
-                            source: None,
-                        })?
-                }
-                schema => schema,
-            };
-            if matches!(item_schema, FieldSchema::Null) {
-                continue;
-            }
-            let FieldSchema::Record(record) = item_schema else {
-                return Err(crate::Error::UnexpectedError {
-                    message: "deletion vector array item must be an Avro record".into(),
-                    source: None,
-                });
-            };
-            let mut file_name = "";
-            let mut cardinality = None;
-            for field in &record.fields {
-                match field.name.as_str() {
-                    "f0" => {
-                        if !field.nullable || cursor.read_union_index()? != 0 {
-                            file_name = cursor.read_string()?;
-                        }
-                    }
-                    "_CARDINALITY" => {
-                        if !field.nullable || cursor.read_union_index()? != 0 {
-                            cardinality = Some(cursor.read_long()?);
-                        }
-                    }
-                    _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
-                }
-            }
-            cardinalities.insert(file_name, cardinality.filter(|value| *value >= 0));
-        }
-    }
+    visit_nullable_dv_ranges(cursor, nullable, schema, |name, meta| {
+        cardinalities.insert(name, meta.cardinality.filter(|value| *value >= 0));
+    })?;
     Ok(cardinalities)
 }
 
@@ -243,11 +184,22 @@ fn decode_nullable_dv_ranges(
     nullable: bool,
     schema: &FieldSchema,
 ) -> crate::Result<Option<IndexMap<String, DeletionVectorMeta>>> {
-    if nullable {
-        let idx = cursor.read_union_index()?;
-        if idx == 0 {
-            return Ok(None);
-        }
+    let mut map = IndexMap::new();
+    let present = visit_nullable_dv_ranges(cursor, nullable, schema, |name, meta| {
+        map.insert(name.to_owned(), meta);
+    })?;
+    Ok(present.then_some(map))
+}
+
+/// Visit DV records with borrowed names; `false` means the outer array was null.
+fn visit_nullable_dv_ranges<'a>(
+    cursor: &mut AvroCursor<'a>,
+    nullable: bool,
+    schema: &FieldSchema,
+    mut visit: impl FnMut(&'a str, DeletionVectorMeta),
+) -> crate::Result<bool> {
+    if nullable && cursor.read_union_index()? == 0 {
+        return Ok(false);
     }
     let FieldSchema::Array(item_schema) = schema else {
         return Err(crate::Error::UnexpectedError {
@@ -255,7 +207,6 @@ fn decode_nullable_dv_ranges(
             source: None,
         });
     };
-    let mut map = IndexMap::new();
     loop {
         let count = cursor.read_long()?;
         if count == 0 {
@@ -292,13 +243,17 @@ fn decode_nullable_dv_ranges(
                     source: None,
                 });
             };
-            let mut file_name = String::new();
+            let mut file_name = "";
             let mut offset = 0;
             let mut length = 0;
             let mut cardinality = None;
             for field in &record.fields {
                 match field.name.as_str() {
-                    "f0" => file_name = read_string_field(cursor, field.nullable)?,
+                    "f0" => {
+                        if !field.nullable || cursor.read_union_index()? != 0 {
+                            file_name = cursor.read_string()?;
+                        }
+                    }
                     "f1" => offset = read_int_field(cursor, field.nullable)?,
                     "f2" => length = read_int_field(cursor, field.nullable)?,
                     "_CARDINALITY" => {
@@ -309,7 +264,7 @@ fn decode_nullable_dv_ranges(
                     _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
                 }
             }
-            map.insert(
+            visit(
                 file_name,
                 DeletionVectorMeta {
                     offset,
@@ -319,7 +274,7 @@ fn decode_nullable_dv_ranges(
             );
         }
     }
-    Ok(Some(map))
+    Ok(true)
 }
 
 fn decode_nullable_global_index(
