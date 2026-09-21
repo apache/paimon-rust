@@ -2185,23 +2185,27 @@ impl TableCommit {
         base_entries: &[ManifestEntry],
         delta_entries: &[ManifestEntry],
     ) -> Result<()> {
-        let base_identifiers = base_entries
+        let mut active_identifiers = base_entries
             .iter()
             .map(ManifestEntry::identifier)
             .collect::<HashSet<_>>();
-        for entry in delta_entries
-            .iter()
-            .filter(|entry| *entry.kind() == FileKind::Delete)
-        {
-            if !base_identifiers.contains(&entry.identifier()) {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Delete conflict: file '{}' in bucket {} does not exist in the current snapshot.",
-                        entry.file().file_name,
-                        entry.bucket(),
-                    ),
-                    source: None,
-                });
+        for entry in delta_entries {
+            let identifier = entry.identifier();
+            match entry.kind() {
+                FileKind::Add => {
+                    active_identifiers.insert(identifier);
+                }
+                FileKind::Delete if !active_identifiers.remove(&identifier) => {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Delete conflict: file '{}' in bucket {} does not exist in the current snapshot.",
+                            entry.file().file_name,
+                            entry.bucket(),
+                        ),
+                        source: None,
+                    });
+                }
+                FileKind::Delete => {}
             }
         }
         Ok(())
@@ -3530,6 +3534,14 @@ mod tests {
         let partition = EMPTY_SERIALIZED_ROW.clone();
         let file = test_data_file("data-0.parquet", 100);
 
+        let transient = test_data_file("transient.parquet", 1);
+        let mut net_zero = CommitMessage::new(partition.clone(), 0, vec![transient.clone()]);
+        net_zero.deleted_files = vec![transient];
+        commit
+            .commit(vec![net_zero])
+            .await
+            .expect("ADD followed by DELETE should cancel out");
+
         commit
             .commit(vec![CommitMessage::new(
                 partition.clone(),
@@ -3579,7 +3591,7 @@ mod tests {
         assert!(matches!(error, crate::Error::DataInvalid { .. }));
 
         let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
-        assert_eq!(snapshot.id(), 1);
+        assert_eq!(snapshot.id(), 2);
         assert_eq!(snapshot.total_record_count(), Some(100));
     }
 
