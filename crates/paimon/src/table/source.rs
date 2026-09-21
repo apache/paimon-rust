@@ -46,8 +46,8 @@ pub(crate) fn data_evolution_anchor_file(files: &[DataFileMeta]) -> crate::Resul
 // ======================= RowRange ===============================
 
 /// An inclusive row range `[from, to]` in the coordinate system of the read
-/// path: stable row IDs for data evolution, or physical positions for raw
-/// primary-key and append reads.
+/// path: stable row IDs for row-tracked tables, or physical positions for raw
+/// tables without row tracking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowRange {
     from: i64,
@@ -497,9 +497,9 @@ pub struct DataSplit {
     /// Deletion file for each data file, same order as `data_files`.
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
     data_deletion_files: Option<Arc<[Option<DeletionFile>]>>,
-    /// IndexedSplit-compatible ranges. Data-evolution reads interpret these as
-    /// stable row IDs; raw reads interpret them as split-local physical
-    /// positions over `data_files` in list order.
+    /// IndexedSplit-compatible ranges. Row-tracked tables interpret these as
+    /// stable row IDs; raw tables without row tracking interpret them as
+    /// split-local physical positions over `data_files` in list order.
     row_ranges: Option<Arc<[RowRange]>>,
     /// Whether the split can be read raw, without the merge reader: its
     /// physical rows are exactly its logical rows (modulo deletion files).

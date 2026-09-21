@@ -242,6 +242,7 @@ async fn append_chunks(
     mut group: InputGroup,
     chunk_size: i64,
 ) -> crate::Result<Vec<DataSplit>> {
+    let row_tracking = table.schema().core_options().row_tracking_enabled();
     let mut chunks: Vec<Vec<AppendSegment>> = Vec::new();
     let mut current = Vec::new();
     let mut current_rows = 0;
@@ -273,24 +274,40 @@ async fn append_chunks(
 
     chunks
         .into_iter()
-        .map(|segments| build_append_split(&group, segments))
+        .map(|segments| build_append_split(&group, segments, row_tracking))
         .collect()
 }
 
 fn build_append_split(
     group: &InputGroup,
     segments: Vec<AppendSegment>,
+    row_tracking: bool,
 ) -> crate::Result<DataSplit> {
     let mut files = Vec::with_capacity(segments.len());
     let mut deletion_files = Vec::with_capacity(segments.len());
     let mut ranges = Vec::new();
     let mut split_offset = 0;
     for segment in segments {
+        let range_base = if row_tracking {
+            segment
+                .input
+                .file
+                .first_row_id
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "Row-tracked file '{}' is missing first_row_id",
+                        segment.input.file.file_name
+                    ),
+                    source: None,
+                })?
+        } else {
+            split_offset
+        };
         ranges.extend(
             segment
                 .ranges
                 .into_iter()
-                .map(|range| RowRange::new(split_offset + range.from(), split_offset + range.to())),
+                .map(|range| RowRange::new(range_base + range.from(), range_base + range.to())),
         );
         split_offset += segment.input.file.row_count;
         files.push(segment.input.file);
@@ -758,6 +775,21 @@ mod tests {
         )
     }
 
+    fn row_tracking_table() -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "chunk_test"),
+            "memory:/chunk-test".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
     fn file(name: &str, row_count: i64, first_row_id: Option<i64>) -> DataFileMeta {
         DataFileMeta {
             file_name: name.to_string(),
@@ -915,6 +947,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!([left, right].concat(), chunks);
+    }
+
+    #[tokio::test]
+    async fn row_tracking_append_chunks_keep_global_row_ids() {
+        let table = row_tracking_table();
+        let input = split(
+            vec![
+                file("a.parquet", 2, Some(100)),
+                file("b.parquet", 2, Some(200)),
+            ],
+            true,
+        );
+        let chunks = chunk_shuffle_splits(
+            &table,
+            vec![input],
+            &ChunkShuffle::from_decimal_seed("0", 3).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.iter().map(DataSplit::row_count).sum::<i64>(), 4);
+        let mut ranges: Vec<_> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.row_ranges().unwrap())
+            .map(|range| (range.from(), range.to()))
+            .collect();
+        ranges.sort();
+        assert_eq!(ranges, vec![(100, 101), (200, 200), (201, 201)]);
+
+        let missing_row_id = split(vec![file("legacy.parquet", 2, None)], true);
+        let error = chunk_shuffle_splits(
+            &table,
+            vec![missing_row_id],
+            &ChunkShuffle::from_decimal_seed("0", 3).unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("missing first_row_id"));
     }
 
     #[tokio::test]

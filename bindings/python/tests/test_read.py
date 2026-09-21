@@ -203,6 +203,43 @@ def test_with_row_ranges():
             table.new_read_builder().with_row_ranges([(2, 1)])
 
 
+def test_row_tracking_append_row_ranges_keep_global_row_ids():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("""CREATE TABLE paimon.rdb.tracked (id INT, pt STRING)
+            PARTITIONED BY (pt) WITH ('row-tracking.enabled' = 'true')""")
+        ctx.sql("""INSERT INTO paimon.rdb.tracked VALUES
+            (1, 'a'), (2, 'a'), (3, 'a')""")
+        ctx.sql("""INSERT INTO paimon.rdb.tracked VALUES
+            (4, 'b'), (5, 'b'), (6, 'b')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.tracked")
+        builder = table.new_read_builder().with_row_ranges([(3, 4)])
+
+        plan = builder.new_scan().plan()
+        rows = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+
+        assert rows.column("id").to_pylist() == [4, 5]
+
+        chunk_builder = table.new_read_builder().with_projection(["id"])
+        chunks = (
+            chunk_builder.new_scan()
+            .with_chunk_shuffle("7", 2)
+            .plan()
+            .splits()
+        )
+        chunk_rows = [
+            pa.Table.from_batches(chunk_builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in chunks
+        ]
+        assert all(0 < len(values) <= 2 for values in chunk_rows)
+        assert sorted(value for values in chunk_rows for value in values) == [
+            1, 2, 3, 4, 5, 6,
+        ]
+
+
 def test_format_table_rejects_row_ranges():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
