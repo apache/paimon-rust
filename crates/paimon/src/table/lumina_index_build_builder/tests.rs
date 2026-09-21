@@ -555,6 +555,25 @@ fn test_extract_vectors_rejects_non_list_float32() {
     assert!(matches!(err, Error::DataInvalid { message, .. } if message.contains("List<Float32>")));
 }
 
+#[test]
+fn test_extract_vectors_rejects_non_finite_element() {
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let batch = vector_batch(vec![Some(vec![Some(1.0), Some(value)])], vec![Some(7)]);
+
+        let err = extract_vectors_from_batches(&[batch], "embedding", 2, 7, 1)
+            .expect_err("a non-finite element should fail");
+
+        let Error::DataInvalid { message, .. } = err else {
+            panic!("expected DataInvalid for {value}, got {err:?}");
+        };
+        assert!(message.contains("non-finite"), "message: {message}");
+        // The row id and the position inside the vector are what make the failure
+        // actionable, as in Java's `Vector element at rowId=%d, index=%d`.
+        assert!(message.contains("_ROW_ID 7"), "message: {message}");
+        assert!(message.contains("index 1"), "message: {message}");
+    }
+}
+
 fn fixed_size_vector_batch(
     rows: Vec<Option<Vec<f32>>>,
     row_ids: Vec<Option<i64>>,
@@ -671,6 +690,39 @@ fn test_extract_vectors_fixed_size_list_rejects_null_element() {
     assert!(
         matches!(err, Error::DataInvalid { message, .. } if message.contains("null vector element"))
     );
+}
+
+#[test]
+fn test_extract_vectors_fixed_size_list_rejects_non_finite_element() {
+    // Both layouts share the element loop, so this pins that the FixedSizeList
+    // path reaches it too.
+    let element_field = Arc::new(ArrowField::new("element", ArrowDataType::Float32, true));
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 2).with_field(element_field);
+    builder.values().append_value(1.0);
+    builder.values().append_value(f32::NAN);
+    builder.append(true);
+    let row_ids = Arc::new(Int64Array::from(vec![Some(0)])) as ArrayRef;
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(
+            "embedding",
+            ArrowDataType::FixedSizeList(
+                Arc::new(ArrowField::new("element", ArrowDataType::Float32, true)),
+                2,
+            ),
+            true,
+        ),
+        ArrowField::new(ROW_ID_FIELD_NAME, ArrowDataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(builder.finish()) as ArrayRef, row_ids],
+    )
+    .unwrap();
+
+    let err = extract_vectors_from_batches(&[batch], "embedding", 2, 0, 1)
+        .expect_err("a non-finite element should fail");
+
+    assert!(matches!(err, Error::DataInvalid { message, .. } if message.contains("non-finite")));
 }
 
 #[test]
