@@ -22,7 +22,7 @@ import tempfile
 import pyarrow as pa
 import pytest
 
-from pypaimon_rust.datafusion import PaimonCatalog, Split, SQLContext
+from pypaimon_rust.datafusion import PaimonCatalog, Split, SQLContext, TableRead
 
 
 def _make_table_with_data(warehouse):
@@ -65,6 +65,10 @@ def test_with_limit():
         # limit is a planning hint; assert only that planning succeeds.
         plan = table.new_read_builder().with_limit(1).new_scan().plan()
         assert plan is not None
+
+
+def test_pruning_blob_limit_capability():
+    assert TableRead.supports_pruning_blob_limit()
 
 
 def test_with_blob_parallelism():

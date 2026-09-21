@@ -225,7 +225,8 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
-    /// Push a row-limit hint down to scan planning.
+    /// Push a row-limit hint down to scan planning. Data-evolution reads also
+    /// enforce this limit before resolving BLOB payloads.
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
         match &mut self.0 {
             ReadBuilderKind::Paimon(builder) => {
@@ -474,9 +475,9 @@ impl<'a> PaimonReadBuilder<'a> {
     /// This allows paimon-core scan planning to generate fewer splits when the
     /// current scan state keeps split-level `merged_row_count()` conservative.
     ///
-    /// Note: This method does not guarantee that exactly `limit` rows will be
-    /// returned by [`TableRead`]. It is only a pushdown hint for planning.
-    /// Callers or query engines are responsible for enforcing the final LIMIT.
+    /// Data-evolution [`TableRead`] enforces the limit before BLOB resolution.
+    /// Other read paths still treat it only as a planning hint, so callers or
+    /// query engines must enforce the final LIMIT themselves.
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
         self.limit = Some(limit);
         self
@@ -543,6 +544,7 @@ impl<'a> PaimonReadBuilder<'a> {
         TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
             .with_parquet_read_budget(parquet_read_budget)
             .with_blob_parallelism(self.blob_parallelism)
+            .map(|read| read.with_data_evolution_limit(self.limit))
     }
 
     /// Resolve the effective read type, deferring projection name resolution to

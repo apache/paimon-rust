@@ -131,10 +131,20 @@ pub(crate) struct DataEvolutionReader {
     blob_read_limiter: BlobReadLimiter,
     blob_parallelism: usize,
     batch_size: Option<usize>,
+    limit: Option<usize>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
     table_options: Arc<HashMap<String, String>>,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
+}
+
+fn take_limited_batch(batch: RecordBatch, remaining: &mut Option<usize>) -> RecordBatch {
+    let Some(left) = remaining else {
+        return batch;
+    };
+    let taken = batch.num_rows().min(*left);
+    *left -= taken;
+    batch.slice(0, taken)
 }
 
 impl DataEvolutionReader {
@@ -212,6 +222,7 @@ impl DataEvolutionReader {
             blob_read_limiter: BlobReadLimiter::new(),
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             batch_size: None,
+            limit: None,
             parquet_read_budget: None,
             table_options: Arc::new(HashMap::new()),
             mosaic_prefetch: MosaicPrefetchOptions::default(),
@@ -229,6 +240,19 @@ impl DataEvolutionReader {
         self.blob_read_limiter = BlobReadLimiter::with_parallelism(blob_parallelism);
         self.blob_parallelism = blob_parallelism;
         self
+    }
+
+    pub(crate) fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    fn effective_batch_size(&self) -> Option<usize> {
+        match (self.batch_size, self.limit) {
+            (Some(size), Some(limit)) if limit > 0 => Some(size.min(limit)),
+            (None, Some(limit)) if limit > 0 => Some(limit),
+            (size, _) => size,
+        }
     }
 
     pub(crate) fn with_parquet_read_budget(
@@ -259,9 +283,13 @@ impl DataEvolutionReader {
 
     /// Read data files in data evolution mode.
     pub fn read(self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        if self.limit == Some(0) {
+            return Ok(futures::stream::empty().boxed());
+        }
         let splits: Vec<DataSplit> = data_splits.to_vec();
 
         Ok(try_stream! {
+            let mut remaining = self.limit;
             let resolve_blob_views = !self.blob_view_read_fields().is_empty();
             let descriptor_fields = self.descriptor_fields_to_resolve(resolve_blob_views);
             let filter_before_blob_resolution =
@@ -285,6 +313,10 @@ impl DataEvolutionReader {
             let push_down_raw_predicates = !self.predicates.is_empty()
                 && self.row_id_index.is_none()
                 && filter_before_blob_resolution;
+            // A managed BLOB file fetches payloads as its batch is decoded.
+            // Keep that batch no larger than the requested output, then stop
+            // consuming the stream as soon as the quota is satisfied.
+            let batch_size = self.effective_batch_size();
             let raw_file_reader = DataFileReader::new(
                 self.file_io.clone(),
                 self.schema_manager.clone(),
@@ -297,14 +329,17 @@ impl DataEvolutionReader {
                     Vec::new()
                 },
             )
-            .with_batch_size(self.batch_size)
+            .with_batch_size(batch_size)
             .with_blob_parallelism(self.blob_parallelism)
             .with_parquet_read_budget(self.parquet_read_budget.clone())
             .with_table_options(Arc::clone(&self.table_options))
             .with_mosaic_prefetch(self.mosaic_prefetch)
             .with_read_timing(self.read_timing.clone());
 
-            for split in splits {
+            'splits: for split in splits {
+                if remaining == Some(0) {
+                    break;
+                }
                 let row_ranges = split.row_ranges().map(|r| r.to_vec());
                 // A chunk may span several disjoint row-id groups while one
                 // group still needs column-wise merging. Process each aligned
@@ -313,8 +348,14 @@ impl DataEvolutionReader {
                 let file_groups = reader_file_groups(split.data_files());
 
                 for files in file_groups {
+                    if remaining == Some(0) {
+                        break 'splits;
+                    }
                     if is_raw_convertible(&files) {
                         for file_meta in files {
+                            if remaining == Some(0) {
+                                break 'splits;
+                            }
                             let deletion_vector = read_file_deletion_vector(
                                 &self.file_io,
                                 &split,
@@ -360,7 +401,8 @@ impl DataEvolutionReader {
                                 deletion_vector,
                                 effective_row_ranges,
                             )?;
-                            while let Some(batch) = stream.next().await {
+                            while remaining != Some(0) {
+                                let Some(batch) = stream.next().await else { break };
                                 let batch = batch?;
                                 let num_rows = batch.num_rows();
                                 let batch = if let Some(idx) = self.row_id_index {
@@ -382,6 +424,7 @@ impl DataEvolutionReader {
                                     blob_view_lookup.as_ref(),
                                     &descriptor_fields,
                                     filter_before_blob_resolution,
+                                    &mut remaining,
                                 ).await?;
                             }
                         }
@@ -428,7 +471,8 @@ impl DataEvolutionReader {
                             expected_output_rows,
                             anchor_deletion_vector,
                         )?;
-                        while let Some(batch) = merge_stream.next().await {
+                        while remaining != Some(0) {
+                            let Some(batch) = merge_stream.next().await else { break };
                             let batch = batch?;
                             let num_rows = batch.num_rows();
                             let batch = if let Some(idx) = self.row_id_index {
@@ -448,6 +492,7 @@ impl DataEvolutionReader {
                                 blob_view_lookup.as_ref(),
                                 &descriptor_fields,
                                 filter_before_blob_resolution,
+                                &mut remaining,
                             ).await?;
                         }
                     }
@@ -517,12 +562,16 @@ impl DataEvolutionReader {
         blob_view_lookup: Option<&BlobViewLookup>,
         descriptor_fields: &HashSet<String>,
         filter_before_blob_resolution: bool,
+        remaining: &mut Option<usize>,
     ) -> crate::Result<RecordBatch> {
         let mut batch = if filter_before_blob_resolution {
             self.filter_wide_batch(batch)?
         } else {
             batch
         };
+        if filter_before_blob_resolution {
+            batch = take_limited_batch(batch, remaining);
+        }
         if filter_before_blob_resolution && batch.num_rows() == 0 {
             return self.project_output(batch);
         }
@@ -542,6 +591,7 @@ impl DataEvolutionReader {
 
         if !filter_before_blob_resolution {
             batch = self.filter_wide_batch(batch)?;
+            batch = take_limited_batch(batch, remaining);
         }
         self.project_output(batch)
     }
@@ -673,14 +723,15 @@ impl DataEvolutionReader {
         let blob_descriptor_fields = self.blob_descriptor_fields.clone();
         let blob_as_descriptor = self.blob_as_descriptor;
         let blob_parallelism = self.blob_parallelism;
-        let batch_size = self.batch_size;
+        let batch_size = self.effective_batch_size();
         let parquet_read_budget = self.parquet_read_budget.clone();
         let table_options = Arc::clone(&self.table_options);
         let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
         let anchor_deletion_vector = anchor_deletion_vector.clone();
-        // Batch size for column-merge output. Matches the default Parquet reader batch size.
-        const MERGE_BATCH_SIZE: usize = 1024;
+        // Match the input cap so a LIMIT cannot resolve payloads for rows that
+        // are only going to be discarded from the merge output.
+        let merge_batch_size = batch_size.unwrap_or(1024).min(1024).max(1);
         let target_schema = build_target_arrow_schema(&read_type)?;
 
         Ok(try_stream! {
@@ -710,7 +761,7 @@ impl DataEvolutionReader {
             if active_source_indices.is_empty() {
                 let mut emitted = 0usize;
                 while emitted < expected_output_rows {
-                    let rows_to_emit = (expected_output_rows - emitted).min(MERGE_BATCH_SIZE);
+                    let rows_to_emit = (expected_output_rows - emitted).min(merge_batch_size);
                     let columns: Vec<Arc<dyn arrow_array::Array>> = target_schema
                         .fields()
                         .iter()
@@ -840,7 +891,7 @@ impl DataEvolutionReader {
                     })?;
                 }
 
-                let rows_to_emit = remaining.min(MERGE_BATCH_SIZE);
+                let rows_to_emit = remaining.min(merge_batch_size);
                 let mut columns: Vec<Arc<dyn arrow_array::Array>> =
                     Vec::with_capacity(source_plan.column_plan.len());
 
@@ -6795,7 +6846,7 @@ mod tests {
         builder.with_filter(predicate);
         let read = builder.new_read().unwrap();
         let batches = read
-            .to_arrow(&[split])
+            .to_arrow(&[split.clone()])
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -6803,6 +6854,17 @@ mod tests {
 
         assert_eq!(collect_int_values(&batches, "id"), vec![2, 3, 4]);
         assert_eq!(collect_int_values(&batches, "value"), vec![20, 30, 40]);
+
+        builder.with_limit(1);
+        let limited = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_int_values(&limited, "id"), vec![2]);
     }
 
     /// Multiple non-overlapping, single-file row-id segments may share one
@@ -7097,7 +7159,7 @@ mod tests {
 
         let read = TableRead::new(&table, table.schema().fields().to_vec(), Vec::new());
         let batches = read
-            .to_arrow(&[raw_split, merge_split])
+            .to_arrow(&[raw_split.clone(), merge_split.clone()])
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -7114,6 +7176,21 @@ mod tests {
             collect_int_values(&batches, "id"),
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         );
+
+        for (limit, expected) in [(0, vec![]), (1, vec![1]), (6, vec![1, 2, 3, 4, 5, 6])] {
+            let mut builder = table.new_read_builder();
+            builder.with_limit(limit);
+            let limited = builder
+                .new_read()
+                .unwrap()
+                .to_arrow(&[raw_split.clone(), merge_split.clone()])
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(collect_int_values(&limited, "id"), expected);
+            assert!(limited.iter().all(|batch| batch.num_rows() <= 2));
+        }
     }
 
     /// _ROW_ID + predicate, raw branch: surviving rows keep their ORIGINAL row
