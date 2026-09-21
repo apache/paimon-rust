@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import json
 import pickle
 import tempfile
 
@@ -1150,6 +1151,80 @@ def test_combined_incremental_retains_predicate_and_projection():
         plan = builder.new_incremental_scan(0, 2).plan()
         result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
         assert result.to_pydict() == {"id": [3]}
+
+
+def _native_split_file_names(splits):
+    names = []
+    for split in splits:
+        _, (state,) = split.__reduce__()
+        payload = json.loads(bytes(state))
+        names.extend(file_["_FILE_NAME"] for file_ in payload["data_files"])
+    return names
+
+
+def _make_input_changelog_table(warehouse):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.cldb")
+    ctx.sql("""CREATE TABLE paimon.cldb.t (id INT, value STRING, PRIMARY KEY (id))
+        WITH ('bucket' = '1', 'changelog-producer' = 'input')""")
+    ctx.sql("INSERT INTO paimon.cldb.t VALUES (1, 'a'), (2, 'b')")
+    ctx.sql("INSERT INTO paimon.cldb.t VALUES (3, 'c')")
+    return PaimonCatalog({"warehouse": warehouse}).get_table("cldb.t")
+
+
+def test_incremental_changelog_and_auto_plan_physical_changelog_files():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_input_changelog_table(warehouse)
+        builder = table.new_read_builder().with_include_row_kind(True)
+
+        delta = builder.new_incremental_scan(0, 2).plan()
+        assert all(name.startswith("data-")
+                   for name in _native_split_file_names(delta.splits()))
+
+        for mode in ("changelog", "CHANGELOG", "auto"):
+            plan = builder.new_incremental_scan(0, 2, mode).plan()
+            assert plan.snapshot_id() == 2
+            assert plan.splits()
+            assert all(split.is_streaming() for split in plan.splits())
+            assert all(name.startswith("changelog-")
+                       for name in _native_split_file_names(plan.splits()))
+            actual = pa.Table.from_batches(
+                builder.new_read().read(plan.splits())).to_pydict()
+            assert actual == {
+                "rowkind": ["+I", "+I", "+I"],
+                "id": [1, 2, 3],
+                "value": ["a", "b", "c"],
+            }
+
+        second = builder.new_incremental_scan(1, 2, "changelog").plan()
+        assert pa.Table.from_batches(
+            builder.new_read().read(second.splits())).to_pydict() == {
+                "rowkind": ["+I"], "id": [3], "value": ["c"]}
+        empty = builder.new_incremental_scan(2, 2, "changelog").plan()
+        assert empty.snapshot_id() == 2
+        assert empty.splits() == []
+
+
+def test_incremental_changelog_keeps_filter_projection_and_validates_mode():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_input_changelog_table(warehouse)
+        builder = (table.new_read_builder()
+                   .with_projection(["id"])
+                   .with_filter({
+                       "method": "greaterThan",
+                       "field": "id",
+                       "literals": [1],
+                   })
+                   .with_include_row_kind(True))
+        plan = builder.new_incremental_scan(0, 2, "changelog").plan()
+        assert pa.Table.from_batches(
+            builder.new_read().read(plan.splits())).to_pydict() == {
+                "rowkind": ["+I", "+I"], "id": [2, 3]}
+
+        for mode, message in (("diff", "before/after"), ("unknown", "expected")):
+            with pytest.raises(ValueError, match=message):
+                table.new_read_builder().new_incremental_scan(0, 2, mode)
 
 
 def _make_de_position_table(warehouse):
