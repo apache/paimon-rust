@@ -359,6 +359,7 @@ impl CatalogMetadataState {
 type SharedCatalogMetadata = Arc<CatalogMetadataState>;
 
 const MAX_CONCURRENT_METADATA_LISTINGS: usize = 16;
+pub(crate) const DEFAULT_MAX_CONCURRENT_METADATA_REQUESTS: usize = 16;
 // Recent tombstones guard against eventually consistent database listings. Tombstones still
 // needed by an active older refresh are exempt from this bound until that refresh completes.
 const MAX_RETAINED_DATABASE_TOMBSTONES: usize = 1024;
@@ -368,14 +369,21 @@ async fn load_database_metadata(
     database: &str,
     ignore_missing_views_endpoint: bool,
     known_capabilities: HashMap<String, SystemTableCapability>,
+    metadata_io_semaphore: &tokio::sync::Semaphore,
 ) -> DFResult<DatabaseMetadata> {
     let tables = async {
+        let _permit = metadata_io_semaphore.acquire().await.map_err(|_| {
+            DataFusionError::Execution("metadata request limiter was closed".to_string())
+        })?;
         catalog
             .list_tables(database)
             .await
             .map_err(to_datafusion_error)
     };
     let views = async {
+        let _permit = metadata_io_semaphore.acquire().await.map_err(|_| {
+            DataFusionError::Execution("metadata request limiter was closed".to_string())
+        })?;
         match catalog.list_views(database).await {
             Ok(names) => Ok(names),
             Err(paimon::Error::Unsupported { .. }) => Ok(vec![]),
@@ -397,29 +405,47 @@ async fn load_database_metadata(
 
     let unresolved_names: Vec<_> = table_names
         .iter()
-        .filter(|name| !known_capabilities.contains_key(*name))
+        .filter(|name| {
+            !matches!(
+                known_capabilities.get(*name),
+                Some(SystemTableCapability::Paimon | SystemTableCapability::Unsupported)
+            )
+        })
         .cloned()
         .collect();
-    let declared_types = if unresolved_names.is_empty() {
-        HashMap::new()
-    } else {
-        match catalog.list_table_types(database, &unresolved_names).await {
-            Ok(types) => types,
-            Err(error) => {
-                log::debug!(
-                    "unable to classify table types while refreshing database '{database}': \
-                     {error}"
-                );
-                HashMap::new()
+    let declared_types: HashMap<_, _> = stream::iter(unresolved_names)
+        .map(|name| async move {
+            let _permit = metadata_io_semaphore.acquire().await.map_err(|_| {
+                DataFusionError::Execution("metadata request limiter was closed".to_string())
+            })?;
+            match catalog
+                .list_table_types(database, std::slice::from_ref(&name))
+                .await
+            {
+                Ok(mut types) => Ok::<_, DataFusionError>(
+                    types.remove(&name).map(|table_type| (name, table_type)),
+                ),
+                Err(error) => {
+                    log::debug!("unable to classify table type for '{database}.{name}': {error}");
+                    Ok::<_, DataFusionError>(None)
+                }
             }
-        }
-    };
+        })
+        .buffer_unordered(MAX_CONCURRENT_METADATA_LISTINGS)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
 
     let mut objects = IndexMap::with_capacity(table_names.len() + view_names.len());
     let mut system_table_capabilities = HashMap::with_capacity(table_names.len());
     for name in table_names {
-        let capability = known_capabilities.get(&name).copied().unwrap_or_else(|| {
-            declared_types
+        let capability = match known_capabilities.get(&name).copied() {
+            Some(
+                capability @ (SystemTableCapability::Paimon | SystemTableCapability::Unsupported),
+            ) => capability,
+            Some(SystemTableCapability::Unknown) | None => declared_types
                 .get(&name)
                 .map(|table_type| {
                     if table_type.requires_table_engine() {
@@ -428,8 +454,8 @@ async fn load_database_metadata(
                         SystemTableCapability::Paimon
                     }
                 })
-                .unwrap_or(SystemTableCapability::Unknown)
-        });
+                .unwrap_or(SystemTableCapability::Unknown),
+        };
         system_table_capabilities.insert(name.clone(), capability);
         objects.entry(name).or_insert(TableType::Base);
     }
@@ -657,6 +683,8 @@ pub struct PaimonCatalogProvider {
     table_engines: TableEngines,
     /// Remotely refreshed metadata used by DataFusion's synchronous catalog callbacks.
     metadata: SharedCatalogMetadata,
+    /// Shared bound for metadata requests issued by this session's providers.
+    metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Debug for PaimonCatalogProvider {
@@ -676,6 +704,26 @@ impl PaimonCatalogProvider {
         blob_reader_registry: BlobReaderRegistry,
         session_state: Option<SessionStateProvider>,
     ) -> Self {
+        Self::new_uninitialized_with_metadata_io_semaphore(
+            catalog_name,
+            catalog,
+            dynamic_options,
+            blob_reader_registry,
+            session_state,
+            Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_METADATA_REQUESTS,
+            )),
+        )
+    }
+
+    pub(crate) fn new_uninitialized_with_metadata_io_semaphore(
+        catalog_name: Option<String>,
+        catalog: Arc<dyn Catalog>,
+        dynamic_options: DynamicOptions,
+        blob_reader_registry: BlobReaderRegistry,
+        session_state: Option<SessionStateProvider>,
+        metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         PaimonCatalogProvider {
             catalog_name,
             catalog,
@@ -686,6 +734,7 @@ impl PaimonCatalogProvider {
             schema_force_view_types: true,
             table_engines: Arc::new(RwLock::new(HashMap::new())),
             metadata: Arc::new(CatalogMetadataState::default()),
+            metadata_io_semaphore,
         }
     }
 
@@ -717,12 +766,34 @@ impl PaimonCatalogProvider {
         blob_reader_registry: BlobReaderRegistry,
         session_state: Option<SessionStateProvider>,
     ) -> DFResult<Self> {
-        let provider = Self::new_uninitialized(
+        Self::try_new_with_metadata_io_semaphore(
             catalog_name,
             catalog,
             dynamic_options,
             blob_reader_registry,
             session_state,
+            Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_METADATA_REQUESTS,
+            )),
+        )
+        .await
+    }
+
+    pub(crate) async fn try_new_with_metadata_io_semaphore(
+        catalog_name: Option<String>,
+        catalog: Arc<dyn Catalog>,
+        dynamic_options: DynamicOptions,
+        blob_reader_registry: BlobReaderRegistry,
+        session_state: Option<SessionStateProvider>,
+        metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> DFResult<Self> {
+        let provider = Self::new_uninitialized_with_metadata_io_semaphore(
+            catalog_name,
+            catalog,
+            dynamic_options,
+            blob_reader_registry,
+            session_state,
+            metadata_io_semaphore,
         );
         provider.initialize_metadata().await?;
         Ok(provider)
@@ -743,11 +814,15 @@ impl PaimonCatalogProvider {
 
     async fn refresh_metadata_inner(&self, ignore_missing_views_endpoint: bool) -> DFResult<()> {
         let generation = self.metadata.begin_refresh();
-        let mut database_names = self
-            .catalog
-            .list_databases()
-            .await
-            .map_err(to_datafusion_error)?;
+        let mut database_names = {
+            let _permit = self.metadata_io_semaphore.acquire().await.map_err(|_| {
+                DataFusionError::Execution("metadata request limiter was closed".to_string())
+            })?;
+            self.catalog
+                .list_databases()
+                .await
+                .map_err(to_datafusion_error)?
+        };
         let mut seen_databases = HashSet::new();
         database_names.retain(|name| seen_databases.insert(name.clone()));
 
@@ -760,6 +835,7 @@ impl PaimonCatalogProvider {
                         database.as_str(),
                         ignore_missing_views_endpoint,
                         known_capabilities,
+                        self.metadata_io_semaphore.as_ref(),
                     )
                     .await?;
                     Ok::<_, datafusion::error::DataFusionError>((database, metadata))
@@ -782,13 +858,17 @@ impl PaimonCatalogProvider {
             .metadata
             .publish(generation.get(), CatalogMetadataSnapshot { databases });
         if !conflicts.is_empty() {
-            let current_databases: HashSet<_> = self
-                .catalog
-                .list_databases()
-                .await
-                .map_err(to_datafusion_error)?
-                .into_iter()
-                .collect();
+            let current_databases: HashSet<_> = {
+                let _permit = self.metadata_io_semaphore.acquire().await.map_err(|_| {
+                    DataFusionError::Execution("metadata request limiter was closed".to_string())
+                })?;
+                self.catalog
+                    .list_databases()
+                    .await
+                    .map_err(to_datafusion_error)?
+                    .into_iter()
+                    .collect()
+            };
             conflicts.retain(|database| current_databases.contains(database));
         }
         stream::iter(conflicts)
@@ -823,6 +903,7 @@ impl PaimonCatalogProvider {
                 database,
                 ignore_missing_views_endpoint,
                 self.metadata.system_table_capabilities(database),
+                self.metadata_io_semaphore.as_ref(),
             )
             .await?;
             if self.metadata.publish_database(
@@ -898,28 +979,54 @@ impl PaimonCatalogProvider {
             .is_some_and(|metadata| metadata.objects.contains_key(&object_name))
     }
 
-    pub(crate) fn record_object_created(&self, database: &str, name: &str, table_type: TableType) {
+    pub(crate) fn record_table_created(
+        &self,
+        database: &str,
+        name: &str,
+        declared_type: Option<PaimonTableType>,
+    ) {
         self.metadata.mutate_database(database, |next| {
             let database = next
                 .databases
                 .entry(database.to_string())
                 .or_insert_with(|| Arc::new(DatabaseMetadata::default()));
             let database = Arc::make_mut(database);
-            database.objects.insert(name.to_string(), table_type);
-            if table_type == TableType::Base {
-                database
-                    .system_table_capabilities
-                    .insert(name.to_string(), SystemTableCapability::Paimon);
-            } else {
-                database.system_table_capabilities.remove(name);
-            }
+            database.objects.insert(name.to_string(), TableType::Base);
+            let capability = match declared_type {
+                Some(table_type) if table_type.requires_table_engine() => {
+                    SystemTableCapability::Unsupported
+                }
+                Some(_) => SystemTableCapability::Paimon,
+                None => SystemTableCapability::Unknown,
+            };
+            database
+                .system_table_capabilities
+                .insert(name.to_string(), capability);
         });
-        if table_type == TableType::Base {
-            self.metadata
-                .set_object_resolution(database, name, ObjectResolution::Paimon);
-        } else {
-            self.metadata.remove_object_resolution(database, name);
+        match declared_type {
+            Some(PaimonTableType::ObjectTable) => {
+                self.metadata
+                    .set_object_resolution(database, name, ObjectResolution::Object);
+            }
+            Some(table_type) if !table_type.requires_table_engine() => {
+                self.metadata
+                    .set_object_resolution(database, name, ObjectResolution::Paimon);
+            }
+            Some(_) | None => self.metadata.remove_object_resolution(database, name),
         }
+    }
+
+    pub(crate) fn record_view_created(&self, database: &str, name: &str) {
+        self.metadata.mutate_database(database, |next| {
+            let database = next
+                .databases
+                .entry(database.to_string())
+                .or_insert_with(|| Arc::new(DatabaseMetadata::default()));
+            let database = Arc::make_mut(database);
+            database.objects.insert(name.to_string(), TableType::View);
+            database.system_table_capabilities.remove(name);
+        });
+        self.metadata.remove_object_resolution(database, name);
     }
 
     pub(crate) fn record_database_created(&self, database: &str) {
@@ -948,7 +1055,7 @@ impl PaimonCatalogProvider {
         self.metadata.remove_object_resolution(database, name);
     }
 
-    pub(crate) fn record_table_renamed(&self, database: &str, from: &str, to: &str) {
+    pub(crate) fn record_table_renamed(&self, database: &str, from: &str, to: &str) -> bool {
         let mut renamed = false;
         self.metadata.mutate_database(database, |next| {
             if let Some(metadata) = next.databases.get_mut(database) {
@@ -956,11 +1063,13 @@ impl PaimonCatalogProvider {
                 let objects = &mut metadata.objects;
                 if let Some(table_type) = objects.shift_remove(from) {
                     objects.insert(to.to_string(), table_type);
-                    if let Some(capability) = metadata.system_table_capabilities.remove(from) {
-                        metadata
-                            .system_table_capabilities
-                            .insert(to.to_string(), capability);
-                    }
+                    let capability = metadata
+                        .system_table_capabilities
+                        .remove(from)
+                        .unwrap_or(SystemTableCapability::Unknown);
+                    metadata
+                        .system_table_capabilities
+                        .insert(to.to_string(), capability);
                     renamed = true;
                 }
             }
@@ -968,6 +1077,7 @@ impl PaimonCatalogProvider {
         if renamed {
             self.metadata.rename_object_resolution(database, from, to);
         }
+        renamed
     }
 
     fn paimon_schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
@@ -995,6 +1105,7 @@ impl PaimonCatalogProvider {
                 self.blob_reader_registry.clone(),
                 self.session_state.clone(),
             )
+            .with_metadata_io_semaphore(Arc::clone(&self.metadata_io_semaphore))
             .with_schema_force_view_types(self.schema_force_view_types)
             .with_table_engines(self.table_engines())
             .with_metadata_snapshot(Arc::clone(&self.metadata)),
@@ -1046,6 +1157,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         let schema_force_view_types = self.schema_force_view_types;
         let table_engines = self.table_engines();
         let metadata = Arc::clone(&self.metadata);
+        let metadata_io_semaphore = Arc::clone(&self.metadata_io_semaphore);
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -1068,6 +1180,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                         blob_reader_registry,
                         session_state,
                     )
+                    .with_metadata_io_semaphore(metadata_io_semaphore)
                     .with_schema_force_view_types(schema_force_view_types)
                     .with_table_engines(table_engines)
                     .with_metadata_snapshot(metadata),
@@ -1090,6 +1203,7 @@ impl CatalogProvider for PaimonCatalogProvider {
         let schema_force_view_types = self.schema_force_view_types;
         let table_engines = self.table_engines();
         let metadata = Arc::clone(&self.metadata);
+        let metadata_io_semaphore = Arc::clone(&self.metadata_io_semaphore);
         let name = name.to_string();
         block_on_with_runtime(
             async move {
@@ -1110,6 +1224,7 @@ impl CatalogProvider for PaimonCatalogProvider {
                         blob_reader_registry,
                         session_state,
                     )
+                    .with_metadata_io_semaphore(metadata_io_semaphore)
                     .with_schema_force_view_types(schema_force_view_types)
                     .with_table_engines(table_engines)
                     .with_metadata_snapshot(metadata),
@@ -1213,6 +1328,8 @@ pub struct PaimonSchemaProvider {
     schema_force_view_types: bool,
     /// Engines for table types served elsewhere; empty without routing.
     table_engines: TableEngines,
+    /// Shared bound for metadata requests issued by this session's providers.
+    metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Debug for PaimonSchemaProvider {
@@ -1246,6 +1363,9 @@ impl PaimonSchemaProvider {
             session_state,
             schema_force_view_types: true,
             table_engines: Arc::new(RwLock::new(HashMap::new())),
+            metadata_io_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_METADATA_REQUESTS,
+            )),
         }
     }
 
@@ -1311,6 +1431,7 @@ impl PaimonSchemaProvider {
             &self.database,
             ignore_missing_views_endpoint,
             self.metadata.system_table_capabilities(&self.database),
+            self.metadata_io_semaphore.as_ref(),
         )
         .await?;
         if !self.metadata.publish_database(
@@ -1328,6 +1449,14 @@ impl PaimonSchemaProvider {
 
     fn with_schema_force_view_types(mut self, schema_force_view_types: bool) -> Self {
         self.schema_force_view_types = schema_force_view_types;
+        self
+    }
+
+    fn with_metadata_io_semaphore(
+        mut self,
+        metadata_io_semaphore: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        self.metadata_io_semaphore = metadata_io_semaphore;
         self
     }
 

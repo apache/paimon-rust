@@ -61,7 +61,7 @@ use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, TableType, Volatility};
+use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan, Volatility};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
@@ -115,6 +115,7 @@ pub struct SQLContext {
     catalog_metadata_refresh_ttl: Duration,
     catalog_metadata_refresh_timeout: Duration,
     catalog_metadata_refresh_semaphore: Arc<tokio::sync::Semaphore>,
+    catalog_metadata_request_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 const MISSING_OBJECT_REFRESH_TTL: Duration = Duration::from_secs(1);
@@ -159,6 +160,7 @@ pub struct SQLContextBuilder {
     catalog_metadata_refresh_ttl: Option<Duration>,
     catalog_metadata_refresh_timeout: Option<Duration>,
     max_concurrent_catalog_metadata_refreshes: Option<usize>,
+    max_concurrent_catalog_metadata_requests: Option<usize>,
 }
 
 impl SQLContextBuilder {
@@ -192,6 +194,16 @@ impl SQLContextBuilder {
             "catalog metadata refresh concurrency must be positive"
         );
         self.max_concurrent_catalog_metadata_refreshes = Some(maximum);
+        self
+    }
+
+    /// Limits the metadata requests issued across all catalogs and databases.
+    pub fn with_max_concurrent_catalog_metadata_requests(mut self, maximum: usize) -> Self {
+        assert!(
+            maximum > 0,
+            "catalog metadata request concurrency must be positive"
+        );
+        self.max_concurrent_catalog_metadata_requests = Some(maximum);
         self
     }
 
@@ -232,6 +244,10 @@ impl SQLContextBuilder {
             catalog_metadata_refresh_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 self.max_concurrent_catalog_metadata_refreshes
                     .unwrap_or(DEFAULT_MAX_CONCURRENT_CATALOG_METADATA_REFRESHES),
+            )),
+            catalog_metadata_request_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                self.max_concurrent_catalog_metadata_requests
+                    .unwrap_or(crate::catalog::DEFAULT_MAX_CONCURRENT_METADATA_REQUESTS),
             )),
         }
     }
@@ -316,12 +332,13 @@ impl SQLContext {
         let session_state: crate::catalog::SessionStateProvider =
             Arc::new(move || weak_state.upgrade().map(|state| state.read().clone()));
         let provider = Arc::new(
-            crate::catalog::PaimonCatalogProvider::try_new(
+            crate::catalog::PaimonCatalogProvider::try_new_with_metadata_io_semaphore(
                 Some(catalog_name.clone()),
                 catalog.clone(),
                 self.dynamic_options.clone(),
                 self.blob_reader_registry.clone(),
                 Some(session_state),
+                Arc::clone(&self.catalog_metadata_request_semaphore),
             )
             .await?,
         );
@@ -1082,11 +1099,23 @@ impl SQLContext {
                     return Ok(());
                 }
                 let (_, catalog_name, identifier) = self.resolve_catalog_and_table(&create.name)?;
+                let declared_type = if create.if_not_exists {
+                    None
+                } else {
+                    let options: HashMap<_, _> = extract_options(&create.table_options)?
+                        .into_iter()
+                        .collect();
+                    Some(
+                        CoreOptions::new(&options)
+                            .table_type()
+                            .map_err(to_datafusion_error)?,
+                    )
+                };
                 self.update_catalog_metadata(&catalog_name, |provider| {
-                    provider.record_object_created(
+                    provider.record_table_created(
                         identifier.database(),
                         identifier.object(),
-                        TableType::Base,
+                        declared_type,
                     )
                 })?;
                 Ok(())
@@ -1098,11 +1127,7 @@ impl SQLContext {
                 }
                 let (_, catalog_name, identifier) = self.resolve_catalog_and_table(&create.name)?;
                 self.update_catalog_metadata(&catalog_name, |provider| {
-                    provider.record_object_created(
-                        identifier.database(),
-                        identifier.object(),
-                        TableType::View,
-                    )
+                    provider.record_view_created(identifier.database(), identifier.object())
                 })?;
                 Ok(())
             }
@@ -1142,10 +1167,27 @@ impl SQLContext {
         }
     }
 
-    fn update_catalog_metadata(
+    fn update_catalog_metadata<T>(
         &self,
         catalog_name: &str,
-        update: impl FnOnce(&crate::catalog::PaimonCatalogProvider),
+        update: impl FnOnce(&crate::catalog::PaimonCatalogProvider) -> T,
+    ) -> DFResult<T> {
+        let provider = self
+            .ctx
+            .catalog(catalog_name)
+            .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
+        let provider = provider
+            .downcast_ref::<crate::catalog::PaimonCatalogProvider>()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!("Catalog '{catalog_name}' is not a Paimon catalog"))
+            })?;
+        Ok(update(provider))
+    }
+
+    async fn refresh_catalog_database_metadata(
+        &self,
+        catalog_name: &str,
+        database: &str,
     ) -> DFResult<()> {
         let provider = self
             .ctx
@@ -1156,8 +1198,7 @@ impl SQLContext {
             .ok_or_else(|| {
                 DataFusionError::Plan(format!("Catalog '{catalog_name}' is not a Paimon catalog"))
             })?;
-        update(provider);
-        Ok(())
+        provider.refresh_database_metadata(database).await
     }
 
     async fn refresh_metadata_targets(
@@ -1951,13 +1992,26 @@ impl SQLContext {
                 .rename_table(&identifier, &new_identifier, false)
                 .await
             {
-                Ok(()) => self.update_catalog_metadata(&catalog_name, |provider| {
-                    provider.record_table_renamed(
-                        identifier.database(),
-                        identifier.object(),
-                        new_identifier.object(),
-                    )
-                })?,
+                Ok(()) => {
+                    let updated = self.update_catalog_metadata(&catalog_name, |provider| {
+                        provider.record_table_renamed(
+                            identifier.database(),
+                            identifier.object(),
+                            new_identifier.object(),
+                        )
+                    })?;
+                    if !updated {
+                        if let Err(error) = self
+                            .refresh_catalog_database_metadata(&catalog_name, identifier.database())
+                            .await
+                        {
+                            log::warn!(
+                                "unable to reconcile metadata after renaming '{}': {error}",
+                                identifier.full_name()
+                            );
+                        }
+                    }
+                }
                 Err(paimon::Error::TableNotExist { .. }) if if_exists => {
                     self.update_catalog_metadata(&catalog_name, |provider| {
                         provider.record_object_dropped(identifier.database(), identifier.object())

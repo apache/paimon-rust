@@ -446,19 +446,15 @@ pub trait Catalog: Send + Sync {
 
     /// Return the declared type for the requested tables.
     ///
-    /// Catalogs that can contain non-Paimon table types should override this method with an
-    /// implementation backed by their metadata store. The default preserves compatibility for
-    /// catalogs that only implement the original Paimon-only [`Self::list_tables`] contract.
+    /// Catalogs that know their declared table types should override this method with an
+    /// implementation backed by their metadata store. The default is deliberately empty so a
+    /// mixed or legacy catalog is not assumed to support Paimon system tables.
     async fn list_table_types(
         &self,
         _database_name: &str,
-        table_names: &[String],
+        _table_names: &[String],
     ) -> Result<HashMap<String, TableType>> {
-        Ok(table_names
-            .iter()
-            .cloned()
-            .map(|name| (name, TableType::Table))
-            .collect())
+        Ok(HashMap::new())
     }
 
     /// Create a table.

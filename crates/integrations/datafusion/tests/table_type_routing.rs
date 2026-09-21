@@ -1235,6 +1235,24 @@ async fn the_default_load_table_classifies_for_a_catalog_that_only_has_get_table
 }
 
 #[tokio::test]
+async fn default_table_type_listing_does_not_claim_system_table_support() {
+    let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
+    let provider = PaimonCatalogProvider::try_new(
+        Some(CATALOG.to_string()),
+        catalog,
+        Default::default(),
+        Default::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let schema = provider.schema(DB).unwrap();
+
+    assert!(schema.table_exist("it"));
+    assert!(!schema.table_exist("it$snapshots"));
+}
+
+#[tokio::test]
 async fn a_legacy_catalog_cannot_serve_an_external_table_as_paimon() {
     let (_dir, catalog) = legacy_catalog_with_iceberg_table().await;
     let mut ctx = SQLContext::new();

@@ -35,7 +35,6 @@ use crate::table::{ObjectTable, SchemaManager, Table};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::TimeZone;
-use futures::{stream, StreamExt, TryStreamExt};
 use opendal::raw::get_basename;
 use snafu::OptionExt;
 
@@ -432,16 +431,14 @@ impl Catalog for FileSystemCatalog {
         database_name: &str,
         table_names: &[String],
     ) -> Result<HashMap<String, TableType>> {
-        stream::iter(table_names.iter().cloned())
-            .map(|table_name| async move {
-                let identifier = Identifier::new(database_name, &table_name);
-                let (_, schema) = self.fetch_table_schema(&identifier).await?;
-                let table_type = CoreOptions::new(schema.options()).table_type()?;
-                Ok((table_name, table_type))
-            })
-            .buffer_unordered(16)
-            .try_collect()
-            .await
+        let mut types = HashMap::with_capacity(table_names.len());
+        for table_name in table_names {
+            let identifier = Identifier::new(database_name, table_name);
+            let (_, schema) = self.fetch_table_schema(&identifier).await?;
+            let table_type = CoreOptions::new(schema.options()).table_type()?;
+            types.insert(table_name.clone(), table_type);
+        }
+        Ok(types)
     }
 
     async fn create_table(
