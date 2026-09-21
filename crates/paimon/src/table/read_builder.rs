@@ -544,7 +544,7 @@ impl<'a> PaimonReadBuilder<'a> {
         TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
             .with_parquet_read_budget(parquet_read_budget)
             .with_blob_parallelism(self.blob_parallelism)
-            .map(|read| read.with_data_evolution_limit(self.limit))
+            .map(|read| read.with_limit(self.limit))
     }
 
     /// Resolve the effective read type, deferring projection name resolution to
