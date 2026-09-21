@@ -157,13 +157,23 @@ plan = rb.new_incremental_scan(2, 5).plan()
 batches = rb.new_read().read(plan.splits())
 ```
 
-The range is `(start_snapshot_id, end_snapshot_id]`. Only APPEND snapshots
-contribute delta manifests. Files use Java batch split packing, with streaming
-read semantics: repeated primary keys and physical retracts remain separate
-rows. Readers do not merge these events into the window's final table state.
-The end snapshot must exist and supplies snapshot metadata, including for empty
-results. Snapshot deletion vectors and automatic global indexes are not applied
-to historical events. Builder filters, projections, and limits still apply.
+The range is `(start_snapshot_id, end_snapshot_id]`. The default `delta` mode
+uses APPEND delta manifests. Use `changelog` to read physical changelog
+manifests, or `auto` to follow the table's `incremental-between` option:
+
+```python
+plan = rb.new_incremental_scan(2, 5, "changelog").plan()
+batches = rb.with_include_row_kind(True).new_read().read(plan.splits())
+```
+
+Explicit `diff` mode is rejected because a diff contains before/after split
+pairs and cannot be represented by the ordinary `Plan.splits()` contract.
+Files use Java batch split packing, with streaming read semantics: repeated
+primary keys and physical retracts remain separate rows. Readers do not merge
+these events into the window's final table state. The end snapshot must exist
+and supplies snapshot metadata, including for empty results. Snapshot deletion
+vectors and automatic global indexes are not applied to historical events.
+Builder filters, projections, and limits still apply.
 
 `split.is_streaming()` identifies this read contract. `split.serialize()` exports
 both batch and streaming splits to Java binary encoding, preserving the streaming

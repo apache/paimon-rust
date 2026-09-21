@@ -92,6 +92,9 @@ class ReadBuilder:
         """Set a scan-planning row-limit hint, not an exact cap: a matching split is
         returned whole. Apply application-level limiting for an exact bound."""
         ...
+    def with_include_row_kind(self, include: bool) -> "ReadBuilder":
+        """Include a leading ``rowkind`` string column in native read results."""
+        ...
     def with_blob_parallelism(self, blob_parallelism: int) -> "ReadBuilder":
         """Set the maximum number of concurrent BLOB range reads. Must be positive."""
         ...
@@ -100,11 +103,20 @@ class ReadBuilder:
         """Set Data Evolution row ranges. Empty selects no rows; format tables are unsupported."""
         ...
     def new_scan(self) -> TableScan: ...
-    def new_incremental_scan(self, start_snapshot_id: int, end_snapshot_id: int) -> TableScan:
-        """Plan APPEND deltas in (start, end] together, preserving physical change events.
+    def new_incremental_scan(
+        self,
+        start_snapshot_id: int,
+        end_snapshot_id: int,
+        mode: str = "delta",
+    ) -> TableScan:
+        """Plan incremental files in (start, end] as one native plan.
 
-        Snapshot IDs are used, not timestamps. The end snapshot must exist.
-        Row-position slicing and sharding use the combined delta batch as their position space.
+        ``mode`` accepts ``delta``, ``changelog`` or ``auto``. Delta reads APPEND
+        manifests; changelog reads physical changelog manifests; auto follows the
+        table's changelog-producer option. Diff is not representable as one
+        split list and is rejected. Snapshot IDs are used, not timestamps. The
+        end snapshot must exist. Row-position slicing and sharding use the
+        combined delta batch as their position space.
         """
         ...
     def new_read(self) -> "TableRead": ...

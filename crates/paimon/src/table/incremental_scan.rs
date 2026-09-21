@@ -296,6 +296,42 @@ impl<'a> IncrementalScan<'a> {
         }
     }
 
+    /// Plan a Delta or Changelog range as one ordinary [`Plan`].
+    ///
+    /// This is the bridge used by readers which already consume
+    /// [`DataSplit`]s. Delta keeps its cross-snapshot packing semantics;
+    /// Changelog preserves physical changelog files and row kinds in snapshot
+    /// order. `Auto` resolves from `changelog-producer`. Diff cannot be
+    /// represented by an ordinary split list because each unit contains a
+    /// before/after pair.
+    pub async fn plan_combined(&self) -> crate::Result<Plan> {
+        match self.resolve_mode() {
+            IncrementalScanMode::Delta => self.plan_combined_delta().await,
+            IncrementalScanMode::Changelog => {
+                let incremental = self.plan().await?;
+                let mut splits = Vec::with_capacity(incremental.splits().len());
+                for split in incremental.splits() {
+                    match split {
+                        IncrementalSplit::Data(split) => splits.push(split.clone()),
+                        IncrementalSplit::DiffPair { .. } => {
+                            return Err(crate::Error::UnexpectedError {
+                                message: "DiffPair appeared in a Changelog incremental plan"
+                                    .to_string(),
+                                source: None,
+                            });
+                        }
+                    }
+                }
+                Ok(Plan::new(splits).with_snapshot_id(self.end_inclusive))
+            }
+            IncrementalScanMode::Diff => Err(crate::Error::Unsupported {
+                message: "Combined incremental planning does not support Diff mode; Diff requires before/after split pairs"
+                    .to_string(),
+            }),
+            IncrementalScanMode::Auto => unreachable!("Auto must resolve before planning"),
+        }
+    }
+
     /// Plan APPEND deltas with batch split packing and streaming read semantics.
     /// Each physical change is retained, including repeated keys and retracts.
     ///
