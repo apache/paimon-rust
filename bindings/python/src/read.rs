@@ -412,6 +412,8 @@ impl PyReadBuilder {
             incremental_range: None,
             row_position_slice: None,
             row_position_shard: None,
+            chunk_shuffle: None,
+            shard: None,
         }
     }
 
@@ -449,6 +451,14 @@ pub struct PyTableScan {
     incremental_range: Option<(i64, i64)>,
     row_position_slice: Option<(u64, u64)>,
     row_position_shard: Option<(u64, u64)>,
+    chunk_shuffle: Option<PyChunkShuffle>,
+    shard: Option<(usize, usize)>,
+}
+
+#[derive(Clone)]
+struct PyChunkShuffle {
+    seed: String,
+    chunk_size: u64,
 }
 
 impl PyTableScan {
@@ -463,6 +473,14 @@ impl PyTableScan {
             scan = scan
                 .with_row_position_shard(index, count)
                 .map_err(to_py_err)?;
+        }
+        if let Some(chunk_shuffle) = &self.chunk_shuffle {
+            scan = scan
+                .with_chunk_shuffle(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
+                .map_err(to_py_err)?;
+        }
+        if let Some((index, count)) = self.shard {
+            scan = scan.with_shard(index, count).map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -484,6 +502,14 @@ impl PyTableScan {
             scan = scan
                 .with_row_position_shard(index, count)
                 .map_err(to_py_err)?;
+        }
+        if let Some(chunk_shuffle) = &self.chunk_shuffle {
+            scan = scan
+                .with_chunk_shuffle(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
+                .map_err(to_py_err)?;
+        }
+        if let Some((index, count)) = self.shard {
+            scan = scan.with_shard(index, count).map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -530,6 +556,35 @@ impl PyTableScan {
             .with_row_position_shard(index, count)
             .map_err(to_py_err)?;
         slf.row_position_shard = Some((index, count));
+        Ok(slf)
+    }
+
+    /// Deterministically shuffle fixed-live-row chunks. `seed` is a decimal
+    /// Python integer string so arbitrarily large seeds retain Python's
+    /// `random.Random` semantics.
+    fn with_chunk_shuffle(
+        mut slf: PyRefMut<'_, Self>,
+        seed: String,
+        chunk_size: u64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        // Validate every combination immediately, not only when plan() runs.
+        slf.core_scan()?
+            .with_chunk_shuffle(&seed, chunk_size)
+            .map_err(to_py_err)?;
+        slf.chunk_shuffle = Some(PyChunkShuffle { seed, chunk_size });
+        Ok(slf)
+    }
+
+    /// Select one balanced worker shard for a distributed scan.
+    fn with_shard(
+        mut slf: PyRefMut<'_, Self>,
+        index: usize,
+        count: usize,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.core_scan()?
+            .with_shard(index, count)
+            .map_err(to_py_err)?;
+        slf.shard = Some((index, count));
         Ok(slf)
     }
 
@@ -756,7 +811,8 @@ impl PySplit {
 
 #[pymethods]
 impl PySplit {
-    /// Physical row count: sum of data-file row counts (not a logical result count).
+    /// Selected row count for IndexedSplit-compatible row ranges, otherwise
+    /// the sum of physical data-file row counts.
     fn row_count(&self) -> i64 {
         self.inner.row_count()
     }

@@ -256,11 +256,30 @@ impl<'a> IncrementalScan<'a> {
         Ok(self)
     }
 
+    /// Repack the combined APPEND-delta batch into deterministic chunks.
+    pub fn with_chunk_shuffle(
+        mut self,
+        seed: impl ToString,
+        chunk_size: u64,
+    ) -> crate::Result<Self> {
+        self.scan = self.scan.with_chunk_shuffle(seed, chunk_size)?;
+        Ok(self)
+    }
+
+    /// Select one balanced worker shard for a distributed scan.
+    pub fn with_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
+        self.scan = self.scan.with_shard(index, count)?;
+        Ok(self)
+    }
+
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
         crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        if self.scan.has_row_position_selection() {
+        if self.scan.has_row_position_selection()
+            || self.scan.has_chunk_shuffle()
+            || self.scan.has_shard()
+        {
             return Err(crate::Error::Unsupported {
-                message: "Incremental row-position selection requires combined delta planning"
+                message: "Incremental row-position selection, chunk_shuffle and sharding require combined delta planning"
                     .into(),
             });
         }

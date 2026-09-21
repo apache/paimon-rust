@@ -45,7 +45,9 @@ pub(crate) fn data_evolution_anchor_file(files: &[DataFileMeta]) -> crate::Resul
 }
 // ======================= RowRange ===============================
 
-/// An inclusive row ID range `[from, to]` for filtering reads in data evolution mode.
+/// An inclusive row range `[from, to]` in the coordinate system of the read
+/// path: stable row IDs for row-tracked tables, or physical positions for raw
+/// tables without row tracking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowRange {
     from: i64,
@@ -495,6 +497,9 @@ pub struct DataSplit {
     /// Deletion file for each data file, same order as `data_files`.
     /// `None` at index `i` means no deletion file for `data_files[i]` (matches Java getDeletionFiles() / List<DeletionFile> with null elements).
     data_deletion_files: Option<Arc<[Option<DeletionFile>]>>,
+    /// IndexedSplit-compatible ranges. Row-tracked tables interpret these as
+    /// stable row IDs; raw tables without row tracking interpret them as
+    /// split-local physical positions over `data_files` in list order.
     row_ranges: Option<Arc<[RowRange]>>,
     /// Whether the split can be read raw, without the merge reader: its
     /// physical rows are exactly its logical rows (modulo deletion files).
@@ -587,6 +592,9 @@ impl DataSplit {
     /// nothing, so the result is a lower bound, not a total. Ask
     /// [`Self::row_counts_known`] before presenting it as one.
     pub fn row_count(&self) -> i64 {
+        if let Some(ranges) = &self.row_ranges {
+            return ranges.iter().map(RowRange::count).sum();
+        }
         self.data_files
             .iter()
             .filter(|f| f.row_count_known())
@@ -619,6 +627,9 @@ impl DataSplit {
     ///
     /// Reference: [DataSplit.mergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L133)
     pub fn merged_row_count(&self) -> Option<i64> {
+        if let Some(ranges) = &self.row_ranges {
+            return Some(ranges.iter().map(RowRange::count).sum());
+        }
         if !self.row_counts_known() {
             return None;
         }
@@ -2243,6 +2254,8 @@ mod tests {
             .with_row_ranges(vec![RowRange::new(1, 4), RowRange::new(11, 13)])
             .build()
             .unwrap();
+        assert_eq!(split.row_count(), 7);
+        assert_eq!(split.merged_row_count(), Some(7));
         assert_eq!(split.serialize_split_v1().unwrap(), expected);
     }
 

@@ -21,6 +21,7 @@
 //! and [FullStartingScanner](https://github.com/apache/paimon/blob/release-1.3/paimon-python/pypaimon/read/scanner/full_starting_scanner.py).
 
 use super::bucket_filter::compute_target_buckets;
+use super::chunk_shuffle::{chunk_shuffle_splits, ChunkShuffle};
 use super::format_table_scan::FormatTableScan;
 use super::global_index_scanner::RowRangeIndex;
 use super::global_index_types::normalize_queryable_global_index_type;
@@ -1136,11 +1137,100 @@ impl<'a> TableScan<'a> {
         self.with_row_position_selection(RowPositionSelection::shard(index, count)?)
     }
 
+    /// Repack an append scan into deterministic fixed-live-row chunks.
+    ///
+    /// `seed` must render as a decimal integer. Accepting any `ToString` seed
+    /// keeps ordinary Rust integer calls ergonomic while allowing language
+    /// bindings to preserve arbitrary-precision integer seeds.
+    pub fn with_chunk_shuffle(self, seed: impl ToString, chunk_size: u64) -> crate::Result<Self> {
+        let config = ChunkShuffle::from_decimal_seed(&seed.to_string(), chunk_size)?;
+        match self.0 {
+            TableScanKind::Paimon(mut scan) => {
+                if !scan.table.schema().primary_keys().is_empty() {
+                    return Err(crate::Error::Unsupported {
+                        message: "chunk_shuffle only supports append tables".to_string(),
+                    });
+                }
+                if scan.limit.is_some() {
+                    return Err(crate::Error::Unsupported {
+                        message: "chunk_shuffle cannot combine with limit".to_string(),
+                    });
+                }
+                if scan.row_ranges.is_some() || scan.row_position_selection().is_some() {
+                    return Err(crate::Error::Unsupported {
+                        message:
+                            "chunk_shuffle cannot combine with row ranges or positional selection"
+                                .to_string(),
+                    });
+                }
+                if !scan.data_predicates.is_empty() {
+                    return Err(crate::Error::Unsupported {
+                        message: "chunk_shuffle only supports partition predicates".to_string(),
+                    });
+                }
+                scan.split_selection = Some(Box::new(ScanSplitSelection {
+                    mode: Some(ScanSplitMode::ChunkShuffle(config)),
+                    shard: scan.shard(),
+                }));
+                Ok(Self(TableScanKind::Paimon(scan)))
+            }
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "format tables do not support chunk_shuffle".to_string(),
+            }),
+        }
+    }
+
+    /// Select one balanced worker shard for a distributed scan.
+    ///
+    /// Sharding is scan-level state, independent of the selected planning
+    /// strategy, so callers may configure it before or after chunk shuffling.
+    pub fn with_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
+        if count == 0 || index >= count {
+            return Err(crate::Error::DataInvalid {
+                message: "shard count must be positive and index less than count".to_string(),
+                source: None,
+            });
+        }
+        match &mut self.0 {
+            TableScanKind::Paimon(scan) => {
+                if scan.row_position_selection().is_some() {
+                    return Err(crate::Error::DataInvalid {
+                        message:
+                            "with_shard and row-position selection cannot be used simultaneously"
+                                .to_string(),
+                        source: None,
+                    });
+                }
+                match scan.split_selection.as_deref_mut() {
+                    Some(selection) => selection.shard = Some((index, count)),
+                    None => {
+                        scan.split_selection = Some(Box::new(ScanSplitSelection {
+                            mode: None,
+                            shard: Some((index, count)),
+                        }));
+                    }
+                }
+                Ok(self)
+            }
+            TableScanKind::Format(_) => Err(crate::Error::Unsupported {
+                message: "format tables do not support sharding".to_string(),
+            }),
+        }
+    }
+
     pub(crate) fn has_row_position_selection(&self) -> bool {
         match &self.0 {
-            TableScanKind::Paimon(scan) => scan.row_position_selection.is_some(),
+            TableScanKind::Paimon(scan) => scan.row_position_selection().is_some(),
             TableScanKind::Format(_) => false,
         }
+    }
+
+    pub(crate) fn has_chunk_shuffle(&self) -> bool {
+        matches!(&self.0, TableScanKind::Paimon(scan) if scan.chunk_shuffle().is_some())
+    }
+
+    pub(crate) fn has_shard(&self) -> bool {
+        matches!(&self.0, TableScanKind::Paimon(scan) if scan.shard().is_some())
     }
 
     fn with_row_position_selection(self, selection: RowPositionSelection) -> crate::Result<Self> {
@@ -1148,8 +1238,24 @@ impl<'a> TableScan<'a> {
             TableScanKind::Paimon(mut scan)
                 if scan.table.schema().core_options().data_evolution_enabled() =>
             {
+                if scan.chunk_shuffle().is_some() {
+                    return Err(crate::Error::DataInvalid {
+                        message:
+                            "row-position selection and chunk_shuffle cannot be used simultaneously"
+                                .into(),
+                        source: None,
+                    });
+                }
+                if scan.shard().is_some() {
+                    return Err(crate::Error::DataInvalid {
+                        message:
+                            "row-position selection and with_shard cannot be used simultaneously"
+                                .into(),
+                        source: None,
+                    });
+                }
                 if scan
-                    .row_position_selection
+                    .row_position_selection()
                     .is_some_and(|previous| previous.is_slice() != selection.is_slice())
                 {
                     return Err(crate::Error::DataInvalid {
@@ -1158,7 +1264,10 @@ impl<'a> TableScan<'a> {
                         source: None,
                     });
                 }
-                scan.row_position_selection = Some(selection);
+                scan.split_selection = Some(Box::new(ScanSplitSelection {
+                    mode: Some(ScanSplitMode::RowPosition(selection)),
+                    shard: None,
+                }));
                 Ok(Self(TableScanKind::Paimon(scan)))
             }
             _ => Err(crate::Error::Unsupported {
@@ -1265,6 +1374,18 @@ impl<'a> TableScan<'a> {
 ///
 /// Reference: [pypaimon.read.table_scan.TableScan](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_scan.py)
 #[derive(Debug, Clone)]
+enum ScanSplitMode {
+    RowPosition(RowPositionSelection),
+    ChunkShuffle(ChunkShuffle),
+}
+
+#[derive(Debug, Clone)]
+struct ScanSplitSelection {
+    mode: Option<ScanSplitMode>,
+    shard: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
 struct PaimonTableScan<'a> {
     table: &'a Table,
     partition_filter: Option<PartitionFilter>,
@@ -1274,7 +1395,10 @@ struct PaimonTableScan<'a> {
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
     row_ranges: Option<Vec<RowRange>>,
-    row_position_selection: Option<RowPositionSelection>,
+    /// Mutually exclusive row-position or fixed-row chunk transformation.
+    /// Boxed because scans normally use neither, and keeping the cold payload
+    /// out of the scan preserves the compact `TableScanKind` representation.
+    split_selection: Option<Box<ScanSplitSelection>>,
     /// Diff compares complete logical states, so it must not accept physical
     /// row-range pruning from an explicit range or a global-index lookup.
     row_range_optimization_disabled: bool,
@@ -1287,6 +1411,34 @@ struct PaimonTableScan<'a> {
 }
 
 impl<'a> PaimonTableScan<'a> {
+    fn row_position_selection(&self) -> Option<RowPositionSelection> {
+        match self
+            .split_selection
+            .as_deref()
+            .and_then(|selection| selection.mode.as_ref())
+        {
+            Some(ScanSplitMode::RowPosition(selection)) => Some(*selection),
+            _ => None,
+        }
+    }
+
+    fn chunk_shuffle(&self) -> Option<&ChunkShuffle> {
+        match self
+            .split_selection
+            .as_deref()
+            .and_then(|selection| selection.mode.as_ref())
+        {
+            Some(ScanSplitMode::ChunkShuffle(config)) => Some(config),
+            _ => None,
+        }
+    }
+
+    fn shard(&self) -> Option<(usize, usize)> {
+        self.split_selection
+            .as_deref()
+            .and_then(|selection| selection.shard)
+    }
+
     fn is_streaming(&self) -> bool {
         self.incremental_split_mode.is_some()
     }
@@ -1306,7 +1458,7 @@ impl<'a> PaimonTableScan<'a> {
             bucket_predicate,
             limit,
             row_ranges,
-            row_position_selection: None,
+            split_selection: None,
             row_range_optimization_disabled: false,
             scan_all_files: false,
             incremental_split_mode: None,
@@ -1335,7 +1487,7 @@ impl<'a> PaimonTableScan<'a> {
 
     fn without_row_range_optimization(mut self) -> Self {
         self.row_ranges = None;
-        self.row_position_selection = None;
+        self.split_selection = None;
         self.row_range_optimization_disabled = true;
         self
     }
@@ -1368,6 +1520,7 @@ impl<'a> PaimonTableScan<'a> {
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
+        self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let snapshot = match super::time_travel::resolve_snapshot(self.table).await? {
             Some(snapshot) => snapshot,
@@ -1380,6 +1533,7 @@ impl<'a> PaimonTableScan<'a> {
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         self.ensure_query_auth_allowed()?;
+        self.validate_shard_strategy()?;
         let mut trace = ScanTrace {
             limit: self.limit,
             ..Default::default()
@@ -1406,6 +1560,15 @@ impl<'a> PaimonTableScan<'a> {
     /// exposes file paths, row counts, and stats the client can't authorize.
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
+    }
+
+    fn validate_shard_strategy(&self) -> crate::Result<()> {
+        if self.shard().is_some() && self.chunk_shuffle().is_none() {
+            return Err(crate::Error::Unsupported {
+                message: "with_shard currently requires chunk_shuffle".to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn projected_read_field_ids(&self) -> crate::Result<Option<HashSet<i32>>> {
@@ -1764,6 +1927,7 @@ impl<'a> PaimonTableScan<'a> {
         end_snapshot: &Snapshot,
     ) -> crate::Result<Plan> {
         self.ensure_query_auth_allowed()?;
+        self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut scan = self.clone();
         scan.incremental_split_mode = Some(IncrementalSplitMode::Batch);
@@ -1826,7 +1990,7 @@ impl<'a> PaimonTableScan<'a> {
         // Positional scans count all candidate row IDs. Pruning a preceding
         // manifest or file here would renumber the surviving rows; intersect
         // explicit/global-index ranges after assigning positions instead.
-        let row_range_index = if data_evolution_enabled && self.row_position_selection.is_none() {
+        let row_range_index = if data_evolution_enabled && self.row_position_selection().is_none() {
             manifest_row_ranges.clone().map(RowRangeIndex::create)
         } else {
             None
@@ -2121,7 +2285,7 @@ impl<'a> PaimonTableScan<'a> {
         // Positional scans count all candidate row IDs. Pruning a preceding
         // manifest or file here would renumber the surviving rows; intersect
         // explicit/global-index ranges after assigning positions instead.
-        let row_range_index = if data_evolution_enabled && self.row_position_selection.is_none() {
+        let row_range_index = if data_evolution_enabled && self.row_position_selection().is_none() {
             manifest_row_ranges.clone().map(RowRangeIndex::create)
         } else {
             None
@@ -2177,7 +2341,7 @@ impl<'a> PaimonTableScan<'a> {
         // Assign row positions using the full candidate file ranges, before
         // group stats, projection or DVs change visible rows. Intersect explicit
         // and index-selected ranges only after assigning the positional range.
-        let effective_row_ranges = if let Some(selection) = self.row_position_selection {
+        let effective_row_ranges = if let Some(selection) = self.row_position_selection() {
             Some(selection.select(&entries, effective_row_ranges.as_deref())?)
         } else {
             effective_row_ranges
@@ -2395,7 +2559,7 @@ impl<'a> PaimonTableScan<'a> {
                     row_id_groups
                 };
 
-                if self.row_position_selection.is_some() {
+                if self.row_position_selection().is_some() {
                     // Positional scans promise row-id order across groups. A
                     // projected group can become a singleton, so moving all
                     // multi-file groups first would change which rows a limit
@@ -2557,6 +2721,11 @@ impl<'a> PaimonTableScan<'a> {
                 let split_candidates_built = splits.len();
                 (splits, split_candidates_built, false)
             };
+        let splits = if let Some(config) = self.chunk_shuffle() {
+            chunk_shuffle_splits(self.table, splits, config, self.shard()).await?
+        } else {
+            splits
+        };
         let splits_before_limit = split_candidates_built;
         if let Some(trace) = trace {
             let final_files = splits.iter().map(|split| split.data_files().len()).sum();
@@ -3680,6 +3849,44 @@ mod tests {
             .unwrap()
             .with_row_position_shard(1, 2)
             .is_ok());
+        assert!(reader
+            .new_scan()
+            .with_row_position_shard(0, 1)
+            .unwrap()
+            .with_chunk_shuffle(0, 1)
+            .is_err());
+        assert!(reader
+            .new_scan()
+            .with_row_position_shard(0, 1)
+            .unwrap()
+            .with_shard(0, 1)
+            .is_err());
+        assert!(reader
+            .new_scan()
+            .with_shard(0, 1)
+            .unwrap()
+            .with_row_position_shard(0, 1)
+            .is_err());
+        assert!(reader
+            .new_scan()
+            .with_chunk_shuffle(0, 1)
+            .unwrap()
+            .with_row_position_shard(0, 1)
+            .is_err());
+        assert!(reader
+            .new_scan()
+            .with_shard(0, 1)
+            .unwrap()
+            .with_chunk_shuffle(0, 1)
+            .is_ok());
+        assert!(reader
+            .new_scan()
+            .with_chunk_shuffle(0, 1)
+            .unwrap()
+            .with_shard(0, 1)
+            .is_ok());
+        assert!(reader.new_scan().with_shard(0, 0).is_err());
+        assert!(reader.new_scan().with_shard(1, 1).is_err());
     }
 
     #[tokio::test]

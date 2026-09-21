@@ -79,6 +79,100 @@ def test_with_blob_parallelism():
             table.new_read_builder().with_blob_parallelism(0)
 
 
+def test_chunk_shuffle_takes_seed_and_chunk_size_before_optional_shard():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+
+        scan = builder.new_scan()
+        assert scan.with_chunk_shuffle(str(2 ** 70), 2) is scan
+        plan = scan.plan()
+        for split in plan.splits():
+            restored = Split.deserialize(split.serialize())
+            assert restored.row_count() == split.row_count()
+        chunks = [
+            pa.Table.from_batches(builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in plan.splits()
+        ]
+        assert sorted(value for chunk in chunks for value in chunk) == [1, 2, 3]
+        assert all(0 < len(chunk) <= 2 for chunk in chunks)
+
+        sharded = []
+        for index in range(2):
+            shard = (
+                builder.new_scan()
+                .with_chunk_shuffle(str(2 ** 70), 2)
+                .with_shard(index, 2)
+                .plan()
+            )
+            sharded.extend(
+                pa.Table.from_batches(builder.new_read().read([split]))
+                .column("id").to_pylist()
+                for split in shard.splits()
+            )
+        assert sharded == chunks
+
+        # Shard is scan-level state, so it may be configured before shuffle.
+        before_shuffle = (
+            builder.new_scan()
+            .with_shard(0, 2)
+            .with_chunk_shuffle(str(2 ** 70), 2)
+            .plan()
+        )
+        before_rows = [
+            pa.Table.from_batches(builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in before_shuffle.splits()
+        ]
+        after_rows = [
+            pa.Table.from_batches(builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in (
+                builder.new_scan()
+                .with_chunk_shuffle(str(2 ** 70), 2)
+                .with_shard(0, 2)
+                .plan()
+                .splits()
+            )
+        ]
+        assert before_rows == after_rows
+
+        with pytest.raises(ValueError, match="count must be positive"):
+            builder.new_scan().with_shard(0, 0)
+        with pytest.raises(RuntimeError, match="requires chunk_shuffle"):
+            builder.new_scan().with_shard(0, 2).plan()
+
+
+def test_chunk_shuffle_reads_split_local_ranges_across_files():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("CREATE TABLE paimon.rdb.t (id INT)")
+        ctx.sql("INSERT INTO paimon.rdb.t VALUES (1), (2)")
+        ctx.sql("INSERT INTO paimon.rdb.t VALUES (3), (4)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.t")
+        builder = table.new_read_builder().with_projection(["id"])
+        splits = (
+            builder.new_scan()
+            .with_chunk_shuffle("7", 3)
+            .plan()
+            .splits()
+        )
+
+        chunks = []
+        for split in splits:
+            restored = Split.deserialize(split.serialize())
+            chunks.append(
+                pa.Table.from_batches(builder.new_read().read([restored]))
+                .column("id").to_pylist()
+            )
+
+        assert sorted(len(chunk) for chunk in chunks) == [1, 3]
+        assert sorted(value for chunk in chunks for value in chunk) == [1, 2, 3, 4]
+
+
 def test_with_row_ranges():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
@@ -107,6 +201,43 @@ def test_with_row_ranges():
 
         with pytest.raises(ValueError, match="start 2 exceeds end 1"):
             table.new_read_builder().with_row_ranges([(2, 1)])
+
+
+def test_row_tracking_append_row_ranges_keep_global_row_ids():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("""CREATE TABLE paimon.rdb.tracked (id INT, pt STRING)
+            PARTITIONED BY (pt) WITH ('row-tracking.enabled' = 'true')""")
+        ctx.sql("""INSERT INTO paimon.rdb.tracked VALUES
+            (1, 'a'), (2, 'a'), (3, 'a')""")
+        ctx.sql("""INSERT INTO paimon.rdb.tracked VALUES
+            (4, 'b'), (5, 'b'), (6, 'b')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.tracked")
+        builder = table.new_read_builder().with_row_ranges([(3, 4)])
+
+        plan = builder.new_scan().plan()
+        rows = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+
+        assert rows.column("id").to_pylist() == [4, 5]
+
+        chunk_builder = table.new_read_builder().with_projection(["id"])
+        chunks = (
+            chunk_builder.new_scan()
+            .with_chunk_shuffle("7", 2)
+            .plan()
+            .splits()
+        )
+        chunk_rows = [
+            pa.Table.from_batches(chunk_builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in chunks
+        ]
+        assert all(0 < len(values) <= 2 for values in chunk_rows)
+        assert sorted(value for values in chunk_rows for value in values) == [
+            1, 2, 3, 4, 5, 6,
+        ]
 
 
 def test_format_table_rejects_row_ranges():
@@ -205,7 +336,7 @@ def test_indexed_split_wire_roundtrip_preserves_row_ranges():
         restored = Split.deserialize(split.serialize())
         rows = pa.Table.from_batches(builder.new_read().read([restored]))
 
-        assert restored.row_count() == 3
+        assert restored.row_count() == 1
         assert rows.column("id").to_pylist() == [2]
 
 
