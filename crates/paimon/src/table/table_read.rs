@@ -159,6 +159,19 @@ impl<'a> TableRead<'a> {
         })
     }
 
+    /// Pass the read limit to paths that can enforce it. Data-evolution reads
+    /// apply it before BLOB resolution; other Paimon reads still use the
+    /// builder limit only as a scan hint.
+    pub(crate) fn with_limit(self, limit: Option<usize>) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(mut read) => {
+                read.limit = limit;
+                Self(TableReadKind::Paimon(read))
+            }
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
+        }
+    }
+
     /// Attach an engine-specific Parquet decoder-filter factory.
     ///
     /// The hook is used only by schema-identical raw reads. Callers must still
@@ -276,6 +289,7 @@ struct PaimonTableRead<'a> {
     parquet_read_budget: Option<Arc<ReadBudget>>,
     data_file_read_timing: Option<Arc<DataFileReadTiming>>,
     blob_parallelism: usize,
+    limit: Option<usize>,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -293,6 +307,7 @@ impl<'a> PaimonTableRead<'a> {
             parquet_read_budget: None,
             data_file_read_timing: None,
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
+            limit: None,
         }
     }
 
@@ -1000,6 +1015,7 @@ impl<'a> PaimonTableRead<'a> {
             self.table.rest_env().cloned(),
         )?
         .with_batch_size(Some(core_options.read_batch_size()?))
+        .with_limit(self.limit)
         .with_blob_parallelism(self.blob_parallelism)
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
         .with_table_options(self.table.schema().options().clone())
