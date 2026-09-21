@@ -536,10 +536,18 @@ impl DataFileReader {
         let file_predicates = if row_id_residual {
             None
         } else {
+            // A ROW file is positional and may contain only write_cols or
+            // leading KV key/system fields. Its decoded schema, not the full
+            // table schema, determines which predicate columns exist.
+            let predicate_fields = if is_row_file {
+                &format_read_fields
+            } else {
+                &file_fields
+            };
             let remapped = crate::arrow::filtering::remap_predicates_to_file(
                 &predicates,
                 &table_fields,
-                &file_fields,
+                predicate_fields,
             );
             if remapped.is_empty() && row_filter_factory.is_none() {
                 None
@@ -547,7 +555,7 @@ impl DataFileReader {
                 Some(crate::arrow::format::FilePredicates {
                     predicates: remapped,
                     row_filter_factory,
-                    file_fields: file_fields.clone(),
+                    file_fields: predicate_fields.clone(),
                 })
             }
         };
@@ -832,10 +840,15 @@ impl DataFileReader {
 
         // Remap predicates from table-level to file-level indices.
         let file_predicates = {
+            let predicate_fields = if is_row_file {
+                &format_read_fields
+            } else {
+                &file_fields
+            };
             let remapped = crate::arrow::filtering::remap_predicates_to_file(
                 &predicates,
                 &table_fields,
-                &file_fields,
+                predicate_fields,
             );
             if remapped.is_empty() {
                 None
@@ -843,7 +856,7 @@ impl DataFileReader {
                 Some(crate::arrow::format::FilePredicates {
                     predicates: remapped,
                     row_filter_factory: None,
-                    file_fields: file_fields.clone(),
+                    file_fields: predicate_fields.clone(),
                 })
             }
         };
@@ -1681,6 +1694,65 @@ mod row_tests {
             })
             .collect();
         assert_eq!(ages, vec![30, 40, 50]);
+    }
+
+    #[tokio::test]
+    async fn row_partial_write_cols_resolve_predicates_against_physical_schema() {
+        let fields = vec![
+            field(0, "id", DataType::Int(IntType::new())),
+            field(1, "age", DataType::Int(IntType::new())),
+        ];
+        let schema = build_target_arrow_schema(&fields[..1]).unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
+                .unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/row_partial_predicate";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "partial.row";
+        let output = file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap();
+        let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size as i64;
+        let mut file = data_file(file_name, file_size, 2, 1);
+        file.write_cols = Some(vec!["id".to_string()]);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .build()
+            .unwrap();
+        let predicates = PredicateBuilder::new(&fields);
+        for (predicate, expected_rows) in [
+            (predicates.is_null("age").unwrap(), 2),
+            (predicates.greater_than("age", Datum::Int(0)).unwrap(), 0),
+        ] {
+            let reader = DataFileReader::new(
+                file_io.clone(),
+                SchemaManager::new(file_io.clone(), table_path.to_string()),
+                1,
+                fields.clone(),
+                vec![fields[0].clone()],
+                vec![predicate],
+            );
+            let batches = reader
+                .read(std::slice::from_ref(&split))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                expected_rows
+            );
+        }
     }
 
     /// The predicate must not renumber a projected `_ROW_ID`: the surviving row
