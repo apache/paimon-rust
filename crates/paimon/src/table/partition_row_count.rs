@@ -76,8 +76,7 @@ pub struct PartitionRowCount {
     /// The partition's typed values, one field per partition key.
     pub partition_row: BinaryRow,
     /// Rows in the partition: overlapping data-evolution files are counted once
-    /// and deletion-vector rows are subtracted. For primary-key tables this is
-    /// the physical count, before merging keys. `None` when it cannot be known
+    /// and deletion-vector rows are subtracted. `None` when it cannot be known
     /// exactly (a file without a row count, or a deletion vector without a
     /// cardinality) — never a guess.
     pub record_count: Option<i64>,
@@ -665,7 +664,8 @@ impl Table {
     /// Data-evolution files sharing a row-id range contribute once. Results are
     /// ordered by serialized partition bytes.
     ///
-    /// Returns an empty Vec when the table has no snapshots yet.
+    /// Primary-key and format tables return [`crate::Error::Unsupported`].
+    /// Returns an empty Vec when a supported table has no snapshots yet.
     pub async fn partition_row_counts(&self) -> crate::Result<Vec<PartitionRowCount>> {
         self.partition_row_counts_with_filter(None).await
     }
@@ -686,10 +686,11 @@ impl Table {
     }
 
     /// Exact-only variant of [`Table::partition_row_counts_with_filter`].
-    /// Returns `None` when metadata cannot establish all counts. Unknown DV
-    /// cardinalities are checked before fetching data manifests, allowing callers
-    /// to fall back without first doing a full metadata aggregation. This may
-    /// conservatively return `None` for an unknown DV on a no-longer-live file.
+    /// Returns `None` for primary-key or format tables, or when metadata cannot
+    /// establish all counts. Unknown DV cardinalities are checked before fetching
+    /// data manifests, allowing callers to fall back without first doing a full
+    /// metadata aggregation. This may conservatively return `None` for an unknown
+    /// DV on a no-longer-live file.
     pub async fn exact_partition_row_counts_with_filter(
         &self,
         filter: Option<Predicate>,
@@ -706,6 +707,18 @@ impl Table {
         let core = CoreOptions::new(schema.options());
         // Manifests carry partition values.
         core.ensure_read_authorized()?;
+        // Primary-key counts need merging; format tables do not use Paimon snapshots.
+        if core.is_format_table() || !schema.primary_keys().is_empty() {
+            return if require_exact {
+                Ok(None)
+            } else {
+                Err(crate::Error::Unsupported {
+                    message:
+                        "partition row counts are not supported for primary-key or format tables"
+                            .to_string(),
+                })
+            };
+        }
 
         let file_io = self.file_io();
         let Some(snapshot) = super::time_travel::resolve_snapshot(self).await? else {
@@ -854,6 +867,66 @@ mod tests {
             BinaryTableStats::empty(),
             0,
         )
+    }
+
+    #[tokio::test]
+    async fn test_partition_row_counts_table_support_and_authorization() {
+        use crate::catalog::Identifier;
+        use crate::spec::{DataType, IntType, Schema, TableSchema};
+
+        for kind in ["append", "primary-key", "format-table"] {
+            for query_auth in [false, true] {
+                let mut schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .option("query-auth.enabled", query_auth.to_string());
+                if kind == "primary-key" {
+                    schema = schema.primary_key(["id"]);
+                } else if kind == "format-table" {
+                    schema = schema.option("type", "format-table");
+                }
+                // Unsupported tables must not be mistaken for empty tables,
+                // even when no snapshot exists. Authorization must still fail closed.
+                let table = Table::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    Identifier::new("default", kind),
+                    format!("memory:/partition-count-support/{kind}/{query_auth}"),
+                    TableSchema::new(0, &schema.build().unwrap()),
+                    None,
+                );
+                let partial = [
+                    table.partition_row_counts().await,
+                    table.partition_row_counts_with_filter(None).await,
+                ];
+                let exact = table.exact_partition_row_counts_with_filter(None).await;
+                if query_auth {
+                    for result in partial
+                        .into_iter()
+                        .map(|result| result.map(|_| ()))
+                        .chain([exact.map(|_| ())])
+                    {
+                        assert!(
+                            matches!(&result, Err(crate::Error::Unsupported { message })
+                                if message.contains("query-auth.enabled")),
+                            "{kind}: {result:?}"
+                        );
+                    }
+                } else if kind == "append" {
+                    assert_eq!(exact.unwrap(), Some(Vec::new()));
+                    for result in partial {
+                        assert!(result.unwrap().is_empty());
+                    }
+                } else {
+                    assert_eq!(exact.unwrap(), None, "{kind}");
+                    for result in partial {
+                        assert!(
+                            matches!(&result, Err(crate::Error::Unsupported { message })
+                                if message.contains("partition row counts")),
+                            "{kind}: {result:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
