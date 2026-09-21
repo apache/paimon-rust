@@ -52,18 +52,53 @@ type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
 type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
 
-fn validate_unique_file_entries(entries: &[ManifestEntry]) -> Result<()> {
-    let mut adds = HashSet::new();
-    let mut deletes = HashSet::new();
+fn validate_file_entries<'a>(entries: impl IntoIterator<Item = &'a ManifestEntry>) -> Result<()> {
+    // Mirror Java FileEntry.mergeEntries while also rejecting repeated entries
+    // of the same kind instead of letting two DELETEs cancel each other.
+    #[derive(Default)]
+    struct State {
+        added: bool,
+        deleted: bool,
+        present: bool,
+    }
+
+    let mut files = HashMap::new();
     for entry in entries {
-        let (kind, files) = match entry.kind() {
-            FileKind::Add => ("ADD", &mut adds),
-            FileKind::Delete => ("DELETE", &mut deletes),
+        let state = files
+            .entry(entry.identifier())
+            .or_insert_with(State::default);
+        let duplicate = match entry.kind() {
+            FileKind::Add => {
+                if state.present && !state.added {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "File conflict: trying to add file '{}' in bucket {} which is already present.",
+                            entry.file().file_name,
+                            entry.bucket(),
+                        ),
+                        source: None,
+                    });
+                }
+                let duplicate = state.added;
+                state.added = true;
+                state.present = true;
+                duplicate
+            }
+            FileKind::Delete => {
+                let duplicate = state.deleted;
+                state.deleted = true;
+                state.present = !state.present;
+                duplicate
+            }
         };
-        if !files.insert(entry.identifier()) {
+        if duplicate {
             return Err(crate::Error::DataInvalid {
                 message: format!(
-                    "Duplicate {kind} entry for file '{}' in bucket {}.",
+                    "Duplicate {} entry for file '{}' in bucket {}.",
+                    match entry.kind() {
+                        FileKind::Add => "ADD",
+                        FileKind::Delete => "DELETE",
+                    },
                     entry.file().file_name,
                     entry.bucket(),
                 ),
@@ -1311,7 +1346,7 @@ impl TableCommit {
                 new_index_entries,
                 check_from_snapshot,
             } => {
-                validate_unique_file_entries(entries)?;
+                validate_file_entries(entries.iter())?;
 
                 // Auto-promote to OVERWRITE when CoW rewrites produce Delete entries.
                 // This ensures the snapshot correctly reflects file replacements.
@@ -1389,7 +1424,7 @@ impl TableCommit {
                 let entries = self
                     .provide_overwrite_entries(plan, latest_snapshot)
                     .await?;
-                validate_unique_file_entries(&entries)?;
+                validate_file_entries(entries.iter())?;
 
                 let (partition_filter, new_index_entries, check_from_snapshot) = match plan {
                     CommitEntriesPlan::Overwrite {
@@ -1951,6 +1986,7 @@ impl TableCommit {
         check_from_snapshot: Option<i64>,
     ) -> Result<()> {
         self.check_delete_entries_against_base(base_entries, delta_entries)?;
+        validate_file_entries(base_entries.iter().chain(delta_entries))?;
 
         // Validate delta entries before duplicate files are merged.
         self.check_total_bucket_conflicts(delta_entries)?;
@@ -3486,7 +3522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_rejects_duplicate_data_file_entries() {
+    async fn test_commit_rejects_conflicting_data_file_entries() {
         let file_io = test_file_io();
         let table_path = "memory:/test_duplicate_data_file_entries";
         setup_dirs(&file_io, table_path).await;
@@ -3504,7 +3540,7 @@ mod tests {
             .unwrap();
 
         let mut duplicate_delete = CommitMessage::new(partition.clone(), 0, vec![]);
-        duplicate_delete.deleted_files = vec![file.clone(), file];
+        duplicate_delete.deleted_files = vec![file.clone(), file.clone()];
         let error = commit
             .commit(vec![duplicate_delete])
             .await
@@ -3517,7 +3553,7 @@ mod tests {
         let duplicate_add = test_data_file("data-1.parquet", 200);
         let error = commit
             .commit(vec![CommitMessage::new(
-                partition,
+                partition.clone(),
                 0,
                 vec![duplicate_add.clone(), duplicate_add],
             )])
@@ -3527,6 +3563,20 @@ mod tests {
             error.to_string().contains("Duplicate ADD"),
             "unexpected error: {error}"
         );
+
+        let mut add_then_delete = CommitMessage::new(partition.clone(), 0, vec![file.clone()]);
+        add_then_delete.deleted_files = vec![file.clone()];
+        let error = commit
+            .commit(vec![add_then_delete])
+            .await
+            .expect_err("a commit must reject adding an existing file before deleting it");
+        assert!(matches!(error, crate::Error::DataInvalid { .. }));
+
+        let error = commit
+            .overwrite(vec![CommitMessage::new(partition, 0, vec![file])], None)
+            .await
+            .expect_err("overwrite must reject deleting and adding the same file");
+        assert!(matches!(error, crate::Error::DataInvalid { .. }));
 
         let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
         assert_eq!(snapshot.id(), 1);
