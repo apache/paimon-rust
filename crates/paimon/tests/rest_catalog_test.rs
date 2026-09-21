@@ -947,9 +947,14 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
     write_batch(
         &view,
         blob_batch(
-            vec![1, 2, 3],
-            vec!["Kept", "Repeated", "Filtered"],
-            vec![kept_ref.clone(), kept_ref, filtered_out_bad_ref],
+            vec![1, 2, 3, 4],
+            vec!["Kept", "Repeated", "Repeated again", "Filtered"],
+            vec![
+                kept_ref.clone(),
+                kept_ref.clone(),
+                kept_ref,
+                filtered_out_bad_ref,
+            ],
         ),
         "view-writer",
     )
@@ -998,7 +1003,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         vec![(1, "Kept".to_string(), Some(b"bob".to_vec()))]
     );
 
-    // LIMIT alone must not resolve the invalid reference in the third row.
+    // LIMIT alone must not resolve the invalid reference in the fourth row.
     // The repeated reference is read from the lookup cache in a later batch.
     let mut limited_builder = rest_view.new_read_builder();
     limited_builder.with_limit(2);
@@ -1016,6 +1021,38 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
         vec![
             (1, "Kept".to_string(), Some(b"bob".to_vec())),
             (2, "Repeated".to_string(), Some(b"bob".to_vec())),
+        ]
+    );
+
+    // A predicate on the resolved view needs candidate lookups. With batches
+    // of two, the final batch must not resolve the invalid fourth reference
+    // after the third match reaches LIMIT.
+    let predicate_view = rest_view.copy_with_options(HashMap::from([(
+        "read.batch-size".to_string(),
+        "2".to_string(),
+    )]));
+    let mut filtered_builder = predicate_view.new_read_builder();
+    filtered_builder.with_limit(3);
+    filtered_builder.with_filter(
+        PredicateBuilder::new(predicate_view.schema().fields())
+            .is_not_null("picture")
+            .unwrap(),
+    );
+    let filtered_plan = filtered_builder.new_scan().plan().await.unwrap();
+    let filtered = filtered_builder
+        .new_read()
+        .unwrap()
+        .to_arrow(filtered_plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_blob_rows(&filtered),
+        vec![
+            (1, "Kept".to_string(), Some(b"bob".to_vec())),
+            (2, "Repeated".to_string(), Some(b"bob".to_vec())),
+            (3, "Repeated again".to_string(), Some(b"bob".to_vec())),
         ]
     );
 }

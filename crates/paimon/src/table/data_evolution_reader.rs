@@ -248,6 +248,12 @@ impl DataEvolutionReader {
     }
 
     fn effective_batch_size(&self) -> Option<usize> {
+        if self.limit.is_some() && self.predicate_needs_blob_resolution() {
+            // A predicate on the resolved payload must inspect candidates in
+            // order. Reading more than one before the quota is updated can
+            // fetch a later, unselected payload (or invalid view reference).
+            return Some(1);
+        }
         match (self.batch_size, self.limit) {
             (Some(size), Some(limit)) if limit > 0 => Some(size.min(limit)),
             (None, Some(limit)) if limit > 0 => Some(limit),
@@ -365,6 +371,26 @@ impl DataEvolutionReader {
             remaining = remaining.saturating_sub(selected_count);
         }
         Ok(selected)
+    }
+
+    fn predicate_needs_blob_resolution(&self) -> bool {
+        if self.predicates.is_empty() {
+            return false;
+        }
+        let mut resolved_fields = HashSet::new();
+        if self.blob_view_resolve_enabled && self.blob_view_rest_env.is_some() {
+            resolved_fields.extend(self.blob_view_fields.iter().cloned());
+        }
+        if !self.blob_as_descriptor {
+            resolved_fields.extend(self.blob_descriptor_fields.iter().cloned());
+            resolved_fields.extend(
+                self.table_fields
+                    .iter()
+                    .filter(|field| field.data_type().is_blob_file_field())
+                    .map(|field| field.name().to_string()),
+            );
+        }
+        predicates_reference_any_field(&self.predicates, &resolved_fields, &self.table_fields)
     }
 
     pub(crate) fn with_parquet_read_budget(
@@ -3033,6 +3059,54 @@ mod tests {
         assert!(prefix_row_ranges(None, 10, 4, 0).is_empty());
     }
 
+    #[test]
+    fn test_limit_uses_single_candidate_only_for_payload_predicates() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "payload".to_string(), DataType::Blob(BlobType::new())),
+        ];
+        let predicate_builder = PredicateBuilder::new(&fields);
+        let reader = |predicate, blob_as_descriptor| {
+            DataEvolutionReader::new(
+                file_io.clone(),
+                SchemaManager::new(file_io.clone(), "memory:/blob_batch_size".to_string()),
+                1,
+                fields.clone(),
+                fields.clone(),
+                vec![predicate],
+                blob_as_descriptor,
+                HashSet::new(),
+                HashSet::new(),
+                false,
+                None,
+            )
+            .unwrap()
+            .with_batch_size(Some(8))
+            .with_limit(Some(3))
+        };
+
+        assert_eq!(
+            reader(predicate_builder.is_not_null("payload").unwrap(), false).effective_batch_size(),
+            Some(1)
+        );
+        assert_eq!(
+            reader(predicate_builder.equal("id", Datum::Int(1)).unwrap(), false)
+                .effective_batch_size(),
+            Some(3)
+        );
+        assert_eq!(
+            reader(predicate_builder.is_not_null("payload").unwrap(), true).effective_batch_size(),
+            Some(3)
+        );
+        assert_eq!(
+            reader(predicate_builder.is_not_null("payload").unwrap(), false)
+                .with_limit(None)
+                .effective_batch_size(),
+            Some(8)
+        );
+    }
+
     #[tokio::test]
     async fn test_descriptor_columns_resolve_concurrently_and_preserve_order() {
         let schema = Arc::new(arrow_schema::Schema::new(vec![
@@ -5185,12 +5259,32 @@ mod tests {
             let no_match = no_match_builder
                 .new_read()
                 .unwrap()
-                .to_arrow(&[split])
+                .to_arrow(std::slice::from_ref(&split))
                 .unwrap()
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
             assert!(collect_int_values(&no_match, "id").is_empty());
+
+            // A predicate on the BLOB value must inspect each candidate, but
+            // the next batch may not fetch row 4 after three matches satisfy
+            // the quota. Its payload has a deliberately invalid checksum.
+            let mut blob_filter_builder = table.new_read_builder();
+            blob_filter_builder.with_limit(3);
+            blob_filter_builder.with_filter(
+                PredicateBuilder::new(table.schema().fields())
+                    .is_not_null("payload")
+                    .unwrap(),
+            );
+            let filtered = blob_filter_builder
+                .new_read()
+                .unwrap()
+                .to_arrow(&[split])
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(collect_int_values(&filtered, "id"), vec![1, 2, 3]);
 
             // A BLOB-only raw-convertible split must obey the same quota.
             builder.with_projection(&["payload"]).unwrap();
