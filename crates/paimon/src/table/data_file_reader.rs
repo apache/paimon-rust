@@ -1654,7 +1654,7 @@ mod row_tests {
 
         let batches = reader
             .clone()
-            .read(&[split.clone()])
+            .read(std::slice::from_ref(&split))
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
