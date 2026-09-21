@@ -544,6 +544,14 @@ impl DataSplit {
         self.row_ranges.as_deref()
     }
 
+    /// Narrow an already planned split without rebuilding or copying its file
+    /// and deletion-vector metadata. Ranges use the same coordinate system as
+    /// the existing `row_ranges` field.
+    pub(crate) fn with_selected_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
+        self.row_ranges = Some(ranges.into());
+        self
+    }
+
     /// Whether this split can be read raw (no sort-merge needed); see the
     /// field doc. Mirrors Java `DataSplit#rawConvertible`.
     pub fn raw_convertible(&self) -> bool {
