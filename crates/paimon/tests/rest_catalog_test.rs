@@ -3155,6 +3155,14 @@ async fn test_query_auth_enabled_after_a_load_is_seen_by_every_entry() {
     );
     assert_refused(
         table
+            .new_read_builder()
+            .new_incremental_scan(paimon::table::IncrementalScanMode::Delta, 0, 1)
+            .plan_combined()
+            .await
+            .expect_err("a combined incremental plan asks the same way"),
+    );
+    assert_refused(
+        table
             .new_vector_search_builder()
             .execute()
             .await

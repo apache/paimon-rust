@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import json
 import pickle
 import tempfile
 
@@ -79,6 +80,100 @@ def test_with_blob_parallelism():
             table.new_read_builder().with_blob_parallelism(0)
 
 
+def test_chunk_shuffle_takes_seed_and_chunk_size_before_optional_shard():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+
+        scan = builder.new_scan()
+        assert scan.with_chunk_shuffle(str(2 ** 70), 2) is scan
+        plan = scan.plan()
+        for split in plan.splits():
+            restored = Split.deserialize(split.serialize())
+            assert restored.row_count() == split.row_count()
+        chunks = [
+            pa.Table.from_batches(builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in plan.splits()
+        ]
+        assert sorted(value for chunk in chunks for value in chunk) == [1, 2, 3]
+        assert all(0 < len(chunk) <= 2 for chunk in chunks)
+
+        sharded = []
+        for index in range(2):
+            shard = (
+                builder.new_scan()
+                .with_chunk_shuffle(str(2 ** 70), 2)
+                .with_shard(index, 2)
+                .plan()
+            )
+            sharded.extend(
+                pa.Table.from_batches(builder.new_read().read([split]))
+                .column("id").to_pylist()
+                for split in shard.splits()
+            )
+        assert sharded == chunks
+
+        # Shard is scan-level state, so it may be configured before shuffle.
+        before_shuffle = (
+            builder.new_scan()
+            .with_shard(0, 2)
+            .with_chunk_shuffle(str(2 ** 70), 2)
+            .plan()
+        )
+        before_rows = [
+            pa.Table.from_batches(builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in before_shuffle.splits()
+        ]
+        after_rows = [
+            pa.Table.from_batches(builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in (
+                builder.new_scan()
+                .with_chunk_shuffle(str(2 ** 70), 2)
+                .with_shard(0, 2)
+                .plan()
+                .splits()
+            )
+        ]
+        assert before_rows == after_rows
+
+        with pytest.raises(ValueError, match="count must be positive"):
+            builder.new_scan().with_shard(0, 0)
+        with pytest.raises(RuntimeError, match="requires chunk_shuffle"):
+            builder.new_scan().with_shard(0, 2).plan()
+
+
+def test_chunk_shuffle_reads_split_local_ranges_across_files():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("CREATE TABLE paimon.rdb.t (id INT)")
+        ctx.sql("INSERT INTO paimon.rdb.t VALUES (1), (2)")
+        ctx.sql("INSERT INTO paimon.rdb.t VALUES (3), (4)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.t")
+        builder = table.new_read_builder().with_projection(["id"])
+        splits = (
+            builder.new_scan()
+            .with_chunk_shuffle("7", 3)
+            .plan()
+            .splits()
+        )
+
+        chunks = []
+        for split in splits:
+            restored = Split.deserialize(split.serialize())
+            chunks.append(
+                pa.Table.from_batches(builder.new_read().read([restored]))
+                .column("id").to_pylist()
+            )
+
+        assert sorted(len(chunk) for chunk in chunks) == [1, 3]
+        assert sorted(value for chunk in chunks for value in chunk) == [1, 2, 3, 4]
+
+
 def test_with_row_ranges():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
@@ -107,6 +202,43 @@ def test_with_row_ranges():
 
         with pytest.raises(ValueError, match="start 2 exceeds end 1"):
             table.new_read_builder().with_row_ranges([(2, 1)])
+
+
+def test_row_tracking_append_row_ranges_keep_global_row_ids():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("""CREATE TABLE paimon.rdb.tracked (id INT, pt STRING)
+            PARTITIONED BY (pt) WITH ('row-tracking.enabled' = 'true')""")
+        ctx.sql("""INSERT INTO paimon.rdb.tracked VALUES
+            (1, 'a'), (2, 'a'), (3, 'a')""")
+        ctx.sql("""INSERT INTO paimon.rdb.tracked VALUES
+            (4, 'b'), (5, 'b'), (6, 'b')""")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.tracked")
+        builder = table.new_read_builder().with_row_ranges([(3, 4)])
+
+        plan = builder.new_scan().plan()
+        rows = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+
+        assert rows.column("id").to_pylist() == [4, 5]
+
+        chunk_builder = table.new_read_builder().with_projection(["id"])
+        chunks = (
+            chunk_builder.new_scan()
+            .with_chunk_shuffle("7", 2)
+            .plan()
+            .splits()
+        )
+        chunk_rows = [
+            pa.Table.from_batches(chunk_builder.new_read().read([split]))
+            .column("id").to_pylist()
+            for split in chunks
+        ]
+        assert all(0 < len(values) <= 2 for values in chunk_rows)
+        assert sorted(value for values in chunk_rows for value in values) == [
+            1, 2, 3, 4, 5, 6,
+        ]
 
 
 def test_format_table_rejects_row_ranges():
@@ -205,7 +337,7 @@ def test_indexed_split_wire_roundtrip_preserves_row_ranges():
         restored = Split.deserialize(split.serialize())
         rows = pa.Table.from_batches(builder.new_read().read([restored]))
 
-        assert restored.row_count() == 3
+        assert restored.row_count() == 1
         assert rows.column("id").to_pylist() == [2]
 
 
@@ -1021,6 +1153,80 @@ def test_combined_incremental_retains_predicate_and_projection():
         assert result.to_pydict() == {"id": [3]}
 
 
+def _native_split_file_names(splits):
+    names = []
+    for split in splits:
+        _, (state,) = split.__reduce__()
+        payload = json.loads(bytes(state))
+        names.extend(file_["_FILE_NAME"] for file_ in payload["data_files"])
+    return names
+
+
+def _make_input_changelog_table(warehouse):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.cldb")
+    ctx.sql("""CREATE TABLE paimon.cldb.t (id INT, value STRING, PRIMARY KEY (id))
+        WITH ('bucket' = '1', 'changelog-producer' = 'input')""")
+    ctx.sql("INSERT INTO paimon.cldb.t VALUES (1, 'a'), (2, 'b')")
+    ctx.sql("INSERT INTO paimon.cldb.t VALUES (3, 'c')")
+    return PaimonCatalog({"warehouse": warehouse}).get_table("cldb.t")
+
+
+def test_incremental_changelog_and_auto_plan_physical_changelog_files():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_input_changelog_table(warehouse)
+        builder = table.new_read_builder().with_include_row_kind(True)
+
+        delta = builder.new_incremental_scan(0, 2).plan()
+        assert all(name.startswith("data-")
+                   for name in _native_split_file_names(delta.splits()))
+
+        for mode in ("changelog", "CHANGELOG", "auto"):
+            plan = builder.new_incremental_scan(0, 2, mode).plan()
+            assert plan.snapshot_id() == 2
+            assert plan.splits()
+            assert all(split.is_streaming() for split in plan.splits())
+            assert all(name.startswith("changelog-")
+                       for name in _native_split_file_names(plan.splits()))
+            actual = pa.Table.from_batches(
+                builder.new_read().read(plan.splits())).to_pydict()
+            assert actual == {
+                "rowkind": ["+I", "+I", "+I"],
+                "id": [1, 2, 3],
+                "value": ["a", "b", "c"],
+            }
+
+        second = builder.new_incremental_scan(1, 2, "changelog").plan()
+        assert pa.Table.from_batches(
+            builder.new_read().read(second.splits())).to_pydict() == {
+                "rowkind": ["+I"], "id": [3], "value": ["c"]}
+        empty = builder.new_incremental_scan(2, 2, "changelog").plan()
+        assert empty.snapshot_id() == 2
+        assert empty.splits() == []
+
+
+def test_incremental_changelog_keeps_filter_projection_and_validates_mode():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_input_changelog_table(warehouse)
+        builder = (table.new_read_builder()
+                   .with_projection(["id"])
+                   .with_filter({
+                       "method": "greaterThan",
+                       "field": "id",
+                       "literals": [1],
+                   })
+                   .with_include_row_kind(True))
+        plan = builder.new_incremental_scan(0, 2, "changelog").plan()
+        assert pa.Table.from_batches(
+            builder.new_read().read(plan.splits())).to_pydict() == {
+                "rowkind": ["+I", "+I"], "id": [2, 3]}
+
+        for mode, message in (("diff", "before/after"), ("unknown", "expected")):
+            with pytest.raises(ValueError, match=message):
+                table.new_read_builder().new_incremental_scan(0, 2, mode)
+
+
 def _make_de_position_table(warehouse):
     ctx = SQLContext()
     ctx.register_catalog("paimon", {"warehouse": warehouse})
@@ -1070,11 +1276,99 @@ def test_row_position_selection_validates_parameters_and_combinations():
         ):
             with pytest.raises(ValueError, match="cannot be used simultaneously"):
                 getattr(scan, method)(*args)
+
+
+def _make_append_position_table(warehouse, row_tracking=False):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.appendpos")
+    options = " WITH ('source.split.target-size' = '1b'"
+    if row_tracking:
+        options += ", 'row-tracking.enabled' = 'true'"
+    options += ")"
+    ctx.sql("CREATE TABLE paimon.appendpos.t (id INT, value STRING)" + options)
+    for start in range(0, 9, 3):
+        values = ", ".join(
+            "(%d, '%s')" % (value, chr(ord('a') + value))
+            for value in range(start, start + 3)
+        )
+        ctx.sql("INSERT INTO paimon.appendpos.t VALUES " + values)
+    return PaimonCatalog({"warehouse": warehouse}).get_table("appendpos.t")
+
+
+@pytest.mark.parametrize("row_tracking", [False, True])
+def test_append_row_position_slices_and_shards_are_native_readable(row_tracking):
     with tempfile.TemporaryDirectory() as warehouse:
-        ordinary = _make_table_with_data(warehouse).new_read_builder()
+        table = _make_append_position_table(warehouse, row_tracking)
+        builder = table.new_read_builder().with_projection(["id"])
+
+        for start, end, expected in (
+            (0, 1, [0]),
+            (2, 7, [2, 3, 4, 5, 6]),
+            (7, 100, [7, 8]),
+            (20, 22, []),
+        ):
+            plan = builder.new_scan().with_row_position_slice(start, end).plan()
+            restored = [Split.deserialize(split.serialize()) for split in plan.splits()]
+            batches = builder.new_read().read(restored)
+            actual = pa.Table.from_batches(batches).column("id").to_pylist() if batches else []
+            assert actual == expected
+            assert plan.snapshot_id() == 3
+
+        shards = []
+        for index, expected in enumerate(([0, 1, 2], [3, 4], [5, 6], [7, 8])):
+            plan = builder.new_scan().with_row_position_shard(index, 4).plan()
+            actual = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+            values = actual.column("id").to_pylist()
+            assert values == expected
+            shards.extend(values)
+        assert shards == list(range(9))
+
+
+def test_append_row_positions_follow_stats_pruned_file_order_before_limit():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_append_position_table(warehouse)
+        builder = (
+            table.new_read_builder()
+            .with_projection(["id"])
+            .with_filter({"method": "greaterOrEqual", "field": "id", "literals": [3]})
+            .with_limit(2)
+        )
+        plan = builder.new_scan().with_row_position_slice(1, 5).plan()
+        actual = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        # with_limit is a planning hint in the Rust API. The complete selected
+        # range must survive planning; PyPaimon enforces the final two-row limit.
+        assert actual.column("id").to_pylist() == [4, 5, 6, 7]
+
+
+def test_append_incremental_row_positions_use_combined_delta_order():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_append_position_table(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+        for start_snapshot, end_snapshot, start, end, expected in (
+            (0, 3, 2, 7, [2, 3, 4, 5, 6]),
+            (1, 3, 1, 4, [4, 5, 6]),
+        ):
+            plan = (
+                builder.new_incremental_scan(start_snapshot, end_snapshot)
+                .with_row_position_slice(start, end)
+                .plan()
+            )
+            restored = [pickle.loads(pickle.dumps(split)) for split in plan.splits()]
+            actual = pa.Table.from_batches(builder.new_read().read(restored))
+            assert actual.column("id").to_pylist() == expected
+
+
+def test_primary_key_row_position_selection_remains_unsupported():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.pkpos")
+        ctx.sql("CREATE TABLE paimon.pkpos.t (id INT, value STRING, PRIMARY KEY (id) NOT ENFORCED)")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("pkpos.t")
         for method in ("with_row_position_slice", "with_row_position_shard"):
-            with pytest.raises(NotImplementedError, match="data.evolution|Data Evolution"):
-                getattr(ordinary.new_scan(), method)(0, 1)
+            with pytest.raises(NotImplementedError, match="append tables"):
+                getattr(table.new_read_builder().new_scan(), method)(0, 1)
 
 
 def test_incremental_row_positions_use_combined_delta_batch():

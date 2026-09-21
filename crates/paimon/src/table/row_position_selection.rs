@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Map row positions to data-evolution row IDs before group pruning.
+//! Select balanced row-position slices for data-evolution and append scans.
 
-use super::source::{merge_row_ranges, RowRange};
+use super::source::{merge_row_ranges, DataSplit, DataSplitBuilder, RowRange};
 use crate::spec::ManifestEntry;
 use crate::{Error, Result};
 
@@ -51,6 +51,18 @@ impl RowPositionSelection {
 
     pub(crate) fn is_slice(self) -> bool {
         matches!(self, Self::Slice { .. })
+    }
+
+    fn bounds(self, total: u64) -> (u64, u64) {
+        match self {
+            Self::Slice { start, end } => (start, end.min(total)),
+            Self::Shard { index, count } => {
+                let size = total / count;
+                let remainder = total % count;
+                let start = index * size + index.min(remainder);
+                (start, start + size + u64::from(index < remainder))
+            }
+        }
     }
 
     /// Positions count the union of complete candidate file ranges. Updates
@@ -90,15 +102,7 @@ impl RowPositionSelection {
         // counts so a range ending at i64::MAX cannot overflow RowRange::count.
         let count = |range: &RowRange| range.to() as u64 - range.from() as u64 + 1;
         let total: u64 = ranges.iter().map(count).sum();
-        let (start, end) = match self {
-            Self::Slice { start, end } => (start, end.min(total)),
-            Self::Shard { index, count } => {
-                let size = total / count;
-                let remainder = total % count;
-                let start = index * size + index.min(remainder);
-                (start, start + size + u64::from(index < remainder))
-            }
-        };
+        let (start, end) = self.bounds(total);
         if start >= end {
             return Vec::new();
         }
@@ -139,17 +143,385 @@ impl RowPositionSelection {
         }
         merge_row_ranges(result)
     }
+
+    /// Select physical append rows after stats pruning and split packing.
+    ///
+    /// Append positions follow the final split/file order. Row-tracked tables
+    /// carry stable global row IDs to the reader; tables without row tracking
+    /// carry positions local to the filtered output split. Filtering files here
+    /// avoids opening files which contain no selected rows.
+    pub(crate) fn select_append_splits(
+        self,
+        splits: Vec<DataSplit>,
+        row_tracking_enabled: bool,
+    ) -> Result<Vec<DataSplit>> {
+        let mut total = 0u64;
+        for split in &splits {
+            for file in split.data_files() {
+                let count = u64::try_from(file.row_count).map_err(|_| Error::DataInvalid {
+                    message: format!(
+                        "Row-position selection requires a valid row count for '{}'",
+                        file.file_name
+                    ),
+                    source: None,
+                })?;
+                total = total.checked_add(count).ok_or_else(|| Error::DataInvalid {
+                    message: "Row-position selection row count overflow".to_string(),
+                    source: None,
+                })?;
+            }
+        }
+        let (start, end) = self.bounds(total);
+        if start >= end {
+            return Ok(Vec::new());
+        }
+
+        let mut position = 0u64;
+        let mut selected_splits = Vec::new();
+        for split in splits {
+            let mut files = Vec::new();
+            let mut deletion_files = split.data_deletion_files().map(|_| Vec::new());
+            let mut ranges = Vec::new();
+            let mut kept_position = 0u64;
+            let mut needs_ranges = split.row_ranges().is_some();
+
+            for (file_index, file) in split.data_files().iter().enumerate() {
+                let count = file.row_count as u64;
+                let next = position + count;
+                let selected_start = start.max(position);
+                let selected_end = end.min(next);
+                if selected_start < selected_end {
+                    let from = selected_start - position;
+                    let to = selected_end - position;
+                    needs_ranges |= from != 0 || to != count;
+                    files.push(file.clone());
+                    if let (Some(source), Some(selected)) =
+                        (split.data_deletion_files(), deletion_files.as_mut())
+                    {
+                        selected.push(source[file_index].clone());
+                    }
+
+                    let range = if row_tracking_enabled {
+                        let first_row_id = file.first_row_id.ok_or_else(|| Error::DataInvalid {
+                            message: format!(
+                                "Row-position selection requires a valid first row id for '{}'",
+                                file.file_name
+                            ),
+                            source: None,
+                        })?;
+                        let from = first_row_id.checked_add(from as i64).ok_or_else(|| {
+                            Error::DataInvalid {
+                                message: "Row-position selection row id overflow".to_string(),
+                                source: None,
+                            }
+                        })?;
+                        let to = first_row_id.checked_add(to as i64 - 1).ok_or_else(|| {
+                            Error::DataInvalid {
+                                message: "Row-position selection row id overflow".to_string(),
+                                source: None,
+                            }
+                        })?;
+                        RowRange::new(from, to)
+                    } else {
+                        let from =
+                            kept_position
+                                .checked_add(from)
+                                .ok_or_else(|| Error::DataInvalid {
+                                    message: "Row-position selection split offset overflow"
+                                        .to_string(),
+                                    source: None,
+                                })?;
+                        let to = kept_position.checked_add(to - 1).ok_or_else(|| {
+                            Error::DataInvalid {
+                                message: "Row-position selection split offset overflow".to_string(),
+                                source: None,
+                            }
+                        })?;
+                        RowRange::new(
+                            i64::try_from(from).map_err(|_| Error::DataInvalid {
+                                message: "Row-position selection split offset exceeds i64"
+                                    .to_string(),
+                                source: None,
+                            })?,
+                            i64::try_from(to).map_err(|_| Error::DataInvalid {
+                                message: "Row-position selection split offset exceeds i64"
+                                    .to_string(),
+                                source: None,
+                            })?,
+                        )
+                    };
+                    ranges.push(range);
+                    kept_position += count;
+                }
+                position = next;
+            }
+
+            if files.is_empty() {
+                if position >= end {
+                    break;
+                }
+                continue;
+            }
+
+            let ranges = if let Some(existing) = split.row_ranges() {
+                intersect_ranges(&ranges, existing)
+            } else {
+                merge_row_ranges(ranges)
+            };
+            if ranges.is_empty() {
+                if position >= end {
+                    break;
+                }
+                continue;
+            }
+
+            let mut builder = DataSplitBuilder::new()
+                .with_snapshot(split.snapshot_id())
+                .with_partition(split.partition().clone())
+                .with_bucket(split.bucket())
+                .with_bucket_path(split.bucket_path().to_string())
+                .with_total_buckets(split.total_buckets())
+                .with_data_files(files)
+                .with_raw_convertible(split.raw_convertible())
+                .with_streaming(split.is_streaming());
+            if let Some(deletion_files) = deletion_files {
+                builder = builder.with_data_deletion_files(deletion_files);
+            }
+            if needs_ranges {
+                builder = builder.with_row_ranges(ranges);
+            }
+            selected_splits.push(builder.build()?);
+            if position >= end {
+                break;
+            }
+        }
+        Ok(selected_splits)
+    }
+}
+
+fn intersect_ranges(left: &[RowRange], right: &[RowRange]) -> Vec<RowRange> {
+    let left = merge_row_ranges(left.to_vec());
+    let right = merge_row_ranges(right.to_vec());
+    let mut result = Vec::new();
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        if let Some(range) =
+            left[left_index].intersect_inclusive(right[right_index].from(), right[right_index].to())
+        {
+            result.push(range);
+        }
+        if left[left_index].to() <= right[right_index].to() {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+    merge_row_ranges(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::stats::BinaryTableStats;
+    use crate::spec::{BinaryRow, DataFileMeta};
+    use crate::table::source::DeletionFile;
 
     fn ranges(pairs: &[(i64, i64)]) -> Vec<RowRange> {
         pairs
             .iter()
             .map(|&(start, end)| RowRange::new(start, end))
             .collect()
+    }
+
+    fn file(name: &str, row_count: i64, first_row_id: Option<i64>) -> DataFileMeta {
+        DataFileMeta {
+            file_name: name.to_string(),
+            file_size: 100,
+            row_count,
+            min_key: Vec::new(),
+            max_key: Vec::new(),
+            key_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            value_stats: BinaryTableStats::new(Vec::new(), Vec::new(), Vec::new()),
+            min_sequence_number: 0,
+            max_sequence_number: 0,
+            schema_id: 0,
+            level: 0,
+            extra_files: Vec::new(),
+            creation_time: None,
+            delete_row_count: None,
+            embedded_index: None,
+            first_row_id,
+            write_cols: None,
+            external_path: None,
+            file_source: None,
+            value_stats_cols: None,
+            column_max_sequence_numbers: None,
+        }
+    }
+
+    fn split(
+        snapshot: i64,
+        files: Vec<DataFileMeta>,
+        deletion_files: Option<Vec<Option<DeletionFile>>>,
+        row_ranges: Option<Vec<RowRange>>,
+    ) -> DataSplit {
+        let mut builder = DataSplitBuilder::new()
+            .with_snapshot(snapshot)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(2)
+            .with_bucket_path("memory:/append/bucket-2".to_string())
+            .with_total_buckets(4)
+            .with_data_files(files)
+            .with_raw_convertible(true)
+            .with_streaming(true);
+        if let Some(deletion_files) = deletion_files {
+            builder = builder.with_data_deletion_files(deletion_files);
+        }
+        if let Some(row_ranges) = row_ranges {
+            builder = builder.with_row_ranges(row_ranges);
+        }
+        builder.build().unwrap()
+    }
+
+    fn pairs(ranges: Option<&[RowRange]>) -> Option<Vec<(i64, i64)>> {
+        ranges.map(|ranges| {
+            ranges
+                .iter()
+                .map(|range| (range.from(), range.to()))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn append_slice_filters_files_and_rebases_local_ranges() {
+        let deletion = DeletionFile::new("b.dv".to_string(), 0, 10, Some(1));
+        let input = split(
+            7,
+            vec![file("a.parquet", 3, None), file("b.parquet", 4, None)],
+            Some(vec![None, Some(deletion.clone())]),
+            None,
+        );
+
+        let selected = RowPositionSelection::slice(4, 6)
+            .unwrap()
+            .select_append_splits(vec![input], false)
+            .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        let selected = &selected[0];
+        assert_eq!(
+            selected
+                .data_files()
+                .iter()
+                .map(|file| file.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b.parquet"]
+        );
+        assert_eq!(pairs(selected.row_ranges()), Some(vec![(1, 2)]));
+        assert_eq!(
+            selected.data_deletion_files(),
+            Some([Some(deletion)].as_slice())
+        );
+        assert_eq!(selected.snapshot_id(), 7);
+        assert_eq!(selected.bucket(), 2);
+        assert_eq!(selected.total_buckets(), 4);
+        assert!(selected.is_streaming());
+        assert!(selected.raw_convertible());
+    }
+
+    #[test]
+    fn append_slice_uses_global_ids_when_row_tracking_is_enabled() {
+        let input = split(
+            1,
+            vec![
+                file("a.parquet", 3, Some(100)),
+                file("b.parquet", 4, Some(200)),
+            ],
+            None,
+            None,
+        );
+
+        let selected = RowPositionSelection::slice(2, 5)
+            .unwrap()
+            .select_append_splits(vec![input], true)
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            pairs(selected[0].row_ranges()),
+            Some(vec![(102, 102), (200, 201)])
+        );
+
+        let restored =
+            DataSplit::deserialize_split_v1(&selected[0].serialize_split_v1().unwrap()).unwrap();
+        assert_eq!(
+            pairs(restored.row_ranges()),
+            pairs(selected[0].row_ranges())
+        );
+    }
+
+    #[test]
+    fn append_shards_cover_physical_rows_once_across_splits() {
+        let inputs = vec![
+            split(
+                1,
+                vec![file("a.parquet", 3, None), file("b.parquet", 4, None)],
+                None,
+                None,
+            ),
+            split(1, vec![file("c.parquet", 2, None)], None, None),
+        ];
+        let mut counts = Vec::new();
+        for index in 0..4 {
+            let selected = RowPositionSelection::shard(index, 4)
+                .unwrap()
+                .select_append_splits(inputs.clone(), false)
+                .unwrap();
+            counts.push(selected.iter().map(DataSplit::row_count).sum::<i64>());
+        }
+        assert_eq!(counts, vec![3, 2, 2, 2]);
+        assert_eq!(counts.iter().sum::<i64>(), 9);
+    }
+
+    #[test]
+    fn append_selection_intersects_existing_global_ranges() {
+        let input = split(
+            1,
+            vec![
+                file("a.parquet", 3, Some(100)),
+                file("b.parquet", 4, Some(200)),
+            ],
+            None,
+            Some(ranges(&[(201, 203)])),
+        );
+        let selected = RowPositionSelection::slice(2, 5)
+            .unwrap()
+            .select_append_splits(vec![input], true)
+            .unwrap();
+        assert_eq!(pairs(selected[0].row_ranges()), Some(vec![(201, 201)]));
+    }
+
+    #[test]
+    fn append_selection_rejects_unknown_counts_and_missing_row_ids() {
+        let unknown = split(
+            1,
+            vec![file(
+                "unknown.parquet",
+                DataFileMeta::ROW_COUNT_UNKNOWN,
+                None,
+            )],
+            None,
+            None,
+        );
+        assert!(RowPositionSelection::slice(0, 1)
+            .unwrap()
+            .select_append_splits(vec![unknown], false)
+            .is_err());
+
+        let missing_id = split(1, vec![file("missing.parquet", 1, None)], None, None);
+        assert!(RowPositionSelection::slice(0, 1)
+            .unwrap()
+            .select_append_splits(vec![missing_id], true)
+            .is_err());
     }
 
     #[test]

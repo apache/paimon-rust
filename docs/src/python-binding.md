@@ -157,34 +157,49 @@ plan = rb.new_incremental_scan(2, 5).plan()
 batches = rb.new_read().read(plan.splits())
 ```
 
-The range is `(start_snapshot_id, end_snapshot_id]`. Only APPEND snapshots
-contribute delta manifests. Files use Java batch split packing, with streaming
-read semantics: repeated primary keys and physical retracts remain separate
-rows. Readers do not merge these events into the window's final table state.
-The end snapshot must exist and supplies snapshot metadata, including for empty
-results. Snapshot deletion vectors and automatic global indexes are not applied
-to historical events. Builder filters, projections, and limits still apply.
+The range is `(start_snapshot_id, end_snapshot_id]`. The default `delta` mode
+uses APPEND delta manifests. Use `changelog` to read physical changelog
+manifests, or `auto` to follow the table's `incremental-between` option:
+
+```python
+plan = rb.new_incremental_scan(2, 5, "changelog").plan()
+batches = rb.with_include_row_kind(True).new_read().read(plan.splits())
+```
+
+Explicit `diff` mode is rejected because a diff contains before/after split
+pairs and cannot be represented by the ordinary `Plan.splits()` contract.
+Files use Java batch split packing, with streaming read semantics: repeated
+primary keys and physical retracts remain separate rows. Readers do not merge
+these events into the window's final table state. The end snapshot must exist
+and supplies snapshot metadata, including for empty results. Snapshot deletion
+vectors and automatic global indexes are not applied to historical events.
+Builder filters, projections, and limits still apply.
 
 `split.is_streaming()` identifies this read contract. `split.serialize()` exports
 both batch and streaming splits to Java binary encoding, preserving the streaming
 flag.
 
-For Data Evolution tables, select half-open row positions or one balanced shard
-on a scan:
+For append and Data Evolution tables, select half-open row positions or one
+balanced shard on a scan:
 
 ```python
 plan = rb.new_scan().with_row_position_slice(10, 20).plan()
 plan = rb.new_scan().with_row_position_shard(1, 4).plan()
 ```
 
-Positions count candidate rows before explicit/global-index range pruning,
-group statistics, projection, and deletion-vector filtering. Column updates
+For ordinary append tables, positions follow the final stats-pruned split and
+file order. Row-tracked tables encode selected stable row IDs; tables without
+row tracking encode positions local to each filtered output split. Unselected
+files are removed, so the reader does not open them. For Data Evolution,
+positions count candidate rows before explicit/global-index range pruning,
+group statistics, projection, and deletion-vector filtering; column updates
 sharing row IDs count once. Explicit `with_row_ranges` and index-selected ranges
-intersect the positions after assignment, even when they exclude earlier files. Slices require `start < end`; shards require a positive
-count and `0 <= index < count`. Slice and shard selection are mutually exclusive
-and may also be applied to `new_incremental_scan` results, where positions count
-the combined APPEND-delta batch. The selection is encoded in the returned splits
-and survives serialization.
+intersect the positions after assignment, even when they exclude earlier files.
+Slices require `start < end`; shards require a positive count and
+`0 <= index < count`. Slice and shard selection are mutually exclusive and may
+also be applied to `new_incremental_scan` results, where positions count the
+combined APPEND-delta batch. The selection is encoded in the returned splits
+and survives serialization and direct native reads.
 
 Deletion-vector reads accept both Java and Python Avro array-item schemas.
 Historical Python bucket-local references are resolved from the table's index

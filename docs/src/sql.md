@@ -1264,6 +1264,7 @@ Supported vindex options:
 | `<index-type>.ivf.coarse-assignment` | `auto` | all IVF types | Build-time list assignment mode: `auto` uses Vamana for large centroid matrices; `exact` always uses exact assignment. |
 | `<index-type>.ivf.train.max-points-per-centroid` | `256` | all IVF types | Positive limit on coarse K-means training data: at most `nlist × value` vectors. |
 | `<index-type>.train.sample-ratio` or `fields.<field>.train.sample-ratio` | `1.0` | all vindex types | Fraction of shard rows selected evenly for training. Must be in `(0, 1]`; all rows are still added to the index. The field-specific option takes precedence. |
+| `vindex.build.granule.enabled` | `true` | all IVF types | Use the granule build pipeline. Set to `false` to use the full-spill build path for future index builds. |
 | `<index-type>.pq.m` | `16` | `ivf-pq` | Number of product-quantization sub-vectors. The dimension must be divisible by this value. |
 | `<index-type>.pq.use-opq` | `false` | `ivf-pq` | Whether to enable OPQ before PQ encoding. |
 | `ivf-pq.ivf.pq-encoding` | `auto` | `ivf-pq` | Build-time PQ encoding mode: `auto` selects an accelerated backend when supported; `canonical` uses the canonical encoder. |

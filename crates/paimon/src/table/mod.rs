@@ -33,6 +33,7 @@ mod bucket_assigner_dynamic;
 mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
+mod chunk_shuffle;
 mod commit_message;
 mod consumer_manager;
 pub(crate) mod cow_writer;

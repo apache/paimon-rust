@@ -409,18 +409,31 @@ impl PyReadBuilder {
             filter: self.filter.clone(),
             row_ranges: self.row_ranges.clone(),
             case_sensitive: self.case_sensitive,
-            incremental_range: None,
+            incremental_scan: None,
             row_position_slice: None,
             row_position_shard: None,
+            chunk_shuffle: None,
+            shard: None,
         }
     }
 
-    /// Plan APPEND deltas in (start_snapshot_id, end_snapshot_id] as one batch.
-    /// Primary-key versions are grouped across all selected snapshots.
-    fn new_incremental_scan(&self, start_snapshot_id: i64, end_snapshot_id: i64) -> PyTableScan {
+    /// Plan physical changes in (start_snapshot_id, end_snapshot_id] as one
+    /// ordinary split plan. Mode is `delta` by default; `changelog` reads
+    /// changelog manifest files and `auto` follows the table's producer.
+    #[pyo3(signature = (start_snapshot_id, end_snapshot_id, mode = "delta"))]
+    fn new_incremental_scan(
+        &self,
+        start_snapshot_id: i64,
+        end_snapshot_id: i64,
+        mode: &str,
+    ) -> PyResult<PyTableScan> {
         let mut scan = self.new_scan();
-        scan.incremental_range = Some((start_snapshot_id, end_snapshot_id));
-        scan
+        scan.incremental_scan = Some(PyIncrementalScan {
+            start_snapshot_id,
+            end_snapshot_id,
+            mode: parse_incremental_scan_mode(mode)?,
+        });
+        Ok(scan)
     }
 
     fn new_read(&self) -> PyTableRead {
@@ -446,9 +459,38 @@ pub struct PyTableScan {
     filter: Option<Predicate>,
     row_ranges: Option<Vec<RowRange>>,
     case_sensitive: bool,
-    incremental_range: Option<(i64, i64)>,
+    incremental_scan: Option<PyIncrementalScan>,
     row_position_slice: Option<(u64, u64)>,
     row_position_shard: Option<(u64, u64)>,
+    chunk_shuffle: Option<PyChunkShuffle>,
+    shard: Option<(usize, usize)>,
+}
+
+#[derive(Clone)]
+struct PyChunkShuffle {
+    seed: String,
+    chunk_size: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PyIncrementalScan {
+    start_snapshot_id: i64,
+    end_snapshot_id: i64,
+    mode: IncrementalScanMode,
+}
+
+fn parse_incremental_scan_mode(mode: &str) -> PyResult<IncrementalScanMode> {
+    match mode.to_ascii_lowercase().as_str() {
+        "delta" => Ok(IncrementalScanMode::Delta),
+        "changelog" => Ok(IncrementalScanMode::Changelog),
+        "auto" => Ok(IncrementalScanMode::Auto),
+        "diff" => Err(PyValueError::new_err(
+            "incremental mode 'diff' requires before/after split pairs and is not supported by TableScan.plan()",
+        )),
+        _ => Err(PyValueError::new_err(format!(
+            "unsupported incremental scan mode '{mode}'; expected delta, changelog or auto"
+        ))),
+    }
 }
 
 impl PyTableScan {
@@ -464,6 +506,14 @@ impl PyTableScan {
                 .with_row_position_shard(index, count)
                 .map_err(to_py_err)?;
         }
+        if let Some(chunk_shuffle) = &self.chunk_shuffle {
+            scan = scan
+                .with_chunk_shuffle(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
+                .map_err(to_py_err)?;
+        }
+        if let Some((index, count)) = self.shard {
+            scan = scan.with_shard(index, count).map_err(to_py_err)?;
+        }
         Ok(scan)
     }
 
@@ -471,10 +521,9 @@ impl PyTableScan {
         &self,
         start: i64,
         end: i64,
+        mode: IncrementalScanMode,
     ) -> PyResult<paimon::table::IncrementalScan<'_>> {
-        let mut scan =
-            self.read_builder()?
-                .new_incremental_scan(IncrementalScanMode::Delta, start, end);
+        let mut scan = self.read_builder()?.new_incremental_scan(mode, start, end);
         if let Some((start, end)) = self.row_position_slice {
             scan = scan
                 .with_row_position_slice(start, end)
@@ -484,6 +533,14 @@ impl PyTableScan {
             scan = scan
                 .with_row_position_shard(index, count)
                 .map_err(to_py_err)?;
+        }
+        if let Some(chunk_shuffle) = &self.chunk_shuffle {
+            scan = scan
+                .with_chunk_shuffle(&chunk_shuffle.seed, chunk_shuffle.chunk_size)
+                .map_err(to_py_err)?;
+        }
+        if let Some((index, count)) = self.shard {
+            scan = scan.with_shard(index, count).map_err(to_py_err)?;
         }
         Ok(scan)
     }
@@ -507,7 +564,7 @@ impl PyTableScan {
 
 #[pymethods]
 impl PyTableScan {
-    /// Select a half-open range of Data Evolution row positions.
+    /// Select a half-open range of append-table row positions.
     fn with_row_position_slice(
         mut slf: PyRefMut<'_, Self>,
         start: u64,
@@ -520,7 +577,7 @@ impl PyTableScan {
         Ok(slf)
     }
 
-    /// Select one Data Evolution row-position shard.
+    /// Select one balanced append-table row-position shard.
     fn with_row_position_shard(
         mut slf: PyRefMut<'_, Self>,
         index: u64,
@@ -533,14 +590,47 @@ impl PyTableScan {
         Ok(slf)
     }
 
+    /// Deterministically shuffle fixed-live-row chunks. `seed` is a decimal
+    /// Python integer string so arbitrarily large seeds retain Python's
+    /// `random.Random` semantics.
+    fn with_chunk_shuffle(
+        mut slf: PyRefMut<'_, Self>,
+        seed: String,
+        chunk_size: u64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        // Validate every combination immediately, not only when plan() runs.
+        slf.core_scan()?
+            .with_chunk_shuffle(&seed, chunk_size)
+            .map_err(to_py_err)?;
+        slf.chunk_shuffle = Some(PyChunkShuffle { seed, chunk_size });
+        Ok(slf)
+    }
+
+    /// Select one balanced worker shard for a distributed scan.
+    fn with_shard(
+        mut slf: PyRefMut<'_, Self>,
+        index: usize,
+        count: usize,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.core_scan()?
+            .with_shard(index, count)
+            .map_err(to_py_err)?;
+        slf.shard = Some((index, count));
+        Ok(slf)
+    }
+
     fn plan(&self, py: Python<'_>) -> PyResult<PyPlan> {
         py.detach(|| {
             runtime().block_on(async {
-                let plan = match self.incremental_range {
-                    Some((start, end)) => {
-                        self.core_incremental_scan(start, end)?
-                            .plan_combined_delta()
-                            .await
+                let plan = match self.incremental_scan {
+                    Some(incremental) => {
+                        self.core_incremental_scan(
+                            incremental.start_snapshot_id,
+                            incremental.end_snapshot_id,
+                            incremental.mode,
+                        )?
+                        .plan_combined()
+                        .await
                     }
                     None => self.core_scan()?.plan().await,
                 };
@@ -756,7 +846,8 @@ impl PySplit {
 
 #[pymethods]
 impl PySplit {
-    /// Physical row count: sum of data-file row counts (not a logical result count).
+    /// Selected row count for IndexedSplit-compatible row ranges, otherwise
+    /// the sum of physical data-file row counts.
     fn row_count(&self) -> i64 {
         self.inner.row_count()
     }

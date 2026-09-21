@@ -26,7 +26,7 @@ use super::VindexIndexBuildBuilder;
 use crate::spec::{GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME};
 use crate::table::data_file_reader::DataFileReadTiming;
 use crate::table::table_read::configured_parquet_read_budget;
-use crate::vindex::VindexVectorIndexOptions;
+use crate::vindex::{VindexVectorIndexOptions, DISKANN_IDENTIFIER};
 use crate::{Error, Result};
 use arrow_buffer::MutableBuffer;
 use futures::TryStreamExt;
@@ -41,6 +41,7 @@ use tokio_util::io::SyncIoBridge;
 
 const INDEX_DIR: &str = "index";
 const VECTOR_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
 pub(super) struct BuiltIndexFile {
     pub(super) meta: IndexFileMeta,
     pub(super) timing: Option<VectorIndexBuildTiming>,
@@ -48,6 +49,44 @@ pub(super) struct BuiltIndexFile {
 
 impl<'a> VindexIndexBuildBuilder<'a> {
     pub(super) async fn build_index_file(
+        &self,
+        shard: &VindexIndexShard,
+        index_column: &str,
+        dimension: i32,
+        index_field_id: i32,
+        options: &VindexVectorIndexOptions,
+        index_meta: Vec<u8>,
+    ) -> Result<BuiltIndexFile> {
+        let use_granule = self.index_type != DISKANN_IDENTIFIER && options.granule_build_enabled;
+        log::info!(
+            "vindex build strategy: index_type={}, strategy={}",
+            self.index_type,
+            if use_granule { "granule" } else { "full-spill" }
+        );
+        if use_granule {
+            return self
+                .build_index_file_granule(
+                    shard,
+                    index_column,
+                    dimension,
+                    index_field_id,
+                    options,
+                    index_meta,
+                )
+                .await;
+        }
+        self.build_full_spill_index_file(
+            shard,
+            index_column,
+            dimension,
+            index_field_id,
+            options,
+            index_meta,
+        )
+        .await
+    }
+
+    async fn build_full_spill_index_file(
         &self,
         shard: &VindexIndexShard,
         index_column: &str,
@@ -328,6 +367,65 @@ impl<'a> VindexIndexBuildBuilder<'a> {
         })?;
 
         let serialize_upload_start = timing_enabled.then(Instant::now);
+        let meta = self
+            .finish_index_file(writer, shard, index_field_id, index_meta, row_count)
+            .await?;
+        let serialize_upload =
+            serialize_upload_start.map_or(Duration::ZERO, |start| start.elapsed());
+        let (oss_read, parquet_decode) = read_timing
+            .as_ref()
+            .map_or((Duration::ZERO, Duration::ZERO), |timing| {
+                (timing.file_read(), timing.parquet_decode())
+            });
+        let (file_schema_open, first_batch_wait, remaining_batch_wait) = read_timing
+            .as_ref()
+            .map_or((Duration::ZERO, Duration::ZERO, Duration::ZERO), |timing| {
+                timing.file_waits()
+            });
+        let parquet_diagnostics = parquet_read_budget
+            .as_ref()
+            .map_or_else(Default::default, |budget| budget.diagnostics());
+        let timing = total_start.map(|start| VectorIndexBuildTiming {
+            total_without_commit: start.elapsed(),
+            source_batch_wait,
+            oss_read,
+            parquet_decode,
+            file_schema_open,
+            first_batch_wait,
+            remaining_batch_wait,
+            parquet_row_group_count: parquet_diagnostics.row_group_count,
+            parquet_projected_bytes_min: parquet_diagnostics.projected_bytes_min,
+            parquet_projected_bytes_max: parquet_diagnostics.projected_bytes_max,
+            parquet_projected_bytes_total: parquet_diagnostics.projected_bytes_total,
+            parquet_peak_inflight_row_groups: parquet_diagnostics.peak_inflight,
+            raw_temp_write,
+            granule_spill_write: Duration::ZERO,
+            train_finish,
+            raw_temp_reread,
+            granule_spill_read: Duration::ZERO,
+            index_add,
+            serialize_upload,
+            rows: row_count_usize,
+            training_rows_seen: training_vector_count,
+            training_rows_retained,
+            batch_count,
+            raw_temp_bytes: bytes_written,
+            granule_spill_bytes: 0,
+            index_bytes: meta.file_size as u64,
+            data_file_count: shard.files.len(),
+            file_name: meta.file_name.clone(),
+        });
+        Ok(BuiltIndexFile { meta, timing })
+    }
+
+    pub(super) async fn finish_index_file(
+        &self,
+        writer: VectorIndexWriter,
+        shard: &VindexIndexShard,
+        index_field_id: i32,
+        index_meta: Vec<u8>,
+        row_count: i64,
+    ) -> Result<IndexFileMeta> {
         self.table
             .file_io()
             .mkdirs(&format!(
@@ -377,11 +475,9 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 return Err(error);
             }
         };
-        let serialize_upload =
-            serialize_upload_start.map_or(Duration::ZERO, |start| start.elapsed());
-        let meta = IndexFileMeta {
+        Ok(IndexFileMeta {
             index_type: self.index_type.clone(),
-            file_name: file_name.clone(),
+            file_name,
             file_size: checked_i64(
                 status.size,
                 "Index file is too large for Rust IndexFileMeta",
@@ -397,47 +493,6 @@ impl<'a> VindexIndexBuildBuilder<'a> {
                 source_meta: None,
                 index_meta: Some(index_meta),
             }),
-        };
-        let (oss_read, parquet_decode) = read_timing
-            .as_ref()
-            .map_or((Duration::ZERO, Duration::ZERO), |timing| {
-                (timing.file_read(), timing.parquet_decode())
-            });
-        let (file_schema_open, first_batch_wait, remaining_batch_wait) = read_timing
-            .as_ref()
-            .map_or((Duration::ZERO, Duration::ZERO, Duration::ZERO), |timing| {
-                timing.file_waits()
-            });
-        let parquet_diagnostics = parquet_read_budget
-            .as_ref()
-            .map_or_else(Default::default, |budget| budget.diagnostics());
-        let timing = total_start.map(|start| VectorIndexBuildTiming {
-            total_without_commit: start.elapsed(),
-            source_batch_wait,
-            oss_read,
-            parquet_decode,
-            file_schema_open,
-            first_batch_wait,
-            remaining_batch_wait,
-            parquet_row_group_count: parquet_diagnostics.row_group_count,
-            parquet_projected_bytes_min: parquet_diagnostics.projected_bytes_min,
-            parquet_projected_bytes_max: parquet_diagnostics.projected_bytes_max,
-            parquet_projected_bytes_total: parquet_diagnostics.projected_bytes_total,
-            parquet_peak_inflight_row_groups: parquet_diagnostics.peak_inflight,
-            raw_temp_write,
-            train_finish,
-            raw_temp_reread,
-            index_add,
-            serialize_upload,
-            rows: row_count_usize,
-            training_rows_seen: training_vector_count,
-            training_rows_retained,
-            batch_count,
-            raw_temp_bytes: bytes_written,
-            index_bytes: status.size,
-            data_file_count: shard.files.len(),
-            file_name,
-        });
-        Ok(BuiltIndexFile { meta, timing })
+        })
     }
 }

@@ -34,6 +34,7 @@ use crate::spec::{
 use crate::table::dedicated_format_file_writer::is_blob_file_name;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::source::any_range_overlaps_file;
+use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::{ArrowRecordBatchStream, RESTEnv, RowRange};
 use crate::{DataSplit, Error};
 use arrow_array::{Array, Int64Array, LargeBinaryArray, RecordBatch};
@@ -83,6 +84,20 @@ fn is_raw_convertible(files: &[DataFileMeta]) -> bool {
         }
     }
     true
+}
+
+/// Split a reader input into independently readable row-id groups.
+///
+/// Native chunk shuffle can deliberately combine several disjoint groups in
+/// one split. If any group needs column merging, checking only the whole split
+/// is insufficient: all normal files would then be sent to one merge group,
+/// which requires a single shared row-id range.
+fn reader_file_groups(files: &[DataFileMeta]) -> Vec<Vec<DataFileMeta>> {
+    if is_raw_convertible(files) {
+        vec![files.to_vec()]
+    } else {
+        group_by_overlapping_row_id(files.to_vec())
+    }
 }
 
 /// Reads data files in data evolution mode, merging columns from files
@@ -291,61 +306,133 @@ impl DataEvolutionReader {
 
             for split in splits {
                 let row_ranges = split.row_ranges().map(|r| r.to_vec());
+                // A chunk may span several disjoint row-id groups while one
+                // group still needs column-wise merging. Process each aligned
+                // group independently; treating the whole chunk as one merge
+                // group would require unrelated normal files to share a range.
+                let file_groups = reader_file_groups(split.data_files());
 
-                if is_raw_convertible(split.data_files()) {
-                    for file_meta in split.data_files().to_vec() {
-                        let deletion_vector = read_file_deletion_vector(
-                            &self.file_io,
-                            &split,
-                            &file_meta,
-                        )
-                        .await?;
-                        let data_fields = raw_file_physical_fields(
-                            &self.schema_manager,
-                            self.table_schema_id,
-                            &self.table_fields,
-                            &file_meta,
-                        )
-                        .await?;
+                for files in file_groups {
+                    if is_raw_convertible(&files) {
+                        for file_meta in files {
+                            let deletion_vector = read_file_deletion_vector(
+                                &self.file_io,
+                                &split,
+                                &file_meta,
+                            )
+                            .await?;
+                            let data_fields = raw_file_physical_fields(
+                                &self.schema_manager,
+                                self.table_schema_id,
+                                &self.table_fields,
+                                &file_meta,
+                            )
+                            .await?;
 
-                        let has_row_id = file_meta.first_row_id.is_some();
-                        let effective_row_ranges = if has_row_id { row_ranges.clone() } else { None };
+                            let has_row_id = file_meta.first_row_id.is_some();
+                            let effective_row_ranges = if has_row_id { row_ranges.clone() } else { None };
 
-                        let selected_row_ids = if self.row_id_index.is_some() && has_row_id {
-                            selected_absolute_row_ranges_for_file(
-                                file_meta.first_row_id.unwrap(),
-                                file_meta.row_count,
-                                effective_row_ranges.as_deref(),
-                                deletion_vector.as_deref(),
-                            )?
-                            .map(|ranges| {
-                                expand_selected_row_ids(
+                            let selected_row_ids = if self.row_id_index.is_some() && has_row_id {
+                                selected_absolute_row_ranges_for_file(
                                     file_meta.first_row_id.unwrap(),
                                     file_meta.row_count,
-                                    &ranges,
+                                    effective_row_ranges.as_deref(),
+                                    deletion_vector.as_deref(),
+                                )?
+                                .map(|ranges| {
+                                    expand_selected_row_ids(
+                                        file_meta.first_row_id.unwrap(),
+                                        file_meta.row_count,
+                                        &ranges,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+                            let file_base_row_id = file_meta.first_row_id.unwrap_or(0);
+                            let mut row_id_cursor = file_base_row_id;
+                            let mut row_id_offset: usize = 0;
+
+                            let mut stream = raw_file_reader.read_single_file_stream(
+                                &split,
+                                file_meta,
+                                data_fields,
+                                deletion_vector,
+                                effective_row_ranges,
+                            )?;
+                            while let Some(batch) = stream.next().await {
+                                let batch = batch?;
+                                let num_rows = batch.num_rows();
+                                let batch = if let Some(idx) = self.row_id_index {
+                                    if !has_row_id {
+                                        append_null_row_id_column(batch, idx, &self.wide_output_schema)?
+                                    } else if let Some(ref ids) = selected_row_ids {
+                                        attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?
+                                    } else {
+                                        let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
+                                        row_id_cursor += num_rows as i64;
+                                        let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(row_ids));
+                                        insert_column_at(batch, array, idx, &self.wide_output_schema)?
+                                    }
+                                } else {
+                                    batch
+                                };
+                                yield self.finish_wide_batch(
+                                    batch,
+                                    blob_view_lookup.as_ref(),
+                                    &descriptor_fields,
+                                    filter_before_blob_resolution,
+                                ).await?;
+                            }
+                        }
+                    } else {
+                        let prepared_group = PreparedMergeGroup::new(&files)?;
+                        let anchor_deletion_vector = read_anchor_deletion_vector(
+                            &self.file_io,
+                            &split,
+                            &prepared_group.files,
+                        )
+                        .await?;
+                        let effective_row_ranges = row_ranges.clone();
+                        let selected_ranges = selected_absolute_row_ranges_for_file(
+                            prepared_group.first_row_id,
+                            prepared_group.logical_row_count,
+                            effective_row_ranges.as_deref(),
+                            anchor_deletion_vector
+                                .as_ref()
+                                .map(|ctx| ctx.deletion_vector.as_ref()),
+                        )?;
+                        let expected_output_rows = match selected_ranges.as_ref() {
+                            Some(ranges) => ranges.iter().map(|r| r.count() as usize).sum(),
+                            None => prepared_group.logical_row_count as usize,
+                        };
+
+                        let selected_row_ids = if self.row_id_index.is_some() {
+                            selected_ranges.as_ref().map(|ranges| {
+                                expand_selected_row_ids(
+                                    prepared_group.first_row_id,
+                                    prepared_group.logical_row_count,
+                                    ranges,
                                 )
                             })
                         } else {
                             None
                         };
-                        let file_base_row_id = file_meta.first_row_id.unwrap_or(0);
-                        let mut row_id_cursor = file_base_row_id;
+                        let mut row_id_cursor = prepared_group.first_row_id;
                         let mut row_id_offset: usize = 0;
 
-                        let mut stream = raw_file_reader.read_single_file_stream(
+                        let mut merge_stream = self.merge_files_by_columns(
                             &split,
-                            file_meta,
-                            data_fields,
-                            deletion_vector,
+                            &prepared_group,
                             effective_row_ranges,
+                            expected_output_rows,
+                            anchor_deletion_vector,
                         )?;
-                        while let Some(batch) = stream.next().await {
+                        while let Some(batch) = merge_stream.next().await {
                             let batch = batch?;
                             let num_rows = batch.num_rows();
                             let batch = if let Some(idx) = self.row_id_index {
-                                if !has_row_id {
-                                    append_null_row_id_column(batch, idx, &self.wide_output_schema)?
-                                } else if let Some(ref ids) = selected_row_ids {
+                                if let Some(ref ids) = selected_row_ids {
                                     attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?
                                 } else {
                                     let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
@@ -363,71 +450,6 @@ impl DataEvolutionReader {
                                 filter_before_blob_resolution,
                             ).await?;
                         }
-                    }
-                } else {
-                    let prepared_group = PreparedMergeGroup::new(split.data_files())?;
-                    let anchor_deletion_vector = read_anchor_deletion_vector(
-                        &self.file_io,
-                        &split,
-                        &prepared_group.files,
-                    )
-                    .await?;
-                    let effective_row_ranges = row_ranges.clone();
-                    let selected_ranges = selected_absolute_row_ranges_for_file(
-                        prepared_group.first_row_id,
-                        prepared_group.logical_row_count,
-                        effective_row_ranges.as_deref(),
-                        anchor_deletion_vector
-                            .as_ref()
-                            .map(|ctx| ctx.deletion_vector.as_ref()),
-                    )?;
-                    let expected_output_rows = match selected_ranges.as_ref() {
-                        Some(ranges) => ranges.iter().map(|r| r.count() as usize).sum(),
-                        None => prepared_group.logical_row_count as usize,
-                    };
-
-                    let selected_row_ids = if self.row_id_index.is_some() {
-                        selected_ranges.as_ref().map(|ranges| {
-                            expand_selected_row_ids(
-                                prepared_group.first_row_id,
-                                prepared_group.logical_row_count,
-                                ranges,
-                            )
-                        })
-                    } else {
-                        None
-                    };
-                    let mut row_id_cursor = prepared_group.first_row_id;
-                    let mut row_id_offset: usize = 0;
-
-                    let mut merge_stream = self.merge_files_by_columns(
-                        &split,
-                        &prepared_group,
-                        effective_row_ranges,
-                        expected_output_rows,
-                        anchor_deletion_vector,
-                    )?;
-                    while let Some(batch) = merge_stream.next().await {
-                        let batch = batch?;
-                        let num_rows = batch.num_rows();
-                        let batch = if let Some(idx) = self.row_id_index {
-                            if let Some(ref ids) = selected_row_ids {
-                                attach_row_id(batch, idx, ids, &mut row_id_offset, &self.wide_output_schema)?
-                            } else {
-                                let row_ids: Vec<i64> = (row_id_cursor..row_id_cursor + num_rows as i64).collect();
-                                row_id_cursor += num_rows as i64;
-                                let array: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(row_ids));
-                                insert_column_at(batch, array, idx, &self.wide_output_schema)?
-                            }
-                        } else {
-                            batch
-                        };
-                        yield self.finish_wide_batch(
-                            batch,
-                            blob_view_lookup.as_ref(),
-                            &descriptor_fields,
-                            filter_before_blob_resolution,
-                        ).await?;
                     }
                 }
             }
@@ -3053,6 +3075,27 @@ mod tests {
         // A lone vector file must NOT be raw-convertible (would bypass merge routing).
         let files = vec![data_file("v1.vector.parquet", 0, 10, 1, Some(vec!["emb"]))];
         assert!(!is_raw_convertible(&files));
+    }
+
+    #[test]
+    fn test_reader_file_groups_separates_disjoint_merge_groups() {
+        let files = vec![
+            data_file("base-0.parquet", 0, 10, 1, Some(vec!["id"])),
+            data_file("partial-0.parquet", 0, 10, 2, Some(vec!["value"])),
+            data_file("base-10.parquet", 10, 10, 1, Some(vec!["id"])),
+            data_file("partial-10.parquet", 10, 10, 2, Some(vec!["value"])),
+        ];
+
+        assert!(!is_raw_convertible(&files));
+        let groups = reader_file_groups(&files);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[1].len(), 2);
+        assert_eq!(PreparedMergeGroup::new(&groups[0]).unwrap().first_row_id, 0);
+        assert_eq!(
+            PreparedMergeGroup::new(&groups[1]).unwrap().first_row_id,
+            10
+        );
     }
 
     #[test]

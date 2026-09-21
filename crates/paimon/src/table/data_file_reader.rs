@@ -277,6 +277,10 @@ impl DataFileReader {
             for split in splits {
                 // Create DV factory for this split only.
                 let dv_factory = reader.build_split_dv_factory(&split).await?;
+                let core_options = crate::spec::CoreOptions::new(&reader.table_options);
+                let ranges_use_row_ids = core_options.row_tracking_enabled()
+                    || core_options.data_evolution_enabled();
+                let mut split_file_offset = 0;
 
                 for file_meta in split.data_files().to_vec() {
                     let dv = DataFileReader::deletion_vector_for_file(
@@ -310,13 +314,25 @@ impl DataFileReader {
                         FileIndexResult::Remain
                     };
 
+                    let range_base = if ranges_use_row_ids {
+                        file_meta.first_row_id.ok_or_else(|| crate::Error::DataInvalid {
+                            message: format!(
+                                "Row-tracked file '{}' is missing first_row_id",
+                                file_meta.file_name
+                            ),
+                            source: None,
+                        })?
+                    } else {
+                        split_file_offset
+                    };
                     let split_ranges = split.row_ranges().map(|ranges| {
                         to_local_row_ranges(
                             ranges,
-                            file_meta.first_row_id.unwrap_or(0),
+                            range_base,
                             file_meta.row_count,
                         )
                     });
+                    split_file_offset += file_meta.row_count;
                     let selected_ranges = match file_index_result {
                         FileIndexResult::Remain => split_ranges,
                         FileIndexResult::Skip => Some(Vec::new()),
@@ -1024,7 +1040,10 @@ fn is_row_file(file_meta: &DataFileMeta) -> bool {
             .is_some_and(|path| path.to_ascii_lowercase().ends_with(".row"))
 }
 
-/// Convert absolute RowRanges to normalized file-local 0-based ranges.
+/// Convert ranges from their read-path coordinate system to file-local ranges.
+/// `first_row_id` is the coordinate base selected by the table's read path:
+/// stable row ID for row-tracked tables, or cumulative split-local physical
+/// offset for raw tables without row tracking.
 fn to_local_row_ranges(
     row_ranges: &[RowRange],
     first_row_id: i64,
@@ -1690,6 +1709,24 @@ mod tests {
     use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use roaring::RoaringBitmap;
     use std::io;
+
+    #[test]
+    fn split_local_ranges_map_across_file_boundaries() {
+        let ranges = [RowRange::new(3, 4), RowRange::new(5, 7)];
+        assert_eq!(
+            to_local_row_ranges(&ranges, 0, 5),
+            vec![RowRange::new(3, 4)]
+        );
+        assert_eq!(
+            to_local_row_ranges(&ranges, 5, 4),
+            vec![RowRange::new(0, 2)]
+        );
+
+        assert_eq!(
+            to_local_row_ranges(&[RowRange::new(103, 104)], 100, 6),
+            vec![RowRange::new(3, 4)]
+        );
+    }
 
     #[test]
     fn test_data_file_read_timing_aggregates_file_waits() {

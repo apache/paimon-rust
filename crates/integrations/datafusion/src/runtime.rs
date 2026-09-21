@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::OnceLock;
 
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::{Builder, Handle, Runtime};
 
 struct ProcessRuntime {
     pid: u32,
@@ -27,6 +28,18 @@ struct ProcessRuntime {
 }
 
 static RUNTIME: AtomicPtr<ProcessRuntime> = AtomicPtr::new(std::ptr::null_mut());
+
+thread_local! {
+    // Set on every thread the process runtime starts, where `block_in_place` is allowed.
+    static ON_PROCESS_RUNTIME_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+fn build_process_runtime() -> std::io::Result<Runtime> {
+    Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(|| ON_PROCESS_RUNTIME_THREAD.with(|flag| flag.set(true)))
+        .build()
+}
 
 fn global_runtime() -> &'static Runtime {
     let pid = std::process::id();
@@ -38,7 +51,7 @@ fn global_runtime() -> &'static Runtime {
             let state = unsafe { &*current };
             if state.pid == pid {
                 return state.runtime.get_or_init(|| {
-                    Runtime::new().expect(
+                    build_process_runtime().expect(
                         "failed to build global tokio runtime for paimon datafusion integration",
                     )
                 });
@@ -103,14 +116,19 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    if Handle::try_current().is_ok() {
-        let handle = global_runtime().handle().clone();
-        std::thread::spawn(move || handle.block_on(future))
-            .join()
-            .expect(panic_error)
-    } else {
-        global_runtime().block_on(future)
+    if Handle::try_current().is_err() {
+        return global_runtime().block_on(future);
     }
+    if ON_PROCESS_RUNTIME_THREAD.with(Cell::get) {
+        // A worker blocked mid-poll strands its LIFO slot and the I/O driver it last parked on.
+        // `block_in_place` hands both to another thread first.
+        return tokio::task::block_in_place(|| global_runtime().block_on(future));
+    }
+    // Threads of other runtimes: `block_in_place` panics in a `LocalSet` or a current-thread runtime.
+    let handle = global_runtime().handle().clone();
+    std::thread::spawn(move || handle.block_on(future))
+        .join()
+        .expect(panic_error)
 }
 
 #[cfg(test)]
@@ -140,6 +158,50 @@ mod tests {
                 .collect();
             assert!(runtimes.iter().all(|runtime| *runtime == runtimes[0]));
         });
+    }
+
+    #[test]
+    fn blocking_on_a_process_runtime_worker_keeps_its_queued_tasks_running() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        global_runtime().spawn(async move {
+            let (value_tx, value_rx) = tokio::sync::oneshot::channel();
+            // Spawned from a worker, this lands in that worker's LIFO slot, which cannot be stolen.
+            tokio::spawn(async move {
+                let _ = value_tx.send(7);
+            });
+            let value = block_on_with_runtime(
+                async move { value_rx.await.unwrap() },
+                "blocking runtime test panicked",
+            );
+            done_tx.send(value).unwrap();
+        });
+        assert_eq!(
+            done_rx.recv_timeout(std::time::Duration::from_secs(30)),
+            Ok(7),
+            "the blocked worker stranded the task it had just queued"
+        );
+    }
+
+    #[test]
+    fn callers_outside_the_process_runtime_keep_the_thread_based_path() {
+        let block = || block_on_with_runtime(async { 7 }, "blocking runtime test panicked");
+
+        // `block_in_place` would panic in both of these.
+        let multi_thread = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let in_local_set = local.block_on(&multi_thread, async move {
+            let spawned = tokio::task::spawn_local(async move { block() });
+            (block(), spawned.await.unwrap())
+        });
+        assert_eq!(in_local_set, (7, 7));
+
+        let current_thread = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(current_thread.block_on(async move { block() }), 7);
     }
 
     #[test]
