@@ -135,7 +135,8 @@ impl LuminaVectorIndexOptions {
             .cloned()
             .unwrap_or_else(|| "diskann".to_string());
 
-        let lumina_options = build_lumina_options(paimon_options, dimension)?;
+        let mut lumina_options = build_lumina_options(paimon_options, dimension)?;
+        canonicalize_metric(&mut lumina_options);
 
         Ok(Self {
             dimension,
@@ -147,6 +148,26 @@ impl LuminaVectorIndexOptions {
 
     pub fn to_lumina_options(&self) -> HashMap<String, String> {
         self.lumina_options.clone()
+    }
+}
+
+/// Rewrite `distance.metric` to the spelling `from_lumina_name` accepts.
+///
+/// The option parser also takes the enum names, via `from_string` above, but
+/// `LuminaIndexMeta::metric` is exact-match, so the configured spelling must not
+/// reach the committed metadata. An unrecognized value is left alone, keeping its
+/// existing error surface.
+fn canonicalize_metric(native_options: &mut HashMap<String, String>) {
+    let Some(configured) = native_options.get(KEY_DISTANCE_METRIC) else {
+        return;
+    };
+    let parsed = LuminaVectorMetric::from_lumina_name(configured)
+        .or_else(|_| LuminaVectorMetric::from_string(configured));
+    if let Ok(metric) = parsed {
+        native_options.insert(
+            KEY_DISTANCE_METRIC.to_string(),
+            metric.lumina_name().to_string(),
+        );
     }
 }
 
@@ -226,6 +247,9 @@ pub fn strip_lumina_options(paimon_options: &HashMap<String, String>) -> HashMap
             result.insert(native_key.to_string(), value.to_string());
         }
     }
+    // `LuminaVectorReader::ensure_loaded` overlays this map on top of the index
+    // metadata, so a table option spelled `L2` would put the enum name back.
+    canonicalize_metric(&mut result);
     result
 }
 
@@ -493,5 +517,63 @@ mod tests {
         assert_eq!(lumina_opts.get("diskann.search.beam_width").unwrap(), "4");
         assert_eq!(lumina_opts.get("encoding.pq.m").unwrap(), "64");
         assert_eq!(lumina_opts.get("search.parallel_number").unwrap(), "5");
+    }
+
+    #[test]
+    fn test_enum_form_metric_is_canonicalized_in_native_options() {
+        // The native-spelling rows pin that canonicalization is a no-op for them.
+        let cases = [
+            ("L2", "l2"),
+            ("COSINE", "cosine"),
+            ("INNER_PRODUCT", "inner_product"),
+            ("l2", "l2"),
+            ("cosine", "cosine"),
+            ("inner_product", "inner_product"),
+        ];
+        for (configured, native) in cases {
+            let paimon_options = HashMap::from([
+                ("lumina.index.dimension".to_string(), "4".to_string()),
+                // `cosine` is rejected with the default `pq` encoding.
+                ("lumina.encoding.type".to_string(), "rawf32".to_string()),
+                ("lumina.distance.metric".to_string(), configured.to_string()),
+            ]);
+            let options = LuminaVectorIndexOptions::new(&paimon_options).unwrap();
+            let native_options = options.to_lumina_options();
+            assert_eq!(
+                native_options.get(KEY_DISTANCE_METRIC).map(String::as_str),
+                Some(native),
+                "configured: {configured}"
+            );
+            let metric = LuminaIndexMeta::new(native_options)
+                .metric()
+                .unwrap_or_else(|e| panic!("configured {configured}: {e}"));
+            assert_eq!(metric.lumina_name(), native, "configured: {configured}");
+        }
+    }
+
+    #[test]
+    fn test_stripped_search_options_use_the_canonical_metric_name() {
+        let stripped = strip_lumina_options(&HashMap::from([(
+            "lumina.distance.metric".to_string(),
+            "L2".to_string(),
+        )]));
+        assert_eq!(
+            stripped.get(KEY_DISTANCE_METRIC).map(String::as_str),
+            Some("l2")
+        );
+    }
+
+    /// An unknown metric keeps its existing error surface rather than being
+    /// defaulted here. Passes without the fix too.
+    #[test]
+    fn test_stripped_search_options_pass_an_unknown_metric_through() {
+        let stripped = strip_lumina_options(&HashMap::from([(
+            "lumina.distance.metric".to_string(),
+            "hamming".to_string(),
+        )]));
+        assert_eq!(
+            stripped.get(KEY_DISTANCE_METRIC).map(String::as_str),
+            Some("hamming")
+        );
     }
 }
