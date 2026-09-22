@@ -158,10 +158,7 @@ class Table:
     def from_rest_response(
         response_json: str, *, database: str, table: str, options: Dict[str, str],
     ) -> "Table":
-        """Reuse REST metadata and merged catalog options, retaining token refresh.
-
-        Skips config/get-table requests. The response must belong to database/table.
-        """
+        """Reuse matching REST metadata and merged options; retain snapshots and token refresh."""
         ...
 
     def copy_with_resolved_schema(self, schema_json: str, *, branch: Optional[str] = None) -> "Table":

@@ -84,10 +84,8 @@ impl PyTable {
         Ok(Self::new(Arc::new(table)))
     }
 
-    /// Reuse a resolved REST get-table response and merged catalog options.
-    ///
-    /// Skips config/get-table requests, retaining REST snapshots and token refresh.
-    /// The caller must supply the response for the given database and table.
+    /// Reuse the matching REST table response and merged catalog options.
+    /// Skips config/get-table requests, preserving REST snapshots and token refresh.
     #[staticmethod]
     #[pyo3(signature = (response_json, *, database, table, options))]
     fn from_rest_response(

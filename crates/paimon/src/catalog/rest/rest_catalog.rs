@@ -98,10 +98,8 @@ impl RESTCatalog {
         })
     }
 
-    /// Build a table from metadata already resolved by another catalog client.
-    ///
-    /// Keeps REST snapshot loading and refreshable data credentials while avoiding
-    /// another get-table request. The response must belong to `identifier`.
+    /// Reuse the response for `identifier` without another get-table request.
+    /// Preserves REST snapshots and credential refresh.
     pub async fn table_from_response(
         &self,
         identifier: &Identifier,
