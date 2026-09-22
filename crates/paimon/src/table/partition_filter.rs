@@ -319,6 +319,13 @@ fn build_field_bounds(
     })
 }
 
+/// Collect `Eq`/`In`/`IsNull` candidate values per partition field.
+///
+/// Preserve every other condition, including earlier constraints on the same
+/// field, as a residual to evaluate before inserting a candidate partition.
+/// A `PartitionSet` is the sole authority in `matches_entry`, and exact partition
+/// filter pushdown lets DataFusion drop its residual filter, so the set must
+/// enforce the complete predicate.
 fn collect_eq_candidates<'a>(
     predicate: &'a Predicate,
     field_candidates: &mut [Option<FieldCandidates<'a>>],
@@ -735,6 +742,80 @@ mod tests {
         let pred = pb.equal("dt", Datum::String("2024-01-01".into())).unwrap();
         let filter = PartitionFilter::from_predicate(pred, &fields);
         assert!(matches!(filter, PartitionFilter::Predicate(_)));
+    }
+
+    fn serialized_dt(fields: &[DataField], dt: &str) -> Vec<u8> {
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_datum(0, &Datum::String(dt.into()), fields[0].data_type());
+        builder.build_serialized()
+    }
+
+    /// A residual range must reject a candidate that contradicts it.
+    #[test]
+    fn test_unexpressible_conjunct_on_covered_field_is_preserved() {
+        let fields = partition_fields_dt();
+        let pb = PredicateBuilder::new(&fields);
+        let pred = Predicate::and(vec![
+            pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
+            pb.greater_or_equal("dt", Datum::String("2024-01-02".into()))
+                .unwrap(),
+        ]);
+        let filter = PartitionFilter::from_predicate(pred, &fields);
+        assert!(!filter
+            .matches_entry(&serialized_dt(&fields, "2024-01-01"))
+            .unwrap());
+    }
+
+    /// Two expressible conjuncts on one field: the second assignment used to
+    /// overwrite the first, keeping whichever came last — here the wider `In`.
+    #[test]
+    fn test_second_conjunct_on_same_field_is_preserved() {
+        let fields = partition_fields_dt();
+        let pb = PredicateBuilder::new(&fields);
+        let pred = Predicate::and(vec![
+            pb.equal("dt", Datum::String("2024-01-02".into())).unwrap(),
+            pb.is_in(
+                "dt",
+                vec![
+                    Datum::String("2024-01-01".into()),
+                    Datum::String("2024-01-02".into()),
+                ],
+            )
+            .unwrap(),
+        ]);
+        let filter = PartitionFilter::from_predicate(pred, &fields);
+        assert!(!filter
+            .matches_entry(&serialized_dt(&fields, "2024-01-01"))
+            .unwrap());
+        assert!(filter
+            .matches_entry(&serialized_dt(&fields, "2024-01-02"))
+            .unwrap());
+    }
+
+    /// An `Or` over the partition field narrows the `In` beside it.
+    #[test]
+    fn test_or_conjunct_beside_covering_in_is_preserved() {
+        let fields = partition_fields_dt();
+        let pb = PredicateBuilder::new(&fields);
+        let pred = Predicate::and(vec![
+            Predicate::or(vec![
+                pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
+                pb.equal("dt", Datum::String("2024-01-02".into())).unwrap(),
+            ]),
+            pb.is_in(
+                "dt",
+                vec![
+                    Datum::String("2024-01-01".into()),
+                    Datum::String("2024-01-02".into()),
+                    Datum::String("2024-01-03".into()),
+                ],
+            )
+            .unwrap(),
+        ]);
+        let filter = PartitionFilter::from_predicate(pred, &fields);
+        assert!(!filter
+            .matches_entry(&serialized_dt(&fields, "2024-01-03"))
+            .unwrap());
     }
 
     #[test]

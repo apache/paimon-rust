@@ -49,14 +49,14 @@ fn int_key(v: i32) -> Vec<u8> {
     v.to_be_bytes().to_vec()
 }
 
-fn int_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+fn int_cmp(a: &[u8], b: &[u8]) -> crate::Result<std::cmp::Ordering> {
     let a_val = i32::from_be_bytes(a.try_into().unwrap());
     let b_val = i32::from_be_bytes(b.try_into().unwrap());
-    a_val.cmp(&b_val)
+    Ok(a_val.cmp(&b_val))
 }
 
 /// Helper: write entries, finish, then open a reader from the in-memory bytes.
-async fn write_and_open<F: Fn(&[u8], &[u8]) -> std::cmp::Ordering>(
+async fn write_and_open<F: Fn(&[u8], &[u8]) -> crate::Result<std::cmp::Ordering>>(
     buf: &VecFileWrite,
     result: &crate::btree::writer::BTreeWriteResult,
     cmp: F,
@@ -667,7 +667,7 @@ async fn test_prefix_query() {
     }
 
     let result = writer.finish().await.unwrap();
-    let reader = write_and_open(&buf, &result, |a: &[u8], b: &[u8]| a.cmp(b)).await;
+    let reader = write_and_open(&buf, &result, |a: &[u8], b: &[u8]| Ok(a.cmp(b))).await;
 
     let bm = reader.query_prefix(b"ap").await.unwrap();
     assert_eq!(bm.len(), 3);
@@ -709,7 +709,7 @@ async fn test_string_fallback_scan_query() {
     }
 
     let result = writer.finish().await.unwrap();
-    let reader = write_and_open(&buf, &result, |a: &[u8], b: &[u8]| a.cmp(b)).await;
+    let reader = write_and_open(&buf, &result, |a: &[u8], b: &[u8]| Ok(a.cmp(b))).await;
     let data_type = DataType::VarChar(VarCharType::string_type());
 
     let ends_with = reader
@@ -874,7 +874,7 @@ async fn test_string_keys() {
     }
 
     let result = writer.finish().await.unwrap();
-    let reader = write_and_open(&buf, &result, |a, b| a.cmp(b)).await;
+    let reader = write_and_open(&buf, &result, |a: &[u8], b: &[u8]| Ok(a.cmp(b))).await;
 
     let bm = reader.query_equal(b"apple").await.unwrap();
     assert!(bm.contains(0));
@@ -893,7 +893,7 @@ async fn test_string_keys_query() {
     }
 
     let result = writer.finish().await.unwrap();
-    let reader = write_and_open(&buf, &result, |a, b| a.cmp(b)).await;
+    let reader = write_and_open(&buf, &result, |a: &[u8], b: &[u8]| Ok(a.cmp(b))).await;
 
     let bm = reader.query_equal(b"cherry").await.unwrap();
     assert_eq!(bm.len(), 1);
@@ -1134,10 +1134,10 @@ fn le_int_key(v: i32) -> Vec<u8> {
     v.to_le_bytes().to_vec()
 }
 
-fn le_int_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+fn le_int_cmp(a: &[u8], b: &[u8]) -> crate::Result<std::cmp::Ordering> {
     let a_val = i32::from_le_bytes(a.try_into().unwrap());
     let b_val = i32::from_le_bytes(b.try_into().unwrap());
-    a_val.cmp(&b_val)
+    Ok(a_val.cmp(&b_val))
 }
 
 fn load_testdata(name: &str) -> Vec<u8> {
@@ -1145,7 +1145,7 @@ fn load_testdata(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {path}: {e}"))
 }
 
-async fn open_testdata<F: Fn(&[u8], &[u8]) -> std::cmp::Ordering>(
+async fn open_testdata<F: Fn(&[u8], &[u8]) -> crate::Result<std::cmp::Ordering>>(
     name: &str,
     meta: &BTreeIndexMeta,
     cmp: F,
@@ -1218,7 +1218,12 @@ async fn test_java_compat_int_with_nulls() {
 #[tokio::test]
 async fn test_java_compat_varchar_no_compress() {
     let meta = BTreeIndexMeta::new(Some(b"a".to_vec()), Some(b"yyyy".to_vec()), false);
-    let reader = open_testdata("btree_varchar_100_no_compress.bin", &meta, |a, b| a.cmp(b)).await;
+    let reader = open_testdata(
+        "btree_varchar_100_no_compress.bin",
+        &meta,
+        |a: &[u8], b: &[u8]| Ok(a.cmp(b)),
+    )
+    .await;
 
     let all = reader.all_non_null_rows().await.unwrap();
     assert_eq!(all.len(), 100);

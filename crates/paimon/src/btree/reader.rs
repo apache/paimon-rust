@@ -26,6 +26,7 @@
 use crate::btree::block::{BlockHandle, BlockReader};
 use crate::btree::bloom_filter::BloomFilter;
 use crate::btree::footer::{BTreeFileFooter, BloomFilterHandle, BTREE_FOOTER_ENCODED_LENGTH};
+use crate::btree::key_serde::key_comparison_io_error;
 use crate::btree::meta::BTreeIndexMeta;
 use crate::btree::posting_list;
 use crate::btree::sst_file::{read_block_from_bytes, SstFileReader};
@@ -41,8 +42,28 @@ struct LazyBloomFilter {
     filter: OnceCell<BloomFilter>,
 }
 
+/// `slice::sort_by` with a fallible comparator. The first failure is reported and the
+/// resulting order is unspecified, so the caller must not use the slice afterwards.
+fn try_sort_by<T>(
+    values: &mut [T],
+    mut cmp: impl FnMut(&T, &T) -> io::Result<Ordering>,
+) -> io::Result<()> {
+    let mut failure = None;
+    values.sort_by(|left, right| match cmp(left, right) {
+        Ok(order) => order,
+        Err(error) => {
+            failure.get_or_insert(error);
+            Ordering::Equal
+        }
+    });
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// BTree index reader with on-demand async data block loading.
-pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> Ordering> {
+pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> {
     reader: Box<dyn FileRead>,
     sst_reader: SstFileReader,
     null_bitmap: RoaringTreemap,
@@ -53,7 +74,7 @@ pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> Ordering> {
     file_version: u32,
 }
 
-impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
+impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
     /// Open a BTree index reader from a FileRead and file metadata.
     /// Only reads footer, index block, and null bitmap on open.
     /// Data blocks are read on demand during queries.
@@ -115,6 +136,13 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         &self.null_bitmap
     }
 
+    /// Compare two keys, reporting a stored key that cannot belong to the column's
+    /// current type as a distinguishable I/O error so the caller can give up on the
+    /// index instead of failing the query.
+    fn compare(&self, left: &[u8], right: &[u8]) -> io::Result<Ordering> {
+        (self.key_comparator)(left, right).map_err(key_comparison_io_error)
+    }
+
     /// Collect all non-null row ids into a bitmap.
     pub async fn all_non_null_rows(&self) -> io::Result<RoaringTreemap> {
         if self.min_key.is_none() {
@@ -138,9 +166,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
             return Ok(RoaringTreemap::new());
         };
 
-        let cmp = &self.key_comparator;
+        let cmp = |left: &[u8], right: &[u8]| self.compare(left, right);
         let index_block = self.sst_reader.index_block();
-        let (_, mut index_iter) = index_block.seek_and_iter(min_key, cmp);
+        let (_, mut index_iter) = index_block.seek_and_iter(min_key, &cmp)?;
         let mut result = RoaringTreemap::new();
 
         while let Some((_key, handle_bytes)) = index_iter.next() {
@@ -168,10 +196,10 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         from_inclusive: bool,
         to_inclusive: bool,
     ) -> io::Result<RoaringTreemap> {
-        let cmp = &self.key_comparator;
+        let cmp = |left: &[u8], right: &[u8]| self.compare(left, right);
         let mut result = RoaringTreemap::new();
 
-        match cmp(from, to) {
+        match self.compare(from, to)? {
             Ordering::Greater => return Ok(result),
             Ordering::Equal if !from_inclusive || !to_inclusive => return Ok(result),
             _ => {}
@@ -179,7 +207,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
 
         // Seek in index block to find the first data block that may contain `from`
         let index_block = self.sst_reader.index_block();
-        let (_, mut index_iter) = index_block.seek_and_iter(from, cmp);
+        let (_, mut index_iter) = index_block.seek_and_iter(from, &cmp)?;
 
         // First data block: seek within it
         let first_block = match index_iter.next() {
@@ -190,7 +218,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
             None => return Ok(result),
         };
 
-        let (_, seeked) = first_block.seek_and_iter(from, cmp);
+        let (_, seeked) = first_block.seek_and_iter(from, &cmp)?;
         let mut offset = seeked.offset;
 
         // Iterate first block from seeked position
@@ -240,16 +268,15 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         to_inclusive: bool,
         result: &mut RoaringTreemap,
     ) -> io::Result<bool> {
-        let cmp = &self.key_comparator;
         while *offset < block.data.len() {
             let (key, value, next_offset) = block.read_entry_at(*offset);
             *offset = next_offset;
 
-            if !from_inclusive && cmp(key, from) == Ordering::Equal {
+            if !from_inclusive && self.compare(key, from)? == Ordering::Equal {
                 continue;
             }
 
-            let diff = cmp(key, to);
+            let diff = self.compare(key, to)?;
             if diff == Ordering::Greater || (!to_inclusive && diff == Ordering::Equal) {
                 return Ok(true);
             }
@@ -316,16 +343,16 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
 
     /// Equal query: returns row ids for the given key.
     pub async fn query_equal(&self, key: &[u8]) -> io::Result<RoaringTreemap> {
-        let cmp = &self.key_comparator;
-        if self
-            .min_key
-            .as_deref()
-            .is_none_or(|min| cmp(key, min) == Ordering::Less)
-            || self
-                .max_key
-                .as_deref()
-                .is_none_or(|max| cmp(key, max) == Ordering::Greater)
-        {
+        let cmp = |left: &[u8], right: &[u8]| self.compare(left, right);
+        let outside_bounds = match self.min_key.as_deref() {
+            None => true,
+            Some(min) if self.compare(key, min)? == Ordering::Less => true,
+            Some(_) => match self.max_key.as_deref() {
+                None => true,
+                Some(max) => self.compare(key, max)? == Ordering::Greater,
+            },
+        };
+        if outside_bounds {
             return Ok(RoaringTreemap::new());
         }
         if !self.bloom_might_contain(key).await? {
@@ -333,13 +360,13 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         }
 
         let index_block = self.sst_reader.index_block();
-        let (_, mut index_iter) = index_block.seek_and_iter(key, cmp);
+        let (_, mut index_iter) = index_block.seek_and_iter(key, &cmp)?;
         let Some((_last_key, handle_bytes)) = index_iter.next() else {
             return Ok(RoaringTreemap::new());
         };
         let handle = BlockHandle::decode(handle_bytes)?;
         let block = self.read_data_block(&handle).await?;
-        let (found, mut entry_iter) = block.seek_and_iter(key, cmp);
+        let (found, mut entry_iter) = block.seek_and_iter(key, &cmp)?;
         let mut result = RoaringTreemap::new();
         if let (true, Some((_entry_key, value))) = (found, entry_iter.next()) {
             posting_list::add_to(value, self.file_version, &mut result)?;
@@ -411,25 +438,39 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
             return Ok(RoaringTreemap::new());
         }
 
-        let cmp = &self.key_comparator;
+        let cmp = |left: &[u8], right: &[u8]| self.compare(left, right);
         let (Some(min_key), Some(max_key)) = (self.min_key.as_deref(), self.max_key.as_deref())
         else {
             return Ok(RoaringTreemap::new());
         };
 
-        // Sort, deduplicate, and discard keys outside this file's bounds before resolving blocks.
-        let mut sorted_keys: Vec<&[u8]> = keys.to_vec();
-        sorted_keys.sort_by(|a, b| cmp(a, b));
-        sorted_keys.dedup_by(|a, b| cmp(a, b) == Ordering::Equal);
-        sorted_keys.retain(|key| {
-            cmp(key, min_key) != Ordering::Less && cmp(key, max_key) != Ordering::Greater
-        });
-        if sorted_keys.is_empty() {
+        // Discard keys outside this file's bounds, then sort and deduplicate the rest
+        // before resolving blocks.
+        let mut sorted_keys: Vec<&[u8]> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if self.compare(key, min_key)? != Ordering::Less
+                && self.compare(key, max_key)? != Ordering::Greater
+            {
+                sorted_keys.push(key);
+            }
+        }
+        try_sort_by(&mut sorted_keys, |left, right| self.compare(left, right))?;
+        let mut unique_keys: Vec<&[u8]> = Vec::with_capacity(sorted_keys.len());
+        for key in sorted_keys {
+            let duplicate = match unique_keys.last() {
+                Some(previous) => self.compare(previous, key)? == Ordering::Equal,
+                None => false,
+            };
+            if !duplicate {
+                unique_keys.push(key);
+            }
+        }
+        if unique_keys.is_empty() {
             return Ok(RoaringTreemap::new());
         }
 
-        let mut bloom_matches = Vec::with_capacity(sorted_keys.len());
-        for key in sorted_keys {
+        let mut bloom_matches = Vec::with_capacity(unique_keys.len());
+        for key in unique_keys {
             if self.bloom_might_contain(key).await? {
                 bloom_matches.push(key);
             }
@@ -443,7 +484,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         let index_block = self.sst_reader.index_block();
         let mut target_blocks: Vec<(BlockHandle, Vec<&[u8]>)> = Vec::new();
         for key in bloom_matches {
-            let (_, mut index_iter) = index_block.seek_and_iter(key, cmp);
+            let (_, mut index_iter) = index_block.seek_and_iter(key, &cmp)?;
             let Some((_last_key, handle_bytes)) = index_iter.next() else {
                 break;
             };
@@ -463,7 +504,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexReader<F> {
         for (handle, block_keys) in target_blocks {
             let block = self.read_data_block(&handle).await?;
             for key in block_keys {
-                let (found, mut entry_iter) = block.seek_and_iter(key, cmp);
+                let (found, mut entry_iter) = block.seek_and_iter(key, &cmp)?;
                 if let (true, Some((_entry_key, value))) = (found, entry_iter.next()) {
                     posting_list::add_to(value, self.file_version, &mut result)?;
                 }

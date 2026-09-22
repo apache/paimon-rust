@@ -25,6 +25,7 @@ use super::bitmap_global_index_format::{
 };
 #[cfg(test)]
 use super::bitmap_global_index_writer::BitmapGlobalIndexWriter;
+use crate::btree::key_serde::key_comparison_io_error;
 use crate::btree::var_len::{decode_var_int, decode_var_long};
 use crate::btree::{compute_crc32, decompress_block, BlockCompressionType};
 use crate::io::FileRead;
@@ -60,6 +61,21 @@ pub(crate) struct BitmapGlobalIndexReader {
     footer: Footer,
     dictionary_blocks: Vec<DictionaryBlockMeta>,
     dictionary_block_cache: Mutex<HashMap<BlockInfo, Arc<Vec<DictionaryEntry>>>>,
+}
+
+/// A key comparator for this reader's `io::Result` signatures.
+///
+/// A dictionary key was written with the type the column had when the index was built,
+/// so comparing it against a literal serialized from the column's current type can fail.
+/// The failure is wrapped so the caller can tell it from a real I/O failure and give up
+/// on the index rather than failing the query.
+type IoKeyComparator<'a> = dyn Fn(&[u8], &[u8]) -> io::Result<Ordering> + Send + Sync + 'a;
+
+fn io_key_comparator(
+    data_type: &DataType,
+) -> impl Fn(&[u8], &[u8]) -> io::Result<Ordering> + Send + Sync {
+    let cmp = make_bitmap_key_comparator(data_type);
+    move |left, right| cmp(left, right).map_err(key_comparison_io_error)
 }
 
 impl BitmapGlobalIndexReader {
@@ -146,29 +162,39 @@ impl BitmapGlobalIndexReader {
             PredicateOperator::IsNotNull => self.is_not_null().await,
             PredicateOperator::Lt => {
                 let key = serialize_bitmap_datum(&literals[0], data_type);
-                self.scan_dictionary(data_type, |candidate, cmp| cmp(candidate, &key).is_lt())
-                    .await
+                self.scan_dictionary(
+                    data_type,
+                    |candidate, cmp| Ok(cmp(candidate, &key)?.is_lt()),
+                )
+                .await
             }
             PredicateOperator::LtEq => {
                 let key = serialize_bitmap_datum(&literals[0], data_type);
-                self.scan_dictionary(data_type, |candidate, cmp| !cmp(candidate, &key).is_gt())
-                    .await
+                self.scan_dictionary(data_type, |candidate, cmp| {
+                    Ok(!cmp(candidate, &key)?.is_gt())
+                })
+                .await
             }
             PredicateOperator::Gt => {
                 let key = serialize_bitmap_datum(&literals[0], data_type);
-                self.scan_dictionary(data_type, |candidate, cmp| cmp(candidate, &key).is_gt())
-                    .await
+                self.scan_dictionary(
+                    data_type,
+                    |candidate, cmp| Ok(cmp(candidate, &key)?.is_gt()),
+                )
+                .await
             }
             PredicateOperator::GtEq => {
                 let key = serialize_bitmap_datum(&literals[0], data_type);
-                self.scan_dictionary(data_type, |candidate, cmp| !cmp(candidate, &key).is_lt())
-                    .await
+                self.scan_dictionary(data_type, |candidate, cmp| {
+                    Ok(!cmp(candidate, &key)?.is_lt())
+                })
+                .await
             }
             PredicateOperator::Between => {
                 let from = serialize_bitmap_datum(&literals[0], data_type);
                 let to = serialize_bitmap_datum(&literals[1], data_type);
                 self.scan_dictionary(data_type, |candidate, cmp| {
-                    !cmp(candidate, &from).is_lt() && !cmp(candidate, &to).is_gt()
+                    Ok(!cmp(candidate, &from)?.is_lt() && !cmp(candidate, &to)?.is_gt())
                 })
                 .await
             }
@@ -178,7 +204,7 @@ impl BitmapGlobalIndexReader {
                 let to = serialize_bitmap_datum(&literals[1], data_type);
                 let inside = self
                     .scan_dictionary(data_type, |candidate, cmp| {
-                        !cmp(candidate, &from).is_lt() && !cmp(candidate, &to).is_gt()
+                        Ok(!cmp(candidate, &from)?.is_lt() && !cmp(candidate, &to)?.is_gt())
                     })
                     .await?;
                 result -= inside;
@@ -195,7 +221,7 @@ impl BitmapGlobalIndexReader {
                 if prefix.is_empty() {
                     return self.is_not_null().await;
                 }
-                self.scan_serialized_dictionary(|candidate| candidate.starts_with(&prefix))
+                self.scan_serialized_dictionary(|candidate| Ok(candidate.starts_with(&prefix)))
                     .await
             }
             PredicateOperator::EndsWith => {
@@ -209,7 +235,7 @@ impl BitmapGlobalIndexReader {
                 if suffix.is_empty() {
                     return self.is_not_null().await;
                 }
-                self.scan_serialized_dictionary(|candidate| candidate.ends_with(&suffix))
+                self.scan_serialized_dictionary(|candidate| Ok(candidate.ends_with(&suffix)))
                     .await
             }
             PredicateOperator::Contains => {
@@ -223,7 +249,7 @@ impl BitmapGlobalIndexReader {
                 if needle.is_empty() {
                     return self.is_not_null().await;
                 }
-                self.scan_serialized_dictionary(|candidate| contains_bytes(candidate, &needle))
+                self.scan_serialized_dictionary(|candidate| Ok(contains_bytes(candidate, &needle)))
                     .await
             }
             PredicateOperator::Like => {
@@ -235,7 +261,8 @@ impl BitmapGlobalIndexReader {
                 }
                 let pattern = string_literal(literals, op)?.to_string();
                 self.scan_serialized_dictionary(|candidate| {
-                    std::str::from_utf8(candidate).is_ok_and(|value| like_match(value, &pattern))
+                    Ok(std::str::from_utf8(candidate)
+                        .is_ok_and(|value| like_match(value, &pattern)))
                 })
                 .await
             }
@@ -254,10 +281,10 @@ impl BitmapGlobalIndexReader {
             return self.is_not_null().await;
         }
         self.scan_dictionary(data_type, |candidate, cmp| {
-            let from_cmp = cmp(candidate, from);
-            let to_cmp = cmp(candidate, to);
-            (from_cmp.is_gt() || (from_inclusive && from_cmp.is_eq()))
-                && (to_cmp.is_lt() || (to_inclusive && to_cmp.is_eq()))
+            let from_cmp = cmp(candidate, from)?;
+            let to_cmp = cmp(candidate, to)?;
+            Ok((from_cmp.is_gt() || (from_inclusive && from_cmp.is_eq()))
+                && (to_cmp.is_lt() || (to_inclusive && to_cmp.is_eq())))
         })
         .await
     }
@@ -271,14 +298,14 @@ impl BitmapGlobalIndexReader {
     }
 
     async fn equal(&self, key: &[u8], data_type: &DataType) -> io::Result<RoaringTreemap> {
-        let logical_cmp = make_bitmap_key_comparator(data_type);
-        self.equal_with_comparator(key, logical_cmp.as_ref()).await
+        let logical_cmp = io_key_comparator(data_type);
+        self.equal_with_comparator(key, &logical_cmp).await
     }
 
     async fn equal_with_comparator(
         &self,
         key: &[u8],
-        logical_cmp: &(dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync),
+        logical_cmp: &IoKeyComparator<'_>,
     ) -> io::Result<RoaringTreemap> {
         match self.find_bitmap_block(key, logical_cmp).await? {
             Some(block) => self.read_bitmap(block).await,
@@ -291,12 +318,10 @@ impl BitmapGlobalIndexReader {
         sorted_keys.sort();
         sorted_keys.dedup();
 
-        let logical_cmp = make_bitmap_key_comparator(data_type);
+        let logical_cmp = io_key_comparator(data_type);
         let mut result = RoaringTreemap::new();
         for key in sorted_keys {
-            result |= self
-                .equal_with_comparator(&key, logical_cmp.as_ref())
-                .await?;
+            result |= self.equal_with_comparator(&key, &logical_cmp).await?;
         }
         Ok(result)
     }
@@ -304,21 +329,21 @@ impl BitmapGlobalIndexReader {
     async fn scan_dictionary(
         &self,
         data_type: &DataType,
-        predicate: impl Fn(&[u8], &dyn Fn(&[u8], &[u8]) -> Ordering) -> bool,
+        predicate: impl Fn(&[u8], &IoKeyComparator<'_>) -> io::Result<bool>,
     ) -> io::Result<RoaringTreemap> {
-        let cmp = make_bitmap_key_comparator(data_type);
-        self.scan_serialized_dictionary(|candidate| predicate(candidate, cmp.as_ref()))
+        let cmp = io_key_comparator(data_type);
+        self.scan_serialized_dictionary(|candidate| predicate(candidate, &cmp))
             .await
     }
 
     async fn scan_serialized_dictionary(
         &self,
-        predicate: impl Fn(&[u8]) -> bool,
+        predicate: impl Fn(&[u8]) -> io::Result<bool>,
     ) -> io::Result<RoaringTreemap> {
         let mut result = RoaringTreemap::new();
         for block_meta in &self.dictionary_blocks {
             for entry in self.read_dictionary_block(block_meta.block).await?.iter() {
-                if predicate(&entry.key) {
+                if predicate(&entry.key)? {
                     result |= self.read_bitmap(entry.bitmap_block).await?;
                 }
             }
@@ -329,13 +354,13 @@ impl BitmapGlobalIndexReader {
     async fn find_bitmap_block(
         &self,
         key: &[u8],
-        logical_cmp: &(dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync),
+        logical_cmp: &IoKeyComparator<'_>,
     ) -> io::Result<Option<BlockInfo>> {
-        let Some(block_meta) = self.find_dictionary_block_meta(key, logical_cmp) else {
+        let Some(block_meta) = self.find_dictionary_block_meta(key, logical_cmp)? else {
             return Ok(None);
         };
         for entry in self.read_dictionary_block(block_meta.block).await?.iter() {
-            match logical_cmp(&entry.key, key) {
+            match logical_cmp(&entry.key, key)? {
                 Ordering::Equal => return Ok(Some(entry.bitmap_block)),
                 Ordering::Greater => return Ok(None),
                 Ordering::Less => {}
@@ -347,23 +372,24 @@ impl BitmapGlobalIndexReader {
     fn find_dictionary_block_meta(
         &self,
         key: &[u8],
-        compare: impl Fn(&[u8], &[u8]) -> Ordering,
-    ) -> Option<&DictionaryBlockMeta> {
+        compare: impl Fn(&[u8], &[u8]) -> io::Result<Ordering>,
+    ) -> io::Result<Option<&DictionaryBlockMeta>> {
         if self.dictionary_blocks.is_empty() {
-            return None;
+            return Ok(None);
         }
         let mut low = 0usize;
         let mut high = self.dictionary_blocks.len();
         while low < high {
             let mid = (low + high) / 2;
-            if compare(&self.dictionary_blocks[mid].first_key, key) != Ordering::Greater {
+            if compare(&self.dictionary_blocks[mid].first_key, key)? != Ordering::Greater {
                 low = mid + 1;
             } else {
                 high = mid;
             }
         }
-        low.checked_sub(1)
-            .and_then(|index| self.dictionary_blocks.get(index))
+        Ok(low
+            .checked_sub(1)
+            .and_then(|index| self.dictionary_blocks.get(index)))
     }
 
     async fn read_dictionary_block(
@@ -1006,9 +1032,10 @@ mod tests {
         ];
         for (op, literals, expected) in cases {
             let key = serialize_bitmap_datum(&literals[0], &data_type);
-            let cmp = make_bitmap_key_comparator(&data_type);
+            let cmp = io_key_comparator(&data_type);
             let expected_block = reader
-                .find_dictionary_block_meta(&key, cmp.as_ref())
+                .find_dictionary_block_meta(&key, cmp)
+                .unwrap()
                 .unwrap()
                 .block;
             let was_cached = reader

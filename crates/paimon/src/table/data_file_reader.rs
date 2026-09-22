@@ -17,7 +17,9 @@
 
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
-use crate::arrow::format::{create_format_reader_with_budget, MosaicPrefetchOptions};
+use crate::arrow::format::{
+    create_format_reader_with_budget, FormatReadFields, MosaicPrefetchOptions,
+};
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::arrow::ReadBudget;
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
@@ -107,7 +109,7 @@ impl FileRead for TimedFileRead {
     }
 }
 
-/// Reads data from Parquet files.
+/// Reads data files through their format-specific readers.
 #[derive(Clone)]
 pub(crate) struct DataFileReader {
     file_io: FileIO,
@@ -335,6 +337,7 @@ impl DataFileReader {
                         &split,
                         file_meta,
                         data_fields,
+                        None,
                         row_selection,
                     )?;
                     while let Some(batch) = stream.next().await {
@@ -395,7 +398,7 @@ impl DataFileReader {
         }
     }
 
-    /// Read a single parquet file from a split, returning a lazy stream of batches.
+    /// Read a single data file from a split, returning a lazy stream of batches.
     /// Optionally applies a deletion vector.
     ///
     /// Handles schema evolution using field-ID-based index mapping:
@@ -422,7 +425,43 @@ impl DataFileReader {
         });
         let row_selection =
             merge_row_selection(file_meta.row_count, dv.as_deref(), local_ranges.as_deref());
-        self.read_single_file_stream_with_selection(split, file_meta, data_fields, row_selection)
+        self.read_single_file_stream_with_selection(
+            split,
+            file_meta,
+            data_fields,
+            None,
+            row_selection,
+        )
+    }
+
+    /// Read one file with the complete physical data schema supplied by a
+    /// caller such as the KV reader. The format chooses whether it needs the
+    /// full schema or only the projected fields.
+    pub(super) fn read_single_file_stream_with_schema(
+        &self,
+        split: &DataSplit,
+        file_meta: DataFileMeta,
+        data_fields: Option<Vec<DataField>>,
+        data_schema_fields: Vec<DataField>,
+        dv: Option<Arc<DeletionVector>>,
+        row_ranges: Option<Vec<RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let local_ranges = row_ranges.as_ref().map(|ranges| {
+            to_local_row_ranges(
+                ranges,
+                file_meta.first_row_id.unwrap_or(0),
+                file_meta.row_count,
+            )
+        });
+        let row_selection =
+            merge_row_selection(file_meta.row_count, dv.as_deref(), local_ranges.as_deref());
+        self.read_single_file_stream_with_selection(
+            split,
+            file_meta,
+            data_fields,
+            Some(data_schema_fields),
+            row_selection,
+        )
     }
 
     fn read_single_file_stream_with_selection(
@@ -430,6 +469,7 @@ impl DataFileReader {
         split: &DataSplit,
         file_meta: DataFileMeta,
         data_fields: Option<Vec<DataField>>,
+        data_schema_fields: Option<Vec<DataField>>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
         if row_selection.as_ref().is_some_and(Vec::is_empty) {
@@ -488,8 +528,6 @@ impl DataFileReader {
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
-        let is_row_file = is_row_file(&file_meta);
-
         // What the reader is asked for.
         let projected_read_fields: Vec<DataField> = if let Some(ref df) = data_fields {
             read_data_fields(df, &read_type)?
@@ -500,11 +538,26 @@ impl DataFileReader {
                 .cloned()
                 .collect()
         };
-        let format_read_fields = if is_row_file {
-            file_fields.clone()
-        } else {
-            projected_read_fields
-        };
+        let data_schema_fields = data_schema_fields_for_file(
+            &file_fields,
+            file_meta.write_cols.as_deref(),
+            data_schema_fields.as_deref(),
+        )?;
+        let path_to_read = split.data_file_path(&file_meta);
+        let configured_reader = create_format_reader_with_budget(
+            &path_to_read,
+            blob_as_descriptor,
+            FormatReadFields {
+                data_schema: &data_schema_fields,
+                projected: &projected_read_fields,
+            },
+            &table_options,
+            parquet_read_budget,
+            blob_parallelism,
+            mosaic_prefetch,
+        )?;
+        let format_read_fields = configured_reader.read_fields;
+        let format_reader = configured_reader.reader;
         // The decoded batch is described by `format_read_fields`, so map
         // `read_type` onto *that* list: its entries carry the types the columns
         // actually come back as, which is what reconciling them needs.
@@ -524,7 +577,7 @@ impl DataFileReader {
             let remapped = crate::arrow::filtering::remap_predicates_to_file(
                 &predicates,
                 &table_fields,
-                &file_fields,
+                &data_schema_fields,
             );
             if remapped.is_empty() && row_filter_factory.is_none() {
                 None
@@ -532,23 +585,13 @@ impl DataFileReader {
                 Some(crate::arrow::format::FilePredicates {
                     predicates: remapped,
                     row_filter_factory,
-                    file_fields: file_fields.clone(),
+                    file_fields: data_schema_fields.clone(),
                 })
             }
         };
 
         Ok(try_stream! {
             let schema_open_start = read_timing.as_ref().map(|_| Instant::now());
-            let path_to_read = split.data_file_path(&file_meta);
-            let format_reader = create_format_reader_with_budget(
-                &path_to_read,
-                blob_as_descriptor,
-                &format_read_fields,
-                &table_options,
-                parquet_read_budget,
-                blob_parallelism,
-                mosaic_prefetch,
-            )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let open_start = read_timing.as_ref().map(|_| Instant::now());
             let file_reader = input_file.reader().await?;
@@ -781,8 +824,6 @@ impl DataFileReader {
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
-        let is_row_file = is_row_file(&file_meta);
-
         // What the reader is asked for.
         let projected_read_fields: Vec<DataField> = if let Some(ref df) = data_fields {
             read_data_fields(df, &read_type)?
@@ -793,11 +834,23 @@ impl DataFileReader {
                 .cloned()
                 .collect()
         };
-        let format_read_fields = if is_row_file {
-            file_fields.clone()
-        } else {
-            projected_read_fields
-        };
+        let data_schema_fields =
+            data_schema_fields_for_file(&file_fields, file_meta.write_cols.as_deref(), None)?;
+        let path_to_read = split.data_file_path(&file_meta);
+        let configured_reader = create_format_reader_with_budget(
+            &path_to_read,
+            blob_as_descriptor,
+            FormatReadFields {
+                data_schema: &data_schema_fields,
+                projected: &projected_read_fields,
+            },
+            &table_options,
+            parquet_read_budget,
+            blob_parallelism,
+            mosaic_prefetch,
+        )?;
+        let format_read_fields = configured_reader.read_fields;
+        let format_reader = configured_reader.reader;
         // The decoded batch is described by `format_read_fields`, so map
         // `read_type` onto *that* list: its entries carry the types the columns
         // actually come back as, which is what reconciling them needs.
@@ -815,7 +868,7 @@ impl DataFileReader {
             let remapped = crate::arrow::filtering::remap_predicates_to_file(
                 &predicates,
                 &table_fields,
-                &file_fields,
+                &data_schema_fields,
             );
             if remapped.is_empty() {
                 None
@@ -823,7 +876,7 @@ impl DataFileReader {
                 Some(crate::arrow::format::FilePredicates {
                     predicates: remapped,
                     row_filter_factory: None,
-                    file_fields: file_fields.clone(),
+                    file_fields: data_schema_fields.clone(),
                 })
             }
         };
@@ -836,16 +889,6 @@ impl DataFileReader {
             merge_row_selection(file_meta.row_count, dv.as_deref(), Some(&local_ranges));
 
         Ok(try_stream! {
-            let path_to_read = split.data_file_path(&file_meta);
-            let format_reader = create_format_reader_with_budget(
-                &path_to_read,
-                blob_as_descriptor,
-                &format_read_fields,
-                &table_options,
-                parquet_read_budget,
-                blob_parallelism,
-                mosaic_prefetch,
-            )?;
             let input_file = file_io.new_input(&path_to_read)?;
             let file_reader = input_file.reader().await?;
 
@@ -1041,12 +1084,27 @@ fn data_field_with_type(field: &DataField, data_type: DataType) -> DataField {
         .with_description(field.description().map(ToString::to_string))
 }
 
-fn is_row_file(file_meta: &DataFileMeta) -> bool {
-    file_meta.file_name.to_ascii_lowercase().ends_with(".row")
-        || file_meta
-            .external_path
-            .as_deref()
-            .is_some_and(|path| path.to_ascii_lowercase().ends_with(".row"))
+fn data_schema_fields_for_file(
+    file_fields: &[DataField],
+    write_cols: Option<&[String]>,
+    data_schema_fields: Option<&[DataField]>,
+) -> crate::Result<Vec<DataField>> {
+    if let Some(write_cols) = write_cols {
+        return write_cols
+            .iter()
+            .map(|name| {
+                file_fields
+                    .iter()
+                    .find(|field| field.name() == name)
+                    .cloned()
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: format!("write column '{name}' is absent from the file schema"),
+                        source: None,
+                    })
+            })
+            .collect();
+    }
+    Ok(data_schema_fields.unwrap_or(file_fields).to_vec())
 }
 
 /// Convert ranges from their read-path coordinate system to file-local ranges.
@@ -1378,6 +1436,31 @@ mod row_tests {
         DataField::new(id, name.to_string(), data_type)
     }
 
+    #[test]
+    fn complete_data_schema_uses_supplied_physical_schema_and_write_cols() {
+        let fields = vec![
+            field(1, "id", DataType::Int(IntType::new())),
+            field(2, "value", DataType::Int(IntType::new())),
+        ];
+        let physical = vec![field(1_000_001, "_KEY_id", DataType::Int(IntType::new()))];
+        assert_eq!(
+            data_schema_fields_for_file(&fields, None, None).unwrap(),
+            fields
+        );
+        let selected = data_schema_fields_for_file(&fields, None, Some(&physical)).unwrap();
+        assert_eq!(
+            selected.iter().map(DataField::name).collect::<Vec<_>>(),
+            vec!["_KEY_id"]
+        );
+        let partial =
+            data_schema_fields_for_file(&fields, Some(&["value".to_string()]), Some(&physical))
+                .unwrap();
+        assert_eq!(
+            partial.iter().map(DataField::name).collect::<Vec<_>>(),
+            vec!["value"]
+        );
+    }
+
     fn data_file(file_name: &str, file_size: i64, row_count: i64, schema_id: i64) -> DataFileMeta {
         DataFileMeta {
             file_name: file_name.to_string(),
@@ -1587,6 +1670,65 @@ mod row_tests {
             })
             .collect();
         assert_eq!(ages, vec![30, 40, 50]);
+    }
+
+    #[tokio::test]
+    async fn row_partial_write_cols_resolve_predicates_against_physical_schema() {
+        let fields = vec![
+            field(0, "id", DataType::Int(IntType::new())),
+            field(1, "age", DataType::Int(IntType::new())),
+        ];
+        let schema = build_target_arrow_schema(&fields[..1]).unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
+                .unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/row_partial_predicate";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "partial.row";
+        let output = file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap();
+        let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size as i64;
+        let mut file = data_file(file_name, file_size, 2, 1);
+        file.write_cols = Some(vec!["id".to_string()]);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .build()
+            .unwrap();
+        let predicates = PredicateBuilder::new(&fields);
+        for (predicate, expected_rows) in [
+            (predicates.is_null("age").unwrap(), 2),
+            (predicates.greater_than("age", Datum::Int(0)).unwrap(), 0),
+        ] {
+            let reader = DataFileReader::new(
+                file_io.clone(),
+                SchemaManager::new(file_io.clone(), table_path.to_string()),
+                1,
+                fields.clone(),
+                vec![fields[0].clone()],
+                vec![predicate],
+            );
+            let batches = reader
+                .read(std::slice::from_ref(&split))
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                expected_rows
+            );
+        }
     }
 
     /// The predicate must not renumber a projected `_ROW_ID`: the surviving row

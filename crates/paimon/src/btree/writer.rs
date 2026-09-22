@@ -23,6 +23,7 @@
 
 use crate::btree::block::{BlockCompressionType, BlockHandle};
 use crate::btree::footer::BTreeFileFooter;
+use crate::btree::key_serde::key_comparison_io_error;
 use crate::btree::meta::BTreeIndexMeta;
 use crate::btree::posting_list;
 use crate::btree::sst_file::SstFileWriter;
@@ -38,7 +39,7 @@ const BLOOM_FILTER_FPP: f64 = 0.05;
 /// Usage:
 /// 1. Call `write(key, row_id)` for each entry (keys must be sorted).
 /// 2. Call `finish()` to close the file and get the index meta.
-pub struct BTreeIndexWriter<F: Fn(&[u8], &[u8]) -> Ordering> {
+pub struct BTreeIndexWriter<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> {
     sst_writer: SstFileWriter,
     current_row_ids: Vec<i64>,
     last_key: Option<Vec<u8>>,
@@ -57,7 +58,7 @@ pub struct BTreeWriteResult {
     pub row_count: u64,
 }
 
-impl BTreeIndexWriter<fn(&[u8], &[u8]) -> Ordering> {
+impl BTreeIndexWriter<fn(&[u8], &[u8]) -> crate::Result<Ordering>> {
     pub fn new(
         writer: Box<dyn FileWrite>,
         block_size: usize,
@@ -84,13 +85,13 @@ impl BTreeIndexWriter<fn(&[u8], &[u8]) -> Ordering> {
             first_key: None,
             null_bitmap: None,
             row_count: 0,
-            key_comparator: |a, b| a.cmp(b),
+            key_comparator: |a, b| Ok(a.cmp(b)),
             file_version: 1,
         }
     }
 }
 
-impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
+impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexWriter<F> {
     /// Create a writer with a custom key comparator.
     pub fn with_comparator(
         writer: Box<dyn FileWrite>,
@@ -179,7 +180,10 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BTreeIndexWriter<F> {
             }
             Some(k) => {
                 if let Some(ref last) = self.last_key {
-                    if (self.key_comparator)(k, last) != Ordering::Equal {
+                    // The build side serializes both keys from the column's current
+                    // type, so a failure here is a real defect, not schema evolution.
+                    let order = (self.key_comparator)(k, last).map_err(key_comparison_io_error)?;
+                    if order != Ordering::Equal {
                         self.flush_row_ids().await?;
                     }
                 }

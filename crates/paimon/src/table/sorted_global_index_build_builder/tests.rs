@@ -475,13 +475,13 @@ fn test_index_key_codec_scopes_java_nan_semantics_to_bitmap() {
         let btree_nan_key = btree_serialize(&negative_nan, &data_type);
         let zero_key = btree_serialize(&zero, &data_type);
         assert_eq!(btree_nan_key, raw_nan_key);
-        assert!(btree_cmp(&btree_nan_key, &zero_key).is_lt());
+        assert!(btree_cmp(&btree_nan_key, &zero_key).unwrap().is_lt());
 
         let (bitmap_cmp, bitmap_serialize) =
             make_index_key_codec(BITMAP_GLOBAL_INDEX_TYPE, &data_type);
         let bitmap_nan_key = bitmap_serialize(&negative_nan, &data_type);
         assert_eq!(bitmap_nan_key, canonical_nan_key);
-        assert!(bitmap_cmp(&bitmap_nan_key, &zero_key).is_gt());
+        assert!(bitmap_cmp(&bitmap_nan_key, &zero_key).unwrap().is_gt());
     }
 
     assert_codec(
@@ -528,7 +528,7 @@ fn test_sort_index_rows_orders_nulls_then_keys() {
     ];
     let cmp = make_key_comparator(&DataType::Int(IntType::new()));
 
-    sort_index_rows(&mut rows, &cmp);
+    sort_index_rows(&mut rows, &cmp).unwrap();
 
     assert_eq!(
         rows,

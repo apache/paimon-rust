@@ -641,10 +641,11 @@ impl BlockReader {
 
     /// Binary search for the given target key. Returns an iterator positioned at the
     /// first entry whose key >= target_key.
-    /// The comparator compares two key byte slices.
-    pub fn seek_and_iter<F>(&self, target_key: &[u8], cmp: &F) -> (bool, BlockIter<'_>)
+    /// The comparator compares two key byte slices, and fails when the stored keys are
+    /// not keys of the column's current type.
+    pub fn seek_and_iter<F>(&self, target_key: &[u8], cmp: &F) -> io::Result<(bool, BlockIter<'_>)>
     where
-        F: Fn(&[u8], &[u8]) -> Ordering,
+        F: Fn(&[u8], &[u8]) -> io::Result<Ordering>,
     {
         let mut left: i32 = 0;
         let mut right: i32 = self.record_count as i32 - 1;
@@ -657,7 +658,7 @@ impl BlockReader {
             let byte_offset = self.seek_to_position(mid as usize);
             let (key, _next_offset) = self.read_key_at(byte_offset);
 
-            match cmp(key, target_key) {
+            match cmp(key, target_key)? {
                 Ordering::Equal => {
                     found = true;
                     best_index = Some(mid as usize);
@@ -675,7 +676,7 @@ impl BlockReader {
             }
         }
 
-        match (best_index, best_offset) {
+        Ok(match (best_index, best_offset) {
             (Some(idx), Some(off)) => (
                 found,
                 BlockIter {
@@ -692,7 +693,7 @@ impl BlockReader {
                     index: self.record_count,
                 },
             ),
-        }
+        })
     }
 }
 
@@ -847,25 +848,44 @@ mod tests {
         let block = writer.finish();
         let reader = BlockReader::create(&block).unwrap();
 
-        let cmp = |a: &[u8], b: &[u8]| a.cmp(b);
+        let cmp = |a: &[u8], b: &[u8]| Ok(a.cmp(b));
 
         // Exact match
-        let (found, mut iter) = reader.seek_and_iter(b"banana", &cmp);
+        let (found, mut iter) = reader.seek_and_iter(b"banana", &cmp).unwrap();
         assert!(found);
         let (k, v) = iter.next().unwrap();
         assert_eq!(k, b"banana");
         assert_eq!(v, b"2");
 
         // Seek to position >= "bz" -> should land on "cherry"
-        let (found, mut iter) = reader.seek_and_iter(b"bz", &cmp);
+        let (found, mut iter) = reader.seek_and_iter(b"bz", &cmp).unwrap();
         assert!(!found);
         let (k, _) = iter.next().unwrap();
         assert_eq!(k, b"cherry");
 
         // Seek past all entries
-        let (found, iter) = reader.seek_and_iter(b"zzz", &cmp);
+        let (found, iter) = reader.seek_and_iter(b"zzz", &cmp).unwrap();
         assert!(!found);
         assert!(!iter.has_next());
+    }
+
+    /// A comparator that rejects the stored keys must abort the search, not settle on
+    /// whatever entry the half-finished binary search last looked at.
+    #[test]
+    fn test_block_seek_propagates_a_comparator_failure() {
+        let mut writer = BlockWriter::new(1024);
+        writer.add(b"apple", b"1");
+        writer.add(b"banana", b"2");
+
+        let block = writer.finish();
+        let reader = BlockReader::create(&block).unwrap();
+
+        let cmp =
+            |_: &[u8], _: &[u8]| Err(io::Error::new(io::ErrorKind::InvalidData, "not my key"));
+        let Err(error) = reader.seek_and_iter(b"banana", &cmp) else {
+            panic!("a failing comparator must abort the seek");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
