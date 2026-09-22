@@ -347,6 +347,13 @@ impl LoadedTable {
 /// Corresponds to [org.apache.paimon.catalog.Catalog](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/catalog/Catalog.java).
 #[async_trait]
 pub trait Catalog: Send + Sync {
+    /// Hook for catalog-specific APIs that are not on this trait, as Java reaches `RESTCatalog`
+    /// through `DelegateCatalog.rootCatalog(...) instanceof RESTCatalog`. Defaults to `None`;
+    /// override as `Some(self)` in a catalog that has such APIs.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     // ======================= database methods ===============================
 
     /// List names of all databases in this catalog.

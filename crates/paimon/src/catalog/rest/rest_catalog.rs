@@ -198,6 +198,9 @@ impl RESTCatalog {
 
 #[async_trait]
 impl Catalog for RESTCatalog {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     // ======================= database methods ===============================
 
     async fn list_databases(&self) -> Result<Vec<String>> {
