@@ -87,7 +87,6 @@ pub(crate) const PATH_OPTION: &str = "path";
 const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
 const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
-const MANIFEST_MERGE_MIN_COUNT_OPTION: &str = "manifest.merge-min-count";
 const MANIFEST_SIDECAR_ENABLED_OPTION: &str = "manifest.sidecar.enabled";
 const MANIFEST_SORT_ENABLED_OPTION: &str = "manifest-sort.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
@@ -138,7 +137,6 @@ const DEFAULT_SOURCE_SPLIT_TARGET_SIZE: i64 = 128 * 1024 * 1024;
 const DEFAULT_SOURCE_SPLIT_OPEN_FILE_COST: i64 = 4 * 1024 * 1024;
 const DEFAULT_MANIFEST_COMPRESSION: &str = "zstd";
 const DEFAULT_MANIFEST_TARGET_FILE_SIZE: i64 = 8 * 1024 * 1024;
-const DEFAULT_MANIFEST_MERGE_MIN_COUNT: usize = 30;
 const DEFAULT_PARTITION_DEFAULT_NAME: &str = "__DEFAULT_PARTITION__";
 const DEFAULT_CHANGELOG_FILE_PREFIX: &str = "changelog-";
 const DEFAULT_TARGET_FILE_SIZE: i64 = 256 * 1024 * 1024;
@@ -1231,15 +1229,6 @@ impl<'a> CoreOptions<'a> {
             .or_else(|| self.options.get(MANIFEST_TARGET_SIZE_OPTION))
             .and_then(|v| parse_memory_size(v))
             .unwrap_or(DEFAULT_MANIFEST_TARGET_FILE_SIZE)
-    }
-
-    /// Compatibility option; Rust commits do not currently compact manifests.
-    pub fn manifest_merge_min_count(&self) -> usize {
-        self.options
-            .get(MANIFEST_MERGE_MIN_COUNT_OPTION)
-            .and_then(|v| v.parse().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(DEFAULT_MANIFEST_MERGE_MIN_COUNT)
     }
 
     /// Whether manifest block sidecars are read and written.
@@ -2729,7 +2718,6 @@ mod tests {
         assert!(!core.row_tracking_enabled());
         assert_eq!(core.manifest_compression(), "zstd");
         assert_eq!(core.manifest_target_size(), 8 * 1024 * 1024);
-        assert_eq!(core.manifest_merge_min_count(), 30);
         assert!(!core.manifest_sidecar_enabled());
     }
 
@@ -2747,7 +2735,6 @@ mod tests {
                 "1kb".to_string(),
             ),
             (MANIFEST_COMPRESSION_OPTION.to_string(), "null".to_string()),
-            (MANIFEST_MERGE_MIN_COUNT_OPTION.to_string(), "3".to_string()),
         ]);
         let core = CoreOptions::new(&options);
         assert_eq!(core.bucket(), 4);
@@ -2758,7 +2745,6 @@ mod tests {
         assert!(core.row_tracking_enabled());
         assert_eq!(core.manifest_compression(), "null");
         assert_eq!(core.manifest_target_size(), 1024);
-        assert_eq!(core.manifest_merge_min_count(), 3);
     }
 
     #[test]
