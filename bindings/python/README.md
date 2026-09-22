@@ -115,10 +115,12 @@ The Python binding follows Java's batch/stream builder structure. Use
 Both create writers and committers with the same commit identity.
 
 ```python
+from pypaimon_rust.datafusion import CommitMessage
+
 builder = table.new_stream_write_builder().with_commit_user("ingest-job")
 committer = builder.new_commit()
 messages = [
-    committer.deserialize_commit_message(body, source_table_location, version=14)
+    CommitMessage.deserialize(body, version=14)
     for body in serialized_messages
 ]
 committer.commit(42, messages)
@@ -156,8 +158,10 @@ null. Batch writers permit one `prepare_commit()` call; reusable stream writers
 use `prepare_commit(wait_compaction, commit_identifier)`.
 
 The Java v14 body has no version header, table identity, commit user, or overwrite
-mode. Import requires a trusted source table location and a separately supplied
-version; overwrite context is derived from the configured builder/committer.
+mode. `CommitMessage.deserialize(body, version=14)` decodes it without a table
+or builder. Submit decoded messages to their originating table; commit identity
+and overwrite mode come from the configured committer. Messages returned directly
+by local writers retain their table and commit-user checks.
 Only v14 is supported. `abort(messages)` deletes newly written files and must
 only be used for messages known not to have committed. Compact increments remain
 unsupported by the Rust committer and are rejected.

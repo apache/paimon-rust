@@ -100,23 +100,6 @@ impl WriteContext {
             commit_user: self.commit_user.clone(),
         })
     }
-
-    fn deserialize(
-        &self,
-        data: &Bound<'_, PyBytes>,
-        source: &str,
-        version: i32,
-        overwrite: bool,
-    ) -> PyResult<PyCommitMessage> {
-        PyCommitMessage::from_serialized(
-            data.as_bytes(),
-            source,
-            self.table.location(),
-            &self.commit_user,
-            version,
-            overwrite,
-        )
-    }
 }
 
 fn boolean_option(table: &Table, key: &str, default: bool) -> PyResult<bool> {
@@ -242,21 +225,6 @@ impl PyBatchWriteBuilder {
             committed: false,
         })
     }
-
-    #[pyo3(signature = (data, source_table_location, *, version=COMMIT_MESSAGE_SERIALIZER_VERSION))]
-    fn deserialize_commit_message(
-        &self,
-        data: &Bound<'_, PyBytes>,
-        source_table_location: &str,
-        version: i32,
-    ) -> PyResult<PyCommitMessage> {
-        self.context.deserialize(
-            data,
-            source_table_location,
-            version,
-            self.static_partition.is_some(),
-        )
-    }
 }
 
 /// Java StreamWriteBuilder: stable commit identity belongs on the builder.
@@ -303,17 +271,6 @@ impl PyStreamWriteBuilder {
             context: CommitContext::new(&self.context.table, &self.context.commit_user, false)?,
         })
     }
-
-    #[pyo3(signature = (data, source_table_location, *, version=COMMIT_MESSAGE_SERIALIZER_VERSION))]
-    fn deserialize_commit_message(
-        &self,
-        data: &Bound<'_, PyBytes>,
-        source_table_location: &str,
-        version: i32,
-    ) -> PyResult<PyCommitMessage> {
-        self.context
-            .deserialize(data, source_table_location, version, false)
-    }
 }
 
 struct WriteState {
@@ -347,8 +304,10 @@ impl WriteState {
             .into_iter()
             .map(|inner| PyCommitMessage {
                 inner,
-                table_location: self.table_location.clone(),
-                commit_user: self.commit_user.clone(),
+                origin: Some(MessageOrigin {
+                    table_location: self.table_location.clone(),
+                    commit_user: self.commit_user.clone(),
+                }),
             })
             .collect())
     }
@@ -443,29 +402,23 @@ impl CommitContext {
         })
     }
 
-    fn messages(&self, messages: &Bound<'_, PyAny>, method: &str) -> PyResult<Vec<CommitMessage>> {
-        collect_and_validate_messages(messages, self.table.location(), &self.commit_user, method)
-    }
-
-    fn deserialize(
+    fn messages(
         &self,
-        data: &Bound<'_, PyBytes>,
-        source: &str,
-        version: i32,
+        messages: &Bound<'_, PyAny>,
+        method: &str,
         overwrite: bool,
-    ) -> PyResult<PyCommitMessage> {
-        PyCommitMessage::from_serialized(
-            data.as_bytes(),
-            source,
+    ) -> PyResult<Vec<CommitMessage>> {
+        collect_and_validate_messages(
+            messages,
             self.table.location(),
             &self.commit_user,
-            version,
+            method,
             overwrite,
         )
     }
 
     fn abort(&self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
-        let messages = self.messages(messages, "abort")?;
+        let messages = self.messages(messages, "abort", false)?;
         py.detach(|| runtime().block_on(self.inner.abort(&messages)))
             .map_err(to_py_err)
     }
@@ -496,19 +449,8 @@ impl PyBatchTableCommit {
     /// Rust committers have no background resources to shut down.
     fn close(&self) {}
 
-    #[pyo3(signature = (data, source_table_location, *, version=COMMIT_MESSAGE_SERIALIZER_VERSION))]
-    fn deserialize_commit_message(
-        &self,
-        data: &Bound<'_, PyBytes>,
-        source_table_location: &str,
-        version: i32,
-    ) -> PyResult<PyCommitMessage> {
-        self.context
-            .deserialize(data, source_table_location, version, self.overwrite)
-    }
-
     fn commit(&mut self, py: Python<'_>, messages: &Bound<'_, PyAny>) -> PyResult<()> {
-        let messages = self.context.messages(messages, "commit")?;
+        let messages = self.context.messages(messages, "commit", self.overwrite)?;
         self.check_committed()?;
         py.detach(|| {
             runtime().block_on(async {
@@ -559,24 +501,13 @@ impl PyStreamTableCommit {
     /// Rust committers have no background resources to shut down.
     fn close(&self) {}
 
-    #[pyo3(signature = (data, source_table_location, *, version=COMMIT_MESSAGE_SERIALIZER_VERSION))]
-    fn deserialize_commit_message(
-        &self,
-        data: &Bound<'_, PyBytes>,
-        source_table_location: &str,
-        version: i32,
-    ) -> PyResult<PyCommitMessage> {
-        self.context
-            .deserialize(data, source_table_location, version, false)
-    }
-
     fn commit(
         &self,
         py: Python<'_>,
         commit_identifier: i64,
         messages: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        let messages = self.context.messages(messages, "commit")?;
+        let messages = self.context.messages(messages, "commit", false)?;
         py.detach(|| {
             runtime().block_on(
                 self.context
@@ -598,7 +529,8 @@ impl PyStreamTableCommit {
             .map(|(id, messages)| {
                 Ok((
                     id.extract::<i64>()?,
-                    self.context.messages(&messages, "filter_and_commit")?,
+                    self.context
+                        .messages(&messages, "filter_and_commit", false)?,
                 ))
             })
             .collect::<PyResult<Vec<_>>>()?;
@@ -618,6 +550,7 @@ fn collect_and_validate_messages<'py>(
     table_location: &str,
     commit_user: &str,
     method: &str,
+    overwrite: bool,
 ) -> PyResult<Vec<CommitMessage>> {
     let mut inner_messages = Vec::new();
     let iter = messages.try_iter().map_err(|_| {
@@ -632,63 +565,44 @@ fn collect_and_validate_messages<'py>(
                 "{method}() expects a sequence of CommitMessage objects"
             ))
         })?;
-        if msg.table_location != table_location {
-            return Err(PyValueError::new_err(format!(
-                "commit message was prepared for a different table \
-                 (message table '{}', committer table '{}')",
-                msg.table_location, table_location
-            )));
+        let mut inner = msg.inner.clone();
+        if let Some(origin) = &msg.origin {
+            if origin.table_location != table_location {
+                return Err(PyValueError::new_err(format!(
+                    "commit message was prepared for a different table \
+                     (message table '{}', committer table '{}')",
+                    origin.table_location, table_location
+                )));
+            }
+            if origin.commit_user != commit_user {
+                return Err(PyValueError::new_err(
+                    "commit message has a different commit_user \
+                     (writer and committer must share one commit_user)"
+                        .to_string(),
+                ));
+            }
+        } else if overwrite {
+            // The Java body has no operation flag. Apply the target committer's
+            // mode to imported messages without changing the Python object.
+            inner.mark_fixed_bucket_overwrite();
         }
-        if msg.commit_user != commit_user {
-            return Err(PyValueError::new_err(
-                "commit message has a different commit_user \
-                 (writer and committer must share one commit_user)"
-                    .to_string(),
-            ));
-        }
-        inner_messages.push(msg.inner.clone());
+        inner_messages.push(inner);
     }
     Ok(inner_messages)
 }
 
-/// A commit message produced by `prepare_commit` or imported from the Java v14 wire format.
-///
-/// Carries the table location and builder `commit_user` used by the Rust
-/// committer. Imported Java bodies have their source table checked by
-/// `deserialize_commit_message` before they receive this context.
-#[pyclass(name = "CommitMessage", module = "pypaimon_rust.datafusion")]
-pub struct PyCommitMessage {
-    pub(crate) inner: CommitMessage,
-    pub(crate) table_location: String,
-    pub(crate) commit_user: String,
+/// Origin information retained for messages returned directly by a local writer.
+struct MessageOrigin {
+    table_location: String,
+    commit_user: String,
 }
 
-impl PyCommitMessage {
-    fn from_serialized(
-        data: &[u8],
-        source_table_location: &str,
-        table_location: &str,
-        commit_user: &str,
-        version: i32,
-        overwrite: bool,
-    ) -> PyResult<Self> {
-        if source_table_location != table_location {
-            return Err(PyValueError::new_err(
-                "commit message source table does not match the target table",
-            ));
-        }
-        let inner = if overwrite {
-            CommitMessage::deserialize_for_fixed_bucket_overwrite(version, data)
-        } else {
-            CommitMessage::deserialize(version, data)
-        }
-        .map_err(to_py_err)?;
-        Ok(Self {
-            inner,
-            table_location: table_location.to_string(),
-            commit_user: commit_user.to_string(),
-        })
-    }
+/// A commit message produced by `prepare_commit` or decoded from the Java v14 body.
+/// Serialized messages contain no table, commit user, or operation context.
+#[pyclass(name = "CommitMessage", module = "pypaimon_rust.datafusion")]
+pub struct PyCommitMessage {
+    inner: CommitMessage,
+    origin: Option<MessageOrigin>,
 }
 
 #[pymethods]
@@ -697,5 +611,15 @@ impl PyCommitMessage {
     fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = self.inner.serialize().map_err(to_py_err)?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Decode a Java body independently of a table or write builder.
+    #[staticmethod]
+    #[pyo3(signature = (data, *, version=COMMIT_MESSAGE_SERIALIZER_VERSION))]
+    fn deserialize(data: &Bound<'_, PyBytes>, version: i32) -> PyResult<Self> {
+        Ok(Self {
+            inner: CommitMessage::deserialize(version, data.as_bytes()).map_err(to_py_err)?,
+            origin: None,
+        })
     }
 }

@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import base64
 import json
 from pathlib import Path
 
@@ -23,7 +24,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from pypaimon_rust import datafusion
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
+from pypaimon_rust.datafusion import CommitMessage, PaimonCatalog, SQLContext
 
 
 def _table(path, partitioned=False, options=None, primary_key=False):
@@ -57,8 +58,8 @@ def _append(table, ids, partitions):
     builder.new_commit().commit(_prepare(builder, ids, partitions))
 
 
-def _import(importer, table, messages):
-    return [importer.deserialize_commit_message(message.serialize(), table.location()) for message in messages]
+def _roundtrip(messages):
+    return [CommitMessage.deserialize(message.serialize()) for message in messages]
 
 
 def _rows(table):
@@ -86,6 +87,8 @@ def test_public_api_separates_batch_and_stream(tmp_path):
     stream = table.new_stream_write_builder()
     assert not hasattr(batch, "with_commit_user")
     assert not hasattr(stream, "with_overwrite")
+    for obj in (batch, stream, batch.new_commit(), stream.new_commit()):
+        assert not hasattr(obj, "deserialize_commit_message")
     assert not hasattr(batch.new_commit(), "filter_and_commit")
     assert not hasattr(batch.new_commit(), "overwrite")
     assert not hasattr(stream.new_commit(), "truncate_table")
@@ -103,12 +106,12 @@ def test_serialized_stream_commit_and_grouped_retry(tmp_path):
     writer = builder.new_write()
     commit = builder.new_commit()
     _write(writer, [1], [10])
-    first = _import(commit, table, writer.prepare_commit(True, 7))
+    first = _roundtrip(writer.prepare_commit(True, 7))
     commit.commit(7, first)
     _write(writer, [2], [20])
-    second = _import(builder, table, writer.prepare_commit(False, 8))
+    second = _roundtrip(writer.prepare_commit(False, 8))
     _write(writer, [3], [30])
-    third = _import(builder, table, writer.prepare_commit(True, 9))
+    third = _roundtrip(writer.prepare_commit(True, 9))
     restored = table.new_stream_write_builder().with_commit_user("python-job").new_commit()
     # Input order differs from commit order; count groups after filtering.
     assert restored.filter_and_commit({9: third, 7: first, 8: second}) == 2
@@ -130,26 +133,31 @@ def test_invalid_stream_commit_user(tmp_path, user):
     assert builder.commit_user() == original
 
 
-@pytest.mark.parametrize("mode", ["batch", "stream"])
-def test_deserialize_checks_source_version_and_payload(tmp_path, mode):
-    table = _table(tmp_path)
-    body = _prepare(table.new_batch_write_builder(), [1], [10])[0].serialize()
-    builder = getattr(table, f"new_{mode}_write_builder")()
-    for importer in (builder, builder.new_commit()):
-        with pytest.raises(ValueError, match="source table"):
-            importer.deserialize_commit_message(body, table.location() + "-other")
-        with pytest.raises(NotImplementedError, match="version"):
-            importer.deserialize_commit_message(body, table.location(), version=13)
+def test_static_deserialize_checks_version_and_payload():
+    # Java CommitMessageSerializer v14 fixture; no table or builder is needed.
+    body = base64.b64decode(
+        "AAAADAAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAABw=="
+    )
+    with pytest.raises(NotImplementedError, match="version"):
+        CommitMessage.deserialize(body, version=13)
+    for invalid in (b"", body[:-1], body + b"extra"):
         with pytest.raises(ValueError):
-            importer.deserialize_commit_message(body[:-1], table.location())
-        assert importer.deserialize_commit_message(body, table.location()).serialize() == body
-    assert table.latest_snapshot() is None
+            CommitMessage.deserialize(invalid)
+    assert CommitMessage.deserialize(body).serialize() == body
+    assert CommitMessage.deserialize(body, version=14).serialize() == body
+
+
+def test_deserialized_batch_commit_uses_target_builder(tmp_path):
+    table = _table(tmp_path)
+    messages = _roundtrip(_prepare(table.new_batch_write_builder(), [1], [10]))
+    table.new_batch_write_builder().new_commit().commit(messages)
+    assert _rows(table) == [1]
 
 
 def test_abort_serialized_messages_deletes_files(tmp_path):
     table = _table(tmp_path)
     builder = table.new_batch_write_builder()
-    messages = _import(builder, table, _prepare(builder, [1], [10]))
+    messages = _roundtrip(_prepare(builder, [1], [10]))
     files = list(tmp_path.rglob("data-*.parquet"))
     assert files
     builder.new_commit().abort(messages)
@@ -206,7 +214,7 @@ def test_default_dynamic_overwrite_uses_touched_partitions(tmp_path, spec):
     _append(table, [1, 2], [10, 20])
     builder = table.new_batch_write_builder()
     assert builder.with_overwrite(spec) is builder
-    builder.new_commit().commit(_import(builder, table, _prepare(builder, [3], [10])))
+    builder.new_commit().commit(_roundtrip(_prepare(builder, [3], [10])))
     assert _rows(table) == [2, 3]
     table.new_batch_write_builder().with_overwrite().new_commit().commit([])
     assert _rows(table) == [2, 3]
@@ -244,7 +252,7 @@ def test_explicit_none_disables_overwrite_and_context_is_copied(tmp_path):
     assert _rows(table) == []
 
 
-def test_fixed_bucket_import_derives_overwrite_from_builder(tmp_path):
+def test_static_deserialize_uses_committer_overwrite_mode(tmp_path):
     table = _table(tmp_path)
     _append(table, [1], [10])
     builder = table.new_batch_write_builder().with_overwrite()
@@ -254,11 +262,26 @@ def test_fixed_bucket_import_derives_overwrite_from_builder(tmp_path):
     assert body[flag_offset] == 0
     body = body[:flag_offset] + bytes([1]) + (1).to_bytes(4, "big") + body[flag_offset + 1:]
     commit = builder.new_commit()
-    message = commit.deserialize_commit_message(body, table.location())
-    # The same bytes and inferred mode are available from the builder.
-    assert builder.deserialize_commit_message(body, table.location()).serialize() == message.serialize()
+    message = CommitMessage.deserialize(body)
+    assert message.serialize() == body
     commit.commit([message])
     assert _rows(table) == [2]
+
+
+def test_overwrite_does_not_mutate_deserialized_message(tmp_path):
+    table = _table(tmp_path, partitioned=True, options={"dynamic-partition-overwrite": "false"})
+    _append(table, [1], [10])
+    body = _prepare(table.new_batch_write_builder(), [2], [20])[0].serialize()
+    flag_offset = 4 + int.from_bytes(body[:4], "big") + 4
+    assert body[flag_offset] == 0
+    body = body[:flag_offset] + bytes([1]) + (1).to_bytes(4, "big") + body[flag_offset + 1:]
+    message = CommitMessage.deserialize(body)
+    overwrite = table.new_batch_write_builder().with_overwrite({"pt": 10}).new_commit()
+    with pytest.raises(ValueError, match="does not belong"):
+        overwrite.commit([message])
+    # A failed overwrite must not stamp the object with its operation mode.
+    table.new_batch_write_builder().new_commit().commit([message])
+    assert _rows(table) == [1, 2]
 
 
 def test_failed_batch_commit_consumes_instance(tmp_path):

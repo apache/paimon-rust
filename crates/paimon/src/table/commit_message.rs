@@ -120,7 +120,9 @@ impl CommitMessage {
         }
     }
 
-    pub(crate) fn mark_fixed_bucket_overwrite(&mut self) {
+    /// Supply the overwrite operation when restoring a message from Java's wire
+    /// format, which does not encode this flag. Use the target committer's mode.
+    pub fn mark_fixed_bucket_overwrite(&mut self) {
         self.fixed_bucket_overwrite = true;
     }
 
