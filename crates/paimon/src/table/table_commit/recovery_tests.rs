@@ -515,13 +515,10 @@ async fn rest_delete_writer_pins_catalog_snapshot_and_preserves_vectors() {
     let handler_loads = loads.clone();
     let handler_snapshot = snapshot.clone();
     let handler_posts = posts.clone();
-    // `get_table` too: the live query-auth check reads the schema and the uuid.
-    let schema_json = serde_json::to_value(&schema).unwrap();
     let app = Router::new().fallback(move |method: Method, uri: Uri, body: Bytes| {
         let loads = handler_loads.clone();
         let snapshot = handler_snapshot.clone();
         let posts = handler_posts.clone();
-        let schema_json = schema_json.clone();
         async move {
             let response = if method == Method::POST && uri.path().ends_with("/commit") {
                 posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -535,7 +532,7 @@ async fn rest_delete_writer_pins_catalog_snapshot_and_preserves_vectors() {
                 loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 serde_json::json!({"snapshot": {"snapshot": *snapshot.lock().unwrap(), "recordCount": 10}})
             } else {
-                serde_json::json!({"schemaId": 0, "id": "uuid", "schema": schema_json})
+                serde_json::json!({"schemaId": 0})
             };
             Json(response)
         }

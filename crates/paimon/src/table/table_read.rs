@@ -275,7 +275,7 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Sync, so the split's marker stands in for asking the server.
+    /// The split's marker carries the plan's decision.
     fn ensure_query_auth_allowed(&self, plan: &IncrementalPlan) -> crate::Result<()> {
         let core_options = CoreOptions::new(self.table().schema().options());
         core_options.ensure_type_paimon_served(&self.table().identifier().full_name())?;

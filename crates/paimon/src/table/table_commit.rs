@@ -257,7 +257,7 @@ impl TableCommit {
         &self,
         mut commits: Vec<(i64, Vec<CommitMessage>)>,
     ) -> Result<usize> {
-        self.table.ensure_read_authorized_live().await?;
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
         commits.sort_by_key(|(id, _)| *id);
         for pair in commits.windows(2) {
@@ -345,7 +345,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         // A refusal here must not clean up: a retry with an identifier that
         // already committed names files a snapshot references.
-        self.table.ensure_read_authorized_live().await?;
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
@@ -393,7 +393,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        self.table.ensure_read_authorized_live().await?;
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
@@ -479,7 +479,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        self.table.ensure_read_authorized_live().await?;
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
@@ -739,7 +739,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        self.table.ensure_read_authorized_live().await?;
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.ensure_not_format_table()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
@@ -821,7 +821,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        self.table.ensure_read_authorized_live().await?;
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.ensure_not_format_table()?;
         self.table.ensure_not_branch_reference_for_write()?;
 

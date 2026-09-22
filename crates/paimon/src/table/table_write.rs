@@ -150,9 +150,6 @@ pub struct TableWrite {
     has_dedicated_vector_fields: bool,
     row_kind_generator: Option<RowKindGenerator>,
     row_kind_filter: Option<RowKindFilter>,
-    /// The first write or commit asks the server; `new` is sync and can only
-    /// read the schema cached on the handle.
-    live_checked: bool,
     file_index_options: Option<Arc<FileIndexOptions>>,
 }
 
@@ -427,7 +424,6 @@ impl TableWrite {
             has_dedicated_vector_fields,
             row_kind_generator,
             row_kind_filter,
-            live_checked: false,
             file_index_options: file_index_options.map(Arc::new),
         })
     }
@@ -504,19 +500,8 @@ impl TableWrite {
         self
     }
 
-    /// Before the first lazy read: a PK write scans the latest snapshot, and a
-    /// dynamic-bucket write loads the hash index.
-    async fn ensure_live_authorized(&mut self) -> Result<()> {
-        if !self.live_checked {
-            self.table.ensure_read_authorized_live().await?;
-            self.live_checked = true;
-        }
-        Ok(())
-    }
-
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.ensure_live_authorized().await?;
         let Some(batch) = self.normalize_write_batch(batch)? else {
             return Ok(());
         };
@@ -911,7 +896,6 @@ impl TableWrite {
     /// Close all writers and collect CommitMessages for use with TableCommit.
     /// Writers are cleared after this call, allowing the TableWrite to be reused.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
-        self.ensure_live_authorized().await?;
         if self.file_index_options.is_some() {
             return self.prepare_indexed_append_commit().await;
         }

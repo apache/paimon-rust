@@ -56,10 +56,10 @@ use paimon::api::{
     ListDatabasesResponse, ListPartitionsResponse, ListTablesResponse, RESTUtil,
     RenameTableRequest, ResourcePaths, TableSnapshot,
 };
-use paimon::catalog::{list_partitions_from_file_system, Catalog, Identifier, DEFAULT_MAIN_BRANCH};
+use paimon::catalog::{list_partitions_from_file_system, Catalog, Identifier};
 use paimon::common::{CatalogOptions, Options};
 use paimon::spec::{Schema, Snapshot};
-use paimon::table::{SchemaManager, SnapshotManager};
+use paimon::table::SnapshotManager;
 use paimon::{Error, FileSystemCatalog};
 
 /// Convenience boxed error type for server construction (covers both
@@ -436,39 +436,11 @@ async fn create_table(
 async fn get_table(path: RestPath, Extension(state): Extension<Arc<AppState>>) -> Response {
     let table = path.get("table");
     let identifier = Identifier::new(path.get("db"), table.clone());
-    // `db.t$branch_x` is a client's live check on a branch: the base table's
-    // location with the branch's latest schema, as Java resolves it.
-    let parsed = match identifier.parsed_object_name() {
-        Ok(parsed) if parsed.system_table().is_none() => parsed,
-        Ok(_) => {
-            return error_response(Error::TableNotExist {
-                full_name: identifier.full_name(),
-            })
-        }
-        Err(error) => return error_response(error),
-    };
-    let base = Identifier::new(identifier.database(), parsed.table());
     // Raw metadata, not a constructed table: engine-served types must stay
     // describable so clients can route them.
-    let (location, loaded_schema) = match state.catalog.fetch_table_schema(&base).await {
+    let (location, loaded_schema) = match state.catalog.fetch_table_schema(&identifier).await {
         Ok(loaded) => loaded,
         Err(e) => return error_response(e),
-    };
-    let branch = parsed.branch_or_default();
-    let loaded_schema = if branch == DEFAULT_MAIN_BRANCH {
-        loaded_schema
-    } else {
-        let manager = SchemaManager::new(state.catalog.file_io().clone(), location.clone())
-            .with_branch(branch);
-        match manager.latest().await {
-            Ok(Some(schema)) => (*schema).clone(),
-            Ok(None) => {
-                return error_response(Error::TableNotExist {
-                    full_name: identifier.full_name(),
-                })
-            }
-            Err(error) => return error_response(error),
-        }
     };
     let table_schema = &loaded_schema;
     // Convert the stored `TableSchema` into the DDL `Schema` the response
@@ -485,11 +457,10 @@ async fn get_table(path: RestPath, Extension(state): Extension<Arc<AppState>>) -
             }
         };
 
-    // FileSystemCatalog has no UUID concept; the full name is a stable id that
-    // satisfies the client's RESTEnv requirement.
-    let uuid = identifier.full_name();
     let response = GetTableResponse::new(
-        Some(uuid),
+        // FileSystemCatalog has no UUID concept; the full name is a stable id
+        // that satisfies the client's RESTEnv requirement.
+        Some(identifier.full_name()),
         Some(table),
         Some(location),
         Some(false),

@@ -122,7 +122,6 @@ impl PlanContext {
 
 /// Creates query-independent plans for DE or primary-key vector search.
 pub struct VectorScan {
-    table: Table,
     context: PlanContext,
     scan: VectorScanKind,
 }
@@ -165,16 +164,10 @@ impl VectorScan {
                 prepared,
             )))
         };
-        Ok(Self {
-            table: table.clone(),
-            context,
-            scan,
-        })
+        Ok(Self { context, scan })
     }
 
     pub async fn plan(&self) -> crate::Result<VectorScanPlan> {
-        // The option can be set after a load.
-        self.table.ensure_read_authorized_live().await?;
         let work = match &self.scan {
             VectorScanKind::DataEvolution(scan) => {
                 VectorScanWork::DataEvolution(Box::new(scan.plan().await?))

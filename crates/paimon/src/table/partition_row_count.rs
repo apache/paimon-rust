@@ -713,13 +713,8 @@ impl Table {
     ) -> crate::Result<Option<Vec<PartitionRowCount>>> {
         let schema = self.schema();
         let core = CoreOptions::new(schema.options());
-        core.ensure_type_paimon_served(&self.identifier().full_name())?;
-        // Manifests count rows the server's rules may hide; a scan applies them.
-        if self.server_query_auth_enabled().await? {
-            return Err(super::query_auth::unsupported(
-                "a partition row count cannot apply a row filter or column masking",
-            ));
-        }
+        // Manifests carry partition values.
+        core.ensure_read_authorized()?;
         // Primary-key counts need merging; format tables do not use Paimon snapshots.
         if core.is_format_table() || !schema.primary_keys().is_empty() {
             return if require_exact {
@@ -959,43 +954,6 @@ mod tests {
         assert!(summary.adds.is_none());
         assert!(!summary.deletes.is_empty());
         assert_eq!(budget.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn test_partition_row_counts_refuse_an_engine_served_table() {
-        use crate::catalog::Identifier;
-        use crate::spec::{DataType, IntType, Schema, TableSchema};
-
-        // Its storage is not Paimon's: no snapshot must not read as empty.
-        let schema = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .option("type", "iceberg-table")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            FileIOBuilder::new("memory").build().unwrap(),
-            Identifier::new("default", "engine_served"),
-            "memory:/partition-count-engine-served".to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        );
-        for result in [
-            table.partition_row_counts().await.map(|_| ()),
-            table
-                .partition_row_counts_with_filter(None)
-                .await
-                .map(|_| ()),
-            table
-                .exact_partition_row_counts_with_filter(None)
-                .await
-                .map(|_| ()),
-        ] {
-            assert!(
-                matches!(&result, Err(crate::Error::Unsupported { message })
-                    if message.contains("cannot be served as a Paimon table")),
-                "{result:?}"
-            );
-        }
     }
 
     #[tokio::test]

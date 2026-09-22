@@ -273,7 +273,7 @@ impl<'a> IncrementalScan<'a> {
     }
 
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
-        self.table.ensure_read_authorized_live().await?;
+        crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         if self.scan.has_row_position_selection()
             || self.scan.has_chunk_shuffle()
             || self.scan.has_shard()
@@ -341,7 +341,7 @@ impl<'a> IncrementalScan<'a> {
     /// must exist and supplies snapshot metadata. Snapshot deletion vectors and
     /// automatic global-index pruning do not apply to these historical events.
     pub async fn plan_combined_delta(&self) -> crate::Result<Plan> {
-        self.table.ensure_read_authorized_live().await?;
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let mode = self.resolve_mode();
         if mode != IncrementalScanMode::Delta {
             return Err(crate::Error::Unsupported {

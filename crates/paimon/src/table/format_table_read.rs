@@ -108,7 +108,7 @@ impl<'a> FormatTableRead<'a> {
     ) -> crate::Result<ArrowRecordBatchStream> {
         let core_options = self.table.schema().core_options();
         core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
-        // Sync, so the marker stands in for asking the server.
+        // The marker carries the plan's decision.
         if core_options.query_auth_enabled()
             || data_splits.iter().any(|split| split.query_auth_required())
         {

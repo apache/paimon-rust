@@ -585,12 +585,9 @@ async fn rest_commit_uses_catalog_snapshot_schema_and_retry_identity() {
     let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handler_snapshot = snapshot.clone();
     let handler_posts = posts.clone();
-    // `get_table` too: the live query-auth check reads the schema and the uuid.
-    let schema_json = serde_json::to_value(test_schema()).unwrap();
     let app = Router::new().fallback(move |method: Method, uri: Uri, body: Bytes| {
         let snapshot = handler_snapshot.clone();
         let posts = handler_posts.clone();
-        let schema_json = schema_json.clone();
         async move {
             let response = if method == Method::POST && uri.path().ends_with("/commit") {
                 posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -603,7 +600,7 @@ async fn rest_commit_uses_catalog_snapshot_schema_and_retry_identity() {
             } else if uri.path().ends_with("/snapshot") {
                 serde_json::json!({"snapshot": {"snapshot": *snapshot.lock().unwrap(), "recordCount": 10}})
             } else {
-                serde_json::json!({"schemaId": 3, "id": "uuid", "schema": schema_json})
+                serde_json::json!({"schemaId": 3})
             };
             Json(response)
         }

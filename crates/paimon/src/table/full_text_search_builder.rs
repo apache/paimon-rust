@@ -117,7 +117,7 @@ impl<'a> FullTextSearchBuilder<'a> {
     pub async fn execute_scored(&self) -> crate::Result<SearchResult> {
         // Fail closed: returns data-derived row ranges outside `TableScan`/`TableRead`.
         let core = CoreOptions::new(self.table.schema().options());
-        self.table.ensure_read_authorized_live().await?;
+        core.ensure_read_authorized()?;
         let text_column =
             self.text_column
                 .as_deref()
@@ -204,7 +204,7 @@ impl<'a> FullTextSearchBuilder<'a> {
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
         // Fail closed: returns data outside `TableScan`/`TableRead`.
         let core = CoreOptions::new(self.table.schema().options());
-        self.table.ensure_read_authorized_live().await?;
+        core.ensure_read_authorized()?;
         let text_column =
             self.text_column
                 .as_deref()

@@ -62,7 +62,7 @@ impl<'a> VindexIndexBuildBuilder<'a> {
 
     pub async fn execute(&self) -> Result<usize> {
         // Building the index scans the table's rows.
-        self.table.ensure_read_authorized_live().await?;
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
 
         self.table.ensure_not_branch_reference_for_write()?;
 

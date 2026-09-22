@@ -366,34 +366,6 @@ impl Table {
         }
     }
 
-    /// The live counterpart of [`CoreOptions::ensure_read_authorized`], which
-    /// reads the schema this handle was loaded with: the option can be set
-    /// after a load.
-    pub(crate) async fn ensure_read_authorized_live(&self) -> Result<()> {
-        CoreOptions::new(self.schema.options())
-            .ensure_type_paimon_served(&self.identifier.full_name())?;
-        if self.server_query_auth_enabled().await? {
-            return Err(query_auth::unsupported(
-                "this operation cannot apply a row filter or column masking",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Whether the server says this table is `query-auth.enabled` right now: the
-    /// handle's schema is a snapshot, and a cached `false` would skip the check.
-    pub(crate) async fn server_query_auth_enabled(&self) -> Result<bool> {
-        let local = CoreOptions::new(self.schema.options()).query_auth_enabled();
-        let Some(rest_env) = &self.rest_env else {
-            return Ok(local);
-        };
-        // Only ever strengthens.
-        if local {
-            return Ok(true);
-        }
-        rest_env.query_auth_enabled_live(&self.branch).await
-    }
-
     /// Whether this handle reads a schema other than the one the server rules
     /// on: a time-travel selector (`copy_with_options` adds one without the
     /// flag), a travelled or branch view, or a `$branch_x` / `$files` name
@@ -417,10 +389,11 @@ impl Table {
     }
 
     /// Whether this user may read this table; `None` when it is not
-    /// `query-auth.enabled`. `server_query_auth` is the caller's own lookup.
+    /// `query-auth.enabled`. `query_auth` is the option loaded with this handle,
+    /// as in Java: a change on the server shows after a re-load.
     pub(crate) async fn authorize_read(
         &self,
-        server_query_auth: bool,
+        query_auth: bool,
     ) -> Result<Option<std::sync::Arc<query_auth::QueryAuthGrant>>> {
         let local = CoreOptions::new(self.schema.options());
         let Some(rest_env) = &self.rest_env else {
@@ -435,7 +408,7 @@ impl Table {
         };
 
         // No freshness assertion yet — an ordinary table must not inherit one.
-        if !server_query_auth {
+        if !query_auth {
             return Ok(None);
         }
         if self.reads_another_schema()? {
@@ -453,7 +426,7 @@ impl Table {
 
         // Naming a system column here would fail the server's column check.
         let response = rest_env
-            .table_query_auth(&self.branch, self.schema.id(), self.schema.fields(), None)
+            .table_query_auth(self.schema.id(), self.schema.fields(), None)
             .await?;
         Ok(Some(std::sync::Arc::new(query_auth::QueryAuthGrant::new(
             response, session,

@@ -1578,7 +1578,7 @@ impl<'a> PaimonTableScan<'a> {
         core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
 
         // File paths and stats, not table columns: the endpoint cannot rule on them.
-        let query_auth = self.table.server_query_auth_enabled().await?;
+        let query_auth = CoreOptions::new(self.table.schema().options()).query_auth_enabled();
         if self.scan_all_files {
             return if query_auth {
                 Err(super::query_auth::unsupported(

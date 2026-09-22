@@ -187,7 +187,6 @@ pub struct RESTServer {
     warehouse: String,
     _data_path: String,
     config: ConfigResponse,
-    get_table_calls: Arc<std::sync::atomic::AtomicUsize>,
     inner: Arc<Mutex<MockState>>,
     resource_paths: ResourcePaths,
     addr: Option<SocketAddr>,
@@ -224,7 +223,6 @@ impl RESTServer {
             _data_path,
             config,
             warehouse,
-            get_table_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             inner: Arc::new(Mutex::new(MockState {
                 databases,
                 ..Default::default()
@@ -818,9 +816,6 @@ impl RESTServer {
         Path((db, table)): Path<(String, String)>,
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
-        state
-            .get_table_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut s = state.inner.lock().unwrap();
 
         let key = format!("{db}.{table}");
@@ -1923,12 +1918,6 @@ impl RESTServer {
                 AuditRESTResponse::new(None, None, None, None, None),
             ),
         );
-    }
-
-    #[allow(dead_code)]
-    pub fn get_table_calls(&self) -> usize {
-        self.get_table_calls
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn clear_table_identity(&self, database: &str, table: &str) {
