@@ -89,8 +89,9 @@ class ReadBuilder:
         """
         ...
     def with_limit(self, limit: int) -> "ReadBuilder":
-        """Set a scan-planning row-limit hint, not an exact cap: a matching split is
-        returned whole. Apply application-level limiting for an exact bound."""
+        """Set a scan-planning hint; data-evolution reads also stop at this
+        limit before resolving BLOB payloads. Other reads still need an
+        application-level limit for an exact bound."""
         ...
     def with_include_row_kind(self, include: bool) -> "ReadBuilder":
         """Include a leading ``rowkind`` string column in native read results."""

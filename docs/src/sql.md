@@ -1356,6 +1356,123 @@ CALL sys.create_lumina_index(
 );
 ```
 
+### grant_permission
+
+Grant an access to a principal on a REST catalog. Only the REST catalog supports
+permission and policy management:
+
+```sql
+CALL sys.grant_permission(
+  resource_type => 'TABLE',
+  database => 'sales',
+  table => 'orders',
+  access => 'SELECT',
+  principal => 'user:alice'
+);
+```
+
+`resource_type` is one of `CATALOG`, `CATALOG_ALL`, `DATABASE`, `DATABASE_ALL`,
+`TABLE`, `COLUMN`, `VIEW` or `FUNCTION`, and decides which locators are required:
+`DATABASE` and `DATABASE_ALL` need `database`, while `TABLE`, `COLUMN`, `VIEW`
+and `FUNCTION` need `database` plus the matching `table`, `view` or `function`.
+`expire_time` is an ISO-8601 UTC instant ending in `Z`.
+
+A `COLUMN` grant narrows an access to part of a table and takes exactly one of
+`column_names` or `excluded_column_names`. **Both are comma-separated strings
+here**, where Java's Spark procedure declares `ARRAY<STRING>`, because a `CALL`
+argument in this engine is always a scalar:
+
+```sql
+CALL sys.grant_permission(
+  resource_type => 'COLUMN',
+  database => 'sales',
+  table => 'orders',
+  access => 'SELECT',
+  principal => 'role:analyst',
+  column_names => 'id, region'
+);
+```
+
+### revoke_permission
+
+Remove an access from a principal. Revoking one that was never granted succeeds:
+
+```sql
+CALL sys.revoke_permission(
+  resource_type => 'TABLE',
+  database => 'sales',
+  table => 'orders',
+  access => 'SELECT',
+  principal => 'user:alice'
+);
+```
+
+### list_permissions
+
+List the assignments on an exact resource, optionally filtered by `principal`
+and `access`, and paged with `max_results` and `page_token`. Only grants made on
+that exact resource are returned, so a `DATABASE_ALL` or `COLUMN` grant that also
+covers the table does not appear:
+
+```sql
+CALL sys.list_permissions(
+  resource_type => 'TABLE',
+  database => 'sales',
+  table => 'orders'
+);
+```
+
+Every row carries `next_page_token`, so an empty page returns no rows and no
+token. The `column_names` and `excluded_column_names` columns are comma-joined.
+
+### create_policy
+
+Attach a row filter or a column mask to a table for one principal. A policy
+carries exactly one of the two, so `ROW_FILTER` takes `predicate_json` and
+rejects `on_column` and `transform_json`, while `COLUMN_MASKING` takes
+`on_column` and `transform_json` and rejects `predicate_json`:
+
+```sql
+CALL sys.create_policy(
+  database => 'sales',
+  table => 'orders',
+  policy_type => 'ROW_FILTER',
+  principal => 'role:analyst',
+  predicate_json => '{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":1,"name":"region","type":"STRING"}},"function":"EQUAL","literals":["APAC"]}'
+);
+```
+
+`predicate_json` and `transform_json` are serialized Paimon `Predicate` and
+`Transform` values, not SQL. They are the same JSON the catalog returns for a
+table's query authorization.
+
+### drop_policy
+
+Remove a policy by its identity, which is the table, the principal, the type,
+and for a column mask the column. `if_exists => 'true'` swallows a missing
+policy, but not a missing table:
+
+```sql
+CALL sys.drop_policy(
+  database => 'sales',
+  table => 'orders',
+  policy_type => 'COLUMN_MASKING',
+  principal => 'role:analyst',
+  column => 'email',
+  if_exists => 'true'
+);
+```
+
+### list_policies
+
+List the policies on a table, optionally filtered by `policy_type` and
+`principal`, and paged like `list_permissions`. A `column` filter is only
+meaningful for a column mask, so it requires `policy_type => 'COLUMN_MASKING'`:
+
+```sql
+CALL sys.list_policies(database => 'sales', table => 'orders');
+```
+
 ## Queries
 
 ### Basic Queries

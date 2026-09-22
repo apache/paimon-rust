@@ -62,6 +62,17 @@ pub(crate) struct FilePredicates {
 /// - Row range selection
 #[async_trait]
 pub(crate) trait FormatFileReader: Send + Sync {
+    /// Choose the fields the decoder must actually read. Most columnar formats
+    /// can read the projection, while positional formats need the complete
+    /// physical data schema to decode each row.
+    fn select_read_fields(
+        &self,
+        _data_schema_fields: &[DataField],
+        projected_fields: &[DataField],
+    ) -> Vec<DataField> {
+        projected_fields.to_vec()
+    }
+
     /// Read a single data file, returning a stream of RecordBatches containing
     /// at least the projected columns (using names from the file's schema). A
     /// reader MAY include extra columns it needed to scan (e.g. predicate columns
@@ -194,24 +205,38 @@ pub(crate) fn create_format_reader(
     create_format_reader_with_budget(
         path,
         blob_as_descriptor,
-        read_fields,
+        FormatReadFields {
+            data_schema: read_fields,
+            projected: read_fields,
+        },
         &HashMap::new(),
         None,
         blob::DEFAULT_BLOB_READ_PARALLELISM,
         MosaicPrefetchOptions::default(),
     )
+    .map(|configured| configured.reader)
+}
+
+pub(crate) struct ConfiguredFormatReader {
+    pub reader: Box<dyn FormatFileReader>,
+    pub read_fields: Vec<DataField>,
+}
+
+pub(crate) struct FormatReadFields<'a> {
+    pub data_schema: &'a [DataField],
+    pub projected: &'a [DataField],
 }
 
 /// Create a format reader with table options and runtime read resources.
 pub(crate) fn create_format_reader_with_budget(
     path: &str,
     blob_as_descriptor: bool,
-    read_fields: &[DataField],
+    fields: FormatReadFields<'_>,
     table_options: &HashMap<String, String>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
     blob_parallelism: usize,
     mosaic_prefetch: MosaicPrefetchOptions,
-) -> crate::Result<Box<dyn FormatFileReader>> {
+) -> crate::Result<ConfiguredFormatReader> {
     let lower = path.to_ascii_lowercase();
     let reader: Box<dyn FormatFileReader> = if lower.ends_with(".parquet") {
         Box::new(parquet::ParquetFormatReader::with_options(
@@ -229,18 +254,14 @@ pub(crate) fn create_format_reader_with_budget(
         Box::new(avro::AvroFormatReader)
     } else if lower.ends_with(".row") {
         Box::new(row::RowFormatReader)
+    } else if lower.ends_with(".mosaic") {
+        Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch))
     } else {
-        if lower.ends_with(".mosaic") {
-            return Ok(shredding::maybe_wrap_reader(
-                Box::new(mosaic::MosaicFormatReader::with_prefetch(mosaic_prefetch)),
-                read_fields,
-            ));
-        }
         #[cfg(feature = "vortex")]
         if lower.ends_with(".vortex") {
-            return Ok(shredding::maybe_wrap_reader(
+            return Ok(configure_format_reader(
                 Box::new(vortex::VortexFormatReader),
-                read_fields,
+                fields,
             ));
         }
         return Err(Error::Unsupported {
@@ -250,7 +271,18 @@ pub(crate) fn create_format_reader_with_budget(
             ),
         });
     };
-    Ok(shredding::maybe_wrap_reader(reader, read_fields))
+    Ok(configure_format_reader(reader, fields))
+}
+
+fn configure_format_reader(
+    reader: Box<dyn FormatFileReader>,
+    fields: FormatReadFields<'_>,
+) -> ConfiguredFormatReader {
+    let read_fields = reader.select_read_fields(fields.data_schema, fields.projected);
+    ConfiguredFormatReader {
+        reader: shredding::maybe_wrap_reader(reader, &read_fields),
+        read_fields,
+    }
 }
 
 fn supported_read_formats() -> Vec<&'static str> {
@@ -382,6 +414,37 @@ fn timestamp_millis_data_type(data_type: &arrow_schema::DataType) -> arrow_schem
 mod tests {
     use super::*;
     use crate::io::FileIOBuilder;
+    use crate::spec::{DataType, IntType};
+
+    #[test]
+    fn format_selects_physical_or_projected_fields() {
+        let data_schema_fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ];
+        let projected_fields = &data_schema_fields[1..];
+        for (path, expected) in [
+            ("data.row", data_schema_fields.as_slice()),
+            ("data.parquet", projected_fields),
+            ("data.orc", projected_fields),
+            ("data.mosaic", projected_fields),
+        ] {
+            let configured = create_format_reader_with_budget(
+                path,
+                false,
+                FormatReadFields {
+                    data_schema: &data_schema_fields,
+                    projected: projected_fields,
+                },
+                &HashMap::new(),
+                None,
+                blob::DEFAULT_BLOB_READ_PARALLELISM,
+                MosaicPrefetchOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(configured.read_fields.as_slice(), expected, "{path}");
+        }
+    }
 
     #[tokio::test]
     async fn create_format_writer_error_lists_every_supported_format() {

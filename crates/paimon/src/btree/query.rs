@@ -42,7 +42,7 @@ pub trait IndexQuery: Send + Sync {
 #[async_trait::async_trait]
 impl<F> IndexQuery for BTreeIndexReader<F>
 where
-    F: Fn(&[u8], &[u8]) -> Ordering + Send + Sync,
+    F: Fn(&[u8], &[u8]) -> crate::Result<Ordering> + Send + Sync,
 {
     async fn query(
         &self,
@@ -196,9 +196,14 @@ impl BetweenInfo<'_> {
             &serialize_datum(self.from, self.data_type),
             &serialize_datum(self.to, self.data_type),
         ) {
-            Ordering::Greater => true,
-            Ordering::Equal => !self.from_inclusive || !self.to_inclusive,
-            Ordering::Less => false,
+            Ok(Ordering::Greater) => true,
+            Ok(Ordering::Equal) => !self.from_inclusive || !self.to_inclusive,
+            Ok(Ordering::Less) => false,
+            // Degradation: pure optimisation. This only shortcuts a provably empty
+            // range to "no rows"; without an ordering we cannot prove that, so say
+            // "not empty" and let the index read decide. Answering "empty" on an
+            // error would drop rows.
+            Err(_) => false,
         }
     }
 }
@@ -218,11 +223,20 @@ pub(crate) type ExtractBetweenResult<'a> = (
 pub(crate) fn extract_between<'a>(
     predicates: &[(PredicateOperator, &'a [Datum], &'a DataType)],
 ) -> ExtractBetweenResult<'a> {
+    // Degradation: pure optimisation. Merging bounds needs an ordering on the
+    // serialized literals; without one, hand every predicate back so each is
+    // evaluated on its own, exactly as when no complete range was found.
+    try_extract_between(predicates).unwrap_or_else(|_| (None, predicates.to_vec()))
+}
+
+fn try_extract_between<'a>(
+    predicates: &[(PredicateOperator, &'a [Datum], &'a DataType)],
+) -> crate::Result<ExtractBetweenResult<'a>> {
     let Some((_, _, data_type)) = predicates.first() else {
-        return (None, Vec::new());
+        return Ok((None, Vec::new()));
     };
     if predicates.len() == 1 && predicates[0].0 != PredicateOperator::Between {
-        return (None, predicates.to_vec());
+        return Ok((None, predicates.to_vec()));
     }
     let cmp = crate::btree::make_key_comparator(data_type);
     let mut lower: Option<(&Datum, Vec<u8>, bool)> = None;
@@ -251,7 +265,7 @@ pub(crate) fn extract_between<'a>(
             if let Some((value, inclusive)) = candidate {
                 let key = serialize_datum(value, data_type);
                 match bound {
-                    Some((_, existing, current_inclusive)) => match cmp(&key, existing) {
+                    Some((_, existing, current_inclusive)) => match cmp(&key, existing)? {
                         Ordering::Equal => *current_inclusive &= inclusive,
                         order if order == tighter => *bound = Some((value, key, inclusive)),
                         _ => {}
@@ -261,7 +275,7 @@ pub(crate) fn extract_between<'a>(
             }
         }
     }
-    match (lower, upper) {
+    Ok(match (lower, upper) {
         (Some((from, _, from_inclusive)), Some((to, _, to_inclusive))) => (
             Some(BetweenInfo {
                 from,
@@ -273,5 +287,5 @@ pub(crate) fn extract_between<'a>(
             remaining,
         ),
         _ => (None, predicates.to_vec()),
-    }
+    })
 }

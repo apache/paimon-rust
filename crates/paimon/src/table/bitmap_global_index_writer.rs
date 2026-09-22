@@ -17,6 +17,7 @@
 //! Writer for Java Paimon's `BitmapGlobalIndexFormat`.
 
 use super::bitmap_global_index_format::{BlockInfo, MAGIC, VERSION};
+use crate::btree::key_serde::key_comparison_io_error;
 use crate::btree::var_len::{encode_var_int, encode_var_long};
 use crate::btree::{compress_block, compute_crc32, BTreeIndexMeta, BlockCompressionType};
 use crate::io::FileWrite;
@@ -32,7 +33,7 @@ pub(crate) struct BitmapWriteResult {
     pub(crate) row_count: u64,
 }
 
-pub(crate) struct BitmapGlobalIndexWriter<F: Fn(&[u8], &[u8]) -> Ordering> {
+pub(crate) struct BitmapGlobalIndexWriter<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> {
     writer: Box<dyn FileWrite>,
     dictionary_block_size: usize,
     compression_type: BlockCompressionType,
@@ -46,7 +47,7 @@ pub(crate) struct BitmapGlobalIndexWriter<F: Fn(&[u8], &[u8]) -> Ordering> {
     row_count: u64,
 }
 
-impl<F: Fn(&[u8], &[u8]) -> Ordering> BitmapGlobalIndexWriter<F> {
+impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BitmapGlobalIndexWriter<F> {
     #[cfg(test)]
     pub(crate) fn new(
         writer: Box<dyn FileWrite>,
@@ -99,7 +100,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BitmapGlobalIndexWriter<F> {
                 let row_id = relative_row_id as u64;
                 self.non_null_rows.insert(row_id);
                 self.bitmaps.entry(key.to_vec()).or_default().insert(row_id);
-                self.update_min_max(key);
+                self.update_min_max(key)?;
             }
             None => {
                 self.null_rows.insert(relative_row_id as u64);
@@ -119,7 +120,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BitmapGlobalIndexWriter<F> {
         }
         let row_id = relative_row_id as u64;
         self.bitmaps.entry(key.to_vec()).or_default().insert(row_id);
-        self.update_min_max(key);
+        self.update_min_max(key)?;
         Ok(())
     }
 
@@ -141,7 +142,21 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BitmapGlobalIndexWriter<F> {
         let mut bitmaps = std::mem::take(&mut self.bitmaps)
             .into_iter()
             .collect::<Vec<_>>();
-        bitmaps.sort_by(|(left, _), (right, _)| (self.key_comparator)(left, right));
+        // The build side serializes every key from the column's current type, so a
+        // comparison failure here is a real defect rather than schema evolution.
+        let mut failure = None;
+        bitmaps.sort_by(
+            |(left, _), (right, _)| match (self.key_comparator)(left, right) {
+                Ok(order) => order,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    Ordering::Equal
+                }
+            },
+        );
+        if let Some(error) = failure {
+            return Err(key_comparison_io_error(error));
+        }
 
         let mut bytes = Vec::new();
         write_bitmap_index_bytes(
@@ -168,21 +183,26 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> BitmapGlobalIndexWriter<F> {
         })
     }
 
-    fn update_min_max(&mut self, key: &[u8]) {
-        if self
-            .first_key
-            .as_ref()
-            .is_none_or(|existing| (self.key_comparator)(key, existing).is_lt())
-        {
+    fn update_min_max(&mut self, key: &[u8]) -> io::Result<()> {
+        let replaces_first = match &self.first_key {
+            None => true,
+            Some(existing) => (self.key_comparator)(key, existing)
+                .map_err(key_comparison_io_error)?
+                .is_lt(),
+        };
+        if replaces_first {
             self.first_key = Some(key.to_vec());
         }
-        if self
-            .last_key
-            .as_ref()
-            .is_none_or(|existing| (self.key_comparator)(key, existing).is_gt())
-        {
+        let replaces_last = match &self.last_key {
+            None => true,
+            Some(existing) => (self.key_comparator)(key, existing)
+                .map_err(key_comparison_io_error)?
+                .is_gt(),
+        };
+        if replaces_last {
             self.last_key = Some(key.to_vec());
         }
+        Ok(())
     }
 }
 

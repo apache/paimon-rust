@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{new_null_array, Array, ArrayRef, ListArray, MapArray, StructArray};
+use arrow_array::{new_null_array, Array, ArrayRef, ListArray, MapArray, StringArray, StructArray};
 use arrow_cast::cast;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
@@ -62,6 +62,18 @@ pub(crate) fn evolve_column(
     // not actually match the target still goes through the cast below.
     if source_type.equals_ignore_nullable(target_type) && source.data_type() == &target_arrow {
         return Ok(source.clone());
+    }
+
+    if matches!(target_type, DataType::VarChar(_) | DataType::Char(_))
+        && matches!(
+            source_type,
+            DataType::Row(_) | DataType::Array(_) | DataType::Map(_)
+        )
+    {
+        return Ok(Arc::new(StringArray::from(render_string_values(
+            source,
+            source_type,
+        )?)));
     }
 
     match (target_type, source_type) {
@@ -103,6 +115,122 @@ pub(crate) fn evolve_column(
         ),
         source: Some(Box::new(e)),
     })
+}
+
+/// Match Paimon's constructed-value string form, including nested values and
+/// NULL containers. Arrow's generic cast cannot convert ROW/ARRAY/MAP to Utf8.
+fn render_string_values(
+    source: &ArrayRef,
+    source_type: &DataType,
+) -> crate::Result<Vec<Option<String>>> {
+    match source_type {
+        DataType::Row(row_type) => {
+            let rows = source
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!("expected ROW array, got {:?}", source.data_type()),
+                    source: None,
+                })?;
+            let children = row_type
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| render_string_values(rows.column(index), field.data_type()))
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok((0..rows.len())
+                .map(|index| {
+                    rows.is_valid(index).then(|| {
+                        format!(
+                            "{{{}}}",
+                            children
+                                .iter()
+                                .map(|child| child[index].as_deref().unwrap_or("null"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                })
+                .collect())
+        }
+        DataType::Array(array_type) => {
+            let rows = source.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                crate::Error::DataInvalid {
+                    message: format!("expected ARRAY array, got {:?}", source.data_type()),
+                    source: None,
+                }
+            })?;
+            let values = render_string_values(rows.values(), array_type.element_type())?;
+            let offsets = rows.value_offsets();
+            Ok((0..rows.len())
+                .map(|index| {
+                    rows.is_valid(index).then(|| {
+                        format!(
+                            "[{}]",
+                            values[offsets[index] as usize..offsets[index + 1] as usize]
+                                .iter()
+                                .map(|value| value.as_deref().unwrap_or("null"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                })
+                .collect())
+        }
+        DataType::Map(map_type) => {
+            let rows = source.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                crate::Error::DataInvalid {
+                    message: format!("expected MAP array, got {:?}", source.data_type()),
+                    source: None,
+                }
+            })?;
+            let keys = render_string_values(rows.keys(), map_type.key_type())?;
+            let values = render_string_values(rows.values(), map_type.value_type())?;
+            let offsets = rows.value_offsets();
+            Ok((0..rows.len())
+                .map(|index| {
+                    rows.is_valid(index).then(|| {
+                        format!(
+                            "{{{}}}",
+                            (offsets[index] as usize..offsets[index + 1] as usize)
+                                .map(|item| format!(
+                                    "{} -> {}",
+                                    keys[item].as_deref().unwrap_or("null"),
+                                    values[item].as_deref().unwrap_or("null")
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                })
+                .collect())
+        }
+        _ => {
+            let casted = cast(source, &ArrowDataType::Utf8).map_err(|error| {
+                crate::Error::UnexpectedError {
+                    message: format!(
+                        "failed to render {:?} as string during schema evolution",
+                        source.data_type()
+                    ),
+                    source: Some(Box::new(error)),
+                }
+            })?;
+            let strings = casted
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| crate::Error::UnexpectedError {
+                    message: "string rendering did not produce Utf8".to_string(),
+                    source: None,
+                })?;
+            Ok((0..strings.len())
+                .map(|index| {
+                    strings
+                        .is_valid(index)
+                        .then(|| strings.value(index).to_string())
+                })
+                .collect())
+        }
+    }
 }
 
 /// Rebuild a struct array to `target_row`: pair children by field id, recurse,
@@ -351,8 +479,10 @@ fn rebuild_map(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{BigIntType, DataField, IntType, VarCharType};
-    use arrow_array::{Int32Array, Int64Array, StringArray};
+    use crate::spec::{
+        ArrayType, BigIntType, DataField, DecimalType, IntType, MapType, VarCharType,
+    };
+    use arrow_array::{Decimal128Array, Int32Array, Int64Array, StringArray};
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Fields};
 
@@ -576,6 +706,143 @@ mod tests {
         let out = evolve_column(&source_struct(), &source_row(), &source_row()).unwrap();
         assert_eq!(out.data_type(), source_struct().data_type());
         assert_eq!(as_struct(&out).column_names(), vec!["codec", "width"]);
+    }
+
+    #[test]
+    fn renders_constructed_values_as_strings_during_schema_evolution() {
+        let source = source_struct();
+        let out = evolve_column(&source, &source_row(), &string_type()).unwrap();
+        assert_eq!(strings(&out).value(0), "{h264, 1920}");
+        assert_eq!(strings(&out).value(1), "{h265, 3840}");
+
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]));
+        let list: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::new(ArrowField::new("element", ArrowDataType::Int32, true)),
+                arrow_buffer::OffsetBuffer::new(vec![0, 2, 2, 3].into()),
+                values,
+                Some(NullBuffer::from(vec![true, false, true])),
+            )
+            .unwrap(),
+        );
+        let source_type = DataType::Array(ArrayType::new(DataType::Int(IntType::new())));
+        let out = evolve_column(&list, &source_type, &string_type()).unwrap();
+        let rendered = strings(&out);
+        assert_eq!(rendered.value(0), "[1, null]");
+        assert!(rendered.is_null(1));
+        assert_eq!(rendered.value(2), "[3]");
+
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["k"]));
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![Some(7)]));
+        let entry_fields = Fields::from(vec![
+            ArrowField::new("key", ArrowDataType::Utf8, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]);
+        let entries = StructArray::try_new(entry_fields.clone(), vec![keys, values], None).unwrap();
+        let map: ArrayRef = Arc::new(
+            MapArray::try_new(
+                Arc::new(ArrowField::new(
+                    "entries",
+                    ArrowDataType::Struct(entry_fields),
+                    false,
+                )),
+                arrow_buffer::OffsetBuffer::new(vec![0, 1].into()),
+                entries,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let source_type = DataType::Map(MapType::new(string_type(), DataType::Int(IntType::new())));
+        let out = evolve_column(&map, &source_type, &string_type()).unwrap();
+        assert_eq!(strings(&out).value(0), "{k -> 7}");
+    }
+
+    #[test]
+    fn reducing_decimal_scale_rounds_half_up_for_both_signs() {
+        let source: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![
+                Some(4_567),
+                Some(-4_567),
+                Some(4_565),
+                Some(-4_565),
+                Some(4_564),
+                Some(-4_564),
+                None,
+            ])
+            .with_precision_and_scale(6, 3)
+            .unwrap(),
+        );
+        let source_type = DataType::Decimal(DecimalType::new(6, 3).unwrap());
+        let target_type = DataType::Decimal(DecimalType::new(6, 2).unwrap());
+        let out = evolve_column(&source, &source_type, &target_type).unwrap();
+        let decimals = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!(decimals.data_type(), &ArrowDataType::Decimal128(6, 2));
+        assert_eq!(decimals.value(0), 457);
+        assert_eq!(decimals.value(1), -457);
+        assert_eq!(decimals.value(2), 457);
+        assert_eq!(decimals.value(3), -457);
+        assert_eq!(decimals.value(4), 456);
+        assert_eq!(decimals.value(5), -456);
+        assert!(decimals.is_null(6));
+        decimals.validate_decimal_precision(6).unwrap();
+    }
+
+    #[test]
+    fn reducing_decimal_scale_nulls_target_precision_overflow() {
+        let source: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![
+                Some(9_994),
+                Some(9_995),
+                Some(-9_995),
+                Some(999_999),
+                None,
+            ])
+            .with_precision_and_scale(6, 3)
+            .unwrap(),
+        );
+        let source_type = DataType::Decimal(DecimalType::new(6, 3).unwrap());
+        let target_type = DataType::Decimal(DecimalType::new(3, 2).unwrap());
+        let out = evolve_column(&source, &source_type, &target_type).unwrap();
+        let decimals = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!(decimals.data_type(), &ArrowDataType::Decimal128(3, 2));
+        assert_eq!(decimals.value(0), 999);
+        assert!(decimals.is_null(1));
+        assert!(decimals.is_null(2));
+        assert!(decimals.is_null(3));
+        assert!(decimals.is_null(4));
+        decimals.validate_decimal_precision(3).unwrap();
+    }
+
+    #[test]
+    fn renders_nested_row_child_as_string_without_losing_parent_nulls() {
+        let inner: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(ArrowField::new("a", ArrowDataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
+        )]));
+        let source: ArrayRef = Arc::new(
+            StructArray::try_new(
+                Fields::from(vec![ArrowField::new(
+                    "inner",
+                    inner.data_type().clone(),
+                    true,
+                )]),
+                vec![inner],
+                Some(NullBuffer::from(vec![true, false])),
+            )
+            .unwrap(),
+        );
+        let source_type = row(vec![field(
+            1,
+            "inner",
+            row(vec![field(2, "a", DataType::Int(IntType::new()))]),
+        )]);
+        let target_type = row(vec![field(1, "inner", string_type())]);
+        let out = evolve_column(&source, &source_type, &target_type).unwrap();
+        let outer = as_struct(&out);
+        let rendered = strings(outer.column(0));
+        assert_eq!(rendered.value(0), "{1}");
+        assert!(outer.is_null(1));
     }
 
     #[test]

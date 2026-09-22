@@ -19,13 +19,14 @@ use super::cursor::AvroCursor;
 use super::decode::{neg_count_to_usize, AvroRecordDecode};
 use super::decode_helpers::{
     extract_record_schema, normalize_partition, read_bytes_field, read_int_field, read_long_field,
-    read_nullable_string_field, read_string_field,
+    read_nullable_string_field, read_string_field, EMPTY_PARTITION,
 };
 use super::schema::{skip_nullable_field, FieldSchema, WriterSchema};
 use crate::spec::index_manifest::IndexManifestEntry;
 use crate::spec::manifest_common::FileKind;
 use crate::spec::{DeletionVectorMeta, GlobalIndexMeta, IndexFileMeta};
 use indexmap::IndexMap;
+use std::collections::HashMap;
 
 impl AvroRecordDecode for IndexManifestEntry {
     fn decode(cursor: &mut AvroCursor, writer_schema: &WriterSchema) -> crate::Result<Self> {
@@ -96,16 +97,107 @@ impl AvroRecordDecode for IndexManifestEntry {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct SlimIndexManifestEntry<'a> {
+    pub kind: FileKind,
+    pub partition: &'a [u8],
+    pub bucket: i32,
+    pub index_type: &'a str,
+    /// File-name mappings, with `None` for an unknown cardinality. Later mappings
+    /// replace earlier ones, just as in the full index-manifest decoder.
+    pub deletion_vector_cardinalities: HashMap<&'a str, Option<i64>>,
+}
+
+pub(crate) fn decode_slim_index_manifest_entry<'a>(
+    cursor: &mut AvroCursor<'a>,
+    writer_schema: &WriterSchema,
+    is_union_wrapped: bool,
+) -> crate::Result<SlimIndexManifestEntry<'a>> {
+    if is_union_wrapped && cursor.read_union_index()? == 0 {
+        return Err(crate::Error::UnexpectedError {
+            message: "avro decode: unexpected null in top-level union".into(),
+            source: None,
+        });
+    }
+
+    let mut entry = SlimIndexManifestEntry {
+        kind: FileKind::Add,
+        partition: EMPTY_PARTITION,
+        bucket: 0,
+        index_type: "",
+        deletion_vector_cardinalities: HashMap::new(),
+    };
+    for field in &writer_schema.fields {
+        match field.name.as_str() {
+            "_KIND" => {
+                entry.kind = match read_int_field(cursor, field.nullable)? {
+                    0 => FileKind::Add,
+                    1 => FileKind::Delete,
+                    v => {
+                        return Err(crate::Error::UnexpectedError {
+                            message: format!("unknown FileKind: {v}"),
+                            source: None,
+                        })
+                    }
+                }
+            }
+            "_PARTITION" => {
+                if !field.nullable || cursor.read_union_index()? != 0 {
+                    let partition = cursor.read_bytes()?;
+                    if partition.len() >= 4 {
+                        entry.partition = partition;
+                    }
+                }
+            }
+            "_BUCKET" => entry.bucket = read_int_field(cursor, field.nullable)?,
+            "_INDEX_TYPE" => {
+                if !field.nullable || cursor.read_union_index()? != 0 {
+                    entry.index_type = cursor.read_string()?;
+                }
+            }
+            "_DELETIONS_VECTORS_RANGES" | "_DELETION_VECTORS_RANGES" => {
+                entry.deletion_vector_cardinalities =
+                    decode_nullable_dv_cardinalities(cursor, field.nullable, &field.schema)?;
+            }
+            _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
+        }
+    }
+    Ok(entry)
+}
+
+fn decode_nullable_dv_cardinalities<'a>(
+    cursor: &mut AvroCursor<'a>,
+    nullable: bool,
+    schema: &FieldSchema,
+) -> crate::Result<HashMap<&'a str, Option<i64>>> {
+    let mut cardinalities = HashMap::new();
+    visit_nullable_dv_ranges(cursor, nullable, schema, |name, meta| {
+        cardinalities.insert(name, meta.cardinality.filter(|value| *value >= 0));
+    })?;
+    Ok(cardinalities)
+}
+
 fn decode_nullable_dv_ranges(
     cursor: &mut AvroCursor,
     nullable: bool,
     schema: &FieldSchema,
 ) -> crate::Result<Option<IndexMap<String, DeletionVectorMeta>>> {
-    if nullable {
-        let idx = cursor.read_union_index()?;
-        if idx == 0 {
-            return Ok(None);
-        }
+    let mut map = IndexMap::new();
+    let present = visit_nullable_dv_ranges(cursor, nullable, schema, |name, meta| {
+        map.insert(name.to_owned(), meta);
+    })?;
+    Ok(present.then_some(map))
+}
+
+/// Visit DV records with borrowed names; `false` means the outer array was null.
+fn visit_nullable_dv_ranges<'a>(
+    cursor: &mut AvroCursor<'a>,
+    nullable: bool,
+    schema: &FieldSchema,
+    mut visit: impl FnMut(&'a str, DeletionVectorMeta),
+) -> crate::Result<bool> {
+    if nullable && cursor.read_union_index()? == 0 {
+        return Ok(false);
     }
     let FieldSchema::Array(item_schema) = schema else {
         return Err(crate::Error::UnexpectedError {
@@ -113,7 +205,6 @@ fn decode_nullable_dv_ranges(
             source: None,
         });
     };
-    let mut map = IndexMap::new();
     loop {
         let count = cursor.read_long()?;
         if count == 0 {
@@ -150,13 +241,17 @@ fn decode_nullable_dv_ranges(
                     source: None,
                 });
             };
-            let mut file_name = String::new();
+            let mut file_name = "";
             let mut offset = 0;
             let mut length = 0;
             let mut cardinality = None;
             for field in &record.fields {
                 match field.name.as_str() {
-                    "f0" => file_name = read_string_field(cursor, field.nullable)?,
+                    "f0" => {
+                        if !field.nullable || cursor.read_union_index()? != 0 {
+                            file_name = cursor.read_string()?;
+                        }
+                    }
                     "f1" => offset = read_int_field(cursor, field.nullable)?,
                     "f2" => length = read_int_field(cursor, field.nullable)?,
                     "_CARDINALITY" => {
@@ -167,7 +262,7 @@ fn decode_nullable_dv_ranges(
                     _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
                 }
             }
-            map.insert(
+            visit(
                 file_name,
                 DeletionVectorMeta {
                     offset,
@@ -177,7 +272,7 @@ fn decode_nullable_dv_ranges(
             );
         }
     }
-    Ok(Some(map))
+    Ok(true)
 }
 
 fn decode_nullable_global_index(

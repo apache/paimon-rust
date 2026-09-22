@@ -81,7 +81,7 @@ impl SortedGlobalIndexBuildBuilder<'_> {
             .await?
         };
         if !rows.is_empty() {
-            sort_index_rows(&mut rows, &cmp);
+            sort_index_rows(&mut rows, &cmp)?;
         }
 
         self.table

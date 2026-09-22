@@ -306,6 +306,12 @@ impl FileSystemCatalog {
 
 #[async_trait]
 impl Catalog for FileSystemCatalog {
+    /// Opts in so that a failed downcast means "wrong catalog", not "never opted in".
+    /// Do not delete: it is what makes the REST-only capability checks test what they claim.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     async fn list_databases(&self) -> Result<Vec<String>> {
         let dirs = self.list_directories(&self.warehouse).await?;
         Ok(dirs

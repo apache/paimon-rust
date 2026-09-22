@@ -225,7 +225,8 @@ impl<'a> ReadBuilder<'a> {
         self
     }
 
-    /// Push a row-limit hint down to scan planning.
+    /// Push a row-limit hint down to scan planning. Data-evolution reads also
+    /// enforce this limit before resolving BLOB payloads.
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
         match &mut self.0 {
             ReadBuilderKind::Paimon(builder) => {
@@ -474,9 +475,9 @@ impl<'a> PaimonReadBuilder<'a> {
     /// This allows paimon-core scan planning to generate fewer splits when the
     /// current scan state keeps split-level `merged_row_count()` conservative.
     ///
-    /// Note: This method does not guarantee that exactly `limit` rows will be
-    /// returned by [`TableRead`]. It is only a pushdown hint for planning.
-    /// Callers or query engines are responsible for enforcing the final LIMIT.
+    /// Data-evolution [`TableRead`] enforces the limit before BLOB resolution.
+    /// Other read paths still treat it only as a planning hint, so callers or
+    /// query engines must enforce the final LIMIT themselves.
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
         self.limit = Some(limit);
         self
@@ -555,6 +556,7 @@ impl<'a> PaimonReadBuilder<'a> {
         TableRead::new(self.table, read_type, self.filter.data_predicates.clone())
             .with_parquet_read_budget(parquet_read_budget)
             .with_blob_parallelism(self.blob_parallelism)
+            .map(|read| read.with_limit(self.limit))
     }
 
     /// Resolve the effective read type, deferring projection name resolution to
@@ -948,7 +950,7 @@ mod tests {
         )
     }
 
-    async fn read_compacted_dv_table(merge_engine: &str) -> Vec<RecordBatch> {
+    async fn read_compacted_dv_table(merge_engine: &str, merge_on_read: bool) -> Vec<RecordBatch> {
         let tempdir = tempdir().unwrap();
         let table_path = local_file_path(tempdir.path());
         let bucket_dir = tempdir.path().join("bucket-0");
@@ -968,6 +970,14 @@ mod tests {
             write_test_deletion_file(&file_io, &local_file_path(&index_dir.join("dv")), &[1]).await;
 
         let table = dv_pk_table(&table_path, merge_engine);
+        let table = if merge_on_read {
+            table.copy_with_options(HashMap::from([(
+                "deletion-vectors.merge-on-read".to_string(),
+                "true".to_string(),
+            )]))
+        } else {
+            table
+        };
         let mut data_file =
             test_data_file::<crate::spec::DataFileMeta>("data.parquet", 3, file_size);
         data_file.delete_row_count = Some(0);
@@ -2145,7 +2155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_table_read_reads_compacted_partial_update_with_deletion_vectors() {
-        let batches = read_compacted_dv_table("partial-update").await;
+        let batches = read_compacted_dv_table("partial-update", false).await;
 
         assert_eq!(collect_int_column(&batches, "id"), vec![1, 3]);
         assert_eq!(collect_int_column(&batches, "value"), vec![10, 30]);
@@ -2153,41 +2163,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_table_read_reads_compacted_aggregation_with_deletion_vectors() {
-        let batches = read_compacted_dv_table("aggregation").await;
+        let batches = read_compacted_dv_table("aggregation", false).await;
 
         assert_eq!(collect_int_column(&batches, "id"), vec![1, 3]);
         assert_eq!(collect_int_column(&batches, "value"), vec![10, 30]);
     }
 
-    #[test]
-    fn test_direct_table_read_rejects_partial_update_dv_merge_on_read() {
-        let table = dv_pk_table(
-            "/tmp/test-partial-update-dv-merge-on-read",
-            "partial-update",
-        )
-        .copy_with_options(HashMap::from([(
-            "deletion-vectors.merge-on-read".to_string(),
-            "true".to_string(),
-        )]));
-        let mut data_file = test_data_file::<crate::spec::DataFileMeta>("data.parquet", 1, 0);
-        data_file.delete_row_count = Some(0);
-        let split = DataSplitBuilder::new()
-            .with_snapshot(1)
-            .with_partition(BinaryRow::new(0))
-            .with_bucket(0)
-            .with_bucket_path("/tmp/test-partial-update-dv-merge-on-read/bucket-0".to_string())
-            .with_total_buckets(1)
-            .with_data_files(vec![data_file])
-            .build()
-            .unwrap();
-
-        let result =
-            TableRead::new(&table, table.schema().fields().to_vec(), Vec::new()).to_arrow(&[split]);
-
-        assert!(matches!(
-            result,
-            Err(crate::Error::Unsupported { ref message })
-                if message.contains("merge-on-read")
-        ));
+    #[tokio::test]
+    async fn test_direct_table_read_supports_partial_update_and_aggregation_dv_merge_on_read() {
+        for engine in ["partial-update", "aggregation"] {
+            let batches = read_compacted_dv_table(engine, true).await;
+            assert_eq!(collect_int_column(&batches, "id"), vec![1, 3]);
+            assert_eq!(collect_int_column(&batches, "value"), vec![10, 30]);
+        }
     }
 }

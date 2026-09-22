@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Reader for Java Paimon's `range-bitmap` file index.
+//! Java-compatible `range-bitmap` file index.
 //!
 //! The index maps ordered dictionary codes to row positions with a bit-sliced
 //! bitmap. Evaluating it produces the same conservative row selection consumed
@@ -32,6 +32,8 @@ use crate::file_index::file_index_reader::FileIndexReader;
 use crate::file_index::file_index_result::FileIndexResult;
 use crate::spec::{DataType, Datum, PredicateOperator};
 use crate::{Error, Result};
+
+pub(crate) mod writer;
 
 const VERSION_1: u8 = 1;
 const JAVA_CANONICAL_FLOAT_NAN_BITS: u32 = 0x7fc0_0000;
@@ -1052,6 +1054,62 @@ mod tests {
 
     fn reader(bytes: Bytes) -> RangeBitmapFileIndexReader {
         RangeBitmapFileIndexReader::try_new(int_type(), bytes).unwrap()
+    }
+
+    #[test]
+    fn test_writer_matches_java_v1_bytes() {
+        use crate::common::Options;
+        use crate::file_index::file_index_writer::FileIndexWriter;
+        use writer::RangeBitmapFileIndexWriter;
+
+        let cases = [
+            (
+                int_type(),
+                vec![
+                    Some(Datum::Int(1)),
+                    Some(Datum::Int(3)),
+                    Some(Datum::Int(5)),
+                    Some(Datum::Int(7)),
+                    Some(Datum::Int(9)),
+                    None,
+                    None,
+                    Some(Datum::Int(10)),
+                ],
+                JAVA_INT_V1,
+            ),
+            (
+                DataType::VarChar(crate::spec::VarCharType::new(32).unwrap()),
+                vec![
+                    Some(Datum::String("aa".into())),
+                    Some(Datum::String("b".into())),
+                    Some(Datum::String("你好".into())),
+                    None,
+                    Some(Datum::String("ccc".into())),
+                ],
+                JAVA_STRING_V1,
+            ),
+            (
+                DataType::Float(crate::spec::FloatType::new()),
+                vec![
+                    Some(Datum::Float(-0.0)),
+                    Some(Datum::Float(0.0)),
+                    Some(Datum::Float(1.5)),
+                    Some(Datum::Float(f32::NAN)),
+                    None,
+                ],
+                JAVA_FLOAT_V1,
+            ),
+        ];
+        for (data_type, values, golden) in cases {
+            let mut writer =
+                RangeBitmapFileIndexWriter::try_new(data_type, &Options::new()).unwrap();
+            for value in &values {
+                writer.write(value.as_ref()).unwrap();
+            }
+            let bytes = writer.serialized_bytes().unwrap();
+            assert_eq!(hex::encode(&bytes), golden);
+            assert_eq!(writer.serialized_bytes().unwrap(), bytes);
+        }
     }
 
     fn selection(rows: impl IntoIterator<Item = u32>) -> FileIndexResult {
