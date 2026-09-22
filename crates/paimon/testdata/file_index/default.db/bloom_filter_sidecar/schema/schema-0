@@ -1,0 +1,27 @@
+{
+  "version" : 3,
+  "id" : 0,
+  "fields" : [ {
+    "id" : 0,
+    "name" : "id",
+    "type" : "INT"
+  }, {
+    "id" : 1,
+    "name" : "payload",
+    "type" : "STRING"
+  } ],
+  "highestFieldId" : 1,
+  "partitionKeys" : [ ],
+  "primaryKeys" : [ ],
+  "options" : {
+    "bucket" : "1",
+    "file-index.bloom-filter.id.items" : "16",
+    "file-index.in-manifest-threshold" : "1 B",
+    "file-index.bloom-filter.columns" : "id",
+    "file-index.bloom-filter.id.fpp" : "0.01",
+    "bucket-key" : "id",
+    "file-index.read.enabled" : "true",
+    "file.format" : "parquet"
+  },
+  "timeMillis" : 1789814327190
+}
