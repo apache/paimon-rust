@@ -3037,6 +3037,39 @@ async fn test_a_branch_reporting_its_own_uuid_still_reads() {
 }
 
 #[tokio::test]
+async fn test_a_branch_of_a_replaced_base_table_is_refused() {
+    // The branch still answers "not query-auth", but the base name now resolves
+    // to a replacement: the handle's files are the old table's.
+    let ctx = setup_catalog(vec!["default"]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = format!("file://{}", tmp.path().display());
+    ctx.server
+        .add_table_with_schema("default", "gone", schema_of(&["id"], &[]), &path);
+    ctx.server
+        .add_table_with_schema("default", "gone$branch_dev", schema_of(&["id"], &[]), &path);
+    let base = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "gone"))
+        .await
+        .unwrap();
+    let branch_schema = paimon::spec::TableSchema::new(0, &schema_of(&["id"], &[]));
+    base.file_io()
+        .new_output(&base.schema_manager().with_branch("dev").schema_path(0))
+        .unwrap()
+        .write(serde_json::to_vec(&branch_schema).unwrap().into())
+        .await
+        .unwrap();
+    let branch = base.copy_with_branch("dev").await.unwrap();
+    ctx.server
+        .set_table_uuid("default", "gone", "uuid-of-the-replacement");
+
+    assert_drifted(
+        plan_err(&branch, "a branch of a replaced base table must not plan").await,
+        "now resolves to uuid",
+    );
+}
+
+#[tokio::test]
 async fn test_a_search_entry_asks_the_server_once() {
     let ctx = setup_catalog(vec!["default"]).await;
     let tmp = tempfile::tempdir().unwrap();

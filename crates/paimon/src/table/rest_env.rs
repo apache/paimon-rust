@@ -112,19 +112,20 @@ impl RESTEnv {
         if crate::spec::CoreOptions::new(schema.options()).query_auth_enabled() {
             return Ok(true);
         }
-        // A branch answers for its own schema only. Whether the server reports
-        // the base table's id for `t$branch_x` is its own business, so the
-        // identity check below is for the name this handle was loaded with.
-        if identifier != self.identifier {
-            return Ok(false);
-        }
+        // A branch's `false` counts only while the base name still resolves to
+        // the loaded table; its own id is the server's business.
+        let response = if identifier != self.identifier {
+            self.api.get_table(&self.identifier).await?
+        } else {
+            response
+        };
         match response.id.as_deref() {
             Some(uuid) if uuid == self.uuid => Ok(false),
             Some(uuid) => Err(crate::Error::DataInvalid {
                 message: format!(
                     "table '{}' now resolves to uuid {uuid}, not the {} this handle was loaded \
                      with; re-load the table before reading it",
-                    identifier.full_name(),
+                    self.identifier.full_name(),
                     self.uuid
                 ),
                 source: None,
