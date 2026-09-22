@@ -133,7 +133,7 @@ pub use audit_log_table::AuditLogTable;
 pub use batch_vector_search_builder::BatchVectorSearchBuilder;
 pub use blob_resolver::{BlobReader, BlobStream};
 pub use branch_manager::BranchManager;
-pub use commit_message::CommitMessage;
+pub use commit_message::{CommitMessage, COMMIT_MESSAGE_SERIALIZER_VERSION};
 pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};

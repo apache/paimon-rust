@@ -890,6 +890,25 @@ impl KeyValueFileWriter {
         Ok(result)
     }
 
+    pub(crate) async fn abort(&mut self) {
+        self.buffer.clear();
+        self.buffer_bytes = 0;
+        let bucket_path = bucket_path_under(
+            &self.config.table_location,
+            &self.config.partition_path,
+            self.config.bucket,
+        );
+        for file in self
+            .written_files
+            .drain(..)
+            .chain(self.written_changelog_files.drain(..))
+        {
+            for path in file.collect_files(&bucket_path) {
+                let _ = self.file_io.delete_file(&path).await;
+            }
+        }
+    }
+
     /// Flush remaining buffer and return all written file metadata.
     pub(crate) async fn prepare_commit(&mut self) -> Result<PreparedFiles> {
         self.flush().await?;

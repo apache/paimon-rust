@@ -706,10 +706,11 @@ async fn test_removed_file_deletion_vector_does_not_reduce_count() {
         .clone();
     assert_eq!(removed.row_count, 2);
 
-    // The public commit API can remove a data file while retaining its DV index.
+    // Remove the data file and its DV together, as required by commit validation.
     let mut message =
         paimon::table::CommitMessage::new(entry.partition.clone(), entry.bucket, vec![]);
     message.deleted_files.push(removed);
+    message.deleted_index_files.push(entry.index_file.clone());
     table
         .new_write_builder()
         .new_commit()
@@ -717,7 +718,27 @@ async fn test_removed_file_deletion_vector_does_not_reduce_count() {
         .await
         .unwrap();
     let after = snapshots.get_latest_snapshot().await.unwrap().unwrap();
-    assert_eq!(after.index_manifest(), snapshot.index_manifest());
+    // Model a legacy snapshot that retained the removed file's DV. Build this
+    // reader-compatibility fixture directly; new commits must reject that state.
+    let mut metadata = serde_json::to_value(&after).unwrap();
+    metadata["indexManifest"] = serde_json::json!(snapshot.index_manifest());
+    let snapshot_path = snapshots.snapshot_path(after.id());
+    table.file_io().delete_file(&snapshot_path).await.unwrap();
+    table
+        .file_io()
+        .new_output(&snapshot_path)
+        .unwrap()
+        .write(serde_json::to_vec(&metadata).unwrap().into())
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshots
+            .get_snapshot(after.id())
+            .await
+            .unwrap()
+            .index_manifest(),
+        snapshot.index_manifest()
+    );
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
     assert!(plan
         .splits()

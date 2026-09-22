@@ -237,7 +237,7 @@ batch = pa.record_batch(
 )
 
 # Create a write builder (shared commit_user for writer and committer)
-wb = table.new_write_builder()
+wb = table.new_batch_write_builder()
 
 # Write batches
 write = wb.new_write()
@@ -265,7 +265,7 @@ ctx.sql("INSERT INTO paimon.default.my_table VALUES (1, 'alice'), (2, 'bob')")
     The input batch schema is strictly validated against the table schema: field count, order, names, and types must match exactly. A `ValueError` is raised on mismatch.
 
 !!! note "Write Builder Consistency"
-    The writer and committer must come from the same `WriteBuilder` — they share a `commit_user` for duplicate-commit detection. Passing messages from one builder's writer to another builder's committer will raise a `ValueError`.
+    The writer and committer must come from the same `BatchWriteBuilder` — they share a `commit_user` for duplicate-commit detection. Passing messages from one builder's writer to another builder's committer will raise a `ValueError`.
 
 ## Column Projection
 
@@ -539,7 +539,7 @@ batch = pa.record_batch(
     [pa.array([1, 2, 3], pa.int32()), pa.array(["alice", "bob", "carol"], pa.string())],
     names=["id", "name"],
 )
-wb = table.new_write_builder()
+wb = table.new_batch_write_builder()
 write = wb.new_write()
 write.write_arrow(batch)
 wb.new_commit().commit(write.prepare_commit())

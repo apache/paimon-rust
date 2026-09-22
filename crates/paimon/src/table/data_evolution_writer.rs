@@ -30,7 +30,7 @@ use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
 use crate::io::FileIO;
 use crate::spec::{
     bucket_path, BinaryRow, CoreOptions, DataField, DataFileMeta, DataType, DeletionVectorMeta,
-    FileKind, IndexFileMeta, IndexManifest, PartitionComputer, EMPTY_BINARY_ROW,
+    FileKind, IndexFileMeta, IndexManifest, PartitionComputer, Snapshot, EMPTY_BINARY_ROW,
 };
 use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_writer::DataFileWriter;
@@ -38,7 +38,6 @@ use crate::table::index_file_path::IndexFileLocation;
 use crate::table::source::data_evolution_anchor_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::DataSplitBuilder;
-use crate::table::SnapshotManager;
 use crate::table::Table;
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
@@ -485,8 +484,14 @@ impl DataEvolutionDeleteWriter {
             return Ok(Vec::new());
         }
 
-        let scan = self
-            .table
+        let snapshot = super::time_travel::resolve_snapshot(&self.table)
+            .await?
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "No files with row tracking found in target table".into(),
+                source: None,
+            })?;
+        let scan_table = self.table.copy_with_pinned_snapshot(&snapshot);
+        let scan = scan_table
             .new_read_builder()
             .new_scan()
             .with_scan_all_files();
@@ -572,7 +577,7 @@ impl DataEvolutionDeleteWriter {
         let mut messages = Vec::new();
         for ((partition, bucket), delete_plan) in deletes_by_bucket {
             if let Some(message) = self
-                .prepare_bucket_delete_message(partition, bucket, delete_plan)
+                .prepare_bucket_delete_message(partition, bucket, delete_plan, &snapshot)
                 .await?
             {
                 messages.push(message);
@@ -587,13 +592,10 @@ impl DataEvolutionDeleteWriter {
         partition: Vec<u8>,
         bucket: i32,
         delete_plan: BucketDeletePlan,
+        snapshot: &Snapshot,
     ) -> Result<Option<CommitMessage>> {
         let (mut bitmaps, deleted_index_files) = self
-            .read_existing_bucket_deletion_vectors(
-                &partition,
-                bucket,
-                delete_plan.check_from_snapshot,
-            )
+            .read_existing_bucket_deletion_vectors(&partition, bucket, snapshot)
             .await?;
         let mut changed = false;
 
@@ -661,13 +663,8 @@ impl DataEvolutionDeleteWriter {
         &self,
         partition: &[u8],
         bucket: i32,
-        snapshot_id: i64,
+        snapshot: &Snapshot,
     ) -> Result<(IndexMap<String, RoaringBitmap>, Vec<IndexFileMeta>)> {
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
-        let snapshot = snapshot_manager.get_snapshot(snapshot_id).await?;
         let Some(index_manifest_name) = snapshot.index_manifest() else {
             return Ok((IndexMap::new(), Vec::new()));
         };

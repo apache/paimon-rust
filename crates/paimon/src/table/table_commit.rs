@@ -52,6 +52,14 @@ type PartitionBucketKey = (Vec<u8>, i32);
 type RowIdRange = (i64, i64);
 type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
 
+fn commit_file_identifier(entry: &ManifestEntry) -> crate::spec::Identifier {
+    let mut identifier = entry.identifier();
+    if is_empty_partition(&identifier.partition) {
+        identifier.partition.clear();
+    }
+    identifier
+}
+
 fn validate_file_entries<'a>(entries: impl IntoIterator<Item = &'a ManifestEntry>) -> Result<()> {
     // Mirror Java FileEntry.mergeEntries while also rejecting repeated entries
     // of the same kind instead of letting two DELETEs cancel each other.
@@ -65,7 +73,7 @@ fn validate_file_entries<'a>(entries: impl IntoIterator<Item = &'a ManifestEntry
     let mut files = HashMap::new();
     for entry in entries {
         let state = files
-            .entry(entry.identifier())
+            .entry(commit_file_identifier(entry))
             .or_insert_with(State::default);
         let duplicate = match entry.kind() {
             FileKind::Add => {
@@ -156,6 +164,22 @@ fn validate_fixed_bucket_commit_mode(messages: &[CommitMessage], overwrite: bool
     Ok(())
 }
 
+fn reject_compact_increment(messages: &[CommitMessage]) -> Result<()> {
+    // Java writes this increment in a separate COMPACT snapshot.
+    if messages.iter().any(|message| {
+        !message.compact_before.is_empty()
+            || !message.compact_after.is_empty()
+            || !message.compact_changelog_files.is_empty()
+            || !message.compact_new_index_files.is_empty()
+            || !message.compact_deleted_index_files.is_empty()
+    }) {
+        return Err(crate::Error::Unsupported {
+            message: "Committing a compact increment requires a separate COMPACT snapshot.".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Table commit logic for Paimon write operations.
 ///
 /// Provides atomic commit functionality including append, overwrite and truncate
@@ -164,6 +188,7 @@ pub struct TableCommit {
     snapshot_manager: SnapshotManager,
     snapshot_commit: Arc<dyn SnapshotCommit>,
     commit_user: String,
+    ignore_empty_commit: bool,
     total_buckets: i32,
     // commit config
     commit_max_retries: u32,
@@ -180,7 +205,7 @@ pub struct TableCommit {
 
 impl TableCommit {
     pub fn new(table: Table, commit_user: String) -> Self {
-        let snapshot_manager = SnapshotManager::new(table.file_io.clone(), table.location.clone());
+        let snapshot_manager = table.snapshot_manager();
         let snapshot_commit = if let Some(env) = &table.rest_env {
             env.snapshot_commit()
         } else {
@@ -205,6 +230,7 @@ impl TableCommit {
             snapshot_manager,
             snapshot_commit,
             commit_user,
+            ignore_empty_commit: true,
             total_buckets,
             commit_max_retries,
             commit_timeout_ms,
@@ -217,6 +243,61 @@ impl TableCommit {
             data_evolution_enabled,
             partition_default_name,
         }
+    }
+
+    /// Control empty APPEND snapshots. Java stream commits set this to false.
+    pub fn with_ignore_empty_commit(mut self, ignore_empty_commit: bool) -> Self {
+        self.ignore_empty_commit = ignore_empty_commit;
+        self
+    }
+
+    /// Java StreamTableCommit.filterAndCommit: sort identifiers and return the
+    /// number of groups remaining after filtering against committed snapshots.
+    pub async fn filter_and_commit(
+        &self,
+        mut commits: Vec<(i64, Vec<CommitMessage>)>,
+    ) -> Result<usize> {
+        self.table.ensure_read_authorized_live().await?;
+        self.table.ensure_not_branch_reference_for_write()?;
+        commits.sort_by_key(|(id, _)| *id);
+        for pair in commits.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Duplicate commit identifier {} in recovery batch",
+                        pair[0].0
+                    ),
+                    source: None,
+                });
+            }
+        }
+        let latest = self.snapshot_manager.get_latest_snapshot().await?;
+        let mut pending = Vec::new();
+        for (id, messages) in commits {
+            if !self.is_committed_identifier(&latest, id).await? {
+                pending.push((id, messages));
+            }
+        }
+        // Java checks every pending checkpoint before publishing any snapshot.
+        // Filtered checkpoints may reference files already expired by retention.
+        for (_, messages) in &pending {
+            self.check_recovery_files(messages).await?;
+        }
+        let count = pending.len();
+        for (id, messages) in pending {
+            self.filter_and_commit_with_identifier(messages, id).await?;
+        }
+        Ok(count)
+    }
+
+    async fn check_recovery_files(&self, messages: &[CommitMessage]) -> Result<()> {
+        reject_compact_increment(messages)?;
+        self.check_recovery_entries(
+            &self.messages_to_entries(messages),
+            &self.messages_to_changelog_entries(messages),
+            &self.messages_to_index_entries(messages),
+        )
+        .await
     }
 
     /// Commit new files in APPEND mode.
@@ -266,17 +347,18 @@ impl TableCommit {
         // already committed names files a snapshot references.
         self.table.ensure_read_authorized_live().await?;
         self.table.ensure_not_branch_reference_for_write()?;
+        reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
 
-        if commit_messages.is_empty() {
+        if commit_messages.is_empty() && self.ignore_empty_commit {
             return Ok(());
         }
 
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
-        let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
+        let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
         self.try_commit(
             CommitEntriesPlan::Direct {
                 entries,
@@ -313,6 +395,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         self.table.ensure_read_authorized_live().await?;
         self.table.ensure_not_branch_reference_for_write()?;
+        reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
 
@@ -323,7 +406,7 @@ impl TableCommit {
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
-        let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
+        let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
         let result = self
             .try_commit(
                 CommitEntriesPlan::Direct {
@@ -398,10 +481,14 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         self.table.ensure_read_authorized_live().await?;
         self.table.ensure_not_branch_reference_for_write()?;
+        reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
 
-        if commit_messages.is_empty() && static_partitions.is_none() {
+        if commit_messages.is_empty()
+            && static_partitions.is_none()
+            && !self.table.schema().partition_fields().is_empty()
+        {
             return Ok(());
         }
 
@@ -428,7 +515,7 @@ impl TableCommit {
             }
         }
 
-        let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
+        let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
 
         self.try_commit(
             CommitEntriesPlan::Overwrite {
@@ -791,6 +878,8 @@ impl TableCommit {
                 .new_files
                 .iter()
                 .chain(message.new_changelog_files.iter())
+                .chain(message.compact_after.iter())
+                .chain(message.compact_changelog_files.iter())
             {
                 for path in file.collect_files(&bucket_path) {
                     let _ = self.table.file_io().delete_file(&path).await;
@@ -807,7 +896,11 @@ impl TableCommit {
             // through `indexFileFactory(partition, bucket)`. Deleting is
             // best-effort, so a wrong path leaks the file silently instead of
             // failing.
-            for file in &message.new_index_files {
+            for file in message
+                .new_index_files
+                .iter()
+                .chain(&message.compact_new_index_files)
+            {
                 let path = committed_index_file_path(
                     table_path,
                     &bucket_path,
@@ -855,81 +948,167 @@ impl TableCommit {
         let mut duplicate_check_start_snapshot_id: Option<i64> = None;
         let mut retry_state: Option<Box<RetryState>> = None;
         let start_time_ms = current_time_millis();
-        // An identified destructive no-op must still record its identifier.
-        // Otherwise a retry after an intervening write can execute the operation
-        // for the first time and delete data which was not present originally.
-        let commit_empty_overwrite =
-            filter_committed && plan.commit_kind_hint() == CommitKind::OVERWRITE;
+        // Java records static overwrite/truncate operations even when no files
+        // match. Dynamic empty overwrite exits before constructing this plan.
+        let commit_empty_overwrite = plan.commit_kind_hint() == CommitKind::OVERWRITE;
+        let commit_empty_append =
+            !self.ignore_empty_commit && matches!(plan, CommitEntriesPlan::Direct { .. });
+        let check_append_files = filter_committed;
         let mut filter_committed = filter_committed;
 
-        loop {
-            let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
-            if filter_committed {
-                if self
-                    .is_committed_identifier(&latest_snapshot, commit_identifier)
-                    .await?
-                {
-                    break;
+        let mut publication_uncertain = false;
+        let mut last_publication_error = None;
+        let result = async {
+            loop {
+                let latest_snapshot = self.snapshot_manager.get_latest_snapshot().await?;
+                if filter_committed {
+                    if self
+                        .is_committed_identifier(&latest_snapshot, commit_identifier)
+                        .await?
+                    {
+                        break;
+                    }
+                    self.check_recovered_files_exist(&plan).await?;
+                    filter_committed = false;
                 }
-                filter_committed = false;
-            }
-            if let Some(start_snapshot_id) = duplicate_check_start_snapshot_id {
-                if self
-                    .is_duplicate_commit(
-                        start_snapshot_id,
+                if let Some(start_snapshot_id) = duplicate_check_start_snapshot_id {
+                    if self
+                        .is_duplicate_commit(
+                            start_snapshot_id,
+                            &latest_snapshot,
+                            commit_identifier,
+                            &plan.commit_kind_hint(),
+                        )
+                        .await?
+                    {
+                        break;
+                    }
+                }
+                validate_expected_latest_snapshot(expected_snapshot_id, &latest_snapshot)?;
+                let resolved = self
+                    .resolve_commit(
+                        &mut plan,
                         &latest_snapshot,
-                        commit_identifier,
-                        &plan.commit_kind_hint(),
+                        retry_state.as_deref(),
+                        check_append_files,
                     )
-                    .await?
+                    .await?;
+
+                if resolved.entries.is_empty()
+                    && resolved.changelog_entries.is_empty()
+                    && !resolved.index_manifest_changed
+                    && !commit_empty_overwrite
+                    && !commit_empty_append
                 {
                     break;
                 }
-            }
-            validate_expected_latest_snapshot(expected_snapshot_id, &latest_snapshot)?;
-            let resolved = self
-                .resolve_commit(&mut plan, &latest_snapshot, retry_state.as_deref())
-                .await?;
 
-            if resolved.entries.is_empty()
-                && resolved.changelog_entries.is_empty()
-                && !resolved.index_manifest_changed
-                && !commit_empty_overwrite
-            {
-                break;
-            }
+                let result = self
+                    .try_commit_once(resolved, &latest_snapshot, commit_identifier)
+                    .await?;
 
-            let result = self
-                .try_commit_once(resolved, &latest_snapshot, commit_identifier)
-                .await?;
-
-            match result {
-                CommitAttemptResult::Success => break,
-                CommitAttemptResult::Retry(state) => {
-                    duplicate_check_start_snapshot_id.get_or_insert_with(|| {
-                        latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1)
-                    });
-                    retry_state = Some(state);
+                match result {
+                    CommitAttemptResult::Success => break,
+                    CommitAttemptResult::Retry(mut state) => {
+                        if let Some(error) = state.publication_error.take() {
+                            publication_uncertain = true;
+                            last_publication_error = Some(error);
+                        }
+                        duplicate_check_start_snapshot_id.get_or_insert_with(|| {
+                            latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1)
+                        });
+                        retry_state = Some(state);
+                    }
                 }
+
+                let elapsed_ms = current_time_millis() - start_time_ms;
+                if elapsed_ms > self.commit_timeout_ms || retry_count >= self.commit_max_retries {
+                    let snap_id = duplicate_check_start_snapshot_id.unwrap_or(1);
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Commit failed for snapshot {} after {} millis with {} retries, \
+                         there may exist commit conflicts between multiple jobs.",
+                            snap_id, elapsed_ms, retry_count
+                        ),
+                        source: last_publication_error.map(|error| Box::new(error) as _),
+                    });
+                }
+
+                self.commit_retry_wait(retry_count).await;
+                retry_count += 1;
             }
 
-            let elapsed_ms = current_time_millis() - start_time_ms;
-            if elapsed_ms > self.commit_timeout_ms || retry_count >= self.commit_max_retries {
-                let snap_id = duplicate_check_start_snapshot_id.unwrap_or(1);
+            Ok(())
+        }
+        .await;
+        match result {
+            Err(error) if publication_uncertain => Err(crate::Error::UnexpectedError {
+                message: "Commit outcome may be unknown; retain prepared files and retry with the same commit identifier".into(),
+                source: Some(Box::new(error)),
+            }),
+            result => result,
+        }
+    }
+
+    /// Validate files before replaying a commit whose identity is no longer visible.
+    async fn check_recovered_files_exist(&self, plan: &CommitEntriesPlan) -> Result<()> {
+        let (entries, changelog_entries, index_entries) = match plan {
+            CommitEntriesPlan::Direct {
+                entries,
+                changelog_entries,
+                new_index_entries,
+                ..
+            } => (
+                entries.as_slice(),
+                changelog_entries.as_slice(),
+                new_index_entries,
+            ),
+            CommitEntriesPlan::Overwrite {
+                new_entries,
+                new_index_entries,
+                ..
+            } => (new_entries.as_slice(), &[][..], new_index_entries),
+        };
+        self.check_recovery_entries(entries, changelog_entries, index_entries)
+            .await
+    }
+
+    async fn check_recovery_entries(
+        &self,
+        entries: &[ManifestEntry],
+        changelog_entries: &[ManifestEntry],
+        index_entries: &[IndexManifestEntry],
+    ) -> Result<()> {
+        let mut paths = HashSet::new();
+        for entry in entries
+            .iter()
+            .chain(changelog_entries)
+            .filter(|e| *e.kind() == FileKind::Add)
+        {
+            paths.extend(
+                entry
+                    .file()
+                    .collect_files(&self.bucket_path(entry.partition(), entry.bucket())?),
+            );
+        }
+        let index_in_data_dir =
+            CoreOptions::new(self.table.schema().options()).index_file_in_data_file_dir();
+        for entry in index_entries.iter().filter(|e| e.kind == FileKind::Add) {
+            paths.insert(committed_index_file_path(
+                self.table.location().trim_end_matches('/'),
+                &self.bucket_path(&entry.partition, entry.bucket)?,
+                index_in_data_dir,
+                &entry.index_file,
+            ));
+        }
+        for path in paths {
+            if !self.table.file_io().exists(&path).await? {
                 return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Commit failed for snapshot {} after {} millis with {} retries, \
-                         there may exist commit conflicts between multiple jobs.",
-                        snap_id, elapsed_ms, retry_count
-                    ),
+                    message: format!("Cannot recover commit: file '{path}' does not exist"),
                     source: None,
                 });
             }
-
-            self.commit_retry_wait(retry_count).await;
-            retry_count += 1;
         }
-
         Ok(())
     }
 
@@ -940,6 +1119,45 @@ impl TableCommit {
         latest_snapshot: &Option<Snapshot>,
         commit_identifier: i64,
     ) -> Result<CommitAttemptResult> {
+        let mut created_files = Vec::new();
+        let prepared = self
+            .prepare_snapshot(
+                &mut resolved,
+                latest_snapshot,
+                commit_identifier,
+                &mut created_files,
+            )
+            .await;
+        let (snapshot, statistics) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                for path in created_files {
+                    let _ = self.snapshot_manager.file_io().delete_file(&path).await;
+                }
+                return Err(error);
+            }
+        };
+        // Once publication starts its outcome may be unknown. These files must
+        // remain available even if the response is lost or a later retry fails.
+        let publication_error = match self.snapshot_commit.commit(&snapshot, &statistics).await {
+            Ok(true) => return Ok(CommitAttemptResult::Success),
+            Ok(false) => None,
+            Err(error) => Some(error),
+        };
+        Ok(CommitAttemptResult::Retry(Box::new(RetryState {
+            latest_snapshot: latest_snapshot.clone(),
+            base_data_files: resolved.base_data_files.take(),
+            publication_error,
+        })))
+    }
+
+    async fn prepare_snapshot(
+        &self,
+        resolved: &mut ResolvedCommit,
+        latest_snapshot: &Option<Snapshot>,
+        commit_identifier: i64,
+        created_files: &mut Vec<String>,
+    ) -> Result<(Snapshot, Vec<PartitionStatistics>)> {
         let new_snapshot_id = latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1);
 
         // Row tracking
@@ -958,7 +1176,7 @@ impl TableCommit {
                 let (assigned, nrid) = self.assign_row_tracking_meta(
                     new_snapshot_id,
                     first_row_id_start,
-                    resolved.entries,
+                    std::mem::take(&mut resolved.entries),
                 )?;
                 resolved.entries = assigned;
                 next_row_id = Some(nrid);
@@ -986,10 +1204,12 @@ impl TableCommit {
                 &manifest_dir,
                 &new_manifest_prefix,
                 &resolved.entries,
+                created_files,
             )
             .await?;
 
         // Write delta manifest list
+        created_files.push(delta_manifest_list_path.clone());
         ManifestList::write_with_compression(
             file_io,
             &delta_manifest_list_path,
@@ -1008,8 +1228,10 @@ impl TableCommit {
                         &manifest_dir,
                         &changelog_manifest_prefix,
                         &resolved.changelog_entries,
+                        created_files,
                     )
                     .await?;
+                created_files.push(changelog_manifest_list_path.clone());
                 ManifestList::write_with_compression(
                     file_io,
                     &changelog_manifest_list_path,
@@ -1047,6 +1269,7 @@ impl TableCommit {
             vec![]
         };
 
+        created_files.push(base_manifest_list_path.clone());
         ManifestList::write_with_compression(
             file_io,
             &base_manifest_list_path,
@@ -1065,35 +1288,89 @@ impl TableCommit {
         }
         total_record_count += delta_record_count;
 
+        if let Some(entries) = &resolved.new_index_manifest_entries {
+            resolved.index_manifest_name = self
+                .write_index_manifest(file_io, &manifest_dir, entries, created_files)
+                .await?;
+        }
+        let schema_id = self.latest_schema_id().await?;
+        let statistics_file = self
+            .inherited_statistics(latest_snapshot.as_ref(), schema_id)
+            .await?;
         let snapshot = Snapshot::builder()
             .version(3)
             .id(new_snapshot_id)
-            .schema_id(self.table.schema().id())
+            .schema_id(schema_id)
             .base_manifest_list(base_manifest_list_name)
             .delta_manifest_list(delta_manifest_list_name)
             .commit_user(self.commit_user.clone())
             .commit_identifier(commit_identifier)
-            .commit_kind(resolved.kind)
+            .commit_kind(resolved.kind.clone())
             .time_millis(current_time_millis())
             .total_record_count(Some(total_record_count))
             .delta_record_count(Some(delta_record_count))
             .changelog_manifest_list(changelog_record_count.map(|_| changelog_manifest_list_name))
             .changelog_manifest_list_size(changelog_manifest_list_size)
             .changelog_record_count(changelog_record_count)
+            .watermark(latest_snapshot.as_ref().and_then(Snapshot::watermark))
+            .statistics(statistics_file)
             .next_row_id(next_row_id)
-            .index_manifest(resolved.index_manifest_name)
+            .index_manifest(resolved.index_manifest_name.clone())
             .build();
 
         let statistics = self.generate_partition_statistics(&resolved.entries)?;
 
-        if self.snapshot_commit.commit(&snapshot, &statistics).await? {
-            Ok(CommitAttemptResult::Success)
-        } else {
-            Ok(CommitAttemptResult::Retry(Box::new(RetryState {
-                latest_snapshot: latest_snapshot.clone(),
-                base_data_files: resolved.base_data_files.take(),
-            })))
+        Ok((snapshot, statistics))
+    }
+
+    async fn latest_schema_id(&self) -> Result<i64> {
+        if let Some(env) = &self.table.rest_env {
+            return env
+                .api()
+                .get_table(env.identifier())
+                .await?
+                .schema_id
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "REST table response is missing schemaId".into(),
+                    source: None,
+                });
         }
+        // Tables constructed directly by callers need not have schema files.
+        Ok(self
+            .table
+            .schema_manager()
+            .latest()
+            .await?
+            .map(|schema| schema.id())
+            .unwrap_or(self.table.schema().id()))
+    }
+
+    async fn inherited_statistics(
+        &self,
+        snapshot: Option<&Snapshot>,
+        schema_id: i64,
+    ) -> Result<Option<String>> {
+        let Some(name) = snapshot.and_then(Snapshot::statistics) else {
+            return Ok(None);
+        };
+        // Read the statistics' own schema ID: the snapshot's schema is not a
+        // substitute when older writers have carried incompatible statistics.
+        #[derive(serde::Deserialize)]
+        struct StatisticsSchema {
+            #[serde(rename = "schemaId")]
+            schema_id: i64,
+        }
+        let path = format!(
+            "{}/statistics/{name}",
+            self.table.location().trim_end_matches('/')
+        );
+        let bytes = self.table.file_io().new_input(&path)?.read().await?;
+        let statistics: StatisticsSchema =
+            serde_json::from_slice(&bytes).map_err(|error| crate::Error::DataInvalid {
+                message: format!("Invalid statistics metadata: {path}"),
+                source: Some(Box::new(error)),
+            })?;
+        Ok((statistics.schema_id == schema_id).then(|| name.to_string()))
     }
 
     /// Write an index manifest file from already-merged entries.
@@ -1104,12 +1381,14 @@ impl TableCommit {
         file_io: &FileIO,
         manifest_dir: &str,
         merged_index_entries: &[IndexManifestEntry],
+        created_files: &mut Vec<String>,
     ) -> Result<Option<String>> {
         if merged_index_entries.is_empty() {
             return Ok(None);
         }
         let name = format!("index-manifest-{}-0", uuid::Uuid::new_v4());
         let path = format!("{manifest_dir}/{name}");
+        created_files.push(path.clone());
         IndexManifest::write_with_compression(
             file_io,
             &path,
@@ -1127,6 +1406,7 @@ impl TableCommit {
         manifest_dir: &str,
         name_prefix: &str,
         entries: &[ManifestEntry],
+        created_files: &mut Vec<String>,
     ) -> Result<Vec<ManifestFileMeta>> {
         if entries.is_empty() {
             return Ok(vec![]);
@@ -1160,6 +1440,7 @@ impl TableCommit {
                         &file_name,
                         &entries[chunk_start..chunk_end],
                         bytes,
+                        created_files,
                     )
                     .await?;
                 result.push(meta);
@@ -1183,6 +1464,7 @@ impl TableCommit {
                     &file_name,
                     &entries[chunk_start..],
                     bytes,
+                    created_files,
                 )
                 .await?;
             result.push(meta);
@@ -1199,6 +1481,7 @@ impl TableCommit {
         file_name: &str,
         entries: &[ManifestEntry],
         bytes: Vec<u8>,
+        created_files: &mut Vec<String>,
     ) -> Result<ManifestFileMeta> {
         let file_size = bytes.len() as i64;
         let sidecar = if self.manifest_sidecar_enabled {
@@ -1211,6 +1494,7 @@ impl TableCommit {
         } else {
             None
         };
+        created_files.push(path.to_string());
         let output = file_io.new_output(path)?;
         output.write(bytes::Bytes::from(bytes)).await?;
         let sidecar_name = sidecar
@@ -1218,6 +1502,7 @@ impl TableCommit {
             .map(|_| format!("{}{}", file_name, crate::spec::MANIFEST_SIDECAR_SUFFIX));
         if let (Some(sidecar), Some(_)) = (sidecar, sidecar_name.as_ref()) {
             let sidecar_path = crate::spec::ManifestSidecar::path(path);
+            created_files.push(sidecar_path.clone());
             let write_result = async {
                 let output = file_io.new_output(&sidecar_path)?;
                 output.write(bytes::Bytes::from(sidecar)).await
@@ -1291,6 +1576,9 @@ impl TableCommit {
         let Some(latest) = latest_snapshot else {
             return Ok(false);
         };
+        if latest.commit_user() == self.commit_user {
+            return Ok(commit_identifier <= latest.commit_identifier());
+        }
         let earliest_snapshot_id = self
             .snapshot_manager
             .earliest_snapshot_id()
@@ -1318,8 +1606,12 @@ impl TableCommit {
         commit_kind: &CommitKind,
     ) -> Result<bool> {
         if let Some(latest) = latest_snapshot {
-            for snapshot_id in start_snapshot_id..=latest.id() {
-                let snap = self.snapshot_manager.get_snapshot(snapshot_id).await?;
+            for snapshot_id in (start_snapshot_id..=latest.id()).rev() {
+                let snap = if snapshot_id == latest.id() {
+                    latest.clone()
+                } else {
+                    self.snapshot_manager.get_snapshot(snapshot_id).await?
+                };
                 if snap.commit_user() == self.commit_user
                     && snap.commit_identifier() == commit_identifier
                     && snap.commit_kind() == commit_kind
@@ -1337,6 +1629,7 @@ impl TableCommit {
         plan: &mut CommitEntriesPlan,
         latest_snapshot: &Option<Snapshot>,
         retry_state: Option<&RetryState>,
+        check_append_files: bool,
     ) -> Result<ResolvedCommit> {
         let file_io = self.snapshot_manager.file_io();
         let manifest_dir = self.snapshot_manager.manifest_dir();
@@ -1350,14 +1643,7 @@ impl TableCommit {
             } => {
                 validate_file_entries(entries.iter())?;
 
-                // Auto-promote to OVERWRITE when CoW rewrites produce Delete entries.
-                // This ensures the snapshot correctly reflects file replacements.
-                let has_delete = entries.iter().any(|e| *e.kind() == FileKind::Delete);
-                let kind = if has_delete {
-                    CommitKind::OVERWRITE
-                } else {
-                    CommitKind::APPEND
-                };
+                let kind = direct_commit_kind(entries, new_index_entries);
                 let has_partition_bucket_counts = entries
                     .iter()
                     .any(|entry| entry.total_buckets() != self.total_buckets);
@@ -1365,17 +1651,12 @@ impl TableCommit {
                     && entries.iter().any(|entry| {
                         *entry.kind() == FileKind::Add && entry.bucket() == POSTPONE_BUCKET
                     });
-                let detect_conflicts = has_delete
+                let detect_conflicts = check_append_files
+                    || kind == CommitKind::OVERWRITE
                     || check_from_snapshot.is_some()
                     || has_partition_bucket_counts
                     || has_postpone_entries;
                 let base_data_files = if detect_conflicts {
-                    self.check_deletion_vector_index_only_conflict(
-                        latest_snapshot.as_ref(),
-                        entries,
-                        new_index_entries,
-                        *check_from_snapshot,
-                    )?;
                     self.detect_commit_conflicts(
                         latest_snapshot,
                         retry_state,
@@ -1403,15 +1684,18 @@ impl TableCommit {
                     new_index_entries,
                 )?);
                 let all = Self::merge_index_entries(&previous, &index_entries, false)?;
+                self.check_deletion_vector_references(
+                    latest_snapshot,
+                    entries,
+                    &index_entries,
+                    &all,
+                )
+                .await?;
                 let index_manifest_changed = all != previous;
-                let index_manifest_name = if index_manifest_changed {
-                    self.write_index_manifest(file_io, &manifest_dir, &all)
-                        .await?
-                } else {
-                    latest_snapshot
-                        .as_ref()
-                        .and_then(|s| s.index_manifest().map(|s| s.to_string()))
-                };
+                let index_manifest_name = latest_snapshot
+                    .as_ref()
+                    .and_then(|s| s.index_manifest().map(str::to_string));
+                let new_index_manifest_entries = index_manifest_changed.then_some(all);
 
                 Ok(ResolvedCommit {
                     entries: entries.clone(),
@@ -1419,6 +1703,7 @@ impl TableCommit {
                     kind,
                     index_manifest_name,
                     index_manifest_changed,
+                    new_index_manifest_entries,
                     base_data_files,
                 })
             }
@@ -1467,15 +1752,18 @@ impl TableCommit {
                     }
                 }
                 let all = Self::merge_index_entries(&all, &new_index_entries, false)?;
+                self.check_deletion_vector_references(
+                    latest_snapshot,
+                    &entries,
+                    &new_index_entries,
+                    &all,
+                )
+                .await?;
                 let index_manifest_changed = all != previous;
-                let index_manifest_name = if index_manifest_changed {
-                    self.write_index_manifest(file_io, &manifest_dir, &all)
-                        .await?
-                } else {
-                    latest_snapshot
-                        .as_ref()
-                        .and_then(|s| s.index_manifest().map(|s| s.to_string()))
-                };
+                let index_manifest_name = latest_snapshot
+                    .as_ref()
+                    .and_then(|s| s.index_manifest().map(str::to_string));
+                let new_index_manifest_entries = index_manifest_changed.then_some(all);
 
                 Ok(ResolvedCommit {
                     entries,
@@ -1483,6 +1771,7 @@ impl TableCommit {
                     kind: CommitKind::OVERWRITE,
                     index_manifest_name,
                     index_manifest_changed,
+                    new_index_manifest_entries,
                     base_data_files,
                 })
             }
@@ -1507,12 +1796,18 @@ impl TableCommit {
             .iter()
             .filter(|entry| entry.kind == FileKind::Delete)
             .collect::<Vec<_>>();
-        if !deletions.is_empty() {
-            all.retain(|entry| {
-                !deletions
-                    .iter()
-                    .any(|delete| same_index_file_entry(entry, delete))
-            });
+        for deletion in deletions {
+            let position = all
+                .iter()
+                .position(|entry| same_index_file_entry(entry, deletion));
+            if let Some(position) = position {
+                all.remove(position);
+            } else if deletion.index_file.index_type == DELETION_VECTORS_INDEX_TYPE {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Cannot replace missing deletion vector index '{}'; prepare the DELETE again from the latest snapshot", deletion.index_file.file_name),
+                    source: None,
+                });
+            }
         }
 
         let additions = new_index_entries
@@ -1534,6 +1829,38 @@ impl TableCommit {
         });
         Self::validate_global_index_overlap(&all, &additions)?;
         Self::validate_added_global_index_overlap(&additions)?;
+        let mut dv_files = HashSet::new();
+        let mut dv_names = HashSet::new();
+        for entry in all
+            .iter()
+            .chain(&additions)
+            .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+        {
+            let partition = if is_empty_partition(&entry.partition) {
+                &[][..]
+            } else {
+                entry.partition.as_slice()
+            };
+            if !dv_names.insert((partition, entry.bucket, entry.index_file.file_name.as_str())) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Duplicate deletion vector index '{}'",
+                        entry.index_file.file_name
+                    ),
+                    source: None,
+                });
+            }
+            if let Some(ranges) = &entry.index_file.deletion_vectors_ranges {
+                for file in ranges.keys() {
+                    if !dv_files.insert((partition, entry.bucket, file.as_str())) {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!("Conflicting deletion vectors for data file '{file}'; prepare the DELETE again from the latest snapshot"),
+                            source: None,
+                        });
+                    }
+                }
+            }
+        }
         all.extend(additions);
         Ok(all)
     }
@@ -1544,13 +1871,6 @@ impl TableCommit {
         commit_entries: &[ManifestEntry],
         new_index_entries: &[IndexManifestEntry],
     ) -> Result<Vec<IndexManifestEntry>> {
-        if new_index_entries
-            .iter()
-            .any(|entry| entry.kind == FileKind::Delete)
-        {
-            return Ok(vec![]);
-        }
-
         let mut updated_cols = HashSet::new();
         let mut written_partitions: Vec<Vec<u8>> = Vec::new();
         for entry in commit_entries
@@ -1560,6 +1880,15 @@ impl TableCommit {
             let Some(write_cols) = entry.file().write_cols.as_ref() else {
                 continue;
             };
+            // Dedicated normal/vector/blob INSERT files also carry write_cols.
+            // Only files targeting existing row IDs can invalidate an existing index.
+            if entry.file().first_row_id.is_none()
+                && !write_cols
+                    .iter()
+                    .any(|col| col == crate::spec::ROW_ID_FIELD_NAME)
+            {
+                continue;
+            }
             for col in write_cols {
                 if !is_system_field(col) {
                     updated_cols.insert(col.clone());
@@ -1588,6 +1917,9 @@ impl TableCommit {
         let mut conflicted_cols = HashSet::new();
         for entry in previous_entries {
             if entry.kind != FileKind::Add
+                || new_index_entries.iter().any(|deleted| {
+                    deleted.kind == FileKind::Delete && same_index_file_entry(entry, deleted)
+                })
                 || !written_partitions
                     .iter()
                     .any(|partition| same_index_partition(partition, &entry.partition))
@@ -1963,6 +2295,7 @@ impl TableCommit {
         if let Some(RetryState {
             latest_snapshot: Some(previous_snapshot),
             base_data_files: Some(previous_base),
+            ..
         }) = retry_state
         {
             if let Some(incremental) = self
@@ -2145,41 +2478,103 @@ impl TableCommit {
         Ok(())
     }
 
-    fn check_deletion_vector_index_only_conflict(
+    /// Validate DV references against the state this attempt will publish. Index
+    /// merging separately verifies replacement identities and one DV per file.
+    async fn check_deletion_vector_references(
         &self,
-        latest_snapshot: Option<&Snapshot>,
+        latest_snapshot: &Option<Snapshot>,
         data_entries: &[ManifestEntry],
         index_entries: &[IndexManifestEntry],
-        check_from_snapshot: Option<i64>,
+        merged_indexes: &[IndexManifestEntry],
     ) -> Result<()> {
-        if !self.data_evolution_enabled || !data_entries.is_empty() {
-            return Ok(());
-        }
-        let Some(check_from_snapshot) = check_from_snapshot else {
-            return Ok(());
+        let file_key = |partition: &[u8], bucket: i32, name: &str| {
+            (
+                if is_empty_partition(partition) {
+                    vec![]
+                } else {
+                    partition.to_vec()
+                },
+                bucket,
+                name.to_string(),
+            )
         };
-        let has_deletion_vector_index_change = index_entries
+        let deleted_files = data_entries
             .iter()
-            .any(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE);
-        if !has_deletion_vector_index_change {
+            .filter(|entry| *entry.kind() == FileKind::Delete)
+            .map(|entry| file_key(entry.partition(), entry.bucket(), &entry.file().file_name))
+            .collect::<HashSet<_>>();
+        let added_dvs = index_entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == FileKind::Add
+                    && entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE
+            })
+            .map(|entry| file_key(&entry.partition, entry.bucket, &entry.index_file.file_name))
+            .collect::<HashSet<_>>();
+        let mut referenced_files = HashSet::new();
+        for entry in merged_indexes
+            .iter()
+            .filter(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+        {
+            let is_added = added_dvs.contains(&file_key(
+                &entry.partition,
+                entry.bucket,
+                &entry.index_file.file_name,
+            ));
+            if let Some(ranges) = &entry.index_file.deletion_vectors_ranges {
+                for name in ranges.keys() {
+                    let key = file_key(&entry.partition, entry.bucket, name);
+                    // Also forbid retaining a DV after deleting its data file.
+                    if is_added || deleted_files.contains(&key) {
+                        referenced_files.insert(key);
+                    }
+                }
+            }
+        }
+        if referenced_files.is_empty() {
             return Ok(());
         }
-        let Some(latest_snapshot) = latest_snapshot else {
-            return Ok(());
+        // DV partitions need not be the partitions of the data entries in a
+        // mixed commit. Do not reuse the data conflict scan's narrower cache.
+        let fields = self.table.schema().partition_fields();
+        let filter = if fields.is_empty() {
+            None
+        } else {
+            Some(PartitionFilter::from_partition_set(
+                referenced_files
+                    .iter()
+                    .map(|(partition, _, _)| partition.clone())
+                    .collect(),
+                &fields,
+            )?)
         };
-        if latest_snapshot.id() <= check_from_snapshot {
-            return Ok(());
+        let base = self
+            .scan_snapshot_entries(latest_snapshot, filter.as_ref())
+            .await?;
+        let mut active_files = base
+            .iter()
+            .map(|entry| file_key(entry.partition(), entry.bucket(), &entry.file().file_name))
+            .collect::<HashSet<_>>();
+        for entry in data_entries {
+            let key = file_key(entry.partition(), entry.bucket(), &entry.file().file_name);
+            match entry.kind() {
+                FileKind::Add => {
+                    active_files.insert(key);
+                }
+                FileKind::Delete => {
+                    active_files.remove(&key);
+                }
+            }
         }
-
-        Err(crate::Error::DataInvalid {
-            message: format!(
-                "Row ID conflict: deletion-vector DELETE was prepared from snapshot \
-                 {check_from_snapshot}, but latest snapshot is {}. Retry with the latest \
-                 deletion vectors.",
-                latest_snapshot.id()
-            ),
-            source: None,
-        })
+        for key in referenced_files {
+            if !active_files.contains(&key) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Deletion vector references missing data file '{}' in bucket {}; prepare the DELETE again from the latest snapshot", key.2, key.1),
+                    source: None,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn check_delete_entries_against_base(
@@ -2189,10 +2584,10 @@ impl TableCommit {
     ) -> Result<()> {
         let mut active_identifiers = base_entries
             .iter()
-            .map(ManifestEntry::identifier)
+            .map(commit_file_identifier)
             .collect::<HashSet<_>>();
         for entry in delta_entries {
-            let identifier = entry.identifier();
+            let identifier = commit_file_identifier(entry);
             match entry.kind() {
                 FileKind::Add => {
                     active_identifiers.insert(identifier);
@@ -2353,10 +2748,17 @@ impl TableCommit {
             return Ok(());
         };
 
-        let source_snapshot = self
-            .snapshot_manager
-            .get_snapshot(check_from_snapshot)
-            .await?;
+        let write_ranges = self.build_row_id_write_ranges(delta_entries).await?;
+        if write_ranges.is_empty() {
+            return Ok(());
+        }
+        let source_snapshot = if check_from_snapshot == latest_snapshot.id() {
+            latest_snapshot.clone()
+        } else {
+            self.snapshot_manager
+                .get_snapshot(check_from_snapshot)
+                .await?
+        };
         let check_next_row_id =
             source_snapshot
                 .next_row_id()
@@ -2367,15 +2769,14 @@ impl TableCommit {
                     source: None,
                 })?;
 
-        let write_ranges = self.build_row_id_write_ranges(delta_entries).await?;
-        if write_ranges.is_empty() {
-            return Ok(());
-        }
-
         let delta_entry_refs = delta_entries.iter().collect::<Vec<_>>();
         let partition_filter = self.build_entries_partition_filter(&delta_entry_refs)?;
         for snapshot_id in check_from_snapshot + 1..=latest_snapshot.id() {
-            let snapshot = self.snapshot_manager.get_snapshot(snapshot_id).await?;
+            let snapshot = if snapshot_id == latest_snapshot.id() {
+                latest_snapshot.clone()
+            } else {
+                self.snapshot_manager.get_snapshot(snapshot_id).await?
+            };
             if snapshot.commit_kind() == &CommitKind::COMPACT {
                 continue;
             }
@@ -2866,12 +3267,42 @@ impl TableCommit {
         Ok(spec)
     }
 
-    /// Earliest source snapshot requested by row-id conflict checks.
-    fn min_check_from_snapshot(messages: &[CommitMessage]) -> Option<i64> {
-        messages
-            .iter()
-            .filter_map(|message| message.check_from_snapshot)
-            .min()
+    /// Check conflicts from the earliest writer snapshot, validating row-id baselines.
+    fn check_from_snapshot(messages: &[CommitMessage]) -> Result<Option<i64>> {
+        let mut check_from_snapshot: Option<i64> = None;
+        for message in messages {
+            let Some(snapshot) = message.check_from_snapshot else {
+                continue;
+            };
+            if snapshot < 0 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Invalid row-id check snapshot: {snapshot}"),
+                    source: None,
+                });
+            }
+            check_from_snapshot =
+                Some(check_from_snapshot.map_or(snapshot, |previous| previous.min(snapshot)));
+        }
+        if check_from_snapshot.is_some() {
+            for message in messages {
+                if message.check_from_snapshot.is_some() {
+                    continue;
+                }
+                if message
+                    .new_files
+                    .iter()
+                    .chain(&message.deleted_files)
+                    .any(|file| file.first_row_id.is_some())
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: "A row-id commit message is missing its check-from snapshot."
+                            .into(),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(check_from_snapshot)
     }
 
     /// Convert commit messages to manifest entries (ADD/DELETE kind).
@@ -2994,18 +3425,30 @@ enum CommitEntriesPlan {
 impl CommitEntriesPlan {
     fn commit_kind_hint(&self) -> CommitKind {
         match self {
-            CommitEntriesPlan::Direct { entries, .. } => {
-                if entries
-                    .iter()
-                    .any(|entry| *entry.kind() == FileKind::Delete)
-                {
-                    CommitKind::OVERWRITE
-                } else {
-                    CommitKind::APPEND
-                }
-            }
+            CommitEntriesPlan::Direct {
+                entries,
+                new_index_entries,
+                ..
+            } => direct_commit_kind(entries, new_index_entries),
             CommitEntriesPlan::Overwrite { .. } => CommitKind::OVERWRITE,
         }
+    }
+}
+
+fn direct_commit_kind(
+    entries: &[ManifestEntry],
+    index_entries: &[IndexManifestEntry],
+) -> CommitKind {
+    if entries
+        .iter()
+        .any(|entry| *entry.kind() == FileKind::Delete)
+        || index_entries
+            .iter()
+            .any(|entry| entry.index_file.index_type == DELETION_VECTORS_INDEX_TYPE)
+    {
+        CommitKind::OVERWRITE
+    } else {
+        CommitKind::APPEND
     }
 }
 
@@ -3016,6 +3459,7 @@ struct ResolvedCommit {
     kind: CommitKind,
     index_manifest_name: Option<String>,
     index_manifest_changed: bool,
+    new_index_manifest_entries: Option<Vec<IndexManifestEntry>>,
     base_data_files: Option<Vec<ManifestEntry>>,
 }
 
@@ -3027,6 +3471,7 @@ enum CommitAttemptResult {
 struct RetryState {
     latest_snapshot: Option<Snapshot>,
     base_data_files: Option<Vec<ManifestEntry>>,
+    publication_error: Option<crate::Error>,
 }
 
 struct RowIdWriteRange {
@@ -3182,6 +3627,12 @@ fn rand_f64() -> f64 {
 mod tests {
     use super::*;
 
+    mod parity {
+        use super::*;
+        include!("table_commit/parity_tests.rs");
+        include!("table_commit/recovery_tests.rs");
+    }
+
     #[tokio::test]
     async fn abort_still_cleans_up_for_a_query_auth_table() {
         let table = crate::table::query_auth_table();
@@ -3197,6 +3648,55 @@ mod tests {
     };
     use apache_avro::types::Value;
     use chrono::{DateTime, Utc};
+
+    #[test]
+    fn check_from_snapshot_uses_minimum_baseline() {
+        let mut tagged = CommitMessage::new(Vec::new(), 0, Vec::new());
+        tagged.check_from_snapshot = Some(7);
+        assert_eq!(
+            TableCommit::check_from_snapshot(&[tagged.clone()]).unwrap(),
+            Some(7)
+        );
+        assert_eq!(TableCommit::check_from_snapshot(&[]).unwrap(), None);
+
+        let mut different = tagged.clone();
+        different.check_from_snapshot = Some(8);
+        let untagged = CommitMessage::new(Vec::new(), 0, Vec::new());
+        for messages in [
+            vec![tagged.clone(), different.clone(), untagged.clone()],
+            vec![different, untagged.clone(), tagged.clone()],
+        ] {
+            assert_eq!(
+                TableCommit::check_from_snapshot(&messages).unwrap(),
+                Some(7)
+            );
+        }
+        assert_eq!(TableCommit::check_from_snapshot(&[untagged]).unwrap(), None);
+    }
+
+    #[test]
+    fn check_from_snapshot_rejects_invalid_or_missing_baselines() {
+        let mut tagged = CommitMessage::new(Vec::new(), 0, Vec::new());
+        tagged.check_from_snapshot = Some(7);
+        let mut negative = tagged.clone();
+        negative.check_from_snapshot = Some(-1);
+        assert!(TableCommit::check_from_snapshot(&[negative]).is_err());
+        let mut missing = CommitMessage::new(Vec::new(), 0, vec![test_data_file("x", 1)]);
+        missing.new_files[0].first_row_id = Some(1);
+        assert!(TableCommit::check_from_snapshot(&[tagged, missing]).is_err());
+    }
+
+    #[test]
+    fn compact_increment_requires_separate_snapshot() {
+        let mut message = CommitMessage::new(Vec::new(), 0, Vec::new());
+        message.compact_before.push(test_data_file("before", 1));
+        message.compact_after.push(test_data_file("after", 1));
+        message
+            .compact_changelog_files
+            .push(test_data_file("changelog", 1));
+        assert!(reject_compact_increment(&[message]).is_err());
+        assert!(reject_compact_increment(&[CommitMessage::new(Vec::new(), 0, Vec::new())]).is_ok());
+    }
 
     #[tokio::test]
     async fn test_query_auth_table_refuses_commit_paths() {
@@ -3816,6 +4316,12 @@ mod tests {
 
         let overwrite =
             CommitMessage::new(vec![], 0, vec![test_data_file("overwrite.parquet", 100)]);
+        file_io
+            .new_output(&format!("{table_path}/bucket-0/overwrite.parquet"))
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"prepared data"))
+            .await
+            .unwrap();
         commit
             .overwrite_with_identifier(vec![overwrite.clone()], None, 2)
             .await
@@ -4150,8 +4656,8 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("Row ID conflict"),
-            "expected row-id conflict for stale DV commit, got: {err_msg}"
+            err_msg.contains("Conflicting deletion vectors"),
+            "expected conflicting vectors for stale DV commit, got: {err_msg}"
         );
 
         let snapshot = latest_snapshot(&file_io, table_path).await.unwrap();
@@ -4424,6 +4930,7 @@ mod tests {
         commit.commit(vec![first]).await.unwrap();
 
         let mut data_file = test_data_file("data-update-id.parquet", 10);
+        data_file.first_row_id = Some(0);
         data_file.write_cols = Some(vec!["id".to_string()]);
         let result = commit
             .commit(vec![CommitMessage::new(vec![], 0, vec![data_file])])
@@ -4460,6 +4967,7 @@ mod tests {
         commit.commit(vec![first]).await.unwrap();
 
         let mut data_file = test_data_file("data-update-id.parquet", 10);
+        data_file.first_row_id = Some(0);
         data_file.write_cols = Some(vec!["id".to_string()]);
         commit
             .commit(vec![CommitMessage::new(vec![], 0, vec![data_file])])
@@ -4490,6 +4998,7 @@ mod tests {
         commit.commit(vec![first]).await.unwrap();
 
         let mut data_file = test_data_file("data-update-name.parquet", 10);
+        data_file.first_row_id = Some(0);
         data_file.write_cols = Some(vec!["name".to_string()]);
         let result = commit
             .commit(vec![CommitMessage::new(vec![], 0, vec![data_file])])
@@ -4532,6 +5041,7 @@ mod tests {
         commit.commit(vec![first]).await.unwrap();
 
         let mut data_file = test_data_file("data-update-name.parquet", 10);
+        data_file.first_row_id = Some(0);
         data_file.write_cols = Some(vec!["name".to_string()]);
         commit
             .commit(vec![CommitMessage::new(vec![], 0, vec![data_file])])
@@ -4555,6 +5065,7 @@ mod tests {
         commit.commit(vec![first]).await.unwrap();
 
         let mut data_file = test_data_file("data-update-name.parquet", 10);
+        data_file.first_row_id = Some(0);
         data_file.write_cols = Some(vec!["name".to_string()]);
         commit
             .commit(vec![CommitMessage::new(vec![], 0, vec![data_file])])
@@ -5011,7 +5522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_truncate_missing_partition_is_noop() {
+    async fn test_truncate_missing_partition_records_java_overwrite_snapshot() {
         let file_io = test_file_io();
         let table_path = "memory:/test_truncate_missing_partition";
         setup_dirs(&file_io, table_path).await;
@@ -5036,7 +5547,9 @@ mod tests {
 
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
-        assert_eq!(snapshot.id(), 1);
+        assert_eq!(snapshot.id(), 2);
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+        assert_eq!(snapshot.delta_record_count(), Some(0));
         assert_eq!(snapshot.total_record_count(), Some(100));
     }
 
@@ -5298,10 +5811,15 @@ mod tests {
         second_partial.first_row_id = Some(0);
         second_partial.file_source = Some(0);
         second_partial.write_cols = Some(vec!["name".to_string()]);
-        let mut second_message = CommitMessage::new(partition, 0, vec![second_partial]);
+        let mut second_message = CommitMessage::new(partition.clone(), 0, vec![second_partial]);
         second_message.check_from_snapshot = Some(1);
+        // A newer writer in the same commit must not hide the stale update.
+        let mut fresh_message =
+            CommitMessage::new(partition, 0, vec![test_data_file("fresh.parquet", 1)]);
+        fresh_message.check_from_snapshot = Some(2);
+        fresh_message.new_files[0].file_source = Some(0);
 
-        let result = commit.commit(vec![second_message]).await;
+        let result = commit.commit(vec![fresh_message, second_message]).await;
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -5309,6 +5827,7 @@ mod tests {
             err_msg.contains("multiple MERGE INTO operations have encountered conflicts"),
             "expected row-id/column conflict, got: {err_msg}"
         );
+        assert_eq!(latest_snapshot(&file_io, table_path).await.unwrap().id(), 2);
     }
 
     #[tokio::test]
@@ -5345,14 +5864,23 @@ mod tests {
         id_partial.first_row_id = Some(0);
         id_partial.file_source = Some(0);
         id_partial.write_cols = Some(vec!["id".to_string()]);
-        let mut id_message = CommitMessage::new(partition, 0, vec![id_partial]);
+        let mut id_message = CommitMessage::new(partition.clone(), 0, vec![id_partial]);
         id_message.check_from_snapshot = Some(1);
+        let mut fresh_message =
+            CommitMessage::new(partition, 0, vec![test_data_file("fresh.parquet", 1)]);
+        fresh_message.check_from_snapshot = Some(2);
+        fresh_message.new_files[0].file_source = Some(0);
 
-        commit.commit(vec![id_message]).await.unwrap();
+        commit
+            .commit(vec![id_message, fresh_message])
+            .await
+            .unwrap();
 
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 3);
+        // Snapshot counts include the two partial-column files.
+        assert_eq!(snapshot.total_record_count(), Some(301));
     }
 
     #[tokio::test]
@@ -6167,12 +6695,7 @@ mod tests {
         let table_path = "memory:/test_commit_preserves_delete";
         setup_dirs(&file_io, table_path).await;
 
-        let table = test_table_with_options(
-            &file_io,
-            table_path,
-            HashMap::from([("manifest.merge-min-count".to_string(), "2".to_string())]),
-        );
-        let mut commit = TableCommit::new(table, "test-user".to_string());
+        let mut commit = setup_commit(&file_io, table_path);
         let partition = vec![0, 0, 0, 0];
         let old_file = test_data_file("old.parquet", 1);
         let mut initial_files = vec![old_file.clone()];

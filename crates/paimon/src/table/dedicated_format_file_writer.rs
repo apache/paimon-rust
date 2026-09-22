@@ -304,6 +304,16 @@ impl AppendDedicatedFormatFileWriter {
         Ok(())
     }
 
+    pub(crate) async fn abort(&mut self) {
+        self.normal_writer.abort().await;
+        for writer in &mut self.blob_writers {
+            writer.writer.abort().await;
+        }
+        if let Some(writer) = &mut self.vector_writer {
+            writer.writer.abort().await;
+        }
+    }
+
     pub(crate) async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
         let mut results = self.normal_writer.prepare_commit().await?;
 
