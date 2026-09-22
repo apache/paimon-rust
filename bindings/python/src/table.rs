@@ -32,7 +32,7 @@ use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
 use crate::snapshot::PySnapshot;
 use crate::tag::PyTag;
-use crate::write::PyWriteBuilder;
+use crate::write::{PyBatchWriteBuilder, PyStreamWriteBuilder};
 
 #[pyclass(name = "Table", module = "pypaimon_rust.datafusion")]
 pub struct PyTable {
@@ -133,9 +133,12 @@ impl PyTable {
         }
     }
 
-    /// Create a [`PyWriteBuilder`] for the batch write loop.
-    fn new_write_builder(&self) -> PyWriteBuilder {
-        PyWriteBuilder::new(Arc::clone(&self.inner))
+    fn new_batch_write_builder(&self) -> PyBatchWriteBuilder {
+        PyBatchWriteBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn new_stream_write_builder(&self) -> PyStreamWriteBuilder {
+        PyStreamWriteBuilder::new(Arc::clone(&self.inner))
     }
 
     // ---------------- #285: observability ----------------

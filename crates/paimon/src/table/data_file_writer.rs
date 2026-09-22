@@ -67,7 +67,7 @@ pub(crate) struct DataFileWriter {
     current_row_count: i64,
     index_options: Option<Arc<FileIndexOptions>>,
     current_index: Option<DataFileIndexWriter>,
-    /// Paths owned by this indexed write until prepare_commit hands them to the caller.
+    /// Paths owned by this write until prepare_commit hands them to the caller.
     created_paths: Vec<String>,
 }
 
@@ -177,8 +177,8 @@ impl DataFileWriter {
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
 
         let file_path = format!("{bucket_dir}/{file_name}");
+        self.created_paths.push(file_path.clone());
         if self.index_options.is_some() {
-            self.created_paths.push(file_path.clone());
             self.created_paths.push(format!(
                 "{bucket_dir}/{}",
                 data_file_to_file_index_file_name(&file_name)

@@ -52,7 +52,7 @@ def test_write_commit_read_roundtrip():
         ctx = _make_empty_table(warehouse)
         table = _get_table(warehouse)
         batch = _batch([1, 2, 3], ["a", "b", "c"])
-        wb = table.new_write_builder()
+        wb = table.new_batch_write_builder()
         write = wb.new_write()
         write.write_arrow(batch)
         messages = write.prepare_commit()
@@ -68,7 +68,7 @@ def test_write_multiple_batches():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = _make_empty_table(warehouse)
         table = _get_table(warehouse)
-        wb = table.new_write_builder()
+        wb = table.new_batch_write_builder()
         write = wb.new_write()
         write.write_arrow(_batch([1], ["a"]))
         write.write_arrow(_batch([2], ["b"]))
@@ -84,7 +84,7 @@ def test_prepare_commit_returns_messages():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_empty_table(warehouse)
         table = _get_table(warehouse)
-        write = table.new_write_builder().new_write()
+        write = table.new_batch_write_builder().new_write()
         write.write_arrow(_batch([1], ["a"]))
         messages = write.prepare_commit()
         assert len(messages) >= 1
@@ -95,7 +95,7 @@ def test_commit_empty_messages_noop():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = _make_empty_table(warehouse)
         table = _get_table(warehouse)
-        wb = table.new_write_builder()
+        wb = table.new_batch_write_builder()
         messages = wb.new_write().prepare_commit()   # no write
         assert messages == []
         wb.new_commit().commit(messages)             # no-op success
@@ -107,7 +107,7 @@ def test_write_arrow_type_mismatch_raises():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_empty_table(warehouse)          # table (id INT, name STRING)
         table = _get_table(warehouse)
-        write = table.new_write_builder().new_write()
+        write = table.new_batch_write_builder().new_write()
         bad = pa.record_batch([["x", "y"], ["a", "b"]], names=["id", "name"])  # id as STRING
         with pytest.raises(ValueError):
             write.write_arrow(bad)
@@ -123,7 +123,7 @@ def test_write_arrow_binary_family_mismatch_raises():
         ctx.sql("CREATE SCHEMA paimon.wdb")
         ctx.sql("CREATE TABLE paimon.wdb.bt (id INT, data BINARY)")
         table = PaimonCatalog({"warehouse": warehouse}).get_table("wdb.bt")
-        write = table.new_write_builder().new_write()
+        write = table.new_batch_write_builder().new_write()
         schema = pa.schema([("id", pa.int32()), ("data", pa.large_binary())])
         bad = pa.record_batch([[1], [b"x"]], schema=schema)
         with pytest.raises(ValueError):
@@ -135,10 +135,10 @@ def test_commit_non_message_raises_typeerror():
         _make_empty_table(warehouse)
         table = _get_table(warehouse)
         with pytest.raises(TypeError):
-            table.new_write_builder().new_commit().commit([object()])
+            table.new_batch_write_builder().new_commit().commit([object()])
         # A non-iterable argument also raises TypeError (not a raw PyO3 error).
         with pytest.raises(TypeError):
-            table.new_write_builder().new_commit().commit(42)
+            table.new_batch_write_builder().new_commit().commit(42)
 
 
 def test_commit_cross_table_messages_raises():
@@ -159,26 +159,26 @@ def test_commit_cross_table_messages_raises():
             [pa.array([1], pa.int32()), pa.array(["a"], pa.string())],
             names=["id", "name"],
         )
-        w1 = t1.new_write_builder().new_write()
+        w1 = t1.new_batch_write_builder().new_write()
         w1.write_arrow(batch)
         messages = w1.prepare_commit()
         with pytest.raises(ValueError):
-            t2.new_write_builder().new_commit().commit(messages)
+            t2.new_batch_write_builder().new_commit().commit(messages)
 
 
 def test_commit_different_builder_same_table_raises():
-    # Even for the same table, a committer from a different WriteBuilder must
+    # Even for the same table, a committer from a different BatchWriteBuilder must
     # reject the messages: each builder mints its own commit_user, and writers
     # and committers must share one (snapshot duplicate detection / postpone
     # bucket file naming depend on it).
     with tempfile.TemporaryDirectory() as warehouse:
         _make_empty_table(warehouse)
         table = _get_table(warehouse)
-        write = table.new_write_builder().new_write()
+        write = table.new_batch_write_builder().new_write()
         write.write_arrow(_batch([1], ["a"]))
         messages = write.prepare_commit()
         with pytest.raises(ValueError):
-            table.new_write_builder().new_commit().commit(messages)
+            table.new_batch_write_builder().new_commit().commit(messages)
 
 
 def test_abort_cleans_up_written_data():
@@ -187,7 +187,7 @@ def test_abort_cleans_up_written_data():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = _make_empty_table(warehouse)
         table = _get_table(warehouse)
-        wb = table.new_write_builder()
+        wb = table.new_batch_write_builder()
         write = wb.new_write()
         write.write_arrow(_batch([1, 2, 3], ["a", "b", "c"]))
         messages = write.prepare_commit()
@@ -202,7 +202,7 @@ def test_abort_empty_messages_noop():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = _make_empty_table(warehouse)
         table = _get_table(warehouse)
-        wb = table.new_write_builder()
+        wb = table.new_batch_write_builder()
         messages = wb.new_write().prepare_commit()  # no write
         assert messages == []
         wb.new_commit().abort(messages)  # no-op success
@@ -215,9 +215,9 @@ def test_abort_non_message_raises_typeerror():
         _make_empty_table(warehouse)
         table = _get_table(warehouse)
         with pytest.raises(TypeError):
-            table.new_write_builder().new_commit().abort([object()])
+            table.new_batch_write_builder().new_commit().abort([object()])
         with pytest.raises(TypeError):
-            table.new_write_builder().new_commit().abort(42)
+            table.new_batch_write_builder().new_commit().abort(42)
 
 
 def test_abort_cross_table_messages_raises():
@@ -234,22 +234,22 @@ def test_abort_cross_table_messages_raises():
             [pa.array([1], pa.int32()), pa.array(["a"], pa.string())],
             names=["id", "name"],
         )
-        w1 = t1.new_write_builder().new_write()
+        w1 = t1.new_batch_write_builder().new_write()
         w1.write_arrow(batch)
         messages = w1.prepare_commit()
         with pytest.raises(ValueError):
-            t2.new_write_builder().new_commit().abort(messages)
+            t2.new_batch_write_builder().new_commit().abort(messages)
 
 
 def test_abort_different_builder_same_table_raises():
     with tempfile.TemporaryDirectory() as warehouse:
         _make_empty_table(warehouse)
         table = _get_table(warehouse)
-        write = table.new_write_builder().new_write()
+        write = table.new_batch_write_builder().new_write()
         write.write_arrow(_batch([1], ["a"]))
         messages = write.prepare_commit()
         with pytest.raises(ValueError):
-            table.new_write_builder().new_commit().abort(messages)
+            table.new_batch_write_builder().new_commit().abort(messages)
 
 
 @pytest.mark.parametrize("legacy,precision,unit,value,directory", [
@@ -270,7 +270,7 @@ def test_timestamp_partition_writes_and_reads_use_java_paths(tmp_path, legacy, p
     schema = pa.schema([("id", pa.int32()), ("ts", pa.timestamp(unit))])
     for row_id in [1, 2]:
         table = _get_table(str(tmp_path))
-        builder = table.new_write_builder()
+        builder = table.new_batch_write_builder()
         write = builder.new_write()
         write.write_arrow(pa.record_batch([[row_id], [value]], schema=schema))
         builder.new_commit().commit(write.prepare_commit())
@@ -304,7 +304,7 @@ def test_ltz_schema_alias_write_roundtrip(tmp_path, precision, unit, micros, fra
     )
     value = datetime(2026, 9, 15, 20, 0, 0, micros, tzinfo=timezone.utc)
     arrow_schema = pa.schema([("id", pa.int32()), ("ts", pa.timestamp(unit, tz="UTC"))])
-    builder = table.new_write_builder()
+    builder = table.new_batch_write_builder()
     write = builder.new_write()
     write.write_arrow(pa.record_batch([[1], [value]], schema=arrow_schema))
     builder.new_commit().commit(write.prepare_commit())

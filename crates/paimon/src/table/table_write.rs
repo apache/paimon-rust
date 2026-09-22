@@ -880,6 +880,19 @@ impl TableWrite {
         Ok(())
     }
 
+    /// Close without preparing another commit, discarding only outstanding output.
+    /// Files already returned by prepare_commit belong to the caller.
+    pub async fn close(&mut self) {
+        for (_, writer) in self.partition_writers.drain() {
+            match writer {
+                FileWriter::Append(mut writer) => writer.abort().await,
+                FileWriter::AppendDedicated(mut writer) => writer.abort().await,
+                FileWriter::KeyValue(mut writer) => writer.abort().await,
+                FileWriter::Postpone(mut writer) => writer.abort().await,
+            }
+        }
+    }
+
     /// Close all writers and collect CommitMessages for use with TableCommit.
     /// Writers are cleared after this call, allowing the TableWrite to be reused.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
