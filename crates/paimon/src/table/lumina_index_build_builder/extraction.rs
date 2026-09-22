@@ -181,7 +181,23 @@ pub(super) fn extract_vectors_from_batches(
                         source: None,
                     });
                 }
-                vectors.push(values.value(value_index));
+                let value = values.value(value_index);
+                // Java rejects these per element in `LuminaVectorGlobalIndexWriter`, and
+                // so does the vindex backend (`paimon_vindex_core`'s
+                // `validate_finite_values`). Without the check the index is built from
+                // undefined data and every later top-k over the shard is scored against
+                // it.
+                if !value.is_finite() {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "Lumina vector extraction found non-finite element {value} \
+                             at _ROW_ID {row_id}, index {}",
+                            value_index - start
+                        ),
+                        source: None,
+                    });
+                }
+                vectors.push(value);
             }
         }
     }
