@@ -27,6 +27,7 @@ use super::partition_filter::PartitionFilter;
 use super::table_read::{configured_parquet_read_budget, TableRead};
 use super::{Table, TableScan};
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
+use crate::resource::ResourceContext;
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::table::source::RowRange;
 use crate::{Error, Result};
@@ -112,7 +113,10 @@ fn normalize_filter(table: &Table, filter: Predicate) -> NormalizedFilter {
 /// Rust keeps a names-based projection API for ergonomics, while aligning the
 /// resulting read semantics with Java Paimon's order-preserving projection.
 #[derive(Debug, Clone)]
-pub struct ReadBuilder<'a>(ReadBuilderKind<'a>);
+pub struct ReadBuilder<'a> {
+    kind: ReadBuilderKind<'a>,
+    resources: Option<ResourceContext>,
+}
 
 #[derive(Debug, Clone)]
 enum ReadBuilderKind<'a> {
@@ -122,11 +126,25 @@ enum ReadBuilderKind<'a> {
 
 impl<'a> ReadBuilder<'a> {
     pub(crate) fn new(table: &'a Table) -> Self {
-        if table.is_format_table() {
-            Self(ReadBuilderKind::Format(FormatReadBuilder::new(table)))
+        let kind = if table.is_format_table() {
+            ReadBuilderKind::Format(FormatReadBuilder::new(table))
         } else {
-            Self(ReadBuilderKind::Paimon(PaimonReadBuilder::new(table)))
+            ReadBuilderKind::Paimon(PaimonReadBuilder::new(table))
+        };
+        Self {
+            kind,
+            resources: None,
         }
+    }
+
+    /// Share output-buffer reservations with other reads in this context.
+    ///
+    /// This currently limits retained output Arrow buffers, not decoding or
+    /// prefetch memory. See [`ResourceContext`] for the accounting contract.
+    /// When the budget cannot admit a batch, its stream returns an error and ends.
+    pub fn with_resources(&mut self, resources: ResourceContext) -> &mut Self {
+        self.resources = Some(resources);
+        self
     }
 
     /// Set column projection by name. Output order follows the caller-specified order.
@@ -139,7 +157,7 @@ impl<'a> ReadBuilder<'a> {
     /// case-insensitively, or a case-fold duplicate/ambiguity — surface from
     /// [`new_read`](Self::new_read) using the effective case sensitivity.
     pub fn with_projection(&mut self, columns: &[&str]) -> Result<&mut Self> {
-        match &mut self.0 {
+        match &mut self.kind {
             ReadBuilderKind::Paimon(builder) => {
                 builder.with_projection(columns)?;
             }
@@ -165,7 +183,7 @@ impl<'a> ReadBuilder<'a> {
     /// retroactively change a predicate already passed to
     /// [`with_filter`](Self::with_filter).
     pub fn with_case_sensitive(&mut self, case_sensitive: bool) -> &mut Self {
-        match &mut self.0 {
+        match &mut self.kind {
             ReadBuilderKind::Paimon(builder) => {
                 builder.with_case_sensitive(case_sensitive);
             }
@@ -179,7 +197,7 @@ impl<'a> ReadBuilder<'a> {
     /// Set the full read type, including nested field pruning or connector-defined
     /// logical read types such as Variant extractions.
     pub fn with_read_type(&mut self, read_type: Vec<DataField>) -> &mut Self {
-        match &mut self.0 {
+        match &mut self.kind {
             ReadBuilderKind::Paimon(builder) => {
                 builder.with_read_type(read_type);
             }
@@ -192,7 +210,7 @@ impl<'a> ReadBuilder<'a> {
 
     /// Set a filter predicate for scan planning and conservative read pruning.
     pub fn with_filter(&mut self, filter: Predicate) -> &mut Self {
-        match &mut self.0 {
+        match &mut self.kind {
             ReadBuilderKind::Paimon(builder) => {
                 builder.with_filter(filter);
             }
@@ -205,7 +223,7 @@ impl<'a> ReadBuilder<'a> {
 
     /// Whether a translated predicate is exact at the table-provider boundary.
     pub fn is_exact_filter_pushdown(&self, filter: &Predicate) -> bool {
-        match &self.0 {
+        match &self.kind {
             ReadBuilderKind::Paimon(builder) => builder.is_exact_filter_pushdown(filter),
             ReadBuilderKind::Format(builder) => builder.is_exact_filter_pushdown(filter),
         }
@@ -214,7 +232,7 @@ impl<'a> ReadBuilder<'a> {
     /// Set Data Evolution row ID ranges `[from, to]` (inclusive).
     /// An empty vector selects no rows. Format tables are not supported.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
-        match &mut self.0 {
+        match &mut self.kind {
             ReadBuilderKind::Paimon(builder) => {
                 builder.with_row_ranges(ranges);
             }
@@ -228,7 +246,7 @@ impl<'a> ReadBuilder<'a> {
     /// Push a row-limit hint down to scan planning. Data-evolution reads also
     /// enforce this limit before resolving BLOB payloads.
     pub fn with_limit(&mut self, limit: usize) -> &mut Self {
-        match &mut self.0 {
+        match &mut self.kind {
             ReadBuilderKind::Paimon(builder) => {
                 builder.with_limit(limit);
             }
@@ -247,7 +265,7 @@ impl<'a> ReadBuilder<'a> {
                 source: None,
             });
         }
-        match &mut self.0 {
+        match &mut self.kind {
             ReadBuilderKind::Paimon(builder) => {
                 builder.with_blob_parallelism(blob_parallelism);
             }
@@ -261,7 +279,7 @@ impl<'a> ReadBuilder<'a> {
     /// Inject a Parquet budget shared with sibling scan partitions.
     #[doc(hidden)]
     pub fn with_parquet_read_budget(&mut self, budget: Arc<crate::arrow::ReadBudget>) -> &mut Self {
-        match &mut self.0 {
+        match &mut self.kind {
             ReadBuilderKind::Paimon(builder) => {
                 builder.with_parquet_read_budget(budget);
             }
@@ -274,7 +292,7 @@ impl<'a> ReadBuilder<'a> {
 
     /// Create a table scan. Call [TableScan::plan] to get splits.
     pub fn new_scan(&self) -> TableScan<'a> {
-        match &self.0 {
+        match &self.kind {
             ReadBuilderKind::Paimon(builder) => builder.new_scan(),
             ReadBuilderKind::Format(builder) => builder.new_scan(),
         }
@@ -293,7 +311,7 @@ impl<'a> ReadBuilder<'a> {
         start_exclusive: i64,
         end_inclusive: i64,
     ) -> IncrementalScan<'a> {
-        match &self.0 {
+        match &self.kind {
             ReadBuilderKind::Paimon(builder) => IncrementalScan::new(
                 builder.table,
                 builder.new_scan(),
@@ -310,10 +328,14 @@ impl<'a> ReadBuilder<'a> {
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
-        match &self.0 {
+        let read = match &self.kind {
             ReadBuilderKind::Paimon(builder) => builder.new_read(),
             ReadBuilderKind::Format(builder) => builder.new_read(),
-        }
+        }?;
+        Ok(match &self.resources {
+            Some(resources) => read.with_resources(resources.clone()),
+            None => read,
+        })
     }
 }
 
@@ -761,7 +783,7 @@ mod tests {
     use test_utils::{local_file_path, test_data_file, write_int_parquet_file};
 
     fn paimon_builder<'a, 'b>(builder: &'b ReadBuilder<'a>) -> &'b PaimonReadBuilder<'a> {
-        match &builder.0 {
+        match &builder.kind {
             ReadBuilderKind::Paimon(inner) => inner,
             ReadBuilderKind::Format(_) => panic!("expected Paimon read builder"),
         }
