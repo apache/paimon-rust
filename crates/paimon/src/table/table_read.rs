@@ -54,10 +54,7 @@ const MAX_MERGE_INPUT_STREAMS: usize = 256;
 ///
 /// Reference: [pypaimon.read.table_read.TableRead](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_read.py)
 #[derive(Debug, Clone)]
-pub struct TableRead<'a> {
-    kind: TableReadKind<'a>,
-    resources: Option<ResourceContext>,
-}
+pub struct TableRead<'a>(TableReadKind<'a>);
 
 #[derive(Debug, Clone)]
 enum TableReadKind<'a> {
@@ -91,14 +88,11 @@ impl<'a> TableRead<'a> {
         if table.is_format_table() {
             Self::new_format(table, read_type, data_predicates, None)
         } else {
-            Self {
-                kind: TableReadKind::Paimon(PaimonTableRead::new(
-                    table,
-                    read_type,
-                    data_predicates,
-                )),
-                resources: None,
-            }
+            Self(TableReadKind::Paimon(PaimonTableRead::new(
+                table,
+                read_type,
+                data_predicates,
+            )))
         }
     }
 
@@ -108,20 +102,17 @@ impl<'a> TableRead<'a> {
         data_predicates: Vec<Predicate>,
         limit: Option<usize>,
     ) -> Self {
-        Self {
-            kind: TableReadKind::Format(FormatTableRead::new(
-                table,
-                read_type,
-                data_predicates,
-                limit,
-            )),
-            resources: None,
-        }
+        Self(TableReadKind::Format(FormatTableRead::new(
+            table,
+            read_type,
+            data_predicates,
+            limit,
+        )))
     }
 
     /// Schema (fields) that this read will produce.
     pub fn read_type(&self) -> &[DataField] {
-        match &self.kind {
+        match &self.0 {
             TableReadKind::Paimon(read) => read.read_type(),
             TableReadKind::Format(read) => read.read_type(),
         }
@@ -129,7 +120,7 @@ impl<'a> TableRead<'a> {
 
     /// Data predicates for read-side pruning.
     pub fn data_predicates(&self) -> &[Predicate] {
-        match &self.kind {
+        match &self.0 {
             TableReadKind::Paimon(read) => read.data_predicates(),
             TableReadKind::Format(read) => read.data_predicates(),
         }
@@ -137,62 +128,61 @@ impl<'a> TableRead<'a> {
 
     /// Table for this read.
     pub fn table(&self) -> &Table {
-        match &self.kind {
+        match &self.0 {
             TableReadKind::Paimon(read) => read.table(),
             TableReadKind::Format(read) => read.table(),
         }
     }
 
-    /// Share Parquet working estimates and output-buffer reservations with other reads.
+    /// Share Parquet working-memory reservations with other consumers.
     ///
-    /// Output reservations survive the reader when callers retain arrays or
-    /// slices. Budget exhaustion is a terminal stream error. The working
-    /// estimates do not measure all decoder allocations; see [`ResourceContext`].
+    /// Callers account for output batches they retain. Budget exhaustion is a
+    /// terminal stream error. See [`ResourceContext`] for the accounting scope.
     pub fn with_resources(mut self, resources: ResourceContext) -> Self {
-        match &mut self.kind {
-            TableReadKind::Paimon(read) => read.resources = Some(resources.clone()),
-            TableReadKind::Format(read) => read.with_resources(resources.clone()),
+        match &mut self.0 {
+            TableReadKind::Paimon(read) => read.resources = Some(resources),
+            TableReadKind::Format(read) => read.with_resources(resources),
         }
-        self.resources = Some(resources);
         self
     }
 
     /// Set a filter predicate.
-    pub fn with_filter(mut self, filter: Predicate) -> Self {
-        self.kind = match self.kind {
-            TableReadKind::Paimon(read) => TableReadKind::Paimon(read.with_filter(filter)),
-            TableReadKind::Format(read) => TableReadKind::Format(read.with_filter(filter)),
-        };
-        self
+    pub fn with_filter(self, filter: Predicate) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(read.with_filter(filter))),
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read.with_filter(filter))),
+        }
     }
 
     /// Set the maximum number of concurrent BLOB range reads for this read.
-    pub fn with_blob_parallelism(mut self, blob_parallelism: usize) -> crate::Result<Self> {
+    pub fn with_blob_parallelism(self, blob_parallelism: usize) -> crate::Result<Self> {
         if blob_parallelism == 0 {
             return Err(crate::Error::DataInvalid {
                 message: "BLOB read parallelism must be greater than zero".to_string(),
                 source: None,
             });
         }
-        self.kind = match self.kind {
-            TableReadKind::Paimon(read) => {
-                TableReadKind::Paimon(read.with_blob_parallelism(blob_parallelism))
-            }
-            TableReadKind::Format(read) => {
-                TableReadKind::Format(read.with_blob_parallelism(blob_parallelism))
-            }
-        };
-        Ok(self)
+        Ok(match self.0 {
+            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
+                read.with_blob_parallelism(blob_parallelism),
+            )),
+            TableReadKind::Format(read) => Self(TableReadKind::Format(
+                read.with_blob_parallelism(blob_parallelism),
+            )),
+        })
     }
 
     /// Pass the read limit to paths that can enforce it. Data-evolution reads
     /// apply it before BLOB resolution; other Paimon reads still use the
     /// builder limit only as a scan hint.
-    pub(crate) fn with_limit(mut self, limit: Option<usize>) -> Self {
-        if let TableReadKind::Paimon(read) = &mut self.kind {
-            read.limit = limit;
+    pub(crate) fn with_limit(self, limit: Option<usize>) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(mut read) => {
+                read.limit = limit;
+                Self(TableReadKind::Paimon(read))
+            }
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
         }
-        self
     }
 
     /// Attach an engine-specific Parquet decoder-filter factory.
@@ -200,52 +190,45 @@ impl<'a> TableRead<'a> {
     /// The hook is used only by schema-identical raw reads. Callers must still
     /// enforce the expression after the scan because an individual file may not
     /// be able to build a decoder filter.
-    pub fn with_row_filter_factory(
-        mut self,
-        factory: Arc<dyn crate::arrow::RowFilterFactory>,
-    ) -> Self {
-        self.kind = match self.kind {
+    pub fn with_row_filter_factory(self, factory: Arc<dyn crate::arrow::RowFilterFactory>) -> Self {
+        match self.0 {
             TableReadKind::Paimon(read) => {
-                TableReadKind::Paimon(read.with_row_filter_factory(factory))
+                Self(TableReadKind::Paimon(read.with_row_filter_factory(factory)))
             }
             TableReadKind::Format(read) => {
-                TableReadKind::Format(read.with_row_filter_factory(factory))
+                Self(TableReadKind::Format(read.with_row_filter_factory(factory)))
             }
-        };
-        self
+        }
     }
 
     /// Override the Parquet resource budget shared by this read.
     #[doc(hidden)]
-    pub fn with_parquet_read_budget(mut self, budget: Arc<ReadBudget>) -> Self {
-        self.kind = match self.kind {
+    pub fn with_parquet_read_budget(self, budget: Arc<ReadBudget>) -> Self {
+        match self.0 {
             TableReadKind::Paimon(read) => {
-                TableReadKind::Paimon(read.with_parquet_read_budget(budget))
+                Self(TableReadKind::Paimon(read.with_parquet_read_budget(budget)))
             }
             TableReadKind::Format(read) => {
-                TableReadKind::Format(read.with_parquet_read_budget(budget))
+                Self(TableReadKind::Format(read.with_parquet_read_budget(budget)))
             }
-        };
-        self
+        }
     }
 
-    pub(crate) fn with_data_file_read_timing(mut self, timing: Arc<DataFileReadTiming>) -> Self {
-        self.kind = match self.kind {
-            TableReadKind::Paimon(read) => {
-                TableReadKind::Paimon(read.with_data_file_read_timing(timing))
-            }
-            TableReadKind::Format(read) => TableReadKind::Format(read),
-        };
-        self
+    pub(crate) fn with_data_file_read_timing(self, timing: Arc<DataFileReadTiming>) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(read) => Self(TableReadKind::Paimon(
+                read.with_data_file_read_timing(timing),
+            )),
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
+        }
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        let output = match &self.kind {
+        match &self.0 {
             TableReadKind::Paimon(read) => read.to_arrow(data_splits),
             TableReadKind::Format(read) => read.to_arrow(data_splits),
-        }?;
-        Ok(self.retain_output(output))
+        }
     }
 
     /// Returns rows with a leading `rowkind` column.
@@ -258,14 +241,13 @@ impl<'a> TableRead<'a> {
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
         self.ensure_query_auth_allowed()?;
-        let output = match &self.kind {
+        match &self.0 {
             TableReadKind::Paimon(read) => read.to_arrow_with_row_kind(data_splits),
             TableReadKind::Format(read) => {
                 let schema = audit_schema_for_read_type(read.read_type(), false)?;
                 prepend_insert_row_kind_stream(read.to_arrow(data_splits)?, schema)
             }
-        }?;
-        Ok(self.retain_output(output))
+        }
     }
 
     /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
@@ -278,13 +260,12 @@ impl<'a> TableRead<'a> {
     ) -> crate::Result<ArrowRecordBatchStream> {
         self.ensure_query_auth_allowed()?;
         plan.validate()?;
-        let output = match &self.kind {
+        match &self.0 {
             TableReadKind::Paimon(read) => read.to_incremental_arrow(plan),
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support incremental batch read".to_string(),
             }),
-        }?;
-        Ok(self.retain_output(output))
+        }
     }
 
     /// Returns an audit-log [`ArrowRecordBatchStream`] for an incremental plan.
@@ -299,24 +280,12 @@ impl<'a> TableRead<'a> {
     ) -> crate::Result<ArrowRecordBatchStream> {
         self.ensure_query_auth_allowed()?;
         plan.validate()?;
-        let output = match &self.kind {
+        match &self.0 {
             TableReadKind::Paimon(read) => read.to_audit_log_arrow(plan),
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support audit log batch read".to_string(),
             }),
-        }?;
-        Ok(self.retain_output(output))
-    }
-
-    fn retain_output(&self, mut output: ArrowRecordBatchStream) -> ArrowRecordBatchStream {
-        let Some(resources) = self.resources.clone() else {
-            return output;
-        };
-        Box::pin(async_stream::try_stream! {
-            while let Some(batch) = output.next().await {
-                yield resources.retain_batch(batch?)?;
-            }
-        })
+        }
     }
 
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
@@ -858,6 +827,10 @@ impl<'a> PaimonTableRead<'a> {
                 });
             }
         }
+        let budget = self.parquet_read_budget()?;
+        let parquet_read_budget = budget
+            .has_resources()
+            .then(|| Arc::new(budget.without_prefetch()));
         let reader = KeyValueFileReader::new(
             self.table.file_io.clone(),
             KeyValueReadConfig {
@@ -879,10 +852,9 @@ impl<'a> PaimonTableRead<'a> {
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: true,
                 max_merge_input_streams: Some(MAX_MERGE_INPUT_STREAMS),
-                // Diff primes the before and after streams in sequence. Keeping
-                // a row-group permit across yielded batches can otherwise let
-                // the first side block the second side indefinitely.
-                parquet_read_budget: None,
+                // Diff advances before/after in lockstep. Disable prefetch so
+                // neither side waits on shared slots, but keep memory admission.
+                parquet_read_budget,
                 mosaic_prefetch: configured_mosaic_prefetch(self.table)?,
             },
         );

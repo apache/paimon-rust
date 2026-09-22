@@ -40,8 +40,7 @@ pub struct ReadBudget {
     row_groups: Arc<Semaphore>,
     // A look-ahead window, independent of shared memory accounting.
     prefetch: Arc<Semaphore>,
-    resources: ResourceContext,
-    retain_outputs: bool,
+    resources: Option<ResourceContext>,
     byte_permits: u32,
     byte_permit_unit: u64,
     max_inflight_bytes: u64,
@@ -128,8 +127,7 @@ impl ReadBudget {
             parallelism,
             row_groups: Arc::new(Semaphore::new(parallelism)),
             prefetch: Arc::new(Semaphore::new(byte_permits as usize)),
-            resources: ResourceContext::builder().build()?,
-            retain_outputs: false,
+            resources: None,
             byte_permits,
             byte_permit_unit,
             max_inflight_bytes,
@@ -201,18 +199,17 @@ impl ReadBudget {
     }
 
     /// Bind a shared memory budget while preserving this scheduling window.
-    /// Working estimates and retained outputs draw from this same context. An
+    /// Working estimates draw from this context. An
     /// oversized row group must still fit the context's memory limit.
     pub fn with_resources(&self, resources: ResourceContext) -> Self {
         Self {
-            resources,
-            retain_outputs: true,
+            resources: Some(resources),
             ..self.clone()
         }
     }
 
     pub(crate) fn has_resources(&self) -> bool {
-        self.retain_outputs
+        self.resources.is_some()
     }
 
     /// Merge inputs need to advance in lockstep. Keep memory admission, while
@@ -258,8 +255,15 @@ impl ReadBudget {
             usize::try_from(estimated_bytes).map_err(|_| crate::Error::ResourceExhausted {
                 message: format!("Row-group estimate {estimated_bytes} exceeds addressable memory"),
             })?;
-        let mut memory = self.resources.reservation();
-        memory.try_grow(bytes)?;
+        let memory = self
+            .resources
+            .as_ref()
+            .map(|resources| {
+                let mut memory = resources.reservation();
+                memory.try_grow(bytes)?;
+                Ok::<_, crate::Error>(memory)
+            })
+            .transpose()?;
         let diagnostics = self.diagnostics_enabled().then(|| {
             let current = self
                 .diagnostics
@@ -274,7 +278,6 @@ impl ReadBudget {
         Ok(ReadPermit {
             _memory: memory,
             prefetch: None,
-            resources: self.retain_outputs.then(|| self.resources.clone()),
             diagnostics,
         })
     }
@@ -321,22 +324,9 @@ impl Default for ReadBudget {
 #[derive(Debug)]
 pub(crate) struct ReadPermit {
     // Return memory before waking scheduling waiters.
-    _memory: MemoryReservation,
+    _memory: Option<MemoryReservation>,
     prefetch: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
-    resources: Option<ResourceContext>,
     diagnostics: Option<Arc<ReadBudgetDiagnostics>>,
-}
-
-impl ReadPermit {
-    pub(crate) fn retain_batch(
-        &self,
-        batch: arrow_array::RecordBatch,
-    ) -> crate::Result<arrow_array::RecordBatch> {
-        match &self.resources {
-            Some(resources) => resources.retain_batch(batch),
-            None => Ok(batch),
-        }
-    }
 }
 
 impl Drop for ReadPermit {
@@ -537,65 +527,6 @@ mod tests {
         let permit = budget.acquire(3).await.unwrap();
         // The prefetch window is clamped to one; the memory charge is all three.
         assert_eq!(resources.metrics().reserved_memory_bytes, 3);
-        drop(permit);
-        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn output_and_live_decoder_estimate_share_the_same_pool() {
-        use arrow_array::{Array, Int32Array, RecordBatch};
-        let array = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
-        let capacity = array.to_data().buffers()[0].capacity();
-        let estimate = capacity / 2;
-        let resources = ResourceContext::builder()
-            .memory_limit(capacity + estimate)
-            .build()
-            .unwrap();
-        let budget = ReadBudget::new(1, 1024 * 1024)
-            .unwrap()
-            .with_resources(resources.clone());
-        let permit = budget.acquire(estimate as u64).await.unwrap();
-        let batch = RecordBatch::try_from_iter([("id", array as arrow_array::ArrayRef)]).unwrap();
-        let output = permit.retain_batch(batch).unwrap();
-        assert_eq!(
-            resources.metrics().reserved_memory_bytes,
-            capacity + estimate
-        );
-        assert_eq!(
-            resources.metrics().peak_reserved_memory_bytes,
-            capacity + estimate
-        );
-        let slice = output.column(0).slice(1, 1);
-        drop(output);
-        drop(permit);
-        assert_eq!(resources.metrics().reserved_memory_bytes, capacity);
-        assert!(matches!(
-            budget.acquire((estimate + 1) as u64).await,
-            Err(crate::Error::ResourceExhausted { .. })
-        ));
-        drop(slice);
-        let permit = budget.acquire(capacity as u64).await.unwrap();
-        drop(permit);
-        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn failed_output_admission_preserves_the_working_reservation() {
-        use arrow_array::{Array, Int32Array, RecordBatch};
-        let array = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
-        let capacity = array.to_data().buffers()[0].capacity();
-        let resources = ResourceContext::builder()
-            .memory_limit(capacity - 1)
-            .build()
-            .unwrap();
-        let budget = ReadBudget::new(1, 1024 * 1024)
-            .unwrap()
-            .with_resources(resources.clone());
-        let permit = budget.acquire((capacity - 2) as u64).await.unwrap();
-        let batch = RecordBatch::try_from_iter([("id", array as arrow_array::ArrayRef)]).unwrap();
-        assert!(permit.retain_batch(batch).is_err());
-        assert_eq!(permit._memory.size(), capacity - 2);
-        assert_eq!(resources.metrics().reserved_memory_bytes, capacity - 2);
         drop(permit);
         assert_eq!(resources.metrics().reserved_memory_bytes, 0);
     }

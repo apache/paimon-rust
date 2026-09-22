@@ -24,6 +24,20 @@
 
 This crate contains the integration of [Apache DataFusion](https://datafusion.apache.org/) and [Apache Paimon](https://paimon.apache.org/).
 
+## Reader memory
+
+Paimon Parquet scans use the memory pool from the executing DataFusion `TaskContext`.
+Configure it through a DataFusion `RuntimeEnv`, including with
+`SQLContext::builder().with_runtime_env(runtime_env)`. Scan partitions share that
+pool with downstream operators and reserve projected row-group working estimates
+before data I/O. A scan consumer cannot spill; exhaustion returns
+`DataFusionError::ResourcesExhausted` after speculative prefetch has been deferred.
+
+Downstream consumers account for output batches they retain. The reader leaves
+Arrow buffers unchanged and releases its working reservation when its decoder is
+dropped, including cancellation. Metadata, merge state, transient batches and
+allocation overhead are not fully accounted, so the pool is not an RSS limit.
+
 ## REST Catalog views and SQL functions
 
 `SQLContext` can read, execute, create, and drop persistent views and can create SQL scalar functions in a Paimon REST Catalog:

@@ -137,9 +137,9 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
-    /// Share Parquet working estimates and output reservations across reads.
+    /// Share Parquet working-memory reservations across reads.
     ///
-    /// Row-group data reads and output buffers draw from the same context.
+    /// Row-group data reads draw from this context; callers account for retained outputs.
     /// See [`ResourceContext`] for the estimate-based accounting contract.
     /// When admission fails, the stream returns a resource-exhausted error and ends.
     pub fn with_resources(&mut self, resources: ResourceContext) -> &mut Self {

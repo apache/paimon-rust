@@ -141,21 +141,6 @@ impl MemoryReservation {
         }
         Ok(())
     }
-
-    pub(super) fn split_off(&mut self, size: usize) -> Self {
-        assert!(size <= self.size);
-        self.size -= size;
-        Self {
-            account: Arc::clone(&self.account),
-            size,
-        }
-    }
-
-    pub(super) fn absorb(&mut self, mut other: Self) {
-        assert!(Arc::ptr_eq(&self.account, &other.account));
-        self.size += other.size;
-        other.size = 0;
-    }
 }
 
 impl Drop for MemoryReservation {

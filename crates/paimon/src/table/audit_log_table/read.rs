@@ -22,7 +22,6 @@ use super::{
     TableReadKind, MAX_MERGE_INPUT_STREAMS,
 };
 use crate::arrow::build_target_arrow_schema;
-use crate::resource::ResourceContext;
 use crate::spec::{
     DataField, DataType, MergeEngine, TinyIntType, ROW_KIND_FIELD_ID, SEQUENCE_NUMBER_FIELD_ID,
     VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
@@ -41,15 +40,13 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct AuditLogRead<'a> {
     read: PaimonTableRead<'a>,
-    resources: Option<ResourceContext>,
 }
 
 impl<'a> AuditLogRead<'a> {
     pub fn new(read: TableRead<'a>) -> crate::Result<Self> {
         read.ensure_query_auth_allowed()?;
-        let resources = read.resources;
-        match read.kind {
-            TableReadKind::Paimon(read) => Ok(Self { read, resources }),
+        match read.0 {
+            TableReadKind::Paimon(read) => Ok(Self { read }),
             TableReadKind::Format(_) => Err(crate::Error::Unsupported {
                 message: "Format tables do not support audit log batch read".to_string(),
             }),
@@ -145,7 +142,6 @@ impl<'a> AuditLogRead<'a> {
             read.to_arrow(data_splits)?
         };
 
-        let resources = self.resources.clone();
         Ok(Box::pin(async_stream::try_stream! {
             futures::pin_mut!(physical_stream);
             let mut projection = None;
@@ -178,15 +174,11 @@ impl<'a> AuditLogRead<'a> {
                         Ok(column)
                     }).collect::<crate::Result<Vec<_>>>()?;
                 let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-                let output = RecordBatch::try_new_with_options(audit_schema.clone(), columns, &options)
+                yield RecordBatch::try_new_with_options(audit_schema.clone(), columns, &options)
                     .map_err(|error| crate::Error::UnexpectedError {
                         message: format!("Failed to build audit log batch: {error}"),
                         source: Some(Box::new(error)),
                     })?;
-                yield match &resources {
-                    Some(resources) => resources.retain_batch(output)?,
-                    None => output,
-                };
             }
         }))
     }

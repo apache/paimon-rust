@@ -15,46 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared memory reservations for native readers and future writers.
+//! Shared memory reservations for readers and embedding engines.
 //!
-//! A reservation is accounting, not an allocator. Parquet readers reserve each
-//! selected row group's projected uncompressed-column estimate before data I/O,
-//! including columns needed by decoder predicates. Live working estimates and
-//! retained output Arrow buffers share one limit; scheduling slots and prefetch
-//! windows remain independent. A working reservation is released after its
-//! decoder drops, while output reservations follow the buffers' shared owners.
+//! Parquet readers reserve each selected row group's projected uncompressed
+//! column size before data I/O, including columns needed by decoder predicates.
+//! The decoder owns that reservation and releases it when dropped. Concurrency
+//! slots and the prefetch window remain separate scheduling controls.
 //!
-//! Working estimates are conservative admission charges, not measurements of
-//! decoder allocations. Metadata, merge state and allocation overhead are not
-//! fully covered, and actual memory can exceed the estimates. Consequently this
-//! is neither an RSS limit nor a bound on every allocation made while reading.
+//! Consumers are responsible for reserving memory they retain. Output batches
+//! are ordinary Arrow batches: a downstream consumer that holds them must reserve
+//! its own memory. The reader does not wrap their buffers or charge their aliases.
+//!
+//! Reservations are accounting, not an allocator or an RSS limit. Row-group
+//! charges are estimates; metadata, merge state, transient batches and allocation
+//! overhead are not fully covered, and actual memory can exceed the estimates.
 
-mod arrow;
 mod memory;
-
 pub use memory::{MemoryPool, MemoryReservation, ResourceMetrics};
 
 use std::sync::Arc;
 
-use self::arrow::BufferRegistry;
 use self::memory::MemoryAccount;
 use crate::Result;
 
-/// Resources shared by readers created for one logical operation.
+/// Memory budget shared by consumers in one logical operation.
 ///
-/// Clones share the limit, metrics and Arrow buffer accounting. A buffer held
-/// by multiple output batches in this context is charged once; its reservation
-/// outlives the reader when the caller retains the buffer or a slice of it.
-/// Native buffers are charged by allocation capacity; external buffers are
-/// estimated using the largest extent Arrow exposes for their backing pointer.
-/// Arrays and schema metadata, as well as allocations made by the caller's
-/// subsequent Arrow operations, are not charged.
-///
-/// Buffers are wrapped with a shared owner without copying their contents.
-/// Arrow may consequently report a smaller capacity for output buffers and
-/// cannot convert them back into mutable buffers without copying. Use this
-/// context's metrics for its reservations, rather than summing Arrow capacities.
-/// Cloning the context shares accounting; distinct contexts charge independently.
+/// Clones share admission and metrics. Each consumer owns its reservations and
+/// releases them when its working state is dropped. Retained output batches are
+/// the caller's responsibility, including when they outlive the reader.
 ///
 /// ```
 /// use paimon::resource::ResourceContext;
@@ -62,7 +50,8 @@ use crate::Result;
 /// let resources = ResourceContext::builder()
 ///     .memory_limit(256 * 1024 * 1024)
 ///     .build()?;
-/// // Pass resources.clone() to each ReadBuilder::with_resources.
+/// // Pass resources.clone() to ReadBuilder::with_resources.
+/// // Other consumers reserve from the same budget for their own retained state.
 /// let mut reservation = resources.reservation();
 /// reservation.try_grow(1024)?;
 /// assert_eq!(resources.metrics().reserved_memory_bytes, 1024);
@@ -73,7 +62,6 @@ use crate::Result;
 #[derive(Clone, Debug)]
 pub struct ResourceContext {
     memory: Arc<MemoryAccount>,
-    buffers: Arc<BufferRegistry>,
 }
 
 impl ResourceContext {
@@ -81,7 +69,7 @@ impl ResourceContext {
         ResourceContextBuilder::default()
     }
 
-    /// Create an initially empty reservation. Grow it before retaining memory.
+    /// Create an initially empty reservation owned by a consumer.
     pub fn reservation(&self) -> MemoryReservation {
         MemoryReservation::new(Arc::clone(&self.memory))
     }
@@ -92,7 +80,7 @@ impl ResourceContext {
     }
 }
 
-/// Configure a shared accounting limit and an optional embedding-engine pool.
+/// Configure a local limit and an optional embedding-engine pool.
 #[derive(Default, Debug)]
 pub struct ResourceContextBuilder {
     memory_limit: Option<usize>,
@@ -116,7 +104,6 @@ impl ResourceContextBuilder {
     pub fn build(self) -> Result<ResourceContext> {
         Ok(ResourceContext {
             memory: Arc::new(MemoryAccount::new(self.memory_limit, self.memory_pool)),
-            buffers: Arc::new(BufferRegistry::default()),
         })
     }
 }

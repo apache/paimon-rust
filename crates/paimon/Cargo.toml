@@ -108,7 +108,6 @@ lzokay-native = { version = "0.1", default-features = false, features = ["decomp
 arrow-array = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-buffer = { workspace = true }
-arrow-data = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }

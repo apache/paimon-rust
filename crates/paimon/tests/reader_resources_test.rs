@@ -46,7 +46,7 @@ async fn parquet_table(primary_key: bool) -> Table {
 }
 
 #[tokio::test]
-async fn parquet_output_reservation_survives_reader_and_batch() {
+async fn parquet_reader_releases_working_memory_while_output_survives() {
     for primary_key in [false, true] {
         let table = parquet_table(primary_key).await;
         let resources = ResourceContext::builder()
@@ -86,8 +86,7 @@ async fn parquet_output_reservation_survives_reader_and_batch() {
         drop(stream);
         drop(read);
         drop(builder);
-        let retained_bytes = resources.metrics().reserved_memory_bytes;
-        assert!(retained_bytes > 0 && retained_bytes <= bytes);
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
         assert_eq!(
             escaped
                 .as_any()
@@ -160,7 +159,7 @@ async fn every_read_output_mode_honors_the_budget() {
 }
 
 #[tokio::test]
-async fn independent_readers_share_outstanding_output_reservations() {
+async fn readers_and_downstream_consumers_share_explicit_reservations() {
     let table = parquet_table(false).await;
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
     let resources = ResourceContext::builder()
@@ -175,9 +174,12 @@ async fn independent_readers_share_outstanding_output_reservations() {
     let mut stream = read.to_arrow(plan.splits()).unwrap();
     let retained = stream.next().await.unwrap().unwrap();
     drop(stream);
-    let retained_bytes = resources.metrics().reserved_memory_bytes;
-    assert!(retained_bytes > 0);
-    // Occupy the rest with another consumer so the second reader cannot emit a batch.
+    assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+    // The downstream consumer explicitly accounts for batches it retains.
+    let retained_bytes = retained.get_array_memory_size();
+    let mut downstream = resources.reservation();
+    downstream.try_grow(retained_bytes).unwrap();
+    // Occupy the rest so another reader cannot start its row-group data read.
     let mut other_consumer = resources.reservation();
     other_consumer
         .try_grow(1024 * 1024 - retained_bytes)
@@ -192,6 +194,7 @@ async fn independent_readers_share_outstanding_output_reservations() {
     assert_eq!(resources.metrics().reserved_memory_bytes, 1024 * 1024);
     drop(other_consumer);
     drop(retained);
+    drop(downstream);
     assert_eq!(resources.metrics().reserved_memory_bytes, 0);
     // A fresh read can use capacity released by the failed read's siblings.
     let batches: Vec<_> = read
@@ -261,7 +264,69 @@ async fn format_table_reader_uses_the_same_resource_context() {
         .unwrap();
     assert_eq!(output.len(), 1);
     assert_eq!(output[0].column(0).as_ref(), input.column(0).as_ref());
-    assert!(resources.metrics().reserved_memory_bytes > 0);
+    assert!(resources.metrics().peak_reserved_memory_bytes > 0);
+    assert_eq!(resources.metrics().reserved_memory_bytes, 0);
     drop(output);
     assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+}
+
+#[tokio::test]
+async fn primary_key_diff_and_audit_diff_share_working_memory() {
+    let table = parquet_table(true).await;
+    write_batch(&table, &make_batch(vec![2], vec![200])).await;
+    for limit in [0, 1024 * 1024] {
+        let resources = ResourceContext::builder()
+            .memory_limit(limit)
+            .build()
+            .unwrap();
+        let mut builder = table.new_read_builder();
+        builder.with_resources(resources.clone());
+        let plan = builder
+            .new_incremental_scan(IncrementalScanMode::Diff, 1, 2)
+            .plan()
+            .await
+            .unwrap();
+        let read = builder.new_read().unwrap();
+        for audit in [false, true] {
+            let stream = if audit {
+                read.to_audit_log_arrow(&plan).unwrap()
+            } else {
+                read.to_incremental_arrow(&plan).unwrap()
+            };
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                stream.try_collect::<Vec<_>>(),
+            )
+            .await
+            .expect("before/after streams must not deadlock on shared capacity");
+            if limit == 0 {
+                assert!(matches!(result, Err(Error::ResourceExhausted { .. })));
+            } else {
+                let batches = result.unwrap();
+                let mut values = Vec::new();
+                for batch in &batches {
+                    let ids = batch
+                        .column_by_name("id")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    assert!(ids.values().iter().all(|id| *id == 2));
+                    values.extend_from_slice(
+                        batch
+                            .column_by_name("value")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values(),
+                    );
+                }
+                values.sort_unstable();
+                assert_eq!(values, if audit { vec![20, 200] } else { vec![200] });
+                assert!(resources.metrics().peak_reserved_memory_bytes > 0);
+            }
+            assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        }
+    }
 }

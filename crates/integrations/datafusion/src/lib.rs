@@ -51,6 +51,7 @@ mod format_table_truncate;
 mod full_text_search;
 mod hybrid_search;
 mod lateral_vector_search;
+mod memory;
 mod merge_into;
 mod physical_plan;
 mod procedures;

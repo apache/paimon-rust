@@ -1000,6 +1000,7 @@ impl PaimonTableScan {
     pub(crate) fn execute_with(
         &self,
         partition: usize,
+        context: Arc<TaskContext>,
         read_splits: impl FnOnce(TableRead<'_>, &[DataSplit]) -> paimon::Result<ArrowRecordBatchStream>
             + Send
             + 'static,
@@ -1021,7 +1022,10 @@ impl PaimonTableScan {
         let parquet_read_budget = Arc::clone(&self.parquet_read_budget);
 
         let fut = async move {
+            let resources = crate::memory::reader_resources(&context, partition)
+                .map_err(to_datafusion_error)?;
             let mut read_builder = table.new_read_builder();
+            read_builder.with_resources(resources);
             let runtime_filter_plan = partition_runtime_decoder_filters(
                 &decoder_filters,
                 table.schema().fields(),
@@ -1172,9 +1176,9 @@ impl ExecutionPlan for PaimonTableScan {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        self.execute_with(partition, |read, splits| read.to_arrow(splits))
+        self.execute_with(partition, context, |read, splits| read.to_arrow(splits))
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
@@ -2306,6 +2310,157 @@ mod tests {
 
         assert!(matches!(result.filters.as_slice(), [PushedDown::No]));
         assert!(result.updated_node.is_none());
+    }
+
+    fn memory_scan_fixture() -> (tempfile::TempDir, PaimonTableScan, usize) {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let dir = tempdir().unwrap();
+        let bucket = dir.path().join("bucket-0");
+        fs::create_dir_all(&bucket).unwrap();
+        let file = bucket.join("data.parquet");
+        write_int_parquet_file(&file, vec![("id", (0..8).collect())], None);
+        let metadata = SerializedFileReader::new(fs::File::open(&file).unwrap()).unwrap();
+        let estimate = metadata
+            .metadata()
+            .row_group(0)
+            .column(0)
+            .uncompressed_size() as usize;
+        let schema = PaimonSchema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("read.batch-size", "2")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("file").build().unwrap(),
+            Identifier::new("default", "memory_test"),
+            local_file_path(dir.path()),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let split = paimon::DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket))
+            .with_total_buckets(1)
+            .with_data_files(vec![test_data_file(
+                "data.parquet",
+                8,
+                fs::metadata(file).unwrap().len() as i64,
+            )])
+            .build()
+            .unwrap();
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            table,
+            test_read_type(),
+            None,
+            vec![Arc::from(vec![split.clone()]), Arc::from(vec![split])],
+            None,
+            false,
+            None,
+            None,
+            true,
+        );
+        (dir, scan, estimate)
+    }
+
+    fn memory_session(
+        pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    ) -> SessionContext {
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        SessionContext::new_with_config_rt(
+            datafusion::prelude::SessionConfig::new(),
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(pool)
+                .build_arc()
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn scan_memory_honors_each_execution_pool_and_audit_reads() {
+        use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        for audit in [false, true] {
+            let (_dir, scan, estimate) = memory_scan_fixture();
+            let plan: Arc<dyn ExecutionPlan> = if audit {
+                Arc::new(super::super::audit_log::PaimonAuditLogScan::new(scan))
+            } else {
+                Arc::new(scan)
+            };
+            let rejected = Arc::new(GreedyMemoryPool::new(0));
+            let ctx = memory_session(rejected.clone());
+            let mut stream = plan.execute(0, ctx.task_ctx()).unwrap();
+            assert!(matches!(
+                stream.try_next().await,
+                Err(DataFusionError::ResourcesExhausted(_))
+            ));
+            assert!(stream.try_next().await.unwrap().is_none());
+            assert_eq!(rejected.reserved(), 0);
+
+            // Reusing a plan must bind to the current execution, never an earlier pool.
+            let admitted = Arc::new(GreedyMemoryPool::new(estimate));
+            let ctx = memory_session(admitted.clone());
+            let output = plan
+                .execute(0, ctx.task_ctx())
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(collect_ids(&output), (0..8).collect::<Vec<_>>());
+            assert_eq!(
+                admitted.reserved(),
+                0,
+                "returned batches belong to their consumer"
+            );
+            assert_eq!(rejected.reserved(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_memory_shares_capacity_with_partitions_and_downstream_consumers() {
+        use datafusion::error::DataFusionError;
+        use datafusion::execution::memory_pool::{FairSpillPool, MemoryConsumer, MemoryPool};
+        let (_dir, scan, estimate) = memory_scan_fixture();
+        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(2 * estimate));
+        let ctx = memory_session(pool.clone());
+        // A spillable peer must not reduce the reader's share: its decoder
+        // cannot spill and must be registered as a non-spillable consumer.
+        let _spillable_peer = MemoryConsumer::new("spillable peer")
+            .with_can_spill(true)
+            .register(&pool);
+        let downstream = MemoryConsumer::new("downstream state").register(&pool);
+        downstream.try_grow(estimate).unwrap();
+        let mut first = scan.execute(0, ctx.task_ctx()).unwrap();
+        let retained = first.try_next().await.unwrap().unwrap();
+        assert_eq!(pool.reserved(), 2 * estimate);
+        let mut second = scan.execute(1, ctx.task_ctx()).unwrap();
+        assert!(matches!(
+            second.try_next().await,
+            Err(DataFusionError::ResourcesExhausted(_))
+        ));
+        assert!(second.try_next().await.unwrap().is_none());
+        assert_eq!(
+            pool.reserved(),
+            2 * estimate,
+            "failed admission must roll back"
+        );
+
+        // Cancelling the decoder releases its estimate even if output survives.
+        drop(first);
+        assert_eq!(pool.reserved(), estimate);
+        assert_eq!(collect_ids(&[retained]), vec![0, 1]);
+        drop(downstream);
+        assert_eq!(pool.reserved(), 0);
+        let output = scan
+            .execute(1, ctx.task_ctx())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(collect_ids(&output), (0..8).collect::<Vec<_>>());
+        assert_eq!(pool.reserved(), 0);
     }
 
     #[tokio::test]

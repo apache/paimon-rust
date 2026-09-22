@@ -949,7 +949,7 @@ impl FormatFileReader for ParquetFormatReader {
                     // Foreground and merge reads only try memory admission. They
                     // never hold a shared scheduling slot while awaiting another
                     // merge input, nor wait for output buffers owned downstream.
-                    let permit = budget.reserve_memory(estimated_bytes)?;
+                    let _permit = budget.reserve_memory(estimated_bytes)?;
                     let mut stream = build_row_group_stream(
                         Arc::clone(&shared_reader), file_size, metadata.clone(), mask.clone(),
                         index, batch_size, selection, shared_filters.clone(),
@@ -966,7 +966,7 @@ impl FormatFileReader for ParquetFormatReader {
                             )?,
                             None => batch,
                         };
-                        yield permit.retain_batch(batch)?;
+                        yield batch;
                     }
                 }
             }.boxed());
@@ -1163,9 +1163,12 @@ where
     // before its first poll. Keep the working reservation until the decoder drops.
     struct ReservedDecoder<S> {
         stream: S,
-        permit: Option<ReadPermit>,
+        _permit: Option<ReadPermit>,
     }
-    let mut decoder = ReservedDecoder { stream, permit };
+    let mut decoder = ReservedDecoder {
+        stream,
+        _permit: permit,
+    };
     async move {
         loop {
             let Ok(slot) = sender.reserve().await else {
@@ -1177,18 +1180,7 @@ where
             };
             match next {
                 Some(Ok(batch)) => {
-                    let batch = match &decoder.permit {
-                        Some(permit) => permit.retain_batch(batch),
-                        None => Ok(batch),
-                    };
-                    match batch {
-                        Ok(batch) => slot.send(ParquetRowGroupMessage::Batch(batch)),
-                        Err(error) => {
-                            drop(decoder);
-                            slot.send(ParquetRowGroupMessage::Error(error));
-                            return;
-                        }
-                    }
+                    slot.send(ParquetRowGroupMessage::Batch(batch));
                 }
                 Some(Err(error)) => {
                     drop(decoder);
@@ -1197,7 +1189,7 @@ where
                 }
                 None => {
                     // Release decoder buffers and their working estimate before
-                    // the next demanded group retries. Output reservations survive.
+                    // the next demanded group retries.
                     drop(decoder);
                     slot.send(ParquetRowGroupMessage::Done);
                     return;
@@ -4628,10 +4620,8 @@ mod tests {
             .iter()
             .map(|rg| super::projected_row_group_bytes(rg, &mask))
             .max()
-            .unwrap() as usize
-            + 2 * 16 * std::mem::size_of::<i32>();
-        // Headroom for one queued and one consumed batch, in addition to the
-        // decoder's live working estimate. Only one row group fits this pool.
+            .unwrap() as usize;
+        // Only one row group fits; the consumer owns its output batches.
         let resources = ResourceContext::builder()
             .memory_limit(limit)
             .build()
@@ -4675,7 +4665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_shared_budget_prefetch_keeps_only_escaped_output_charged() {
+    async fn cancelling_shared_budget_prefetch_releases_memory_with_escaped_output() {
         use crate::resource::ResourceContext;
         let data = Bytes::from(
             write_multi_row_group_parquet(64, 256, EnabledStatistics::Chunk, false).await,
@@ -4712,7 +4702,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(resources.metrics().reserved_memory_bytes > 0);
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
         assert_eq!(
             escaped
                 .as_any()
