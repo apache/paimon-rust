@@ -25,7 +25,7 @@
 //!
 //! Reference: Java Paimon `SortMergeReaderWithMinHeap`.
 
-use super::data_file_reader::{is_row_file, DataFileReader};
+use super::data_file_reader::DataFileReader;
 use super::sort_merge::{
     AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, MergeFunction,
     PartialUpdateMergeFunction, SortMergeReaderBuilder,
@@ -177,7 +177,7 @@ fn ensure_merge_input_limit(input_stream_count: usize, limit: Option<usize>) -> 
 
 /// Java's `KeyValueFieldsExtractor` builds the physical file layout from the
 /// schema that wrote the file, including its historical key names and types.
-fn key_value_row_format_fields(
+fn key_value_data_schema_fields(
     file_fields: &[DataField],
     trimmed_primary_keys: &[String],
 ) -> crate::Result<Vec<DataField>> {
@@ -187,7 +187,7 @@ fn key_value_row_format_fields(
             .iter()
             .find(|field| field.name() == name)
             .ok_or_else(|| Error::DataInvalid {
-                message: format!("KV .row key field '{name}' is absent from the file schema"),
+                message: format!("KV key field '{name}' is absent from the file schema"),
                 source: None,
             })?;
         physical.push(
@@ -647,20 +647,15 @@ impl KeyValueFileReader {
                                         None
                                     };
                                 let data_fields = data_schema.as_ref().map(|schema| schema.fields().to_vec());
-                                let row_reader = if is_row_file(&file_meta) {
-                                    let file_fields = data_schema
-                                        .as_ref()
-                                        .map_or(run_table_fields.as_slice(), |schema| schema.fields());
-                                    let file_key_names = data_schema
-                                        .as_ref()
-                                        .map(|schema| schema.trimmed_primary_keys());
-                                    let key_names = file_key_names.as_deref().unwrap_or(&run_primary_keys);
-                                    Some(reader.clone().with_row_format_fields(
-                                        key_value_row_format_fields(file_fields, key_names)?,
-                                    ))
-                                } else {
-                                    None
-                                };
+                                let file_fields = data_schema
+                                    .as_ref()
+                                    .map_or(run_table_fields.as_slice(), |schema| schema.fields());
+                                let file_key_names = data_schema
+                                    .as_ref()
+                                    .map(|schema| schema.trimmed_primary_keys());
+                                let key_names = file_key_names.as_deref().unwrap_or(&run_primary_keys);
+                                let data_schema_fields =
+                                    key_value_data_schema_fields(file_fields, key_names)?;
                                 let deletion_file = deletion_files_by_split
                                     .get(&(Arc::as_ptr(&split) as usize))
                                     .and_then(|files| files.get(&file_meta.file_name))
@@ -671,10 +666,11 @@ impl KeyValueFileReader {
                                     )),
                                     None => None,
                                 };
-                                let mut file_stream = row_reader.as_ref().unwrap_or(&reader).read_single_file_stream(
+                                let mut file_stream = reader.read_single_file_stream_with_schema(
                                     split.as_ref(),
                                     file_meta,
                                     data_fields,
+                                    data_schema_fields,
                                     deletion_vector,
                                     split.row_ranges().map(|ranges| ranges.to_vec()),
                                 )?;
@@ -809,7 +805,7 @@ mod tests {
                 .with_description(Some("sort key".to_string())),
             DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
         ];
-        let physical = key_value_row_format_fields(&fields, &["old_id".to_string()]).unwrap();
+        let physical = key_value_data_schema_fields(&fields, &["old_id".to_string()]).unwrap();
         assert_eq!(
             physical.iter().map(DataField::name).collect::<Vec<_>>(),
             vec![
@@ -823,7 +819,7 @@ mod tests {
         assert_eq!(physical[0].id(), 1_000_000);
         assert_eq!(physical[0].description(), Some("sort key"));
         assert_eq!(&physical[3..], fields);
-        assert!(key_value_row_format_fields(&fields, &["id".to_string()]).is_err());
+        assert!(key_value_data_schema_fields(&fields, &["id".to_string()]).is_err());
     }
 
     #[tokio::test]
@@ -861,7 +857,7 @@ mod tests {
         write_schema_file(&table, &old_schema).await;
 
         let physical =
-            key_value_row_format_fields(old_schema.fields(), &old_schema.trimmed_primary_keys())
+            key_value_data_schema_fields(old_schema.fields(), &old_schema.trimmed_primary_keys())
                 .unwrap();
         let schema = build_target_arrow_schema(&physical).unwrap();
         let batch = RecordBatch::try_new(
