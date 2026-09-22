@@ -1143,6 +1143,23 @@ options. BTree additionally accepts `btree-index.bloom-filter.enabled` (default
 `false`) to accelerate equality and `IN` lookups. Per-call options override table
 options. Bitmap and multivalue global indexes use Java-compatible bitmap files.
 
+BTree reads both Java-compatible V1 and V2 index files. Writing defaults to V1
+for compatibility with older readers. Set `btree-index.file-version=2` explicitly
+to use adaptive single-row, delta-list, and Roaring postings; every reader of
+the table must support V2 before enabling it. Existing index files do not need
+to be rebuilt for the reader to handle a mix of versions.
+
+BTree min/max metadata can also avoid index-file reads when every key matches,
+there are no nulls, and the file set's row counts prove complete coverage of
+the same source row-ID range. These all-matching files do not consume the
+fallback index-scan byte budget; partially matching files still do. The proof is
+applied separately to each conjunct, so an all-matching bound does not force a
+full posting-list scan alongside a selective equality on the same column.
+Multiple lower/upper bounds (including `BETWEEN`) on one column are tightened
+into one range query; contradictory bounds produce no indexed candidates
+without opening index files. Unindexed-tail handling and residual filtering
+continue to follow the selected global-index search mode.
+
 FM global indexes support character-string columns and exact byte-substring
 `contains`, `IS NULL`, and `IS NOT NULL` predicates. They use the
 Java-compatible partitioned V1 format. `sorted-index.records-per-range` bounds
@@ -1247,6 +1264,7 @@ Supported vindex options:
 | `<index-type>.ivf.coarse-assignment` | `auto` | all IVF types | Build-time list assignment mode: `auto` uses Vamana for large centroid matrices; `exact` always uses exact assignment. |
 | `<index-type>.ivf.train.max-points-per-centroid` | `256` | all IVF types | Positive limit on coarse K-means training data: at most `nlist × value` vectors. |
 | `<index-type>.train.sample-ratio` or `fields.<field>.train.sample-ratio` | `1.0` | all vindex types | Fraction of shard rows selected evenly for training. Must be in `(0, 1]`; all rows are still added to the index. The field-specific option takes precedence. |
+| `vindex.build.granule.enabled` | `true` | all IVF types | Use the granule build pipeline. Set to `false` to use the full-spill build path for future index builds. |
 | `<index-type>.pq.m` | `16` | `ivf-pq` | Number of product-quantization sub-vectors. The dimension must be divisible by this value. |
 | `<index-type>.pq.use-opq` | `false` | `ivf-pq` | Whether to enable OPQ before PQ encoding. |
 | `ivf-pq.ivf.pq-encoding` | `auto` | `ivf-pq` | Build-time PQ encoding mode: `auto` selects an accelerated backend when supported; `canonical` uses the canonical encoder. |
@@ -2436,6 +2454,7 @@ deletion vectors enabled.
 | `global-index.row-count-per-shard` | `100000` | Maximum row count per vector global-index shard. |
 | `sorted-index.records-per-range` | `100000` | Maximum row count per BTree, bitmap, multivalue, or FM global-index file range; falls back to legacy `btree-index.records-per-range`. |
 | `btree-index.block-size` | `64kb` | Target BTree data-block size. |
+| `btree-index.file-version` | `1` | BTree file version to write: `1` or `2`. V2 uses adaptive postings and requires V2-capable readers. |
 | `btree-index.bloom-filter.enabled` | `false` | Writes a Bloom filter used to avoid BTree data-block reads for missing equality and `IN` keys. |
 | `btree-index.compression` | `none` | BTree block compression: `none`, `zstd`, `lz4`, or `lzo`. |
 | `btree-index.compression-level` | `1` | BTree compression level (used by codecs that support levels). |
@@ -2453,7 +2472,7 @@ deletion vectors enabled.
 | `fm-index.read-cache-size` | `64mb` | Scan-scoped decoded FM block cache size. |
 | `fm-index.demand-page-size` | `512kb` | Target compressed-block read-ahead size for FM demand paging. |
 | `fm-index.locate-cost-ratio` | `0.001` | Maximum estimated locate work as a fraction of indexed text; denser matches fall back to the source scan. |
-| `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected BTree global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables BTree fallback index scans. |
+| `btree-index.fallback-scan-max-size` | `256mb` | Maximum total size of BTree global-index files requiring fallback scans for range/between and suffix/contains/complex LIKE predicates; files proven to match completely by metadata need no scan and are excluded. `0` disables BTree fallback index scans. |
 | `bitmap-index.fallback-scan-max-size` | `256mb` | Maximum total size of selected bitmap global-index files for fallback scans used by range/between and suffix/contains/complex LIKE predicates; `0` disables bitmap fallback index scans. |
 | `global-index.search-mode` | `fast` | Global index coverage mode for reads: `fast`, `full`, or `detail`. |
 | `global-index.thread-num` | `32` | Number of concurrent global-index search tasks; must be greater than 0 and must not exceed the runtime's task limit. This does not limit Vindex file range reads. |

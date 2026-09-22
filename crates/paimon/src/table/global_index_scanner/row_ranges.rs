@@ -24,32 +24,30 @@ use std::collections::{HashMap, HashSet};
 
 /// Convert a RoaringTreemap to merged RowRanges (already sorted and deduplicated).
 pub(super) fn bitmap_to_ranges(bitmap: &RoaringTreemap) -> Vec<RowRange> {
-    if bitmap.is_empty() {
-        return Vec::new();
-    }
-    let mut ranges = Vec::new();
-    let mut iter = bitmap.iter();
-    let first = iter.next().unwrap();
-    let mut start = first as i64;
-    let mut end = start;
-
-    for id in iter {
-        let id = id as i64;
-        if id == end + 1 {
-            end = id;
-        } else {
+    let mut ranges: Vec<RowRange> = Vec::new();
+    // Walk containers/runs instead of every set bit. Adjacent high-32 partitions
+    // must still be joined to preserve the canonical range layout.
+    for (high, low) in bitmap.bitmaps() {
+        let base = u64::from(high) << 32;
+        let mut iter = low.iter();
+        while let Some(range) = iter.next_range() {
+            let start = (base | u64::from(*range.start())) as i64;
+            let end = (base | u64::from(*range.end())) as i64;
+            if let Some(last) = ranges.last_mut() {
+                if last.to().checked_add(1) == Some(start) {
+                    *last = RowRange::new(last.from(), end);
+                    continue;
+                }
+            }
             ranges.push(RowRange::new(start, end));
-            start = id;
-            end = id;
         }
     }
-    ranges.push(RowRange::new(start, end));
     ranges
 }
 
 /// Intersect two sorted range lists using RowRangeIndex for efficient binary search.
 pub(super) fn intersect_sorted_ranges(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
-    let idx = RowRangeIndex::create(a.to_vec());
+    let idx = RowRangeIndex::from_sorted_ranges(a.to_vec());
     let mut result = Vec::new();
     for r in b {
         result.extend(idx.intersected_ranges(r.from(), r.to()));
@@ -187,6 +185,11 @@ impl RowRangeIndex {
     /// Ranges are sorted and merged to eliminate overlaps.
     pub fn create(ranges: Vec<RowRange>) -> Self {
         let ranges = merge_row_ranges(ranges);
+        Self::from_sorted_ranges(ranges)
+    }
+
+    // Internal callers with canonical ranges must not sort and merge them again.
+    fn from_sorted_ranges(ranges: Vec<RowRange>) -> Self {
         let starts: Vec<i64> = ranges.iter().map(|r| r.from()).collect();
         let ends: Vec<i64> = ranges.iter().map(|r| r.to()).collect();
         Self {

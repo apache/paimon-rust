@@ -23,6 +23,16 @@ use crate::{Error, Result};
 use arrow_array::{Array, FixedSizeListArray, Float32Array, Int64Array, ListArray, RecordBatch};
 
 pub(super) fn data_split_for_shard(shard: &VindexIndexShard) -> Result<DataSplit> {
+    data_split_for_shard_ranges(
+        shard,
+        vec![RowRange::new(shard.row_range_start, shard.row_range_end)],
+    )
+}
+
+pub(super) fn data_split_for_shard_ranges(
+    shard: &VindexIndexShard,
+    row_ranges: Vec<RowRange>,
+) -> Result<DataSplit> {
     DataSplitBuilder::new()
         .with_snapshot(shard.snapshot_id)
         .with_partition(shard.partition.clone())
@@ -30,17 +40,23 @@ pub(super) fn data_split_for_shard(shard: &VindexIndexShard) -> Result<DataSplit
         .with_bucket_path(shard.bucket_path.clone())
         .with_total_buckets(shard.total_buckets)
         .with_data_files(shard.files.clone())
-        .with_row_ranges(vec![RowRange::new(
-            shard.row_range_start,
-            shard.row_range_end,
-        )])
+        .with_row_ranges(row_ranges)
         .build()
 }
 
 pub(super) struct ValidatedVectorBatch<'a> {
     pub(super) values: &'a [f32],
     pub(super) bytes: &'a [u8],
+    pub(super) row_ids: &'a [i64],
     pub(super) row_count: usize,
+}
+
+pub(super) fn extract_vector_batch<'a>(
+    batch: &'a RecordBatch,
+    index_column: &str,
+    dimension: usize,
+) -> Result<ValidatedVectorBatch<'a>> {
+    validate_vector_batch_with(batch, index_column, dimension, |_| Ok(()))
 }
 
 pub(super) fn validate_vector_batch<'a>(
@@ -48,6 +64,73 @@ pub(super) fn validate_vector_batch<'a>(
     index_column: &str,
     dimension: usize,
     expected_row_id: &mut i64,
+) -> Result<ValidatedVectorBatch<'a>> {
+    validate_vector_batch_with(batch, index_column, dimension, |row_id| {
+        if row_id != *expected_row_id {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "vindex vector extraction expected _ROW_ID {}, got {}",
+                    expected_row_id, row_id
+                ),
+                source: None,
+            });
+        }
+        *expected_row_id = expected_row_id
+            .checked_add(1)
+            .ok_or_else(|| Error::DataInvalid {
+                message: "vindex expected row id overflows i64".to_string(),
+                source: None,
+            })?;
+        Ok(())
+    })
+}
+
+pub(super) fn validate_vector_batch_ranges<'a>(
+    batch: &'a RecordBatch,
+    index_column: &str,
+    dimension: usize,
+    ranges: &[RowRange],
+    range_index: &mut usize,
+    expected_row_id: &mut i64,
+) -> Result<ValidatedVectorBatch<'a>> {
+    validate_vector_batch_with(batch, index_column, dimension, |row_id| {
+        let range = ranges.get(*range_index).ok_or_else(|| Error::DataInvalid {
+            message: format!("vindex vector extraction got unexpected _ROW_ID {row_id}"),
+            source: None,
+        })?;
+        if row_id != *expected_row_id {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "vindex vector extraction expected _ROW_ID {}, got {}",
+                    expected_row_id, row_id
+                ),
+                source: None,
+            });
+        }
+        if row_id == range.to() {
+            *range_index += 1;
+            *expected_row_id = match ranges.get(*range_index) {
+                Some(next) => next.from(),
+                None => row_id.checked_add(1).ok_or_else(|| Error::DataInvalid {
+                    message: "vindex expected row id overflows i64".to_string(),
+                    source: None,
+                })?,
+            };
+        } else {
+            *expected_row_id = row_id.checked_add(1).ok_or_else(|| Error::DataInvalid {
+                message: "vindex expected row id overflows i64".to_string(),
+                source: None,
+            })?;
+        }
+        Ok(())
+    })
+}
+
+fn validate_vector_batch_with<'a>(
+    batch: &'a RecordBatch,
+    index_column: &str,
+    dimension: usize,
+    mut validate_row_id: impl FnMut(i64) -> Result<()>,
 ) -> Result<ValidatedVectorBatch<'a>> {
     let vector_index = batch
         .schema()
@@ -163,21 +246,7 @@ pub(super) fn validate_vector_batch<'a>(
         });
     }
     for row_id in row_ids.values() {
-        if *row_id != *expected_row_id {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "vindex vector extraction expected _ROW_ID {}, got {}",
-                    expected_row_id, row_id
-                ),
-                source: None,
-            });
-        }
-        *expected_row_id = expected_row_id
-            .checked_add(1)
-            .ok_or_else(|| Error::DataInvalid {
-                message: "vindex expected row id overflows i64".to_string(),
-                source: None,
-            })?;
+        validate_row_id(*row_id)?;
     }
 
     let byte_start = checked_vector_bytes(start, 1)?;
@@ -185,6 +254,7 @@ pub(super) fn validate_vector_batch<'a>(
     Ok(ValidatedVectorBatch {
         values: &values.values()[start..end],
         bytes: &values.values().inner().as_slice()[byte_start..byte_end],
+        row_ids: row_ids.values(),
         row_count: batch.num_rows(),
     })
 }

@@ -657,6 +657,22 @@ async fn scan_ids(table: &Table, predicate: Predicate) -> Vec<i32> {
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
+    // The column-group fixture must merge payloads by RowID, not just return
+    // the right number of rows from the indexed key/flag group.
+    for batch in &batches {
+        if let Some(payload) = batch.column_by_name("payload") {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let payload = payload.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(payload.null_count(), 0);
+            for row in 0..batch.num_rows() {
+                assert_eq!(payload.value(row), i64::from(ids.value(row)) * 17);
+            }
+        }
+    }
     let mut ids = batches
         .iter()
         .flat_map(|batch| {
@@ -676,8 +692,15 @@ async fn scan_ids(table: &Table, predicate: Predicate) -> Vec<i32> {
 
 #[tokio::test]
 async fn test_execute_writes_btree_index_manifest_and_file() {
+    for version in [1, 2] {
+        assert_btree_build_version(version).await;
+    }
+}
+
+async fn assert_btree_build_version(version: u32) {
     let table_path = "memory:/test_btree_global_index_builder_e2e";
     let mut options = table_options("10");
+    options.insert("btree-index.file-version".into(), version.to_string());
     options.insert(
         "btree-index.bloom-filter.enabled".to_string(),
         "true".to_string(),
@@ -742,6 +765,7 @@ async fn test_execute_writes_btree_index_manifest_and_file() {
         .bloom_filter_handle
         .expect("enabled BTree build must write a Bloom filter");
     assert_eq!(bloom_handle.expected_entries, 2);
+    assert_eq!(footer.version, version);
 
     let global_meta = index_file
         .global_index_meta
@@ -805,6 +829,230 @@ async fn test_execute_writes_btree_index_manifest_and_file() {
         plan.splits()[0].row_ranges(),
         Some(&[RowRange::new(0, 0), RowRange::new(2, 2)][..])
     );
+    let predicate = PredicateBuilder::new(scan_table.schema().fields())
+        .equal("name", crate::spec::Datum::String("alice".to_string()))
+        .unwrap();
+    assert_eq!(scan_ids(&scan_table, predicate).await, vec![1, 3]);
+}
+
+async fn column_group_btree_table(rows: i32, version: u32) -> Table {
+    use crate::table::data_evolution_writer::DataEvolutionPartialWriter;
+    let mut options = table_options("2000000");
+    options.insert("btree-index.file-version".into(), version.to_string());
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .column("payload", DataType::BigInt(crate::spec::BigIntType::new()))
+        .options(options)
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "column_groups"),
+        format!("memory:/btree_column_groups_v{version}"),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    setup_dirs(&table).await;
+    let batch = data_batch(
+        (0..rows).collect(),
+        (0..rows)
+            .map(|id| if id % 10 == 0 { "miss" } else { "hit" })
+            .collect(),
+    );
+    let mut write =
+        DataEvolutionPartialWriter::new(&table, vec!["id".into(), "name".into()]).unwrap();
+    write
+        .write_partial_batch(
+            crate::spec::EMPTY_BINARY_ROW.to_serialized_bytes(),
+            0,
+            0,
+            0,
+            batch,
+        )
+        .await
+        .unwrap();
+    let mut messages = write.prepare_commit().await.unwrap();
+    // Seed an append column group: normal commit allocates its RowIDs.
+    // Subsequent partial-column writes reuse that committed RowID domain.
+    for message in &mut messages {
+        message.check_from_snapshot = None;
+        for file in &mut message.new_files {
+            file.first_row_id = None;
+        }
+    }
+    TableCommit::new(table.clone(), "bench".into())
+        .commit(messages)
+        .await
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "payload",
+            ArrowDataType::Int64,
+            true,
+        )])),
+        vec![Arc::new(Int64Array::from(
+            (0..rows).map(|id| i64::from(id) * 17).collect::<Vec<_>>(),
+        ))],
+    )
+    .unwrap();
+    let mut payload = DataEvolutionPartialWriter::new(&table, vec!["payload".into()]).unwrap();
+    payload
+        .write_partial_batch(
+            crate::spec::EMPTY_BINARY_ROW.to_serialized_bytes(),
+            0,
+            0,
+            1,
+            batch,
+        )
+        .await
+        .unwrap();
+    TableCommit::new(table.clone(), "payload".into())
+        .commit(payload.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let files: Vec<_> = plan
+        .splits()
+        .iter()
+        .flat_map(|split| split.data_files())
+        .collect();
+    assert_eq!(files.len(), 2);
+    for file in &files {
+        assert!(file.file_name.ends_with(".parquet"));
+        assert_eq!(file.first_row_id, Some(0));
+        assert_eq!(file.row_count, i64::from(rows));
+    }
+    assert!(files
+        .iter()
+        .any(|file| file.write_cols.as_deref() == Some(&["id".into(), "name".into()])));
+    assert!(files
+        .iter()
+        .any(|file| file.write_cols.as_deref() == Some(&["payload".into()])));
+    for column in ["id", "name"] {
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_column(column)
+            .execute()
+            .await
+            .unwrap();
+    }
+    table
+}
+
+#[tokio::test]
+async fn test_scalar_column_group_reads() {
+    for version in [1, 2] {
+        let table = column_group_btree_table(4096, version).await;
+        let builder = PredicateBuilder::new(table.schema().fields());
+        for (predicate, expected) in [
+            (
+                builder.equal("name", Datum::String("miss".into())).unwrap(),
+                (0..4096).step_by(10).collect(),
+            ),
+            (
+                Predicate::and(vec![
+                    builder.greater_or_equal("id", Datum::Int(0)).unwrap(),
+                    builder.equal("id", Datum::Int(1)).unwrap(),
+                ]),
+                vec![1],
+            ),
+        ] {
+            assert_eq!(scan_ids(&table, predicate).await, expected);
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual release benchmark; default Parquet, column groups, planning and full reads"]
+async fn benchmark_btree_data_evolution_read() {
+    use crate::spec::Datum;
+    use std::time::Instant;
+    let rows = 1_200_000;
+    for version in [1, 2] {
+        let table = column_group_btree_table(rows, version).await;
+        let mut options = table.schema().options().clone();
+        options.insert("global-index.enabled".into(), "false".into());
+        let no_index = Table::new(
+            table.file_io().clone(),
+            table.identifier().clone(),
+            table.location().to_string(),
+            table.schema().copy_with_replaced_options(options),
+            None,
+        );
+        let builder = PredicateBuilder::new(table.schema().fields());
+        let point = builder.equal("id", Datum::Int(1)).unwrap();
+        let dense = builder.equal("name", Datum::String("hit".into())).unwrap();
+        let sparse = builder.equal("name", Datum::String("miss".into())).unwrap();
+        let all = builder
+            .less_than("name", Datum::String("z".into()))
+            .unwrap();
+        let bounded = Predicate::and(vec![
+            builder.greater_than("id", Datum::Int(rows / 2)).unwrap(),
+            builder.less_than("id", Datum::Int(rows / 2 + 100)).unwrap(),
+        ]);
+        let point_with_full_bound = Predicate::and(vec![
+            builder.greater_or_equal("id", Datum::Int(0)).unwrap(),
+            point.clone(),
+        ]);
+        let multiple_bounds = Predicate::and(vec![
+            builder.greater_or_equal("id", Datum::Int(0)).unwrap(),
+            builder.less_than("id", Datum::Int(rows)).unwrap(),
+            bounded.clone(),
+        ]);
+        for (name, predicate, expected) in [
+            (
+                "90pct",
+                dense.clone(),
+                (0..rows).filter(|id| id % 10 != 0).collect::<Vec<_>>(),
+            ),
+            (
+                "10pct",
+                sparse,
+                (0..rows).filter(|id| id % 10 == 0).collect(),
+            ),
+            ("point", point.clone(), vec![1]),
+            ("point_and_full_same_field", point_with_full_bound, vec![1]),
+            (
+                "multiple_bounds",
+                multiple_bounds,
+                (rows / 2 + 1..rows / 2 + 100).collect(),
+            ),
+            (
+                "point_and_90pct",
+                Predicate::and(vec![point, dense]),
+                vec![1],
+            ),
+            ("all_match", all, (0..rows).collect()),
+            ("bounded", bounded, (rows / 2 + 1..rows / 2 + 100).collect()),
+        ] {
+            for source in [&table, &no_index] {
+                for _ in 0..3 {
+                    assert_eq!(scan_ids(source, predicate.clone()).await, expected);
+                }
+            }
+            let sources = [&table, &no_index];
+            let mut samples = [Vec::new(), Vec::new()];
+            for round in 0..7 {
+                for i in [round % 2, 1 - round % 2] {
+                    let start = Instant::now();
+                    let actual = scan_ids(sources[i], predicate.clone()).await;
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    assert_eq!(actual, expected);
+                    samples[i].push(elapsed);
+                }
+            }
+            for times in &mut samples {
+                times.sort_by(f64::total_cmp);
+            }
+            println!(
+                "TABLE_BENCH version={version} case={name} rows={} index_ms={:.3} scan_ms={:.3}",
+                expected.len(),
+                samples[0][3],
+                samples[1][3]
+            );
+        }
+    }
 }
 
 #[tokio::test]

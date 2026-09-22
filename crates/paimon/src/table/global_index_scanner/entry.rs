@@ -30,6 +30,7 @@ pub(super) struct GlobalIndexEntry {
     pub(super) file_name: String,
     pub(super) index_type: GlobalIndexFileKind,
     pub(super) file_size: i64,
+    pub(super) row_count: i64,
     pub(super) row_range_start: i64,
     pub(super) row_range_end: i64,
     pub(super) external_path: Option<String>,

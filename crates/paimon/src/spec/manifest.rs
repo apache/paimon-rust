@@ -88,8 +88,7 @@ impl Manifest {
     }
 }
 
-/// Merge ADD/DELETE entries by file identifier, returning only the active ADD set.
-/// Mirrors Java [FileEntry.mergeEntries](https://github.com/apache/paimon/blob/release-1.4/paimon-core/src/main/java/org/apache/paimon/manifest/FileEntry.java).
+/// Resolve a complete manifest set to its active ADD entries.
 /// Return order is unspecified.
 pub(crate) fn merge_active_entries(entries: Vec<ManifestEntry>) -> Vec<ManifestEntry> {
     use std::collections::HashMap;

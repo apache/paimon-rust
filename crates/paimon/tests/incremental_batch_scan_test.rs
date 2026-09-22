@@ -367,6 +367,101 @@ async fn auto_uses_changelog_when_producer_is_input() {
     assert_eq!(auto, vec![(1, 10), (1, 20)]);
 }
 
+#[tokio::test]
+async fn combined_changelog_plan_keeps_physical_files_kinds_and_snapshot() {
+    use arrow_array::StringArray;
+
+    let table_path = "memory:/incremental_batch/combined_changelog";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[
+            ("changelog-producer", "input"),
+            ("merge-engine", "deduplicate"),
+            ("bucket", "1"),
+        ]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    write_batch(
+        &table,
+        &make_batch_with_kinds(vec![1, 1], vec![10, 20], vec![0, 2]),
+    )
+    .await;
+
+    for mode in [IncrementalScanMode::Changelog, IncrementalScanMode::Auto] {
+        let plan = table
+            .new_read_builder()
+            .new_incremental_scan(mode, 0, 1)
+            .plan_combined()
+            .await
+            .unwrap();
+        assert_eq!(plan.snapshot_id(), Some(1));
+        assert!(!plan.splits().is_empty());
+        assert!(plan.splits().iter().all(|split| split.is_streaming()));
+        assert!(plan.splits().iter().all(|split| split
+            .data_files()
+            .iter()
+            .all(|file| file.file_name.starts_with("changelog-"))));
+
+        let read = table.new_read_builder().new_read().unwrap();
+        let kind_batches: Vec<RecordBatch> = read
+            .to_arrow_with_row_kind(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut kinds: Vec<_> = kind_batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|kind| kind.unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        kinds.sort();
+        assert_eq!(kinds, vec!["+I", "+U"]);
+
+        let batches: Vec<RecordBatch> = read
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(collect_pairs(&batches), vec![(1, 10), (1, 20)]);
+    }
+}
+
+#[tokio::test]
+async fn combined_incremental_plan_rejects_diff_pairs() {
+    let table_path = "memory:/incremental_batch/combined_diff_rejected";
+    let (file_io, table) = memory_table(
+        table_path,
+        pk_schema(&[("merge-engine", "deduplicate"), ("bucket", "1")]),
+    );
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+    write_batch(&table, &make_batch(vec![1], vec![10])).await;
+    write_batch(&table, &make_batch(vec![1], vec![20])).await;
+
+    let error = table
+        .new_read_builder()
+        .new_incremental_scan(IncrementalScanMode::Diff, 1, 2)
+        .plan_combined()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        paimon::Error::Unsupported { ref message }
+            if message.contains("before/after split pairs")
+    ));
+}
+
 /// Partition filter from ReadBuilder is pushed into the changelog plan path.
 #[tokio::test]
 async fn incremental_changelog_scan_applies_partition_filter_from_read_builder() {

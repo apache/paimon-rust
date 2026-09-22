@@ -39,9 +39,14 @@ class TableSchema:
 
 class Split:
     def __init__(self, state: bytes) -> None: ...
+    @staticmethod
+    def deserialize(state: bytes) -> "Split":
+        """Decode a Java-compatible SplitSerializer v1 frame."""
+        ...
     def row_count(self) -> int: ...
-    # Java SplitSerializer v1 binary: a DataSplit (v8), or an IndexedSplit when the split has row ranges.
     def is_streaming(self) -> bool: ...
+    # Java SplitSerializer v1 binary: DataSplit v8/v9, or score-free
+    # IndexedSplit when the native split has row ranges.
     def serialize(self) -> bytes: ...
 
 class Plan:
@@ -60,6 +65,9 @@ class RecordBatchReader:
     def __iter__(self) -> "RecordBatchReader": ...
     def __next__(self) -> pyarrow.RecordBatch: ...
     def read_next_batch(self) -> Optional[pyarrow.RecordBatch]: ...
+    def close(self) -> None:
+        """Stop an in-flight read and release the underlying native stream."""
+        ...
 
 class TableRead:
     def read_arrow(self, splits: Sequence[Split]) -> RecordBatchReader:
@@ -81,8 +89,12 @@ class ReadBuilder:
         """
         ...
     def with_limit(self, limit: int) -> "ReadBuilder":
-        """Set a scan-planning row-limit hint, not an exact cap: a matching split is
-        returned whole. Apply application-level limiting for an exact bound."""
+        """Set a scan-planning hint; data-evolution reads also stop at this
+        limit before resolving BLOB payloads. Other reads still need an
+        application-level limit for an exact bound."""
+        ...
+    def with_include_row_kind(self, include: bool) -> "ReadBuilder":
+        """Include a leading ``rowkind`` string column in native read results."""
         ...
     def with_blob_parallelism(self, blob_parallelism: int) -> "ReadBuilder":
         """Set the maximum number of concurrent BLOB range reads. Must be positive."""
@@ -92,11 +104,20 @@ class ReadBuilder:
         """Set Data Evolution row ranges. Empty selects no rows; format tables are unsupported."""
         ...
     def new_scan(self) -> TableScan: ...
-    def new_incremental_scan(self, start_snapshot_id: int, end_snapshot_id: int) -> TableScan:
-        """Plan APPEND deltas in (start, end] together, preserving physical change events.
+    def new_incremental_scan(
+        self,
+        start_snapshot_id: int,
+        end_snapshot_id: int,
+        mode: str = "delta",
+    ) -> TableScan:
+        """Plan incremental files in (start, end] as one native plan.
 
-        Snapshot IDs are used, not timestamps. The end snapshot must exist.
-        Row-position slicing and sharding use the combined delta batch as their position space.
+        ``mode`` accepts ``delta``, ``changelog`` or ``auto``. Delta reads APPEND
+        manifests; changelog reads physical changelog manifests; auto follows the
+        table's changelog-producer option. Diff is not representable as one
+        split list and is rejected. Snapshot IDs are used, not timestamps. The
+        end snapshot must exist. Row-position slicing and sharding use the
+        combined delta batch as their position space.
         """
         ...
     def new_read(self) -> "TableRead": ...

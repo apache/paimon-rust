@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::extraction::validate_vector_batch;
+use super::extraction::{validate_vector_batch, validate_vector_batch_ranges};
 use super::planning::{plan_vindex_shards, VindexIndexShard};
 use super::validation::{
     checked_training_sample_index, checked_training_vector_count, checked_vector_bytes,
@@ -250,6 +250,70 @@ fn test_extract_vectors_accepts_list_float32_and_row_ids() {
     let vectors = extract_vectors_from_batches(&[batch], "embedding", 2, 10, 2).unwrap();
 
     assert_eq!(vectors, vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn test_ranged_vector_validation_accepts_gaps_across_batches() {
+    let ranges = vec![RowRange::new(10, 11), RowRange::new(15, 16)];
+    let batches = [
+        vector_batch(
+            vec![
+                Some(vec![Some(1.0), Some(2.0)]),
+                Some(vec![Some(3.0), Some(4.0)]),
+            ],
+            vec![Some(10), Some(11)],
+        ),
+        vector_batch(
+            vec![
+                Some(vec![Some(5.0), Some(6.0)]),
+                Some(vec![Some(7.0), Some(8.0)]),
+            ],
+            vec![Some(15), Some(16)],
+        ),
+    ];
+    let mut range_index = 0;
+    let mut expected_row_id = ranges[0].from();
+
+    for batch in &batches {
+        validate_vector_batch_ranges(
+            batch,
+            "embedding",
+            2,
+            &ranges,
+            &mut range_index,
+            &mut expected_row_id,
+        )
+        .unwrap();
+    }
+
+    assert_eq!(range_index, ranges.len());
+    assert_eq!(expected_row_id, 17);
+}
+
+#[test]
+fn test_ranged_vector_validation_rejects_bad_row_ids() {
+    let ranges = vec![RowRange::new(10, 11), RowRange::new(15, 16)];
+    for row_ids in [
+        vec![Some(10), Some(10)],
+        vec![Some(10), Some(15)],
+        vec![Some(9), Some(10)],
+        vec![Some(10), Some(11), Some(16), Some(15)],
+        vec![Some(10), Some(11), Some(15), Some(16), Some(17)],
+    ] {
+        let rows = row_ids.len();
+        let batch = vector_batch(vec![Some(vec![Some(1.0), Some(2.0)]); rows], row_ids);
+        let mut range_index = 0;
+        let mut expected_row_id = ranges[0].from();
+        assert!(validate_vector_batch_ranges(
+            &batch,
+            "embedding",
+            2,
+            &ranges,
+            &mut range_index,
+            &mut expected_row_id,
+        )
+        .is_err());
+    }
 }
 
 #[test]
@@ -605,6 +669,10 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
     let second_built = table
         .new_vindex_index_build_builder(IVF_FLAT_IDENTIFIER)
         .with_index_column("embedding")
+        .with_options(HashMap::from([(
+            "vindex.build.granule.enabled".to_string(),
+            "false".to_string(),
+        )]))
         .execute()
         .await
         .unwrap();
@@ -639,6 +707,315 @@ async fn vindex_incremental_build_indexes_only_new_rows() {
             "new index file range must start at or after {n}, got [{}, {}]",
             meta.row_range_start,
             meta.row_range_end
+        );
+    }
+}
+
+#[tokio::test]
+async fn vindex_small_training_sample_preserves_tail_cluster_recall() {
+    let table_path = "memory:/test_vindex_small_sample_recall";
+    let mut options = table_options("1000");
+    for (key, value) in [
+        ("ivf-sq.dimension", "1"),
+        ("ivf-sq.nlist", "1"),
+        ("ivf-sq.metric", "l2"),
+        ("ivf-sq.train.sample-ratio", "0.1"),
+    ] {
+        options.insert(key.to_string(), value.to_string());
+    }
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        table_path,
+        vindex_schema_builder(options).build().unwrap(),
+    );
+    setup_dirs(table.file_io(), table_path).await;
+    write_vectors(
+        &table,
+        (0..1000).collect(),
+        (0..1000)
+            .map(|id| {
+                vec![if id < 450 {
+                    0.0
+                } else if id < 900 {
+                    1.0
+                } else {
+                    100.0
+                }]
+            })
+            .collect(),
+    )
+    .await;
+    assert_eq!(
+        table
+            .new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![100.0])
+        .with_limit(10)
+        .with_options(HashMap::from([(
+            "ivf-sq.nprobe".to_string(),
+            "1".to_string(),
+        )]))
+        .execute()
+        .await
+        .unwrap();
+    let row_ids = &result.row_ids().unwrap().row_ids;
+    assert_eq!(row_ids.len(), 10);
+    // Equal-distance IDs need not have a stable order; all hits must be in the tail cluster.
+    assert!(
+        row_ids.iter().all(|row_id| (900..1000).contains(row_id)),
+        "{result:?}"
+    );
+}
+
+/// Every eighth data file holds a cluster the other files do not. With 4,096 one-page
+/// files the granule planner reads 512 of them first, one per stratum of eight, so a
+/// fixed position in the stratum would train without ever seeing that cluster.
+#[tokio::test]
+async fn vindex_granule_training_sees_file_periodic_cluster() {
+    const FILES: usize = 4_096;
+    const ROWS_PER_FILE: usize = 256;
+    let table_path = "memory:/test_vindex_granule_periodic_cluster";
+    let mut options = table_options("2000000");
+    for (key, value) in [
+        ("ivf-sq.dimension", "1"),
+        ("ivf-sq.nlist", "1"),
+        ("ivf-sq.metric", "l2"),
+        ("target-file-size", "1b"),
+    ] {
+        options.insert(key.to_string(), value.to_string());
+    }
+    let table = test_table_with_io(
+        FileIOBuilder::new("memory").build().unwrap(),
+        table_path,
+        vindex_schema_builder(options).build().unwrap(),
+    );
+    setup_dirs(table.file_io(), table_path).await;
+    let mut table_write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    for file in 0..FILES {
+        let value = if file % 8 == 7 {
+            100.0
+        } else {
+            (file % 2) as f32
+        };
+        let first_id = (file * ROWS_PER_FILE) as i32;
+        table_write
+            .write_arrow_batch(&build_vector_batch(
+                (first_id..first_id + ROWS_PER_FILE as i32).collect(),
+                vec![vec![value]; ROWS_PER_FILE],
+            ))
+            .await
+            .unwrap();
+    }
+    let messages = table_write.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        table
+            .new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER)
+            .with_index_column("embedding")
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+
+    let result = table
+        .new_vector_search_builder()
+        .with_vector_column("embedding")
+        .with_query_vector(vec![100.0])
+        .with_limit(10)
+        .with_options(HashMap::from([(
+            "ivf-sq.nprobe".to_string(),
+            "1".to_string(),
+        )]))
+        .execute()
+        .await
+        .unwrap();
+    let row_ids = &result.row_ids().unwrap().row_ids;
+    assert_eq!(row_ids.len(), 10);
+    // Equal-distance IDs need not have a stable order; all hits must be in the periodic cluster.
+    assert!(
+        row_ids
+            .iter()
+            .all(|row_id| (*row_id as usize / ROWS_PER_FILE) % 8 == 7),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn vindex_granule_training_sees_one_oversized_row_group() {
+    use crate::arrow::format::parquet::parquet_granules;
+    use parquet::arrow::AsyncArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+
+    const FILES: usize = 4_096;
+    const SMALL_ROWS: usize = 128;
+    const LARGE_ROWS: usize = 524_288;
+    let total_rows = (FILES - 1) * SMALL_ROWS + LARGE_ROWS;
+    // Reuse physical file contents; logical row IDs are assigned by the commit.
+    let mut contents = Vec::new();
+    for (rows, value) in [(SMALL_ROWS, 0.0), (SMALL_ROWS, 1.0), (LARGE_ROWS, 100.0)] {
+        let batch = build_vector_batch((0..rows as i32).collect(), vec![vec![value]; rows]);
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows))
+            .set_offset_index_disabled(true)
+            .set_dictionary_enabled(false)
+            .set_compression(Compression::UNCOMPRESSED)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            AsyncArrowWriter::try_new(&mut bytes, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).await.unwrap();
+        writer.close().await.unwrap();
+        contents.push(bytes::Bytes::from(bytes));
+    }
+
+    // The control uses full spill. Three real snapshot identities exercise the
+    // production seed derivation, without adding a seed override to the builder.
+    for (granule_enabled, snapshots) in [(false, 1), (true, 1), (true, 2), (true, 3)] {
+        let table_path = format!("memory:/oversized_granule_{granule_enabled}_{snapshots}");
+        let mut options = table_options("2000000");
+        for (key, value) in [
+            ("ivf-sq.dimension", "1"),
+            ("ivf-sq.nlist", "1"),
+            ("ivf-sq.metric", "l2"),
+        ] {
+            options.insert(key.to_string(), value.to_string());
+        }
+        let table = test_table_with_io(
+            FileIOBuilder::new("memory").build().unwrap(),
+            &table_path,
+            vindex_schema_builder(options).build().unwrap(),
+        );
+        setup_dirs(table.file_io(), &table_path).await;
+        let mut files = Vec::new();
+        for index in 0..FILES {
+            let large = index == FILES - 1;
+            let bytes = &contents[if large { 2 } else { index % 2 }];
+            let name = format!("data-{index:04}.parquet");
+            table
+                .file_io()
+                .new_output(&format!("{table_path}/bucket-0/{name}"))
+                .unwrap()
+                .write(bytes.clone())
+                .await
+                .unwrap();
+            let mut file = data_file(
+                &name,
+                None,
+                if large { LARGE_ROWS } else { SMALL_ROWS } as i64,
+            );
+            file.file_size = bytes.len() as i64;
+            file.file_source = Some(0); // APPEND: the commit assigns row IDs.
+            files.push(file);
+        }
+        for group in files.chunks(FILES.div_ceil(snapshots)) {
+            TableCommit::new(table.clone(), "test-user".to_string())
+                .commit(vec![CommitMessage::new(
+                    BinaryRow::new(0).to_serialized_bytes(),
+                    0,
+                    group.to_vec(),
+                )])
+                .await
+                .unwrap();
+        }
+        let snapshot = SnapshotManager::new(table.file_io().clone(), table_path.clone())
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.id(), snapshots as i64);
+        let entries = table
+            .new_read_builder()
+            .new_scan()
+            .with_scan_all_files()
+            .plan_manifest_entries(&snapshot)
+            .await
+            .unwrap();
+        let large_file = entries
+            .iter()
+            .find(|entry| entry.file().row_count == LARGE_ROWS as i64)
+            .unwrap()
+            .file();
+        let (large_start, large_end) = large_file.row_id_range().unwrap();
+        let input = table
+            .file_io()
+            .new_input(&large_file.data_file_path(&format!("{table_path}/bucket-0")))
+            .unwrap();
+        let (physical_granules, has_offset_index) = parquet_granules(
+            Box::new(input.reader().await.unwrap()),
+            large_file.file_size as u64,
+            "embedding",
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(!has_offset_index);
+        assert_eq!(physical_granules.len(), 1);
+        assert_eq!(physical_granules[0].row_count, LARGE_ROWS as i64);
+
+        let mut builder = table.new_vindex_index_build_builder(crate::vindex::IVF_SQ_IDENTIFIER);
+        builder
+            .with_index_column("embedding")
+            .with_options(HashMap::from([(
+                "vindex.build.granule.enabled".to_string(),
+                granule_enabled.to_string(),
+            )]));
+        if granule_enabled {
+            let shards = plan_vindex_shards(
+                table.location(),
+                table.schema().partition_keys(),
+                table.schema().fields(),
+                &CoreOptions::new(table.schema().options()),
+                snapshot.id(),
+                entries,
+                2_000_000,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(shards.len(), 1);
+            let plan = builder
+                .plan_granules(&shards[0], "embedding", total_rows, 65_536)
+                .await
+                .unwrap();
+            // The independently trained cluster occupies half the logical rows
+            // and projected bytes, so selecting it must trigger the byte gate.
+            assert!(plan.rest.is_empty(), "snapshot {}", snapshot.id());
+            assert_eq!(plan.first, vec![RowRange::new(0, total_rows as i64 - 1)]);
+        }
+        assert_eq!(builder.execute().await.unwrap(), 1);
+        let result = table
+            .new_vector_search_builder()
+            .with_vector_column("embedding")
+            .with_query_vector(vec![100.0])
+            .with_limit(10)
+            .with_options(HashMap::from([(
+                "ivf-sq.nprobe".to_string(),
+                "1".to_string(),
+            )]))
+            .execute()
+            .await
+            .unwrap();
+        let row_ids = &result.row_ids().unwrap().row_ids;
+        assert_eq!(row_ids.len(), 10);
+        assert!(
+            row_ids
+                .iter()
+                .all(|row| (large_start as u64..=large_end as u64).contains(row)),
+            "granule={granule_enabled}, snapshot={snapshots}: {result:?}"
         );
     }
 }

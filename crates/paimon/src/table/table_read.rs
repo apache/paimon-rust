@@ -159,6 +159,19 @@ impl<'a> TableRead<'a> {
         })
     }
 
+    /// Pass the read limit to paths that can enforce it. Data-evolution reads
+    /// apply it before BLOB resolution; other Paimon reads still use the
+    /// builder limit only as a scan hint.
+    pub(crate) fn with_limit(self, limit: Option<usize>) -> Self {
+        match self.0 {
+            TableReadKind::Paimon(mut read) => {
+                read.limit = limit;
+                Self(TableReadKind::Paimon(read))
+            }
+            TableReadKind::Format(read) => Self(TableReadKind::Format(read)),
+        }
+    }
+
     /// Attach an engine-specific Parquet decoder-filter factory.
     ///
     /// The hook is used only by schema-identical raw reads. Callers must still
@@ -202,6 +215,25 @@ impl<'a> TableRead<'a> {
         match &self.0 {
             TableReadKind::Paimon(read) => read.to_arrow(data_splits),
             TableReadKind::Format(read) => read.to_arrow(data_splits),
+        }
+    }
+
+    /// Returns rows with a leading `rowkind` column.
+    ///
+    /// Materialized snapshot rows are inserts (`+I`). Streaming primary-key
+    /// splits retain their physical `_VALUE_KIND` values so change events are
+    /// exposed as `+I`, `-U`, `+U`, or `-D` without merge reconciliation.
+    pub fn to_arrow_with_row_kind(
+        &self,
+        data_splits: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.ensure_query_auth_allowed()?;
+        match &self.0 {
+            TableReadKind::Paimon(read) => read.to_arrow_with_row_kind(data_splits),
+            TableReadKind::Format(read) => {
+                let schema = audit_schema_for_read_type(read.read_type(), false)?;
+                prepend_insert_row_kind_stream(read.to_arrow(data_splits)?, schema)
+            }
         }
     }
 
@@ -257,6 +289,7 @@ struct PaimonTableRead<'a> {
     parquet_read_budget: Option<Arc<ReadBudget>>,
     data_file_read_timing: Option<Arc<DataFileReadTiming>>,
     blob_parallelism: usize,
+    limit: Option<usize>,
 }
 
 impl<'a> PaimonTableRead<'a> {
@@ -274,6 +307,7 @@ impl<'a> PaimonTableRead<'a> {
             parquet_read_budget: None,
             data_file_read_timing: None,
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
+            limit: None,
         }
     }
 
@@ -415,16 +449,57 @@ impl<'a> PaimonTableRead<'a> {
         }
     }
 
+    fn to_arrow_with_row_kind(
+        &self,
+        data_splits: &[DataSplit],
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let schema = audit_schema_for_read_type(&self.read_type, false)?;
+        let (streaming, materialized): (Vec<_>, Vec<_>) = data_splits
+            .iter()
+            .cloned()
+            .partition(DataSplit::is_streaming);
+        let mut streams = Vec::with_capacity(2);
+        if !materialized.is_empty() {
+            streams.push(prepend_insert_row_kind_stream(
+                self.to_arrow(&materialized)?,
+                Arc::clone(&schema),
+            )?);
+        }
+        if !streaming.is_empty() {
+            if self.table.schema().primary_keys().is_empty() {
+                streams.push(prepend_insert_row_kind_stream(
+                    self.to_arrow(&streaming)?,
+                    Arc::clone(&schema),
+                )?);
+            } else {
+                streams.push(self.audit_raw_data_splits(&streaming, true, false)?);
+            }
+        }
+        Ok(Box::pin(stream::select_all(streams)))
+    }
+
     fn audit_raw_stream(
         &self,
         plan: &IncrementalPlan,
         has_value_kind: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
         plan.validate()?;
-        let core_options = self.table.schema().core_options();
         let data_splits = plan.data_splits();
+        self.audit_raw_data_splits(
+            &data_splits,
+            has_value_kind,
+            audit_sequence_number_enabled(self.table),
+        )
+    }
+
+    fn audit_raw_data_splits(
+        &self,
+        data_splits: &[DataSplit],
+        has_value_kind: bool,
+        include_sequence: bool,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let core_options = self.table.schema().core_options();
         let user_read_type = self.read_type.clone();
-        let include_sequence = audit_sequence_number_enabled(self.table);
         let audit_schema = audit_schema_for_read_type(&user_read_type, include_sequence)?;
 
         let mut read_type = user_read_type.clone();
@@ -460,7 +535,7 @@ impl<'a> PaimonTableRead<'a> {
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
         .with_table_options(self.table.schema().options().clone())
         .with_mosaic_prefetch(configured_mosaic_prefetch(self.table)?);
-        let raw_stream = reader.read(&data_splits)?;
+        let raw_stream = reader.read(data_splits)?;
 
         Ok(Box::pin(async_stream::try_stream! {
             futures::pin_mut!(raw_stream);
@@ -796,10 +871,9 @@ impl<'a> PaimonTableRead<'a> {
     /// Read PK table. For `Deduplicate` and `FirstRow`, raw-convertible splits from scan
     /// planning (mirrors Java `DataSplit#convertToRawFiles`) use the faster
     /// DataFileReader; the rest go through KeyValueFileReader for sort-merge
-    /// dedup. A fully materialized deletion-vector plan for `PartialUpdate` or
-    /// `Aggregation` can also be read raw because DVs already mask stale rows.
-    /// Plans that still need any per-key merge fail closed because mixing raw
-    /// and merged outputs would produce incorrect results.
+    /// dedup. Deletion-vector splits for any merge engine are read raw only
+    /// when their rows are fully materialized; otherwise the per-file DVs are
+    /// applied before the key merge.
     fn read_pk(
         &self,
         data_splits: &[DataSplit],
@@ -828,39 +902,9 @@ impl<'a> PaimonTableRead<'a> {
             return self.read_kv(data_splits, core_options);
         }
 
-        if matches!(
-            merge_engine,
-            MergeEngine::PartialUpdate | MergeEngine::Aggregation
-        ) {
-            let merge_engine_name = match merge_engine {
-                MergeEngine::PartialUpdate => "partial-update",
-                MergeEngine::Aggregation => "aggregation",
-                _ => unreachable!("guarded by partial-update/aggregation match"),
-            };
-            if core_options.deletion_vectors_merge_on_read() {
-                return Err(crate::Error::Unsupported {
-                    message: format!(
-                        "merge-engine={merge_engine_name} with deletion-vectors.merge-on-read=true is not supported"
-                    ),
-                });
-            }
-            if !data_splits
-                .iter()
-                .all(DataSplit::is_fully_materialized_pk_dv)
-            {
-                return Err(crate::Error::Unsupported {
-                    message: format!(
-                        "merge-engine={merge_engine_name} with deletion vectors can only read fully materialized compacted splits"
-                    ),
-                });
-            }
-            return self.read_raw(data_splits);
-        }
-
-        // Compacted deletion-vector splits read raw: their stale versions are
-        // masked directly by DVs. A split containing level-0 data goes through
-        // the key merge; KeyValueFileReader applies any attached per-file DVs
-        // before merging the uncompacted versions.
+        // Fully materialized deletion-vector splits read raw: their stale
+        // versions are masked directly by DVs. Other splits go through the key
+        // merge; KeyValueFileReader applies any attached per-file DVs first.
         let mut kv_splits = Vec::new();
         let mut raw_splits = Vec::new();
         for split in data_splits {
@@ -940,6 +984,7 @@ impl<'a> PaimonTableRead<'a> {
             self.table.rest_env().cloned(),
         )?
         .with_batch_size(Some(core_options.read_batch_size()?))
+        .with_limit(self.limit)
         .with_blob_parallelism(self.blob_parallelism)
         .with_parquet_read_budget(Some(self.parquet_read_budget()?))
         .with_table_options(self.table.schema().options().clone())
@@ -980,6 +1025,34 @@ impl<'a> PaimonTableRead<'a> {
         }
         Ok(reader)
     }
+}
+
+fn prepend_insert_row_kind_stream(
+    stream: ArrowRecordBatchStream,
+    schema: Arc<ArrowSchema>,
+) -> crate::Result<ArrowRecordBatchStream> {
+    Ok(Box::pin(async_stream::try_stream! {
+        futures::pin_mut!(stream);
+        while let Some(batch) = stream.next().await {
+            yield prepend_insert_row_kind(batch?, Arc::clone(&schema))?;
+        }
+    }))
+}
+
+fn prepend_insert_row_kind(
+    batch: RecordBatch,
+    schema: Arc<ArrowSchema>,
+) -> crate::Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(batch.num_columns() + 1);
+    columns.push(Arc::new(StringArray::from(vec!["+I"; batch.num_rows()])) as ArrayRef);
+    columns.extend(batch.columns().iter().cloned());
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(schema, columns, &options).map_err(|error| {
+        crate::Error::UnexpectedError {
+            message: format!("Failed to prepend row kind column: {error}"),
+            source: Some(Box::new(error)),
+        }
+    })
 }
 
 fn audit_schema_for_read_type(
@@ -1539,12 +1612,12 @@ fn scalar_compare(
 /// planning treats the missing stat as "no deletes" for compatibility, so the
 /// read side must fall back to the merge reader, which drops them.
 ///
-/// Deletion-vector tables merge only splits containing level-0 files. Fully
-/// compacted splits stay on the raw path, while the merge reader applies any
-/// attached DVs before reconciling uncompacted key versions.
+/// Deletion-vector tables also merge any split that is not fully materialized,
+/// including level-0 data and legacy or retract-containing compacted files.
+/// The merge reader applies attached DVs before reconciling key versions.
 fn pk_split_needs_merge(split: &DataSplit, dv_enabled: bool) -> bool {
     if dv_enabled {
-        return split.data_files().iter().any(|f| f.level == 0);
+        return !split.is_fully_materialized_pk_dv();
     }
     !split.raw_convertible()
         || split
@@ -1568,6 +1641,32 @@ mod tests {
     use crate::table::query_auth_table;
     use crate::table::source::DataSplitBuilder;
     use futures::TryStreamExt;
+
+    #[test]
+    fn test_prepend_insert_row_kind_preserves_zero_column_row_count() {
+        let batch = RecordBatch::try_new_with_options(
+            Arc::new(ArrowSchema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(3)),
+        )
+        .unwrap();
+
+        let actual =
+            prepend_insert_row_kind(batch, audit_schema_for_read_type(&[], false).unwrap())
+                .unwrap();
+
+        assert_eq!(actual.num_rows(), 3);
+        assert_eq!(actual.schema().fields()[0].name(), ROW_KIND_FIELD_NAME);
+        let kinds = actual
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            kinds.iter().collect::<Vec<_>>(),
+            vec![Some("+I"), Some("+I"), Some("+I")]
+        );
+    }
 
     pub(super) fn file(name: &str, level: i32, delete_row_count: Option<i64>) -> DataFileMeta {
         DataFileMeta {
@@ -1753,10 +1852,18 @@ mod tests {
         let legacy = split(vec![file("a", 5, None)], true);
         assert!(pk_split_needs_merge(&legacy, false));
 
-        // Deletion-vector tables dispatch on level 0 only.
+        // DV reads can only bypass the merge when the split is known to hold
+        // fully materialized rows. Level, raw-convertibility and retract-row
+        // metadata all matter, including for caller-constructed splits.
         let dv_l0 = split(vec![file("a", 0, None)], false);
         assert!(pk_split_needs_merge(&dv_l0, true));
-        let dv_compacted = split(vec![file("a", 5, None)], false);
+        let dv_non_raw = split(vec![file("a", 5, Some(0))], false);
+        assert!(pk_split_needs_merge(&dv_non_raw, true));
+        let dv_legacy = split(vec![file("a", 5, None)], true);
+        assert!(pk_split_needs_merge(&dv_legacy, true));
+        let dv_retracts = split(vec![file("a", 5, Some(1))], true);
+        assert!(pk_split_needs_merge(&dv_retracts, true));
+        let dv_compacted = split(vec![file("a", 5, Some(0))], true);
         assert!(!pk_split_needs_merge(&dv_compacted, true));
     }
 

@@ -236,32 +236,6 @@ impl DataFileReader {
                 .any(|p| !matches!(p, Predicate::AlwaysTrue))
     }
 
-    /// Reject projecting `_ROW_ID` alongside an exact predicate.
-    /// `_ROW_ID` is assigned positionally from emitted batch row counts, so
-    /// residual filtering or row-group/page pruning would desync it. (`_ROW_ID`
-    /// predicates travel via `row_ranges`, so they do not trip this.)
-    fn reject_row_id_with_predicates(
-        read_type: &[DataField],
-        predicates: &[Predicate],
-    ) -> crate::Result<()> {
-        let projects_row_id = read_type
-            .iter()
-            .any(|field| field.name() == ROW_ID_FIELD_NAME);
-        // Only predicates that can actually drop rows desync positional `_ROW_ID`.
-        // A constant `AlwaysTrue` keeps every row in order and is harmless, so it
-        // must not trip the guard.
-        let has_row_filtering_predicate = predicates
-            .iter()
-            .any(|p| !matches!(p, Predicate::AlwaysTrue));
-        if projects_row_id && has_row_filtering_predicate {
-            return Err(crate::Error::Unsupported {
-                message: "reading _ROW_ID together with a data predicate is not supported yet"
-                    .to_string(),
-            });
-        }
-        Ok(())
-    }
-
     /// Take a stream of DataSplits and read every data file in each split.
     /// Returns a stream of Arrow RecordBatches from all files.
     ///
@@ -277,6 +251,10 @@ impl DataFileReader {
             for split in splits {
                 // Create DV factory for this split only.
                 let dv_factory = reader.build_split_dv_factory(&split).await?;
+                let core_options = crate::spec::CoreOptions::new(&reader.table_options);
+                let ranges_use_row_ids = core_options.row_tracking_enabled()
+                    || core_options.data_evolution_enabled();
+                let mut split_file_offset = 0;
 
                 for file_meta in split.data_files().to_vec() {
                     let dv = DataFileReader::deletion_vector_for_file(
@@ -310,13 +288,25 @@ impl DataFileReader {
                         FileIndexResult::Remain
                     };
 
+                    let range_base = if ranges_use_row_ids {
+                        file_meta.first_row_id.ok_or_else(|| crate::Error::DataInvalid {
+                            message: format!(
+                                "Row-tracked file '{}' is missing first_row_id",
+                                file_meta.file_name
+                            ),
+                            source: None,
+                        })?
+                    } else {
+                        split_file_offset
+                    };
                     let split_ranges = split.row_ranges().map(|ranges| {
                         to_local_row_ranges(
                             ranges,
-                            file_meta.first_row_id.unwrap_or(0),
+                            range_base,
                             file_meta.row_count,
                         )
                     });
+                    split_file_offset += file_meta.row_count;
                     let selected_ranges = match file_index_result {
                         FileIndexResult::Remain => split_ranges,
                         FileIndexResult::Skip => Some(Vec::new()),
@@ -442,33 +432,47 @@ impl DataFileReader {
         data_fields: Option<Vec<DataField>>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        // Guard at the true risk site: `_ROW_ID` is materialized positionally from
-        // each batch's row count (see `row_id_column_for_batch`), assuming the
-        // reader emits rows in original file order and count. Format readers may
-        // skip row groups/pages or apply an exact row filter *before* `_ROW_ID`
-        // is assigned here, which would desync the ids. So projecting `_ROW_ID`
-        // together with a data predicate is unsupported — fail loudly
-        // rather than return wrong ids. Placed here (not only in `read()`) because
-        // `read_single_file_stream` is also called directly by the KV and
-        // data-evolution readers; both strip/omit `_ROW_ID` from the read_type
-        // they pass, so this guard does not affect them.
-        Self::reject_row_id_with_predicates(&self.read_type, &self.predicates)?;
         if row_selection.as_ref().is_some_and(Vec::is_empty) {
             return Ok(futures::stream::empty().boxed());
         }
 
-        let read_type = self.read_type.clone();
+        let mut read_type = self.read_type.clone();
+        let output_field_count = read_type.len();
         let table_fields = self.table_fields.clone();
         let predicates = self.predicates.clone();
+        let projects_row_id = read_type
+            .iter()
+            .any(|field| field.name() == ROW_ID_FIELD_NAME);
+        let row_id_residual = projects_row_id
+            && predicates
+                .iter()
+                .any(|predicate| !matches!(predicate, Predicate::AlwaysTrue));
+        if row_id_residual {
+            // Decoder-side filtering can drop rows before positional `_ROW_ID`
+            // attachment. Read predicate-only columns without pushing the filter
+            // down, attach the original ids, then evaluate the exact predicate.
+            let mut refs = Vec::new();
+            for predicate in &predicates {
+                crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
+            }
+            for (name, index) in refs {
+                if name != ROW_ID_FIELD_NAME {
+                    if let Some(field) = table_fields.get(index) {
+                        crate::arrow::residual::push_unique_scan_field(&mut read_type, field);
+                    }
+                }
+            }
+        }
+        let residual_predicates = row_id_residual.then(|| crate::arrow::format::FilePredicates {
+            predicates: predicates.clone(),
+            row_filter_factory: None,
+            file_fields: table_fields.clone(),
+        });
         // The first version of the engine hook is deliberately limited to a
         // schema-identical raw read. Schema-evolution readers retain their exact
         // post-filter until expression adaptation is proven for that path.
-        // Positional `_ROW_ID` materialization must also see the unfiltered row
-        // stream, just like the predicate guard above.
-        let projects_row_id = self
-            .read_type
-            .iter()
-            .any(|field| field.name() == ROW_ID_FIELD_NAME);
+        // Positional `_ROW_ID` materialization must see the unfiltered row
+        // stream, so the engine hook stays disabled for this projection.
         let row_filter_factory = (data_fields.is_none() && !projects_row_id)
             .then(|| self.row_filter_factory.clone())
             .flatten();
@@ -514,7 +518,9 @@ impl DataFileReader {
         };
 
         // Remap predicates from table-level to file-level indices.
-        let file_predicates = {
+        let file_predicates = if row_id_residual {
+            None
+        } else {
             let remapped = crate::arrow::filtering::remap_predicates_to_file(
                 &predicates,
                 &table_fields,
@@ -673,6 +679,25 @@ impl DataFileReader {
                         source: Some(Box::new(e)),
                     }
                 })?;
+                let result = if let Some(residual) = &residual_predicates {
+                    let filtered = crate::arrow::residual::filter_record_batch_by_predicates(
+                        result,
+                        residual,
+                        &read_type,
+                    )?;
+                    if read_type.len() > output_field_count {
+                        filtered.project(&(0..output_field_count).collect::<Vec<_>>()).map_err(|e| {
+                            Error::UnexpectedError {
+                                message: format!("Failed to project filtered RecordBatch: {e}"),
+                                source: Some(Box::new(e)),
+                            }
+                        })?
+                    } else {
+                        filtered
+                    }
+                } else {
+                    result
+                };
                 yield result;
             }
         }
@@ -1024,7 +1049,10 @@ fn is_row_file(file_meta: &DataFileMeta) -> bool {
             .is_some_and(|path| path.to_ascii_lowercase().ends_with(".row"))
 }
 
-/// Convert absolute RowRanges to normalized file-local 0-based ranges.
+/// Convert ranges from their read-path coordinate system to file-local ranges.
+/// `first_row_id` is the coordinate base selected by the table's read path:
+/// stable row ID for row-tracked tables, or cumulative split-local physical
+/// offset for raw tables without row tracking.
 fn to_local_row_ranges(
     row_ranges: &[RowRange],
     first_row_id: i64,
@@ -1561,14 +1589,10 @@ mod row_tests {
         assert_eq!(ages, vec![30, 40, 50]);
     }
 
-    /// Guard: projecting `_ROW_ID` together with a data predicate must fail
-    /// loudly rather than assign wrong row ids. `_ROW_ID` is materialized
-    /// positionally from post-filter batch row counts, so the readers' residual
-    /// filter dropping rows would desync it. See the guard in `read()`.
-    #[tokio::test]
-    async fn read_rejects_row_id_projection_with_data_predicate() {
-        // Write a real .row file so read() reaches read_single_file_stream (where
-        // the guard lives). Project _ROW_ID alongside a data predicate → Unsupported.
+    /// The predicate must not renumber a projected `_ROW_ID`: the surviving row
+    /// keeps its original physical position even when the predicate column is
+    /// absent from the requested projection.
+    async fn assert_row_id_with_data_predicate(format: &str) {
         let fields = vec![
             field(0, "id", DataType::Int(IntType::new())),
             field(1, "age", DataType::Int(IntType::new())),
@@ -1584,9 +1608,9 @@ mod row_tests {
         .unwrap();
 
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let table_path = "memory:/row_id_guard";
+        let table_path = format!("memory:/row_id_predicate_{format}");
         let bucket_path = format!("{table_path}/bucket-0");
-        let file_name = "part-0.row";
+        let file_name = format!("part-0.{format}");
         let output = file_io
             .new_output(&format!("{bucket_path}/{file_name}"))
             .unwrap();
@@ -1596,13 +1620,15 @@ mod row_tests {
         writer.write(&batch).await.unwrap();
         let file_size = writer.close().await.unwrap().file_size as i64;
 
+        let mut file_meta = data_file(&file_name, file_size, 3, 1);
+        file_meta.first_row_id = Some(100);
         let split = DataSplitBuilder::new()
             .with_snapshot(1)
             .with_partition(BinaryRow::new(0))
             .with_bucket(0)
             .with_bucket_path(bucket_path)
             .with_total_buckets(1)
-            .with_data_files(vec![data_file(file_name, file_size, 3, 1)])
+            .with_data_files(vec![file_meta.clone()])
             .build()
             .unwrap();
 
@@ -1611,58 +1637,82 @@ mod row_tests {
             ROW_ID_FIELD_NAME.to_string(),
             DataType::BigInt(crate::spec::BigIntType::new()),
         );
-        // read_type projects _ROW_ID alongside a real column; predicate on age.
-        let read_type = vec![fields[1].clone(), row_id];
+        // Project only _ROW_ID; age must be read internally for the predicate.
+        let read_type = vec![row_id];
         let predicate: Predicate = PredicateBuilder::new(&fields)
-            .greater_than("age", Datum::Int(25))
+            .greater_than("age", Datum::Int(15))
             .unwrap();
 
         let reader = DataFileReader::new(
             file_io.clone(),
-            SchemaManager::new(file_io, table_path.to_string()),
+            SchemaManager::new(file_io, table_path),
             1,
             fields,
             read_type,
             vec![predicate],
         );
 
-        // The guard is inside read_single_file_stream, reached while consuming the
-        // stream, so the error surfaces on collect.
-        let result = reader.read(&[split]).unwrap().try_collect::<Vec<_>>().await;
-        let err = match result {
-            Ok(_) => panic!("must reject _ROW_ID + predicate"),
-            Err(err) => err,
+        let batches = reader
+            .clone()
+            .read(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let row_ids = |batches: &[RecordBatch]| {
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect::<Vec<_>>()
         };
-        assert!(
-            matches!(&err, crate::Error::Unsupported { message } if message.contains("_ROW_ID")),
-            "expected Unsupported mentioning _ROW_ID, got: {err:?}"
-        );
+        assert_eq!(row_ids(&batches), vec![101, 102]);
+
+        let selected = reader
+            .clone()
+            .read_single_file_stream(
+                &split,
+                file_meta.clone(),
+                None,
+                None,
+                Some(vec![RowRange::new(100, 101)]),
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(row_ids(&selected), vec![101]);
+
+        let mut deleted = RoaringBitmap::new();
+        deleted.insert(2);
+        let selected = reader
+            .read_single_file_stream(
+                &split,
+                file_meta,
+                None,
+                Some(Arc::new(DeletionVector::from_bitmap(deleted))),
+                None,
+            )
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(row_ids(&selected), vec![101]);
     }
 
-    #[test]
-    fn reject_row_id_guard_allows_constant_always_true_predicate() {
-        // A constant AlwaysTrue keeps every row in order, so it cannot desync
-        // positional _ROW_ID and must NOT trip the guard.
-        let row_id = DataField::new(
-            crate::spec::ROW_ID_FIELD_ID,
-            ROW_ID_FIELD_NAME.to_string(),
-            DataType::BigInt(crate::spec::BigIntType::new()),
-        );
-        let read_type = vec![row_id];
-        // AlwaysTrue alone -> allowed.
-        assert!(
-            DataFileReader::reject_row_id_with_predicates(&read_type, &[Predicate::AlwaysTrue])
-                .is_ok(),
-            "AlwaysTrue must not trip the _ROW_ID guard"
-        );
-        // A real filtering predicate -> rejected.
-        let filtering = PredicateBuilder::new(&[field(0, "age", DataType::Int(IntType::new()))])
-            .greater_than("age", Datum::Int(1))
-            .unwrap();
-        assert!(
-            DataFileReader::reject_row_id_with_predicates(&read_type, &[filtering]).is_err(),
-            "a row-filtering predicate must trip the _ROW_ID guard"
-        );
+    #[tokio::test]
+    async fn read_row_id_with_data_predicate_keeps_physical_position() {
+        for format in ["row", "parquet"] {
+            assert_row_id_with_data_predicate(format).await;
+        }
     }
 }
 
@@ -1690,6 +1740,24 @@ mod tests {
     use paimon_mosaic_core::writer::{MosaicWriter, OutputFile, WriterOptions};
     use roaring::RoaringBitmap;
     use std::io;
+
+    #[test]
+    fn split_local_ranges_map_across_file_boundaries() {
+        let ranges = [RowRange::new(3, 4), RowRange::new(5, 7)];
+        assert_eq!(
+            to_local_row_ranges(&ranges, 0, 5),
+            vec![RowRange::new(3, 4)]
+        );
+        assert_eq!(
+            to_local_row_ranges(&ranges, 5, 4),
+            vec![RowRange::new(0, 2)]
+        );
+
+        assert_eq!(
+            to_local_row_ranges(&[RowRange::new(103, 104)], 100, 6),
+            vec![RowRange::new(3, 4)]
+        );
+    }
 
     #[test]
     fn test_data_file_read_timing_aggregates_file_waits() {

@@ -352,8 +352,8 @@ async fn position_selection_precedes_deletions_and_preserves_historical_reads() 
         .unwrap();
     assert_eq!(plan.snapshot_id(), Some(2));
     assert_eq!(read_ids(&historical, &plan).await, vec![0, 1, 2]);
-    // A planning limit is a hint. It cannot drop later groups when earlier
-    // selected positions are deleted; the consumer takes its final limit.
+    // The planning limit cannot drop later groups when earlier selected
+    // positions are deleted; the data-evolution reader enforces the final limit.
     let mut builder = table.new_read_builder();
     builder.with_limit(2);
     let plan = builder
@@ -363,8 +363,7 @@ async fn position_selection_precedes_deletions_and_preserves_historical_reads() 
         .plan()
         .await
         .unwrap();
-    let rows = read_column(&builder, &plan, 0).await;
-    assert_eq!(&rows[..2], &[3, 4]);
+    assert_eq!(read_column(&builder, &plan, 0).await, vec![3, 4]);
 }
 
 #[tokio::test]
@@ -405,8 +404,13 @@ async fn combined_delta_preserves_events_across_repeated_endpoint_deletes() {
             .plan_combined_delta()
             .await
             .unwrap();
-        // The limit is a planning hint; both selected positions belong to one group.
-        assert_eq!(read_column(&builder, &plan, 0).await, vec![4, 5]);
+        // Both selected positions belong to one planned group, but the
+        // data-evolution reader applies the requested output limit.
+        assert_eq!(
+            read_column(&table.new_read_builder(), &plan, 0).await,
+            vec![4, 5]
+        );
+        assert_eq!(read_column(&builder, &plan, 0).await, vec![4]);
         let current = table.new_read_builder().new_scan().plan().await.unwrap();
         assert_eq!(read_ids(&table, &current).await, vec![0, 2, 3]);
     }
@@ -448,7 +452,13 @@ async fn projection_and_column_updates_do_not_multiply_positions_or_reorder_grou
         .plan()
         .await
         .unwrap();
-    assert_eq!(read_column(&builder, &plan, 0).await, vec![20, 30, 40, 999]);
+    let mut full_read = table.new_read_builder();
+    full_read.with_projection(&["value"]).unwrap();
+    assert_eq!(
+        read_column(&full_read, &plan, 0).await,
+        vec![20, 30, 40, 999]
+    );
+    assert_eq!(read_column(&builder, &plan, 0).await, vec![20]);
     for (index, expected) in [vec![0, 10, 20, 30], vec![40, 999, 60, 70]]
         .into_iter()
         .enumerate()
@@ -460,7 +470,8 @@ async fn projection_and_column_updates_do_not_multiply_positions_or_reorder_grou
             .plan()
             .await
             .unwrap();
-        assert_eq!(read_column(&builder, &plan, 0).await, expected);
+        assert_eq!(read_column(&full_read, &plan, 0).await, expected);
+        assert_eq!(read_column(&builder, &plan, 0).await, vec![expected[0]]);
     }
 }
 

@@ -293,6 +293,9 @@ impl FormatFileReader for RowFormatReader {
             })?;
         index.validate_for_file(total_rows, index_start)?;
         validate_row_selection(total_rows, row_selection.as_deref())?;
+        // Public callers may supply unordered or overlapping ranges. Normalize
+        // once so every block can seek directly to its overlapping window.
+        let row_selection = row_selection.map(crate::table::merge_row_ranges);
 
         let schema = build_target_arrow_schema(read_fields)?;
         let row_type = read_fields.to_vec();
@@ -2294,11 +2297,8 @@ fn blocks_to_read(
         } else {
             total_rows
         };
-        let intersects = selection.is_none_or(|ranges| {
-            ranges
-                .iter()
-                .any(|r| (r.from() as usize) < end && (r.to() as usize) >= start)
-        });
+        let intersects =
+            selection.is_none_or(|ranges| !overlapping_ranges(ranges, start, end).is_empty());
         if intersects {
             result.push(block_idx);
         }
@@ -2315,7 +2315,7 @@ fn selected_local_indices(
         None => (0..block_end - block_start).collect(),
         Some(ranges) => {
             let mut result = Vec::new();
-            for range in ranges {
+            for range in overlapping_ranges(ranges, block_start, block_end) {
                 let start = (range.from() as usize).max(block_start);
                 let end = ((range.to() as usize) + 1).min(block_end);
                 if start < end {
@@ -2325,6 +2325,15 @@ fn selected_local_indices(
             result
         }
     }
+}
+
+/// Input is sorted, disjoint and nonnegative; `end` is exclusive.
+/// Never rescan a large prefix for each successive data block.
+fn overlapping_ranges(ranges: &[RowRange], start: usize, end: usize) -> &[RowRange] {
+    let first = ranges.partition_point(|range| (range.to() as usize) < start);
+    let suffix = &ranges[first..];
+    let count = suffix.partition_point(|range| (range.from() as usize) < end);
+    &suffix[..count]
 }
 
 fn i128_to_java_bigint_bytes(value: i128) -> Vec<u8> {
@@ -2642,7 +2651,11 @@ mod tests {
                 &fields,
                 None,
                 Some(8),
-                Some(vec![RowRange::new(1, 2)]),
+                Some(vec![
+                    RowRange::new(2, 2),
+                    RowRange::new(1, 2),
+                    RowRange::new(1, 1),
+                ]),
             )
             .await
             .unwrap()
@@ -2977,6 +2990,106 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; exact selection oracle, no timing assertions"]
+    fn benchmark_scalar_row_selection() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let rows = 1_200_000;
+        let block_rows = 1024;
+        let starts: Vec<_> = (0..rows).step_by(block_rows).map(|id| id as i64).collect();
+        let index =
+            RowBlockIndex::new(vec![1; starts.len()], vec![1; starts.len()], starts).unwrap();
+        for (name, run, stride) in [
+            ("90pct", 9, 10),
+            ("10pct", 1, 10),
+            ("contiguous", rows, rows),
+        ] {
+            let ranges: Vec<_> = (0..rows)
+                .step_by(stride)
+                .map(|id| RowRange::new(id as i64, (id + run - 1) as i64))
+                .collect();
+            let run_selection = || {
+                let blocks = blocks_to_read(&index, rows, Some(&ranges));
+                let mut selected = Vec::new();
+                for block in blocks {
+                    let start = index.block_row_start(block);
+                    let end = (start + block_rows).min(rows);
+                    selected.extend(
+                        selected_local_indices(start, end, Some(&ranges))
+                            .into_iter()
+                            .map(|id| start + id),
+                    );
+                }
+                selected
+            };
+            let expected: Vec<_> = ranges
+                .iter()
+                .flat_map(|r| r.from() as usize..=r.to() as usize)
+                .collect();
+            for _ in 0..3 {
+                assert_eq!(run_selection(), expected);
+            }
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let start = Instant::now();
+                let selected = run_selection();
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                assert_eq!(selected, expected);
+                black_box(selected);
+                samples.push(elapsed);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "ROW_SELECTION_BENCH case={name} ranges={} blocks={} median_ms={:.3}",
+                ranges.len(),
+                index.block_count(),
+                samples[3]
+            );
+        }
+    }
+
+    #[test]
+    fn row_selection_windows_match_independent_row_oracle() {
+        let index = RowBlockIndex::new(vec![1; 4], vec![1; 4], vec![0, 10, 20, 30]).unwrap();
+        for selection in [
+            None,
+            Some(vec![]),
+            Some(vec![RowRange::new(9, 11), RowRange::new(29, 39)]),
+            Some(vec![RowRange::new(0, 0), RowRange::new(39, 39)]),
+            Some(vec![RowRange::new(0, 39)]),
+        ] {
+            let expected: Vec<_> = (0..40)
+                .filter(|row| {
+                    selection.as_ref().is_none_or(|ranges| {
+                        ranges
+                            .iter()
+                            .any(|range| range.from() <= *row as i64 && *row as i64 <= range.to())
+                    })
+                })
+                .collect();
+            let blocks = blocks_to_read(&index, 40, selection.as_deref());
+            let mut actual = Vec::new();
+            for block in blocks {
+                actual.extend(
+                    selected_local_indices(block * 10, (block + 1) * 10, selection.as_deref())
+                        .into_iter()
+                        .map(|row| block * 10 + row),
+                );
+            }
+            assert_eq!(actual, expected);
+        }
+        let ranges: Vec<_> = (0..1_200_000)
+            .step_by(10)
+            .map(|row| RowRange::new(row, row))
+            .collect();
+        assert_eq!(
+            overlapping_ranges(&ranges, 1_199_989, 1_200_000),
+            &[RowRange::new(1_199_990, 1_199_990)]
+        );
+        assert!(overlapping_ranges(&ranges, 1_199_991, 1_200_000).is_empty());
     }
 
     #[tokio::test]

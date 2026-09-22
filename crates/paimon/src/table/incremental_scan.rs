@@ -256,11 +256,30 @@ impl<'a> IncrementalScan<'a> {
         Ok(self)
     }
 
+    /// Repack the combined APPEND-delta batch into deterministic chunks.
+    pub fn with_chunk_shuffle(
+        mut self,
+        seed: impl ToString,
+        chunk_size: u64,
+    ) -> crate::Result<Self> {
+        self.scan = self.scan.with_chunk_shuffle(seed, chunk_size)?;
+        Ok(self)
+    }
+
+    /// Select one balanced worker shard for a distributed scan.
+    pub fn with_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
+        self.scan = self.scan.with_shard(index, count)?;
+        Ok(self)
+    }
+
     pub async fn plan(&self) -> crate::Result<IncrementalPlan> {
         crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        if self.scan.has_row_position_selection() {
+        if self.scan.has_row_position_selection()
+            || self.scan.has_chunk_shuffle()
+            || self.scan.has_shard()
+        {
             return Err(crate::Error::Unsupported {
-                message: "Incremental row-position selection requires combined delta planning"
+                message: "Incremental row-position selection, chunk_shuffle and sharding require combined delta planning"
                     .into(),
             });
         }
@@ -274,6 +293,42 @@ impl<'a> IncrementalScan<'a> {
             IncrementalScanMode::Changelog => self.plan_changelog(mode).await,
             IncrementalScanMode::Auto => unreachable!("Auto must resolve before planning"),
             IncrementalScanMode::Diff => self.plan_diff(mode).await,
+        }
+    }
+
+    /// Plan a Delta or Changelog range as one ordinary [`Plan`].
+    ///
+    /// This is the bridge used by readers which already consume
+    /// [`DataSplit`]s. Delta keeps its cross-snapshot packing semantics;
+    /// Changelog preserves physical changelog files and row kinds in snapshot
+    /// order. `Auto` resolves from `changelog-producer`. Diff cannot be
+    /// represented by an ordinary split list because each unit contains a
+    /// before/after pair.
+    pub async fn plan_combined(&self) -> crate::Result<Plan> {
+        match self.resolve_mode() {
+            IncrementalScanMode::Delta => self.plan_combined_delta().await,
+            IncrementalScanMode::Changelog => {
+                let incremental = self.plan().await?;
+                let mut splits = Vec::with_capacity(incremental.splits().len());
+                for split in incremental.splits() {
+                    match split {
+                        IncrementalSplit::Data(split) => splits.push(split.clone()),
+                        IncrementalSplit::DiffPair { .. } => {
+                            return Err(crate::Error::UnexpectedError {
+                                message: "DiffPair appeared in a Changelog incremental plan"
+                                    .to_string(),
+                                source: None,
+                            });
+                        }
+                    }
+                }
+                Ok(Plan::new(splits).with_snapshot_id(self.end_inclusive))
+            }
+            IncrementalScanMode::Diff => Err(crate::Error::Unsupported {
+                message: "Combined incremental planning does not support Diff mode; Diff requires before/after split pairs"
+                    .to_string(),
+            }),
+            IncrementalScanMode::Auto => unreachable!("Auto must resolve before planning"),
         }
     }
 

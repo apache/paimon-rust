@@ -893,7 +893,7 @@ async fn test_rest_env_get_table_reuses_catalog_environment() {
 // on Windows elsewhere for the same opendal `fs` StripPrefixError.
 #[cfg(not(windows))]
 #[tokio::test]
-async fn test_blob_view_prescan_filters_invalid_filtered_out_reference() {
+async fn test_blob_view_limit_only_resolves_selected_references() {
     let tmp = tempfile::tempdir().unwrap();
     let warehouse = format!("file://{}", tmp.path().display());
 
@@ -924,7 +924,7 @@ async fn test_blob_view_prescan_filters_invalid_filtered_out_reference() {
     .await;
 
     let view_id = Identifier::new("default", "blob_view_target");
-    let view_schema = blob_schema(&[("blob-view-field", "picture")]);
+    let view_schema = blob_schema(&[("blob-view-field", "picture"), ("read.batch-size", "1")]);
     fs_catalog
         .create_table(&view_id, view_schema.clone(), false)
         .await
@@ -938,18 +938,23 @@ async fn test_blob_view_prescan_filters_invalid_filtered_out_reference() {
         .find(|field| field.name() == "picture")
         .unwrap()
         .id();
-    let filtered_out_bad_ref = BlobViewStruct::new(source_id.clone(), picture_field_id, 99)
+    let kept_ref = BlobViewStruct::new(source_id.clone(), picture_field_id, 1)
         .serialize()
         .unwrap();
-    let kept_ref = BlobViewStruct::new(source_id.clone(), picture_field_id, 1)
+    let filtered_out_bad_ref = BlobViewStruct::new(source_id.clone(), picture_field_id, 99)
         .serialize()
         .unwrap();
     write_batch(
         &view,
         blob_batch(
-            vec![1, 2],
-            vec!["Filtered", "Kept"],
-            vec![filtered_out_bad_ref, kept_ref],
+            vec![1, 2, 3, 4],
+            vec!["Kept", "Repeated", "Repeated again", "Filtered"],
+            vec![
+                kept_ref.clone(),
+                kept_ref.clone(),
+                kept_ref,
+                filtered_out_bad_ref,
+            ],
         ),
         "view-writer",
     )
@@ -980,7 +985,7 @@ async fn test_blob_view_prescan_filters_invalid_filtered_out_reference() {
 
     let rest_view = rest_catalog.get_table(&view_id).await.unwrap();
     let predicate = PredicateBuilder::new(rest_view.schema().fields())
-        .equal("id", Datum::Int(2))
+        .equal("id", Datum::Int(1))
         .unwrap();
     let mut read_builder = rest_view.new_read_builder();
     read_builder.with_filter(predicate);
@@ -995,7 +1000,60 @@ async fn test_blob_view_prescan_filters_invalid_filtered_out_reference() {
 
     assert_eq!(
         collect_blob_rows(&batches),
-        vec![(2, "Kept".to_string(), Some(b"bob".to_vec()))]
+        vec![(1, "Kept".to_string(), Some(b"bob".to_vec()))]
+    );
+
+    // LIMIT alone must not resolve the invalid reference in the fourth row.
+    // The repeated reference is read from the lookup cache in a later batch.
+    let mut limited_builder = rest_view.new_read_builder();
+    limited_builder.with_limit(2);
+    let limited_plan = limited_builder.new_scan().plan().await.unwrap();
+    let limited = limited_builder
+        .new_read()
+        .unwrap()
+        .to_arrow(limited_plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_blob_rows(&limited),
+        vec![
+            (1, "Kept".to_string(), Some(b"bob".to_vec())),
+            (2, "Repeated".to_string(), Some(b"bob".to_vec())),
+        ]
+    );
+
+    // A predicate on the resolved view needs candidate lookups. With batches
+    // of two, the final batch must not resolve the invalid fourth reference
+    // after the third match reaches LIMIT.
+    let predicate_view = rest_view.copy_with_options(HashMap::from([(
+        "read.batch-size".to_string(),
+        "2".to_string(),
+    )]));
+    let mut filtered_builder = predicate_view.new_read_builder();
+    filtered_builder.with_limit(3);
+    filtered_builder.with_filter(
+        PredicateBuilder::new(predicate_view.schema().fields())
+            .is_not_null("picture")
+            .unwrap(),
+    );
+    let filtered_plan = filtered_builder.new_scan().plan().await.unwrap();
+    let filtered = filtered_builder
+        .new_read()
+        .unwrap()
+        .to_arrow(filtered_plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_blob_rows(&filtered),
+        vec![
+            (1, "Kept".to_string(), Some(b"bob".to_vec())),
+            (2, "Repeated".to_string(), Some(b"bob".to_vec())),
+            (3, "Repeated again".to_string(), Some(b"bob".to_vec())),
+        ]
     );
 }
 

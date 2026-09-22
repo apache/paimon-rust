@@ -1223,8 +1223,7 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_MANIFEST_TARGET_FILE_SIZE)
     }
 
-    /// Minimum number of small manifest files required before minor manifest
-    /// compaction rewrites them into a new rolling manifest set.
+    /// Compatibility option; Rust commits do not currently compact manifests.
     pub fn manifest_merge_min_count(&self) -> usize {
         self.options
             .get(MANIFEST_MERGE_MIN_COUNT_OPTION)
