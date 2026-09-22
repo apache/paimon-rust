@@ -154,6 +154,36 @@ def test_deserialized_batch_commit_uses_target_builder(tmp_path):
     assert _rows(table) == [1]
 
 
+@pytest.mark.parametrize("overwrite", [False, True])
+@pytest.mark.parametrize("serialized", [False, True])
+def test_batch_bridge_preserves_external_commit_user(tmp_path, overwrite, serialized):
+    table = _table(tmp_path, primary_key=True, options={"bucket": "1"})
+    _append(table, [1], [10])
+    builder = table.new_batch_write_builder()
+    assert builder._with_commit_user("python-batch-job") is builder
+    if overwrite:
+        builder.with_overwrite()
+    messages = _prepare(builder, [2], [20])
+    if serialized:
+        messages = _roundtrip(messages)
+    builder.new_commit().commit(messages)
+    assert _rows(table) == ([2] if overwrite else [1, 2])
+    snapshot = _snapshot(table)
+    assert snapshot["commitUser"] == "python-batch-job"
+    assert snapshot["commitIdentifier"] == 2**63 - 1
+
+
+@pytest.mark.parametrize("user", ["", "../job", "a/b"])
+def test_invalid_batch_bridge_commit_user_preserves_identity(tmp_path, user):
+    table = _table(tmp_path)
+    builder = table.new_batch_write_builder()._with_commit_user("python-batch-job")
+    with pytest.raises(ValueError):
+        builder._with_commit_user(user)
+    builder.new_commit().commit(_prepare(builder, [1], [10]))
+    assert _snapshot(table)["commitUser"] == "python-batch-job"
+    assert _rows(table) == [1]
+
+
 def test_abort_serialized_messages_deletes_files(tmp_path):
     table = _table(tmp_path)
     builder = table.new_batch_write_builder()
