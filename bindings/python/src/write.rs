@@ -189,6 +189,20 @@ impl PyBatchWriteBuilder {
 
 #[pymethods]
 impl PyBatchWriteBuilder {
+    /// Internal PyPaimon bridge: retain the identity of the external Python writer.
+    fn _with_commit_user(
+        mut slf: PyRefMut<'_, Self>,
+        commit_user: String,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.context
+            .table
+            .new_write_builder()
+            .with_commit_user(commit_user.clone())
+            .map_err(to_py_err)?;
+        slf.context.commit_user = commit_user;
+        Ok(slf)
+    }
+
     /// No argument enables overwrite with an empty spec; explicit None restores append.
     #[pyo3(signature = (static_partition=Some(HashMap::new())))]
     fn with_overwrite<'py>(

@@ -252,6 +252,9 @@ class StreamTableCommit:
     def abort(self, messages: Sequence[CommitMessage]) -> None: ...
 
 class BatchWriteBuilder:
+    def _with_commit_user(self, commit_user: str) -> "BatchWriteBuilder":
+        """Internal PyPaimon bridge for commits produced by an external Python writer."""
+        ...
     def with_overwrite(self, static_partition: Optional[Dict[str, Any]] = {}) -> "BatchWriteBuilder":
         """Configure both writer and committer. Explicit None restores append.
 
