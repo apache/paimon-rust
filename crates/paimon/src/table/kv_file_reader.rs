@@ -25,7 +25,7 @@
 //!
 //! Reference: Java Paimon `SortMergeReaderWithMinHeap`.
 
-use super::data_file_reader::DataFileReader;
+use super::data_file_reader::{is_row_file, DataFileReader};
 use super::sort_merge::{
     AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, MergeFunction,
     PartialUpdateMergeFunction, SortMergeReaderBuilder,
@@ -173,6 +173,42 @@ fn ensure_merge_input_limit(input_stream_count: usize, limit: Option<usize>) -> 
         });
     }
     Ok(())
+}
+
+/// Java's `KeyValueFieldsExtractor` builds the physical file layout from the
+/// schema that wrote the file, including its historical key names and types.
+fn key_value_row_format_fields(
+    file_fields: &[DataField],
+    trimmed_primary_keys: &[String],
+) -> crate::Result<Vec<DataField>> {
+    let mut physical = Vec::with_capacity(trimmed_primary_keys.len() + 2 + file_fields.len());
+    for name in trimmed_primary_keys {
+        let field = file_fields
+            .iter()
+            .find(|field| field.name() == name)
+            .ok_or_else(|| Error::DataInvalid {
+                message: format!("KV .row key field '{name}' is absent from the file schema"),
+                source: None,
+            })?;
+        physical.push(
+            field
+                .clone()
+                .with_name(format!("_KEY_{name}"))
+                .with_id(field.id() + 1_000_000),
+        );
+    }
+    physical.push(DataField::new(
+        SEQUENCE_NUMBER_FIELD_ID,
+        SEQUENCE_NUMBER_FIELD_NAME.to_string(),
+        PaimonDataType::BigInt(BigIntType::new()),
+    ));
+    physical.push(DataField::new(
+        VALUE_KIND_FIELD_ID,
+        VALUE_KIND_FIELD_NAME.to_string(),
+        PaimonDataType::TinyInt(TinyIntType::new()),
+    ));
+    physical.extend_from_slice(file_fields);
+    Ok(physical)
 }
 
 struct MergeRun {
@@ -596,18 +632,32 @@ impl KeyValueFileReader {
                         .with_batch_size(Some(config.read_batch_size))
                         .with_parquet_read_budget(group_parquet_read_budget.clone())
                         .with_table_options(config.table_options.clone())
-                        .with_row_key_names(config.primary_keys.clone())
                         .with_mosaic_prefetch(config.mosaic_prefetch);
                         let run_schema_manager = config.schema_manager.clone();
+                        let run_table_fields = config.table_fields.clone();
+                        let run_primary_keys = config.primary_keys.clone();
                         let run_file_io = file_io.clone();
                         let deletion_files_by_split = deletion_files_by_split.clone();
                         let run_stream: ArrowRecordBatchStream = Box::pin(try_stream! {
                             for MergeFile { split, file: file_meta } in files {
-                                let data_fields: Option<Vec<DataField>> =
+                                let data_schema =
                                     if file_meta.schema_id != table_schema_id {
-                                        let data_schema =
-                                            run_schema_manager.schema(file_meta.schema_id).await?;
-                                        Some(data_schema.fields().to_vec())
+                                        Some(run_schema_manager.schema(file_meta.schema_id).await?)
+                                    } else {
+                                        None
+                                    };
+                                let data_fields = data_schema.as_ref().map(|schema| schema.fields().to_vec());
+                                let row_reader = if is_row_file(&file_meta) {
+                                    let file_fields = data_schema
+                                        .as_ref()
+                                        .map_or(run_table_fields.as_slice(), |schema| schema.fields());
+                                    let file_key_names = data_schema
+                                        .as_ref()
+                                        .map(|schema| schema.trimmed_primary_keys());
+                                    let key_names = file_key_names.as_deref().unwrap_or(&run_primary_keys);
+                                    Some(reader.clone().with_row_format_fields(
+                                        key_value_row_format_fields(file_fields, key_names)?,
+                                    ))
                                 } else {
                                     None
                                 };
@@ -621,7 +671,7 @@ impl KeyValueFileReader {
                                     )),
                                     None => None,
                                 };
-                                let mut file_stream = reader.read_single_file_stream(
+                                let mut file_stream = row_reader.as_ref().unwrap_or(&reader).read_single_file_stream(
                                     split.as_ref(),
                                     file_meta,
                                     data_fields,
@@ -729,6 +779,8 @@ impl KeyValueFileReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arrow::build_target_arrow_schema;
+    use crate::arrow::format::create_format_writer;
     use crate::catalog::Identifier;
     use crate::deletion_vector::DeletionVector;
     use crate::io::FileIOBuilder;
@@ -749,6 +801,117 @@ mod tests {
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn kv_row_layout_preserves_file_schema_key_names_and_fields() {
+        let fields = vec![
+            DataField::new(0, "old_id".to_string(), DataType::Int(IntType::new()))
+                .with_description(Some("sort key".to_string())),
+            DataField::new(1, "value".to_string(), DataType::Int(IntType::new())),
+        ];
+        let physical = key_value_row_format_fields(&fields, &["old_id".to_string()]).unwrap();
+        assert_eq!(
+            physical.iter().map(DataField::name).collect::<Vec<_>>(),
+            vec![
+                "_KEY_old_id",
+                "_SEQUENCE_NUMBER",
+                "_VALUE_KIND",
+                "old_id",
+                "value"
+            ]
+        );
+        assert_eq!(physical[0].id(), 1_000_000);
+        assert_eq!(physical[0].description(), Some("sort key"));
+        assert_eq!(&physical[3..], fields);
+        assert!(key_value_row_format_fields(&fields, &["id".to_string()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn kv_row_read_uses_historical_schema_for_renamed_key() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_row_renamed_key";
+        setup_dirs(&file_io, table_path).await;
+        let old_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("old_id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["old_id"])
+                .option("bucket", "1")
+                .build()
+                .unwrap(),
+        );
+        let current_schema = TableSchema::new(
+            1,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .build()
+                .unwrap(),
+        );
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "kv_row_renamed_key"),
+            table_path.to_string(),
+            current_schema,
+            None,
+        );
+        write_schema_file(&table, &old_schema).await;
+
+        let physical =
+            key_value_row_format_fields(old_schema.fields(), &old_schema.trimmed_primary_keys())
+                .unwrap();
+        let schema = build_target_arrow_schema(&physical).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int8Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![7])),
+                Arc::new(Int32Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        let bucket_path = format!("{table_path}/bucket-0");
+        let file_name = "part-0.row";
+        let output = file_io
+            .new_output(&format!("{bucket_path}/{file_name}"))
+            .unwrap();
+        let mut writer = create_format_writer(&output, schema, "zstd", 1, None, None, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        let file_size = writer.close().await.unwrap().file_size as i64;
+
+        let mut file = dummy_data_file(file_name.to_string());
+        file.file_size = file_size;
+        file.min_key = int_key(7);
+        file.max_key = int_key(7);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(vec![file])
+            .with_raw_convertible(false)
+            .build()
+            .unwrap();
+        let batches = table
+            .new_read_builder()
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(int_column(&batches, "id"), vec![7]);
+        assert_eq!(int_column(&batches, "value"), vec![42]);
+    }
 
     #[tokio::test]
     async fn test_row_id_filter_on_a_primary_key_table_is_rejected() {
