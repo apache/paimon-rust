@@ -30,8 +30,7 @@ use super::partition_filter::PartitionFilter;
 use super::row_position_selection::RowPositionSelection;
 use super::stats_filter::{
     data_evolution_group_matches_predicates_for_table, data_file_matches_predicates_for_table,
-    data_file_matches_predicates_with_key_stats, group_by_overlapping_row_id, FileStatsRows,
-    ResolvedStatsSchema,
+    data_file_matches_predicates_with_key_stats, group_by_overlapping_row_id, ResolvedStatsSchema,
 };
 use super::{find_field_id_by_name, Table};
 use crate::io::FileIO;
@@ -276,21 +275,7 @@ async fn read_all_manifest_entries(
     // whose partition range doesn't overlap the partition predicate.
     let manifest_files_before_partition_pruning = manifest_files.len();
     if let Some(pf) = partition_filter {
-        if !partition_fields.is_empty() {
-            manifest_files.retain(|meta| {
-                let stats = meta.partition_stats();
-                let min_values = BinaryRow::from_serialized_bytes(stats.min_values()).ok();
-                let max_values = BinaryRow::from_serialized_bytes(stats.max_values()).ok();
-                let null_counts = stats.null_counts().clone();
-                let file_stats = FileStatsRows::for_manifest_partition(
-                    meta.num_added_files() + meta.num_deleted_files(),
-                    min_values,
-                    max_values,
-                    null_counts,
-                );
-                pf.matches_manifest(&file_stats, partition_fields)
-            });
-        }
+        manifest_files.retain(|meta| pf.matches_manifest(meta, partition_fields));
     }
     if let Some(trace) = trace.as_deref_mut() {
         trace.manifest_files_before_partition_pruning = manifest_files_before_partition_pruning;
@@ -2112,21 +2097,7 @@ impl<'a> PaimonTableScan<'a> {
             read_manifest_list(file_io, table_path, manifest_list_name).await?;
 
         if let Some(pf) = self.partition_filter.as_ref() {
-            if !partition_fields.is_empty() {
-                manifest_metas.retain(|meta| {
-                    let stats = meta.partition_stats();
-                    let min_values = BinaryRow::from_serialized_bytes(stats.min_values()).ok();
-                    let max_values = BinaryRow::from_serialized_bytes(stats.max_values()).ok();
-                    let null_counts = stats.null_counts().clone();
-                    let file_stats = FileStatsRows::for_manifest_partition(
-                        meta.num_added_files() + meta.num_deleted_files(),
-                        min_values,
-                        max_values,
-                        null_counts,
-                    );
-                    pf.matches_manifest(&file_stats, &partition_fields)
-                });
-            }
+            manifest_metas.retain(|meta| pf.matches_manifest(meta, &partition_fields));
         }
         if let Some(index) = row_range_index {
             retain_manifest_row_ranges(&mut manifest_metas, index);

@@ -406,6 +406,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pinned_snapshot_preserves_read_schema_without_rereading() {
+        let (file_io, table_path) = setup_evolved_table().await;
+        let table = latest_table(&file_io, &table_path)
+            .copy_with_options(options(&[("scan.version", "2"), ("custom", "value")]));
+        let manager = table.snapshot_manager();
+        let snapshot = manager.get_snapshot(1).await.unwrap();
+        // Pinning and later resolution must reuse the supplied snapshot, not
+        // read it again or switch the table's schema to schema 0.
+        file_io
+            .delete_file(&manager.snapshot_path(1))
+            .await
+            .unwrap();
+        let pinned = table.copy_with_pinned_snapshot(&snapshot);
+        assert_eq!(pinned.schema().id(), table.schema().id());
+        assert_eq!(pinned.schema().fields(), table.schema().fields());
+        assert_eq!(pinned.schema().options().get("custom").unwrap(), "value");
+        assert!(!pinned.schema().options().contains_key("scan.version"));
+        assert_eq!(
+            pinned.schema().options().get("scan.snapshot-id").unwrap(),
+            "1"
+        );
+        assert_eq!(
+            super::resolve_snapshot(&pinned).await.unwrap().unwrap(),
+            snapshot
+        );
+        assert!(pinned.new_write_builder().new_write().is_err());
+        assert!(table.travel_snapshot().is_none());
+    }
+
+    #[tokio::test]
     async fn test_copy_with_time_travel_same_schema_still_rejects_write() {
         let (file_io, table_path) = setup_evolved_table().await;
         let table = latest_table(&file_io, &table_path);

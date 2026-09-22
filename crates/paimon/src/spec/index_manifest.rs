@@ -216,7 +216,7 @@ mod tests {
                                 DeletionVectorMeta {
                                     offset: 31,
                                     length: 22,
-                                    cardinality: None,
+                                    cardinality: has_cardinality.then_some(4),
                                 },
                             ),
                         ])),
@@ -224,14 +224,53 @@ mod tests {
                         global_index_meta: None,
                     },
                 };
-                // Two entries also catch a cursor shifted past the final DV.
-                let entries = vec![entry.clone(), entry];
+                // The second entry also catches cursor shifts and verifies that
+                // unknown cardinalities retain their file-name mapping.
+                let mut partially_unknown = entry.clone();
+                partially_unknown
+                    .index_file
+                    .deletion_vectors_ranges
+                    .as_mut()
+                    .unwrap()
+                    .insert(
+                        "data-unknown.parquet".into(),
+                        DeletionVectorMeta {
+                            offset: 53,
+                            length: 18,
+                            cardinality: None,
+                        },
+                    );
+                let entries = vec![entry, partially_unknown];
                 let bytes = crate::spec::to_avro_bytes(&schema.to_string(), &entries).unwrap();
                 assert_eq!(
                     IndexManifest::read_from_bytes(&bytes).unwrap(),
                     entries,
                     "nullable_items={nullable_items}, has_cardinality={has_cardinality}"
                 );
+                let mut seen = 0;
+                crate::spec::avro::visit_slim_index_manifest_entries(
+                    &bytes,
+                    &crate::spec::avro::SharedSchemaCache::new(),
+                    &mut |entry| {
+                        let expected = &entries[seen];
+                        assert_eq!(entry.bucket, expected.bucket);
+                        assert_eq!(
+                            entry.deletion_vector_cardinalities,
+                            expected
+                                .index_file
+                                .deletion_vectors_ranges
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .map(|(name, meta)| (name.as_str(), meta.cardinality))
+                                .collect()
+                        );
+                        seen += 1;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(seen, entries.len());
             }
         }
     }
@@ -264,7 +303,7 @@ mod tests {
                     DeletionVectorMeta {
                         offset: 17,
                         length: 31,
-                        cardinality: Some(2),
+                        cardinality: Some(-1),
                     },
                 )])),
                 external_path: Some("memory:/external/index".into()),
@@ -303,10 +342,36 @@ mod tests {
             "future".into(),
             Value::Array(vec![Value::String("ignored".into())]),
         ));
+        // Last duplicate wins: full decoding preserves the negative cardinality,
+        // while slim decoding must report it as unknown, not retain the earlier 2.
+        let last = Value::Union(1, Box::new(Value::Record(fields.clone())));
+        fields
+            .iter_mut()
+            .find(|(name, _)| name == "_CARDINALITY")
+            .unwrap()
+            .1 = Value::Union(1, Box::new(Value::Long(2)));
+        items.push(last);
         let mut writer = apache_avro::Writer::new(&schema, Vec::new());
         writer.append(value.resolve(&schema).unwrap()).unwrap();
         let bytes = writer.into_inner().unwrap();
         assert_eq!(IndexManifest::read_from_bytes(&bytes).unwrap(), vec![entry]);
+
+        let mut seen = 0;
+        crate::spec::avro::visit_slim_index_manifest_entries(
+            &bytes,
+            &crate::spec::avro::SharedSchemaCache::new(),
+            &mut |entry| {
+                assert_eq!(entry.bucket, 7);
+                assert_eq!(
+                    entry.deletion_vector_cardinalities,
+                    std::collections::HashMap::from([("data.parquet", None)])
+                );
+                seen += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, 1);
     }
 
     #[test]

@@ -21,8 +21,8 @@
 
 use crate::predicate_stats::data_leaf_may_match;
 use crate::spec::{
-    eval_row, extract_datum, BinaryRow, BinaryRowBuilder, DataField, Datum, Predicate,
-    PredicateBuilder, PredicateOperator,
+    eval_row, extract_datum, BinaryRow, BinaryRowBuilder, DataField, Datum, ManifestFileMeta,
+    Predicate, PredicateBuilder, PredicateOperator,
 };
 use crate::table::stats_filter::FileStatsRows;
 use std::collections::HashSet;
@@ -32,6 +32,11 @@ use std::collections::HashSet;
 pub(crate) struct FieldBounds {
     min: Predicate,
     max: Predicate,
+}
+
+struct FieldCandidates<'a> {
+    predicate: &'a Predicate,
+    values: Vec<Option<&'a Datum>>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,10 +58,9 @@ impl PartitionFilter {
         }
 
         let num_fields = partition_fields.len();
-        let mut field_candidates: Vec<Option<Vec<Option<&Datum>>>> = vec![None; num_fields];
-        if !collect_eq_candidates(&predicate, &mut field_candidates) {
-            return PartitionFilter::Predicate(predicate);
-        }
+        let mut field_candidates = (0..num_fields).map(|_| None).collect::<Vec<_>>();
+        let mut residuals = Vec::new();
+        collect_eq_candidates(&predicate, &mut field_candidates, &mut residuals);
 
         if field_candidates.iter().any(|c| c.is_none()) {
             return PartitionFilter::Predicate(predicate);
@@ -67,7 +71,7 @@ impl PartitionFilter {
         loop {
             let mut builder = BinaryRowBuilder::new(num_fields as i32);
             for i in 0..num_fields {
-                let vals = field_candidates[i].as_ref().unwrap();
+                let vals = &field_candidates[i].as_ref().unwrap().values;
                 match vals[combo[i]] {
                     Some(datum) => {
                         builder.write_datum(i, datum, partition_fields[i].data_type());
@@ -75,13 +79,44 @@ impl PartitionFilter {
                     None => builder.set_null_at(i),
                 }
             }
-            partitions.insert(builder.build_serialized());
+            let row = builder.build();
+            // Prove the selected constraint with one comparison, not an IN rescan.
+            // Fall back if encoding changes a literal (e.g. timestamp precision)
+            // or it is not equal to itself (NaN), preserving full evaluation.
+            for (i, candidate) in field_candidates.iter().enumerate() {
+                let FieldCandidates {
+                    predicate: Predicate::Leaf { data_type, .. },
+                    values,
+                } = candidate.as_ref().unwrap()
+                else {
+                    return PartitionFilter::Predicate(predicate);
+                };
+                match extract_datum(&row, i, data_type) {
+                    Ok(value) if value.as_ref() == values[combo[i]] => {}
+                    _ => return PartitionFilter::Predicate(predicate),
+                }
+            }
+            let matches = residuals.iter().try_fold(true, |matched, residual| {
+                if matched {
+                    eval_row(residual, &row)
+                } else {
+                    Ok(false)
+                }
+            });
+            match matches {
+                Ok(true) => {
+                    partitions.insert(row.to_serialized_bytes());
+                }
+                Ok(false) => {}
+                // Keep construction infallible; entry matching reports evaluation errors.
+                Err(_) => return PartitionFilter::Predicate(predicate),
+            }
 
             let mut carry = true;
             for i in (0..num_fields).rev() {
                 if carry {
                     combo[i] += 1;
-                    if combo[i] < field_candidates[i].as_ref().unwrap().len() {
+                    if combo[i] < field_candidates[i].as_ref().unwrap().values.len() {
                         carry = false;
                     } else {
                         combo[i] = 0;
@@ -93,6 +128,7 @@ impl PartitionFilter {
             }
         }
 
+        // These bounds may be wider than the retained set, but remain safe for pruning.
         let bounds = match build_bounds_from_candidates(&field_candidates, partition_fields) {
             Some(b) => b,
             None => return PartitionFilter::Predicate(predicate),
@@ -125,21 +161,31 @@ impl PartitionFilter {
 
     pub(super) fn matches_manifest(
         &self,
-        stats: &FileStatsRows,
+        meta: &ManifestFileMeta,
         partition_fields: &[DataField],
     ) -> bool {
+        if partition_fields.is_empty() {
+            return true;
+        }
+        let stats = meta.partition_stats();
+        let stats = FileStatsRows::for_manifest_partition(
+            meta.num_added_files() + meta.num_deleted_files(),
+            BinaryRow::from_serialized_bytes(stats.min_values()).ok(),
+            BinaryRow::from_serialized_bytes(stats.max_values()).ok(),
+            stats.null_counts().clone(),
+        );
         match self {
             PartitionFilter::PartitionSet { bounds, .. } => {
                 for b in bounds {
-                    if !predicate_may_match(&b.min, stats, partition_fields)
-                        || !predicate_may_match(&b.max, stats, partition_fields)
+                    if !predicate_may_match(&b.min, &stats, partition_fields)
+                        || !predicate_may_match(&b.max, &stats, partition_fields)
                     {
                         return false;
                     }
                 }
                 true
             }
-            PartitionFilter::Predicate(pred) => predicate_may_match(pred, stats, partition_fields),
+            PartitionFilter::Predicate(pred) => predicate_may_match(pred, &stats, partition_fields),
         }
     }
 }
@@ -177,7 +223,7 @@ fn predicate_may_match(
 
 /// Build per-field min/max bounds from candidate values (from `collect_eq_candidates`).
 fn build_bounds_from_candidates(
-    field_candidates: &[Option<Vec<Option<&Datum>>>],
+    field_candidates: &[Option<FieldCandidates<'_>>],
     partition_fields: &[DataField],
 ) -> Option<Vec<FieldBounds>> {
     let pb = PredicateBuilder::new(partition_fields);
@@ -185,7 +231,7 @@ fn build_bounds_from_candidates(
         .iter()
         .enumerate()
         .map(|(i, candidates)| {
-            let vals = candidates.as_ref().unwrap();
+            let vals = &candidates.as_ref().unwrap().values;
             build_field_bounds(&pb, partition_fields[i].name(), vals)
         })
         .collect()
@@ -275,47 +321,47 @@ fn build_field_bounds(
 
 /// Collect `Eq`/`In`/`IsNull` candidate values per partition field.
 ///
-/// Returns `false` as soon as any node of the tree is not fully represented by
-/// the collected candidates. Callers must then keep the original predicate: a
-/// `PartitionSet` is the sole authority in `matches_entry`, which never looks at
-/// the predicate again, and `ReadBuilder::is_exact_filter_pushdown` lets
-/// DataFusion drop its residual filter for a partition-only predicate.
+/// Preserve every other condition, including earlier constraints on the same
+/// field, as a residual to evaluate before inserting a candidate partition.
+/// A `PartitionSet` is the sole authority in `matches_entry`, and exact partition
+/// filter pushdown lets DataFusion drop its residual filter, so the set must
+/// enforce the complete predicate.
 fn collect_eq_candidates<'a>(
     predicate: &'a Predicate,
-    field_candidates: &mut Vec<Option<Vec<Option<&'a Datum>>>>,
-) -> bool {
+    field_candidates: &mut [Option<FieldCandidates<'a>>],
+    residuals: &mut Vec<&'a Predicate>,
+) {
     match predicate {
-        Predicate::And(children) => children
-            .iter()
-            .all(|child| collect_eq_candidates(child, field_candidates)),
+        Predicate::And(children) => {
+            for child in children {
+                collect_eq_candidates(child, field_candidates, residuals);
+            }
+        }
         Predicate::Leaf {
             index,
             op,
             literals,
             ..
         } if *index < field_candidates.len() => {
-            // A second conjunct on the same field used to overwrite the first,
-            // keeping only whichever came last.
-            if field_candidates[*index].is_some() {
-                return false;
-            }
-            match op {
-                PredicateOperator::Eq if !literals.is_empty() => {
-                    field_candidates[*index] = Some(vec![Some(&literals[0])]);
-                    true
-                }
+            let values = match op {
+                PredicateOperator::Eq if !literals.is_empty() => vec![Some(&literals[0])],
                 PredicateOperator::In if !literals.is_empty() => {
-                    field_candidates[*index] = Some(literals.iter().map(Some).collect());
-                    true
+                    literals.iter().map(Some).collect()
                 }
-                PredicateOperator::IsNull => {
-                    field_candidates[*index] = Some(vec![None]);
-                    true
+                PredicateOperator::IsNull => vec![None],
+                _ => {
+                    residuals.push(predicate);
+                    return;
                 }
-                _ => false,
+            };
+            if let Some(previous) =
+                field_candidates[*index].replace(FieldCandidates { predicate, values })
+            {
+                // A later constraint on the same field does not supersede the earlier one.
+                residuals.push(previous.predicate);
             }
         }
-        _ => false,
+        _ => residuals.push(predicate),
     }
 }
 
@@ -341,6 +387,64 @@ mod tests {
             "dt".to_string(),
             DataType::VarChar(VarCharType::default()),
         )]
+    }
+
+    #[test]
+    fn test_manifest_pruning_uses_partition_statistics() {
+        use crate::spec::stats::BinaryTableStats;
+
+        let fields = partition_fields_dt();
+        let pb = PredicateBuilder::new(&fields);
+        let mut min = BinaryRowBuilder::new(1);
+        min.write_string(0, "2024-01-01");
+        let mut max = BinaryRowBuilder::new(1);
+        max.write_string(0, "2024-01-03");
+        let meta = ManifestFileMeta::new(
+            "manifest".into(),
+            1,
+            10,
+            5,
+            BinaryTableStats::new(
+                min.build_serialized(),
+                max.build_serialized(),
+                vec![Some(0)],
+            ),
+            0,
+        );
+        for (predicate, expected) in [
+            (
+                pb.equal("dt", Datum::String("2024-01-02".into())).unwrap(),
+                true,
+            ),
+            (
+                pb.equal("dt", Datum::String("2024-01-04".into())).unwrap(),
+                false,
+            ),
+            (
+                pb.greater_than("dt", Datum::String("2024-01-01".into()))
+                    .unwrap(),
+                true,
+            ),
+            (
+                pb.greater_than("dt", Datum::String("2024-01-03".into()))
+                    .unwrap(),
+                false,
+            ),
+            (pb.is_null("dt").unwrap(), false),
+        ] {
+            let filter = PartitionFilter::from_predicate(predicate, &fields);
+            assert_eq!(filter.matches_manifest(&meta, &fields), expected);
+            assert!(filter.matches_manifest(&meta, &[]));
+            let unknown = ManifestFileMeta::new(
+                "unknown-stats".into(),
+                1,
+                10,
+                5,
+                BinaryTableStats::new(vec![0xFF], vec![0xFF], vec![]),
+                0,
+            );
+            assert!(filter.matches_manifest(&unknown, &fields));
+        }
     }
 
     #[test]
@@ -448,6 +552,171 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_candidates_preserve_all_conjuncts() {
+        let fields = partition_fields_dt();
+        let pb = PredicateBuilder::new(&fields);
+        let a = pb.equal("dt", Datum::String("a".into())).unwrap();
+        let b = pb.equal("dt", Datum::String("b".into())).unwrap();
+        let candidates = pb
+            .is_in(
+                "dt",
+                vec![Datum::String("a".into()), Datum::String("b".into())],
+            )
+            .unwrap();
+        for (predicate, expected) in [
+            (
+                Predicate::and(vec![
+                    candidates.clone(),
+                    pb.greater_than("dt", Datum::String("a".into())).unwrap(),
+                ]),
+                vec![Some("b")],
+            ),
+            (
+                Predicate::and(vec![
+                    candidates.clone(),
+                    pb.is_in(
+                        "dt",
+                        vec![Datum::String("b".into()), Datum::String("c".into())],
+                    )
+                    .unwrap(),
+                ]),
+                vec![Some("b")],
+            ),
+            (Predicate::and(vec![a.clone(), b.clone()]), vec![]),
+            (
+                Predicate::and(vec![
+                    candidates.clone(),
+                    Predicate::or(vec![b, pb.equal("dt", Datum::String("c".into())).unwrap()]),
+                ]),
+                vec![Some("b")],
+            ),
+            (
+                Predicate::and(vec![candidates, Predicate::negate(a)]),
+                vec![Some("b")],
+            ),
+            (
+                Predicate::and(vec![
+                    pb.is_null("dt").unwrap(),
+                    pb.is_not_null("dt").unwrap(),
+                ]),
+                vec![],
+            ),
+        ] {
+            let filter = PartitionFilter::from_predicate(predicate.clone(), &fields);
+            assert!(matches!(filter, PartitionFilter::PartitionSet { .. }));
+            for value in [None, Some("a"), Some("b"), Some("c")] {
+                let mut row = BinaryRowBuilder::new(1);
+                match value {
+                    Some(value) => {
+                        row.write_datum(0, &Datum::String(value.into()), fields[0].data_type())
+                    }
+                    None => row.set_null_at(0),
+                }
+                assert_eq!(
+                    filter.matches_entry(&row.build_serialized()).unwrap(),
+                    expected.contains(&value),
+                    "{predicate:?}, {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_large_in_candidates_with_residual_filters() {
+        let fields = vec![DataField::new(
+            0,
+            "id".into(),
+            DataType::Int(IntType::new()),
+        )];
+        let pb = PredicateBuilder::new(&fields);
+        for size in [2_000, 4_000] {
+            for with_range in [false, true] {
+                let list = pb.is_in("id", (0..size).map(Datum::Int).collect()).unwrap();
+                let predicate = if with_range {
+                    Predicate::and(vec![
+                        list,
+                        pb.greater_or_equal("id", Datum::Int(size / 2)).unwrap(),
+                    ])
+                } else {
+                    list
+                };
+                {
+                    let mut candidates = vec![None];
+                    let mut residuals = Vec::new();
+                    collect_eq_candidates(&predicate, &mut candidates, &mut residuals);
+                    assert_eq!(candidates[0].as_ref().unwrap().values.len(), size as usize);
+                    assert_eq!(residuals.len(), usize::from(with_range));
+                    assert!(residuals.iter().all(|p| matches!(
+                        p,
+                        Predicate::Leaf {
+                            op: PredicateOperator::GtEq,
+                            ..
+                        }
+                    )));
+                }
+                let started = std::time::Instant::now();
+                let filter = PartitionFilter::from_predicate(predicate, &fields);
+                println!(
+                    "IN size={size}, range={with_range}: {:?}",
+                    started.elapsed()
+                );
+                let PartitionFilter::PartitionSet { partitions, .. } = &filter else {
+                    panic!("large IN must retain constant-time partition lookup");
+                };
+                assert_eq!(
+                    partitions.len(),
+                    if with_range { size / 2 } else { size } as usize
+                );
+                for value in [-1, 0, size / 2 - 1, size / 2, size - 1, size] {
+                    let mut row = BinaryRowBuilder::new(1);
+                    row.write_int(0, value);
+                    assert_eq!(
+                        filter.matches_entry(&row.build_serialized()).unwrap(),
+                        (if with_range { size / 2 } else { 0 }..size).contains(&value)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_roundtripping_candidates_keep_full_predicate() {
+        let timestamp = |millis, nanos| Datum::Timestamp { millis, nanos };
+        for (data_type, literals, probes) in [
+            (
+                DataType::Double(crate::spec::DoubleType::new()),
+                vec![Datum::Double(f64::NAN), Datum::Double(1.0)],
+                vec![
+                    (Datum::Double(f64::NAN), false),
+                    (Datum::Double(1.0), true),
+                    (Datum::Double(2.0), false),
+                ],
+            ),
+            (
+                DataType::Timestamp(crate::spec::TimestampType::new(3).unwrap()),
+                vec![timestamp(5, 1), timestamp(5, 0)],
+                vec![(timestamp(5, 0), true), (timestamp(6, 0), false)],
+            ),
+        ] {
+            let fields = vec![DataField::new(0, "key".into(), data_type.clone())];
+            let predicate = PredicateBuilder::new(&fields)
+                .is_in("key", literals)
+                .unwrap();
+            let filter = PartitionFilter::from_predicate(predicate, &fields);
+            assert!(matches!(filter, PartitionFilter::Predicate(_)));
+            for (value, expected) in probes {
+                let mut row = BinaryRowBuilder::new(1);
+                row.write_datum(0, &value, &data_type);
+                assert_eq!(
+                    filter.matches_entry(&row.build_serialized()).unwrap(),
+                    expected,
+                    "{value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_range_predicate_falls_back() {
         let fields = partition_fields_dt();
         let pb = PredicateBuilder::new(&fields);
@@ -481,9 +750,9 @@ mod tests {
         builder.build_serialized()
     }
 
-    /// Coverage is complete, but `>=` is not expressible as a set of values.
+    /// A residual range must reject a candidate that contradicts it.
     #[test]
-    fn test_unexpressible_conjunct_on_covered_field_falls_back() {
+    fn test_unexpressible_conjunct_on_covered_field_is_preserved() {
         let fields = partition_fields_dt();
         let pb = PredicateBuilder::new(&fields);
         let pred = Predicate::and(vec![
@@ -492,7 +761,6 @@ mod tests {
                 .unwrap(),
         ]);
         let filter = PartitionFilter::from_predicate(pred, &fields);
-        assert!(matches!(filter, PartitionFilter::Predicate(_)));
         assert!(!filter
             .matches_entry(&serialized_dt(&fields, "2024-01-01"))
             .unwrap());
@@ -501,7 +769,7 @@ mod tests {
     /// Two expressible conjuncts on one field: the second assignment used to
     /// overwrite the first, keeping whichever came last — here the wider `In`.
     #[test]
-    fn test_second_conjunct_on_same_field_falls_back() {
+    fn test_second_conjunct_on_same_field_is_preserved() {
         let fields = partition_fields_dt();
         let pb = PredicateBuilder::new(&fields);
         let pred = Predicate::and(vec![
@@ -516,7 +784,6 @@ mod tests {
             .unwrap(),
         ]);
         let filter = PartitionFilter::from_predicate(pred, &fields);
-        assert!(matches!(filter, PartitionFilter::Predicate(_)));
         assert!(!filter
             .matches_entry(&serialized_dt(&fields, "2024-01-01"))
             .unwrap());
@@ -527,7 +794,7 @@ mod tests {
 
     /// An `Or` over the partition field narrows the `In` beside it.
     #[test]
-    fn test_or_conjunct_beside_covering_in_falls_back() {
+    fn test_or_conjunct_beside_covering_in_is_preserved() {
         let fields = partition_fields_dt();
         let pb = PredicateBuilder::new(&fields);
         let pred = Predicate::and(vec![
@@ -546,7 +813,6 @@ mod tests {
             .unwrap(),
         ]);
         let filter = PartitionFilter::from_predicate(pred, &fields);
-        assert!(matches!(filter, PartitionFilter::Predicate(_)));
         assert!(!filter
             .matches_entry(&serialized_dt(&fields, "2024-01-03"))
             .unwrap());
