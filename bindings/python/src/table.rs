@@ -32,7 +32,7 @@ use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
 use crate::snapshot::PySnapshot;
 use crate::tag::PyTag;
-use crate::write::PyWriteBuilder;
+use crate::write::{PyTableCommit, PyWriteBuilder};
 
 #[pyclass(name = "Table", module = "pypaimon_rust.datafusion")]
 pub struct PyTable {
@@ -134,8 +134,18 @@ impl PyTable {
     }
 
     /// Create a [`PyWriteBuilder`] for the batch write loop.
-    fn new_write_builder(&self) -> PyWriteBuilder {
-        PyWriteBuilder::new(Arc::clone(&self.inner))
+    #[pyo3(signature = (commit_user=None, *, overwrite=false))]
+    fn new_write_builder(
+        &self,
+        commit_user: Option<String>,
+        overwrite: bool,
+    ) -> PyResult<PyWriteBuilder> {
+        PyWriteBuilder::new(Arc::clone(&self.inner), commit_user, overwrite)
+    }
+
+    /// Create a native committer with the caller's stable job/attempt identity.
+    fn new_commit(&self, commit_user: String) -> PyResult<PyTableCommit> {
+        PyTableCommit::new(Arc::clone(&self.inner), commit_user)
     }
 
     // ---------------- #285: observability ----------------

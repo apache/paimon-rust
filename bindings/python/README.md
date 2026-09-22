@@ -107,6 +107,44 @@ print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
 
+### Native commit from serialized messages
+
+Use `table.new_commit(commit_user)` to commit messages prepared by an external
+Java/PyPaimon writer. Keep `commit_user` stable across retries of the same job.
+The Java v14 body has no version header, table identity, or overwrite mode;
+the caller must retain that context alongside the bytes.
+
+```python
+committer = table.new_commit("ingest-job")
+messages = [
+    committer.deserialize_commit_message(body, source_table_location, version=14)
+    for body in serialized_messages
+]
+committer.commit(messages, commit_identifier=42)
+
+# After an uncertain result, retry the same identifier and complete message set.
+table.new_commit("ingest-job").filter_and_commit(messages, 42)
+```
+
+Identifiers must increase monotonically for each commit user. Omitting an
+identifier uses batch commit semantics. `abort(messages)` deletes newly written
+files; only use it for messages known not to have committed.
+
+`overwrite(messages, static_partitions=None, *, commit_identifier=None)` supports
+dynamic overwrite (`None`), whole-table overwrite (`{}`), and static/partial
+partition specs. Specs use Python values matching the partition schema, for
+example `{"region": "EU", "year": 2026}`; `None` or the configured default partition
+name denotes null. `truncate_partitions(specs, commit_identifier=None)` and
+`truncate_table(commit_identifier=None)` expose the Rust truncate operations.
+Overwrite and truncate filter repeated identifiers when an explicit identifier
+is supplied, preserving data written after the original operation.
+
+For overwrite, prepare native writers with
+`table.new_write_builder(commit_user="ingest-job", overwrite=True)`. When importing
+fixed-bucket messages carrying `totalBuckets`, pass `overwrite=True` to restore
+operation context absent from Java's wire format. Submit these through `overwrite`.
+Compact increments remain unsupported by the Rust committer and are rejected.
+
 ### Tables resolved outside the Rust catalog
 
 `Table.from_resolved_schema(location, schema_json, *, database="default",

@@ -163,7 +163,14 @@ class Table:
     def location(self) -> str: ...
     def schema(self) -> TableSchema: ...
     def new_read_builder(self, options: Optional[Dict[str, str]] = None) -> ReadBuilder: ...
-    def new_write_builder(self) -> "WriteBuilder": ...
+    def new_write_builder(
+        self, commit_user: Optional[str] = None, *, overwrite: bool = False
+    ) -> "WriteBuilder":
+        """Share a commit user with writers; overwrite=True prepares overwrite writes."""
+        ...
+    def new_commit(self, commit_user: str) -> "TableCommit":
+        """Create a committer with a stable job/attempt identity."""
+        ...
     def latest_snapshot(self) -> Optional[Snapshot]:
         """
         Warning: This method blocks on a DataFusion runtime.
@@ -207,7 +214,55 @@ class TableWrite:
     def prepare_commit(self) -> List[CommitMessage]: ...
 
 class TableCommit:
-    def commit(self, messages: Sequence[CommitMessage]) -> None: ...
+    def deserialize_commit_message(
+        self, data: bytes, source_table_location: str, *, version: int = 14,
+        overwrite: bool = False,
+    ) -> CommitMessage:
+        """Import an unframed Java body using trusted source table and write mode.
+
+        Only v14 is supported. For fixed-bucket overwrite messages, overwrite=True
+        restores operation context that Java does not store in the wire body.
+        """
+        ...
+    def commit(
+        self, messages: Sequence[CommitMessage], commit_identifier: Optional[int] = None
+    ) -> None:
+        """Commit once per identifier, increasing it monotonically per commit user.
+
+        None uses the batch identifier. This does not filter prior identifiers;
+        use filter_and_commit when retrying an uncertain result.
+        """
+        ...
+    def filter_and_commit(
+        self, messages: Sequence[CommitMessage], commit_identifier: int
+    ) -> None:
+        """Skip an already committed identifier before committing its messages."""
+        ...
+    def overwrite(
+        self, messages: Sequence[CommitMessage],
+        static_partitions: Optional[Dict[str, Any]] = None, *,
+        commit_identifier: Optional[int] = None,
+    ) -> None:
+        """None replaces touched partitions; {} replaces the whole table.
+
+        A nonempty spec replaces matching partitions, including partial specs.
+        Values use the schema's Python types (int, str, date, Decimal, etc.);
+        None and the configured default partition name denote null. With empty
+        messages, a static spec truncates matching partitions; None is a no-op.
+        An explicit identifier filters a previously committed operation on retry.
+        """
+        ...
+    def truncate_partitions(
+        self, partitions: Sequence[Dict[str, Any]], commit_identifier: Optional[int] = None
+    ) -> None:
+        """Truncate matching partitions using typed specs. An empty list is rejected.
+
+        An explicit identifier filters a previously committed operation on retry.
+        """
+        ...
+    def truncate_table(self, commit_identifier: Optional[int] = None) -> None:
+        """Truncate all data, filtering retries when an identifier is supplied."""
+        ...
     def abort(self, messages: Sequence[CommitMessage]) -> None:
         """Delete the files the messages refer to. Best-effort: missing files and
         storage errors are ignored. The messages must not be committed afterwards."""
@@ -215,9 +270,10 @@ class TableCommit:
 
 class WriteBuilder:
     def deserialize_commit_message(
-        self, data: bytes, source_table_location: str
+        self, data: bytes, source_table_location: str, *, version: int = 14,
+        overwrite: bool = False,
     ) -> CommitMessage:
-        """Import a Java v14 body with a trusted source table location."""
+        """Import a Java v14 body with trusted source table and overwrite context."""
         ...
     def new_write(self) -> TableWrite: ...
     def new_commit(self) -> TableCommit: ...
