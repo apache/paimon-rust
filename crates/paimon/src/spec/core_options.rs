@@ -101,6 +101,7 @@ pub(crate) const MOSAIC_READ_PREFETCH_MAX_BYTES_OPTION: &str = "mosaic.read.pref
 pub(crate) const TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION: &str =
     "table-read.sequence-number.enabled";
 pub(crate) const SEQUENCE_FIELD_OPTION: &str = "sequence.field";
+const SEQUENCE_FIELD_SORT_ORDER_OPTION: &str = "sequence.field.sort-order";
 pub(crate) const DISABLE_EXPLICIT_TYPE_CASTING_OPTION: &str = "disable-explicit-type-casting";
 pub(crate) const DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL_OPTION: &str =
     "alter-column-null-to-not-null.disabled";
@@ -620,6 +621,15 @@ impl<'a> CoreOptions<'a> {
             .get(SEQUENCE_FIELD_OPTION)
             .map(|s| s.split(',').map(str::trim).collect())
             .unwrap_or_default()
+    }
+
+    /// User sequence fields sort ascending unless explicitly configured descending.
+    /// Null sequences remain smaller than non-null sequences in either order.
+    pub fn sequence_field_sort_order_is_ascending(&self) -> bool {
+        !self
+            .options
+            .get(SEQUENCE_FIELD_SORT_ORDER_OPTION)
+            .is_some_and(|order| order.eq_ignore_ascii_case("descending"))
     }
 
     /// Merge engine for primary-key tables. Default is `Deduplicate`.

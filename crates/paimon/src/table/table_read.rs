@@ -819,6 +819,7 @@ impl<'a> PaimonTableRead<'a> {
                 read_type: read_type.to_vec(),
                 predicates: self.data_predicates.clone(),
                 primary_keys: self.table.schema.trimmed_primary_keys(),
+                table_primary_keys: self.table.schema.primary_keys().to_vec(),
                 merge_engine: core_options.merge_engine()?,
                 sequence_fields: core_options
                     .sequence_fields()
@@ -946,6 +947,7 @@ impl<'a> PaimonTableRead<'a> {
                 read_type: self.read_type().to_vec(),
                 predicates: self.data_predicates.clone(),
                 primary_keys: self.table.schema.trimmed_primary_keys(),
+                table_primary_keys: self.table.schema.primary_keys().to_vec(),
                 merge_engine: core_options.merge_engine()?,
                 sequence_fields: core_options
                     .sequence_fields()

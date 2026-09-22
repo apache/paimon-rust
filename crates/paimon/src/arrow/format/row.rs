@@ -225,6 +225,14 @@ pub(super) fn row_type_from_arrow_schema(schema: &SchemaRef) -> crate::Result<Ve
 
 #[async_trait]
 impl FormatFileReader for RowFormatReader {
+    fn select_read_fields(
+        &self,
+        data_schema_fields: &[DataField],
+        _projected_fields: &[DataField],
+    ) -> Vec<DataField> {
+        data_schema_fields.to_vec()
+    }
+
     async fn read_batch_stream(
         &self,
         reader: Box<dyn FileRead>,

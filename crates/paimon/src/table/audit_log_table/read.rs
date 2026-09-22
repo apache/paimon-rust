@@ -117,6 +117,7 @@ impl<'a> AuditLogRead<'a> {
                     read_type,
                     predicates: self.read.data_predicates.clone(),
                     primary_keys: self.read.table.schema.trimmed_primary_keys(),
+                    table_primary_keys: self.read.table.schema.primary_keys().to_vec(),
                     merge_engine,
                     sequence_fields: core_options
                         .sequence_fields()
