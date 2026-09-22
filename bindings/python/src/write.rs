@@ -189,6 +189,20 @@ impl PyBatchWriteBuilder {
 
 #[pymethods]
 impl PyBatchWriteBuilder {
+    /// Internal PyPaimon bridge: retain the identity of the external Python writer.
+    fn _with_commit_user(
+        mut slf: PyRefMut<'_, Self>,
+        commit_user: String,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.context
+            .table
+            .new_write_builder()
+            .with_commit_user(commit_user.clone())
+            .map_err(to_py_err)?;
+        slf.context.commit_user = commit_user;
+        Ok(slf)
+    }
+
     /// No argument enables overwrite with an empty spec; explicit None restores append.
     #[pyo3(signature = (static_partition=Some(HashMap::new())))]
     fn with_overwrite<'py>(
@@ -500,38 +514,6 @@ pub struct PyStreamTableCommit {
 impl PyStreamTableCommit {
     /// Rust committers have no background resources to shut down.
     fn close(&self) {}
-
-    /// Internal PyPaimon bridge; Python owns the batch/stream lifecycle.
-    fn _overwrite(
-        &self,
-        py: Python<'_>,
-        commit_identifier: i64,
-        messages: &Bound<'_, PyAny>,
-        static_partition: PythonPartitionSpec,
-    ) -> PyResult<()> {
-        let table = &self.context.table;
-        let dynamic = boolean_option(table, "dynamic-partition-overwrite", true)?
-            && !table.schema().partition_keys().is_empty();
-        let partitions = if dynamic {
-            None
-        } else {
-            Some(partition_spec(py, table, static_partition)?)
-        };
-        let messages = self.context.messages(messages, "overwrite", true)?;
-        py.detach(|| {
-            runtime().block_on(async {
-                if commit_identifier == i64::MAX {
-                    self.context.inner.overwrite(messages, partitions).await
-                } else {
-                    self.context
-                        .inner
-                        .overwrite_with_identifier(messages, partitions, commit_identifier)
-                        .await
-                }
-            })
-        })
-        .map_err(to_py_err)
-    }
 
     fn commit(
         &self,

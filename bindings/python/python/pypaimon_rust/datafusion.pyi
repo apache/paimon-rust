@@ -241,11 +241,6 @@ class BatchTableCommit:
 
 class StreamTableCommit:
     def close(self) -> None: ...
-    def _overwrite(
-        self, commit_identifier: int, messages: Sequence[CommitMessage], static_partition: Dict[str, Any]
-    ) -> None:
-        """Internal PyPaimon overwrite bridge; preserve its identity and batch/checkpoint identifier."""
-        ...
     def commit(self, commit_identifier: int, messages: Sequence[CommitMessage]) -> None:
         """Commit a checkpoint, including empty checkpoints, without filtering retries."""
         ...
@@ -257,6 +252,9 @@ class StreamTableCommit:
     def abort(self, messages: Sequence[CommitMessage]) -> None: ...
 
 class BatchWriteBuilder:
+    def _with_commit_user(self, commit_user: str) -> "BatchWriteBuilder":
+        """Internal PyPaimon bridge for commits produced by an external Python writer."""
+        ...
     def with_overwrite(self, static_partition: Optional[Dict[str, Any]] = {}) -> "BatchWriteBuilder":
         """Configure both writer and committer. Explicit None restores append.
 
