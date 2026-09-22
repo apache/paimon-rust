@@ -175,19 +175,13 @@ pub(crate) fn visit_slim_manifest_entries<F>(
 where
     F: FnMut(SlimManifestEntry<'_>) -> crate::Result<()>,
 {
-    let (header, mut block_iter) = parse_ocf_streaming(bytes)?;
-    let writer_schema = shared_cache.get_or_parse(&header.schema_json)?;
-    while let Some(block) = block_iter.next_block()? {
-        let mut cursor = AvroCursor::new(&block.data);
-        for _ in 0..block.object_count {
-            visit(manifest_entry_decode::decode_slim_manifest_entry(
-                &mut cursor,
-                &writer_schema,
-                writer_schema.is_union_wrapped,
-            )?)?;
-        }
-    }
-    Ok(())
+    visit_ocf_records(bytes, shared_cache, |cursor, schema| {
+        visit(manifest_entry_decode::decode_slim_manifest_entry(
+            cursor,
+            schema,
+            schema.is_union_wrapped,
+        )?)
+    })
 }
 
 /// Visit index-manifest entries without materializing deletion-vector maps.
@@ -199,18 +193,28 @@ pub(crate) fn visit_slim_index_manifest_entries<F>(
 where
     F: FnMut(SlimIndexManifestEntry<'_>) -> crate::Result<()>,
 {
+    visit_ocf_records(bytes, shared_cache, |cursor, schema| {
+        visit(
+            index_manifest_entry_decode::decode_slim_index_manifest_entry(
+                cursor,
+                schema,
+                schema.is_union_wrapped,
+            )?,
+        )
+    })
+}
+
+fn visit_ocf_records(
+    bytes: &[u8],
+    shared_cache: &SharedSchemaCache,
+    mut visit: impl FnMut(&mut AvroCursor<'_>, &WriterSchema) -> crate::Result<()>,
+) -> crate::Result<()> {
     let (header, mut block_iter) = parse_ocf_streaming(bytes)?;
     let writer_schema = shared_cache.get_or_parse(&header.schema_json)?;
     while let Some(block) = block_iter.next_block()? {
         let mut cursor = AvroCursor::new(&block.data);
         for _ in 0..block.object_count {
-            visit(
-                index_manifest_entry_decode::decode_slim_index_manifest_entry(
-                    &mut cursor,
-                    &writer_schema,
-                    writer_schema.is_union_wrapped,
-                )?,
-            )?;
+            visit(&mut cursor, &writer_schema)?;
         }
     }
     Ok(())

@@ -1355,7 +1355,7 @@ mod tests {
 
         // Missing counts stay unknown, and absent file identities are rejected.
         // Full and slim decoders must agree, including for nonstandard schemas.
-        for (case, expected) in [
+        for ((case, expected), reordered) in [
             ("missing_count", None),
             ("null_count", None),
             ("null_file", None),
@@ -1363,7 +1363,10 @@ mod tests {
             ("missing_file", None),
             ("zero", Some(0)),
             ("known", Some(2)),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|case| [(case, false), (case, true)])
+        {
             let mut file_fields = vec![json!({"name": "_FILE_NAME", "type": "string"})];
             let mut file_values = vec![("_FILE_NAME".into(), Value::String("data.parquet".into()))];
             if case != "missing_count" {
@@ -1376,10 +1379,22 @@ mod tests {
                     },
                 ));
             }
+            file_fields.push(json!({"name": "_FUTURE_FILE_FIELD", "type": ["null", {"type": "array", "items": "long"}]}));
+            file_values.push((
+                "_FUTURE_FILE_FIELD".into(),
+                Value::Union(1, Box::new(Value::Array(vec![Value::Long(7)]))),
+            ));
+            if reordered {
+                file_fields.reverse();
+                file_values.reverse();
+            }
             let partition = crate::spec::EMPTY_SERIALIZED_ROW.clone();
             let mut fields = vec![
                 json!({"name": "_PARTITION", "type": "bytes"}),
                 json!({"name": "_KIND", "type": "int"}),
+                json!({"name": "_BUCKET", "type": "int"}),
+                json!({"name": "_TOTAL_BUCKETS", "type": "int"}),
+                json!({"name": "_VERSION", "type": ["null", "int"]}),
             ];
             let mut values = vec![
                 ("_PARTITION".into(), Value::Bytes(partition.clone())),
@@ -1387,6 +1402,9 @@ mod tests {
                     "_KIND".into(),
                     Value::Int(i32::from(case == "null_deleted_file")),
                 ),
+                ("_BUCKET".into(), Value::Int(3)),
+                ("_TOTAL_BUCKETS".into(), Value::Int(4)),
+                ("_VERSION".into(), Value::Union(1, Box::new(Value::Int(2)))),
             ];
             let null_file = matches!(case, "null_file" | "null_deleted_file");
             if case != "missing_file" {
@@ -1402,16 +1420,45 @@ mod tests {
                     },
                 ));
             }
+            fields.push(json!({"name": "_FUTURE_ENTRY_FIELD", "type": ["null", "string"]}));
+            values.push((
+                "_FUTURE_ENTRY_FIELD".into(),
+                Value::Union(1, Box::new(Value::String("ignored".into()))),
+            ));
+            if reordered {
+                fields.reverse();
+                values.reverse();
+            }
+            let record_schema = json!({"type": "record", "name": "manifest", "fields": fields});
             let schema = apache_avro::Schema::parse_str(
-                &json!({
-                    "type": "record", "name": "manifest", "fields": fields
-                })
+                &if reordered {
+                    json!(["null", record_schema])
+                } else {
+                    record_schema
+                }
                 .to_string(),
             )
             .unwrap();
             let mut writer = apache_avro::Writer::new(&schema, Vec::new());
-            writer.append(Value::Record(values)).unwrap();
+            let record = Value::Record(values);
+            writer
+                .append(if reordered {
+                    Value::Union(1, Box::new(record))
+                } else {
+                    record
+                })
+                .unwrap();
             let bytes = writer.into_inner().unwrap();
+            if !reordered && case != "missing_file" {
+                // The early filter must skip _FILE, even if it is null.
+                assert!(from_manifest_bytes_filtered(
+                    &bytes,
+                    &mut SchemaCache::new(),
+                    &mut |_, _, _, _| false
+                )
+                .unwrap()
+                .is_empty());
+            }
             let full = from_avro_bytes_fast::<ManifestEntry>(&bytes);
             let filtered =
                 from_manifest_bytes_filtered(&bytes, &mut SchemaCache::new(), &mut |_, _, _, _| {
@@ -1435,7 +1482,18 @@ mod tests {
                 continue;
             }
             let full = full.unwrap();
-            assert_eq!(full, filtered.unwrap(), "{case}");
+            assert_eq!(full, filtered.unwrap(), "{case}, reordered={reordered}");
+            assert_eq!(
+                full[0],
+                ManifestEntry::new(
+                    FileKind::Add,
+                    partition.clone(),
+                    3,
+                    4,
+                    full[0].file().clone(),
+                    2
+                )
+            );
             assert_eq!(
                 full[0].file().row_count,
                 expected.unwrap_or(DataFileMeta::ROW_COUNT_UNKNOWN),

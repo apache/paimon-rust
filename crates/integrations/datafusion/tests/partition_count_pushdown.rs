@@ -157,6 +157,81 @@ async fn test_grouped_count_with_partition_filter_is_answered_from_manifests() {
 }
 
 #[tokio::test]
+async fn test_mixed_partition_predicates_preserve_count_exactness() {
+    use paimon::spec::{Datum, Predicate, PredicateBuilder};
+
+    let (_tmp, catalog, ctx) = setup().await;
+    for condition in [
+        "dt IN ('2024-01-01', '2024-01-02') AND dt > '2024-01-01'",
+        "dt IN ('2024-01-01', '2024-01-02', '2024-01-03', '2024-01-04', '2024-01-05') AND dt > '2024-01-01'",
+    ] {
+        let sql = format!("SELECT dt, COUNT(*) FROM paimon.test_db.t WHERE content_key = 'head' AND {condition} GROUP BY dt");
+        assert!(!scans_table(&ctx, &sql).await, "{sql}");
+        assert_eq!(rows(&ctx, &sql).await, vec![row("2024-01-02", 2)], "{sql}");
+        assert_eq!(
+            rows(&ctx, &sql.replace("COUNT(*)", "COUNT(id)")).await,
+            vec![row("2024-01-02", 2)],
+            "ordinary scan: {sql}"
+        );
+    }
+    let sql = "SELECT COUNT(*) FROM paimon.test_db.t WHERE content_key = 'head' AND dt = '2024-01-01' AND dt > '2024-01-01'";
+    assert_eq!(rows(&ctx, sql).await, vec![row("", 0)]);
+
+    // Native predicates bypass SQL simplification. Both count APIs must enforce
+    // the full predicate, independently of the ordinary scan's shared helper.
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t"))
+        .await
+        .unwrap();
+    let pb = PredicateBuilder::new(table.schema().fields());
+    let greater = pb
+        .greater_than("dt", Datum::String("2024-01-01".into()))
+        .unwrap();
+    let head = pb
+        .equal("content_key", Datum::String("head".into()))
+        .unwrap();
+    let dates = pb
+        .is_in(
+            "dt",
+            vec![
+                Datum::String("2024-01-01".into()),
+                Datum::String("2024-01-02".into()),
+            ],
+        )
+        .unwrap();
+    for (date_filter, expected) in [
+        (dates, vec![("2024-01-02", "head", Some(2))]),
+        (
+            pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
+            vec![],
+        ),
+    ] {
+        let predicate = Predicate::and(vec![date_filter, greater.clone(), head.clone()]);
+        let partial = table
+            .partition_row_counts_with_filter(Some(predicate.clone()))
+            .await
+            .unwrap();
+        let exact = table
+            .exact_partition_row_counts_with_filter(Some(predicate))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial, exact);
+        let actual: Vec<_> = exact
+            .iter()
+            .map(|count| {
+                (
+                    count.partition_row.get_string(0).unwrap(),
+                    count.partition_row.get_string(1).unwrap(),
+                    count.record_count,
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[tokio::test]
 async fn test_table_alias_preserves_count_pushdown_and_eligibility() {
     let (_tmp, _catalog, ctx) = setup().await;
     for sql in [

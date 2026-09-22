@@ -18,11 +18,11 @@
 use super::cursor::AvroCursor;
 use super::decode::{neg_count_to_usize, AvroRecordDecode};
 use super::decode_helpers::{
-    extract_record_schema, normalize_partition, read_bytes_field, read_int_field, read_long_field,
-    read_string_field, EMPTY_PARTITION,
+    extract_record_schema, read_bytes_field, read_int_field, read_long_field, read_string_field,
+    EMPTY_PARTITION,
 };
 use super::manifest_file_meta_decode::decode_nullable_binary_table_stats;
-use super::schema::{skip_nullable_field, FieldSchema, WriterSchema};
+use super::schema::{skip_nullable_field, WriterSchema};
 use crate::spec::manifest_common::FileKind;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::DataFileMeta;
@@ -31,55 +31,16 @@ use chrono::{DateTime, Utc};
 
 impl AvroRecordDecode for ManifestEntry {
     fn decode(cursor: &mut AvroCursor, writer_schema: &WriterSchema) -> crate::Result<Self> {
-        let mut kind: Option<FileKind> = None;
-        let mut partition: Option<Vec<u8>> = None;
-        let mut bucket: Option<i32> = None;
-        let mut total_buckets: Option<i32> = None;
-        let mut file: Option<DataFileMeta> = None;
-        let mut version: Option<i32> = None;
-
-        for field in &writer_schema.fields {
-            match field.name.as_str() {
-                "_KIND" => {
-                    let v = read_int_field(cursor, field.nullable)?;
-                    kind = Some(match v {
-                        0 => FileKind::Add,
-                        1 => FileKind::Delete,
-                        _ => {
-                            return Err(crate::Error::UnexpectedError {
-                                message: format!("unknown FileKind: {v}"),
-                                source: None,
-                            })
-                        }
-                    });
-                }
-                "_PARTITION" => partition = Some(read_bytes_field(cursor, field.nullable)?),
-                "_BUCKET" => bucket = Some(read_int_field(cursor, field.nullable)?),
-                "_TOTAL_BUCKETS" => total_buckets = Some(read_int_field(cursor, field.nullable)?),
-                "_FILE" => {
-                    file = decode_nullable_data_file_meta(cursor, &field.schema, field.nullable)?;
-                }
-                "_VERSION" => version = Some(read_int_field(cursor, field.nullable)?),
-                _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
-            }
-        }
-
-        Ok(ManifestEntry::new(
-            kind.unwrap_or(FileKind::Add),
-            normalize_partition(partition),
-            bucket.unwrap_or(0),
-            total_buckets.unwrap_or(0),
-            file.ok_or_else(missing_file_metadata)?,
-            version.unwrap_or(0),
-        ))
+        // The generic OCF decoder already consumed the top-level union.
+        decode_manifest_entries_filtered(cursor, writer_schema, false, &mut |_, _, _, _| true)?
+            .ok_or_else(missing_file_metadata)
     }
 }
 
 /// Decode ManifestEntry records with a filter applied on lightweight fields.
 ///
-/// Decodes only _KIND, _PARTITION, _BUCKET, _TOTAL_BUCKETS, _VERSION first.
-/// If `filter` returns false, skips the expensive _FILE (DataFileMeta) decoding.
-/// Returns only entries that pass the filter.
+/// When the writer places the lightweight fields before _FILE, rejected entries
+/// skip DataFileMeta decoding entirely. Otherwise, retain the entry conservatively.
 pub(crate) fn decode_manifest_entries_filtered<F>(
     cursor: &mut AvroCursor,
     writer_schema: &WriterSchema,
@@ -89,34 +50,66 @@ pub(crate) fn decode_manifest_entries_filtered<F>(
 where
     F: FnMut(FileKind, &[u8], i32, i32) -> bool,
 {
-    if is_union_wrapped {
-        let idx = cursor.read_union_index()?;
-        if idx == 0 {
-            return Err(crate::Error::UnexpectedError {
-                message: "avro decode: unexpected null in top-level union".into(),
-                source: None,
-            });
-        }
+    Ok(decode_manifest_entry_with(
+        cursor,
+        writer_schema,
+        is_union_wrapped,
+        filter,
+        decode_data_file_meta,
+    )?
+    .map(|(fields, file)| {
+        ManifestEntry::new(
+            fields.kind.unwrap_or(FileKind::Add),
+            fields.partition().to_vec(),
+            fields.bucket.unwrap_or(0),
+            fields.total_buckets.unwrap_or(0),
+            file,
+            fields.version,
+        )
+    }))
+}
+
+#[derive(Default)]
+struct ManifestEntryFields<'a> {
+    kind: Option<FileKind>,
+    partition: Option<&'a [u8]>,
+    bucket: Option<i32>,
+    total_buckets: Option<i32>,
+    version: i32,
+}
+
+impl<'a> ManifestEntryFields<'a> {
+    fn partition(&self) -> &'a [u8] {
+        self.partition
+            .filter(|bytes| bytes.len() >= 4)
+            .unwrap_or(EMPTY_PARTITION)
     }
+}
 
-    // Two-pass decode: first collect lightweight fields and record _FILE position,
-    // then conditionally decode _FILE.
-    let mut kind: Option<FileKind> = None;
-    let mut partition: Option<Vec<u8>> = None;
-    let mut bucket: Option<i32> = None;
-    let mut total_buckets: Option<i32> = None;
-    let mut version: Option<i32> = None;
-    let mut file: Option<DataFileMeta> = None;
+/// Shared wire walk; collectors choose full or borrowed _FILE decoding.
+fn decode_manifest_entry_with<'a, T>(
+    cursor: &mut AvroCursor<'a>,
+    writer_schema: &WriterSchema,
+    is_union_wrapped: bool,
+    filter: &mut impl FnMut(FileKind, &[u8], i32, i32) -> bool,
+    mut decode_file: impl FnMut(&mut AvroCursor<'a>, &WriterSchema) -> crate::Result<T>,
+) -> crate::Result<Option<(ManifestEntryFields<'a>, T)>> {
+    if is_union_wrapped && cursor.read_union_index()? == 0 {
+        return Err(crate::Error::UnexpectedError {
+            message: "avro decode: unexpected null in top-level union".into(),
+            source: None,
+        });
+    }
+    let mut fields = ManifestEntryFields::default();
+    let mut file = None;
     let mut file_skipped = false;
-
     for field in &writer_schema.fields {
         match field.name.as_str() {
             "_KIND" => {
-                let v = read_int_field(cursor, field.nullable)?;
-                kind = Some(match v {
+                fields.kind = Some(match read_int_field(cursor, field.nullable)? {
                     0 => FileKind::Add,
                     1 => FileKind::Delete,
-                    _ => {
+                    v => {
                         return Err(crate::Error::UnexpectedError {
                             message: format!("unknown FileKind: {v}"),
                             source: None,
@@ -124,47 +117,47 @@ where
                     }
                 });
             }
-            "_PARTITION" => partition = Some(read_bytes_field(cursor, field.nullable)?),
-            "_BUCKET" => bucket = Some(read_int_field(cursor, field.nullable)?),
-            "_TOTAL_BUCKETS" => total_buckets = Some(read_int_field(cursor, field.nullable)?),
+            "_PARTITION" => {
+                fields.partition =
+                    Some(decode_nullable_bytes_ref(cursor, field.nullable)?.unwrap_or(&[]))
+            }
+            "_BUCKET" => fields.bucket = Some(read_int_field(cursor, field.nullable)?),
+            "_TOTAL_BUCKETS" => {
+                fields.total_buckets = Some(read_int_field(cursor, field.nullable)?)
+            }
             "_FILE" => {
-                let can_filter = kind.is_some()
-                    && partition.is_some()
-                    && bucket.is_some()
-                    && total_buckets.is_some();
-                if can_filter {
-                    let k = kind.unwrap_or(FileKind::Add);
-                    let p = partition.as_deref().unwrap_or(&[]);
-                    let b = bucket.unwrap_or(0);
-                    let tb = total_buckets.unwrap_or(0);
-                    if filter(k, p, b, tb) {
-                        file =
-                            decode_nullable_data_file_meta(cursor, &field.schema, field.nullable)?;
-                    } else {
+                if let (Some(kind), Some(partition), Some(bucket), Some(total_buckets)) = (
+                    fields.kind,
+                    fields.partition,
+                    fields.bucket,
+                    fields.total_buckets,
+                ) {
+                    if !filter(kind, partition, bucket, total_buckets) {
                         skip_nullable_field(cursor, &field.schema, field.nullable)?;
                         file_skipped = true;
+                        continue;
                     }
-                } else {
-                    file = decode_nullable_data_file_meta(cursor, &field.schema, field.nullable)?;
                 }
+                file = if field.nullable && cursor.read_union_index()? == 0 {
+                    None
+                } else {
+                    let schema = extract_record_schema(&field.schema).ok_or_else(|| {
+                        crate::Error::UnexpectedError {
+                            message: "avro decode: _FILE field is not a record".into(),
+                            source: None,
+                        }
+                    })?;
+                    Some(decode_file(cursor, schema)?)
+                };
             }
-            "_VERSION" => version = Some(read_int_field(cursor, field.nullable)?),
+            "_VERSION" => fields.version = read_int_field(cursor, field.nullable)?,
             _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
         }
     }
-
     if file_skipped {
         return Ok(None);
     }
-
-    Ok(Some(ManifestEntry::new(
-        kind.unwrap_or(FileKind::Add),
-        normalize_partition(partition),
-        bucket.unwrap_or(0),
-        total_buckets.unwrap_or(0),
-        file.ok_or_else(missing_file_metadata)?,
-        version.unwrap_or(0),
-    )))
+    Ok(Some((fields, file.ok_or_else(missing_file_metadata)?)))
 }
 
 /// Borrowed view of the manifest-entry fields needed to count rows per partition.
@@ -191,16 +184,24 @@ pub(crate) fn decode_slim_manifest_entry<'a>(
     writer_schema: &WriterSchema,
     is_union_wrapped: bool,
 ) -> crate::Result<SlimManifestEntry<'a>> {
-    if is_union_wrapped {
-        let idx = cursor.read_union_index()?;
-        if idx == 0 {
-            return Err(crate::Error::UnexpectedError {
-                message: "avro decode: unexpected null in top-level union".into(),
-                source: None,
-            });
-        }
-    }
+    let (fields, mut entry) = decode_manifest_entry_with(
+        cursor,
+        writer_schema,
+        is_union_wrapped,
+        &mut |_, _, _, _| true,
+        decode_slim_data_file,
+    )?
+    .ok_or_else(missing_file_metadata)?;
+    entry.kind = fields.kind.unwrap_or(FileKind::Add);
+    entry.partition = fields.partition();
+    entry.bucket = fields.bucket.unwrap_or(0);
+    Ok(entry)
+}
 
+fn decode_slim_data_file<'a>(
+    cursor: &mut AvroCursor<'a>,
+    writer_schema: &WriterSchema,
+) -> crate::Result<SlimManifestEntry<'a>> {
     let mut entry = SlimManifestEntry {
         kind: FileKind::Add,
         partition: EMPTY_PARTITION,
@@ -213,81 +214,32 @@ pub(crate) fn decode_slim_manifest_entry<'a>(
         embedded_index: None,
         external_path: None,
     };
-    let mut file_present = false;
-
-    for field in &writer_schema.fields {
-        match field.name.as_str() {
-            "_KIND" => {
-                entry.kind = match read_int_field(cursor, field.nullable)? {
-                    0 => FileKind::Add,
-                    1 => FileKind::Delete,
-                    v => {
-                        return Err(crate::Error::UnexpectedError {
-                            message: format!("unknown FileKind: {v}"),
-                            source: None,
-                        })
-                    }
-                };
-            }
-            "_PARTITION" => {
-                if !field.nullable || cursor.read_union_index()? != 0 {
-                    let bytes = cursor.read_bytes()?;
-                    // Same rule as `normalize_partition`: anything shorter than a
-                    // BinaryRow header is the unpartitioned row.
-                    if bytes.len() >= 4 {
-                        entry.partition = bytes;
-                    }
+    for file_field in &writer_schema.fields {
+        match file_field.name.as_str() {
+            "_FILE_NAME" => {
+                if !file_field.nullable || cursor.read_union_index()? != 0 {
+                    entry.file_name = cursor.read_string()?;
                 }
             }
-            "_BUCKET" => entry.bucket = read_int_field(cursor, field.nullable)?,
-            "_FILE" => {
-                if field.nullable && cursor.read_union_index()? == 0 {
-                    continue;
-                }
-                let record_schema = extract_record_schema(&field.schema).ok_or_else(|| {
-                    crate::Error::UnexpectedError {
-                        message: "avro decode: _FILE field is not a record".into(),
-                        source: None,
-                    }
-                })?;
-                file_present = true;
-                for file_field in &record_schema.fields {
-                    match file_field.name.as_str() {
-                        "_FILE_NAME" => {
-                            if !file_field.nullable || cursor.read_union_index()? != 0 {
-                                entry.file_name = cursor.read_string()?;
-                            }
-                        }
-                        "_ROW_COUNT" => {
-                            entry.row_count = decode_nullable_long(cursor, file_field.nullable)?
-                                .unwrap_or(DataFileMeta::ROW_COUNT_UNKNOWN)
-                        }
-                        "_LEVEL" => entry.level = read_int_field(cursor, file_field.nullable)?,
-                        "_EXTRA_FILES" => {
-                            entry.extra_files =
-                                decode_borrowed_string_array(cursor, file_field.nullable)?
-                        }
-                        "_EMBEDDED_FILE_INDEX" => {
-                            entry.embedded_index =
-                                decode_nullable_bytes_ref(cursor, file_field.nullable)?
-                        }
-                        "_EXTERNAL_PATH" => {
-                            entry.external_path =
-                                decode_nullable_string_ref(cursor, file_field.nullable)?
-                        }
-                        "_FIRST_ROW_ID" => {
-                            entry.first_row_id = decode_nullable_long(cursor, file_field.nullable)?
-                        }
-                        _ => skip_nullable_field(cursor, &file_field.schema, file_field.nullable)?,
-                    }
-                }
+            "_ROW_COUNT" => {
+                entry.row_count = decode_nullable_long(cursor, file_field.nullable)?
+                    .unwrap_or(DataFileMeta::ROW_COUNT_UNKNOWN)
             }
-            _ => skip_nullable_field(cursor, &field.schema, field.nullable)?,
+            "_LEVEL" => entry.level = read_int_field(cursor, file_field.nullable)?,
+            "_EXTRA_FILES" => {
+                entry.extra_files = decode_borrowed_string_array(cursor, file_field.nullable)?
+            }
+            "_EMBEDDED_FILE_INDEX" => {
+                entry.embedded_index = decode_nullable_bytes_ref(cursor, file_field.nullable)?
+            }
+            "_EXTERNAL_PATH" => {
+                entry.external_path = decode_nullable_string_ref(cursor, file_field.nullable)?
+            }
+            "_FIRST_ROW_ID" => {
+                entry.first_row_id = decode_nullable_long(cursor, file_field.nullable)?
+            }
+            _ => skip_nullable_field(cursor, &file_field.schema, file_field.nullable)?,
         }
-    }
-
-    if !file_present {
-        return Err(missing_file_metadata());
     }
     Ok(entry)
 }
@@ -337,25 +289,6 @@ fn decode_nullable_string_ref<'a>(
         return Ok(None);
     }
     cursor.read_string().map(Some)
-}
-
-fn decode_nullable_data_file_meta(
-    cursor: &mut AvroCursor,
-    field_schema: &FieldSchema,
-    nullable: bool,
-) -> crate::Result<Option<DataFileMeta>> {
-    if nullable {
-        let idx = cursor.read_union_index()?;
-        if idx == 0 {
-            return Ok(None);
-        }
-    }
-    let record_schema =
-        extract_record_schema(field_schema).ok_or_else(|| crate::Error::UnexpectedError {
-            message: "avro decode: _FILE field is not a record".into(),
-            source: None,
-        })?;
-    decode_data_file_meta(cursor, record_schema).map(Some)
 }
 
 /// Read string array, handling both `{"type":"array",...}` and `["null", {"type":"array",...}]`.
