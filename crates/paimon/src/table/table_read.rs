@@ -143,12 +143,16 @@ impl<'a> TableRead<'a> {
         }
     }
 
-    /// Share retained output-buffer reservations with other reads.
+    /// Share Parquet working estimates and output-buffer reservations with other reads.
     ///
-    /// Reservations survive the reader when callers retain output arrays or
-    /// slices. Budget exhaustion is a terminal stream error. Decoder working
-    /// memory and prefetch buffers are not yet covered; see [`ResourceContext`].
+    /// Output reservations survive the reader when callers retain arrays or
+    /// slices. Budget exhaustion is a terminal stream error. The working
+    /// estimates do not measure all decoder allocations; see [`ResourceContext`].
     pub fn with_resources(mut self, resources: ResourceContext) -> Self {
+        match &mut self.kind {
+            TableReadKind::Paimon(read) => read.resources = Some(resources.clone()),
+            TableReadKind::Format(read) => read.with_resources(resources.clone()),
+        }
         self.resources = Some(resources);
         self
     }
@@ -327,6 +331,7 @@ struct PaimonTableRead<'a> {
     data_predicates: Vec<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
+    resources: Option<ResourceContext>,
     data_file_read_timing: Option<Arc<DataFileReadTiming>>,
     blob_parallelism: usize,
     limit: Option<usize>,
@@ -345,6 +350,7 @@ impl<'a> PaimonTableRead<'a> {
             data_predicates,
             row_filter_factory: None,
             parquet_read_budget: None,
+            resources: None,
             data_file_read_timing: None,
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             limit: None,
@@ -402,10 +408,14 @@ impl<'a> PaimonTableRead<'a> {
     }
 
     fn parquet_read_budget(&self) -> crate::Result<Arc<ReadBudget>> {
-        match &self.parquet_read_budget {
-            Some(budget) => Ok(Arc::clone(budget)),
-            None => configured_parquet_read_budget(self.table),
-        }
+        let budget = match &self.parquet_read_budget {
+            Some(budget) => Arc::clone(budget),
+            None => configured_parquet_read_budget(self.table)?,
+        };
+        Ok(match &self.resources {
+            Some(resources) => Arc::new(budget.with_resources(resources.clone())),
+            None => budget,
+        })
     }
 
     /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.

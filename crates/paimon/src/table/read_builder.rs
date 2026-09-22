@@ -137,11 +137,11 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
-    /// Share output-buffer reservations with other reads in this context.
+    /// Share Parquet working estimates and output reservations across reads.
     ///
-    /// This currently limits retained output Arrow buffers, not decoding or
-    /// prefetch memory. See [`ResourceContext`] for the accounting contract.
-    /// When the budget cannot admit a batch, its stream returns an error and ends.
+    /// Row-group data reads and output buffers draw from the same context.
+    /// See [`ResourceContext`] for the estimate-based accounting contract.
+    /// When admission fails, the stream returns a resource-exhausted error and ends.
     pub fn with_resources(&mut self, resources: ResourceContext) -> &mut Self {
         self.resources = Some(resources);
         self

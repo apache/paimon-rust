@@ -17,11 +17,17 @@
 
 //! Shared memory reservations for native readers and future writers.
 //!
-//! A reservation is accounting, not an allocator. Reader integration currently
-//! accounts for output Arrow buffers before handing them to the caller. It does
-//! not yet reserve decoder working memory, prefetch buffers, scan metadata or
-//! merge state before allocation. Consequently the limit is not an RSS limit
-//! or a bound on all memory used while reading.
+//! A reservation is accounting, not an allocator. Parquet readers reserve each
+//! selected row group's projected uncompressed-column estimate before data I/O,
+//! including columns needed by decoder predicates. Live working estimates and
+//! retained output Arrow buffers share one limit; scheduling slots and prefetch
+//! windows remain independent. A working reservation is released after its
+//! decoder drops, while output reservations follow the buffers' shared owners.
+//!
+//! Working estimates are conservative admission charges, not measurements of
+//! decoder allocations. Metadata, merge state and allocation overhead are not
+//! fully covered, and actual memory can exceed the estimates. Consequently this
+//! is neither an RSS limit nor a bound on every allocation made while reading.
 
 mod arrow;
 mod memory;

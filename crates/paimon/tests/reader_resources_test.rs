@@ -86,7 +86,8 @@ async fn parquet_output_reservation_survives_reader_and_batch() {
         drop(stream);
         drop(read);
         drop(builder);
-        assert_eq!(resources.metrics().reserved_memory_bytes, bytes);
+        let retained_bytes = resources.metrics().reserved_memory_bytes;
+        assert!(retained_bytes > 0 && retained_bytes <= bytes);
         assert_eq!(
             escaped
                 .as_any()
