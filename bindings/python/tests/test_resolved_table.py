@@ -194,3 +194,69 @@ def test_catalog_schema_copy_validates_branch_and_structure(resolved_source):
     schema["fields"][1]["id"] = schema["fields"][0]["id"]
     with pytest.raises(ValueError):
         table.copy_with_resolved_schema(json.dumps(schema))
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_resolved_rest_response_keeps_snapshot_and_token_refresh(resolved_source, external):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    root, schema = resolved_source
+    snapshot = json.loads((root / "snapshot" / "snapshot-1").read_text())
+    requests = []
+    token_requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            if self.path.endswith('/token'):
+                token_requests.append(self.path)
+                # Expire the first token to verify that subsequent FileIO refreshes it.
+                response = {"token": {}, "expiresAtMillis": (
+                    0 if len(token_requests) == 1 else 4102444800000)}
+            elif self.path.endswith('/snapshot'):
+                # Disk has snapshot 2; REST snapshot 1 must remain authoritative.
+                response = {"snapshot": {"snapshot": snapshot}}
+            else:
+                self.send_error(500, "Unexpected metadata request")
+                return
+            body = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        response = {"id": "table-uuid", "name": "t", "path": str(root),
+                    "isExternal": external, "schemaId": schema['id'], "schema": schema}
+        table = Table.from_rest_response(json.dumps(response), database='db', table='t', options={
+            'uri': 'http://127.0.0.1:%d' % server.server_port,
+            'warehouse': 'test', 'token.provider': 'bear', 'token': 'test-token',
+            'data-token.enabled': 'true',
+        })
+        assert len(token_requests) == (0 if external else 1)
+        assert all(path.endswith('/token') for path in requests)
+        assert _read(table) == (1, [{'id': 1, 'name': 'a'}])
+        assert all(path.endswith(('/token', '/snapshot')) for path in requests)
+        assert any(path.endswith('/snapshot') for path in requests)
+        assert len(token_requests) == (0 if external else 2)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize('response', ['{', '{}'])
+def test_resolved_rest_response_rejects_missing_metadata(response):
+    with pytest.raises(ValueError):
+        Table.from_rest_response(response, database='db', table='t', options={
+            'uri': 'http://127.0.0.1:1', 'warehouse': 'test',
+            'token.provider': 'bear', 'token': 'test-token',
+        })

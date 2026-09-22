@@ -196,6 +196,13 @@ results and branch-scoped requests. Permission and service failures (including
 HTTP 501) are propagated as in Java, and the
 FileIO provider continues to refresh catalog credentials after schema replacement.
 
+`Table.from_rest_response(response_json, database=..., table=..., options=...)`
+accepts a REST get-table response already fetched by another client. Pass the
+merged catalog options (including server configuration). It skips config and
+get-table requests while retaining REST snapshot loading and refreshable data
+tokens. The response must belong to the supplied database/table; use
+`copy_with_resolved_schema` afterward to apply a resolved branch or dynamic options.
+
 ## Setup
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/):

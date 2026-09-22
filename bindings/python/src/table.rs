@@ -18,9 +18,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use paimon::catalog::Identifier;
+use paimon::catalog::{Identifier, RESTCatalog};
 use paimon::io::FileIO;
 use paimon::spec::TableSchema;
+use paimon::Options;
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -80,6 +81,35 @@ impl PyTable {
             branch,
         )
         .map_err(to_py_err)?;
+        Ok(Self::new(Arc::new(table)))
+    }
+
+    /// Reuse a resolved REST get-table response and merged catalog options.
+    ///
+    /// Skips config/get-table requests, retaining REST snapshots and token refresh.
+    /// The caller must supply the response for the given database and table.
+    #[staticmethod]
+    #[pyo3(signature = (response_json, *, database, table, options))]
+    fn from_rest_response(
+        py: Python<'_>,
+        response_json: &str,
+        database: &str,
+        table: &str,
+        options: HashMap<String, String>,
+    ) -> PyResult<Self> {
+        let response: paimon::api::GetTableResponse =
+            serde_json::from_str(response_json).map_err(|err| {
+                PyValueError::new_err(format!("Invalid REST table response JSON: {err}"))
+            })?;
+        let identifier = Identifier::new(database, table);
+        let table = py
+            .detach(|| {
+                runtime().block_on(async {
+                    let catalog = RESTCatalog::new(Options::from_map(options), false).await?;
+                    catalog.table_from_response(&identifier, response).await
+                })
+            })
+            .map_err(to_py_err)?;
         Ok(Self::new(Arc::new(table)))
     }
 
