@@ -20,10 +20,13 @@ use std::sync::Arc;
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
-use paimon::table::{CommitMessage, Table, TableCommit, TableWrite};
+use paimon::table::{
+    CommitMessage, Table, TableCommit, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
+};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use crate::error::to_py_err;
 
@@ -82,6 +85,26 @@ impl PyWriteBuilder {
 
 #[pymethods]
 impl PyWriteBuilder {
+    /// Import a Java/PyPaimon v14 body with a trusted, out-of-band source table.
+    /// The Java bytes themselves do not identify a table.
+    fn deserialize_commit_message(
+        &self,
+        data: &Bound<'_, PyBytes>,
+        source_table_location: &str,
+    ) -> PyResult<PyCommitMessage> {
+        if source_table_location != self.table.location() {
+            return Err(PyValueError::new_err(
+                "commit message source table does not match this WriteBuilder",
+            ));
+        }
+        Ok(PyCommitMessage {
+            inner: CommitMessage::deserialize(COMMIT_MESSAGE_SERIALIZER_VERSION, data.as_bytes())
+                .map_err(to_py_err)?,
+            table_location: self.table.location().to_string(),
+            commit_user: self.commit_user.clone(),
+        })
+    }
+
     /// Create a writer for accumulating Arrow batches.
     fn new_write(&self) -> PyResult<PyTableWrite> {
         let builder = self
@@ -249,15 +272,23 @@ impl PyTableCommit {
     }
 }
 
-/// An opaque commit message produced by `prepare_commit`, consumed by `commit`.
-/// PR1 supports same-process transfer only (no pickle/serialization).
+/// A commit message produced by `prepare_commit` or imported from the Java v14 wire format.
 ///
-/// Carries the originating table's location and builder `commit_user` so a
-/// committer can reject messages prepared for a different table or by a
-/// different `WriteBuilder`.
+/// Carries the table location and builder `commit_user` used by the Rust
+/// committer. Imported Java bodies have their source table checked by
+/// `deserialize_commit_message` before they receive this context.
 #[pyclass(name = "CommitMessage", module = "pypaimon_rust.datafusion")]
 pub struct PyCommitMessage {
     pub(crate) inner: CommitMessage,
     pub(crate) table_location: String,
     pub(crate) commit_user: String,
+}
+
+#[pymethods]
+impl PyCommitMessage {
+    /// Export the Java `CommitMessageSerializer` v14 body (no version header).
+    fn serialize<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.inner.serialize().map_err(to_py_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
 }

@@ -156,6 +156,22 @@ fn validate_fixed_bucket_commit_mode(messages: &[CommitMessage], overwrite: bool
     Ok(())
 }
 
+fn reject_compact_increment(messages: &[CommitMessage]) -> Result<()> {
+    // Java writes this increment in a separate COMPACT snapshot.
+    if messages.iter().any(|message| {
+        !message.compact_before.is_empty()
+            || !message.compact_after.is_empty()
+            || !message.compact_changelog_files.is_empty()
+            || !message.compact_new_index_files.is_empty()
+            || !message.compact_deleted_index_files.is_empty()
+    }) {
+        return Err(crate::Error::Unsupported {
+            message: "Committing a compact increment requires a separate COMPACT snapshot.".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Table commit logic for Paimon write operations.
 ///
 /// Provides atomic commit functionality including append, overwrite and truncate
@@ -264,6 +280,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
 
@@ -274,7 +291,7 @@ impl TableCommit {
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
-        let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
+        let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
         self.try_commit(
             CommitEntriesPlan::Direct {
                 entries,
@@ -311,6 +328,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
 
@@ -321,7 +339,7 @@ impl TableCommit {
         let entries = self.messages_to_entries(&commit_messages);
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
-        let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
+        let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
         let result = self
             .try_commit(
                 CommitEntriesPlan::Direct {
@@ -396,6 +414,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
+        reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
 
@@ -426,7 +445,7 @@ impl TableCommit {
             }
         }
 
-        let check_from_snapshot = Self::min_check_from_snapshot(&commit_messages);
+        let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
 
         self.try_commit(
             CommitEntriesPlan::Overwrite {
@@ -789,6 +808,8 @@ impl TableCommit {
                 .new_files
                 .iter()
                 .chain(message.new_changelog_files.iter())
+                .chain(message.compact_after.iter())
+                .chain(message.compact_changelog_files.iter())
             {
                 for path in file.collect_files(&bucket_path) {
                     let _ = self.table.file_io().delete_file(&path).await;
@@ -805,7 +826,11 @@ impl TableCommit {
             // through `indexFileFactory(partition, bucket)`. Deleting is
             // best-effort, so a wrong path leaks the file silently instead of
             // failing.
-            for file in &message.new_index_files {
+            for file in message
+                .new_index_files
+                .iter()
+                .chain(&message.compact_new_index_files)
+            {
                 let path = committed_index_file_path(
                     table_path,
                     &bucket_path,
@@ -3014,12 +3039,49 @@ impl TableCommit {
         Ok(spec)
     }
 
-    /// Earliest source snapshot requested by row-id conflict checks.
-    fn min_check_from_snapshot(messages: &[CommitMessage]) -> Option<i64> {
-        messages
-            .iter()
-            .filter_map(|message| message.check_from_snapshot)
-            .min()
+    /// Validate the row-id baseline using Java FileStoreCommitImpl's rules.
+    fn check_from_snapshot(messages: &[CommitMessage]) -> Result<Option<i64>> {
+        let mut check_from_snapshot = None;
+        for message in messages {
+            let Some(snapshot) = message.check_from_snapshot else {
+                continue;
+            };
+            if snapshot < 0 {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Invalid row-id check snapshot: {snapshot}"),
+                    source: None,
+                });
+            }
+            if let Some(previous) = check_from_snapshot {
+                if previous != snapshot {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!("Commit messages have different row-id check snapshots: {previous} and {snapshot}"),
+                        source: None,
+                    });
+                }
+            }
+            check_from_snapshot = Some(snapshot);
+        }
+        if check_from_snapshot.is_some() {
+            for message in messages {
+                if message.check_from_snapshot.is_some() {
+                    continue;
+                }
+                if message
+                    .new_files
+                    .iter()
+                    .chain(&message.deleted_files)
+                    .any(|file| file.first_row_id.is_some())
+                {
+                    return Err(crate::Error::DataInvalid {
+                        message: "A row-id commit message is missing its check-from snapshot."
+                            .into(),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(check_from_snapshot)
     }
 
     /// Convert commit messages to manifest entries (ADD/DELETE kind).
@@ -3364,6 +3426,39 @@ mod tests {
     };
     use apache_avro::types::Value;
     use chrono::{DateTime, Utc};
+
+    #[test]
+    fn check_from_snapshot_matches_java_message_rules() {
+        let mut tagged = CommitMessage::new(Vec::new(), 0, Vec::new());
+        tagged.check_from_snapshot = Some(7);
+        assert_eq!(
+            TableCommit::check_from_snapshot(&[tagged.clone()]).unwrap(),
+            Some(7)
+        );
+        assert_eq!(TableCommit::check_from_snapshot(&[]).unwrap(), None);
+
+        let mut different = tagged.clone();
+        different.check_from_snapshot = Some(8);
+        assert!(TableCommit::check_from_snapshot(&[tagged.clone(), different]).is_err());
+        let mut negative = tagged.clone();
+        negative.check_from_snapshot = Some(-1);
+        assert!(TableCommit::check_from_snapshot(&[negative]).is_err());
+        let mut missing = CommitMessage::new(Vec::new(), 0, vec![test_data_file("x", 1)]);
+        missing.new_files[0].first_row_id = Some(1);
+        assert!(TableCommit::check_from_snapshot(&[tagged, missing]).is_err());
+    }
+
+    #[test]
+    fn compact_increment_requires_separate_snapshot() {
+        let mut message = CommitMessage::new(Vec::new(), 0, Vec::new());
+        message.compact_before.push(test_data_file("before", 1));
+        message.compact_after.push(test_data_file("after", 1));
+        message
+            .compact_changelog_files
+            .push(test_data_file("changelog", 1));
+        assert!(reject_compact_increment(&[message]).is_err());
+        assert!(reject_compact_increment(&[CommitMessage::new(Vec::new(), 0, Vec::new())]).is_ok());
+    }
 
     #[tokio::test]
     async fn test_query_auth_table_refuses_commit_paths() {
