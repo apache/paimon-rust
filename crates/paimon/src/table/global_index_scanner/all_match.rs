@@ -18,7 +18,8 @@
 //! Prove complete scalar BTree domains match without opening index files.
 
 use super::entry::{sorted_entry_meta, GlobalIndexEntry, GlobalIndexFileKind};
-use crate::btree::{make_key_comparator, serialize_datum};
+use crate::btree::key_serde::KeyComparator;
+use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexMeta};
 use crate::spec::{DataType, Datum, PredicateOperator};
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::collections::HashMap;
@@ -69,28 +70,12 @@ pub(super) fn all_matching_entries(
         }
         for (predicate_index, (op, values, cmp)) in comparisons.iter().enumerate() {
             let all_match = files.iter().all(|&index| {
-                let meta = sorted_entry_meta(entries[index]);
-                let (Some(first), Some(last)) = (&meta.first_key, &meta.last_key) else {
-                    return false;
-                };
-                !meta.has_nulls && {
-                    if cmp(first, last) == Greater {
-                        return false;
-                    }
-                    match (op, values.as_slice()) {
-                        (PredicateOperator::Eq, [value]) => {
-                            cmp(first, value) == Equal && cmp(last, value) == Equal
-                        }
-                        (PredicateOperator::Lt, [value]) => cmp(last, value) == Less,
-                        (PredicateOperator::LtEq, [value]) => cmp(last, value) != Greater,
-                        (PredicateOperator::Gt, [value]) => cmp(first, value) == Greater,
-                        (PredicateOperator::GtEq, [value]) => cmp(first, value) != Less,
-                        (PredicateOperator::Between, [from, to]) => {
-                            cmp(first, from) != Less && cmp(last, to) != Greater
-                        }
-                        _ => false,
-                    }
-                }
+                // Degradation: pure optimisation. This only proves that a file's whole
+                // row range matches so the posting list need not be decoded. Without an
+                // ordering nothing is proven, so the entry is simply not an all-match
+                // and the ordinary query path handles it.
+                entry_all_matches(sorted_entry_meta(entries[index]), *op, values, cmp)
+                    .unwrap_or(false)
             });
             if all_match {
                 for &index in &files {
@@ -100,4 +85,31 @@ pub(super) fn all_matching_entries(
         }
     }
     result
+}
+
+fn entry_all_matches(
+    meta: &BTreeIndexMeta,
+    op: PredicateOperator,
+    values: &[Vec<u8>],
+    cmp: &KeyComparator,
+) -> crate::Result<bool> {
+    let (Some(first), Some(last)) = (&meta.first_key, &meta.last_key) else {
+        return Ok(false);
+    };
+    if meta.has_nulls || cmp(first, last)? == Greater {
+        return Ok(false);
+    }
+    Ok(match (op, values) {
+        (PredicateOperator::Eq, [value]) => {
+            cmp(first, value)? == Equal && cmp(last, value)? == Equal
+        }
+        (PredicateOperator::Lt, [value]) => cmp(last, value)? == Less,
+        (PredicateOperator::LtEq, [value]) => cmp(last, value)? != Greater,
+        (PredicateOperator::Gt, [value]) => cmp(first, value)? == Greater,
+        (PredicateOperator::GtEq, [value]) => cmp(first, value)? != Less,
+        (PredicateOperator::Between, [from, to]) => {
+            cmp(first, from)? != Less && cmp(last, to)? != Greater
+        }
+        _ => false,
+    })
 }

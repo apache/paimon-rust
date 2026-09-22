@@ -20,6 +20,7 @@
 use super::planning::SortedGlobalIndexShard;
 use super::validation::checked_row_count;
 use super::{SerializeKeyFn, SortedIndexKeyRow};
+use crate::btree::key_serde::DynKeyComparator;
 use crate::spec::{
     extract_datum_from_array, extract_datum_from_arrow, DataField, DataType, ROW_ID_FIELD_NAME,
 };
@@ -328,16 +329,30 @@ pub(super) fn extract_multivalue_index_rows_from_batches(
     Ok(rows)
 }
 
+/// Sort the extracted rows with the index's key comparator.
+///
+/// Both keys come from [`super::make_index_key_codec`] for the column's current type, so
+/// a comparison failure is a real defect rather than an index built before a type change;
+/// it aborts the build instead of degrading.
 pub(super) fn sort_index_rows(
     rows: &mut [SortedIndexKeyRow],
-    cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
-) {
+    cmp: &DynKeyComparator<'_>,
+) -> Result<()> {
+    let mut failure = None;
     rows.sort_by(|left, right| match (&left.0, &right.0) {
         (None, None) => left.1.cmp(&right.1),
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
-        (Some(left_key), Some(right_key)) => {
-            cmp(left_key, right_key).then_with(|| left.1.cmp(&right.1))
-        }
+        (Some(left_key), Some(right_key)) => match cmp(left_key, right_key) {
+            Ok(order) => order.then_with(|| left.1.cmp(&right.1)),
+            Err(error) => {
+                failure.get_or_insert(error);
+                left.1.cmp(&right.1)
+            }
+        },
     });
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }

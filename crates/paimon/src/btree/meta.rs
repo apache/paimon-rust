@@ -24,6 +24,7 @@
 //! ```
 //! Null key flags distinguish empty serialized keys from absent keys.
 
+use crate::btree::key_serde::DynKeyComparator;
 use crate::spec::PredicateOperator;
 use std::cmp::Ordering;
 use std::io;
@@ -76,66 +77,102 @@ impl BTreeIndexMeta {
     }
 
     /// File-level pruning: check if this BTree file may contain matching keys.
+    ///
+    /// Degradation: pruning predicate. A comparator failure means the stored keys are
+    /// not keys of the column's current type, so this file's recorded bounds order
+    /// nothing and prove nothing -- answer "may match" and leave the decision to the
+    /// read. Turning the failure into "cannot match" would silently drop rows.
     pub fn may_match(
         &self,
         op: PredicateOperator,
         serialized_literals: &[Vec<u8>],
-        cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
+        cmp: &DynKeyComparator<'_>,
     ) -> bool {
-        match op {
+        self.try_may_match(op, serialized_literals, cmp)
+            .unwrap_or(true)
+    }
+
+    fn try_may_match(
+        &self,
+        op: PredicateOperator,
+        serialized_literals: &[Vec<u8>],
+        cmp: &DynKeyComparator<'_>,
+    ) -> crate::Result<bool> {
+        Ok(match op {
             PredicateOperator::IsNull => self.has_nulls,
             PredicateOperator::IsNotNull => !self.only_nulls(),
             PredicateOperator::NotEq | PredicateOperator::NotIn => true,
             _ => {
                 if self.only_nulls() {
-                    return false;
+                    return Ok(false);
                 }
                 let (first_key, last_key) = match (&self.first_key, &self.last_key) {
                     (Some(f), Some(l)) => (f.as_slice(), l.as_slice()),
-                    _ => return true,
+                    _ => return Ok(true),
                 };
                 match op {
                     PredicateOperator::Eq => {
-                        cmp(&serialized_literals[0], first_key) != Ordering::Less
-                            && cmp(&serialized_literals[0], last_key) != Ordering::Greater
+                        cmp(&serialized_literals[0], first_key)? != Ordering::Less
+                            && cmp(&serialized_literals[0], last_key)? != Ordering::Greater
                     }
                     PredicateOperator::Lt => {
-                        cmp(first_key, &serialized_literals[0]) == Ordering::Less
+                        cmp(first_key, &serialized_literals[0])? == Ordering::Less
                     }
                     PredicateOperator::LtEq => {
-                        cmp(first_key, &serialized_literals[0]) != Ordering::Greater
+                        cmp(first_key, &serialized_literals[0])? != Ordering::Greater
                     }
                     PredicateOperator::Gt => {
-                        cmp(last_key, &serialized_literals[0]) == Ordering::Greater
+                        cmp(last_key, &serialized_literals[0])? == Ordering::Greater
                     }
                     PredicateOperator::GtEq => {
-                        cmp(last_key, &serialized_literals[0]) != Ordering::Less
+                        cmp(last_key, &serialized_literals[0])? != Ordering::Less
                     }
-                    PredicateOperator::In => serialized_literals.iter().any(|key| {
-                        cmp(key, first_key) != Ordering::Less
-                            && cmp(key, last_key) != Ordering::Greater
-                    }),
+                    PredicateOperator::In => {
+                        let mut any = false;
+                        for key in serialized_literals {
+                            if cmp(key, first_key)? != Ordering::Less
+                                && cmp(key, last_key)? != Ordering::Greater
+                            {
+                                any = true;
+                                break;
+                            }
+                        }
+                        any
+                    }
                     _ => true,
                 }
             }
-        }
+        })
     }
 
     /// File-level pruning for between: file may match if [first_key, last_key] overlaps [from, to].
+    ///
+    /// Degradation: pruning predicate, for the same reason as [`Self::may_match`].
     pub fn may_match_between(
         &self,
         from_key: &[u8],
         to_key: &[u8],
-        cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
+        cmp: &DynKeyComparator<'_>,
     ) -> bool {
+        self.try_may_match_between(from_key, to_key, cmp)
+            .unwrap_or(true)
+    }
+
+    fn try_may_match_between(
+        &self,
+        from_key: &[u8],
+        to_key: &[u8],
+        cmp: &DynKeyComparator<'_>,
+    ) -> crate::Result<bool> {
         if self.only_nulls() {
-            return false;
+            return Ok(false);
         }
         let (first_key, last_key) = match (&self.first_key, &self.last_key) {
             (Some(f), Some(l)) => (f.as_slice(), l.as_slice()),
-            _ => return true,
+            _ => return Ok(true),
         };
-        cmp(first_key, to_key) != Ordering::Greater && cmp(last_key, from_key) != Ordering::Less
+        Ok(cmp(first_key, to_key)? != Ordering::Greater
+            && cmp(last_key, from_key)? != Ordering::Less)
     }
 
     /// Serialize to bytes (compatible with Java SortedIndexFileMeta.serialize()).
@@ -305,5 +342,34 @@ mod tests {
 
         let error = BTreeIndexMeta::deserialize(&encoded).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Pruning must stay conservative when the recorded keys cannot be compared: the
+    /// index was built before the column's type changed, so its bounds prove nothing.
+    /// Answering "cannot match" here would silently drop rows.
+    #[test]
+    fn test_pruning_says_may_match_when_the_comparator_rejects_the_stored_keys() {
+        let meta = BTreeIndexMeta::new(Some(vec![0; 4]), Some(vec![9; 4]), false);
+        let failing = |_: &[u8], _: &[u8]| {
+            Err(crate::Error::DataInvalid {
+                message: "stored keys are not keys of this type".to_string(),
+                source: None,
+            })
+        };
+
+        for op in [
+            PredicateOperator::Eq,
+            PredicateOperator::Lt,
+            PredicateOperator::LtEq,
+            PredicateOperator::Gt,
+            PredicateOperator::GtEq,
+            PredicateOperator::In,
+        ] {
+            assert!(
+                meta.may_match(op, &[vec![0; 8]], &failing),
+                "{op} must not prune the file"
+            );
+        }
+        assert!(meta.may_match_between(&[0; 8], &[9; 8], &failing));
     }
 }

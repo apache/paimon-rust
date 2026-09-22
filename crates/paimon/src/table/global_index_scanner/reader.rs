@@ -22,6 +22,7 @@ use super::entry::{
 };
 use super::query_plan::{add_file_size, EntryQueryPlan, EntryQueryResult, FallbackScanPlan};
 use super::{BoxedCmp, GlobalIndexScanner};
+use crate::btree::key_serde::is_key_comparison_failure;
 use crate::btree::query::{BetweenInfo, IndexQuery};
 use crate::btree::{make_key_comparator, serialize_datum, BTreeIndexMeta, BTreeIndexReader};
 use crate::fm_index::FMGlobalIndexReader;
@@ -129,7 +130,7 @@ impl GlobalIndexScanner {
             };
             let from_key = serialize_key(between.from, between.data_type);
             let to_key = serialize_key(between.to, between.data_type);
-            let bitmap = reader
+            let bitmap = match reader
                 .as_ref()
                 .expect("reader is opened when between matches")
                 .range_query(
@@ -140,7 +141,22 @@ impl GlobalIndexScanner {
                     between.to_inclusive,
                 )
                 .await
-                .map_err(|error| Self::query_error(entry, error))?;
+            {
+                Ok(bitmap) => bitmap,
+                // Degradation: this predicate is not evaluated by the global index at
+                // all. The stored keys are not keys of the column's current type, so
+                // this file cannot answer; declining makes `evaluate_leaf` return
+                // `Ok(None)` and the predicate falls through to the read pipeline.
+                // Returning no rows would silently drop rows, and failing the query
+                // would turn a readable table into an error.
+                Err(error) if is_key_comparison_failure(&error) => {
+                    return Ok(EntryQueryResult {
+                        bitmap: None,
+                        declined: true,
+                    })
+                }
+                Err(error) => return Err(Self::query_error(entry, error)),
+            };
             file_result = Some(bitmap);
         }
 
@@ -152,13 +168,18 @@ impl GlobalIndexScanner {
                     .fetch_add(1, super::TestOrdering::SeqCst);
             }
             let (op, literals, data_type) = &effective_predicates[idx];
-            let Some(bitmap) = reader
+            let queried = reader
                 .as_ref()
                 .expect("reader is opened when predicates match")
                 .query(*op, literals, data_type)
-                .await
-                .map_err(|error| Self::query_error(entry, error))?
-            else {
+                .await;
+            let Some(bitmap) = (match queried {
+                Ok(bitmap) => bitmap,
+                // Degradation: this predicate is not evaluated by the global index at
+                // all, for the same reason as the between query above.
+                Err(error) if is_key_comparison_failure(&error) => None,
+                Err(error) => return Err(Self::query_error(entry, error)),
+            }) else {
                 return Ok(EntryQueryResult {
                     bitmap: None,
                     declined: true,

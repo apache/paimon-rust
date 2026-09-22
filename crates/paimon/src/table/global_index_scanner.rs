@@ -54,7 +54,7 @@ use tokio::sync::Semaphore;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize as TestAtomicUsize, Ordering as TestOrdering};
 
-type BoxedCmp = Box<dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync>;
+type BoxedCmp = Box<dyn Fn(&[u8], &[u8]) -> Result<Ordering> + Send + Sync>;
 
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 

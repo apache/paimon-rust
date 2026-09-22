@@ -17,12 +17,12 @@
 
 //! Manifest entry parsing and file-level pruning metadata.
 
+use crate::btree::key_serde::DynKeyComparator;
 use crate::btree::BTreeIndexMeta;
 use crate::spec::{DataType, PredicateOperator};
 use crate::table::bitmap_global_index_format::is_bitmap_floating_residual_sensitive_op;
 use crate::table::index_file_path::IndexFileLocation;
 use crate::{Error, Result};
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// A resolved global index entry with parsed metadata.
@@ -167,7 +167,7 @@ pub(super) fn bitmap_meta_may_match(
     op: PredicateOperator,
     data_type: &DataType,
     serialized_literals: &[Vec<u8>],
-    cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
+    cmp: &DynKeyComparator<'_>,
 ) -> bool {
     if is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(op) {
         !meta.only_nulls()
@@ -181,7 +181,7 @@ pub(super) fn bitmap_meta_may_match_between(
     data_type: &DataType,
     from_key: &[u8],
     to_key: &[u8],
-    cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
+    cmp: &DynKeyComparator<'_>,
 ) -> bool {
     if is_floating_point(data_type)
         && is_bitmap_floating_residual_sensitive_op(PredicateOperator::Between)
@@ -196,7 +196,7 @@ pub(super) fn multivalue_meta_may_match(
     meta: &BTreeIndexMeta,
     op: PredicateOperator,
     serialized_literals: &[Vec<u8>],
-    cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
+    cmp: &DynKeyComparator<'_>,
 ) -> bool {
     match op {
         PredicateOperator::ArrayContains => {
