@@ -54,7 +54,9 @@ impl PartitionFilter {
 
         let num_fields = partition_fields.len();
         let mut field_candidates: Vec<Option<Vec<Option<&Datum>>>> = vec![None; num_fields];
-        collect_eq_candidates(&predicate, &mut field_candidates);
+        if !collect_eq_candidates(&predicate, &mut field_candidates) {
+            return PartitionFilter::Predicate(predicate);
+        }
 
         if field_candidates.iter().any(|c| c.is_none()) {
             return PartitionFilter::Predicate(predicate);
@@ -271,36 +273,49 @@ fn build_field_bounds(
     })
 }
 
+/// Collect `Eq`/`In`/`IsNull` candidate values per partition field.
+///
+/// Returns `false` as soon as any node of the tree is not fully represented by
+/// the collected candidates. Callers must then keep the original predicate: a
+/// `PartitionSet` is the sole authority in `matches_entry`, which never looks at
+/// the predicate again, and `ReadBuilder::is_exact_filter_pushdown` lets
+/// DataFusion drop its residual filter for a partition-only predicate.
 fn collect_eq_candidates<'a>(
     predicate: &'a Predicate,
     field_candidates: &mut Vec<Option<Vec<Option<&'a Datum>>>>,
-) {
+) -> bool {
     match predicate {
-        Predicate::And(children) => {
-            for child in children {
-                collect_eq_candidates(child, field_candidates);
-            }
-        }
+        Predicate::And(children) => children
+            .iter()
+            .all(|child| collect_eq_candidates(child, field_candidates)),
         Predicate::Leaf {
             index,
             op,
             literals,
             ..
-        } if *index < field_candidates.len() => match op {
-            PredicateOperator::Eq => {
-                if let Some(lit) = literals.first() {
-                    field_candidates[*index] = Some(vec![Some(lit)]);
+        } if *index < field_candidates.len() => {
+            // A second conjunct on the same field used to overwrite the first,
+            // keeping only whichever came last.
+            if field_candidates[*index].is_some() {
+                return false;
+            }
+            match op {
+                PredicateOperator::Eq if !literals.is_empty() => {
+                    field_candidates[*index] = Some(vec![Some(&literals[0])]);
+                    true
                 }
+                PredicateOperator::In if !literals.is_empty() => {
+                    field_candidates[*index] = Some(literals.iter().map(Some).collect());
+                    true
+                }
+                PredicateOperator::IsNull => {
+                    field_candidates[*index] = Some(vec![None]);
+                    true
+                }
+                _ => false,
             }
-            PredicateOperator::In if !literals.is_empty() => {
-                field_candidates[*index] = Some(literals.iter().map(Some).collect());
-            }
-            PredicateOperator::IsNull => {
-                field_candidates[*index] = Some(vec![None]);
-            }
-            _ => {}
-        },
-        _ => {}
+        }
+        _ => false,
     }
 }
 
@@ -458,6 +473,83 @@ mod tests {
         let pred = pb.equal("dt", Datum::String("2024-01-01".into())).unwrap();
         let filter = PartitionFilter::from_predicate(pred, &fields);
         assert!(matches!(filter, PartitionFilter::Predicate(_)));
+    }
+
+    fn serialized_dt(fields: &[DataField], dt: &str) -> Vec<u8> {
+        let mut builder = BinaryRowBuilder::new(1);
+        builder.write_datum(0, &Datum::String(dt.into()), fields[0].data_type());
+        builder.build_serialized()
+    }
+
+    /// Coverage is complete, but `>=` is not expressible as a set of values.
+    #[test]
+    fn test_unexpressible_conjunct_on_covered_field_falls_back() {
+        let fields = partition_fields_dt();
+        let pb = PredicateBuilder::new(&fields);
+        let pred = Predicate::and(vec![
+            pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
+            pb.greater_or_equal("dt", Datum::String("2024-01-02".into()))
+                .unwrap(),
+        ]);
+        let filter = PartitionFilter::from_predicate(pred, &fields);
+        assert!(matches!(filter, PartitionFilter::Predicate(_)));
+        assert!(!filter
+            .matches_entry(&serialized_dt(&fields, "2024-01-01"))
+            .unwrap());
+    }
+
+    /// Two expressible conjuncts on one field: the second assignment used to
+    /// overwrite the first, keeping whichever came last — here the wider `In`.
+    #[test]
+    fn test_second_conjunct_on_same_field_falls_back() {
+        let fields = partition_fields_dt();
+        let pb = PredicateBuilder::new(&fields);
+        let pred = Predicate::and(vec![
+            pb.equal("dt", Datum::String("2024-01-02".into())).unwrap(),
+            pb.is_in(
+                "dt",
+                vec![
+                    Datum::String("2024-01-01".into()),
+                    Datum::String("2024-01-02".into()),
+                ],
+            )
+            .unwrap(),
+        ]);
+        let filter = PartitionFilter::from_predicate(pred, &fields);
+        assert!(matches!(filter, PartitionFilter::Predicate(_)));
+        assert!(!filter
+            .matches_entry(&serialized_dt(&fields, "2024-01-01"))
+            .unwrap());
+        assert!(filter
+            .matches_entry(&serialized_dt(&fields, "2024-01-02"))
+            .unwrap());
+    }
+
+    /// An `Or` over the partition field narrows the `In` beside it.
+    #[test]
+    fn test_or_conjunct_beside_covering_in_falls_back() {
+        let fields = partition_fields_dt();
+        let pb = PredicateBuilder::new(&fields);
+        let pred = Predicate::and(vec![
+            Predicate::or(vec![
+                pb.equal("dt", Datum::String("2024-01-01".into())).unwrap(),
+                pb.equal("dt", Datum::String("2024-01-02".into())).unwrap(),
+            ]),
+            pb.is_in(
+                "dt",
+                vec![
+                    Datum::String("2024-01-01".into()),
+                    Datum::String("2024-01-02".into()),
+                    Datum::String("2024-01-03".into()),
+                ],
+            )
+            .unwrap(),
+        ]);
+        let filter = PartitionFilter::from_predicate(pred, &fields);
+        assert!(matches!(filter, PartitionFilter::Predicate(_)));
+        assert!(!filter
+            .matches_entry(&serialized_dt(&fields, "2024-01-03"))
+            .unwrap());
     }
 
     #[test]
