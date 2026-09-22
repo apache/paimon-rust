@@ -1392,12 +1392,19 @@ async fn read_blob_map_entry(
         });
     }
 
-    let header = read_blob_map_range(
-        reader,
-        payload_range.start..payload_range.start + BLOB_MAP_HEADER_SIZE,
-        "header",
-    )
-    .await?;
+    let index_lengths_start = payload_range.end - BLOB_MAP_INDEX_LENGTHS_SIZE;
+    let (header, index_lengths) = futures::try_join!(
+        read_blob_map_range(
+            reader,
+            payload_range.start..payload_range.start + BLOB_MAP_HEADER_SIZE,
+            "header",
+        ),
+        read_blob_map_range(
+            reader,
+            index_lengths_start..payload_range.end,
+            "index lengths",
+        ),
+    )?;
     let magic = i32::from_le_bytes(header[..4].try_into().unwrap());
     if magic != BLOB_MAP_MAGIC_NUMBER {
         return Err(Error::DataInvalid {
@@ -1424,13 +1431,6 @@ async fn read_blob_map_entry(
     }
     let entry_count = entry_count as usize;
 
-    let index_lengths_start = payload_range.end - BLOB_MAP_INDEX_LENGTHS_SIZE;
-    let index_lengths = read_blob_map_range(
-        reader,
-        index_lengths_start..payload_range.end,
-        "index lengths",
-    )
-    .await?;
     let key_index_length = i32::from_le_bytes(index_lengths[..4].try_into().unwrap());
     let value_index_length = i32::from_le_bytes(index_lengths[4..8].try_into().unwrap());
     let max_indexes = payload_length - BLOB_MAP_MIN_PAYLOAD_SIZE;
@@ -1460,19 +1460,20 @@ async fn read_blob_map_entry(
 
     let value_index_start = index_lengths_start - value_index_length;
     let key_index_start = value_index_start - key_index_length;
-    let key_index =
-        read_blob_map_range(reader, key_index_start..value_index_start, "key index").await?;
-    let value_index = read_blob_map_range(
+    let indexes = read_blob_map_range(
         reader,
-        value_index_start..index_lengths_start,
-        "value index",
+        key_index_start..index_lengths_start,
+        "key/value indexes",
     )
     .await?;
-    let key_lengths = decode_delta_varints(&key_index).map_err(|e| Error::DataInvalid {
+    let key_index_length = key_index_length as usize;
+    let key_index = &indexes[..key_index_length];
+    let value_index = &indexes[key_index_length..];
+    let key_lengths = decode_delta_varints(key_index).map_err(|e| Error::DataInvalid {
         message: format!("Invalid MAP<X, BLOB> key index: {e}"),
         source: Some(Box::new(e)),
     })?;
-    let value_lengths = decode_delta_varints(&value_index).map_err(|e| Error::DataInvalid {
+    let value_lengths = decode_delta_varints(value_index).map_err(|e| Error::DataInvalid {
         message: format!("Invalid MAP<X, BLOB> value index: {e}"),
         source: Some(Box::new(e)),
     })?;
@@ -2500,6 +2501,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_map_descriptor_reads_metadata_in_three_round_trips() {
+        let payload =
+            build_blob_map_payload(&[("first", Some(b"alpha")), ("second", Some(b"beta"))]);
+        let reader = TrackingFileRead::new(Bytes::from(payload.clone()));
+        let key_type = DataType::VarChar(VarCharType::new(VarCharType::MAX_LENGTH).unwrap());
+
+        read_blob_map_entry(&reader, 0..payload.len() as u64, "", true, &key_type)
+            .await
+            .unwrap();
+
+        assert_eq!(reader.ranges().len(), 4);
+        assert_eq!(reader.max_in_flight(), 2);
+    }
+
+    #[tokio::test]
     async fn test_inline_blob_map_reader_rejects_crc_mismatch() {
         let payload = build_blob_map_payload(&[("key", Some(b"value"))]);
         let mut file_bytes = blob_test_utils::build_blob_file_bytes(&[Some(payload.as_slice())]);
@@ -2548,7 +2564,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(reader.ranges().len(), 4);
+        assert_eq!(reader.ranges().len(), 3);
         assert!(!reader.ranges().contains(&blob_entry_range(&payload_range)));
         assert_data_invalid(error, "too large");
     }
@@ -2563,7 +2579,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(reader.ranges().len(), 4);
+        assert_eq!(reader.ranges().len(), 3);
         assert!(!reader.ranges().contains(&blob_entry_range(&payload_range)));
         assert_data_invalid(error, "fixed-width key length");
     }
@@ -3669,14 +3685,15 @@ mod tests {
         let mut index_lengths = Vec::with_capacity(BLOB_MAP_INDEX_LENGTHS_SIZE as usize);
         index_lengths.extend_from_slice(&(key_index.len() as i32).to_le_bytes());
         index_lengths.extend_from_slice(&(value_index.len() as i32).to_le_bytes());
+        let mut indexes = key_index.clone();
+        indexes.extend_from_slice(&value_index);
         let reader = SparseFileRead::new(vec![
             (
                 payload_range.start..payload_range.start + BLOB_MAP_HEADER_SIZE,
                 Bytes::from(header),
             ),
             (lengths_start..payload_range.end, Bytes::from(index_lengths)),
-            (key_index_start..value_index_start, Bytes::from(key_index)),
-            (value_index_start..lengths_start, Bytes::from(value_index)),
+            (key_index_start..lengths_start, Bytes::from(indexes)),
             (data_start..data_start, Bytes::new()),
         ]);
         (reader, payload_range)
