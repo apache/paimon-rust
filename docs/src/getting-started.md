@@ -135,7 +135,7 @@ Mosaic data file reads are always available. The current Mosaic support is read-
 
 ## FileIndexes for Append Writes
 
-Ordinary append writes can generate Bitmap and Bloom Filter indexes for supported
+Ordinary append writes can generate Bitmap, Bloom Filter, and Range Bitmap indexes for supported
 top-level columns using table options:
 
 ```text
@@ -143,16 +143,26 @@ file-index.bitmap.columns = category
 file-index.bloom-filter.columns = id
 file-index.bloom-filter.id.items = 100000
 file-index.bloom-filter.id.fpp = 0.01
+file-index.range-bitmap.columns = score
+file-index.range-bitmap.score.chunk-size = 16kb
 file-index.in-manifest-threshold = 500 B
 ```
 
 Column lists are comma-separated. Bitmap supports `version` (currently `2` only)
 and `index-block-size` per column. Bloom Filter supports `items` and `fpp`.
+Range Bitmap writes Java V1 payloads and supports `chunk-size` per column
+(0 through 2147483647 bytes). The default is `16kb`, except for Boolean,
+TinyInt, and SmallInt, which default to `0b`. A chunk's first key is stored
+in its header, so `0b` is valid and creates one dictionary chunk per distinct key.
+Supported Range Bitmap types are Boolean, TinyInt, SmallInt, Int, BigInt,
+Float, Double, Decimal (precision <= 18), Date, Time, Timestamp and
+LocalZonedTimestamp (precision <= 6), and Char/VarChar/String.
+Range Bitmap enables range predicate pruning through the existing file index
+reader; it does not add TopN support.
 For index types supported for writing, invalid columns, unsupported data types,
 and invalid index options fail when creating the writer. Index types without a
-writer (such as `bsi` and `range-bitmap`) and all their options are ignored, so
-these table properties do not prevent append writes. Range Bitmap indexes can
-still be read from existing files.
+writer (such as `bsi`) and all their options are ignored, so
+these table properties do not prevent append writes.
 
 When supported indexes are configured, each data file gets its own index.
 The complete serialized index is embedded in the manifest when its size

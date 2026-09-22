@@ -104,7 +104,9 @@ impl FileIndexOptions {
             };
             if !matches!(
                 (identifier, option),
-                ("bitmap", "version" | "index-block-size") | ("bloom-filter", "items" | "fpp")
+                ("bitmap", "version" | "index-block-size")
+                    | ("bloom-filter", "items" | "fpp")
+                    | ("range-bitmap", "chunk-size")
             ) {
                 return Err(Error::ConfigInvalid {
                     message: format!("Unknown file index option: {key}"),
