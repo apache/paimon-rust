@@ -33,9 +33,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    new_null_array, Array, ArrayRef, Decimal128Array, ListArray, MapArray, StringArray, StructArray,
-};
+use arrow_array::{new_null_array, Array, ArrayRef, ListArray, MapArray, StringArray, StructArray};
 use arrow_cast::cast;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
@@ -64,50 +62,6 @@ pub(crate) fn evolve_column(
     // not actually match the target still goes through the cast below.
     if source_type.equals_ignore_nullable(target_type) && source.data_type() == &target_arrow {
         return Ok(source.clone());
-    }
-
-    if let (
-        ArrowDataType::Decimal128(_, source_scale),
-        ArrowDataType::Decimal128(target_precision, target_scale),
-    ) = (source.data_type(), &target_arrow)
-    {
-        if source_scale > target_scale {
-            // Arrow rounds Decimal128 scale reductions. Paimon schema casts,
-            // like Python's unsafe Arrow cast, truncate toward zero instead.
-            let shift = u32::try_from(i16::from(*source_scale) - i16::from(*target_scale))
-                .map_err(|_| crate::Error::DataInvalid {
-                    message: "invalid decimal scale reduction".to_string(),
-                    source: None,
-                })?;
-            let divisor = 10_i128
-                .checked_pow(shift)
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: "decimal scale reduction exceeds Decimal128 range".to_string(),
-                    source: None,
-                })?;
-            let decimals = source
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!("expected Decimal128 array, got {:?}", source.data_type()),
-                    source: None,
-                })?;
-            let reduced = Decimal128Array::from(
-                (0..decimals.len())
-                    .map(|index| {
-                        decimals
-                            .is_valid(index)
-                            .then(|| decimals.value(index) / divisor)
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .with_precision_and_scale(*target_precision, *target_scale)
-            .map_err(|error| crate::Error::DataInvalid {
-                message: format!("decimal scale reduction exceeds target precision: {error}"),
-                source: None,
-            })?;
-            return Ok(Arc::new(reduced));
-        }
     }
 
     if matches!(target_type, DataType::VarChar(_) | DataType::Char(_))
@@ -528,7 +482,7 @@ mod tests {
     use crate::spec::{
         ArrayType, BigIntType, DataField, DecimalType, IntType, MapType, VarCharType,
     };
-    use arrow_array::{Int32Array, Int64Array, StringArray};
+    use arrow_array::{Decimal128Array, Int32Array, Int64Array, StringArray};
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Fields};
 
@@ -805,21 +759,59 @@ mod tests {
     }
 
     #[test]
-    fn reducing_decimal_scale_truncates_instead_of_rounding() {
+    fn reducing_decimal_scale_rounds_half_up_for_both_signs() {
         let source: ArrayRef = Arc::new(
-            Decimal128Array::from(vec![Some(12_345), Some(45_678), Some(-45_678), None])
-                .with_precision_and_scale(10, 4)
-                .unwrap(),
+            Decimal128Array::from(vec![
+                Some(4_567),
+                Some(-4_567),
+                Some(4_565),
+                Some(-4_565),
+                Some(4_564),
+                Some(-4_564),
+                None,
+            ])
+            .with_precision_and_scale(6, 3)
+            .unwrap(),
         );
-        let source_type = DataType::Decimal(DecimalType::new(10, 4).unwrap());
-        let target_type = DataType::Decimal(DecimalType::new(10, 2).unwrap());
+        let source_type = DataType::Decimal(DecimalType::new(6, 3).unwrap());
+        let target_type = DataType::Decimal(DecimalType::new(6, 2).unwrap());
         let out = evolve_column(&source, &source_type, &target_type).unwrap();
         let decimals = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
-        assert_eq!(decimals.data_type(), &ArrowDataType::Decimal128(10, 2));
-        assert_eq!(decimals.value(0), 123);
-        assert_eq!(decimals.value(1), 456);
-        assert_eq!(decimals.value(2), -456);
+        assert_eq!(decimals.data_type(), &ArrowDataType::Decimal128(6, 2));
+        assert_eq!(decimals.value(0), 457);
+        assert_eq!(decimals.value(1), -457);
+        assert_eq!(decimals.value(2), 457);
+        assert_eq!(decimals.value(3), -457);
+        assert_eq!(decimals.value(4), 456);
+        assert_eq!(decimals.value(5), -456);
+        assert!(decimals.is_null(6));
+        decimals.validate_decimal_precision(6).unwrap();
+    }
+
+    #[test]
+    fn reducing_decimal_scale_nulls_target_precision_overflow() {
+        let source: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![
+                Some(9_994),
+                Some(9_995),
+                Some(-9_995),
+                Some(999_999),
+                None,
+            ])
+            .with_precision_and_scale(6, 3)
+            .unwrap(),
+        );
+        let source_type = DataType::Decimal(DecimalType::new(6, 3).unwrap());
+        let target_type = DataType::Decimal(DecimalType::new(3, 2).unwrap());
+        let out = evolve_column(&source, &source_type, &target_type).unwrap();
+        let decimals = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!(decimals.data_type(), &ArrowDataType::Decimal128(3, 2));
+        assert_eq!(decimals.value(0), 999);
+        assert!(decimals.is_null(1));
+        assert!(decimals.is_null(2));
         assert!(decimals.is_null(3));
+        assert!(decimals.is_null(4));
+        decimals.validate_decimal_precision(3).unwrap();
     }
 
     #[test]
