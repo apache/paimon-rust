@@ -548,9 +548,16 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::schema::PyDataField>()?;
     this.add_class::<PyPythonScalarUDFObject>()?;
     this.add_class::<PySQLContext>()?;
-    this.add_class::<crate::write::PyWriteBuilder>()?;
-    this.add_class::<crate::write::PyTableWrite>()?;
-    this.add_class::<crate::write::PyTableCommit>()?;
+    this.add_class::<crate::write::PyBatchWriteBuilder>()?;
+    this.add_class::<crate::write::PyStreamWriteBuilder>()?;
+    this.add_class::<crate::write::PyBatchTableWrite>()?;
+    this.add_class::<crate::write::PyStreamTableWrite>()?;
+    this.add_class::<crate::write::PyBatchTableCommit>()?;
+    this.add_class::<crate::write::PyStreamTableCommit>()?;
+    // Preserve the original batch-only class names.
+    this.add("WriteBuilder", this.getattr("BatchWriteBuilder")?)?;
+    this.add("TableWrite", this.getattr("BatchTableWrite")?)?;
+    this.add("TableCommit", this.getattr("BatchTableCommit")?)?;
     this.add_class::<crate::write::PyCommitMessage>()?;
     this.add_function(wrap_pyfunction!(udf, &this)?)?;
     this.add_class::<crate::snapshot::PySnapshot>()?;

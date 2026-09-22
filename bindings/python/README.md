@@ -90,7 +90,7 @@ batch = pa.record_batch(
     [[3, 4], ["charlie", "diana"]],
     schema=pa.schema([("id", pa.int32()), ("name", pa.utf8())]),
 )
-write_builder = table.new_write_builder()
+write_builder = table.new_batch_write_builder()
 writer = write_builder.new_write()
 writer.write_arrow(batch)
 commit_messages = writer.prepare_commit()
@@ -109,41 +109,59 @@ print(batches_tt[0])
 
 ### Native commit from serialized messages
 
-Use `table.new_commit(commit_user)` to commit messages prepared by an external
-Java/PyPaimon writer. Keep `commit_user` stable across retries of the same job.
-The Java v14 body has no version header, table identity, or overwrite mode;
-the caller must retain that context alongside the bytes.
+The Python binding follows Java's batch/stream builder structure. Use
+`table.new_batch_write_builder()` for batch writes and
+`table.new_stream_write_builder().with_commit_user("ingest-job")` for streaming.
+Both create writers and committers with the same commit identity. The original
+no-argument `new_write_builder()` remains an alias for the batch builder.
 
 ```python
-committer = table.new_commit("ingest-job")
+builder = table.new_stream_write_builder().with_commit_user("ingest-job")
+committer = builder.new_commit()
 messages = [
     committer.deserialize_commit_message(body, source_table_location, version=14)
     for body in serialized_messages
 ]
-committer.commit(messages, commit_identifier=42)
+committer.commit(42, messages)
 
-# After an uncertain result, retry the same identifier and complete message set.
-table.new_commit("ingest-job").filter_and_commit(messages, 42)
+# After an uncertain result, restore the same user and retry checkpoint groups.
+restored = table.new_stream_write_builder().with_commit_user("ingest-job").new_commit()
+committed_groups = restored.filter_and_commit({42: messages})
 ```
 
-Identifiers must increase monotonically for each commit user. Omitting an
-identifier uses batch commit semantics. `abort(messages)` deletes newly written
-files; only use it for messages known not to have committed.
+Stream identifiers increase monotonically per commit user. `filter_and_commit`
+sorts them and returns the number of groups committed after filtering. Empty
+stream checkpoints create snapshots recording their identifiers. Batch
+`commit(messages)` uses Java's batch identifier and permits one attempt per
+committer. Batch empty commits follow `snapshot.ignore-empty-commit` (default
+true). `truncate_table()` shares the batch commit guard; `truncate_partitions`
+accepts a nonempty list of partition specs as in Java.
 
-`overwrite(messages, static_partitions=None, *, commit_identifier=None)` supports
-dynamic overwrite (`None`), whole-table overwrite (`{}`), and static/partial
-partition specs. Specs use Python values matching the partition schema, for
-example `{"region": "EU", "year": 2026}`; `None` or the configured default partition
-name denotes null. `truncate_partitions(specs, commit_identifier=None)` and
-`truncate_table(commit_identifier=None)` expose the Rust truncate operations.
-Overwrite and truncate filter repeated identifiers when an explicit identifier
-is supplied, preserving data written after the original operation.
+Configure overwrite on the batch builder:
 
-For overwrite, prepare native writers with
-`table.new_write_builder(commit_user="ingest-job", overwrite=True)`. When importing
-fixed-bucket messages carrying `totalBuckets`, pass `overwrite=True` to restore
-operation context absent from Java's wire format. Submit these through `overwrite`.
-Compact increments remain unsupported by the Rust committer and are rejected.
+```python
+builder = table.new_batch_write_builder().with_overwrite()
+writer = builder.new_write()
+writer.write_arrow(batch)
+builder.new_commit().commit(writer.prepare_commit())
+```
+
+This configures both writer and committer. For partitioned tables,
+`dynamic-partition-overwrite=true` (the default) replaces touched partitions,
+including when a static spec was supplied; empty input deletes nothing.
+With that option false, `with_overwrite(spec)` replaces matching partitions and
+`with_overwrite()` replaces all. Unpartitioned empty overwrite truncates the
+whole table. Explicit `with_overwrite(None)` restores append. Partition values
+use schema-compatible Python values; `None` or the default partition name means
+null. Batch writers permit one `prepare_commit()` call; reusable stream writers
+use `prepare_commit(wait_compaction, commit_identifier)`.
+
+The Java v14 body has no version header, table identity, commit user, or overwrite
+mode. Import requires a trusted source table location and a separately supplied
+version; overwrite context is derived from the configured builder/committer.
+Only v14 is supported. `abort(messages)` deletes newly written files and must
+only be used for messages known not to have committed. Compact increments remain
+unsupported by the Rust committer and are rejected.
 
 ### Tables resolved outside the Rust catalog
 

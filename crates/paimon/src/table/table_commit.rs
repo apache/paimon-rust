@@ -180,6 +180,7 @@ pub struct TableCommit {
     snapshot_manager: SnapshotManager,
     snapshot_commit: Arc<dyn SnapshotCommit>,
     commit_user: String,
+    ignore_empty_commit: bool,
     total_buckets: i32,
     // commit config
     commit_max_retries: u32,
@@ -221,6 +222,7 @@ impl TableCommit {
             snapshot_manager,
             snapshot_commit,
             commit_user,
+            ignore_empty_commit: true,
             total_buckets,
             commit_max_retries,
             commit_timeout_ms,
@@ -233,6 +235,79 @@ impl TableCommit {
             data_evolution_enabled,
             partition_default_name,
         }
+    }
+
+    /// Control empty APPEND snapshots. Java stream commits set this to false.
+    pub fn with_ignore_empty_commit(mut self, ignore_empty_commit: bool) -> Self {
+        self.ignore_empty_commit = ignore_empty_commit;
+        self
+    }
+
+    /// Java StreamTableCommit.filterAndCommit: sort identifiers and return the
+    /// number of groups remaining after filtering against committed snapshots.
+    pub async fn filter_and_commit(
+        &self,
+        mut commits: Vec<(i64, Vec<CommitMessage>)>,
+    ) -> Result<usize> {
+        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
+        self.table.ensure_not_branch_reference_for_write()?;
+        commits.sort_by_key(|(id, _)| *id);
+        let latest = self.snapshot_manager.get_latest_snapshot().await?;
+        let mut pending = Vec::new();
+        for (id, messages) in commits {
+            if !self.is_committed_identifier(&latest, id).await? {
+                pending.push((id, messages));
+            }
+        }
+        // Java checks every pending checkpoint before publishing any snapshot.
+        // Filtered checkpoints may reference files already expired by retention.
+        for (_, messages) in &pending {
+            self.check_recovery_files(messages).await?;
+        }
+        let count = pending.len();
+        for (id, messages) in pending {
+            self.commit_with_identifier(messages, id).await?;
+        }
+        Ok(count)
+    }
+
+    async fn check_recovery_files(&self, messages: &[CommitMessage]) -> Result<()> {
+        let index_in_bucket =
+            CoreOptions::new(self.table.schema().options()).index_file_in_data_file_dir();
+        for message in messages {
+            let bucket_path = self.bucket_path(&message.partition, message.bucket)?;
+            let mut paths = Vec::new();
+            for file in message
+                .new_files
+                .iter()
+                .chain(&message.new_changelog_files)
+                .chain(&message.compact_after)
+                .chain(&message.compact_changelog_files)
+            {
+                paths.extend(file.collect_files(&bucket_path));
+            }
+            for file in message
+                .new_index_files
+                .iter()
+                .chain(&message.compact_new_index_files)
+            {
+                paths.push(committed_index_file_path(
+                    self.table.location().trim_end_matches('/'),
+                    &bucket_path,
+                    index_in_bucket,
+                    file,
+                ));
+            }
+            for path in paths {
+                if !self.table.file_io().exists(&path).await? {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!("Cannot recover commit: file '{path}' does not exist"),
+                        source: None,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Commit new files in APPEND mode.
@@ -284,7 +359,7 @@ impl TableCommit {
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
 
-        if commit_messages.is_empty() {
+        if commit_messages.is_empty() && self.ignore_empty_commit {
             return Ok(());
         }
 
@@ -878,11 +953,11 @@ impl TableCommit {
         let mut duplicate_check_start_snapshot_id: Option<i64> = None;
         let mut retry_state: Option<Box<RetryState>> = None;
         let start_time_ms = current_time_millis();
-        // An identified destructive no-op must still record its identifier.
-        // Otherwise a retry after an intervening write can execute the operation
-        // for the first time and delete data which was not present originally.
-        let commit_empty_overwrite =
-            filter_committed && plan.commit_kind_hint() == CommitKind::OVERWRITE;
+        // Java records static overwrite/truncate operations even when no files
+        // match. Dynamic empty overwrite exits before constructing this plan.
+        let commit_empty_overwrite = plan.commit_kind_hint() == CommitKind::OVERWRITE;
+        let commit_empty_append =
+            !self.ignore_empty_commit && matches!(plan, CommitEntriesPlan::Direct { .. });
         let mut filter_committed = filter_committed;
 
         let mut publication_uncertain = false;
@@ -921,6 +996,7 @@ impl TableCommit {
                     && resolved.changelog_entries.is_empty()
                     && !resolved.index_manifest_changed
                     && !commit_empty_overwrite
+                    && !commit_empty_append
                 {
                     break;
                 }
@@ -5273,7 +5349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_truncate_missing_partition_is_noop() {
+    async fn test_truncate_missing_partition_records_java_overwrite_snapshot() {
         let file_io = test_file_io();
         let table_path = "memory:/test_truncate_missing_partition";
         setup_dirs(&file_io, table_path).await;
@@ -5298,7 +5374,9 @@ mod tests {
 
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
-        assert_eq!(snapshot.id(), 1);
+        assert_eq!(snapshot.id(), 2);
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+        assert_eq!(snapshot.delta_record_count(), Some(0));
         assert_eq!(snapshot.total_record_count(), Some(100));
     }
 

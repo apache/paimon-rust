@@ -67,6 +67,7 @@ pub(crate) struct PostponeFileWriter {
     /// Timestamp captured when the current file was opened (used for deterministic replay order).
     current_file_creation_time: DateTime<Utc>,
     written_files: Vec<DataFileMeta>,
+    created_paths: Vec<String>,
     /// Background file close tasks spawned during rolling.
     in_flight_closes: JoinSet<Result<DataFileMeta>>,
 }
@@ -83,6 +84,7 @@ impl PostponeFileWriter {
             current_file_start_seq: 0,
             current_file_creation_time: Utc::now(),
             written_files: Vec::new(),
+            created_paths: Vec::new(),
             in_flight_closes: JoinSet::new(),
         }
     }
@@ -155,6 +157,18 @@ impl PostponeFileWriter {
         Ok(())
     }
 
+    pub(crate) async fn abort(&mut self) {
+        if let Some(writer) = self.current_writer.take() {
+            let _ = writer.close().await;
+        }
+        self.current_file_name = None;
+        while self.in_flight_closes.join_next().await.is_some() {}
+        for path in self.created_paths.drain(..) {
+            let _ = self.file_io.delete_file(&path).await;
+        }
+        self.written_files.clear();
+    }
+
     pub(crate) async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
         self.close_current_file().await?;
         while let Some(result) = self.in_flight_closes.join_next().await {
@@ -164,6 +178,7 @@ impl PostponeFileWriter {
             })??;
             self.written_files.push(meta);
         }
+        self.created_paths.clear();
         Ok(std::mem::take(&mut self.written_files))
     }
 
@@ -213,6 +228,7 @@ impl PostponeFileWriter {
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
         let physical_schema = build_physical_schema(&user_schema);
         let file_path = format!("{bucket_dir}/{file_name}");
+        self.created_paths.push(file_path.clone());
         let output = self.file_io.new_output(&file_path)?;
         let writer = create_format_writer(
             &output,

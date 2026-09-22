@@ -163,14 +163,11 @@ class Table:
     def location(self) -> str: ...
     def schema(self) -> TableSchema: ...
     def new_read_builder(self, options: Optional[Dict[str, str]] = None) -> ReadBuilder: ...
-    def new_write_builder(
-        self, commit_user: Optional[str] = None, *, overwrite: bool = False
-    ) -> "WriteBuilder":
-        """Share a commit user with writers; overwrite=True prepares overwrite writes."""
+    def new_write_builder(self) -> "BatchWriteBuilder":
+        """Compatibility alias for new_batch_write_builder()."""
         ...
-    def new_commit(self, commit_user: str) -> "TableCommit":
-        """Create a committer with a stable job/attempt identity."""
-        ...
+    def new_batch_write_builder(self) -> "BatchWriteBuilder": ...
+    def new_stream_write_builder(self) -> "StreamWriteBuilder": ...
     def latest_snapshot(self) -> Optional[Snapshot]:
         """
         Warning: This method blocks on a DataFusion runtime.
@@ -209,74 +206,88 @@ class CommitMessage:
         """Java CommitMessageSerializer v14 body, without a version header."""
         ...
 
-class TableWrite:
+class BatchTableWrite:
+    def close(self) -> None: ...
     def write_arrow(self, batch: pyarrow.RecordBatch) -> None: ...
-    def prepare_commit(self) -> List[CommitMessage]: ...
+    def prepare_commit(self) -> List[CommitMessage]:
+        """Prepare once per instance, including empty or failed attempts."""
+        ...
 
-class TableCommit:
+class StreamTableWrite:
+    def close(self) -> None: ...
+    def write_arrow(self, batch: pyarrow.RecordBatch) -> None: ...
+    def prepare_commit(self, wait_compaction: bool, commit_identifier: int) -> List[CommitMessage]:
+        """Flush a checkpoint; submit its messages with the same identifier.
+
+        Rust currently flushes synchronously without background compaction.
+        """
+        ...
+
+class BatchTableCommit:
+    def close(self) -> None: ...
     def deserialize_commit_message(
-        self, data: bytes, source_table_location: str, *, version: int = 14,
-        overwrite: bool = False,
+        self, data: bytes, source_table_location: str, *, version: int = 14
     ) -> CommitMessage:
-        """Import an unframed Java body using trusted source table and write mode.
-
-        Only v14 is supported. For fixed-bucket overwrite messages, overwrite=True
-        restores operation context that Java does not store in the wire body.
-        """
+        """Import a Java v14 body; overwrite context comes from the builder."""
         ...
-    def commit(
-        self, messages: Sequence[CommitMessage], commit_identifier: Optional[int] = None
-    ) -> None:
-        """Commit once per identifier, increasing it monotonically per commit user.
-
-        None uses the batch identifier. This does not filter prior identifiers;
-        use filter_and_commit when retrying an uncertain result.
-        """
+    def commit(self, messages: Sequence[CommitMessage]) -> None:
+        """Commit once, using the builder's overwrite configuration and batch identifier."""
         ...
-    def filter_and_commit(
-        self, messages: Sequence[CommitMessage], commit_identifier: int
-    ) -> None:
-        """Skip an already committed identifier before committing its messages."""
+    def truncate_table(self) -> None:
+        """Truncate all data; shares the one-time guard with commit()."""
         ...
-    def overwrite(
-        self, messages: Sequence[CommitMessage],
-        static_partitions: Optional[Dict[str, Any]] = None, *,
-        commit_identifier: Optional[int] = None,
-    ) -> None:
-        """None replaces touched partitions; {} replaces the whole table.
-
-        A nonempty spec replaces matching partitions, including partial specs.
-        Values use the schema's Python types (int, str, date, Decimal, etc.);
-        None and the configured default partition name denote null. With empty
-        messages, a static spec truncates matching partitions; None is a no-op.
-        An explicit identifier filters a previously committed operation on retry.
-        """
-        ...
-    def truncate_partitions(
-        self, partitions: Sequence[Dict[str, Any]], commit_identifier: Optional[int] = None
-    ) -> None:
-        """Truncate matching partitions using typed specs. An empty list is rejected.
-
-        An explicit identifier filters a previously committed operation on retry.
-        """
-        ...
-    def truncate_table(self, commit_identifier: Optional[int] = None) -> None:
-        """Truncate all data, filtering retries when an identifier is supplied."""
+    def truncate_partitions(self, partitions: Sequence[Dict[str, Any]]) -> None:
+        """Truncate matching partitions. Reject empty input, as Java does."""
         ...
     def abort(self, messages: Sequence[CommitMessage]) -> None:
-        """Delete the files the messages refer to. Best-effort: missing files and
-        storage errors are ignored. The messages must not be committed afterwards."""
+        """Best-effort deletion of newly written files; only abort uncommitted messages."""
         ...
 
-class WriteBuilder:
+class StreamTableCommit:
+    def close(self) -> None: ...
     def deserialize_commit_message(
-        self, data: bytes, source_table_location: str, *, version: int = 14,
-        overwrite: bool = False,
-    ) -> CommitMessage:
-        """Import a Java v14 body with trusted source table and overwrite context."""
+        self, data: bytes, source_table_location: str, *, version: int = 14
+    ) -> CommitMessage: ...
+    def commit(self, commit_identifier: int, messages: Sequence[CommitMessage]) -> None:
+        """Commit a checkpoint, including empty checkpoints, without filtering retries."""
         ...
-    def new_write(self) -> TableWrite: ...
-    def new_commit(self) -> TableCommit: ...
+    def filter_and_commit(
+        self, commit_identifiers_and_messages: Dict[int, Sequence[CommitMessage]]
+    ) -> int:
+        """Sort identifiers, skip committed groups, and return the number committed."""
+        ...
+    def abort(self, messages: Sequence[CommitMessage]) -> None: ...
+
+class BatchWriteBuilder:
+    def with_overwrite(self, static_partition: Optional[Dict[str, Any]] = {}) -> "BatchWriteBuilder":
+        """Configure both writer and committer. Explicit None restores append.
+
+        For partitioned tables dynamic-partition-overwrite defaults to true:
+        replace touched partitions, irrespective of the static spec; empty input
+        removes nothing. With the option false, match the spec ({} means all).
+        An unpartitioned empty overwrite truncates the table. Partition values
+        use the schema's Python types; None or the default partition name is null.
+        """
+        ...
+    def deserialize_commit_message(
+        self, data: bytes, source_table_location: str, *, version: int = 14
+    ) -> CommitMessage: ...
+    def new_write(self) -> BatchTableWrite: ...
+    def new_commit(self) -> BatchTableCommit: ...
+
+class StreamWriteBuilder:
+    def commit_user(self) -> str: ...
+    def with_commit_user(self, commit_user: str) -> "StreamWriteBuilder": ...
+    def deserialize_commit_message(
+        self, data: bytes, source_table_location: str, *, version: int = 14
+    ) -> CommitMessage: ...
+    def new_write(self) -> StreamTableWrite: ...
+    def new_commit(self) -> StreamTableCommit: ...
+
+# Original batch-only names, retained for compatibility.
+WriteBuilder = BatchWriteBuilder
+TableWrite = BatchTableWrite
+TableCommit = BatchTableCommit
 
 class PaimonCatalog:
     def __init__(self, catalog_options: Dict[str, str]) -> None: ...

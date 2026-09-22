@@ -32,7 +32,7 @@ use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
 use crate::snapshot::PySnapshot;
 use crate::tag::PyTag;
-use crate::write::{PyTableCommit, PyWriteBuilder};
+use crate::write::{PyBatchWriteBuilder, PyStreamWriteBuilder};
 
 #[pyclass(name = "Table", module = "pypaimon_rust.datafusion")]
 pub struct PyTable {
@@ -133,19 +133,17 @@ impl PyTable {
         }
     }
 
-    /// Create a [`PyWriteBuilder`] for the batch write loop.
-    #[pyo3(signature = (commit_user=None, *, overwrite=false))]
-    fn new_write_builder(
-        &self,
-        commit_user: Option<String>,
-        overwrite: bool,
-    ) -> PyResult<PyWriteBuilder> {
-        PyWriteBuilder::new(Arc::clone(&self.inner), commit_user, overwrite)
+    /// Compatibility alias for new_batch_write_builder().
+    fn new_write_builder(&self) -> PyBatchWriteBuilder {
+        self.new_batch_write_builder()
     }
 
-    /// Create a native committer with the caller's stable job/attempt identity.
-    fn new_commit(&self, commit_user: String) -> PyResult<PyTableCommit> {
-        PyTableCommit::new(Arc::clone(&self.inner), commit_user)
+    fn new_batch_write_builder(&self) -> PyBatchWriteBuilder {
+        PyBatchWriteBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn new_stream_write_builder(&self) -> PyStreamWriteBuilder {
+        PyStreamWriteBuilder::new(Arc::clone(&self.inner))
     }
 
     // ---------------- #285: observability ----------------
