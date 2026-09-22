@@ -2930,7 +2930,7 @@ async fn test_query_auth_refuses_a_decorated_handle() {
             .add_table_with_schema("default", name, schema_of(&["id"], GUARDED), &path);
     }
     // No handle is built from a decorated name; the branch is reached through
-    // `copy_with_branch`, and the live check asks the server about it there.
+    // `copy_with_branch`.
     for name in ["guarded$branch_dev", "guarded$files"] {
         assert!(
             ctx.catalog

@@ -439,7 +439,7 @@ fn plan_from_bucket_splits(
             "bucket-split planning requires at least one bucket split",
         ));
     }
-    // Sync, so the split's marker stands in for asking the server, as in `to_arrow`.
+    // The split's marker carries the plan's decision, as in `to_arrow`.
     if splits.iter().any(|s| s.data_split().query_auth_required()) {
         return Err(crate::table::query_auth::unsupported(
             "an engine-planned vector split of such a table carries no authorization",
