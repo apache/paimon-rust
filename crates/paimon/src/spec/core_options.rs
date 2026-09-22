@@ -125,6 +125,8 @@ const DEFAULT_COMMIT_TIMEOUT_MS: u64 = u64::MAX;
 const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 10;
 const DEFAULT_COMMIT_MAX_RETRY_WAIT_MS: u64 = 10_000;
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
+/// Local date/time string used for snapshot time travel, matching Java Paimon.
+pub const SCAN_TIMESTAMP_OPTION: &str = "scan.timestamp";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
 pub const SCAN_SNAPSHOT_ID_OPTION: &str = "scan.snapshot-id";
 pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
@@ -502,7 +504,7 @@ impl<'a> CoreOptions<'a> {
                     SCAN_WATERMARK_OPTION,
                 ]
             } else if mode.eq_ignore_ascii_case("from-timestamp") {
-                &[SCAN_TIMESTAMP_MILLIS_OPTION]
+                &[SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_TIMESTAMP_OPTION]
             } else {
                 return Err(crate::Error::Unsupported {
                     message: format!(
@@ -1060,9 +1062,12 @@ impl<'a> CoreOptions<'a> {
     }
 
     fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
-        let mut selectors = Vec::with_capacity(5);
+        let mut selectors = Vec::with_capacity(6);
         if self.options.contains_key(SCAN_TIMESTAMP_MILLIS_OPTION) {
             selectors.push(SCAN_TIMESTAMP_MILLIS_OPTION);
+        }
+        if self.options.contains_key(SCAN_TIMESTAMP_OPTION) {
+            selectors.push(SCAN_TIMESTAMP_OPTION);
         }
         if self.options.contains_key(SCAN_WATERMARK_OPTION) {
             selectors.push(SCAN_WATERMARK_OPTION);
@@ -1124,6 +1129,10 @@ impl<'a> CoreOptions<'a> {
 
         if let Some(ts) = self.parse_i64_option(SCAN_TIMESTAMP_MILLIS_OPTION)? {
             Ok(Some(TimeTravelSelector::TimestampMillis(ts)))
+        } else if let Some(value) = self.options.get(SCAN_TIMESTAMP_OPTION) {
+            Ok(Some(TimeTravelSelector::TimestampMillis(
+                parse_scan_timestamp(value, &chrono::Local)?,
+            )))
         } else if let Some(watermark) = self.parse_i64_option(SCAN_WATERMARK_OPTION)? {
             Ok(Some(TimeTravelSelector::Watermark(watermark)))
         } else if let Some(value) = self.options.get(SCAN_VERSION_OPTION).map(String::as_str) {
@@ -1612,6 +1621,59 @@ impl<'a> CoreOptions<'a> {
             Some(raw) => raw.split(',').map(|c| c.trim().to_string()).collect(),
         }
     }
+}
+
+/// Java DateTimeUtils accepts a date, a space-separated timestamp, or an ISO
+/// local timestamp (whose seconds are optional). It truncates to milliseconds
+/// and resolves the date/time in the process's default time zone.
+fn parse_scan_timestamp(value: &str, zone: &impl chrono::TimeZone) -> crate::Result<i64> {
+    use chrono::{Days, NaiveDate, NaiveDateTime, Offset, TimeZone, Timelike};
+
+    let datetime = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M"))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map(|date| date.and_hms_opt(0, 0, 0).unwrap())
+        })
+        .map_err(|error| crate::Error::DataInvalid {
+            message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+            source: Some(Box::new(error)),
+        })?;
+    // Chrono also accepts leap seconds and fractions longer than nanoseconds;
+    // Java's local timestamp parser does not.
+    if datetime.nanosecond() >= 1_000_000_000
+        || value
+            .rsplit_once('.')
+            .is_some_and(|(_, fraction)| fraction.len() > 9)
+    {
+        return Err(crate::Error::DataInvalid {
+            message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+            source: None,
+        });
+    }
+    // LocalDateTime.atZone chooses the earlier instant during an overlap.
+    if let Some(timestamp) = zone.from_local_datetime(&datetime).earliest() {
+        return Ok(timestamp.timestamp_millis());
+    }
+    // During a clock-forward gap Java shifts the local time forward by the
+    // gap, which is equivalent to applying the offset before the transition.
+    // Looking back one local day also covers whole-day date-line transitions.
+    datetime
+        .checked_sub_days(Days::new(1))
+        .and_then(|before| zone.from_local_datetime(&before).earliest())
+        .and_then(|before| {
+            before
+                .offset()
+                .fix()
+                .from_local_datetime(&datetime)
+                .single()
+        })
+        .map(|timestamp| timestamp.timestamp_millis())
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: format!("Invalid local time for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+            source: None,
+        })
 }
 
 /// Parse a memory size string to bytes using binary (1024-based) semantics,
@@ -2492,6 +2554,120 @@ mod tests {
         assert_eq!(parallelism(Some("-3")), 1);
         assert_eq!(parallelism(Some("5000")), 1000);
         assert_eq!(parallelism(Some("many")), 64);
+    }
+
+    #[test]
+    fn test_scan_timestamp_parses_local_time_and_truncates_to_millis() {
+        use chrono::{Local, TimeZone};
+
+        let midnight = Local.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap();
+        let noon = Local.with_ymd_and_hms(2024, 1, 2, 12, 3, 4).unwrap();
+        for (value, expected) in [
+            ("2024-01-02", midnight.timestamp_millis()),
+            ("2024-1-2 12:3:4", noon.timestamp_millis()),
+            ("2024-01-02 12:03:04", noon.timestamp_millis()),
+            (
+                "2024-01-02 12:03:04.123456789",
+                noon.timestamp_millis() + 123,
+            ),
+            ("2024-01-02T12:03:04.9", noon.timestamp_millis() + 900),
+            ("2024-01-02T12:03", noon.timestamp_millis() - 4000),
+        ] {
+            let options = HashMap::from([("scan.timestamp".to_string(), value.to_string())]);
+            assert_eq!(
+                CoreOptions::new(&options)
+                    .try_time_travel_selector()
+                    .unwrap(),
+                Some(TimeTravelSelector::TimestampMillis(expected)),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_timestamp_matches_java_zone_transitions() {
+        for (zone, value, expected) in [
+            (
+                "America/New_York",
+                "2024-11-03 01:30:00",
+                "2024-11-03T05:30:00Z",
+            ),
+            (
+                "America/New_York",
+                "2024-03-10 02:30:00",
+                "2024-03-10T07:30:00Z",
+            ),
+            (
+                "Australia/Lord_Howe",
+                "2024-10-06 02:15:00",
+                "2024-10-05T15:45:00Z",
+            ),
+            (
+                "Pacific/Apia",
+                "2011-12-30 12:00:00",
+                "2011-12-30T22:00:00Z",
+            ),
+            (
+                "UTC",
+                "1969-12-31 23:59:59.999999999",
+                "1969-12-31T23:59:59.999Z",
+            ),
+        ] {
+            let zone = zone.parse::<arrow_array::timezone::Tz>().unwrap();
+            assert_eq!(
+                parse_scan_timestamp(value, &zone).unwrap(),
+                chrono::DateTime::parse_from_rfc3339(expected)
+                    .unwrap()
+                    .timestamp_millis(),
+                "{value} in {zone}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_timestamp_rejects_invalid_values_and_conflicts() {
+        for value in [
+            "",
+            "invalid",
+            "1700000000000",
+            "2024-13-01",
+            "2024-01-01 25:00:00",
+            "2024-01-01T00:00:00Z",
+            "2024-01-01 23:59:60",
+            "2024-01-01 00:00:00.1234567890",
+        ] {
+            let options = HashMap::from([("scan.timestamp".to_string(), value.to_string())]);
+            let core = CoreOptions::new(&options);
+            assert!(core.has_time_travel_selector());
+            let err = core.try_time_travel_selector().unwrap_err();
+            assert!(
+                matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("scan.timestamp")),
+                "{value}"
+            );
+        }
+        for selector in [
+            SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_WATERMARK_OPTION,
+            SCAN_VERSION_OPTION,
+            SCAN_SNAPSHOT_ID_OPTION,
+            SCAN_TAG_NAME_OPTION,
+        ] {
+            let options = HashMap::from([
+                ("scan.timestamp".to_string(), "2024-01-02".to_string()),
+                (selector.to_string(), "1".to_string()),
+            ]);
+            let err = CoreOptions::new(&options)
+                .try_time_travel_selector()
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("Only one") && message.contains("scan.timestamp") && message.contains(selector))
+            );
+        }
+        let options = HashMap::from([
+            ("scan.timestamp".to_string(), "2024-01-02".to_string()),
+            ("scan.mode".to_string(), "from-timestamp".to_string()),
+        ]);
+        assert!(CoreOptions::new(&options).validate_scan_options().is_ok());
     }
 
     #[test]

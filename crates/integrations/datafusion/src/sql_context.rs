@@ -1461,13 +1461,14 @@ impl SQLContext {
     fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
         use paimon::spec::{
             SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
-            SCAN_VERSION_OPTION,
+            SCAN_TIMESTAMP_OPTION, SCAN_VERSION_OPTION,
         };
 
         let options = self.dynamic_options.read().unwrap();
         for key in [
             SCAN_VERSION_OPTION,
             SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_TIMESTAMP_OPTION,
             SCAN_SNAPSHOT_ID_OPTION,
             SCAN_TAG_NAME_OPTION,
         ] {

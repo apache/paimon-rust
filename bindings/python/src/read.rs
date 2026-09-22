@@ -39,8 +39,9 @@ const MAP_SELECTED_KEYS_PREFIX: &str = "__PAIMON_MAP_SELECTED_KEYS:";
 const MAP_SELECTED_KEYS_DELIMITER: char = ';';
 
 /// Time-travel selector option names, in the core's resolution priority order.
-const TIME_TRAVEL_SELECTORS: [&str; 5] = [
+const TIME_TRAVEL_SELECTORS: [&str; 6] = [
     "scan.timestamp-millis",
+    "scan.timestamp",
     "scan.watermark",
     "scan.version",
     "scan.snapshot-id",

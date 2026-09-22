@@ -373,8 +373,9 @@ pub unsafe extern "C" fn paimon_table_latest_snapshot(
 }
 
 /// Time-travel selector option names, in the core's resolution priority order.
-const TIME_TRAVEL_SELECTORS: [&str; 5] = [
+const TIME_TRAVEL_SELECTORS: [&str; 6] = [
     "scan.timestamp-millis",
+    "scan.timestamp",
     "scan.watermark",
     "scan.version",
     "scan.snapshot-id",
@@ -446,7 +447,7 @@ pub unsafe extern "C" fn paimon_table_new_read_builder(
 }
 
 /// Create a ReadBuilder from a Table with scan options (e.g. time-travel
-/// selectors `scan.snapshot-id` / `scan.tag-name` / `scan.timestamp-millis` /
+/// selectors `scan.snapshot-id` / `scan.tag-name` / `scan.timestamp-millis` / `scan.timestamp` /
 /// `scan.watermark` / `scan.version`). At most one time-travel selector may be
 /// set. A selector that does not resolve to a snapshot is an error (never a
 /// silent read-of-latest).
@@ -2520,20 +2521,22 @@ mod tests {
     fn malformed_selector_value_does_not_silently_read_latest() {
         unsafe {
             let table = boxed_test_table();
-            let k = CString::new("scan.snapshot-id").unwrap();
-            let v = CString::new("abc").unwrap();
-            let opts = [opt(&k, &v)];
-            // Core swallows the parse error and falls back; the binding reports
-            // the unified "did not resolve" error rather than building a
-            // latest-reading builder.
-            let (code, message) = assert_rb_err_code_message(
-                paimon_table_new_read_builder_with_options(table, opts.as_ptr(), 1),
-            );
-            assert_eq!(code, PaimonErrorCode::InvalidInput as i32);
-            assert!(
-                message.contains("did not resolve"),
-                "message should report the selector did not resolve, got: {message}"
-            );
+            for selector in ["scan.snapshot-id", "scan.timestamp"] {
+                let k = CString::new(selector).unwrap();
+                let v = CString::new("abc").unwrap();
+                let opts = [opt(&k, &v)];
+                // Core swallows the parse error and falls back; the binding reports
+                // the unified "did not resolve" error rather than building a
+                // latest-reading builder.
+                let (code, message) = assert_rb_err_code_message(
+                    paimon_table_new_read_builder_with_options(table, opts.as_ptr(), 1),
+                );
+                assert_eq!(code, PaimonErrorCode::InvalidInput as i32);
+                assert!(
+                    message.contains("did not resolve"),
+                    "message should report the selector did not resolve, got: {message}"
+                );
+            }
             paimon_table_free(table);
         }
     }

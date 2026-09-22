@@ -222,7 +222,7 @@ pub(super) fn ensure_table_write_allowed(table: &Table) -> crate::Result<()> {
     if !matches!(selector, Ok(None)) {
         return Err(crate::Error::Unsupported {
             message: "Cannot write to a table with a time-travel option set \
-                  (scan.version / scan.timestamp-millis / scan.snapshot-id / scan.tag-name)"
+                  (scan.version / scan.timestamp-millis / scan.timestamp / scan.watermark / scan.snapshot-id / scan.tag-name)"
                 .to_string(),
         });
     }

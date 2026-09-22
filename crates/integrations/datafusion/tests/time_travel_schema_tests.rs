@@ -397,4 +397,39 @@ async fn test_timestamp_as_of_uses_snapshot_schema() {
         .unwrap();
     assert_eq!(column_names(&batches), vec!["id", "name"]);
     assert_eq!(total_rows(&batches), 3);
+
+    sql_context
+        .sql("SET 'paimon.scan.timestamp' = '1970-01-03 00:00:00.123'")
+        .await
+        .unwrap();
+    let batches = sql_context
+        .sql("SELECT * FROM paimon.default.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(column_names(&batches), vec!["id", "name"]);
+    assert_eq!(total_rows(&batches), 3);
+    let error = match sql_context
+        .sql("DELETE FROM paimon.default.t WHERE id = 1")
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("writes with scan.timestamp must fail"),
+    };
+    assert!(error.to_string().contains("scan.timestamp"), "{error}");
+    sql_context
+        .sql("RESET 'paimon.scan.timestamp'")
+        .await
+        .unwrap();
+    let batches = sql_context
+        .sql("SELECT * FROM paimon.default.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(column_names(&batches), vec!["id", "name", "age"]);
+    assert_eq!(total_rows(&batches), 5);
 }

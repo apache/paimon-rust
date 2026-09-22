@@ -2018,6 +2018,19 @@ SELECT * FROM paimon.default.my_table TIMESTAMP AS OF '2024-01-01 00:00:00';
 
 This finds the latest snapshot whose commit time is less than or equal to the given timestamp. The timestamp is interpreted in the local timezone.
 
+The session option `scan.timestamp` also accepts a local timestamp string,
+including fractional seconds (up to nine digits, truncated to milliseconds):
+
+```sql
+SET 'paimon.scan.timestamp' = '2024-01-01 00:00:00.123';
+SELECT * FROM paimon.default.my_table;
+RESET 'paimon.scan.timestamp';
+```
+
+It can be combined with `scan.mode=from-timestamp`, but cannot be combined with
+another time-travel selector such as `scan.timestamp-millis` or `scan.snapshot-id`.
+An invalid timestamp or a time before the earliest available snapshot fails the read.
+
 ### By Watermark
 
 Use `VERSION AS OF 'watermark-<value>'` syntax:

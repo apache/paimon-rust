@@ -967,6 +967,30 @@ def test_time_travel_by_snapshot_id():
         assert _rows(batches) == 1  # only snapshot 1's row
 
 
+def test_time_travel_by_timestamp_string():
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        _make_two_snapshot_table(warehouse)
+        snapshot_path = Path(warehouse) / "tdb.db/t/snapshot/snapshot-1"
+        snapshot = json.loads(snapshot_path.read_text())
+        snapshot["timeMillis"] = 86_400_000  # 1970-01-02 UTC
+        snapshot_path.write_text(json.dumps(snapshot))
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
+        for mode in [{}, {"scan.mode": "from-timestamp"}]:
+            builder = table.new_read_builder(
+                {"scan.timestamp": "1970-01-03 00:00:00.123456789", **mode})
+            splits = builder.new_scan().plan().splits()
+            result = pa.Table.from_batches(builder.new_read().read(splits))
+            assert result.column("id").to_pylist() == [1]
+        for value in ["invalid", "1970-01-01 00:00:00"]:
+            with pytest.raises(ValueError, match="did not resolve"):
+                table.new_read_builder({"scan.timestamp": value})
+        with pytest.raises(ValueError, match="Only one"):
+            table.new_read_builder({"scan.timestamp": "1970-01-03",
+                                    "scan.timestamp-millis": "172800000"})
+
+
 def test_time_travel_by_tag_name():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = _make_two_snapshot_table(warehouse)
