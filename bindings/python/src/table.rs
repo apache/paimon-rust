@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use paimon::catalog::{Identifier, RESTCatalog};
+use paimon::catalog::Identifier;
 use paimon::io::FileIO;
 use paimon::spec::TableSchema;
 use paimon::Options;
@@ -102,10 +102,11 @@ impl PyTable {
         let identifier = Identifier::new(database, table);
         let table = py
             .detach(|| {
-                runtime().block_on(async {
-                    let catalog = RESTCatalog::new(Options::from_map(options), false).await?;
-                    catalog.table_from_response(&identifier, response).await
-                })
+                runtime().block_on(paimon::table::Table::from_rest_response(
+                    identifier,
+                    response,
+                    Options::from_map(options),
+                ))
             })
             .map_err(to_py_err)?;
         Ok(Self::new(Arc::new(table)))

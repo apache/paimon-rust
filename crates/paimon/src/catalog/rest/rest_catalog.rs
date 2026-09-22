@@ -98,25 +98,6 @@ impl RESTCatalog {
         })
     }
 
-    /// Reuse the response for `identifier` without another get-table request.
-    /// Preserves REST snapshots and credential refresh.
-    pub async fn table_from_response(
-        &self,
-        identifier: &Identifier,
-        response: crate::api::GetTableResponse,
-    ) -> Result<Table> {
-        identifier.validate()?;
-        RESTEnv::build_table(
-            identifier,
-            response,
-            self.api.clone(),
-            self.options.clone(),
-            self.data_token_enabled,
-            self.local_cache.clone(),
-        )
-        .await
-    }
-
     /// Get the warehouse path.
     pub fn warehouse(&self) -> &str {
         &self.warehouse

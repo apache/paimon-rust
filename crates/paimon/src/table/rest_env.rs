@@ -20,15 +20,48 @@
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::catalog::{Identifier, RESTTokenFileIO};
-use crate::common::Options;
+use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::cache::LocalCache;
+use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
 use crate::io::FileIO;
 use crate::spec::{CoreOptions, TableSchema, PATH_OPTION};
 use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
 use crate::table::{ObjectTable, Table};
 use crate::Result;
 use std::sync::Arc;
+
+impl Table {
+    /// Reuse the matching REST response and merged catalog options without config/get-table requests.
+    /// Preserves REST snapshots, credential refresh and local caching.
+    pub async fn from_rest_response(
+        identifier: Identifier,
+        response: crate::api::GetTableResponse,
+        options: Options,
+    ) -> Result<Self> {
+        identifier.validate()?;
+        options
+            .get(CatalogOptions::WAREHOUSE)
+            .ok_or_else(|| RestError::BadRequest {
+                message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
+            })?;
+        let api = Arc::new(RESTApi::new(options.clone(), false).await?);
+        let data_token_enabled = api
+            .options()
+            .get(CatalogOptions::DATA_TOKEN_ENABLED)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let local_cache = create_local_cache_with_namespace(&options, api.options())?;
+        RESTEnv::build_table(
+            &identifier,
+            response,
+            api,
+            options,
+            data_token_enabled,
+            local_cache,
+        )
+        .await
+    }
+}
 
 /// REST environment that holds the REST API client, identifier, and uuid
 /// needed to create a `RESTSnapshotCommit`.
