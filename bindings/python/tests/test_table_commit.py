@@ -167,6 +167,13 @@ def test_overwrite_bridge_preserves_external_identity_and_identifiers(tmp_path, 
         snapshot = _snapshot(table)
         assert snapshot["commitUser"] == "python-job"
         assert snapshot["commitIdentifier"] == identifier
+        if identifier != 2**63 - 1:
+            # Replaying a checkpoint must not overwrite a later writer's data.
+            _append(table, [row_id + 10], [20])
+            latest_id = table.latest_snapshot().id()
+            commit._overwrite(identifier, messages, {})
+            assert table.latest_snapshot().id() == latest_id
+            assert _rows(table) == [row_id, row_id + 10]
 
 
 def test_abort_serialized_messages_deletes_files(tmp_path):
