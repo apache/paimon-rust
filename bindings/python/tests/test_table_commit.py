@@ -22,6 +22,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from pypaimon_rust import datafusion
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
 
 
@@ -74,12 +75,15 @@ def _snapshot(table):
 def test_public_api_separates_batch_and_stream(tmp_path):
     table = _table(tmp_path)
     assert not hasattr(table, "new_commit")
-    for kwargs in ({"commit_user": "job"}, {"overwrite": True}):
-        with pytest.raises(TypeError):
-            table.new_write_builder(**kwargs)
+    assert not hasattr(table, "new_write_builder")
+    for name in ("WriteBuilder", "TableWrite", "TableCommit"):
+        assert not hasattr(datafusion, name)
+    for factory in (table.new_batch_write_builder, table.new_stream_write_builder):
+        for kwargs in ({"commit_user": "job"}, {"overwrite": True}):
+            with pytest.raises(TypeError):
+                factory(**kwargs)
     batch = table.new_batch_write_builder()
     stream = table.new_stream_write_builder()
-    assert type(table.new_write_builder()) is type(batch)
     assert not hasattr(batch, "with_commit_user")
     assert not hasattr(stream, "with_overwrite")
     assert not hasattr(batch.new_commit(), "filter_and_commit")

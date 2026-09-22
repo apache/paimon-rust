@@ -554,10 +554,6 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::write::PyStreamTableWrite>()?;
     this.add_class::<crate::write::PyBatchTableCommit>()?;
     this.add_class::<crate::write::PyStreamTableCommit>()?;
-    // Preserve the original batch-only class names.
-    this.add("WriteBuilder", this.getattr("BatchWriteBuilder")?)?;
-    this.add("TableWrite", this.getattr("BatchTableWrite")?)?;
-    this.add("TableCommit", this.getattr("BatchTableCommit")?)?;
     this.add_class::<crate::write::PyCommitMessage>()?;
     this.add_function(wrap_pyfunction!(udf, &this)?)?;
     this.add_class::<crate::snapshot::PySnapshot>()?;

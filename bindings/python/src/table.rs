@@ -133,11 +133,6 @@ impl PyTable {
         }
     }
 
-    /// Compatibility alias for new_batch_write_builder().
-    fn new_write_builder(&self) -> PyBatchWriteBuilder {
-        self.new_batch_write_builder()
-    }
-
     fn new_batch_write_builder(&self) -> PyBatchWriteBuilder {
         PyBatchWriteBuilder::new(Arc::clone(&self.inner))
     }

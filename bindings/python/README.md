@@ -112,8 +112,7 @@ print(batches_tt[0])
 The Python binding follows Java's batch/stream builder structure. Use
 `table.new_batch_write_builder()` for batch writes and
 `table.new_stream_write_builder().with_commit_user("ingest-job")` for streaming.
-Both create writers and committers with the same commit identity. The original
-no-argument `new_write_builder()` remains an alias for the batch builder.
+Both create writers and committers with the same commit identity.
 
 ```python
 builder = table.new_stream_write_builder().with_commit_user("ingest-job")

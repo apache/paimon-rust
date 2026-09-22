@@ -3115,9 +3115,9 @@ impl TableCommit {
         Ok(spec)
     }
 
-    /// Validate the row-id baseline using Java FileStoreCommitImpl's rules.
+    /// Check conflicts from the earliest writer snapshot, validating row-id baselines.
     fn check_from_snapshot(messages: &[CommitMessage]) -> Result<Option<i64>> {
-        let mut check_from_snapshot = None;
+        let mut check_from_snapshot: Option<i64> = None;
         for message in messages {
             let Some(snapshot) = message.check_from_snapshot else {
                 continue;
@@ -3128,15 +3128,8 @@ impl TableCommit {
                     source: None,
                 });
             }
-            if let Some(previous) = check_from_snapshot {
-                if previous != snapshot {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!("Commit messages have different row-id check snapshots: {previous} and {snapshot}"),
-                        source: None,
-                    });
-                }
-            }
-            check_from_snapshot = Some(snapshot);
+            check_from_snapshot =
+                Some(check_from_snapshot.map_or(snapshot, |previous| previous.min(snapshot)));
         }
         if check_from_snapshot.is_some() {
             for message in messages {
@@ -3504,7 +3497,7 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     #[test]
-    fn check_from_snapshot_matches_java_message_rules() {
+    fn check_from_snapshot_uses_minimum_baseline() {
         let mut tagged = CommitMessage::new(Vec::new(), 0, Vec::new());
         tagged.check_from_snapshot = Some(7);
         assert_eq!(
@@ -3515,7 +3508,23 @@ mod tests {
 
         let mut different = tagged.clone();
         different.check_from_snapshot = Some(8);
-        assert!(TableCommit::check_from_snapshot(&[tagged.clone(), different]).is_err());
+        let untagged = CommitMessage::new(Vec::new(), 0, Vec::new());
+        for messages in [
+            vec![tagged.clone(), different.clone(), untagged.clone()],
+            vec![different, untagged.clone(), tagged.clone()],
+        ] {
+            assert_eq!(
+                TableCommit::check_from_snapshot(&messages).unwrap(),
+                Some(7)
+            );
+        }
+        assert_eq!(TableCommit::check_from_snapshot(&[untagged]).unwrap(), None);
+    }
+
+    #[test]
+    fn check_from_snapshot_rejects_invalid_or_missing_baselines() {
+        let mut tagged = CommitMessage::new(Vec::new(), 0, Vec::new());
+        tagged.check_from_snapshot = Some(7);
         let mut negative = tagged.clone();
         negative.check_from_snapshot = Some(-1);
         assert!(TableCommit::check_from_snapshot(&[negative]).is_err());
@@ -5638,10 +5647,15 @@ mod tests {
         second_partial.first_row_id = Some(0);
         second_partial.file_source = Some(0);
         second_partial.write_cols = Some(vec!["name".to_string()]);
-        let mut second_message = CommitMessage::new(partition, 0, vec![second_partial]);
+        let mut second_message = CommitMessage::new(partition.clone(), 0, vec![second_partial]);
         second_message.check_from_snapshot = Some(1);
+        // A newer writer in the same commit must not hide the stale update.
+        let mut fresh_message =
+            CommitMessage::new(partition, 0, vec![test_data_file("fresh.parquet", 1)]);
+        fresh_message.check_from_snapshot = Some(2);
+        fresh_message.new_files[0].file_source = Some(0);
 
-        let result = commit.commit(vec![second_message]).await;
+        let result = commit.commit(vec![fresh_message, second_message]).await;
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -5649,6 +5663,7 @@ mod tests {
             err_msg.contains("multiple MERGE INTO operations have encountered conflicts"),
             "expected row-id/column conflict, got: {err_msg}"
         );
+        assert_eq!(latest_snapshot(&file_io, table_path).await.unwrap().id(), 2);
     }
 
     #[tokio::test]
@@ -5685,14 +5700,23 @@ mod tests {
         id_partial.first_row_id = Some(0);
         id_partial.file_source = Some(0);
         id_partial.write_cols = Some(vec!["id".to_string()]);
-        let mut id_message = CommitMessage::new(partition, 0, vec![id_partial]);
+        let mut id_message = CommitMessage::new(partition.clone(), 0, vec![id_partial]);
         id_message.check_from_snapshot = Some(1);
+        let mut fresh_message =
+            CommitMessage::new(partition, 0, vec![test_data_file("fresh.parquet", 1)]);
+        fresh_message.check_from_snapshot = Some(2);
+        fresh_message.new_files[0].file_source = Some(0);
 
-        commit.commit(vec![id_message]).await.unwrap();
+        commit
+            .commit(vec![id_message, fresh_message])
+            .await
+            .unwrap();
 
         let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 3);
+        // Snapshot counts include the two partial-column files.
+        assert_eq!(snapshot.total_record_count(), Some(301));
     }
 
     #[tokio::test]
