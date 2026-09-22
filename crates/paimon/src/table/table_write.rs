@@ -4675,4 +4675,76 @@ pub(in crate::table) mod tests {
             "append tables keep file-level bin pack"
         );
     }
+    #[tokio::test]
+    async fn dedicated_insert_preserves_existing_global_index() {
+        for action in ["THROW_ERROR", "DROP_PARTITION_INDEX"] {
+            let file_io = test_file_io();
+            let path = "memory:/audit-dedicated-index-append";
+            setup_dirs(&file_io, path).await;
+            let table = Table::new(
+                file_io.clone(),
+                Identifier::new("default", "audit"),
+                path.into(),
+                test_vector_table_schema("parquet").copy_with_options(
+                    std::collections::HashMap::from([(
+                        "global-index.column-update-action".into(),
+                        action.into(),
+                    )]),
+                ),
+                None,
+            );
+            async fn append(table: &Table, id: i32) -> crate::Result<()> {
+                let mut writer = TableWrite::new(table, "audit".into())?;
+                writer
+                    .write_arrow_batch(&make_vector_batch(vec![id], vec![vec![1.0, 0.0]]))
+                    .await?;
+                let messages = writer.prepare_commit().await?;
+                assert!(messages[0]
+                    .new_files
+                    .iter()
+                    .all(|f| f.first_row_id.is_none() && f.write_cols.is_some()));
+                TableCommit::new(table.clone(), "audit".into())
+                    .commit(messages)
+                    .await
+            }
+            append(&table, 1).await.unwrap();
+            let mut message = crate::table::CommitMessage::new(vec![], 0, vec![]);
+            message.new_index_files.push(crate::spec::IndexFileMeta {
+                index_type: "lumina".into(),
+                file_name: "audit-index".into(),
+                file_size: 1,
+                row_count: 1,
+                deletion_vectors_ranges: None,
+                external_path: None,
+                global_index_meta: Some(crate::spec::GlobalIndexMeta {
+                    index_field_id: 1,
+                    row_range_start: 0,
+                    row_range_end: 0,
+                    extra_field_ids: None,
+                    index_meta: None,
+                    source_meta: None,
+                }),
+            });
+            TableCommit::new(table.clone(), "audit-index".into())
+                .commit(vec![message])
+                .await
+                .unwrap();
+            append(&table, 2).await.unwrap();
+            let snapshot = table
+                .snapshot_manager()
+                .get_latest_snapshot()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.next_row_id(), Some(2));
+            let entries = crate::spec::IndexManifest::read(
+                &file_io,
+                &format!("{path}/manifest/{}", snapshot.index_manifest().unwrap()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].index_file.file_name, "audit-index");
+        }
+    }
 }

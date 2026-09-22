@@ -404,7 +404,8 @@ def test_close_cleans_unprepared_output_but_preserves_prepared_files(tmp_path, b
     assert prepared_paths
     _write(writer, [2], [20])
     _write(writer, [3], [30])
-    assert set(tmp_path.rglob("*.parquet")) - prepared_paths
+    # Rolled files may still be closing in the background. close() must await
+    # that work and clean outstanding output before we inspect the directory.
     writer.close()
     assert set(tmp_path.rglob("*.parquet")) == prepared_paths
     builder.new_commit().commit(1, messages)

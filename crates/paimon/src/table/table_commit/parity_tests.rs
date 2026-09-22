@@ -123,7 +123,7 @@ async fn dv_replacement_rejects_missing_old_index() {
     setup_dirs(&io, path).await;
     let commit = setup_commit(&io, path);
     commit
-        .commit(vec![dv_message("current-dv", "data.parquet")])
+        .commit(vec![append_message("data.parquet"), dv_message("current-dv", "data.parquet")])
         .await
         .unwrap();
     let mut message = dv_message("new-dv", "data.parquet");
@@ -142,6 +142,8 @@ async fn dv_replacement_is_overwrite_and_preserves_unrelated_vectors() {
     let commit = setup_commit(&io, path);
     commit
         .commit(vec![
+            append_message("data-a"),
+            append_message("data-b"),
             dv_message("old", "data-a"),
             dv_message("other", "data-b"),
         ])
@@ -181,12 +183,14 @@ async fn unrelated_dv_delete_does_not_bypass_indexed_column_policy() {
         );
         let commit = TableCommit::new(table, "test-user".into());
         let mut initial = dv_message("old-dv", "data");
+        initial.new_files.push(test_data_file("data", 10));
         initial
             .new_index_files
             .push(test_global_index_file("global", 0, 0, 9));
         commit.commit(vec![initial]).await.unwrap();
         let mut update = append_message("update.parquet");
         update.new_files[0].write_cols = Some(vec!["id".into()]);
+        update.new_files[0].first_row_id = Some(0);
         let mut delete = dv_message("new-dv", "data");
         delete
             .deleted_index_files
@@ -356,6 +360,9 @@ async fn mixed_append_cannot_bypass_stale_dv_check() {
     for name in ["data", "concurrent"] {
         let mut message = append_message(name);
         message.new_files[0].file_source = Some(0);
+        if name == "concurrent" {
+            message.new_index_files = vec![test_deletion_vector_index_file("first-dv", "data")];
+        }
         commit.commit(vec![message]).await.unwrap();
     }
     let mut delete = dv_message("dv", "data");
@@ -364,7 +371,7 @@ async fn mixed_append_cannot_bypass_stale_dv_check() {
     append.new_files[0].file_source = Some(0);
     let error = commit.commit(vec![append, delete]).await.unwrap_err();
     assert!(
-        error.to_string().contains("deletion-vector DELETE"),
+        error.to_string().contains("Conflicting deletion vectors"),
         "{error}"
     );
     assert_eq!(latest_snapshot(&io, path).await.unwrap().id(), 2);
@@ -545,7 +552,7 @@ async fn dv_publication_response_loss_uses_overwrite_identity() {
     });
     commit.snapshot_commit = publisher.clone();
     commit
-        .commit_with_identifier(vec![dv_message("dv", "data")], 7)
+        .commit_with_identifier(vec![append_message("data"), dv_message("dv", "data")], 7)
         .await
         .unwrap();
     assert_eq!(
