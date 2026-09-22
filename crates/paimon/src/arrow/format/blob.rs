@@ -1393,18 +1393,12 @@ async fn read_blob_map_entry(
     }
 
     let index_lengths_start = payload_range.end - BLOB_MAP_INDEX_LENGTHS_SIZE;
-    let (header, index_lengths) = futures::try_join!(
-        read_blob_map_range(
-            reader,
-            payload_range.start..payload_range.start + BLOB_MAP_HEADER_SIZE,
-            "header",
-        ),
-        read_blob_map_range(
-            reader,
-            index_lengths_start..payload_range.end,
-            "index lengths",
-        ),
-    )?;
+    let header = read_blob_map_range(
+        reader,
+        payload_range.start..payload_range.start + BLOB_MAP_HEADER_SIZE,
+        "header",
+    )
+    .await?;
     let magic = i32::from_le_bytes(header[..4].try_into().unwrap());
     if magic != BLOB_MAP_MAGIC_NUMBER {
         return Err(Error::DataInvalid {
@@ -1431,6 +1425,12 @@ async fn read_blob_map_entry(
     }
     let entry_count = entry_count as usize;
 
+    let index_lengths = read_blob_map_range(
+        reader,
+        index_lengths_start..payload_range.end,
+        "index lengths",
+    )
+    .await?;
     let key_index_length = i32::from_le_bytes(index_lengths[..4].try_into().unwrap());
     let value_index_length = i32::from_le_bytes(index_lengths[4..8].try_into().unwrap());
     let max_indexes = payload_length - BLOB_MAP_MIN_PAYLOAD_SIZE;
@@ -2501,7 +2501,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_blob_map_descriptor_reads_metadata_in_three_round_trips() {
+    async fn test_blob_map_descriptor_merges_adjacent_indexes() {
         let payload =
             build_blob_map_payload(&[("first", Some(b"alpha")), ("second", Some(b"beta"))]);
         let reader = TrackingFileRead::new(Bytes::from(payload.clone()));
@@ -2512,7 +2512,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(reader.ranges().len(), 4);
-        assert_eq!(reader.max_in_flight(), 2);
+        assert_eq!(reader.max_in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_blob_map_descriptor_honors_configured_parallelism() {
+        let payloads = ["first", "second", "third"]
+            .into_iter()
+            .map(|key| build_blob_map_payload(&[(key, Some(b"value"))]))
+            .collect::<Vec<_>>();
+        let rows = payloads
+            .iter()
+            .map(|payload| Some(payload.as_slice()))
+            .collect::<Vec<_>>();
+        let file_bytes = blob_test_utils::build_blob_file_bytes(&rows);
+
+        for parallelism in [1, 2] {
+            let reader = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
+            let batches = BlobFormatReader::new(String::new(), true)
+                .with_blob_parallelism(parallelism)
+                .read_batch_stream(
+                    Box::new(reader.clone()),
+                    file_bytes.len() as u64,
+                    &blob_map_read_fields(),
+                    None,
+                    Some(rows.len()),
+                    None,
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            assert_eq!(collect_blob_map_values(&batches[0]).len(), rows.len());
+            assert_eq!(reader.max_in_flight(), parallelism);
+        }
     }
 
     #[tokio::test]
