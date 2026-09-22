@@ -1929,12 +1929,12 @@ fn legacy_floating_comparator(data_type: &DataType) -> BoxedCmp {
         DataType::Float(_) => Box::new(|left, right| {
             let left = f32::from_le_bytes(left.try_into().unwrap());
             let right = f32::from_le_bytes(right.try_into().unwrap());
-            left.total_cmp(&right)
+            Ok(left.total_cmp(&right))
         }),
         DataType::Double(_) => Box::new(|left, right| {
             let left = f64::from_le_bytes(left.try_into().unwrap());
             let right = f64::from_le_bytes(right.try_into().unwrap());
-            left.total_cmp(&right)
+            Ok(left.total_cmp(&right))
         }),
         _ => unreachable!("legacy floating comparator requires Float or Double"),
     }
@@ -1955,7 +1955,7 @@ async fn assert_legacy_floating_btree(
         .collect::<Vec<_>>();
     rows.push((zero_key, 3));
     let cmp = legacy_floating_comparator(&data_type);
-    rows.sort_by(|left, right| cmp(&left.0, &right.0));
+    rows.sort_by(|left, right| cmp(&left.0, &right.0).unwrap());
     let expected_first_key = rows.first().unwrap().0.clone();
     let expected_last_key = rows.last().unwrap().0.clone();
 

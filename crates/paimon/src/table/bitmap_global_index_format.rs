@@ -16,7 +16,7 @@
 
 //! Shared key and wire-format primitives for Java-compatible bitmap indexes.
 
-use crate::btree::key_serde::KeyComparator;
+use crate::btree::key_serde::{fixed_key_bytes, KeyComparator};
 use crate::btree::{make_key_comparator, serialize_datum};
 use crate::spec::{DataType, Datum, PredicateOperator};
 use std::cmp::Ordering;
@@ -39,14 +39,14 @@ pub(super) struct BlockInfo {
 pub(crate) fn make_bitmap_key_comparator(data_type: &DataType) -> KeyComparator {
     match data_type {
         DataType::Float(_) => Box::new(|left, right| {
-            let left = f32::from_le_bytes(left[..4].try_into().unwrap());
-            let right = f32::from_le_bytes(right[..4].try_into().unwrap());
-            compare_float_like_java(left, right)
+            let left = f32::from_le_bytes(fixed_key_bytes::<4>(left, "FLOAT")?);
+            let right = f32::from_le_bytes(fixed_key_bytes::<4>(right, "FLOAT")?);
+            Ok(compare_float_like_java(left, right))
         }),
         DataType::Double(_) => Box::new(|left, right| {
-            let left = f64::from_le_bytes(left[..8].try_into().unwrap());
-            let right = f64::from_le_bytes(right[..8].try_into().unwrap());
-            compare_double_like_java(left, right)
+            let left = f64::from_le_bytes(fixed_key_bytes::<8>(left, "DOUBLE")?);
+            let right = f64::from_le_bytes(fixed_key_bytes::<8>(right, "DOUBLE")?);
+            Ok(compare_double_like_java(left, right))
         }),
         _ => make_key_comparator(data_type),
     }
