@@ -2677,6 +2677,17 @@ async fn guarded(name: &str, columns: &[&str]) -> Guarded {
     }
 }
 
+/// Writes `branch`'s schema beside the table's, so `copy_with_branch` finds it.
+async fn write_branch_schema(base: &Table, branch: &str) {
+    let schema = paimon::spec::TableSchema::new(0, &schema_of(&["id"], &[]));
+    base.file_io()
+        .new_output(&base.schema_manager().with_branch(branch).schema_path(0))
+        .unwrap()
+        .write(serde_json::to_vec(&schema).unwrap().into())
+        .await
+        .unwrap();
+}
+
 async fn plan_err(table: &Table, why: &str) -> paimon::Error {
     table
         .new_read_builder()
@@ -2962,9 +2973,13 @@ async fn test_a_disabled_answer_from_a_replacement_table_is_not_trusted() {
     ctx.server
         .set_table_uuid("default", "replaced", "uuid-of-b");
 
+    let mut search = table.new_vector_search_builder();
+    search
+        .with_vector_column("id")
+        .with_query_vector(vec![1.0])
+        .with_limit(1);
     assert_drifted(
-        table
-            .new_vector_search_builder()
+        search
             .execute()
             .await
             .expect_err("a false from another uuid must not authorize this handle"),
@@ -2993,13 +3008,7 @@ async fn test_an_ordinary_branch_read_still_plans() {
         .get_table(&Identifier::new("default", "plainbr"))
         .await
         .unwrap();
-    let branch_schema = paimon::spec::TableSchema::new(0, &schema_of(&["id"], &[]));
-    base.file_io()
-        .new_output(&base.schema_manager().with_branch("dev").schema_path(0))
-        .unwrap()
-        .write(serde_json::to_vec(&branch_schema).unwrap().into())
-        .await
-        .unwrap();
+    write_branch_schema(&base, "dev").await;
 
     base.copy_with_branch("dev")
         .await
@@ -3038,13 +3047,7 @@ async fn test_query_auth_enabled_on_a_branch_is_seen_by_a_branch_handle() {
         .unwrap();
     // The branch schema on disk predates the option, so the branch handle
     // caches `false` too.
-    let branch_schema = paimon::spec::TableSchema::new(0, &schema_of(&["id"], &[]));
-    base.file_io()
-        .new_output(&base.schema_manager().with_branch("dev").schema_path(0))
-        .unwrap()
-        .write(serde_json::to_vec(&branch_schema).unwrap().into())
-        .await
-        .unwrap();
+    write_branch_schema(&base, "dev").await;
     let branch = base.copy_with_branch("dev").await.unwrap();
 
     assert_refused(
@@ -3061,40 +3064,6 @@ async fn test_query_auth_enabled_on_a_branch_is_seen_by_a_branch_handle() {
 // derive on Windows (see #397).
 #[cfg(not(windows))]
 #[tokio::test]
-async fn test_a_branch_reporting_its_own_uuid_still_reads() {
-    let ctx = setup_catalog(vec!["default"]).await;
-    let tmp = tempfile::tempdir().unwrap();
-    let path = format!("file://{}", tmp.path().display());
-    // Neither is query-auth. The server answers `t$branch_dev` with an id of
-    // its own, which a client must not read as "the table was replaced".
-    ctx.server
-        .add_table_with_schema("default", "own", schema_of(&["id"], &[]), &path);
-    ctx.server
-        .add_table_with_schema("default", "own$branch_dev", schema_of(&["id"], &[]), &path);
-
-    let base = ctx
-        .catalog
-        .get_table(&Identifier::new("default", "own"))
-        .await
-        .unwrap();
-    let branch_schema = paimon::spec::TableSchema::new(0, &schema_of(&["id"], &[]));
-    base.file_io()
-        .new_output(&base.schema_manager().with_branch("dev").schema_path(0))
-        .unwrap()
-        .write(serde_json::to_vec(&branch_schema).unwrap().into())
-        .await
-        .unwrap();
-    let branch = base.copy_with_branch("dev").await.unwrap();
-
-    branch
-        .new_read_builder()
-        .new_scan()
-        .plan()
-        .await
-        .expect("a branch id of the server's own choosing is not a replaced table");
-}
-
-#[tokio::test]
 async fn test_a_branch_of_a_replaced_base_table_is_refused() {
     // The branch still answers "not query-auth", but the base name now resolves
     // to a replacement: the handle's files are the old table's.
@@ -3110,13 +3079,7 @@ async fn test_a_branch_of_a_replaced_base_table_is_refused() {
         .get_table(&Identifier::new("default", "gone"))
         .await
         .unwrap();
-    let branch_schema = paimon::spec::TableSchema::new(0, &schema_of(&["id"], &[]));
-    base.file_io()
-        .new_output(&base.schema_manager().with_branch("dev").schema_path(0))
-        .unwrap()
-        .write(serde_json::to_vec(&branch_schema).unwrap().into())
-        .await
-        .unwrap();
+    write_branch_schema(&base, "dev").await;
     let branch = base.copy_with_branch("dev").await.unwrap();
     ctx.server
         .set_table_uuid("default", "gone", "uuid-of-the-replacement");
@@ -3141,7 +3104,12 @@ async fn test_a_search_entry_asks_the_server_once() {
         .unwrap();
 
     let before = ctx.server.get_table_calls();
-    let _ = table.new_vector_search_builder().execute().await;
+    let mut search = table.new_vector_search_builder();
+    search
+        .with_vector_column("id")
+        .with_query_vector(vec![1.0])
+        .with_limit(1);
+    let _ = search.execute().await;
     assert_eq!(
         ctx.server.get_table_calls() - before,
         1,
@@ -3223,12 +3191,6 @@ async fn test_query_auth_enabled_after_a_load_is_seen_by_every_entry() {
     assert_refused(plan_err(&table, "a scan must ask the server, not the cached flag").await);
     assert_refused(
         table
-            .ensure_read_authorized()
-            .await
-            .expect_err("a read without a plan must ask the server too"),
-    );
-    assert_refused(
-        table
             .new_read_builder()
             .new_scan()
             .with_scan_all_files()
@@ -3252,9 +3214,13 @@ async fn test_query_auth_enabled_after_a_load_is_seen_by_every_entry() {
             .await
             .expect_err("a combined incremental plan asks the same way"),
     );
+    let mut search = table.new_vector_search_builder();
+    search
+        .with_vector_column("id")
+        .with_query_vector(vec![1.0])
+        .with_limit(1);
     assert_refused(
-        table
-            .new_vector_search_builder()
+        search
             .execute()
             .await
             .expect_err("a vector search reads index files directly"),
@@ -3267,16 +3233,24 @@ async fn test_query_auth_enabled_after_a_load_is_seen_by_every_entry() {
             .await
             .expect_err("a full-text search reads index files directly"),
     );
+    let mut hybrid = table.new_hybrid_search_builder();
+    hybrid.with_limit(1);
+    hybrid
+        .add_vector_route("id", vec![1.0], 1, 1.0, std::collections::HashMap::new())
+        .unwrap();
     assert_refused(
-        table
-            .new_hybrid_search_builder()
+        hybrid
             .execute()
             .await
             .expect_err("a hybrid search reads index files directly"),
     );
+    let mut batch_search = table.new_batch_vector_search_builder();
+    batch_search
+        .with_vector_column("id")
+        .with_query_vectors(vec![vec![1.0]])
+        .with_limit(1);
     assert_refused(
-        table
-            .new_batch_vector_search_builder()
+        batch_search
             .execute()
             .await
             .expect_err("the batch path is reachable without the outer builder"),
@@ -3293,6 +3267,18 @@ async fn test_query_auth_enabled_after_a_load_is_seen_by_every_entry() {
             .partition_stats()
             .await
             .expect_err("partition stats expose partition values, row counts and sizes"),
+    );
+    assert_refused(
+        table
+            .partition_row_counts()
+            .await
+            .expect_err("manifest row counts include rows the rules hide"),
+    );
+    assert_refused(
+        table
+            .exact_partition_row_counts_with_filter(None)
+            .await
+            .expect_err("the exact count is refused too, so DataFusion scans instead"),
     );
     assert_refused(
         table

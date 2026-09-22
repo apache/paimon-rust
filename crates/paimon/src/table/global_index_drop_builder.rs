@@ -51,9 +51,7 @@ impl<'a> GlobalIndexDropBuilder<'a> {
 
     pub async fn execute(&self) -> Result<usize> {
         // Dropping an index reads the index manifest.
-        self.table
-            .ensure_read_authorized_live("dropping an index")
-            .await?;
+        self.table.ensure_read_authorized_live().await?;
 
         self.table.ensure_not_branch_reference_for_write()?;
 

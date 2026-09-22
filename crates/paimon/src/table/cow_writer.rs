@@ -219,9 +219,7 @@ impl CopyOnWriteMergeWriter {
     #[must_use = "commit messages must be passed to TableCommit"]
     pub async fn prepare_commit(self) -> Result<Vec<CommitMessage>> {
         // A copy-on-write rewrite reads the rows it replaces.
-        self.table
-            .ensure_read_authorized_live("a copy-on-write rewrite")
-            .await?;
+        self.table.ensure_read_authorized_live().await?;
 
         if self.affected_files.is_empty() {
             return Ok(Vec::new());

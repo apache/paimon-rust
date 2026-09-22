@@ -508,7 +508,7 @@ impl TableWrite {
     /// dynamic-bucket write loads the hash index.
     async fn ensure_live_authorized(&mut self) -> Result<()> {
         if !self.live_checked {
-            self.table.ensure_read_authorized_live("a write").await?;
+            self.table.ensure_read_authorized_live().await?;
             self.live_checked = true;
         }
         Ok(())

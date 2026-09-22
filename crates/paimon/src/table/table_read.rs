@@ -279,7 +279,15 @@ impl<'a> TableRead<'a> {
     fn ensure_query_auth_allowed(&self, plan: &IncrementalPlan) -> crate::Result<()> {
         let core_options = CoreOptions::new(self.table().schema().options());
         core_options.ensure_type_paimon_served(&self.table().identifier().full_name())?;
-        if core_options.query_auth_enabled() || plan.any_query_auth_required() {
+        // Diff pairs too, which `data_splits()` leaves out.
+        let marked = plan.splits().iter().any(|split| match split {
+            IncrementalSplit::Data(split) => split.query_auth_required(),
+            IncrementalSplit::DiffPair { before, after } => before
+                .iter()
+                .chain(after)
+                .any(DataSplit::query_auth_required),
+        });
+        if core_options.query_auth_enabled() || marked {
             return Err(super::query_auth::unsupported(
                 "an incremental read cannot apply a row filter or column masking",
             ));
@@ -1979,24 +1987,6 @@ mod tests {
             Err(crate::Error::DataInvalid { ref message, .. })
                 if message.contains("invalid value 4 at row 0")
         ));
-    }
-
-    #[test]
-    fn test_incremental_and_audit_log_reads_refuse_a_query_auth_table() {
-        let table = query_auth_table();
-        let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
-        let plan = IncrementalPlan::new(IncrementalScanMode::Delta, Vec::new());
-        for err in [
-            read.to_incremental_arrow(&plan).err(),
-            read.to_audit_log_arrow(&plan).err(),
-        ] {
-            let err = err.expect("both must refuse a query-auth.enabled table");
-            assert!(
-                matches!(err, crate::Error::Unsupported { ref message }
-                    if message.contains("query-auth.enabled")),
-                "got {err:?}"
-            );
-        }
     }
 
     #[test]

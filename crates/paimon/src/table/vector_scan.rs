@@ -125,7 +125,6 @@ pub struct VectorScan {
     table: Table,
     context: PlanContext,
     scan: VectorScanKind,
-    authorized: bool,
 }
 
 enum VectorScanKind {
@@ -140,7 +139,6 @@ impl VectorScan {
         filter: Option<&Predicate>,
         include_row_ids: Option<&Arc<RoaringTreemap>>,
         prepared: Option<&PreparedVectorSearchFilter>,
-        authorized: bool,
     ) -> crate::Result<Self> {
         let context = PlanContext::new(table, column, filter, include_row_ids, prepared)?;
         let core = CoreOptions::new(table.schema().options());
@@ -171,23 +169,12 @@ impl VectorScan {
             table: table.clone(),
             context,
             scan,
-            authorized,
         })
-    }
-
-    /// The caller already asked the server for this operation.
-    pub(crate) fn assume_authorized(mut self) -> Self {
-        self.authorized = true;
-        self
     }
 
     pub async fn plan(&self) -> crate::Result<VectorScanPlan> {
         // The option can be set after a load.
-        if !self.authorized {
-            self.table
-                .ensure_read_authorized_live("a vector search")
-                .await?;
-        }
+        self.table.ensure_read_authorized_live().await?;
         let work = match &self.scan {
             VectorScanKind::DataEvolution(scan) => {
                 VectorScanWork::DataEvolution(Box::new(scan.plan().await?))

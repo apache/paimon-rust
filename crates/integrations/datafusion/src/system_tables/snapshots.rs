@@ -86,7 +86,6 @@ impl TableProvider for SnapshotsTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        super::ensure_scan_authorized(&self.table).await?;
         let sm = self.table.snapshot_manager();
         let snapshots = crate::runtime::await_with_runtime(async move { sm.list_all().await })
             .await

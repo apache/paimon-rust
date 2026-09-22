@@ -367,22 +367,15 @@ impl Table {
     }
 
     /// The live counterpart of [`CoreOptions::ensure_read_authorized`], which
-    /// reads the schema this handle was loaded with. For a read that plans
-    /// nothing — DataFusion's system tables — since the option can be set
+    /// reads the schema this handle was loaded with: the option can be set
     /// after a load.
-    pub async fn ensure_read_authorized(&self) -> Result<()> {
-        self.ensure_read_authorized_live("a read without a plan")
-            .await
-    }
-
-    /// As [`Self::ensure_read_authorized`], naming the operation that asks.
-    pub(crate) async fn ensure_read_authorized_live(&self, operation: &str) -> Result<()> {
+    pub(crate) async fn ensure_read_authorized_live(&self) -> Result<()> {
         CoreOptions::new(self.schema.options())
             .ensure_type_paimon_served(&self.identifier.full_name())?;
         if self.server_query_auth_enabled().await? {
-            return Err(query_auth::unsupported(&format!(
-                "{operation} cannot apply a row filter or column masking"
-            )));
+            return Err(query_auth::unsupported(
+                "this operation cannot apply a row filter or column masking",
+            ));
         }
         Ok(())
     }
@@ -430,13 +423,6 @@ impl Table {
         server_query_auth: bool,
     ) -> Result<Option<std::sync::Arc<query_auth::QueryAuthGrant>>> {
         let local = CoreOptions::new(self.schema.options());
-        if self.reads_another_schema()? && local.query_auth_enabled() {
-            return Err(query_auth::unsupported(
-                "a time-travelled or branch read authorizes against the table's current schema, \
-                 which is not the one it reads",
-            ));
-        }
-
         let Some(rest_env) = &self.rest_env else {
             // Only a REST catalog can authorize.
             return if local.query_auth_enabled() {

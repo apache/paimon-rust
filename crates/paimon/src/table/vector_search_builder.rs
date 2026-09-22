@@ -31,8 +31,6 @@ pub struct VectorSearchBuilder<'a> {
     limit: Option<usize>,
     options: HashMap<String, String>,
     filter: Option<Predicate>,
-    /// Set when the caller already asked, so a delegated search does not repeat it.
-    authorized: bool,
 }
 
 impl<'a> VectorSearchBuilder<'a> {
@@ -44,14 +42,7 @@ impl<'a> VectorSearchBuilder<'a> {
             limit: None,
             options: HashMap::new(),
             filter: None,
-            authorized: false,
         }
-    }
-
-    /// The caller already asked the server for this operation.
-    pub(crate) fn assume_authorized(mut self) -> Self {
-        self.authorized = true;
-        self
     }
 
     pub fn with_vector_column(&mut self, name: &str) -> &mut Self {
@@ -101,14 +92,7 @@ impl<'a> VectorSearchBuilder<'a> {
             .ok_or_else(|| crate::Error::ConfigInvalid {
                 message: "Vector column must be set via with_vector_column()".to_string(),
             })?;
-        VectorScan::new(
-            self.table,
-            column,
-            self.filter.as_ref(),
-            None,
-            None,
-            self.authorized,
-        )
+        VectorScan::new(self.table, column, self.filter.as_ref(), None, None)
     }
 
     /// Create an owned reader; query errors are reported before planning.
@@ -131,15 +115,8 @@ impl<'a> VectorSearchBuilder<'a> {
     /// Search locally using the same Scan -> Plan -> Read API exposed to engines.
     /// Use the result's `new_read_builder()` to materialize projected columns.
     pub async fn execute(&self) -> crate::Result<SearchResult> {
-        // Before any validation or fast path, and once: the scan is told so.
-        if !self.authorized {
-            self.table
-                .ensure_read_authorized_live("a vector search")
-                .await?;
-        }
         let read = self.new_read()?;
-        let scan = self.new_scan()?.assume_authorized();
-        read.read(scan.plan().await?).await
+        read.read(self.new_scan()?.plan().await?).await
     }
 
     fn query(&self) -> crate::Result<(&str, &[f32], usize)> {

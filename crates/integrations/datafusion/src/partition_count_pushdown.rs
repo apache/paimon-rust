@@ -297,7 +297,14 @@ impl TableProvider for PartitionRowCountProvider {
             .clone();
         let table = self.table.clone();
         let table = crate::runtime::await_with_runtime(async move {
-            CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
+            // Rules the manifests cannot apply: stay unpinned, so the exact
+            // count declines and the scan runs with the server's grant.
+            if CoreOptions::new(table.schema().options())
+                .ensure_read_authorized()
+                .is_err()
+            {
+                return Ok(Some(table));
+            }
             if table.travel_snapshot().is_some() {
                 return Ok(Some(table));
             }
@@ -329,6 +336,7 @@ impl TableProvider for PartitionRowCountProvider {
             self,
             table,
             provider_as_source(Arc::new(fallback_provider)),
+            provider_as_source(Arc::new(self.fallback_provider.clone())),
             projection.cloned(),
             state,
         )?);
@@ -353,6 +361,7 @@ struct PartitionRowCountStream {
     projection: Option<Vec<usize>>,
     output_schema: SchemaRef,
     source: Arc<dyn TableSource>,
+    unpinned_source: Arc<dyn TableSource>,
     table_name: TableReference,
     filters: Vec<Expr>,
     state: Arc<SessionState>,
@@ -363,6 +372,7 @@ impl PartitionRowCountStream {
         provider: &PartitionRowCountProvider,
         table: Option<Table>,
         source: Arc<dyn TableSource>,
+        unpinned_source: Arc<dyn TableSource>,
         projection: Option<Vec<usize>>,
         state: SessionState,
     ) -> DFResult<Self> {
@@ -375,6 +385,7 @@ impl PartitionRowCountStream {
             projection,
             output_schema,
             source,
+            unpinned_source,
             table_name: provider.table_name.clone(),
             filters: provider.filters.clone(),
             state: Arc::new(state),
@@ -388,13 +399,25 @@ impl PartitionRowCountStream {
         let counts = match self.table.clone() {
             Some(table) => {
                 let predicate = self.predicate.clone();
-                crate::runtime::await_with_runtime(async move {
+                match crate::runtime::await_with_runtime(async move {
                     table
                         .exact_partition_row_counts_with_filter(predicate)
                         .await
                 })
                 .await
-                .map_err(to_datafusion_error)?
+                {
+                    Ok(counts) => counts,
+                    // Refused rather than undecidable: the server's rules apply
+                    // in a scan, which only an unpinned handle can authorize.
+                    Err(paimon::Error::Unsupported { .. }) => {
+                        let plan = crate::runtime::await_with_runtime(
+                            self.scan_by_reading(&self.unpinned_source),
+                        )
+                        .await?;
+                        return self.fallback_stream(plan, context);
+                    }
+                    Err(error) => return Err(to_datafusion_error(error)),
+                }
             }
             None => Some(Vec::new()),
         };
@@ -408,15 +431,9 @@ impl PartitionRowCountStream {
                 self.table_name,
                 self.table.as_ref().and_then(Table::travel_snapshot).map(|snapshot| snapshot.id()),
             );
-            let plan = crate::runtime::await_with_runtime(self.scan_by_reading()).await?;
-            if plan.schema() != self.output_schema {
-                return internal_err!(
-                    "partition count fallback schema mismatch: expected {:?}, got {:?}",
-                    self.output_schema,
-                    plan.schema()
-                );
-            }
-            return datafusion::physical_plan::execute_stream(plan, context);
+            let plan =
+                crate::runtime::await_with_runtime(self.scan_by_reading(&self.source)).await?;
+            return self.fallback_stream(plan, context);
         };
 
         // A partition with no surviving rows must not create a GROUP BY key.
@@ -477,8 +494,26 @@ impl PartitionRowCountStream {
     }
 
     /// The same rows, computed the ordinary way: count the original scan per partition.
-    async fn scan_by_reading(&self) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let source_schema = self.source.schema();
+    fn fallback_stream(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        if plan.schema() != self.output_schema {
+            return internal_err!(
+                "partition count fallback schema mismatch: expected {:?}, got {:?}",
+                self.output_schema,
+                plan.schema()
+            );
+        }
+        datafusion::physical_plan::execute_stream(plan, context)
+    }
+
+    async fn scan_by_reading(
+        &self,
+        source: &Arc<dyn TableSource>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let source_schema = source.schema();
         let partition_indices = self
             .partition_fields
             .iter()
@@ -486,7 +521,7 @@ impl PartitionRowCountStream {
             .collect::<Result<Vec<_>, _>>()?;
         let scan = LogicalPlan::TableScan(TableScan::try_new(
             self.table_name.clone(),
-            Arc::clone(&self.source),
+            Arc::clone(source),
             Some(partition_indices),
             self.filters.clone(),
             None,

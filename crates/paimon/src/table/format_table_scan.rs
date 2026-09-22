@@ -64,16 +64,12 @@ impl<'a> FormatTableScan<'a> {
     }
 
     pub(crate) async fn plan(&self) -> crate::Result<Plan> {
-        self.table
-            .ensure_read_authorized_live("a format table")
-            .await?;
+        self.table.ensure_read_authorized_live().await?;
         self.plan_inner(None).await
     }
 
     pub(crate) async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        self.table
-            .ensure_read_authorized_live("a format table")
-            .await?;
+        self.table.ensure_read_authorized_live().await?;
         let mut trace = ScanTrace::default();
         let plan = self.plan_inner(Some(&mut trace)).await?;
         trace.planned_data_file_bytes = plan.planned_data_file_bytes();

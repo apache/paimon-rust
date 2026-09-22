@@ -100,9 +100,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
 
     pub async fn execute(&self) -> Result<usize> {
         // Building the index scans the table's rows.
-        self.table
-            .ensure_read_authorized_live("building an index")
-            .await?;
+        self.table.ensure_read_authorized_live().await?;
 
         self.table.ensure_not_branch_reference_for_write()?;
 

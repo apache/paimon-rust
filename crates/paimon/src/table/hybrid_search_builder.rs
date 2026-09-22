@@ -286,9 +286,7 @@ impl<'a> HybridSearchBuilder<'a> {
 
     pub async fn execute_scored(&self) -> crate::Result<ScoredRowIds> {
         let core = CoreOptions::new(self.table.schema().options());
-        self.table
-            .ensure_read_authorized_live("a hybrid search")
-            .await?;
+        core.ensure_read_authorized()?;
         let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
             message: "Limit must be set via with_limit()".to_string(),
         })?;
@@ -319,7 +317,7 @@ impl<'a> HybridSearchBuilder<'a> {
         for route in &self.routes {
             let result = match route.kind {
                 HybridSearchRouteKind::Vector => {
-                    let mut builder = self.table.new_vector_search_builder().assume_authorized();
+                    let mut builder = self.table.new_vector_search_builder();
                     builder
                         .with_vector_column(&route.field_name)
                         .with_query_vector(route.vector.clone().expect("validated vector route"))
@@ -352,9 +350,7 @@ impl<'a> HybridSearchBuilder<'a> {
     /// `execute`/`execute_scored`. Mirrors Java `HybridSearchBuilderImpl` PK path.
     pub async fn execute_read(&self) -> crate::Result<ArrowRecordBatchStream> {
         let core = CoreOptions::new(self.table.schema().options());
-        self.table
-            .ensure_read_authorized_live("a hybrid search")
-            .await?;
+        core.ensure_read_authorized()?;
         let limit = self.limit.ok_or_else(|| crate::Error::ConfigInvalid {
             message: "Limit must be set via with_limit()".to_string(),
         })?;
@@ -572,7 +568,7 @@ impl<'a> HybridSearchBuilder<'a> {
         route: &HybridSearchRoute,
     ) -> crate::Result<PkRoute> {
         let vector = route.vector.as_deref().expect("validated vector route");
-        let mut builder = table.new_vector_search_builder().assume_authorized();
+        let mut builder = table.new_vector_search_builder();
         builder
             .with_vector_column(&route.field_name)
             .with_query_vector(vector.to_vec())
@@ -900,7 +896,7 @@ async fn execute_full_text_route(
     table: &Table,
     route: &HybridSearchRoute,
 ) -> crate::Result<ScoredRowIds> {
-    let mut builder = table.new_full_text_search_builder().assume_authorized();
+    let mut builder = table.new_full_text_search_builder();
     builder
         .with_text_column(&route.field_name)
         .with_query_text(

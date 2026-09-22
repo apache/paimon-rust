@@ -264,7 +264,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         // A refusal here must not clean up: a retry with an identifier that
         // already committed names files a snapshot references.
-        self.table.ensure_read_authorized_live("a commit").await?;
+        self.table.ensure_read_authorized_live().await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -311,7 +311,7 @@ impl TableCommit {
         commit_identifier: i64,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        self.table.ensure_read_authorized_live("a commit").await?;
+        self.table.ensure_read_authorized_live().await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -396,9 +396,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        // A refusal here must not clean up: a retry with an identifier that
-        // already committed names files a snapshot references.
-        self.table.ensure_read_authorized_live("a commit").await?;
+        self.table.ensure_read_authorized_live().await?;
         self.table.ensure_not_branch_reference_for_write()?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -654,7 +652,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        self.table.ensure_read_authorized_live("a commit").await?;
+        self.table.ensure_read_authorized_live().await?;
         self.ensure_not_format_table()?;
         self.table.ensure_not_branch_reference_for_write()?;
 
@@ -736,7 +734,7 @@ impl TableCommit {
         filter_committed: bool,
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
-        self.table.ensure_read_authorized_live("a commit").await?;
+        self.table.ensure_read_authorized_live().await?;
         self.ensure_not_format_table()?;
         self.table.ensure_not_branch_reference_for_write()?;
 

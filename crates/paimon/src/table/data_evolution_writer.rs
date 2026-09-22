@@ -160,9 +160,7 @@ impl DataEvolutionWriter {
     #[must_use = "commit messages must be passed to TableCommit"]
     pub async fn prepare_commit(self) -> Result<Vec<CommitMessage>> {
         // A row-id update reads the original rows it rewrites.
-        self.table
-            .ensure_read_authorized_live("a row-id update")
-            .await?;
+        self.table.ensure_read_authorized_live().await?;
 
         let total_matched: usize = self.matched_batches.iter().map(|b| b.num_rows()).sum();
         if total_matched == 0 {
@@ -480,9 +478,7 @@ impl DataEvolutionDeleteWriter {
     #[must_use = "commit messages must be passed to TableCommit"]
     pub async fn prepare_commit(mut self) -> Result<Vec<CommitMessage>> {
         // A row-id delete reads the files it rewrites.
-        self.table
-            .ensure_read_authorized_live("a row-id delete")
-            .await?;
+        self.table.ensure_read_authorized_live().await?;
 
         dedup_i64_in_place(&mut self.row_ids);
         if self.row_ids.is_empty() {

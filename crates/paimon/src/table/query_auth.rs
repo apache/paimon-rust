@@ -180,7 +180,7 @@ pub(crate) fn reject_noncanonical_fields(
 #[cfg(test)]
 mod tests {
     use super::reject_system_columns;
-    use crate::table::query_auth_table;
+    use crate::table::{query_auth_table, rest_query_auth_table};
 
     #[tokio::test]
     async fn test_a_grant_is_pinned_to_the_handle_that_obtained_it() {
@@ -206,10 +206,13 @@ mod tests {
             "scan.timestamp-millis",
             "scan.watermark",
         ] {
-            let table = query_auth_table().copy_with_options(std::collections::HashMap::from([(
-                selector.to_string(),
-                "1".to_string(),
-            )]));
+            let table =
+                rest_query_auth_table()
+                    .await
+                    .copy_with_options(std::collections::HashMap::from([(
+                        selector.to_string(),
+                        "1".to_string(),
+                    )]));
             assert!(!table.is_time_traveled(), "{selector} sets no flag");
             let err = table.authorize_read(true).await.unwrap_err();
             assert!(
@@ -500,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_time_travelled_or_branch_read_is_refused() {
-        let mut travelled = query_auth_table();
+        let mut travelled = rest_query_auth_table().await;
         travelled.time_traveled = true;
         let err = travelled.authorize_read(true).await.unwrap_err();
         assert!(
@@ -509,7 +512,7 @@ mod tests {
             "got {err:?}"
         );
 
-        let mut branch = query_auth_table();
+        let mut branch = rest_query_auth_table().await;
         branch.branch_reference = true;
         assert!(branch.authorize_read(true).await.is_err());
     }

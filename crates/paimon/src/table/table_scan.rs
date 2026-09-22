@@ -1275,15 +1275,17 @@ impl<'a> TableScan<'a> {
     }
 
     pub async fn plan(&self) -> crate::Result<Plan> {
+        // Boxed: engines poll this under deep operator stacks, and every layer
+        // above would otherwise embed the planning state.
         match &self.0 {
-            TableScanKind::Paimon(scan) => scan.plan().await,
+            TableScanKind::Paimon(scan) => Box::pin(scan.plan()).await,
             TableScanKind::Format(scan) => scan.plan().await,
         }
     }
 
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         match &self.0 {
-            TableScanKind::Paimon(scan) => scan.plan_with_trace().await,
+            TableScanKind::Paimon(scan) => Box::pin(scan.plan_with_trace()).await,
             TableScanKind::Format(scan) => scan.plan_with_trace().await,
         }
     }
