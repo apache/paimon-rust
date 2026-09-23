@@ -4670,6 +4670,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "indexmap 2.14.0",
+ "jiff",
  "libloading 0.9.0",
  "log",
  "lru 0.18.2",

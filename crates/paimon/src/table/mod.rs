@@ -193,7 +193,8 @@ use crate::catalog::{validate_branch_name, Identifier, DEFAULT_MAIN_BRANCH};
 use crate::io::FileIO;
 use crate::spec::{
     CoreOptions, DataField, Snapshot, TableSchema, SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION,
-    SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_VERSION_OPTION, SCAN_WATERMARK_OPTION,
+    SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_TIMESTAMP_OPTION, SCAN_VERSION_OPTION,
+    SCAN_WATERMARK_OPTION,
 };
 use std::collections::HashMap;
 
@@ -456,6 +457,7 @@ impl Table {
         let selector_changed = extra.keys().any(|k| {
             k == crate::spec::SCAN_VERSION_OPTION
                 || k == crate::spec::SCAN_TIMESTAMP_MILLIS_OPTION
+                || k == crate::spec::SCAN_TIMESTAMP_OPTION
                 || k == crate::spec::SCAN_WATERMARK_OPTION
                 || k == crate::spec::SCAN_SNAPSHOT_ID_OPTION
                 || k == crate::spec::SCAN_TAG_NAME_OPTION
@@ -533,6 +535,7 @@ impl Table {
         let mut options = self.schema.options().clone();
         for selector in [
             SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_TIMESTAMP_OPTION,
             SCAN_WATERMARK_OPTION,
             SCAN_VERSION_OPTION,
             SCAN_SNAPSHOT_ID_OPTION,
@@ -559,7 +562,7 @@ impl Table {
     ///
     /// Mirrors Java `AbstractFileStoreTable.copy(dynamicOptions)` →
     /// `tryTimeTravel`: if the merged options contain a time-travel selector
-    /// (`scan.version` / `scan.timestamp-millis` / `scan.watermark` /
+    /// (`scan.version` / `scan.timestamp-millis` / `scan.timestamp` / `scan.watermark` /
     /// `scan.snapshot-id` / `scan.tag-name`) that resolves to a snapshot, the
     /// table's fields and keys come from that snapshot's schema while the
     /// options stay the merged ones (Java `TableSchema.copy(newOptions)`).

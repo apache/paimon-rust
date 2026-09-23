@@ -1490,13 +1490,14 @@ impl<'a> PaimonTableScan<'a> {
     ///
     /// Time travel is resolved from table options:
     /// - `scan.version` is resolved first, overwriting the same selector kind;
-    ///   only one of `scan.timestamp-millis`, `scan.watermark`, `scan.snapshot-id`,
+    ///   only one of `scan.timestamp-millis`, `scan.timestamp`, `scan.watermark`, `scan.snapshot-id`,
     ///   `scan.tag-name` may remain after resolution
     /// - `scan.version` → tag name (if exists) → `watermark-<value>` → snapshot
     ///   id (if parseable) → error (ambiguous by design, like SQL `VERSION AS OF`)
     /// - `scan.snapshot-id` → snapshot id only (never a tag lookup)
     /// - `scan.tag-name` → tag name only (never parsed as a snapshot id)
     /// - `scan.timestamp-millis` → find the latest snapshot <= that timestamp
+    /// - `scan.timestamp` → parse in the local time zone, then resolve like `scan.timestamp-millis`
     /// - `scan.watermark` → find the earliest snapshot with watermark >= that
     ///   value (snapshots without a watermark are skipped)
     /// - otherwise → read the latest snapshot

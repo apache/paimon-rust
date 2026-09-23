@@ -443,6 +443,9 @@ rb = table.new_read_builder({"scan.snapshot-id": "1"})
 # By timestamp (epoch millis)
 rb = table.new_read_builder({"scan.timestamp-millis": "1700000000000"})
 
+# By timestamp string (process local time zone; fractional seconds are supported)
+rb = table.new_read_builder({"scan.timestamp": "2024-01-01 12:00:00.123"})
+
 # By version
 rb = table.new_read_builder({"scan.version": "3"})
 
@@ -452,6 +455,12 @@ rb = table.new_read_builder({"scan.tag-name": "release-1.0"})
 
 !!! warning
     Only one time-travel selector may be set. Providing multiple selectors will raise a `ValueError`.
+
+`scan.timestamp` selects the latest snapshot committed at or before the given
+local time. It accepts `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS[.fraction]`, or
+`YYYY-MM-DDTHH:MM[:SS[.fraction]]`, with up to nine fractional digits truncated
+to milliseconds. It can be combined with `scan.mode=from-timestamp`. Invalid
+timestamps and times before the earliest available snapshot raise an error.
 
 ## Table Inspection
 
