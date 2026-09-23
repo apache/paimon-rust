@@ -434,8 +434,6 @@ async fn test_timestamp_as_of_uses_snapshot_schema() {
     assert_eq!(total_rows(&batches), 5);
 }
 
-// Windows chrono::Local uses the system zone and does not honor TZ.
-#[cfg(unix)]
 #[tokio::test]
 async fn test_session_scan_timestamp_overlap_reads_earlier_snapshot() {
     const CHILD: &str = "PAIMON_SCAN_TIMESTAMP_SQL_OVERLAP_CHILD";
@@ -488,4 +486,18 @@ async fn test_session_scan_timestamp_overlap_reads_earlier_snapshot() {
         .unwrap();
     assert_eq!(column_names(&batches), vec!["id", "name"]);
     assert_eq!(total_rows(&batches), 3);
+
+    sql_context
+        .sql("SET 'paimon.scan.timestamp' = '2024-11-03 02:00:00'")
+        .await
+        .unwrap();
+    let batches = sql_context
+        .sql("SELECT * FROM paimon.default.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(column_names(&batches), vec!["id", "name", "age"]);
+    assert_eq!(total_rows(&batches), 5);
 }

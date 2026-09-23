@@ -1131,7 +1131,7 @@ impl<'a> CoreOptions<'a> {
             Ok(Some(TimeTravelSelector::TimestampMillis(ts)))
         } else if let Some(value) = self.options.get(SCAN_TIMESTAMP_OPTION) {
             Ok(Some(TimeTravelSelector::TimestampMillis(
-                parse_scan_timestamp(value, &chrono::Local)?,
+                parse_scan_timestamp(value, &jiff::tz::TimeZone::system())?,
             )))
         } else if let Some(watermark) = self.parse_i64_option(SCAN_WATERMARK_OPTION)? {
             Ok(Some(TimeTravelSelector::Watermark(watermark)))
@@ -1626,8 +1626,8 @@ impl<'a> CoreOptions<'a> {
 /// Java DateTimeUtils accepts a date, a space-separated timestamp, or an ISO
 /// local timestamp (whose seconds are optional). It truncates to milliseconds
 /// and resolves the date/time in the process's default time zone.
-fn parse_scan_timestamp(value: &str, zone: &impl chrono::TimeZone) -> crate::Result<i64> {
-    use chrono::{Days, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone, Timelike};
+fn parse_scan_timestamp(value: &str, zone: &jiff::tz::TimeZone) -> crate::Result<i64> {
+    use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 
     let datetime = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
@@ -1652,33 +1652,34 @@ fn parse_scan_timestamp(value: &str, zone: &impl chrono::TimeZone) -> crate::Res
             source: None,
         });
     }
-    // LocalDateTime.atZone chooses the earlier UTC instant during an overlap.
-    // Chrono's LocalResult candidates are not necessarily ordered by instant
-    // (notably for chrono::Local on some platforms), so compare explicitly.
-    match zone.from_local_datetime(&datetime) {
-        LocalResult::Single(timestamp) => return Ok(timestamp.timestamp_millis()),
-        LocalResult::Ambiguous(first, second) => {
-            return Ok(first.timestamp_millis().min(second.timestamp_millis()));
-        }
-        LocalResult::None => {}
-    }
-    // During a clock-forward gap Java shifts the local time forward by the
-    // gap, which is equivalent to applying the offset before the transition.
-    // Looking back one local day also covers whole-day date-line transitions.
-    datetime
-        .checked_sub_days(Days::new(1))
-        .and_then(|before| zone.from_local_datetime(&before).earliest())
-        .and_then(|before| {
-            before
-                .offset()
-                .fix()
-                .from_local_datetime(&datetime)
-                .single()
-        })
-        .map(|timestamp| timestamp.timestamp_millis())
-        .ok_or_else(|| crate::Error::DataInvalid {
+    // Java parses with precision 3 before applying the system time zone.
+    // Truncating here also preserves the correct millisecond for instants
+    // immediately before the Unix epoch.
+    let year = i16::try_from(datetime.year()).map_err(|error| crate::Error::DataInvalid {
+        message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+        source: Some(Box::new(error)),
+    })?;
+    let civil = jiff::civil::DateTime::new(
+        year,
+        datetime.month() as i8,
+        datetime.day() as i8,
+        datetime.hour() as i8,
+        datetime.minute() as i8,
+        datetime.second() as i8,
+        (datetime.nanosecond() / 1_000_000 * 1_000_000) as i32,
+    )
+    .map_err(|error| crate::Error::DataInvalid {
+        message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+        source: Some(Box::new(error)),
+    })?;
+    // Jiff's compatible disambiguation matches Java LocalDateTime.atZone:
+    // the earlier instant in a fold, and the later local time in a gap.
+    zone.to_ambiguous_timestamp(civil)
+        .compatible()
+        .map(|timestamp| timestamp.as_millisecond())
+        .map_err(|error| crate::Error::DataInvalid {
             message: format!("Invalid local time for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
-            source: None,
+            source: Some(Box::new(error)),
         })
 }
 
@@ -2564,27 +2565,20 @@ mod tests {
 
     #[test]
     fn test_scan_timestamp_parses_local_time_and_truncates_to_millis() {
-        use chrono::{Local, TimeZone};
-
-        let midnight = Local.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap();
-        let noon = Local.with_ymd_and_hms(2024, 1, 2, 12, 3, 4).unwrap();
+        let zone = jiff::tz::db().get("Asia/Shanghai").unwrap();
+        let midnight = 1_704_124_800_000_i64; // 2024-01-01T16:00:00Z
+        let noon = 1_704_168_184_000_i64; // 2024-01-02T04:03:04Z
         for (value, expected) in [
-            ("2024-01-02", midnight.timestamp_millis()),
-            ("2024-1-2 12:3:4", noon.timestamp_millis()),
-            ("2024-01-02 12:03:04", noon.timestamp_millis()),
-            (
-                "2024-01-02 12:03:04.123456789",
-                noon.timestamp_millis() + 123,
-            ),
-            ("2024-01-02T12:03:04.9", noon.timestamp_millis() + 900),
-            ("2024-01-02T12:03", noon.timestamp_millis() - 4000),
+            ("2024-01-02", midnight),
+            ("2024-1-2 12:3:4", noon),
+            ("2024-01-02 12:03:04", noon),
+            ("2024-01-02 12:03:04.123456789", noon + 123),
+            ("2024-01-02T12:03:04.9", noon + 900),
+            ("2024-01-02T12:03", noon - 4000),
         ] {
-            let options = HashMap::from([("scan.timestamp".to_string(), value.to_string())]);
             assert_eq!(
-                CoreOptions::new(&options)
-                    .try_time_travel_selector()
-                    .unwrap(),
-                Some(TimeTravelSelector::TimestampMillis(expected)),
+                parse_scan_timestamp(value, &zone).unwrap(),
+                expected,
                 "{value}"
             );
         }
@@ -2597,6 +2591,16 @@ mod tests {
                 "America/New_York",
                 "2024-11-03 01:30:00",
                 "2024-11-03T05:30:00Z",
+            ),
+            (
+                "America/New_York",
+                "2024-11-03 02:00:00",
+                "2024-11-03T07:00:00Z",
+            ),
+            (
+                "America/New_York",
+                "2024-11-03 02:00:00.999",
+                "2024-11-03T07:00:00.999Z",
             ),
             (
                 "America/New_York",
@@ -2619,27 +2623,31 @@ mod tests {
                 "1969-12-31T23:59:59.999Z",
             ),
         ] {
-            let zone = zone.parse::<arrow_array::timezone::Tz>().unwrap();
+            let zone = jiff::tz::db().get(zone).unwrap();
             assert_eq!(
                 parse_scan_timestamp(value, &zone).unwrap(),
                 chrono::DateTime::parse_from_rfc3339(expected)
                     .unwrap()
                     .timestamp_millis(),
-                "{value} in {zone}"
+                "{value} in {zone:?}"
             );
         }
     }
 
-    // Windows chrono::Local uses the system zone and does not honor TZ.
-    #[cfg(unix)]
     #[test]
     fn test_scan_timestamp_local_overlap_uses_earlier_instant() {
         const CHILD: &str = "PAIMON_SCAN_TIMESTAMP_OVERLAP_CHILD";
         if std::env::var_os(CHILD).is_some() {
-            // `chrono::Local` reads process-global timezone state. Run this in
-            // a fresh process so other tests cannot affect the chosen zone.
-            let actual = parse_scan_timestamp("2024-11-03 01:30:00", &chrono::Local).unwrap();
+            // Resolve the system zone in a fresh process, including on Windows.
+            let actual =
+                parse_scan_timestamp("2024-11-03 01:30:00", &jiff::tz::TimeZone::system()).unwrap();
             assert_eq!(actual, 1_730_611_800_000); // 2024-11-03T05:30:00Z
+            let overlap_end =
+                parse_scan_timestamp("2024-11-03 02:00:00", &jiff::tz::TimeZone::system()).unwrap();
+            assert_eq!(overlap_end, 1_730_617_200_000); // 2024-11-03T07:00:00Z
+            let gap =
+                parse_scan_timestamp("2024-03-10 02:30:00", &jiff::tz::TimeZone::system()).unwrap();
+            assert_eq!(gap, 1_710_055_800_000); // 2024-03-10T07:30:00Z
             return;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
