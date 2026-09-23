@@ -465,6 +465,10 @@ impl FormatFileWriter for ParquetFormatWriter {
         self.inner.in_progress_size()
     }
 
+    fn pending_rows(&self) -> Option<usize> {
+        Some(self.inner.in_progress_rows())
+    }
+
     async fn flush(&mut self) -> crate::Result<()> {
         self.inner
             .flush()
@@ -2748,10 +2752,12 @@ mod tests {
         PredicateOperator, RowSelection,
     };
     use crate::arrow::format::{
-        create_format_reader, create_format_writer, FormatFileReader, FormatFileWriter,
+        create_format_reader, create_format_writer, with_write_resources, FormatFileReader,
+        FormatFileWriter,
     };
     use crate::arrow::{build_target_arrow_schema, variant_arrow_type, ReadBudget};
     use crate::io::FileIOBuilder;
+    use crate::resource::ResourceContext;
     use crate::spec::{
         ArrayType, BigIntType, DataField, DataType, Datum, IntType, LocalZonedTimestampType,
         MapType, PredicateBuilder, TimestampType, VarCharType, VariantType,
@@ -2767,7 +2773,7 @@ mod tests {
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::{StreamExt, TryStreamExt};
     use parquet::basic::{Compression, GzipLevel, ZstdLevel};
-    use parquet::file::properties::EnabledStatistics;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::file::statistics::Statistics as ParquetStatistics;
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
     use std::collections::HashMap;
@@ -3660,6 +3666,65 @@ mod tests {
             .await
             .expect("dropping the receiver must cancel a pending row-group read")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_resource_charge_releases_auto_flushed_row_group_with_tail() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_writer_resource_auto_flush.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let schema = writer_arrow_schema();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build();
+        let inner = AsyncArrowWriter::try_new(
+            output.async_writer().await.unwrap(),
+            schema.clone(),
+            Some(props),
+        )
+        .unwrap();
+        let first = writer_test_batch(&schema, vec![1, 2, 3, 4, 5], vec![10, 20, 30, 40, 50]);
+        let second = writer_test_batch(&schema, vec![6, 7, 8, 9], vec![60, 70, 80, 90]);
+        let first_bytes = first.get_array_memory_size();
+        let second_bytes = second.get_array_memory_size();
+        let resources = ResourceContext::builder()
+            .memory_limit(first_bytes + second_bytes / 2)
+            .build()
+            .unwrap();
+        let mut writer = with_write_resources(
+            Box::new(ParquetFormatWriter {
+                inner,
+                input_schema: schema.clone(),
+                schema,
+                write_fields: None,
+                stats_modes: None,
+                stats_dense_store: false,
+            }),
+            Some(&resources),
+        );
+
+        writer.write(&first).await.unwrap();
+        assert!(writer.in_progress_size() > 0);
+        assert_eq!(
+            resources.metrics().reserved_memory_bytes,
+            first_bytes.div_ceil(5)
+        );
+        writer.write(&second).await.unwrap();
+        assert_eq!(
+            resources.metrics().reserved_memory_bytes,
+            second_bytes.div_ceil(4)
+        );
+        writer.close().await.unwrap();
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
+        let total_rows: usize = reader
+            .into_iter()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum();
+        assert_eq!(total_rows, 9);
     }
 
     #[tokio::test]

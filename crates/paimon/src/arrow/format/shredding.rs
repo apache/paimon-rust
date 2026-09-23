@@ -360,6 +360,16 @@ impl FormatFileWriter for ShreddingFormatWriter {
         }
     }
 
+    fn pending_rows(&self) -> Option<usize> {
+        match &self.state {
+            ShreddingWriterState::Ready { inner, .. } => inner.pending_rows(),
+            ShreddingWriterState::Infer {
+                buffered_row_count, ..
+            } => Some(*buffered_row_count),
+            ShreddingWriterState::Closed => Some(0),
+        }
+    }
+
     async fn flush(&mut self) -> crate::Result<()> {
         self.finalize_inferred_writer().await?;
         match &mut self.state {
