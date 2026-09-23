@@ -39,7 +39,7 @@ use crate::Error;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 /// Predicates with the file-level field context needed for pushdown.
@@ -114,6 +114,19 @@ pub(crate) trait FormatFileWriter: Send {
     /// Number of bytes buffered in the current row group (not yet flushed).
     fn in_progress_size(&self) -> usize;
 
+    /// Whether this writer still retains batch data. This can differ from
+    /// `in_progress_size` while a format is inferring its physical schema.
+    fn retains_batch_data(&self) -> bool {
+        self.in_progress_size() != 0
+    }
+
+    /// Number of input rows still represented by buffered data, when known.
+    /// Unlike `in_progress_size`, this allows accounting to release the part
+    /// of a batch already written by an automatic row-group flush.
+    fn pending_rows(&self) -> Option<usize> {
+        None
+    }
+
     /// Flush the current row group to storage without closing the file.
     async fn flush(&mut self) -> crate::Result<()>;
 
@@ -135,6 +148,136 @@ pub(crate) trait FormatFileWriter: Send {
 
     /// Flush and close the writer, finalizing the file on storage.
     async fn close(self: Box<Self>) -> crate::Result<FormatWriteResult>;
+}
+
+/// Account for batches retained by a format writer until its next flush.
+/// The charge is an estimate of input Arrow buffers, not encoded allocations.
+pub(crate) fn with_write_resources(
+    writer: Box<dyn FormatFileWriter>,
+    resources: Option<&crate::resource::ResourceContext>,
+) -> Box<dyn FormatFileWriter> {
+    match resources {
+        Some(resources) => Box::new(ResourceFormatWriter {
+            inner: writer,
+            reservation: resources.reservation(),
+            batches: VecDeque::new(),
+            charged_rows: 0,
+        }),
+        None => writer,
+    }
+}
+
+struct ResourceFormatWriter {
+    inner: Box<dyn FormatFileWriter>,
+    reservation: crate::resource::MemoryReservation,
+    batches: VecDeque<BufferedBatchCharge>,
+    charged_rows: usize,
+}
+
+struct BufferedBatchCharge {
+    rows: usize,
+    bytes: usize,
+}
+
+impl ResourceFormatWriter {
+    fn release_flushed(&mut self) -> crate::Result<()> {
+        let Some(pending_rows) = self.inner.pending_rows() else {
+            if !self.inner.retains_batch_data() {
+                self.batches.clear();
+                self.charged_rows = 0;
+                self.reservation.try_resize(0)?;
+            }
+            return Ok(());
+        };
+        if pending_rows == 0 {
+            self.batches.clear();
+            self.charged_rows = 0;
+            return self.reservation.try_resize(0);
+        }
+        if pending_rows > self.charged_rows {
+            // Keep the full charge if a writer reports more rows than we have
+            // observed; releasing any amount would risk under-accounting.
+            return Ok(());
+        }
+        let mut flushed_rows = self.charged_rows - pending_rows;
+        let mut released_bytes = 0;
+        while flushed_rows > 0 {
+            let batch = self.batches.front_mut().expect("charged rows remain");
+            let consumed_rows = flushed_rows.min(batch.rows);
+            let remaining_rows = batch.rows - consumed_rows;
+            let remaining_bytes = (batch.bytes as u128 * remaining_rows as u128)
+                .div_ceil(batch.rows as u128) as usize;
+            released_bytes += batch.bytes - remaining_bytes;
+            flushed_rows -= consumed_rows;
+            if remaining_rows == 0 {
+                self.batches.pop_front();
+            } else {
+                batch.rows = remaining_rows;
+                batch.bytes = remaining_bytes;
+            }
+        }
+        self.charged_rows = pending_rows;
+        self.reservation
+            .try_resize(self.reservation.size() - released_bytes)
+    }
+}
+
+#[async_trait]
+impl FormatFileWriter for ResourceFormatWriter {
+    async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
+        let bytes = if batch.num_rows() == 0 {
+            0
+        } else {
+            batch.get_array_memory_size()
+        };
+        self.reservation.try_grow(bytes)?;
+        self.inner.write(batch).await?;
+        if batch.num_rows() != 0 {
+            self.batches.push_back(BufferedBatchCharge {
+                rows: batch.num_rows(),
+                bytes,
+            });
+            self.charged_rows += batch.num_rows();
+        }
+        self.release_flushed()
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.inner.num_bytes()
+    }
+
+    fn in_progress_size(&self) -> usize {
+        self.inner.in_progress_size()
+    }
+
+    fn retains_batch_data(&self) -> bool {
+        self.inner.retains_batch_data()
+    }
+
+    fn pending_rows(&self) -> Option<usize> {
+        self.inner.pending_rows()
+    }
+
+    async fn flush(&mut self) -> crate::Result<()> {
+        self.inner.flush().await?;
+        self.release_flushed()
+    }
+
+    fn commit_field_metadata(
+        &mut self,
+        metadata: &crate::arrow::shredding::FieldMetadata,
+    ) -> crate::Result<()> {
+        self.inner.commit_field_metadata(metadata)
+    }
+
+    async fn close(self: Box<Self>) -> crate::Result<FormatWriteResult> {
+        let Self {
+            inner, reservation, ..
+        } = *self;
+        let result = inner.close().await;
+        drop(reservation);
+        result
+    }
 }
 
 pub(crate) struct FormatWriteResult {

@@ -55,3 +55,12 @@ pub(crate) fn reader_resources(
         .memory_pool(Arc::new(DataFusionMemoryPool { reservation }))
         .build()
 }
+
+pub(crate) fn writer_resources(context: &TaskContext) -> paimon::Result<ResourceContext> {
+    let reservation = MemoryConsumer::new("PaimonTableWrite")
+        .with_can_spill(false)
+        .register(context.memory_pool());
+    ResourceContext::builder()
+        .memory_pool(Arc::new(DataFusionMemoryPool { reservation }))
+        .build()
+}

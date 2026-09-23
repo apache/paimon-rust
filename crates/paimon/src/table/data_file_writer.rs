@@ -23,8 +23,11 @@
 //! [`DataFileMeta`] for the commit path.
 
 use super::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
-use crate::arrow::format::{create_format_writer, FormatFileWriter, FormatValueStats};
+use crate::arrow::format::{
+    create_format_writer, with_write_resources, FormatFileWriter, FormatValueStats,
+};
 use crate::io::FileIO;
+use crate::resource::ResourceContext;
 use crate::spec::data_file_to_file_index_file_name;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{bucket_path_under, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
@@ -67,6 +70,7 @@ pub(crate) struct DataFileWriter {
     current_row_count: i64,
     index_options: Option<Arc<FileIndexOptions>>,
     current_index: Option<DataFileIndexWriter>,
+    resources: Option<ResourceContext>,
     /// Paths owned by this write until prepare_commit hands them to the caller.
     created_paths: Vec<String>,
 }
@@ -113,6 +117,7 @@ impl DataFileWriter {
             current_row_count: 0,
             index_options: None,
             current_index: None,
+            resources: None,
             created_paths: Vec::new(),
         }
     }
@@ -122,10 +127,19 @@ impl DataFileWriter {
         self
     }
 
+    pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
+        self.resources = resources;
+        self
+    }
+
+    pub(crate) fn set_resources(&mut self, resources: Option<ResourceContext>) {
+        self.resources = resources;
+    }
+
     /// Write a RecordBatch. Rolls to a new file when target size is reached.
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         let result = self.write_batch(batch).await;
-        if result.is_err() && self.index_options.is_some() {
+        if self.index_options.is_some() && result.is_err() {
             self.abort().await;
         }
         result
@@ -195,7 +209,7 @@ impl DataFileWriter {
             Some(&self.format_options),
         )
         .await?;
-        self.current_writer = Some(writer);
+        self.current_writer = Some(with_write_resources(writer, self.resources.as_ref()));
         self.current_index = index;
         self.current_file_name = Some(file_name);
         self.current_row_count = 0;

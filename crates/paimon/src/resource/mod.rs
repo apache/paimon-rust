@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared memory reservations for readers and embedding engines.
+//! Shared memory reservations for readers, writers, and embedding engines.
 //!
 //! Parquet readers reserve each selected row group's projected uncompressed
 //! column size before data I/O, including columns needed by decoder predicates.
@@ -29,6 +29,9 @@
 //! Reservations are accounting, not an allocator or an RSS limit. Row-group
 //! charges are estimates; metadata, merge state, transient batches and allocation
 //! overhead are not fully covered, and actual memory can exceed the estimates.
+//! Writers charge retained key-value input batches and unflushed format-writer
+//! input batches. Sorting, encoding, transient routing batches, and file indexes
+//! are not fully covered. Input batches held by the caller remain its responsibility.
 
 mod memory;
 pub use memory::{MemoryPool, MemoryReservation, ResourceMetrics};
@@ -50,7 +53,7 @@ use crate::Result;
 /// let resources = ResourceContext::builder()
 ///     .memory_limit(256 * 1024 * 1024)
 ///     .build()?;
-/// // Pass resources.clone() to ReadBuilder::with_resources.
+/// // Pass resources.clone() to ReadBuilder::with_resources or WriteBuilder::with_resources.
 /// // Other consumers reserve from the same budget for their own retained state.
 /// let mut reservation = resources.reservation();
 /// reservation.try_grow(1024)?;

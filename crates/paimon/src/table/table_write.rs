@@ -22,6 +22,7 @@
 
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::partition::partition_array;
+use crate::resource::ResourceContext;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
@@ -89,13 +90,24 @@ impl FileWriter {
     }
 
     async fn prepare_commit(mut self) -> Result<PreparedFiles> {
+        let result = match &mut self {
+            FileWriter::Append(w) => w.prepare_commit().await.map(PreparedFiles::data),
+            FileWriter::AppendDedicated(w) => w.prepare_commit().await.map(PreparedFiles::data),
+            FileWriter::KeyValue(w) => w.prepare_commit().await,
+            FileWriter::Postpone(w) => w.prepare_commit().await.map(PreparedFiles::data),
+        };
+        if result.is_err() {
+            self.abort().await;
+        }
+        result
+    }
+
+    async fn abort(&mut self) {
         match self {
-            FileWriter::Append(ref mut w) => w.prepare_commit().await.map(PreparedFiles::data),
-            FileWriter::AppendDedicated(ref mut w) => {
-                w.prepare_commit().await.map(PreparedFiles::data)
-            }
-            FileWriter::KeyValue(ref mut w) => w.prepare_commit().await,
-            FileWriter::Postpone(ref mut w) => w.prepare_commit().await.map(PreparedFiles::data),
+            FileWriter::Append(w) => w.abort().await,
+            FileWriter::AppendDedicated(w) => w.abort().await,
+            FileWriter::KeyValue(w) => w.abort().await,
+            FileWriter::Postpone(w) => w.abort().await,
         }
     }
 }
@@ -107,6 +119,7 @@ impl FileWriter {
 ///
 /// Call `prepare_commit()` to close all writers and collect
 /// `CommitMessage`s for use with `TableCommit`.
+/// A failed write discards pending output; create a new `TableWrite` before retrying.
 ///
 /// Reference: [pypaimon BatchTableWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/table_write.py)
 pub struct TableWrite {
@@ -151,6 +164,8 @@ pub struct TableWrite {
     row_kind_generator: Option<RowKindGenerator>,
     row_kind_filter: Option<RowKindFilter>,
     file_index_options: Option<Arc<FileIndexOptions>>,
+    resources: Option<ResourceContext>,
+    failed: bool,
 }
 
 impl TableWrite {
@@ -425,6 +440,8 @@ impl TableWrite {
             row_kind_generator,
             row_kind_filter,
             file_index_options: file_index_options.map(Arc::new),
+            resources: None,
+            failed: false,
         })
     }
 
@@ -500,8 +517,18 @@ impl TableWrite {
         self
     }
 
+    /// Share write-buffer reservations with other consumers of this operation.
+    /// Input batches remain the caller's responsibility; charges here estimate
+    /// retained key-value batches and unflushed format-writer input. Call this
+    /// before the first write.
+    pub fn with_resources(mut self, resources: ResourceContext) -> Self {
+        self.resources = Some(resources);
+        self
+    }
+
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.ensure_active()?;
         let Some(batch) = self.normalize_write_batch(batch)? else {
             return Ok(());
         };
@@ -850,6 +877,7 @@ impl TableWrite {
         bucket: i32,
         batch: RecordBatch,
     ) -> Result<()> {
+        self.ensure_active()?;
         let result = async {
             let key = (partition_bytes, bucket);
             if !self.partition_writers.contains_key(&key) {
@@ -862,14 +890,21 @@ impl TableWrite {
                 .await
         }
         .await;
-        if result.is_err() && self.file_index_options.is_some() {
-            for (_, writer) in self.partition_writers.drain() {
-                if let FileWriter::Append(mut writer) = writer {
-                    writer.abort().await;
-                }
-            }
+        if result.is_err() {
+            self.close().await;
+            self.failed = true;
         }
         result
+    }
+
+    fn ensure_active(&self) -> Result<()> {
+        if self.failed {
+            return Err(crate::Error::DataInvalid {
+                message: "TableWrite cannot be reused after a write failure".to_string(),
+                source: None,
+            });
+        }
+        Ok(())
     }
 
     /// Write multiple Arrow RecordBatches.
@@ -883,19 +918,15 @@ impl TableWrite {
     /// Close without preparing another commit, discarding only outstanding output.
     /// Files already returned by prepare_commit belong to the caller.
     pub async fn close(&mut self) {
-        for (_, writer) in self.partition_writers.drain() {
-            match writer {
-                FileWriter::Append(mut writer) => writer.abort().await,
-                FileWriter::AppendDedicated(mut writer) => writer.abort().await,
-                FileWriter::KeyValue(mut writer) => writer.abort().await,
-                FileWriter::Postpone(mut writer) => writer.abort().await,
-            }
+        for (_, mut writer) in self.partition_writers.drain() {
+            writer.abort().await;
         }
     }
 
     /// Close all writers and collect CommitMessages for use with TableCommit.
     /// Writers are cleared after this call, allowing the TableWrite to be reused.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
+        self.ensure_active()?;
         if self.file_index_options.is_some() {
             return self.prepare_indexed_append_commit().await;
         }
@@ -905,30 +936,50 @@ impl TableWrite {
         let futures: Vec<_> = writers
             .into_iter()
             .map(|((partition_bytes, bucket), writer)| async move {
-                let files = writer.prepare_commit().await?;
-                Ok::<_, crate::Error>((partition_bytes, bucket, files))
+                (partition_bytes, bucket, writer.prepare_commit().await)
             })
             .collect();
 
-        let results = futures::future::try_join_all(futures).await?;
+        let results = futures::future::join_all(futures).await;
+
+        let mut messages = Vec::new();
+        let mut error = None;
+        for (partition_bytes, bucket, result) in results {
+            match result {
+                Ok(files) if !files.data_files.is_empty() || !files.changelog_files.is_empty() => {
+                    let mut message = CommitMessage::new(partition_bytes, bucket, files.data_files);
+                    message.new_changelog_files = files.changelog_files;
+                    messages.push(message);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    error.get_or_insert(err);
+                }
+            }
+        }
+        if let Some(error) = error {
+            self.failed = true;
+            let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
+            let _ = commit.abort(&messages).await;
+            return Err(error);
+        }
 
         // Collect index files from bucket assigner
         let file_io = self.table.file_io();
-        let mut index_files_by_key = self.bucket_assigner.prepare_commit_index(file_io).await?;
-
-        let mut messages = Vec::new();
-        for (partition_bytes, bucket, files) in results {
-            let key = (partition_bytes.clone(), bucket);
-            let index_files = index_files_by_key.remove(&key).unwrap_or_default();
-            if !files.data_files.is_empty()
-                || !files.changelog_files.is_empty()
-                || !index_files.is_empty()
-            {
-                let mut msg = CommitMessage::new(partition_bytes, bucket, files.data_files);
-                msg.new_changelog_files = files.changelog_files;
-                msg.new_index_files = index_files;
-                messages.push(msg);
+        let mut index_files_by_key = match self.bucket_assigner.prepare_commit_index(file_io).await
+        {
+            Ok(files) => files,
+            Err(error) => {
+                self.failed = true;
+                let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
+                let _ = commit.abort(&messages).await;
+                return Err(error);
             }
+        };
+
+        for message in &mut messages {
+            let key = (message.partition.clone(), message.bucket);
+            message.new_index_files = index_files_by_key.remove(&key).unwrap_or_default();
         }
         // Emit index-only messages for (partition, bucket) pairs that had no data writer
         // (e.g., old buckets where keys migrated away in cross-partition mode).
@@ -966,6 +1017,7 @@ impl TableWrite {
             }
         }
         if let Some(error) = error {
+            self.failed = true;
             let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
             let _ = commit.abort(&messages).await;
             return Err(error);
@@ -1026,7 +1078,8 @@ impl TableWrite {
                     self.table.schema().options(),
                     &self.blob_inline_fields,
                     &self.blob_view_fields,
-                ),
+                )
+                .with_resources(self.resources.clone()),
             )))
         } else {
             Ok(FileWriter::Append(
@@ -1047,7 +1100,8 @@ impl TableWrite {
                     None,
                     None,
                 )
-                .with_file_index(self.file_index_options.clone()),
+                .with_file_index(self.file_index_options.clone())
+                .with_resources(self.resources.clone()),
             ))
         }
     }
@@ -1055,21 +1109,24 @@ impl TableWrite {
     /// Create a postpone writer (KV format, no sorting/dedup, special file naming).
     fn create_postpone_writer(&self, partition_path: String, bucket: i32) -> FileWriter {
         let data_file_prefix = format!("data-u-{}-s-0-w-", self.commit_user);
-        FileWriter::Postpone(PostponeFileWriter::new(
-            self.table.file_io().clone(),
-            PostponeWriteConfig {
-                table_location: self.table.location().to_string(),
-                partition_path,
-                bucket,
-                schema_id: self.schema_id,
-                target_file_size: self.target_file_size,
-                file_compression: self.file_compression.clone(),
-                file_compression_zstd_level: self.file_compression_zstd_level,
-                write_buffer_size: self.write_buffer_size,
-                file_format: self.file_format.clone(),
-                data_file_prefix,
-            },
-        ))
+        FileWriter::Postpone(
+            PostponeFileWriter::new(
+                self.table.file_io().clone(),
+                PostponeWriteConfig {
+                    table_location: self.table.location().to_string(),
+                    partition_path,
+                    bucket,
+                    schema_id: self.schema_id,
+                    target_file_size: self.target_file_size,
+                    file_compression: self.file_compression.clone(),
+                    file_compression_zstd_level: self.file_compression_zstd_level,
+                    write_buffer_size: self.write_buffer_size,
+                    file_format: self.file_format.clone(),
+                    data_file_prefix,
+                },
+            )
+            .with_resources(self.resources.clone()),
+        )
     }
 
     /// Create a key-value writer for PK tables with normal buckets.
@@ -1097,34 +1154,37 @@ impl TableWrite {
             .copied()
             .unwrap_or(0);
 
-        Ok(FileWriter::KeyValue(KeyValueFileWriter::new(
-            self.table.file_io().clone(),
-            KeyValueWriteConfig {
-                table_name: self.table.identifier().full_name(),
-                table_options: self.table.schema().options().clone(),
-                table_location: self.table.location().to_string(),
-                partition_path,
-                bucket,
-                schema_id: self.schema_id,
-                file_compression: self.file_compression.clone(),
-                file_compression_zstd_level: self.file_compression_zstd_level,
-                write_buffer_size: self.write_buffer_size,
-                file_format: self.file_format.clone(),
-                input_changelog: self.changelog_producer == ChangelogProducer::Input
-                    && !self.is_overwrite,
-                changelog_file_prefix: self.changelog_file_prefix.clone(),
-                changelog_file_compression: self.changelog_file_compression.clone(),
-                changelog_file_format: self.changelog_file_format.clone(),
-                primary_keys: self.table.schema().primary_keys().to_vec(),
-                primary_key_indices: self.primary_key_indices.clone(),
-                primary_key_types: self.primary_key_types.clone(),
-                sequence_field_indices: self.sequence_field_indices.clone(),
-                merge_engine: self.merge_engine,
-                deletion_vectors_enabled: CoreOptions::new(self.table.schema().options())
-                    .deletion_vectors_enabled(),
-            },
-            next_seq,
-        )?))
+        Ok(FileWriter::KeyValue(
+            KeyValueFileWriter::new(
+                self.table.file_io().clone(),
+                KeyValueWriteConfig {
+                    table_name: self.table.identifier().full_name(),
+                    table_options: self.table.schema().options().clone(),
+                    table_location: self.table.location().to_string(),
+                    partition_path,
+                    bucket,
+                    schema_id: self.schema_id,
+                    file_compression: self.file_compression.clone(),
+                    file_compression_zstd_level: self.file_compression_zstd_level,
+                    write_buffer_size: self.write_buffer_size,
+                    file_format: self.file_format.clone(),
+                    input_changelog: self.changelog_producer == ChangelogProducer::Input
+                        && !self.is_overwrite,
+                    changelog_file_prefix: self.changelog_file_prefix.clone(),
+                    changelog_file_compression: self.changelog_file_compression.clone(),
+                    changelog_file_format: self.changelog_file_format.clone(),
+                    primary_keys: self.table.schema().primary_keys().to_vec(),
+                    primary_key_indices: self.primary_key_indices.clone(),
+                    primary_key_types: self.primary_key_types.clone(),
+                    sequence_field_indices: self.sequence_field_indices.clone(),
+                    merge_engine: self.merge_engine,
+                    deletion_vectors_enabled: CoreOptions::new(self.table.schema().options())
+                        .deletion_vectors_enabled(),
+                },
+                next_seq,
+            )?
+            .with_resources(self.resources.clone()),
+        ))
     }
 }
 

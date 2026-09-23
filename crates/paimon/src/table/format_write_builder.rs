@@ -19,6 +19,7 @@
 
 use super::write_builder::validate_commit_user;
 use super::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
+use crate::resource::ResourceContext;
 use uuid::Uuid;
 
 pub(crate) struct FormatWriteBuilder<'a> {
@@ -49,6 +50,10 @@ impl<'a> FormatWriteBuilder<'a> {
     }
 
     pub(crate) fn with_overwrite(self) -> Self {
+        self
+    }
+
+    pub(crate) fn with_resources(self, _resources: ResourceContext) -> Self {
         self
     }
 
