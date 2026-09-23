@@ -991,7 +991,9 @@ impl DataEvolutionReader {
             let source_parquet_read_budget = if active_source_indices.len() == 1 {
                 parquet_read_budget.clone()
             } else {
-                None
+                parquet_read_budget.as_ref()
+                    .filter(|budget| budget.has_resources())
+                    .map(|budget| Arc::new(budget.without_prefetch()))
             };
             let mut source_streams: Vec<Option<ArrowRecordBatchStream>> = source_plan
                 .sources
@@ -7602,6 +7604,87 @@ mod tests {
             let schema = batch.schema();
             let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             assert_eq!(names, vec!["id"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evolution_multi_source_merge_preserves_memory_admission() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let id_path = bucket_dir.join("id.parquet");
+        write_int_parquet_file(&id_path, vec![("id", vec![1, 2, 3, 4])], Some(2));
+        let value_path = bucket_dir.join("value.parquet");
+        write_int_parquet_file(&value_path, vec![("value", vec![10, 20, 30, 40])], Some(2));
+
+        let table = two_col_evolution_table(table_path);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "id.parquet",
+                    0,
+                    4,
+                    1,
+                    id_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "value.parquet",
+                    0,
+                    4,
+                    2,
+                    value_path.metadata().unwrap().len() as i64,
+                    Some(vec!["value"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        for limit in [None, Some(0), Some(1024 * 1024)] {
+            let resources = limit.map(|limit| {
+                crate::resource::ResourceContext::builder()
+                    .memory_limit(limit)
+                    .build()
+                    .unwrap()
+            });
+            let mut builder = table.new_read_builder();
+            builder.with_parquet_read_budget(Arc::new(ReadBudget::new(2, 1).unwrap()));
+            if let Some(resources) = &resources {
+                builder.with_resources(resources.clone());
+            }
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                builder
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(std::slice::from_ref(&split))
+                    .unwrap()
+                    .try_collect::<Vec<_>>(),
+            )
+            .await
+            .expect("column merges must not wait on shared prefetch permits");
+
+            if limit == Some(0) {
+                assert!(matches!(result, Err(Error::ResourceExhausted { .. })));
+            } else {
+                let batches = result.unwrap();
+                assert_eq!(collect_int_values(&batches, "id"), vec![1, 2, 3, 4]);
+                assert_eq!(collect_int_values(&batches, "value"), vec![10, 20, 30, 40]);
+                if let Some(resources) = &resources {
+                    let peak = resources.metrics().peak_reserved_memory_bytes;
+                    assert!(peak > 0 && peak <= limit.unwrap());
+                }
+            }
+            if let Some(resources) = &resources {
+                assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+            }
         }
     }
 
