@@ -380,10 +380,7 @@ fn response_identifier(
     let database = response
         .database
         .as_deref()
-        .ok_or_else(|| Error::DataInvalid {
-            message: "Table response missing database".to_string(),
-            source: None,
-        })?;
+        .unwrap_or_else(|| requested.database());
     let name = response.name.as_deref().ok_or_else(|| Error::DataInvalid {
         message: format!("Table response for database '{database}' missing name"),
         source: None,

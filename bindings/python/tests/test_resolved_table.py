@@ -234,7 +234,8 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(resolved_source
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        response = {"id": "table-uuid", "database": "db", "name": "t", "path": str(root),
+        # PyPaimon and older REST servers do not include `database`.
+        response = {"id": "table-uuid", "name": "t", "path": str(root),
                     "isExternal": external, "schemaId": schema['id'], "schema": schema}
         table = Table.from_rest_response(json.dumps(response), database='db', table='t', options={
             'uri': 'http://127.0.0.1:%d' % server.server_port,
