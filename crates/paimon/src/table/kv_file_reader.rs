@@ -616,7 +616,9 @@ impl KeyValueFileReader {
                     let group_parquet_read_budget = if input_stream_count == 1 {
                         config.parquet_read_budget.clone()
                     } else {
-                        None
+                        config.parquet_read_budget.as_ref()
+                            .filter(|budget| budget.has_resources())
+                            .map(|budget| Arc::new(budget.without_prefetch()))
                     };
                     let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
 
@@ -2035,43 +2037,70 @@ mod tests {
         let planned = plan_merge_groups(std::slice::from_ref(&split), Some(&comparator), false);
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].len(), 2);
-        let core_options = table.schema().core_options();
-        let reader = KeyValueFileReader::new(
-            table.file_io().clone(),
-            KeyValueReadConfig {
-                table_name: table.identifier().full_name(),
-                table_options: table.schema().options().clone(),
-                schema_manager: table.schema_manager().clone(),
-                table_schema_id: table.schema().id(),
-                table_fields: table.schema().fields().to_vec(),
-                read_type: table.schema().fields().to_vec(),
-                predicates: Vec::new(),
-                primary_keys: table.schema().trimmed_primary_keys(),
-                table_primary_keys: table.schema().primary_keys().to_vec(),
-                merge_engine: core_options.merge_engine().unwrap(),
-                sequence_fields: Vec::new(),
-                read_batch_size: core_options.read_batch_size().unwrap(),
-                merge_splits: false,
-                max_merge_input_streams: None,
-                parquet_read_budget: Some(Arc::new(ReadBudget::new(2, 256 << 20).unwrap())),
-                mosaic_prefetch: MosaicPrefetchOptions::default(),
-            },
-        );
-        let batches = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            reader
-                .read(std::slice::from_ref(split.as_ref()))
-                .unwrap()
-                .try_collect::<Vec<_>>(),
-        )
-        .await
-        .expect("multiple sorted-run inputs must not deadlock on shared Parquet permits")
-        .unwrap();
+        for limit in [None, Some(0), Some(1024 * 1024)] {
+            let core_options = table.schema().core_options();
+            let budget = ReadBudget::new(2, 256 << 20).unwrap();
+            let resources = limit.map(|limit| {
+                crate::resource::ResourceContext::builder()
+                    .memory_limit(limit)
+                    .build()
+                    .unwrap()
+            });
+            let budget = match &resources {
+                Some(resources) => budget.with_resources(resources.clone()),
+                None => budget,
+            };
+            let reader = KeyValueFileReader::new(
+                table.file_io().clone(),
+                KeyValueReadConfig {
+                    table_name: table.identifier().full_name(),
+                    table_options: table.schema().options().clone(),
+                    schema_manager: table.schema_manager().clone(),
+                    table_schema_id: table.schema().id(),
+                    table_fields: table.schema().fields().to_vec(),
+                    read_type: table.schema().fields().to_vec(),
+                    predicates: Vec::new(),
+                    primary_keys: table.schema().trimmed_primary_keys(),
+                    table_primary_keys: table.schema().primary_keys().to_vec(),
+                    merge_engine: core_options.merge_engine().unwrap(),
+                    sequence_fields: Vec::new(),
+                    read_batch_size: core_options.read_batch_size().unwrap(),
+                    merge_splits: false,
+                    max_merge_input_streams: None,
+                    parquet_read_budget: Some(Arc::new(budget)),
+                    mosaic_prefetch: MosaicPrefetchOptions::default(),
+                },
+            );
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader
+                    .read(std::slice::from_ref(split.as_ref()))
+                    .unwrap()
+                    .try_collect::<Vec<_>>(),
+            )
+            .await
+            .expect("multiple sorted-run inputs must not deadlock on shared Parquet permits");
+            if limit == Some(0) {
+                assert!(matches!(
+                    result,
+                    Err(crate::Error::ResourceExhausted { .. })
+                ));
+            } else {
+                let batches = result.unwrap();
 
-        assert_eq!(
-            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            128
-        );
+                assert_eq!(
+                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    128
+                );
+                drop(batches);
+                if let Some(resources) = &resources {
+                    assert!(resources.metrics().peak_reserved_memory_bytes > 0);
+                }
+            }
+            if let Some(resources) = resources {
+                assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+            }
+        }
     }
 
     #[tokio::test]

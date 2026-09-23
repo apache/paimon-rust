@@ -109,7 +109,11 @@ pub struct SQLContext {
 ///
 /// The builder preserves Paimon's session configuration while allowing callers
 /// to customize DataFusion runtime resources such as memory pools, temporary
-/// directories, and object store registries.
+/// directories, and object store registries. Parquet scans reserve projected
+/// row-group working estimates from the execution's memory pool. These readers
+/// cannot spill; supported downstream DataFusion operators may spill their state.
+/// Output batches are accounted by consumers that retain them, not by the reader.
+/// The pool does not cover every allocation or bound process RSS.
 ///
 /// # Example
 ///

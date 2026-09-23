@@ -26,6 +26,7 @@ use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::ReadBudget;
+use crate::resource::ResourceContext;
 use crate::spec::{
     BigIntType, CoreOptions, DataField, DataType, MergeEngine, Predicate, TinyIntType,
     ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
@@ -131,6 +132,18 @@ impl<'a> TableRead<'a> {
             TableReadKind::Paimon(read) => read.table(),
             TableReadKind::Format(read) => read.table(),
         }
+    }
+
+    /// Share Parquet working-memory reservations with other consumers.
+    ///
+    /// Callers account for output batches they retain. Budget exhaustion is a
+    /// terminal stream error. See [`ResourceContext`] for the accounting scope.
+    pub fn with_resources(mut self, resources: ResourceContext) -> Self {
+        match &mut self.0 {
+            TableReadKind::Paimon(read) => read.resources = Some(resources),
+            TableReadKind::Format(read) => read.with_resources(resources),
+        }
+        self
     }
 
     /// Set a filter predicate.
@@ -287,6 +300,7 @@ struct PaimonTableRead<'a> {
     data_predicates: Vec<Predicate>,
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
+    resources: Option<ResourceContext>,
     data_file_read_timing: Option<Arc<DataFileReadTiming>>,
     blob_parallelism: usize,
     limit: Option<usize>,
@@ -305,6 +319,7 @@ impl<'a> PaimonTableRead<'a> {
             data_predicates,
             row_filter_factory: None,
             parquet_read_budget: None,
+            resources: None,
             data_file_read_timing: None,
             blob_parallelism: DEFAULT_BLOB_READ_PARALLELISM,
             limit: None,
@@ -362,10 +377,14 @@ impl<'a> PaimonTableRead<'a> {
     }
 
     fn parquet_read_budget(&self) -> crate::Result<Arc<ReadBudget>> {
-        match &self.parquet_read_budget {
-            Some(budget) => Ok(Arc::clone(budget)),
-            None => configured_parquet_read_budget(self.table),
-        }
+        let budget = match &self.parquet_read_budget {
+            Some(budget) => Arc::clone(budget),
+            None => configured_parquet_read_budget(self.table)?,
+        };
+        Ok(match &self.resources {
+            Some(resources) => Arc::new(budget.with_resources(resources.clone())),
+            None => budget,
+        })
     }
 
     /// Returns an [`ArrowRecordBatchStream`] for an incremental scan plan.
@@ -808,6 +827,10 @@ impl<'a> PaimonTableRead<'a> {
                 });
             }
         }
+        let budget = self.parquet_read_budget()?;
+        let parquet_read_budget = budget
+            .has_resources()
+            .then(|| Arc::new(budget.without_prefetch()));
         let reader = KeyValueFileReader::new(
             self.table.file_io.clone(),
             KeyValueReadConfig {
@@ -829,10 +852,9 @@ impl<'a> PaimonTableRead<'a> {
                 read_batch_size: core_options.read_batch_size()?,
                 merge_splits: true,
                 max_merge_input_streams: Some(MAX_MERGE_INPUT_STREAMS),
-                // Diff primes the before and after streams in sequence. Keeping
-                // a row-group permit across yielded batches can otherwise let
-                // the first side block the second side indefinitely.
-                parquet_read_budget: None,
+                // Diff advances before/after in lockstep. Disable prefetch so
+                // neither side waits on shared slots, but keep memory admission.
+                parquet_read_budget,
                 mosaic_prefetch: configured_mosaic_prefetch(self.table)?,
             },
         );

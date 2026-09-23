@@ -19,5 +19,10 @@ use datafusion::common::error::GenericError;
 
 /// Converts a Paimon error into a DataFusion error.
 pub fn to_datafusion_error(error: paimon::Error) -> datafusion::error::DataFusionError {
-    datafusion::error::DataFusionError::External(GenericError::from(error))
+    match error {
+        paimon::Error::ResourceExhausted { message } => {
+            datafusion::error::DataFusionError::ResourcesExhausted(message)
+        }
+        other => datafusion::error::DataFusionError::External(GenericError::from(other)),
+    }
 }

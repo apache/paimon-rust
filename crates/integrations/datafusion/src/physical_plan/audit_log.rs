@@ -62,9 +62,9 @@ impl ExecutionPlan for PaimonAuditLogScan {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        self.inner.execute_with(partition, |read, splits| {
+        self.inner.execute_with(partition, context, |read, splits| {
             AuditLogRead::new(read)?.to_arrow(splits)
         })
     }
