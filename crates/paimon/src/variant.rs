@@ -1103,6 +1103,20 @@ fn get_decimal(value: &[u8], pos: usize) -> Result<VariantDecimal> {
     })
 }
 
+/// A non-finite float/double serializes as a quoted `"Infinity"` /
+/// `"-Infinity"` / `"NaN"` token, matching Java `GenericVariant.toJson`
+/// (`appendQuoted(sb, Double.toString(d))`). Rust's `to_string` would emit a
+/// bare `inf`/`NaN`, which is not valid JSON and breaks any downstream parser.
+fn non_finite_json_token(d: f64) -> &'static str {
+    if d.is_nan() {
+        "\"NaN\""
+    } else if d > 0.0 {
+        "\"Infinity\""
+    } else {
+        "\"-Infinity\""
+    }
+}
+
 fn write_json(value: &[u8], metadata: &[u8], pos: usize, out: &mut String) -> Result<()> {
     match value_kind(value, pos)? {
         VariantKind::Object => {
@@ -1160,9 +1174,23 @@ fn write_json(value: &[u8], metadata: &[u8], pos: usize, out: &mut String) -> Re
                 source: Some(Box::new(e)),
             })?,
         ),
-        VariantKind::Double => out.push_str(&get_double(value, pos)?.to_string()),
+        VariantKind::Double => {
+            let d = get_double(value, pos)?;
+            if d.is_finite() {
+                out.push_str(&d.to_string());
+            } else {
+                out.push_str(non_finite_json_token(d));
+            }
+        }
         VariantKind::Decimal => out.push_str(&get_decimal(value, pos)?.to_plain_string()),
-        VariantKind::Float => out.push_str(&get_float(value, pos)?.to_string()),
+        VariantKind::Float => {
+            let f = get_float(value, pos)?;
+            if f.is_finite() {
+                out.push_str(&f.to_string());
+            } else {
+                out.push_str(non_finite_json_token(f as f64));
+            }
+        }
         VariantKind::Binary => {
             let encoded = general_purpose::STANDARD.encode(get_binary(value, pos)?);
             out.push_str(
@@ -3411,6 +3439,21 @@ mod tests {
                 .unwrap(),
             "2"
         );
+    }
+
+    #[test]
+    fn to_json_quotes_non_finite_floats_like_java() {
+        // A non-finite double/float must serialize as a quoted "Infinity" /
+        // "-Infinity" / "NaN" token, matching Java `GenericVariant.toJson`
+        // (`appendQuoted(sb, Double.toString(d))`). A bare `inf`/`NaN` from
+        // Rust's `to_string` is invalid JSON that breaks any downstream parser.
+        let pos_inf = GenericVariant::parse_json("1e400").unwrap();
+        assert_eq!(pos_inf.to_json().unwrap(), r#""Infinity""#);
+        let neg_inf = GenericVariant::parse_json("-1e400").unwrap();
+        assert_eq!(neg_inf.to_json().unwrap(), r#""-Infinity""#);
+        // Finite values are unchanged (still bare JSON numbers).
+        let finite = GenericVariant::parse_json("1.5").unwrap();
+        assert_eq!(finite.to_json().unwrap(), "1.5");
     }
 
     #[test]
