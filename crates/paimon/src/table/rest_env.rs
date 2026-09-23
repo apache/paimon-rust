@@ -39,6 +39,8 @@ impl Table {
         options: Options,
     ) -> Result<Self> {
         identifier.validate()?;
+        // Reject a stale or misrouted response before initializing auth or local-cache resources.
+        response_identifier(&identifier, &response)?;
         options
             .get(CatalogOptions::WAREHOUSE)
             .ok_or_else(|| RestError::BadRequest {

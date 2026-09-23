@@ -259,11 +259,10 @@ def test_resolved_rest_response_rejects_identity_mismatch(resolved_source, datab
     root, schema = resolved_source
     response = {"id": "table-uuid", "database": "db", "name": "t", "path": str(root),
                 "isExternal": True, "schemaId": schema["id"], "schema": schema}
+    # Identity validation must run before REST auth/cache initialization.
     with pytest.raises(ValueError, match="does not match requested identifier"):
-        Table.from_rest_response(json.dumps(response), database=database, table=table, options={
-            "uri": "http://127.0.0.1:1", "warehouse": "test",
-            "token.provider": "bear", "token": "test-token",
-        })
+        Table.from_rest_response(
+            json.dumps(response), database=database, table=table, options={})
 
 
 @pytest.mark.parametrize(("change", "message"), [
