@@ -17,6 +17,7 @@
 
 use super::postpone_bucket_plan::data_invalid;
 use super::postpone_fixed_bucket_router::validate_postpone_fixed_bucket_table;
+use crate::resource::ResourceContext;
 use crate::table::write_builder::{ensure_table_write_allowed, validate_commit_user};
 use crate::table::{
     PostponeBucketPlan, PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite, Table,
@@ -29,6 +30,7 @@ pub struct PostponeFixedBucketWriteBuilder<'a> {
     commit_user: String,
     overwrite: bool,
     bucket_plan: Option<PostponeBucketPlan>,
+    resources: Option<ResourceContext>,
 }
 
 impl<'a> PostponeFixedBucketWriteBuilder<'a> {
@@ -39,6 +41,7 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
             commit_user: Uuid::new_v4().to_string(),
             overwrite: false,
             bucket_plan: None,
+            resources: None,
         })
     }
 
@@ -63,6 +66,11 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
         self
     }
 
+    pub fn with_resources(mut self, resources: ResourceContext) -> Self {
+        self.resources = Some(resources);
+        self
+    }
+
     pub fn new_commit(&self) -> PostponeFixedBucketTableCommit {
         PostponeFixedBucketTableCommit::new(self.table, self.commit_user.clone(), self.overwrite)
     }
@@ -83,6 +91,7 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
             self.commit_user.clone(),
             plan,
             self.overwrite,
+            self.resources.clone(),
         )
     }
 }

@@ -114,6 +114,12 @@ pub(crate) trait FormatFileWriter: Send {
     /// Number of bytes buffered in the current row group (not yet flushed).
     fn in_progress_size(&self) -> usize;
 
+    /// Whether this writer still retains batch data. This can differ from
+    /// `in_progress_size` while a format is inferring its physical schema.
+    fn retains_batch_data(&self) -> bool {
+        self.in_progress_size() != 0
+    }
+
     /// Flush the current row group to storage without closing the file.
     async fn flush(&mut self) -> crate::Result<()>;
 
@@ -135,6 +141,68 @@ pub(crate) trait FormatFileWriter: Send {
 
     /// Flush and close the writer, finalizing the file on storage.
     async fn close(self: Box<Self>) -> crate::Result<FormatWriteResult>;
+}
+
+/// Account for batches retained by a format writer until its next flush.
+/// The charge is an estimate of input Arrow buffers, not encoded allocations.
+pub(crate) fn with_write_resources(
+    writer: Box<dyn FormatFileWriter>,
+    resources: Option<&crate::resource::ResourceContext>,
+) -> Box<dyn FormatFileWriter> {
+    match resources {
+        Some(resources) => Box::new(ResourceFormatWriter {
+            inner: writer,
+            reservation: resources.reservation(),
+        }),
+        None => writer,
+    }
+}
+
+struct ResourceFormatWriter {
+    inner: Box<dyn FormatFileWriter>,
+    reservation: crate::resource::MemoryReservation,
+}
+
+#[async_trait]
+impl FormatFileWriter for ResourceFormatWriter {
+    async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
+        self.reservation.try_grow(batch.get_array_memory_size())?;
+        self.inner.write(batch).await?;
+        if !self.inner.retains_batch_data() {
+            self.reservation.try_resize(0)?;
+        }
+        Ok(())
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.inner.num_bytes()
+    }
+
+    fn in_progress_size(&self) -> usize {
+        self.inner.in_progress_size()
+    }
+
+    async fn flush(&mut self) -> crate::Result<()> {
+        self.inner.flush().await?;
+        if !self.inner.retains_batch_data() {
+            self.reservation.try_resize(0)?;
+        }
+        Ok(())
+    }
+
+    fn commit_field_metadata(
+        &mut self,
+        metadata: &crate::arrow::shredding::FieldMetadata,
+    ) -> crate::Result<()> {
+        self.inner.commit_field_metadata(metadata)
+    }
+
+    async fn close(self: Box<Self>) -> crate::Result<FormatWriteResult> {
+        let Self { inner, reservation } = *self;
+        let result = inner.close().await;
+        drop(reservation);
+        result
+    }
 }
 
 pub(crate) struct FormatWriteResult {

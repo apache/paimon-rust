@@ -20,6 +20,7 @@
 //! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
 
 use super::format_write_builder::FormatWriteBuilder;
+use crate::resource::ResourceContext;
 use crate::table::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
 use uuid::Uuid;
 
@@ -75,6 +76,18 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
+    /// Share a memory budget across table writers created by `new_write`.
+    pub fn with_resources(self, resources: ResourceContext) -> Self {
+        match self.0 {
+            WriteBuilderKind::Paimon(builder) => {
+                Self(WriteBuilderKind::Paimon(builder.with_resources(resources)))
+            }
+            WriteBuilderKind::Format(builder) => {
+                Self(WriteBuilderKind::Format(builder.with_resources(resources)))
+            }
+        }
+    }
+
     /// Create a new TableCommit for committing write results.
     pub fn new_commit(&self) -> TableCommit {
         match &self.0 {
@@ -120,6 +133,7 @@ struct PaimonWriteBuilder<'a> {
     table: &'a Table,
     commit_user: String,
     overwrite: bool,
+    resources: Option<ResourceContext>,
 }
 
 impl<'a> PaimonWriteBuilder<'a> {
@@ -128,6 +142,7 @@ impl<'a> PaimonWriteBuilder<'a> {
             table,
             commit_user: Uuid::new_v4().to_string(),
             overwrite: false,
+            resources: None,
         }
     }
 
@@ -159,6 +174,11 @@ impl<'a> PaimonWriteBuilder<'a> {
         self
     }
 
+    pub fn with_resources(mut self, resources: ResourceContext) -> Self {
+        self.resources = Some(resources);
+        self
+    }
+
     /// Create a new TableCommit for committing write results.
     pub fn new_commit(&self) -> TableCommit {
         TableCommit::new(self.table.clone(), self.commit_user.clone())
@@ -179,7 +199,10 @@ impl<'a> PaimonWriteBuilder<'a> {
     /// when the first writer for that partition is created.
     pub fn new_write(&self) -> crate::Result<TableWrite> {
         ensure_table_write_allowed(self.table)?;
-        let write = TableWrite::new(self.table, self.commit_user.clone())?;
+        let mut write = TableWrite::new(self.table, self.commit_user.clone())?;
+        if let Some(resources) = &self.resources {
+            write = write.with_resources(resources.clone());
+        }
         Ok(if self.overwrite {
             write.with_overwrite()
         } else {

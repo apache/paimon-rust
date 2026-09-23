@@ -25,7 +25,7 @@ use crate::{Error, Result};
 /// Calls may run concurrently on any runtime thread. Failed reservations must
 /// leave the pool unchanged. Methods must not panic; `release` is infallible and
 /// may run during unwinding. The pool must not wait for, or call back into, a
-/// reader to free memory. Reclamation belongs to the consumer, outside the pool.
+/// consumer to free memory. Reclamation belongs to the consumer, outside the pool.
 pub trait MemoryPool: std::fmt::Debug + Send + Sync + 'static {
     fn try_reserve(&self, bytes: usize) -> Result<()>;
     fn release(&self, bytes: usize);

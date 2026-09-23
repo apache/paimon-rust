@@ -24,8 +24,9 @@
 //!
 //! Reference: [PostponeBucketWriter](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/sink/PostponeBucketWriter.java)
 
-use crate::arrow::format::{create_format_writer, FormatFileWriter};
+use crate::arrow::format::{create_format_writer, with_write_resources, FormatFileWriter};
 use crate::io::FileIO;
+use crate::resource::ResourceContext;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{bucket_path_under, DataFileMeta, EMPTY_SERIALIZED_ROW, VALUE_KIND_FIELD_NAME};
 use crate::table::kv_file_writer::build_physical_schema;
@@ -70,6 +71,7 @@ pub(crate) struct PostponeFileWriter {
     created_paths: Vec<String>,
     /// Background file close tasks spawned during rolling.
     in_flight_closes: JoinSet<Result<DataFileMeta>>,
+    resources: Option<ResourceContext>,
 }
 
 impl PostponeFileWriter {
@@ -86,7 +88,13 @@ impl PostponeFileWriter {
             written_files: Vec::new(),
             created_paths: Vec::new(),
             in_flight_closes: JoinSet::new(),
+            resources: None,
         }
+    }
+
+    pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
+        self.resources = resources;
+        self
     }
 
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -101,7 +109,6 @@ impl PostponeFileWriter {
         let num_rows = batch.num_rows();
         let start_seq = self.next_sequence_number;
         let end_seq = start_seq + num_rows as i64 - 1;
-        self.next_sequence_number = end_seq + 1;
 
         // Build physical batch: [_SEQUENCE_NUMBER, _VALUE_KIND, all_user_cols...]
         let mut physical_columns: Vec<Arc<dyn arrow_array::Array>> = Vec::new();
@@ -134,12 +141,13 @@ impl PostponeFileWriter {
                 }
             })?;
 
-        self.current_row_count += num_rows as i64;
         self.current_writer
             .as_mut()
             .unwrap()
             .write(&physical_batch)
             .await?;
+        self.next_sequence_number = end_seq + 1;
+        self.current_row_count += num_rows as i64;
 
         // Roll to a new file if target size is reached — close in background
         if self.current_writer.as_ref().unwrap().num_bytes() as i64 >= self.config.target_file_size
@@ -240,7 +248,7 @@ impl PostponeFileWriter {
             None,
         )
         .await?;
-        self.current_writer = Some(writer);
+        self.current_writer = Some(with_write_resources(writer, self.resources.as_ref()));
         self.current_file_name = Some(file_name);
         self.current_row_count = 0;
         self.current_file_start_seq = self.next_sequence_number;

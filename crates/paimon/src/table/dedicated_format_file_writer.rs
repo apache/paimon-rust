@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::io::FileIO;
+use crate::resource::ResourceContext;
 use crate::spec::{BlobViewStruct, DataField, DataFileMeta, DataType};
 use crate::table::data_file_writer::DataFileWriter;
 use crate::Result;
@@ -198,6 +199,17 @@ impl AppendDedicatedFormatFileWriter {
                 .map(|(idx, field)| (idx, field.name().to_string()))
                 .collect(),
         }
+    }
+
+    pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
+        self.normal_writer.set_resources(resources.clone());
+        for blob in &mut self.blob_writers {
+            blob.writer.set_resources(resources.clone());
+        }
+        if let Some(vector) = &mut self.vector_writer {
+            vector.writer.set_resources(resources);
+        }
+        self
     }
 
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {

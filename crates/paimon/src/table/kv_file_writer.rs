@@ -27,8 +27,9 @@
 //! Reference: [org.apache.paimon.io.KeyValueDataFileWriterImpl](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/io/KeyValueDataFileWriterImpl.java)
 
 use crate::arrow::arrow_fields_to_paimon;
-use crate::arrow::format::create_format_writer;
+use crate::arrow::format::{create_format_writer, with_write_resources};
 use crate::io::FileIO;
+use crate::resource::{MemoryReservation, ResourceContext};
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
     bucket_path_under, extract_datum_from_arrow, AggregationConfig, BinaryRowBuilder, CoreOptions,
@@ -58,6 +59,8 @@ pub(crate) struct KeyValueFileWriter {
     buffer: Vec<RecordBatch>,
     /// Approximate buffered bytes.
     buffer_bytes: usize,
+    resources: Option<ResourceContext>,
+    buffer_reservation: Option<MemoryReservation>,
     /// Completed file metadata.
     written_files: Vec<DataFileMeta>,
     /// Completed changelog file metadata.
@@ -147,9 +150,17 @@ impl KeyValueFileWriter {
             next_sequence_number,
             buffer: Vec::new(),
             buffer_bytes: 0,
+            resources: None,
+            buffer_reservation: None,
             written_files: Vec::new(),
             written_changelog_files: Vec::new(),
         })
+    }
+
+    pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
+        self.buffer_reservation = resources.as_ref().map(ResourceContext::reservation);
+        self.resources = resources;
+        self
     }
 
     /// Buffer a RecordBatch. Flushes when buffer exceeds write_buffer_size.
@@ -170,6 +181,9 @@ impl KeyValueFileWriter {
             .iter()
             .map(|c| c.get_buffer_memory_size())
             .sum();
+        if let Some(reservation) = &mut self.buffer_reservation {
+            reservation.try_grow(batch_bytes)?;
+        }
         self.buffer.push(batch);
         self.buffer_bytes += batch_bytes;
 
@@ -194,6 +208,8 @@ impl KeyValueFileWriter {
 
         let batches = std::mem::take(&mut self.buffer);
         self.buffer_bytes = 0;
+        let _buffer_reservation = self.buffer_reservation.take();
+        self.buffer_reservation = self.resources.as_ref().map(ResourceContext::reservation);
 
         // Concatenate all buffered batches, then immediately free the originals.
         let user_schema = batches[0].schema();
@@ -416,7 +432,7 @@ impl KeyValueFileWriter {
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
         let file_path = format!("{bucket_dir}/{file_name}");
         let output = self.file_io.new_output(&file_path)?;
-        let mut writer = create_format_writer(
+        let writer = create_format_writer(
             &output,
             physical_schema.clone(),
             write.file_compression,
@@ -426,6 +442,7 @@ impl KeyValueFileWriter {
             None,
         )
         .await?;
+        let mut writer = with_write_resources(writer, self.resources.as_ref());
 
         let vk_idx = batch
             .schema()
@@ -484,7 +501,11 @@ impl KeyValueFileWriter {
                     message: format!("Failed to create physical batch: {e}"),
                     source: None,
                 })?;
-            writer.write(&chunk_batch).await?;
+            if let Err(error) = writer.write(&chunk_batch).await {
+                let _ = writer.close().await;
+                let _ = self.file_io.delete_file(&file_path).await;
+                return Err(error);
+            }
         }
 
         let file_size = writer.close().await?.file_size as i64;
@@ -893,6 +914,9 @@ impl KeyValueFileWriter {
     pub(crate) async fn abort(&mut self) {
         self.buffer.clear();
         self.buffer_bytes = 0;
+        if let Some(reservation) = &mut self.buffer_reservation {
+            let _ = reservation.try_resize(0);
+        }
         let bucket_path = bucket_path_under(
             &self.config.table_location,
             &self.config.partition_path,

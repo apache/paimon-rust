@@ -350,6 +350,16 @@ impl FormatFileWriter for ShreddingFormatWriter {
         }
     }
 
+    fn retains_batch_data(&self) -> bool {
+        match &self.state {
+            ShreddingWriterState::Ready { inner, .. } => inner.retains_batch_data(),
+            ShreddingWriterState::Infer {
+                buffered_batches, ..
+            } => !buffered_batches.is_empty(),
+            ShreddingWriterState::Closed => false,
+        }
+    }
+
     async fn flush(&mut self) -> crate::Result<()> {
         self.finalize_inferred_writer().await?;
         match &mut self.state {
@@ -384,7 +394,12 @@ impl FormatFileWriter for ShreddingFormatWriter {
 mod tests {
     use super::*;
     use crate::arrow::build_target_arrow_schema;
+    use crate::arrow::format::with_write_resources;
+    use crate::resource::ResourceContext;
     use crate::spec::{DataType, IntType, MapType, VarCharType, VariantType};
+    use arrow_array::Int32Array;
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema};
+    use std::sync::Arc;
 
     /// Factory that must never be reached: these tests only exercise plan
     /// detection, which fails before any writer is created.
@@ -410,6 +425,38 @@ mod tests {
                 DataType::Int(IntType::new()),
             )),
         )
+    }
+
+    #[tokio::test]
+    async fn inference_buffer_is_charged_without_triggering_row_group_flush() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
+                .unwrap();
+        let writer = ShreddingFormatWriter {
+            state: ShreddingWriterState::Infer {
+                writer_factory: Some(Box::new(NoopWriterFactory)),
+                schema,
+                logical_write_fields: vec![],
+                format_options: HashMap::new(),
+                buffered_batches: vec![],
+                buffered_row_count: 0,
+                infer_buffer_row_count: 10,
+                plan_builder: InferPlanBuilder::Variant,
+            },
+            compression: "zstd".to_string(),
+        };
+        let resources = ResourceContext::builder().build().unwrap();
+        let mut writer = with_write_resources(Box::new(writer), Some(&resources));
+        writer.write(&batch).await.unwrap();
+        assert_eq!(writer.in_progress_size(), 0);
+        assert!(resources.metrics().reserved_memory_bytes > 0);
+        drop(writer);
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
     }
 
     /// Mirroring Java's `ShreddingWritePlanWriterFactories`: at most one
