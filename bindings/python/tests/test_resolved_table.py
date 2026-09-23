@@ -234,7 +234,7 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(resolved_source
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        response = {"id": "table-uuid", "name": "t", "path": str(root),
+        response = {"id": "table-uuid", "database": "db", "name": "t", "path": str(root),
                     "isExternal": external, "schemaId": schema['id'], "schema": schema}
         table = Table.from_rest_response(json.dumps(response), database='db', table='t', options={
             'uri': 'http://127.0.0.1:%d' % server.server_port,
@@ -253,15 +253,16 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(resolved_source
         thread.join()
 
 
-def test_resolved_rest_response_uses_response_name(resolved_source):
+@pytest.mark.parametrize(("database", "table"), [("db", "wrong"), ("wrong", "t")])
+def test_resolved_rest_response_rejects_identity_mismatch(resolved_source, database, table):
     root, schema = resolved_source
-    response = {"id": "table-uuid", "name": "t", "path": str(root),
+    response = {"id": "table-uuid", "database": "db", "name": "t", "path": str(root),
                 "isExternal": True, "schemaId": schema["id"], "schema": schema}
-    table = Table.from_rest_response(json.dumps(response), database="db", table="wrong", options={
-        "uri": "http://127.0.0.1:1", "warehouse": "test",
-        "token.provider": "bear", "token": "test-token",
-    })
-    assert table.identifier() == "db.t"
+    with pytest.raises(ValueError, match="does not match requested identifier"):
+        Table.from_rest_response(json.dumps(response), database=database, table=table, options={
+            "uri": "http://127.0.0.1:1", "warehouse": "test",
+            "token.provider": "bear", "token": "test-token",
+        })
 
 
 @pytest.mark.parametrize(("change", "message"), [
@@ -277,7 +278,7 @@ def test_resolved_rest_response_validates_schema_structure(resolved_source, chan
         schema["primaryKeys"] = ["missing"]
     else:
         schema["partitionKeys"] = ["missing"]
-    response = {"id": "table-uuid", "name": "t", "path": str(root),
+    response = {"id": "table-uuid", "database": "db", "name": "t", "path": str(root),
                 "isExternal": True, "schemaId": schema["id"], "schema": schema}
     with pytest.raises(ValueError, match=message):
         Table.from_rest_response(json.dumps(response), database="db", table="t", options={

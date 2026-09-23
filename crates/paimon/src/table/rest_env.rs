@@ -377,15 +377,29 @@ fn response_identifier(
     requested: &Identifier,
     response: &crate::api::GetTableResponse,
 ) -> Result<Identifier> {
+    let database = response
+        .database
+        .as_deref()
+        .ok_or_else(|| Error::DataInvalid {
+            message: "Table response missing database".to_string(),
+            source: None,
+        })?;
     let name = response.name.as_deref().ok_or_else(|| Error::DataInvalid {
-        message: format!(
-            "Table response for database '{}' missing name",
-            requested.database()
-        ),
+        message: format!("Table response for database '{database}' missing name"),
         source: None,
     })?;
-    let identifier = Identifier::new(requested.database(), name);
+    let identifier = Identifier::new(database, name);
     identifier.validate()?;
+    if &identifier != requested {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Table response identifier '{}' does not match requested identifier '{}'",
+                identifier.full_name(),
+                requested.full_name()
+            ),
+            source: None,
+        });
+    }
     Ok(identifier)
 }
 
