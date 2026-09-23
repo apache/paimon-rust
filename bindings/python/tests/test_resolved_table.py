@@ -253,6 +253,39 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(resolved_source
         thread.join()
 
 
+def test_resolved_rest_response_uses_response_name(resolved_source):
+    root, schema = resolved_source
+    response = {"id": "table-uuid", "name": "t", "path": str(root),
+                "isExternal": True, "schemaId": schema["id"], "schema": schema}
+    table = Table.from_rest_response(json.dumps(response), database="db", table="wrong", options={
+        "uri": "http://127.0.0.1:1", "warehouse": "test",
+        "token.provider": "bear", "token": "test-token",
+    })
+    assert table.identifier() == "db.t"
+
+
+@pytest.mark.parametrize(("change", "message"), [
+    ("duplicate_id", "duplicate field id"),
+    ("missing_primary_key", "primary key"),
+    ("missing_partition_key", "partition fields"),
+])
+def test_resolved_rest_response_validates_schema_structure(resolved_source, change, message):
+    root, schema = resolved_source
+    if change == "duplicate_id":
+        schema["fields"][1]["id"] = schema["fields"][0]["id"]
+    elif change == "missing_primary_key":
+        schema["primaryKeys"] = ["missing"]
+    else:
+        schema["partitionKeys"] = ["missing"]
+    response = {"id": "table-uuid", "name": "t", "path": str(root),
+                "isExternal": True, "schemaId": schema["id"], "schema": schema}
+    with pytest.raises(ValueError, match=message):
+        Table.from_rest_response(json.dumps(response), database="db", table="t", options={
+            "uri": "http://127.0.0.1:1", "warehouse": "test",
+            "token.provider": "bear", "token": "test-token",
+        })
+
+
 @pytest.mark.parametrize('response', ['{', '{}'])
 def test_resolved_rest_response_rejects_missing_metadata(response):
     with pytest.raises(ValueError):

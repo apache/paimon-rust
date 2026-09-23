@@ -171,6 +171,7 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
     ) -> Result<Table> {
+        let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
             message: format!("Table {} response missing schema", identifier.full_name()),
             source: None,
@@ -208,6 +209,7 @@ impl RESTEnv {
                 table_path.clone(),
             )]));
         }
+        table_schema.validate_resolved_structure()?;
 
         let is_external = response.is_external.ok_or_else(|| Error::DataInvalid {
             message: format!(
@@ -216,7 +218,7 @@ impl RESTEnv {
             ),
             source: None,
         })?;
-        validate_catalog_managed_format_table(identifier, &table_schema, is_external)?;
+        validate_catalog_managed_format_table(&identifier, &table_schema, is_external)?;
 
         let uuid = response.id.ok_or_else(|| Error::DataInvalid {
             message: format!(
@@ -227,7 +229,7 @@ impl RESTEnv {
         })?;
 
         let file_io = Self::build_file_io(
-            identifier,
+            &identifier,
             &table_path,
             api.clone(),
             &options,
@@ -248,7 +250,7 @@ impl RESTEnv {
 
         Ok(Table::new(
             file_io,
-            identifier.clone(),
+            identifier,
             table_path,
             table_schema,
             Some(rest_env),
@@ -263,6 +265,7 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
     ) -> Result<ObjectTable> {
+        let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
             message: format!("Table {} response missing schema", identifier.full_name()),
             source: None,
@@ -288,6 +291,7 @@ impl RESTEnv {
         let mut schema_options = schema.options().clone();
         schema_options.insert(PATH_OPTION.to_string(), object_path.clone());
         let table_schema = TableSchema::new(schema_id, &schema).copy_with_options(schema_options);
+        table_schema.validate_resolved_structure()?;
         let is_external = response.is_external.ok_or_else(|| Error::DataInvalid {
             message: format!(
                 "Table {} response missing is_external",
@@ -297,7 +301,7 @@ impl RESTEnv {
         })?;
 
         let file_io = Self::build_file_io(
-            identifier,
+            &identifier,
             &object_path,
             api,
             &options,
@@ -307,7 +311,7 @@ impl RESTEnv {
         )
         .await?;
 
-        ObjectTable::try_new(file_io, identifier.clone(), &table_schema)
+        ObjectTable::try_new(file_io, identifier, &table_schema)
     }
 
     async fn build_file_io(
@@ -367,6 +371,22 @@ impl RESTEnv {
             self.uuid.clone(),
         ))
     }
+}
+
+fn response_identifier(
+    requested: &Identifier,
+    response: &crate::api::GetTableResponse,
+) -> Result<Identifier> {
+    let name = response.name.as_deref().ok_or_else(|| Error::DataInvalid {
+        message: format!(
+            "Table response for database '{}' missing name",
+            requested.database()
+        ),
+        source: None,
+    })?;
+    let identifier = Identifier::new(requested.database(), name);
+    identifier.validate()?;
+    Ok(identifier)
 }
 
 /// Refuse a Format Table that asks for catalog-managed partitions it cannot have: an engine
