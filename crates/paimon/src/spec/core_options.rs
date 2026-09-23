@@ -1627,7 +1627,7 @@ impl<'a> CoreOptions<'a> {
 /// local timestamp (whose seconds are optional). It truncates to milliseconds
 /// and resolves the date/time in the process's default time zone.
 fn parse_scan_timestamp(value: &str, zone: &impl chrono::TimeZone) -> crate::Result<i64> {
-    use chrono::{Days, NaiveDate, NaiveDateTime, Offset, TimeZone, Timelike};
+    use chrono::{Days, LocalResult, NaiveDate, NaiveDateTime, Offset, TimeZone, Timelike};
 
     let datetime = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
@@ -1652,9 +1652,15 @@ fn parse_scan_timestamp(value: &str, zone: &impl chrono::TimeZone) -> crate::Res
             source: None,
         });
     }
-    // LocalDateTime.atZone chooses the earlier instant during an overlap.
-    if let Some(timestamp) = zone.from_local_datetime(&datetime).earliest() {
-        return Ok(timestamp.timestamp_millis());
+    // LocalDateTime.atZone chooses the earlier UTC instant during an overlap.
+    // Chrono's LocalResult candidates are not necessarily ordered by instant
+    // (notably for chrono::Local on some platforms), so compare explicitly.
+    match zone.from_local_datetime(&datetime) {
+        LocalResult::Single(timestamp) => return Ok(timestamp.timestamp_millis()),
+        LocalResult::Ambiguous(first, second) => {
+            return Ok(first.timestamp_millis().min(second.timestamp_millis()));
+        }
+        LocalResult::None => {}
     }
     // During a clock-forward gap Java shifts the local time forward by the
     // gap, which is equivalent to applying the offset before the transition.
@@ -2622,6 +2628,35 @@ mod tests {
                 "{value} in {zone}"
             );
         }
+    }
+
+    // Windows chrono::Local uses the system zone and does not honor TZ.
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_timestamp_local_overlap_uses_earlier_instant() {
+        const CHILD: &str = "PAIMON_SCAN_TIMESTAMP_OVERLAP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // `chrono::Local` reads process-global timezone state. Run this in
+            // a fresh process so other tests cannot affect the chosen zone.
+            let actual = parse_scan_timestamp("2024-11-03 01:30:00", &chrono::Local).unwrap();
+            assert_eq!(actual, 1_730_611_800_000); // 2024-11-03T05:30:00Z
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "spec::core_options::tests::test_scan_timestamp_local_overlap_uses_earlier_instant",
+            ])
+            .env("TZ", "America/New_York")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
