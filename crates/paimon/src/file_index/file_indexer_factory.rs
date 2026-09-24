@@ -21,6 +21,7 @@ use crate::common::Options;
 use crate::file_index::bitmap::writer::BitmapFileIndexWriter;
 use crate::file_index::bitmap::BitmapFileIndexReader;
 use crate::file_index::bloom_filter::{BloomFilterReader, BloomFilterWriter};
+use crate::file_index::bsi::{BsiFileIndexReader, BsiFileIndexWriter};
 use crate::file_index::file_index_reader::FileIndexReader;
 use crate::file_index::file_index_writer::FileIndexWriter;
 use crate::file_index::range_bitmap::writer::RangeBitmapFileIndexWriter;
@@ -31,6 +32,7 @@ use crate::{Error, Result};
 pub(crate) const BITMAP_INDEX: &str = "bitmap";
 pub(crate) const BLOOM_FILTER_INDEX: &str = "bloom-filter";
 pub(crate) const RANGE_BITMAP_INDEX: &str = "range-bitmap";
+pub(crate) const BSI_INDEX: &str = "bsi";
 
 struct FailOpenFileIndexReader;
 
@@ -41,6 +43,7 @@ enum BuiltinFileIndexer {
     Bitmap,
     BloomFilter,
     RangeBitmap,
+    Bsi,
 }
 
 impl BuiltinFileIndexer {
@@ -49,6 +52,7 @@ impl BuiltinFileIndexer {
             BITMAP_INDEX => Ok(Self::Bitmap),
             BLOOM_FILTER_INDEX => Ok(Self::BloomFilter),
             RANGE_BITMAP_INDEX => Ok(Self::RangeBitmap),
+            BSI_INDEX => Ok(Self::Bsi),
             _ => Err(Error::Unsupported {
                 message: format!("Unknown file index identifier: {identifier}"),
             }),
@@ -64,7 +68,7 @@ impl FileIndexerFactory {
     pub(crate) fn is_supported(identifier: &str) -> bool {
         matches!(
             identifier,
-            BITMAP_INDEX | BLOOM_FILTER_INDEX | RANGE_BITMAP_INDEX
+            BITMAP_INDEX | BLOOM_FILTER_INDEX | RANGE_BITMAP_INDEX | BSI_INDEX
         )
     }
 
@@ -72,7 +76,7 @@ impl FileIndexerFactory {
     pub(crate) fn is_write_supported(identifier: &str) -> bool {
         matches!(
             identifier,
-            BITMAP_INDEX | BLOOM_FILTER_INDEX | RANGE_BITMAP_INDEX
+            BITMAP_INDEX | BLOOM_FILTER_INDEX | RANGE_BITMAP_INDEX | BSI_INDEX
         )
     }
 
@@ -91,6 +95,9 @@ impl FileIndexerFactory {
             BuiltinFileIndexer::RangeBitmap => Ok(Box::new(RangeBitmapFileIndexWriter::try_new(
                 data_type, options,
             )?)),
+            BuiltinFileIndexer::Bsi => {
+                Ok(Box::new(BsiFileIndexWriter::try_new(data_type, options)?))
+            }
         }
     }
 
@@ -119,6 +126,12 @@ impl FileIndexerFactory {
                     },
                 )
             }
+            BuiltinFileIndexer::Bsi => {
+                Ok(match BsiFileIndexReader::try_new(data_type, serialized) {
+                    Ok(reader) => Box::new(reader),
+                    Err(_) => Box::new(FailOpenFileIndexReader),
+                })
+            }
         }
     }
 }
@@ -137,7 +150,12 @@ mod tests {
 
     #[test]
     fn test_builtin_writers_track_empty_rows_consistently() {
-        for identifier in [BITMAP_INDEX, BLOOM_FILTER_INDEX, RANGE_BITMAP_INDEX] {
+        for identifier in [
+            BITMAP_INDEX,
+            BLOOM_FILTER_INDEX,
+            RANGE_BITMAP_INDEX,
+            BSI_INDEX,
+        ] {
             assert!(FileIndexerFactory::is_write_supported(identifier));
             let mut writer =
                 FileIndexerFactory::create_writer(identifier, int_type(), &Options::new()).unwrap();
@@ -203,7 +221,12 @@ mod tests {
 
     #[test]
     fn test_writer_rejects_mismatched_datum() {
-        for identifier in [BITMAP_INDEX, BLOOM_FILTER_INDEX, RANGE_BITMAP_INDEX] {
+        for identifier in [
+            BITMAP_INDEX,
+            BLOOM_FILTER_INDEX,
+            RANGE_BITMAP_INDEX,
+            BSI_INDEX,
+        ] {
             let mut writer =
                 FileIndexerFactory::create_writer(identifier, int_type(), &Options::new()).unwrap();
 

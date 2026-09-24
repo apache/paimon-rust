@@ -398,14 +398,11 @@ impl TableWrite {
 
         let file_index_options = FileIndexOptions::parse(schema.options(), schema.fields())?;
         if file_index_options.is_some()
-            && (has_primary_keys
-                || has_blob_fields
-                || has_dedicated_vector_fields
-                || !blob_view_fields.is_empty()
-                || core_options.data_evolution_enabled())
+            && (has_blob_fields || has_dedicated_vector_fields || !blob_view_fields.is_empty())
         {
             return Err(crate::Error::Unsupported {
-                message: "FileIndex generation supports ordinary append writes only; primary-key, data-evolution and dedicated Blob/Vector writes are not supported".to_string(),
+                message: "FileIndex generation does not support dedicated Blob/Vector writes"
+                    .to_string(),
             });
         }
 
@@ -943,9 +940,6 @@ impl TableWrite {
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         self.ensure_active()?;
         self.partition_seq_cache.clear();
-        if self.file_index_options.is_some() {
-            return self.prepare_indexed_append_commit().await;
-        }
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
             self.partition_writers.drain().collect();
 
@@ -1005,38 +999,6 @@ impl TableWrite {
                 msg.new_index_files = idx_files;
                 messages.push(msg);
             }
-        }
-        Ok(messages)
-    }
-
-    async fn prepare_indexed_append_commit(&mut self) -> Result<Vec<CommitMessage>> {
-        let closes =
-            self.partition_writers
-                .drain()
-                .map(|((partition, bucket), writer)| async move {
-                    (partition, bucket, writer.prepare_commit().await)
-                });
-        // Do not cancel another partition's close when one fails: its completed
-        // files must remain reachable for abort cleanup.
-        let results = futures::future::join_all(closes).await;
-        let mut messages = Vec::new();
-        let mut error = None;
-        for (partition, bucket, result) in results {
-            match result {
-                Ok(files) if !files.data_files.is_empty() => {
-                    messages.push(CommitMessage::new(partition, bucket, files.data_files));
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    error.get_or_insert(err);
-                }
-            }
-        }
-        if let Some(error) = error {
-            self.failed = true;
-            let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
-            let _ = commit.abort(&messages).await;
-            return Err(error);
         }
         Ok(messages)
     }
@@ -1142,6 +1104,7 @@ impl TableWrite {
                     write_buffer_size: self.write_buffer_size,
                     file_format: self.file_format.clone(),
                     data_file_prefix,
+                    file_index_options: self.file_index_options.clone(),
                 },
             )
             .with_resources(self.resources.clone()),
@@ -1201,6 +1164,7 @@ impl TableWrite {
                     merge_engine: self.merge_engine,
                     deletion_vectors_enabled: CoreOptions::new(self.table.schema().options())
                         .deletion_vectors_enabled(),
+                    file_index_options: self.file_index_options.clone(),
                 },
                 next_seq,
             )?

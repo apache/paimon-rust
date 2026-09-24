@@ -25,7 +25,7 @@
 //!
 //! Reference: Java Paimon `SortMergeReaderWithMinHeap`.
 
-use super::data_file_reader::DataFileReader;
+use super::data_file_reader::{file_index_selection_to_local_ranges, DataFileReader};
 use super::sort_merge::{
     AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, MergeFunction,
     PartialUpdateMergeFunction, SortMergeReaderBuilder,
@@ -33,6 +33,8 @@ use super::sort_merge::{
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::{build_target_arrow_schema, ReadBudget};
 use crate::deletion_vector::DeletionVectorFactory;
+use crate::file_index::evaluator::evaluate_file_index;
+use crate::file_index::file_index_result::FileIndexResult;
 use crate::io::FileIO;
 use crate::spec::{
     BigIntType, CoreOptions, DataField, DataFileMeta, DataType as PaimonDataType, MergeEngine,
@@ -566,6 +568,8 @@ impl KeyValueFileReader {
         let config = self.config;
         let table_schema_id = config.table_schema_id;
         let pushdown_predicates = self.pushdown_predicates;
+        let file_index_read_enabled =
+            CoreOptions::new(&config.table_options).file_index_read_enabled();
         #[cfg(test)]
         let input_batch_sizes = self.input_batch_sizes;
 
@@ -639,6 +643,7 @@ impl KeyValueFileReader {
                         let run_table_fields = config.table_fields.clone();
                         let run_primary_keys = config.primary_keys.clone();
                         let run_file_io = file_io.clone();
+                        let run_index_predicates = pushdown_predicates.clone();
                         let deletion_files_by_split = deletion_files_by_split.clone();
                         let run_stream: ArrowRecordBatchStream = Box::pin(try_stream! {
                             for MergeFile { split, file: file_meta } in files {
@@ -658,6 +663,32 @@ impl KeyValueFileReader {
                                 let key_names = file_key_names.as_deref().unwrap_or(&run_primary_keys);
                                 let data_schema_fields =
                                     key_value_data_schema_fields(file_fields, key_names)?;
+                                // Only the PK-only predicate projection may run before
+                                // sort-merge. A value index can match an old version of
+                                // a key, so it must not prune merge inputs here.
+                                let row_ranges = if file_index_read_enabled {
+                                    match evaluate_file_index(
+                                        &run_file_io,
+                                        split.bucket_path(),
+                                        &file_meta,
+                                        &run_table_fields,
+                                        file_fields,
+                                        &run_index_predicates,
+                                    ).await? {
+                                        FileIndexResult::Skip => continue,
+                                        FileIndexResult::Selection(selection)
+                                            if split.row_ranges().is_none()
+                                                && file_meta.first_row_id.is_none() => {
+                                            file_index_selection_to_local_ranges(
+                                                &selection,
+                                                file_meta.row_count,
+                                            )?
+                                        }
+                                        _ => split.row_ranges().map(|ranges| ranges.to_vec()),
+                                    }
+                                } else {
+                                    split.row_ranges().map(|ranges| ranges.to_vec())
+                                };
                                 let deletion_file = deletion_files_by_split
                                     .get(&(Arc::as_ptr(&split) as usize))
                                     .and_then(|files| files.get(&file_meta.file_name))
@@ -674,7 +705,7 @@ impl KeyValueFileReader {
                                     data_fields,
                                     data_schema_fields,
                                     deletion_vector,
-                                    split.row_ranges().map(|ranges| ranges.to_vec()),
+                                    row_ranges,
                                 )?;
                                 while let Some(batch) = file_stream.next().await {
                                     yield batch?;

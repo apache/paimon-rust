@@ -1161,7 +1161,7 @@ const MAX_FILE_INDEX_ROW_RANGES: usize = 65_536;
 /// Convert a bitmap into contiguous ranges without visiting every selected row.
 /// `None` means the bitmap is too fragmented to materialize safely and callers
 /// must preserve other restrictions and rely on the residual predicate.
-fn file_index_selection_to_local_ranges(
+pub(super) fn file_index_selection_to_local_ranges(
     selection: &RoaringBitmap,
     row_count: i64,
 ) -> crate::Result<Option<Vec<RowRange>>> {

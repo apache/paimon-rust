@@ -21,6 +21,8 @@
 pub(crate) mod bitmap;
 #[allow(dead_code)]
 pub(crate) mod bloom_filter;
+#[allow(dead_code)]
+pub(crate) mod bsi;
 pub(crate) mod evaluator;
 mod file_index_format;
 #[allow(dead_code)]
