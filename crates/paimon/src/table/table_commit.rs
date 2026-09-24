@@ -1137,7 +1137,12 @@ impl TableCommit {
         };
         // Once publication starts its outcome may be unknown. These files must
         // remain available even if the response is lost or a later retry fails.
-        let publication_error = match self.snapshot_commit.commit(&snapshot, &statistics).await {
+        let base_snapshot_uuid = latest_snapshot.as_ref().and_then(Snapshot::uuid);
+        let publication_error = match self
+            .snapshot_commit
+            .commit(base_snapshot_uuid, &snapshot, &statistics)
+            .await
+        {
             Ok(true) => return Ok(CommitAttemptResult::Success),
             Ok(false) => None,
             Err(error) => Some(error),
@@ -1297,6 +1302,7 @@ impl TableCommit {
             .await?;
         let snapshot = Snapshot::builder()
             .version(3)
+            .uuid(Some(uuid::Uuid::new_v4().to_string()))
             .id(new_snapshot_id)
             .schema_id(schema_id)
             .base_manifest_list(base_manifest_list_name)
@@ -1525,6 +1531,8 @@ impl TableCommit {
         let mut min_row_id: Option<i64> = None;
         let mut max_row_id: Option<i64> = None;
         let mut all_entries_have_row_id = !entries.is_empty();
+        let mut total_buckets: Option<i32> = None;
+        let mut total_buckets_known = true;
         let mut schema_id = self.table.schema().id();
         for entry in entries {
             match entry.kind() {
@@ -1533,6 +1541,12 @@ impl TableCommit {
             }
             schema_id = schema_id.max(entry.file().schema_id);
             let b = entry.bucket();
+            let candidate = entry.total_buckets();
+            if candidate <= 0 || total_buckets.is_some_and(|value| value != candidate) {
+                total_buckets_known = false;
+            } else {
+                total_buckets = Some(candidate);
+            }
             min_bucket = Some(min_bucket.map_or(b, |cur| cur.min(b)));
             max_bucket = Some(max_bucket.map_or(b, |cur| cur.max(b)));
             let l = entry.file().level;
@@ -1561,6 +1575,11 @@ impl TableCommit {
             schema_id,
         )
         .with_bucket_level_stats(min_bucket, max_bucket, min_level, max_level)
+        .with_total_buckets(if total_buckets_known {
+            total_buckets
+        } else {
+            None
+        })
         .with_row_id_stats(min_row_id, max_row_id)
         .with_extra_files(sidecar_name.map(|name| vec![name])))
     }
@@ -6741,7 +6760,12 @@ mod tests {
         let table_path = "memory:/test_commit_bucket_level_stats";
         setup_dirs(&file_io, table_path).await;
 
-        let commit = setup_commit(&file_io, table_path);
+        let table = test_table_with_options(
+            &file_io,
+            table_path,
+            HashMap::from([("bucket".to_string(), "8".to_string())]),
+        );
+        let commit = TableCommit::new(table, "test-user".to_string());
 
         fn data_file_at_level(name: &str, level: i32) -> DataFileMeta {
             let mut f = test_data_file(name, 1);
@@ -6768,6 +6792,7 @@ mod tests {
         );
         assert_eq!(metas[0].min_bucket(), Some(0));
         assert_eq!(metas[0].max_bucket(), Some(3));
+        assert_eq!(metas[0].total_buckets(), Some(commit.total_buckets));
         assert_eq!(metas[0].min_level(), Some(0));
         assert_eq!(metas[0].max_level(), Some(2));
     }

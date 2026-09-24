@@ -110,6 +110,11 @@ impl PyTable {
         self.inner.location().to_string()
     }
 
+    /// REST catalog table identity used by callers with an already resolved schema.
+    fn rest_table_uuid(&self) -> Option<&str> {
+        self.inner.rest_env().map(|env| env.uuid())
+    }
+
     fn schema(&self) -> PyTableSchema {
         PyTableSchema::new(self.inner.schema().clone())
     }

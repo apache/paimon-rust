@@ -199,6 +199,7 @@ mod tests {
                 "_MAX_LEVEL",
                 "_MIN_ROW_ID",
                 "_MAX_ROW_ID",
+                "_TOTAL_BUCKETS",
                 "_EXTRA_FILES",
             ],
         );
@@ -244,9 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_manifest_file_meta_total_buckets_without_writing_it() {
-        assert!(!MANIFEST_FILE_META_SCHEMA.contains("_TOTAL_BUCKETS"));
-
+    fn test_roundtrip_total_buckets_and_read_legacy_manifest_meta() {
         let original = vec![ManifestFileMeta::new(
             "manifest-java-0".to_string(),
             1024,
@@ -255,48 +254,29 @@ mod tests {
             BinaryTableStats::empty(),
             0,
         )
-        .with_bucket_level_stats(Some(2), Some(2), Some(0), Some(0))];
+        .with_bucket_level_stats(Some(2), Some(2), Some(0), Some(0))
+        .with_total_buckets(Some(8))];
         let bytes = to_avro_bytes(MANIFEST_FILE_META_SCHEMA, &original).unwrap();
-        let mut value = Reader::new(bytes.as_slice())
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        let fields = match &mut value {
-            Value::Union(_, record) => match record.as_mut() {
-                Value::Record(fields) => fields,
-                other => panic!("Expected an Avro record, got {other:?}"),
-            },
-            other => panic!("Expected an Avro union, got {other:?}"),
-        };
-        let extra_files_index = fields
-            .iter()
-            .position(|(name, _)| name == "_EXTRA_FILES")
-            .unwrap();
-        fields.insert(
-            extra_files_index,
-            (
-                "_TOTAL_BUCKETS".to_string(),
-                Value::Union(1, Box::new(Value::Int(8))),
-            ),
-        );
-
-        let java_schema = MANIFEST_FILE_META_SCHEMA.replacen(
-            r#"{"name": "_EXTRA_FILES", "type": ["null", {"type": "array", "items": "string"}], "default": null}"#,
-            concat!(
-                r#"{"name": "_TOTAL_BUCKETS", "type": ["null", "int"], "default": null},"#,
-                "\n        ",
-                r#"{"name": "_EXTRA_FILES", "type": ["null", {"type": "array", "items": "string"}], "default": null}"#
-            ),
-            1,
-        );
-        let schema = Schema::parse_str(&java_schema).unwrap();
-        let mut writer = Writer::new(&schema, Vec::new());
-        writer.append(value).unwrap();
-        let bytes = writer.into_inner().unwrap();
-
         let decoded = from_avro_bytes_fast::<ManifestFileMeta>(&bytes).unwrap();
         assert_eq!(decoded[0].total_buckets(), Some(8));
+
+        let legacy_schema = MANIFEST_FILE_META_SCHEMA.replacen(
+            "        {\"name\": \"_TOTAL_BUCKETS\", \"type\": [\"null\", \"int\"], \"default\": null},\n",
+            "",
+            1,
+        );
+        assert!(!legacy_schema.contains("_TOTAL_BUCKETS"));
+        let legacy = vec![ManifestFileMeta::new(
+            "manifest-legacy-0".to_string(),
+            1024,
+            5,
+            0,
+            BinaryTableStats::empty(),
+            0,
+        )];
+        let bytes = to_avro_bytes(&legacy_schema, &legacy).unwrap();
+        let decoded = from_avro_bytes_fast::<ManifestFileMeta>(&bytes).unwrap();
+        assert_eq!(decoded[0].total_buckets(), None);
     }
 
     #[test]

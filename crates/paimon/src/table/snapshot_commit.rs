@@ -36,8 +36,12 @@ use std::sync::Arc;
 pub trait SnapshotCommit: Send + Sync {
     /// Commit the given snapshot. Returns true if successful, false if
     /// another writer won the race.
-    async fn commit(&self, snapshot: &Snapshot, statistics: &[PartitionStatistics])
-        -> Result<bool>;
+    async fn commit(
+        &self,
+        base_snapshot_uuid: Option<&str>,
+        snapshot: &Snapshot,
+        statistics: &[PartitionStatistics],
+    ) -> Result<bool>;
 }
 
 /// A SnapshotCommit using file renaming to commit.
@@ -57,6 +61,7 @@ impl RenamingSnapshotCommit {
 impl SnapshotCommit for RenamingSnapshotCommit {
     async fn commit(
         &self,
+        _base_snapshot_uuid: Option<&str>,
         snapshot: &Snapshot,
         _statistics: &[PartitionStatistics],
     ) -> Result<bool> {
@@ -88,11 +93,18 @@ impl RESTSnapshotCommit {
 impl SnapshotCommit for RESTSnapshotCommit {
     async fn commit(
         &self,
+        base_snapshot_uuid: Option<&str>,
         snapshot: &Snapshot,
         statistics: &[PartitionStatistics],
     ) -> Result<bool> {
         self.api
-            .commit_snapshot(&self.identifier, &self.uuid, snapshot, statistics)
+            .commit_snapshot(
+                &self.identifier,
+                &self.uuid,
+                base_snapshot_uuid,
+                snapshot,
+                statistics,
+            )
             .await
     }
 }

@@ -443,7 +443,7 @@ mod tests {
         assert!(
             messages[0].new_files[0]
                 .file_name
-                .starts_with("data-u-my-commit-user-s-"),
+                .starts_with("data--u-my-commit-user-s-"),
             "Expected custom commit user in file name, got: {}",
             messages[0].new_files[0].file_name
         );

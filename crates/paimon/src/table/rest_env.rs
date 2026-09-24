@@ -86,6 +86,11 @@ impl RESTEnv {
         &self.identifier
     }
 
+    /// Catalog identity used to reject commits against a replaced table.
+    pub fn uuid(&self) -> &str {
+        &self.uuid
+    }
+
     /// Load a table through the same REST catalog environment.
     pub async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
         Self::load_table(
