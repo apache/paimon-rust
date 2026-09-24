@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Row-level DML on a Format Table, which the Rust client cannot write.
+//! Format Table inserts and the row-level mutations that still need a
+//! dedicated copy-on-write implementation.
 
 mod common;
 
@@ -229,4 +230,110 @@ async fn test_row_level_dml_is_refused_on_a_format_table_without_catalog_managed
         assert_eq!(files(&table_dir), seeded, "{statement}");
         assert_eq!(ids(&context, &table_name).await, [1, 2, 3], "{statement}");
     }
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_insert_into_catalog_managed_format_table_registers_partition() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let context = catalog_managed_format_table(&temp_dir).await;
+    context
+        .sql(&format!(
+            "INSERT INTO {TABLE_NAME} (dt, id) VALUES ('a', 10), ('c', 11)"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(ids(&context, TABLE_NAME).await, [1, 2, 3, 10, 11]);
+    assert_eq!(
+        files(&temp_dir.path().join("dt=c"))
+            .iter()
+            .filter(|file| file.ends_with(".parquet"))
+            .count(),
+        1
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_insert_into_directory_format_table_publishes_visible_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (table_dir, context) = directory_partitioned_format_table(&temp_dir).await;
+    let table_name = format!("paimon.{DATABASE}.{TABLE}");
+    context
+        .sql(&format!(
+            "INSERT INTO {table_name} (dt, id) VALUES ('b', 10), ('c', 11)"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(ids(&context, &table_name).await, [1, 2, 3, 10, 11]);
+    assert_eq!(
+        files(&table_dir.join("dt=b"))
+            .iter()
+            .filter(|file| file.ends_with(".parquet"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        files(&table_dir.join("dt=c"))
+            .iter()
+            .filter(|file| file.ends_with(".parquet"))
+            .count(),
+        1
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_overwrite_only_replaces_touched_catalog_partition() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let context = catalog_managed_format_table(&temp_dir).await;
+    context
+        .sql(&format!(
+            "INSERT OVERWRITE {TABLE_NAME} VALUES ('a', 10), ('a', 11)"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(ids(&context, TABLE_NAME).await, [3, 10, 11]);
+    assert_eq!(
+        files(&temp_dir.path().join("dt=a"))
+            .iter()
+            .filter(|file| file.ends_with(".parquet"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        files(&temp_dir.path().join("dt=b"))
+            .iter()
+            .filter(|file| file.ends_with(".parquet"))
+            .count(),
+        1
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_static_partition_overwrite_with_empty_source_keeps_other_data() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (_table_dir, context) = directory_partitioned_format_table(&temp_dir).await;
+    let table_name = format!("paimon.{DATABASE}.{TABLE}");
+    context
+        .sql(&format!(
+            "INSERT OVERWRITE {table_name} PARTITION (dt = 'a') \
+             SELECT CAST(0 AS BIGINT) AS id WHERE FALSE"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(ids(&context, &table_name).await, [3]);
 }

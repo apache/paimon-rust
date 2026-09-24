@@ -459,6 +459,37 @@ impl FileIO {
         Ok(())
     }
 
+    /// Copy a large file without materializing its entire contents in memory.
+    /// Format Table publication uses this when a backend does not support
+    /// rename, as is common for object stores and the in-memory test backend.
+    pub async fn copy_file_streaming(&self, src: &str, dst: &str) -> Result<()> {
+        const CHUNK_SIZE: u64 = 8 * 1024 * 1024;
+        let input = self.new_input(src)?;
+        let size = input.metadata().await?.size;
+        let reader = input.reader().await?;
+        let output = self.new_output(dst)?;
+        let mut writer = output.writer().await?;
+        let mut position = 0;
+        while position < size {
+            let end = (position + CHUNK_SIZE).min(size);
+            let bytes = reader.read(position..end).await?;
+            if bytes.len() as u64 != end - position {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Short read while copying '{src}': expected {} bytes, got {}",
+                        end - position,
+                        bytes.len()
+                    ),
+                    source: None,
+                });
+            }
+            writer.write(bytes).await?;
+            position = end;
+        }
+        writer.close().await?;
+        Ok(())
+    }
+
     /// Renames the file/directory src to dst.
     ///
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L159>
@@ -1899,6 +1930,31 @@ mod input_output_test {
                 .unwrap(),
             Bytes::from_static(b"source value")
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_copy_crosses_chunk_boundary() {
+        let file_io = setup_memory_file_io();
+        let source = "memory:/format-copy/source.parquet";
+        let target = "memory:/format-copy/target.parquet";
+        let mut payload = vec![0u8; 8 * 1024 * 1024 + 17];
+        payload[0] = 3;
+        payload[8 * 1024 * 1024 - 1] = 7;
+        payload[8 * 1024 * 1024] = 11;
+        payload[8 * 1024 * 1024 + 16] = 13;
+        file_io
+            .new_output(source)
+            .unwrap()
+            .write(Bytes::from(payload.clone()))
+            .await
+            .unwrap();
+
+        file_io.copy_file_streaming(source, target).await.unwrap();
+        assert_eq!(
+            file_io.new_input(target).unwrap().read().await.unwrap(),
+            Bytes::from(payload)
+        );
+        assert!(file_io.exists(source).await.unwrap());
     }
 
     #[cfg(not(windows))]

@@ -49,8 +49,12 @@ mod format_partition;
 mod format_partition_stats;
 mod format_partition_truncate;
 mod format_read_builder;
+mod format_table_commit;
 mod format_table_read;
 mod format_table_scan;
+#[cfg(test)]
+mod format_table_write_tests;
+mod format_table_writer;
 mod format_write_builder;
 #[cfg(feature = "fulltext")]
 mod full_text_index_adapter;
