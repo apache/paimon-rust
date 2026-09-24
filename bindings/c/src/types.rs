@@ -372,6 +372,7 @@ pub(crate) struct WriteBuilderState {
     pub table: Table,
     pub commit_user: String,
     pub overwrite: bool,
+    pub resources: Option<ResourceContext>,
 }
 
 pub(crate) struct PostponeFixedBucketWriteBuilderState {
@@ -379,6 +380,7 @@ pub(crate) struct PostponeFixedBucketWriteBuilderState {
     pub commit_user: String,
     pub overwrite: bool,
     pub bucket_plan: Option<PostponeBucketPlan>,
+    pub resources: Option<ResourceContext>,
 }
 
 pub(crate) struct TableWriteState {

@@ -23,7 +23,8 @@ use crate::error::{check_non_null, paimon_error};
 use crate::result::paimon_result_resource_context;
 use crate::types::{paimon_resource_context, paimon_resource_metrics};
 
-/// Create a shared reader reservation budget in bytes. Zero rejects nonempty reservations.
+/// Create a shared reader and writer reservation budget in bytes.
+/// Zero rejects nonempty reservations.
 #[no_mangle]
 pub extern "C" fn paimon_resource_context_create(
     memory_limit_bytes: usize,
@@ -73,7 +74,7 @@ pub unsafe extern "C" fn paimon_resource_context_metrics(
     std::ptr::null_mut()
 }
 
-/// Free a resource context handle. Builders and streams retain their own clones.
+/// Free a resource context handle. Builders, streams, and writers retain their own clones.
 ///
 /// # Safety
 /// `context` must be a handle returned by `paimon_resource_context_create`, or null.
