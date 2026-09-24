@@ -180,13 +180,61 @@ impl TableWrite {
         resources: Option<ResourceContext>,
         overwrite: bool,
     ) -> Result<Self> {
-        let format_writer = FormatTableWriter::new(table, resources)?;
-        // The ordinary fields are inert for a Format Table: every public write
-        // operation dispatches to `format_writer` before touching bucket state.
-        let mut write = Self::new(table, commit_user)?;
-        write.format_writer = Some(format_writer);
-        write.is_overwrite = overwrite;
-        Ok(write)
+        let format_writer = FormatTableWriter::new(table, resources.clone())?;
+        let schema = table.schema();
+        let options = CoreOptions::new(schema.options());
+        // Format Tables do not use Paimon buckets, indexes, changelogs or
+        // snapshots. Build their public TableWrite wrapper without running
+        // Paimon-only option validation or constructing stateful assigners.
+        Ok(Self {
+            format_writer: Some(format_writer),
+            table: table.clone(),
+            write_schema: build_target_arrow_schema(schema.fields())?,
+            partition_writers: HashMap::new(),
+            partition_computer: PartitionComputer::new(
+                schema.partition_keys(),
+                schema.fields(),
+                options.partition_default_name(),
+                options.legacy_partition_name(),
+            )?,
+            partition_keys: schema.partition_keys().to_vec(),
+            schema_id: schema.id(),
+            target_file_size: 0,
+            blob_target_file_size: 0,
+            vector_target_file_size: 0,
+            file_compression: String::new(),
+            file_compression_zstd_level: 0,
+            write_buffer_size: 0,
+            file_format: String::new(),
+            data_file_prefix: String::new(),
+            primary_key_indices: Vec::new(),
+            primary_key_types: Vec::new(),
+            sequence_field_indices: Vec::new(),
+            merge_engine: MergeEngine::Deduplicate,
+            changelog_producer: ChangelogProducer::None,
+            changelog_file_prefix: String::new(),
+            changelog_file_format: String::new(),
+            changelog_file_compression: String::new(),
+            partition_seq_cache: HashMap::new(),
+            sequence_snapshot: None,
+            commit_user,
+            postpone_write_id: 0,
+            bucket_assigner: BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
+                Vec::new(),
+                0,
+            )),
+            is_overwrite: overwrite,
+            blob_view_fields: HashSet::new(),
+            blob_inline_fields: HashSet::new(),
+            has_blob_fields: false,
+            vector_file_format: None,
+            has_dedicated_vector_fields: false,
+            row_kind_generator: None,
+            row_kind_filter: None,
+            file_index_options: None,
+            resources,
+            failed: false,
+        })
     }
 
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
@@ -543,6 +591,9 @@ impl TableWrite {
     /// retained key-value batches and unflushed format-writer input. Call this
     /// before the first write.
     pub fn with_resources(mut self, resources: ResourceContext) -> Self {
+        if let Some(writer) = self.format_writer.as_mut() {
+            writer.set_resources(resources.clone());
+        }
         self.resources = Some(resources);
         self
     }

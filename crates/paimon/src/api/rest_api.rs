@@ -625,13 +625,46 @@ impl RESTApi {
         statistics: Option<Vec<PartitionStatistics>>,
         replace_statistics: bool,
     ) -> Result<()> {
+        self.create_partitions_with_options(
+            identifier,
+            partition_specs,
+            ignore_if_exists,
+            statistics,
+            replace_statistics,
+            None,
+        )
+        .await
+    }
+
+    /// Create partitions with aligned statistics and per-partition catalog options.
+    pub async fn create_partitions_with_options(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+        ignore_if_exists: bool,
+        statistics: Option<Vec<PartitionStatistics>>,
+        replace_statistics: bool,
+        partition_options: Option<Vec<HashMap<String, String>>>,
+    ) -> Result<()> {
         let database = identifier.database();
         let table = identifier.object();
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        if partition_options
+            .as_ref()
+            .is_some_and(|options| options.len() != partition_specs.len())
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Partition options must align with partition specs".into(),
+                source: None,
+            });
+        }
         let path = self.resource_paths.partitions(database, table);
         let mut request = CreatePartitionsRequest::new(partition_specs, ignore_if_exists);
         if let Some(statistics) = statistics {
             request = request.with_statistics(statistics, replace_statistics);
+        }
+        if let Some(options) = partition_options {
+            request = request.with_partition_options(options);
         }
         let _resp: serde_json::Value = self.client.post(&path, &request).await?;
         Ok(())

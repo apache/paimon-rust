@@ -89,6 +89,18 @@ impl<'a> FormatTableCommit<'a> {
         messages: &[CommitMessage],
         overwrite: Option<Option<&HashMap<String, Option<Datum>>>>,
     ) -> Result<()> {
+        let result = self.apply_inner(messages, overwrite).await;
+        if result.is_err() {
+            let _ = self.abort(messages).await;
+        }
+        result
+    }
+
+    async fn apply_inner(
+        &self,
+        messages: &[CommitMessage],
+        overwrite: Option<Option<&HashMap<String, Option<Datum>>>>,
+    ) -> Result<()> {
         self.table.ensure_not_branch_reference_for_write()?;
         let files = self.validate_messages(messages).await?;
         let managed = self.table.has_catalog_managed_partitions();
@@ -123,7 +135,8 @@ impl<'a> FormatTableCommit<'a> {
         if managed {
             let mut touched = requested.clone();
             touched.extend(selected.iter().cloned());
-            self.validate_registered_partitions(&touched).await?;
+            self.validate_registered_partitions(&touched, overwrite.is_none())
+                .await?;
         }
 
         if overwrite.is_some() {
@@ -154,7 +167,7 @@ impl<'a> FormatTableCommit<'a> {
                 // files must survive an uncertain partial publish. Append can
                 // safely roll back files this attempt uniquely named.
                 if overwrite.is_none() {
-                    for path in &published {
+                    for path in published.iter().chain(std::iter::once(&file.target_path)) {
                         let _ = self.table.file_io().delete_file(path).await;
                     }
                 }
@@ -176,28 +189,56 @@ impl<'a> FormatTableCommit<'a> {
                     .table
                     .rest_env()
                     .expect("managed partition REST environment");
-                let result = env
-                    .api()
-                    .create_partitions_with_statistics(
-                        env.identifier(),
-                        specs,
-                        true,
-                        Some(stats),
-                        overwrite.is_some(),
-                    )
-                    .await;
-                if let Err(error) = result {
-                    if overwrite.is_some() {
-                        // The old data is already gone. Keep replacements even
-                        // when reporting metadata failed, as Java does.
+                if overwrite.is_some() {
+                    let options = specs
+                        .iter()
+                        .map(|spec| {
+                            Ok(HashMap::from([(
+                                "path".to_string(),
+                                self.catalog_partition_path(spec)?,
+                            )]))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    // Replacement data survives a metadata failure because old
+                    // data has already been removed.
+                    env.api()
+                        .create_partitions_with_options(
+                            env.identifier(),
+                            specs,
+                            true,
+                            Some(stats),
+                            true,
+                            Some(options),
+                        )
+                        .await?;
+                } else {
+                    // Java registers first, then preserves visible files even
+                    // if the later additive statistics report fails.
+                    if let Err(error) = env
+                        .api()
+                        .create_partitions(env.identifier(), specs.clone(), true)
+                        .await
+                    {
+                        for path in &published {
+                            let _ = self.table.file_io().delete_file(path).await;
+                        }
                         return Err(error);
                     }
-                    // After files are published a registration error leaves an
-                    // uncertain result. A retry must not duplicate rows.
-                    for path in published {
-                        let _ = self.table.file_io().delete_file(&path).await;
+                    if let Err(error) = env
+                        .api()
+                        .create_partitions_with_statistics(
+                            env.identifier(),
+                            specs,
+                            true,
+                            Some(stats),
+                            false,
+                        )
+                        .await
+                    {
+                        log::warn!(
+                            "Committed Format Table data but failed to report append statistics: {error}"
+                        );
                     }
-                    return Err(error);
                 }
             }
         }
@@ -265,6 +306,7 @@ impl<'a> FormatTableCommit<'a> {
     async fn validate_registered_partitions(
         &self,
         specs: &[HashMap<String, String>],
+        reject_custom_location: bool,
     ) -> Result<()> {
         if specs.is_empty() {
             return Ok(());
@@ -285,10 +327,11 @@ impl<'a> FormatTableCommit<'a> {
                     source: None,
                 });
             }
-            if partition
-                .options
-                .as_ref()
-                .is_some_and(|options| options.contains_key("path"))
+            if reject_custom_location
+                && partition
+                    .options
+                    .as_ref()
+                    .is_some_and(|options| options.contains_key("path"))
             {
                 return Err(crate::Error::Unsupported {
                     message:
@@ -307,6 +350,29 @@ impl<'a> FormatTableCommit<'a> {
         } else {
             format!("{}/{relative}", self.table_path)
         })
+    }
+
+    fn catalog_partition_path(&self, spec: &HashMap<String, String>) -> Result<String> {
+        let path = self.partition_directory(spec)?;
+        if url::Url::parse(&path).is_ok() {
+            return Ok(path);
+        }
+        let absolute = std::path::Path::new(&path);
+        let absolute = if absolute.is_absolute() {
+            absolute.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| crate::Error::ConfigInvalid {
+                    message: format!("Cannot resolve Format Table partition path: {error}"),
+                })?
+                .join(absolute)
+        };
+        url::Url::from_file_path(&absolute)
+            .map(|url| url.to_string())
+            .map_err(|_| crate::Error::DataInvalid {
+                message: format!("Invalid Format Table partition path: {path}"),
+                source: None,
+            })
     }
 
     async fn publish(&self, file: &FormatFileCommit) -> Result<()> {

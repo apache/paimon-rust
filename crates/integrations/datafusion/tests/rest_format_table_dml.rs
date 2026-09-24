@@ -46,7 +46,7 @@ const WAREHOUSE: &str = "test_warehouse";
 
 /// A Format Table with one file in each of `dt=a` and `dt=b`, whose partitions a mock REST
 /// catalog manages. Its data directory is the root of `temp_dir`.
-async fn catalog_managed_format_table(temp_dir: &TempDir) -> SQLContext {
+async fn catalog_managed_format_table(temp_dir: &TempDir) -> (SQLContext, mock_server::RESTServer) {
     let server = start_mock_server(
         WAREHOUSE.to_string(),
         temp_dir.path().to_string_lossy().into_owned(),
@@ -82,7 +82,7 @@ async fn catalog_managed_format_table(temp_dir: &TempDir) -> SQLContext {
     let catalog = Arc::new(RESTCatalog::new(options, true).await.unwrap());
     let mut context = SQLContext::new();
     context.register_catalog("paimon", catalog).await.unwrap();
-    context
+    (context, server)
 }
 
 /// The same table with its partitions discovered from the directory layout, in a filesystem
@@ -206,7 +206,7 @@ fn statements(table_name: &str) -> [String; 3] {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_row_level_dml_is_refused_on_a_catalog_managed_format_table() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let context = catalog_managed_format_table(&temp_dir).await;
+    let (context, _server) = catalog_managed_format_table(&temp_dir).await;
     let seeded = files(temp_dir.path());
 
     for statement in statements(TABLE_NAME) {
@@ -236,7 +236,7 @@ async fn test_row_level_dml_is_refused_on_a_format_table_without_catalog_managed
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_insert_into_catalog_managed_format_table_registers_partition() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let context = catalog_managed_format_table(&temp_dir).await;
+    let (context, _server) = catalog_managed_format_table(&temp_dir).await;
     context
         .sql(&format!(
             "INSERT INTO {TABLE_NAME} (dt, id) VALUES ('a', 10), ('c', 11)"
@@ -254,6 +254,96 @@ async fn test_insert_into_catalog_managed_format_table_registers_partition() {
             .count(),
         1
     );
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_append_keeps_visible_files_when_statistics_report_fails() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (context, server) = catalog_managed_format_table(&temp_dir).await;
+    server.set_create_partitions_statistics_error_status(Some(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+    ));
+    context
+        .sql(&format!(
+            "INSERT INTO {TABLE_NAME} (dt, id) VALUES ('c', 11)"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(ids(&context, TABLE_NAME).await, [1, 2, 3, 11]);
+    let calls = server.create_partitions_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].2.partition_statistics.is_none());
+    assert!(calls[1].2.partition_statistics.is_some());
+    assert_eq!(
+        files(&temp_dir.path().join("dt=c"))
+            .iter()
+            .filter(|file| file.ends_with(".parquet"))
+            .count(),
+        1
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_failed_partition_preflight_discards_staged_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (context, server) = catalog_managed_format_table(&temp_dir).await;
+    let seeded = files(temp_dir.path());
+    server.set_list_partitions_by_names_error_status(Some(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+    ));
+    let error = context
+        .sql(&format!(
+            "INSERT INTO {TABLE_NAME} (dt, id) VALUES ('c', 11)"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("Service unavailable"), "{error}");
+    assert_eq!(files(temp_dir.path()), seeded);
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_overwrite_rebinds_custom_partition_without_deleting_external_data() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (context, server) = catalog_managed_format_table(&temp_dir).await;
+    let external = temp_dir.path().join("external-a");
+    write_ids(&external, &[99]);
+    let spec = HashMap::from([("dt".to_string(), "a".to_string())]);
+    server.set_table_partition_options(
+        DATABASE,
+        TABLE,
+        &spec,
+        HashMap::from([("path".to_string(), format!("file://{}", external.display()))]),
+    );
+    context
+        .sql(&format!("INSERT OVERWRITE {TABLE_NAME} VALUES ('a', 10)"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(ids(&context, TABLE_NAME).await, [3, 10]);
+    assert_eq!(files(&external), ["part-0.parquet"]);
+    let partition = server
+        .table_partitions(DATABASE, TABLE)
+        .into_iter()
+        .find(|partition| partition.spec == spec)
+        .unwrap();
+    let path = partition.options.unwrap().remove("path").unwrap();
+    assert!(path.ends_with("/dt=a"), "{path}");
+    let calls = server.create_partitions_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].2.replace_statistics, Some(true));
+    assert!(calls[0].2.partition_options.is_some());
 }
 
 #[cfg(not(windows))]
@@ -292,7 +382,7 @@ async fn test_insert_into_directory_format_table_publishes_visible_files() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_overwrite_only_replaces_touched_catalog_partition() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let context = catalog_managed_format_table(&temp_dir).await;
+    let (context, _server) = catalog_managed_format_table(&temp_dir).await;
     context
         .sql(&format!(
             "INSERT OVERWRITE {TABLE_NAME} VALUES ('a', 10), ('a', 11)"

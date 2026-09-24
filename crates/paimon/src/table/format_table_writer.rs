@@ -77,9 +77,25 @@ pub(crate) struct FormatTableWriter {
 }
 
 impl FormatTableWriter {
+    pub(crate) fn set_resources(&mut self, resources: ResourceContext) {
+        self.resources = Some(resources);
+    }
+
     pub(crate) fn new(table: &Table, resources: Option<ResourceContext>) -> Result<Self> {
         table.ensure_not_branch_reference_for_write()?;
         let schema = table.schema();
+        if let Some(field) = schema
+            .fields()
+            .iter()
+            .find(|field| field.default_value().is_some())
+        {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "Format Table column default for '{}' is not supported by the Rust writer",
+                    field.name()
+                ),
+            });
+        }
         let options = CoreOptions::new(schema.options());
         let format = options.file_format();
         let extension = supported_format_table_extension(&format)?.to_string();

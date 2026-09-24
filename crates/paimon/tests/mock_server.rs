@@ -72,6 +72,7 @@ struct MockState {
     create_partitions_calls: Vec<(String, String, CreatePartitionsRequest)>,
     drop_partitions_calls: Vec<(String, String, DropPartitionsRequest)>,
     create_partitions_error_status: Option<StatusCode>,
+    create_partitions_statistics_error_status: Option<StatusCode>,
     list_partitions_error_status: Option<StatusCode>,
     permissions: Vec<PermissionAssignment>,
     list_permissions_queries: Vec<HashMap<String, String>>,
@@ -1012,6 +1013,7 @@ impl RESTServer {
             return (StatusCode::NOT_FOUND, Json(error)).into_response();
         }
 
+        let statistics_error = inner.create_partitions_statistics_error_status;
         let registered_partitions = inner.partitions.entry(key).or_default();
         let has_conflict = request
             .partition_specs
@@ -1033,12 +1035,28 @@ impl RESTServer {
             return (StatusCode::CONFLICT, Json(error)).into_response();
         }
 
-        for spec in request.partition_specs {
-            if !registered_partitions
+        for (index, spec) in request.partition_specs.into_iter().enumerate() {
+            let position = registered_partitions
                 .iter()
-                .any(|partition| partition.spec == spec)
-            {
+                .position(|partition| partition.spec == spec);
+            let partition = if let Some(position) = position {
+                &mut registered_partitions[position]
+            } else {
                 registered_partitions.push(partition_from_spec(spec));
+                registered_partitions.last_mut().unwrap()
+            };
+            if let Some(options) = request
+                .partition_options
+                .as_ref()
+                .and_then(|options| options.get(index))
+            {
+                partition.options = Some(options.clone());
+            }
+        }
+        if request.partition_statistics.is_some() {
+            if let Some(status) = statistics_error {
+                return (status, Json(json!({"message": "Statistics update failed"})))
+                    .into_response();
             }
         }
         // As the catalog does: a negative field was never measured and leaves the stored value
@@ -1741,6 +1759,14 @@ impl RESTServer {
     /// Make the create-partitions endpoint return the given status.
     pub fn set_create_partitions_error_status(&self, status: Option<StatusCode>) {
         self.inner.lock().unwrap().create_partitions_error_status = status;
+    }
+
+    /// Fail only statistics-bearing partition requests, after registration.
+    pub fn set_create_partitions_statistics_error_status(&self, status: Option<StatusCode>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .create_partitions_statistics_error_status = status;
     }
 
     /// Make the list-partitions endpoint return the given status.

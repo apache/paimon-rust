@@ -223,6 +223,30 @@ async fn append_unpartitioned_table_has_no_snapshot() {
 }
 
 #[tokio::test]
+async fn format_table_ignores_paimon_bucket_configuration() {
+    let table = memory_table("format_bucket_ignored", true, &[("bucket", "2")]);
+    append(&table, &batch(&[("a", 1)])).await;
+    assert_eq!(ids(&table).await, [1]);
+}
+
+#[test]
+fn declared_column_default_is_rejected_before_opening_a_writer() {
+    let table = memory_table("format_column_default", true, &[]);
+    let mut schema = serde_json::to_value(table.schema()).unwrap();
+    schema["fields"][0]["defaultValue"] = serde_json::json!("'fallback'");
+    let schema = serde_json::from_value(schema).unwrap();
+    let table = Table::new(
+        table.file_io().clone(),
+        table.identifier().clone(),
+        table.location().to_string(),
+        schema,
+        None,
+    );
+    let error = table.new_write_builder().new_write().err().unwrap();
+    assert!(error.to_string().contains("column default"));
+}
+
+#[tokio::test]
 async fn file_rolls_at_target_row_count_even_inside_one_batch() {
     let table = memory_table("format_roll_rows", true, &[("target-file-row-num", "2")]);
     append(
