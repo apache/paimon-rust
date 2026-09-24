@@ -52,6 +52,7 @@ use crate::catalog::*;
 use crate::error::*;
 use crate::file_io::*;
 use crate::identifier::*;
+use crate::resource::*;
 use crate::table::*;
 use crate::types::*;
 use crate::vector_read::*;
@@ -360,6 +361,41 @@ unsafe fn read_rows_ffi(table: *const paimon_table) -> Vec<(i32, String)> {
     paimon_read_builder_free(rb);
 
     rows
+}
+
+unsafe fn read_stream_with_resources(
+    table: *const paimon_table,
+    context: *const paimon_resource_context,
+) -> *mut paimon_record_batch_reader {
+    let builder_result = paimon_table_new_read_builder(table);
+    assert!(builder_result.error.is_null());
+    let builder = builder_result.read_builder;
+    assert!(paimon_read_builder_with_resources(builder, context).is_null());
+
+    let scan_result = paimon_read_builder_new_scan(builder);
+    assert!(scan_result.error.is_null());
+    let plan_result = paimon_table_scan_plan(scan_result.scan);
+    assert!(plan_result.error.is_null());
+    let read_result = paimon_read_builder_new_read(builder);
+    assert!(read_result.error.is_null());
+    let stream_result =
+        paimon_table_read_to_arrow(read_result.read, plan_result.plan, 0, usize::MAX);
+    assert!(stream_result.error.is_null());
+
+    paimon_table_read_free(read_result.read);
+    paimon_plan_free(plan_result.plan);
+    paimon_table_scan_free(scan_result.scan);
+    paimon_read_builder_free(builder);
+    stream_result.reader
+}
+
+unsafe fn resource_metrics(context: *const paimon_resource_context) -> paimon_resource_metrics {
+    let mut metrics = paimon_resource_metrics {
+        reserved_memory_bytes: 0,
+        peak_reserved_memory_bytes: 0,
+    };
+    assert!(paimon_resource_context_metrics(context, &mut metrics).is_null());
+    metrics
 }
 
 // =========================================================================
@@ -1129,6 +1165,87 @@ fn test_read_with_data() {
         vec![(1, "a".into()), (2, "b".into()), (3, "c".into())]
     );
     unsafe { unwrap_table(handle) };
+}
+
+#[test]
+fn test_read_resources_share_budget_and_release_reservations() {
+    let path = "memory:/test_read_resources";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    write_data_rust(&table, &[make_batch(vec![1, 2, 3], vec!["a", "b", "c"])]);
+    let table = unsafe { wrap_table(table) };
+
+    unsafe {
+        let probe_result = paimon_resource_context_create(usize::MAX);
+        assert!(probe_result.error.is_null());
+        let probe = probe_result.context;
+        let stream = read_stream_with_resources(table, probe);
+        let first = paimon_record_batch_reader_next(stream);
+        assert!(first.error.is_null());
+        assert!(!first.batch.array.is_null());
+        let single_reader_bytes = resource_metrics(probe).reserved_memory_bytes;
+        assert!(single_reader_bytes > 0);
+        paimon_arrow_batch_free(first.batch);
+        paimon_record_batch_reader_free(stream);
+        assert_eq!(resource_metrics(probe).reserved_memory_bytes, 0);
+        paimon_resource_context_free(probe);
+
+        let budget_result = paimon_resource_context_create(single_reader_bytes);
+        assert!(budget_result.error.is_null());
+        let budget = budget_result.context;
+        let first_stream = read_stream_with_resources(table, budget);
+        let second_stream = read_stream_with_resources(table, budget);
+
+        let first = paimon_record_batch_reader_next(first_stream);
+        assert!(first.error.is_null());
+        assert!(!first.batch.array.is_null());
+        assert_eq!(
+            resource_metrics(budget).reserved_memory_bytes,
+            single_reader_bytes
+        );
+
+        let second = paimon_record_batch_reader_next(second_stream);
+        assert!(!second.error.is_null());
+        assert_eq!(
+            (*second.error).code,
+            PaimonErrorCode::ResourceExhausted as i32
+        );
+        paimon_error_free(second.error);
+        assert_eq!(
+            resource_metrics(budget).reserved_memory_bytes,
+            single_reader_bytes
+        );
+
+        paimon_arrow_batch_free(first.batch);
+        paimon_record_batch_reader_free(first_stream);
+        paimon_record_batch_reader_free(second_stream);
+        let released = resource_metrics(budget);
+        assert_eq!(released.reserved_memory_bytes, 0);
+        assert_eq!(released.peak_reserved_memory_bytes, single_reader_bytes);
+        paimon_resource_context_free(budget);
+
+        let zero_result = paimon_resource_context_create(0);
+        assert!(zero_result.error.is_null());
+        let zero_stream = read_stream_with_resources(table, zero_result.context);
+        paimon_resource_context_free(zero_result.context);
+        let rejected = paimon_record_batch_reader_next(zero_stream);
+        assert!(!rejected.error.is_null());
+        assert_eq!(
+            (*rejected.error).code,
+            PaimonErrorCode::ResourceExhausted as i32
+        );
+        paimon_error_free(rejected.error);
+        paimon_record_batch_reader_free(zero_stream);
+
+        unwrap_table(table);
+    }
 }
 
 #[test]

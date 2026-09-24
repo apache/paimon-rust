@@ -428,6 +428,7 @@ unsafe fn new_read_builder_state(
 
     Ok(ReadBuilderState {
         table: resolved,
+        resources: None,
         projected_columns: None,
         filter: None,
         case_sensitive: true,
@@ -515,6 +516,32 @@ pub unsafe extern "C" fn paimon_table_new_read_builder_with_options(
 }
 
 // ======================= ReadBuilder ===============================
+
+/// Share a resource context with reads created from this builder.
+///
+/// The builder clones the context, so the caller may free its handle after this call.
+/// Passing null returns an error and leaves the builder unchanged.
+///
+/// # Safety
+/// `rb` must be a valid read builder handle, or null (returns error).
+/// `context` must be a valid resource context handle, or null (returns error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_read_builder_with_resources(
+    rb: *mut paimon_read_builder,
+    context: *const paimon_resource_context,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(rb, "rb") {
+        return error;
+    }
+    if let Err(error) = check_non_null(context, "context") {
+        return error;
+    }
+
+    let resources = &*((*context).inner as *const paimon::resource::ResourceContext);
+    let state = &mut *((*rb).inner as *mut ReadBuilderState);
+    state.resources = Some(resources.clone());
+    std::ptr::null_mut()
+}
 
 /// Free a paimon_read_builder.
 ///
@@ -710,6 +737,7 @@ pub unsafe extern "C" fn paimon_read_builder_new_read(
         Ok(table_read) => {
             let read_state = TableReadState {
                 table: state.table.clone(),
+                resources: state.resources.clone(),
                 read_type: table_read.read_type().to_vec(),
                 data_predicates: table_read.data_predicates().to_vec(),
             };
@@ -908,11 +936,14 @@ pub unsafe extern "C" fn paimon_table_read_to_arrow(
     let end = (offset.saturating_add(length)).min(all_splits.len());
     let selected = &all_splits[start..end];
 
-    let table_read = paimon::table::TableRead::new(
+    let mut table_read = paimon::table::TableRead::new(
         &state.table,
         state.read_type.clone(),
         state.data_predicates.clone(),
     );
+    if let Some(resources) = &state.resources {
+        table_read = table_read.with_resources(resources.clone());
+    }
 
     match table_read.to_arrow(selected) {
         Ok(stream) => {

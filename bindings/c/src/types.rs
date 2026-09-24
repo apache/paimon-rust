@@ -19,6 +19,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
+use paimon::resource::ResourceContext;
 use paimon::spec::{DataField, Predicate};
 use paimon::table::{
     CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableCommit,
@@ -200,9 +201,21 @@ pub struct paimon_read_builder {
     pub inner: *mut c_void,
 }
 
+#[repr(C)]
+pub struct paimon_resource_context {
+    pub inner: *mut c_void,
+}
+
+#[repr(C)]
+pub struct paimon_resource_metrics {
+    pub reserved_memory_bytes: usize,
+    pub peak_reserved_memory_bytes: usize,
+}
+
 /// Internal state for ReadBuilder that stores table, projection columns, and filter.
 pub(crate) struct ReadBuilderState {
     pub table: Table,
+    pub resources: Option<ResourceContext>,
     pub projected_columns: Option<Vec<String>>,
     pub filter: Option<Predicate>,
     pub case_sensitive: bool,
@@ -227,6 +240,7 @@ pub struct paimon_table_read {
 /// Internal state for TableRead that stores table, projected read type, and data predicates.
 pub(crate) struct TableReadState {
     pub table: Table,
+    pub resources: Option<ResourceContext>,
     pub read_type: Vec<DataField>,
     pub data_predicates: Vec<Predicate>,
 }

@@ -264,6 +264,56 @@ paimon_record_batch_reader_free(reader);
 paimon_table_read_free(read);
 ```
 
+### Shared Reader Memory Budget
+
+Create one resource context for reads that should share a reservation limit, then
+attach it to each read builder before calling `paimon_read_builder_new_read`:
+
+```c
+paimon_result_resource_context budget_result =
+    paimon_resource_context_create(64 * 1024 * 1024);
+CHECK_RESULT(budget_result);
+paimon_resource_context *budget = budget_result.context;
+
+paimon_error *error = paimon_read_builder_with_resources(read_builder, budget);
+if (error != NULL) {
+    paimon_error_free(error);
+    paimon_resource_context_free(budget);
+    goto cleanup;
+}
+
+/* Create and consume readers from read_builder here. */
+
+paimon_resource_metrics metrics;
+error = paimon_resource_context_metrics(budget, &metrics);
+if (error != NULL) {
+    paimon_error_free(error);
+    paimon_resource_context_free(budget);
+    goto cleanup;
+}
+printf("current=%zu peak=%zu\n",
+       metrics.reserved_memory_bytes,
+       metrics.peak_reserved_memory_bytes);
+
+paimon_resource_context_free(budget);
+```
+
+The builder clones the context, and each read stream retains its own clone.
+The caller may free the context handle after attaching it to the builder; keep
+the handle until after reading if metrics are needed. Reusing one context across
+builders makes their reservations compete for the same limit. A zero-byte limit
+rejects nonempty reservations. Admission failure is reported with
+`ResourceExhausted` (error code `6`), often from
+`paimon_record_batch_reader_next` when the stream actually reads data.
+
+`reserved_memory_bytes` is the current outstanding reservation total;
+`peak_reserved_memory_bytes` is the highest total reached by this context and
+does not reset when streams end. After all streams using a context are freed,
+the current total returns to zero. These counters track estimated reader
+working memory, including projected Parquet row groups. They are not process
+allocation or RSS measurements. Returned Arrow batches retained by the caller
+are not charged to the reader context.
+
 `paimon_table_read_to_arrow` accepts an `offset` and `length`, so separate
 workers can process disjoint contiguous ranges of the same plan. The requested
 range is clamped to the number of available splits.
