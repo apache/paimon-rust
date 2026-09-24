@@ -1925,13 +1925,24 @@ unsafe fn build_leaf_predicate_datums(
 
 /// Combine two predicates with AND. Consumes both inputs.
 ///
+/// If either input is null — e.g. forwarded straight from a leaf constructor
+/// that failed and returned a null predicate — both inputs are freed and null
+/// is returned instead of dereferencing the null pointer (which is undefined
+/// behavior and crashes the host). This mirrors the null tolerance of
+/// `paimon_predicate_free` and `paimon_read_builder_with_filter`.
+///
 /// # Safety
-/// `a` and `b` must be valid pointers from predicate functions.
+/// `a` and `b` must each be a valid pointer from a predicate function, or null.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_and(
     a: *mut paimon_predicate,
     b: *mut paimon_predicate,
 ) -> *mut paimon_predicate {
+    if a.is_null() || b.is_null() {
+        paimon_predicate_free(a);
+        paimon_predicate_free(b);
+        return std::ptr::null_mut();
+    }
     let pred_a = *Box::from_raw(Box::from_raw(a).inner as *mut Predicate);
     let pred_b = *Box::from_raw(Box::from_raw(b).inner as *mut Predicate);
     let combined = Predicate::and(vec![pred_a, pred_b]);
@@ -1941,13 +1952,24 @@ pub unsafe extern "C" fn paimon_predicate_and(
 
 /// Combine two predicates with OR. Consumes both inputs.
 ///
+/// If either input is null — e.g. forwarded straight from a leaf constructor
+/// that failed and returned a null predicate — both inputs are freed and null
+/// is returned instead of dereferencing the null pointer (which is undefined
+/// behavior and crashes the host). This mirrors the null tolerance of
+/// `paimon_predicate_free` and `paimon_read_builder_with_filter`.
+///
 /// # Safety
-/// `a` and `b` must be valid pointers from predicate functions.
+/// `a` and `b` must each be a valid pointer from a predicate function, or null.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_or(
     a: *mut paimon_predicate,
     b: *mut paimon_predicate,
 ) -> *mut paimon_predicate {
+    if a.is_null() || b.is_null() {
+        paimon_predicate_free(a);
+        paimon_predicate_free(b);
+        return std::ptr::null_mut();
+    }
     let pred_a = *Box::from_raw(Box::from_raw(a).inner as *mut Predicate);
     let pred_b = *Box::from_raw(Box::from_raw(b).inner as *mut Predicate);
     let combined = Predicate::or(vec![pred_a, pred_b]);
@@ -1957,10 +1979,18 @@ pub unsafe extern "C" fn paimon_predicate_or(
 
 /// Negate a predicate with NOT. Consumes the input.
 ///
+/// If the input is null — e.g. forwarded straight from a leaf constructor that
+/// failed and returned a null predicate — null is returned instead of
+/// dereferencing the null pointer (which is undefined behavior and crashes the
+/// host). This mirrors the null tolerance of `paimon_predicate_free`.
+///
 /// # Safety
-/// `p` must be a valid pointer from a predicate function.
+/// `p` must be a valid pointer from a predicate function, or null.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_not(p: *mut paimon_predicate) -> *mut paimon_predicate {
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
     let pred = *Box::from_raw(Box::from_raw(p).inner as *mut Predicate);
     let negated = Predicate::negate(pred);
     let inner = Box::into_raw(Box::new(negated)) as *mut c_void;

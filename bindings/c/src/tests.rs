@@ -1410,6 +1410,57 @@ fn test_predicate_and_or_not() {
     unsafe { unwrap_table(handle) };
 }
 
+#[test]
+fn test_predicate_combinators_reject_null_without_crashing() {
+    // Leaf constructors return a null predicate on error (bad column, bad
+    // UTF-8, bad datum). Forwarding that null into a combinator must not
+    // dereference it: before the null guards these calls were UB / a host
+    // crash. Now they free any non-null sibling (honoring "consumes both
+    // inputs") and return null.
+    let path = "memory:/test_predicate_null_combinators";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        // Both-null: no dereference, null out.
+        assert!(paimon_predicate_and(ptr::null_mut(), ptr::null_mut()).is_null());
+        assert!(paimon_predicate_or(ptr::null_mut(), ptr::null_mut()).is_null());
+        assert!(paimon_predicate_not(ptr::null_mut()).is_null());
+
+        let col = CString::new("id").unwrap();
+        let mk_datum = || paimon_datum {
+            tag: 3,
+            int_val: 1,
+            double_val: 0.0,
+            str_data: ptr::null(),
+            str_len: 0,
+            int_val2: 0,
+            uint_val: 0,
+            uint_val2: 0,
+        };
+
+        // One-null: the valid sibling is consumed (freed) and null returned.
+        // Do not free the survivor again — the combinator already did.
+        let p = paimon_predicate_greater_than(handle, col.as_ptr(), mk_datum());
+        assert!(p.error.is_null() && !p.predicate.is_null());
+        assert!(paimon_predicate_and(p.predicate, ptr::null_mut()).is_null());
+
+        let p2 = paimon_predicate_greater_than(handle, col.as_ptr(), mk_datum());
+        assert!(p2.error.is_null() && !p2.predicate.is_null());
+        assert!(paimon_predicate_or(ptr::null_mut(), p2.predicate).is_null());
+    }
+
+    unsafe { unwrap_table(handle) };
+}
+
 // =========================================================================
 //  Write path tests
 // =========================================================================
