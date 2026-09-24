@@ -758,6 +758,7 @@ impl RESTServer {
         // Create table response
         let response = GetTableResponse::new(
             Some(table_name.clone()),
+            Some(db.clone()),
             Some(table_name),
             None,
             Some(true),
@@ -1620,6 +1621,7 @@ impl RESTServer {
             // Update the table name in response and insert at new location
             let new_table_response = GetTableResponse::new(
                 Some(request.destination.object().to_string()),
+                Some(request.destination.database().to_string()),
                 Some(request.destination.object().to_string()),
                 table_response.path,
                 table_response.is_external,
@@ -1682,6 +1684,7 @@ impl RESTServer {
         s.tables.entry(key).or_insert_with(|| {
             GetTableResponse::new(
                 Some(table.to_string()),
+                Some(database.to_string()),
                 Some(table.to_string()),
                 None,
                 Some(true),
@@ -1818,6 +1821,7 @@ impl RESTServer {
             key,
             GetTableResponse::new(
                 Some(table.to_string()),
+                Some(database.to_string()),
                 Some(table.to_string()),
                 Some(path.to_string()),
                 Some(true),

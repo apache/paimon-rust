@@ -461,6 +461,7 @@ async fn get_table(path: RestPath, Extension(state): Extension<Arc<AppState>>) -
         // FileSystemCatalog has no UUID concept; the full name is a stable id
         // that satisfies the client's RESTEnv requirement.
         Some(identifier.full_name()),
+        Some(identifier.database().to_string()),
         Some(table),
         Some(location),
         Some(false),

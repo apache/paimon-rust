@@ -194,3 +194,121 @@ def test_catalog_schema_copy_validates_branch_and_structure(resolved_source):
     schema["fields"][1]["id"] = schema["fields"][0]["id"]
     with pytest.raises(ValueError):
         table.copy_with_resolved_schema(json.dumps(schema))
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("object_name", ["t", "t$branch_main", "t$branch_dev"])
+def test_resolved_rest_response_keeps_snapshot_and_token_refresh(
+    resolved_source, external, object_name
+):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    root, schema = resolved_source
+    snapshot = json.loads((root / "snapshot" / "snapshot-1").read_text())
+    requests = []
+    token_requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            if self.path.endswith('/token'):
+                token_requests.append(self.path)
+                # Expire the first token to verify that subsequent FileIO refreshes it.
+                response = {"token": {}, "expiresAtMillis": (
+                    0 if len(token_requests) == 1 else 4102444800000)}
+            elif self.path.endswith('/snapshot'):
+                # Disk has snapshot 2; REST snapshot 1 must remain authoritative.
+                response = {"snapshot": {"snapshot": snapshot}}
+            else:
+                self.send_error(500, "Unexpected metadata request")
+                return
+            body = json.dumps(response).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # PyPaimon and older REST servers do not include `database`.
+        response = {"id": "table-uuid", "name": object_name, "path": str(root),
+                    "isExternal": external, "schemaId": schema['id'], "schema": schema}
+        table = Table.from_rest_response(
+            json.dumps(response),
+            database='db',
+            table=object_name,
+            rest_options={
+                'uri': 'http://127.0.0.1:%d' % server.server_port,
+                'warehouse': 'test', 'token.provider': 'bear', 'token': 'test-token',
+                'data-token.enabled': 'true',
+            },
+        )
+        expected_branch = (
+            object_name.split('$branch_', 1)[-1]
+            if '$branch_' in object_name else 'main'
+        )
+        assert table.branch() == expected_branch
+        if '$branch_' in object_name:
+            with pytest.raises(NotImplementedError, match='Writing to Paimon branch'):
+                table.new_batch_write_builder().new_write()
+        assert len(token_requests) == (0 if external else 1)
+        assert all(path.endswith('/token') for path in requests)
+        assert _read(table) == (1, [{'id': 1, 'name': 'a'}])
+        assert all(path.endswith(('/token', '/snapshot')) for path in requests)
+        encoded_name = object_name.replace('$', '%24')
+        assert any(path.endswith(
+            f'/databases/db/tables/{encoded_name}/snapshot') for path in requests)
+        assert len(token_requests) == (0 if external else 2)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize(("database", "table"), [("db", "wrong"), ("wrong", "t")])
+def test_resolved_rest_response_rejects_identity_mismatch(resolved_source, database, table):
+    root, schema = resolved_source
+    response = {"id": "table-uuid", "database": "db", "name": "t", "path": str(root),
+                "isExternal": True, "schemaId": schema["id"], "schema": schema}
+    # Identity validation must run before REST auth/cache initialization.
+    with pytest.raises(ValueError, match="does not match requested identifier"):
+        Table.from_rest_response(
+            json.dumps(response), database=database, table=table, rest_options={})
+
+
+@pytest.mark.parametrize(("change", "message"), [
+    ("duplicate_id", "duplicate field id"),
+    ("missing_primary_key", "primary key"),
+    ("missing_partition_key", "partition fields"),
+])
+def test_resolved_rest_response_validates_schema_structure(resolved_source, change, message):
+    root, schema = resolved_source
+    if change == "duplicate_id":
+        schema["fields"][1]["id"] = schema["fields"][0]["id"]
+    elif change == "missing_primary_key":
+        schema["primaryKeys"] = ["missing"]
+    else:
+        schema["partitionKeys"] = ["missing"]
+    response = {"id": "table-uuid", "database": "db", "name": "t", "path": str(root),
+                "isExternal": True, "schemaId": schema["id"], "schema": schema}
+    with pytest.raises(ValueError, match=message):
+        Table.from_rest_response(json.dumps(response), database="db", table="t", rest_options={
+            "uri": "http://127.0.0.1:1", "warehouse": "test",
+            "token.provider": "bear", "token": "test-token",
+        })
+
+
+@pytest.mark.parametrize('response', ['{', '{}'])
+def test_resolved_rest_response_rejects_missing_metadata(response):
+    with pytest.raises(ValueError):
+        Table.from_rest_response(response, database='db', table='t', rest_options={
+            'uri': 'http://127.0.0.1:1', 'warehouse': 'test',
+            'token.provider': 'bear', 'token': 'test-token',
+        })

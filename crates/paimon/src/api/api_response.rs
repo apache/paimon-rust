@@ -140,6 +140,8 @@ pub struct GetTableResponse {
     pub audit: AuditRESTResponse,
     /// The unique identifier of the table.
     pub id: Option<String>,
+    /// The database containing the table.
+    pub database: Option<String>,
     /// The name of the table.
     pub name: Option<String>,
     /// The path to the table.
@@ -242,6 +244,7 @@ impl GetTableResponse {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: Option<String>,
+        database: Option<String>,
         name: Option<String>,
         path: Option<String>,
         is_external: Option<bool>,
@@ -252,6 +255,7 @@ impl GetTableResponse {
         Self {
             audit,
             id,
+            database,
             name,
             path,
             is_external,

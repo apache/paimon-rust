@@ -20,15 +20,50 @@
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
 use crate::catalog::{Identifier, RESTTokenFileIO};
-use crate::common::Options;
+use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
-use crate::io::cache::LocalCache;
+use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
 use crate::io::FileIO;
 use crate::spec::{CoreOptions, TableSchema, PATH_OPTION};
 use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
 use crate::table::{ObjectTable, Table};
 use crate::Result;
 use std::sync::Arc;
+
+impl Table {
+    /// Reuse the matching REST response and merged catalog options without config/get-table requests.
+    /// Preserves REST snapshots, credential refresh and local caching.
+    pub async fn from_rest_response(
+        identifier: Identifier,
+        response: crate::api::GetTableResponse,
+        rest_options: Options,
+    ) -> Result<Self> {
+        identifier.validate()?;
+        // Reject a stale or misrouted response before initializing auth or local-cache resources.
+        response_identifier(&identifier, &response)?;
+        rest_options
+            .get(CatalogOptions::WAREHOUSE)
+            .ok_or_else(|| RestError::BadRequest {
+                message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
+            })?;
+        let api = Arc::new(RESTApi::new(rest_options.clone(), false).await?);
+        let data_token_enabled = api
+            .options()
+            .get(CatalogOptions::DATA_TOKEN_ENABLED)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let local_cache = create_local_cache_with_namespace(&rest_options, api.options())?;
+        RESTEnv::build_table(
+            &identifier,
+            response,
+            api,
+            rest_options,
+            data_token_enabled,
+            local_cache,
+        )
+        .await
+    }
+}
 
 /// REST environment that holds the REST API client, identifier, and uuid
 /// needed to create a `RESTSnapshotCommit`.
@@ -143,6 +178,7 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
     ) -> Result<Table> {
+        let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
             message: format!("Table {} response missing schema", identifier.full_name()),
             source: None,
@@ -180,6 +216,7 @@ impl RESTEnv {
                 table_path.clone(),
             )]));
         }
+        table_schema.validate_resolved_structure()?;
 
         let is_external = response.is_external.ok_or_else(|| Error::DataInvalid {
             message: format!(
@@ -188,7 +225,7 @@ impl RESTEnv {
             ),
             source: None,
         })?;
-        validate_catalog_managed_format_table(identifier, &table_schema, is_external)?;
+        validate_catalog_managed_format_table(&identifier, &table_schema, is_external)?;
 
         let uuid = response.id.ok_or_else(|| Error::DataInvalid {
             message: format!(
@@ -199,7 +236,7 @@ impl RESTEnv {
         })?;
 
         let file_io = Self::build_file_io(
-            identifier,
+            &identifier,
             &table_path,
             api.clone(),
             &options,
@@ -217,14 +254,20 @@ impl RESTEnv {
             data_token_enabled,
             local_cache,
         );
-
-        Ok(Table::new(
+        let parsed_identifier = identifier.parsed_object_name()?;
+        let branch = parsed_identifier.branch_or_default().to_string();
+        let branch_reference = parsed_identifier.branch().is_some();
+        let table = Table::new(
             file_io,
-            identifier.clone(),
+            identifier,
             table_path,
             table_schema,
             Some(rest_env),
-        ))
+        );
+
+        let mut table = table.copy_with_resolved_schema(table.schema().clone(), &branch)?;
+        table.branch_reference = branch_reference;
+        Ok(table)
     }
 
     pub(crate) async fn build_object_table(
@@ -235,6 +278,7 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
     ) -> Result<ObjectTable> {
+        let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
             message: format!("Table {} response missing schema", identifier.full_name()),
             source: None,
@@ -260,6 +304,7 @@ impl RESTEnv {
         let mut schema_options = schema.options().clone();
         schema_options.insert(PATH_OPTION.to_string(), object_path.clone());
         let table_schema = TableSchema::new(schema_id, &schema).copy_with_options(schema_options);
+        table_schema.validate_resolved_structure()?;
         let is_external = response.is_external.ok_or_else(|| Error::DataInvalid {
             message: format!(
                 "Table {} response missing is_external",
@@ -269,7 +314,7 @@ impl RESTEnv {
         })?;
 
         let file_io = Self::build_file_io(
-            identifier,
+            &identifier,
             &object_path,
             api,
             &options,
@@ -279,7 +324,7 @@ impl RESTEnv {
         )
         .await?;
 
-        ObjectTable::try_new(file_io, identifier.clone(), &table_schema)
+        ObjectTable::try_new(file_io, identifier, &table_schema)
     }
 
     async fn build_file_io(
@@ -315,11 +360,13 @@ impl RESTEnv {
         &self,
         branch: &str,
     ) -> Result<Option<crate::spec::Snapshot>> {
-        let object = self.identifier.parsed_object_name()?.table().to_string();
-        let object = if branch == crate::catalog::DEFAULT_MAIN_BRANCH {
-            object
+        let parsed_identifier = self.identifier.parsed_object_name()?;
+        let object = if parsed_identifier.branch() == Some(branch) {
+            format!("{}$branch_{branch}", parsed_identifier.table())
+        } else if branch == crate::catalog::DEFAULT_MAIN_BRANCH {
+            parsed_identifier.table().to_string()
         } else {
-            format!("{object}$branch_{branch}")
+            format!("{}$branch_{branch}", parsed_identifier.table())
         };
         let identifier = Identifier::new(self.identifier.database(), object);
         match self.api.load_snapshot(&identifier).await {
@@ -339,6 +386,33 @@ impl RESTEnv {
             self.uuid.clone(),
         ))
     }
+}
+
+fn response_identifier(
+    requested: &Identifier,
+    response: &crate::api::GetTableResponse,
+) -> Result<Identifier> {
+    let database = response
+        .database
+        .as_deref()
+        .unwrap_or_else(|| requested.database());
+    let name = response.name.as_deref().ok_or_else(|| Error::DataInvalid {
+        message: format!("Table response for database '{database}' missing name"),
+        source: None,
+    })?;
+    let identifier = Identifier::new(database, name);
+    identifier.validate()?;
+    if &identifier != requested {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Table response identifier '{}' does not match requested identifier '{}'",
+                identifier.full_name(),
+                requested.full_name()
+            ),
+            source: None,
+        });
+    }
+    Ok(identifier)
 }
 
 /// Refuse a Format Table that asks for catalog-managed partitions it cannot have: an engine
