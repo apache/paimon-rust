@@ -1039,12 +1039,14 @@ fn array_from_values(values: &[Option<ShreddedValue>], data_type: &DataType) -> 
     }
 }
 
+/// `ShreddedValue::Timestamp` is micros (Variant type ids 12/13; the nanos forms, 18/19,
+/// are not decoded yet). Scale it to the leaf's unit; lossy conversions floor.
 fn timestamp_array(
     values: &[Option<ShreddedValue>],
     precision: u32,
     tz: Option<&str>,
 ) -> Result<ArrayRef> {
-    let values = values
+    let micros = values
         .iter()
         .map(|value| match value {
             Some(ShreddedValue::Timestamp(v)) => Some(*v),
@@ -1052,10 +1054,44 @@ fn timestamp_array(
         })
         .collect::<Vec<_>>();
     Ok(match precision {
-        0 => Arc::new(TimestampSecondArray::from(values).with_timezone_opt(tz)),
-        1..=3 => Arc::new(TimestampMillisecondArray::from(values).with_timezone_opt(tz)),
-        4..=6 => Arc::new(TimestampMicrosecondArray::from(values).with_timezone_opt(tz)),
-        _ => Arc::new(TimestampNanosecondArray::from(values).with_timezone_opt(tz)),
+        0 => {
+            let seconds = micros
+                .into_iter()
+                .map(|v| v.map(|v| v.div_euclid(1_000_000)))
+                .collect::<Vec<_>>();
+            Arc::new(TimestampSecondArray::from(seconds).with_timezone_opt(tz))
+        }
+        1..=3 => {
+            let millis = micros
+                .into_iter()
+                .map(|v| v.map(|v| v.div_euclid(1_000)))
+                .collect::<Vec<_>>();
+            Arc::new(TimestampMillisecondArray::from(millis).with_timezone_opt(tz))
+        }
+        4..=6 => Arc::new(TimestampMicrosecondArray::from(micros).with_timezone_opt(tz)),
+        _ => {
+            // The spec-conforming answer for a value the leaf cannot hold is to leave
+            // `typed_value` null and keep the variant in `value`, as `try_typed_shred`
+            // does (`crate::variant`, `cast_shredded_ref`). That decision is already made
+            // by the time this runs, and it needs `VariantScalarSchema::Timestamp` to
+            // carry precision, so error instead of writing a wrapped value.
+            let nanos = micros
+                .into_iter()
+                .map(|value| {
+                    value
+                        .map(|v| {
+                            v.checked_mul(1_000).ok_or_else(|| Error::DataInvalid {
+                                message: format!(
+                                    "Variant shredded timestamp {v} us exceeds nanosecond range"
+                                ),
+                                source: None,
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Arc::new(TimestampNanosecondArray::from(nanos).with_timezone_opt(tz))
+        }
     })
 }
 
@@ -1260,20 +1296,39 @@ fn value_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Optio
     })
 }
 
+/// Keys off the array's own unit, never the declared precision, so a file written by
+/// another engine decodes from its own schema. Truncation floors, like the write side.
 fn timestamp_value_at(array: &dyn Array, row: usize) -> Result<i64> {
     match array.data_type() {
         ArrowDataType::Timestamp(TimeUnit::Second, _) => {
-            Ok(downcast_array::<TimestampSecondArray>(array, "TimestampS")?.value(row))
+            let seconds = downcast_array::<TimestampSecondArray>(array, "TimestampS")?.value(row);
+            seconds
+                .checked_mul(1_000_000)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "Variant shredded timestamp {seconds} s exceeds microsecond range"
+                    ),
+                    source: None,
+                })
         }
         ArrowDataType::Timestamp(TimeUnit::Millisecond, _) => {
-            Ok(downcast_array::<TimestampMillisecondArray>(array, "TimestampMs")?.value(row))
+            let millis =
+                downcast_array::<TimestampMillisecondArray>(array, "TimestampMs")?.value(row);
+            millis.checked_mul(1_000).ok_or_else(|| Error::DataInvalid {
+                message: format!(
+                    "Variant shredded timestamp {millis} ms exceeds microsecond range"
+                ),
+                source: None,
+            })
         }
         ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => {
             Ok(downcast_array::<TimestampMicrosecondArray>(array, "TimestampUs")?.value(row))
         }
-        ArrowDataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            Ok(downcast_array::<TimestampNanosecondArray>(array, "TimestampNs")?.value(row))
-        }
+        ArrowDataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(downcast_array::<
+            TimestampNanosecondArray,
+        >(array, "TimestampNs")?
+        .value(row)
+        .div_euclid(1_000)),
         other => Err(Error::DataInvalid {
             message: format!("Unsupported Variant shredded timestamp array: {other:?}"),
             source: None,
@@ -1340,7 +1395,13 @@ fn null_buffer(validities: Vec<bool>) -> NullBuffer {
 mod tests {
     use super::*;
     use crate::arrow::variant_arrow_type;
-    use crate::spec::{variant_extraction_row, BlobType, IntType, VarCharType, VariantType};
+    use crate::spec::{
+        variant_extraction_row, BlobType, IntType, LocalZonedTimestampType, TimestampType,
+        VarCharType, VariantType,
+    };
+
+    /// Micros with a non-zero sub-millisecond tail, so a millis conversion is observable.
+    const SHRED_US: i64 = 1_700_000_000_123_456;
 
     fn variant_array_for_test(values: &[GenericVariant]) -> ArrayRef {
         let value_items = values
@@ -1707,6 +1768,178 @@ mod tests {
                 .unwrap()
                 .field(0)
                 .data_type()
+        );
+    }
+
+    #[test]
+    fn shredded_timestamp_write_truncates_to_millis_below_precision_four() {
+        let data_type = DataType::Timestamp(TimestampType::new(3).unwrap());
+        let array =
+            array_from_values(&[Some(ShreddedValue::Timestamp(SHRED_US))], &data_type).unwrap();
+        let millis = array
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("precision 3 shreds into a MILLIS leaf");
+        assert_eq!(millis.value(0), 1_700_000_000_123);
+    }
+
+    #[test]
+    fn shredded_timestamp_write_scales_to_nanos_above_precision_six() {
+        let data_type = DataType::Timestamp(TimestampType::new(9).unwrap());
+        let array =
+            array_from_values(&[Some(ShreddedValue::Timestamp(SHRED_US))], &data_type).unwrap();
+        let nanos = array
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("precision 9 shreds into a NANOS leaf");
+        assert_eq!(nanos.value(0), 1_700_000_000_123_456_000);
+    }
+
+    #[test]
+    fn shredded_timestamp_read_scales_a_millis_leaf_to_micros() {
+        let data_type = DataType::Timestamp(TimestampType::new(3).unwrap());
+        let array = TimestampMillisecondArray::from(vec![1_700_000_000_123i64]);
+        assert_eq!(
+            value_at(&array, 0, &data_type).unwrap(),
+            Some(ShreddedValue::Timestamp(1_700_000_000_123_000))
+        );
+    }
+
+    #[test]
+    fn shredded_timestamp_read_truncates_a_nanos_leaf_to_micros() {
+        let data_type = DataType::Timestamp(TimestampType::new(9).unwrap());
+        let array = TimestampNanosecondArray::from(vec![1_700_000_000_123_456_789i64]);
+        assert_eq!(
+            value_at(&array, 0, &data_type).unwrap(),
+            Some(ShreddedValue::Timestamp(1_700_000_000_123_456))
+        );
+    }
+
+    /// Both conversions floor, so a pre-epoch value must not round toward zero.
+    #[test]
+    fn shredded_timestamp_conversions_floor_for_pre_epoch_values() {
+        let millis_type = DataType::Timestamp(TimestampType::new(3).unwrap());
+        let array = array_from_values(&[Some(ShreddedValue::Timestamp(-1))], &millis_type).unwrap();
+        let millis = array
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(millis.value(0), -1);
+
+        let nanos_type = DataType::Timestamp(TimestampType::new(9).unwrap());
+        let array = TimestampNanosecondArray::from(vec![-1_500i64]);
+        assert_eq!(
+            value_at(&array, 0, &nanos_type).unwrap(),
+            Some(ShreddedValue::Timestamp(-2))
+        );
+    }
+
+    #[test]
+    fn shredded_local_zoned_timestamp_converts_and_keeps_utc() {
+        let data_type = DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap());
+        let array =
+            array_from_values(&[Some(ShreddedValue::Timestamp(SHRED_US))], &data_type).unwrap();
+        let millis = array
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("precision 3 shreds into a MILLIS leaf");
+        assert_eq!(millis.value(0), 1_700_000_000_123);
+        assert_eq!(millis.timezone(), Some("UTC"));
+    }
+
+    #[test]
+    fn shredded_timestamp_write_rejects_a_nanosecond_overflow() {
+        let data_type = DataType::Timestamp(TimestampType::new(9).unwrap());
+        let too_large = i64::MAX / 1_000 + 1;
+        let err = array_from_values(&[Some(ShreddedValue::Timestamp(too_large))], &data_type)
+            .expect_err("micros past 2262 cannot be scaled to nanoseconds");
+        assert!(
+            err.to_string().contains("exceeds nanosecond range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn shredded_timestamp_read_rejects_a_microsecond_overflow() {
+        let data_type = DataType::Timestamp(TimestampType::new(3).unwrap());
+        let array = TimestampMillisecondArray::from(vec![i64::MAX]);
+        let err = value_at(&array, 0, &data_type)
+            .expect_err("millis at i64::MAX cannot be scaled to microseconds");
+        assert!(
+            err.to_string().contains("exceeds microsecond range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn shredded_timestamp_write_truncates_to_seconds_at_precision_zero() {
+        // #884 exposes TIMESTAMP(0) as an Arrow SECOND leaf; the micros shred floors to it.
+        let data_type = DataType::Timestamp(TimestampType::new(0).unwrap());
+        let array =
+            array_from_values(&[Some(ShreddedValue::Timestamp(SHRED_US))], &data_type).unwrap();
+        let seconds = array
+            .as_any()
+            .downcast_ref::<TimestampSecondArray>()
+            .expect("precision 0 shreds into a SECOND leaf");
+        assert_eq!(seconds.value(0), 1_700_000_000);
+    }
+
+    #[test]
+    fn shredded_timestamp_read_scales_a_seconds_leaf_to_micros() {
+        let data_type = DataType::Timestamp(TimestampType::new(0).unwrap());
+        let array = TimestampSecondArray::from(vec![1_700_000_000i64]);
+        assert_eq!(
+            value_at(&array, 0, &data_type).unwrap(),
+            Some(ShreddedValue::Timestamp(1_700_000_000_000_000))
+        );
+    }
+
+    #[test]
+    fn shredded_local_zoned_timestamp_precision_zero_keeps_utc() {
+        let data_type = DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(0).unwrap());
+        let array =
+            array_from_values(&[Some(ShreddedValue::Timestamp(SHRED_US))], &data_type).unwrap();
+        let seconds = array
+            .as_any()
+            .downcast_ref::<TimestampSecondArray>()
+            .expect("precision 0 shreds into a SECOND leaf");
+        assert_eq!(seconds.value(0), 1_700_000_000);
+        assert_eq!(seconds.timezone(), Some("UTC"));
+    }
+
+    #[test]
+    fn shredded_timestamp_read_rejects_a_second_leaf_overflow() {
+        // A SECOND leaf scaled to micros can overflow where the millis/nanos legs cannot.
+        let data_type = DataType::Timestamp(TimestampType::new(0).unwrap());
+        let array = TimestampSecondArray::from(vec![i64::MAX]);
+        let err = value_at(&array, 0, &data_type)
+            .expect_err("seconds at i64::MAX cannot be scaled to microseconds");
+        assert!(
+            err.to_string().contains("exceeds microsecond range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Migration fixture. Before this fix, a shredded TIMESTAMP(1..=3)/(7..=9) leaf held the
+    /// raw micros value under a MILLIS/NANOS Arrow annotation, and the reader passed it
+    /// through unscaled, so a file round-tripped inside one paimon-rust version. This is the
+    /// pre-fix on-disk shape: micros stored in a MILLIS leaf. The scaling reader now trusts
+    /// the annotation and multiplies, so the value comes back 1000x too large.
+    ///
+    /// **Policy: this is a deliberate, documented breaking change.** The leaves carry no
+    /// marker distinguishing a pre-fix file from a conforming one, so a legacy read mode is
+    /// not implementable; shredded-timestamp columns written at precision outside 4..=6 by a
+    /// paimon-rust release that predates this fix (the write path shipped in v0.3.0 and
+    /// v0.4.0-rc1) must be rewritten. Variant shredding is pre-1.0 and experimental.
+    #[test]
+    fn pre_fix_old_writer_micros_under_millis_leaf_is_now_reinterpreted() {
+        let data_type = DataType::Timestamp(TimestampType::new(3).unwrap());
+        // What an old writer stored for micros SHRED_US: the raw micros in a MILLIS leaf.
+        let old_file_leaf = TimestampMillisecondArray::from(vec![SHRED_US]);
+        assert_eq!(
+            value_at(&old_file_leaf, 0, &data_type).unwrap(),
+            // 1000x the intended SHRED_US: the documented cost of trusting the annotation.
+            Some(ShreddedValue::Timestamp(SHRED_US * 1_000))
         );
     }
 }
