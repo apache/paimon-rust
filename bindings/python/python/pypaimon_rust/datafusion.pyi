@@ -59,6 +59,14 @@ class Plan:
 class TableScan:
     def with_row_position_slice(self, start: int, end: int) -> "TableScan": ...
     def with_row_position_shard(self, index: int, count: int) -> "TableScan": ...
+    def with_chunk_shuffle(self, seed: str, chunk_size: int) -> "TableScan":
+        """Deterministically shuffle fixed-live-row chunks. ``seed`` is a decimal
+        integer string so arbitrarily large seeds keep Python ``random.Random``
+        semantics."""
+        ...
+    def with_shard(self, index: int, count: int) -> "TableScan":
+        """Select one balanced worker shard (``index`` of ``count``) for a distributed scan."""
+        ...
     def plan(self) -> Plan: ...
 
 class RecordBatchReader:
@@ -77,6 +85,10 @@ class TableRead:
 
 class ReadBuilder:
     def with_projection(self, columns: List[str]) -> "ReadBuilder": ...
+    def with_nested_projection(self, paths: List[List[str]]) -> "ReadBuilder":
+        """Project top-level fields or nested ROW leaves by exact name paths. A MAP
+        path keeps the complete MAP so the caller can extract literal keys."""
+        ...
     def with_case_sensitive(self, case_sensitive: bool) -> "ReadBuilder":
         """
         Set whether column-name matching (projection and predicate column
