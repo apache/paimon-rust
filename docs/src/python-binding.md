@@ -159,7 +159,8 @@ batches = rb.new_read().read(plan.splits())
 
 The range is `(start_snapshot_id, end_snapshot_id]`. The default `delta` mode
 uses APPEND delta manifests. Use `changelog` to read physical changelog
-manifests, or `auto` to follow the table's `incremental-between` option:
+manifests, or `auto` to follow the table's `changelog-producer` option
+(`delta` when it is `none`, otherwise `changelog`):
 
 ```python
 plan = rb.new_incremental_scan(2, 5, "changelog").plan()
