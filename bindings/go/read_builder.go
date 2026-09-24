@@ -45,6 +45,23 @@ func (rb *ReadBuilder) Close() {
 	})
 }
 
+// WithResources shares the context's reservation budget with reads from this builder.
+// The builder retains the context after the caller closes its handle.
+func (rb *ReadBuilder) WithResources(resources *ResourceContext) error {
+	if rb.inner == nil {
+		return ErrClosed
+	}
+	if resources == nil {
+		return errNilResourceContext
+	}
+	resources.mu.RLock()
+	defer resources.mu.RUnlock()
+	if resources.inner == nil {
+		return ErrClosed
+	}
+	return ffiReadBuilderWithResources.symbol(rb.ctx)(rb.inner, resources.inner)
+}
+
 // WithProjection sets column projection by name. Output order follows the
 // caller-specified order. A name that matches no schema column under any case
 // sensitivity is rejected immediately; case-dependent errors and duplicate names
@@ -193,6 +210,18 @@ var ffiReadBuilderWithProjection = newFFI(ffiOpts{
 			return parseError(ctx, errPtr)
 		}
 		return nil
+	}
+})
+
+var ffiReadBuilderWithResources = newFFI(ffiOpts{
+	sym:    "paimon_read_builder_with_resources",
+	rType:  &ffi.TypePointer,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonReadBuilder, *paimonResourceContext) error {
+	return func(builder *paimonReadBuilder, resources *paimonResourceContext) error {
+		var ffiError *paimonError
+		ffiCall(unsafe.Pointer(&ffiError), unsafe.Pointer(&builder), unsafe.Pointer(&resources))
+		return parseError(ctx, ffiError)
 	}
 })
 

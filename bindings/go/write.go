@@ -72,6 +72,23 @@ func (wb *WriteBuilder) Close() {
 	})
 }
 
+// WithResources shares the context's reservation budget with writers from this builder.
+// The builder retains the context after the caller closes its handle.
+func (wb *WriteBuilder) WithResources(resources *ResourceContext) error {
+	if wb.inner == nil {
+		return ErrClosed
+	}
+	if resources == nil {
+		return errNilResourceContext
+	}
+	resources.mu.RLock()
+	defer resources.mu.RUnlock()
+	if resources.inner == nil {
+		return ErrClosed
+	}
+	return ffiWriteBuilderWithResources.symbol(wb.ctx)(wb.inner, resources.inner)
+}
+
 // WithOverwrite enables overwrite mode for this builder's writers and committers.
 func (wb *WriteBuilder) WithOverwrite() error {
 	if wb.inner == nil {
