@@ -925,8 +925,18 @@ impl TableWrite {
 
     /// Close all writers and collect CommitMessages for use with TableCommit.
     /// Writers are cleared after this call, allowing the TableWrite to be reused.
+    ///
+    /// The per-bucket primary-key sequence cache is invalidated here too: it
+    /// memoizes `max_sequence_number + 1` scanned from the latest snapshot, which
+    /// this commit advances. Keeping it would make the next reuse cycle re-seed
+    /// from the pre-commit value and assign sequence numbers that overlap the
+    /// just-written files, so the highest-sequence-wins merge would silently drop
+    /// the newer rows -- Java's `MergeTreeWriter` advances its counter across
+    /// commits. (`sequence_snapshot` is pinned only by the postpone path, which
+    /// forbids reuse, so it is left untouched.)
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         self.ensure_active()?;
+        self.partition_seq_cache.clear();
         if self.file_index_options.is_some() {
             return self.prepare_indexed_append_commit().await;
         }
