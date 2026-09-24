@@ -25,6 +25,7 @@ mod catalog;
 mod error;
 mod file_io;
 mod identifier;
+mod resource;
 mod result;
 mod table;
 #[cfg(test)]

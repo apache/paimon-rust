@@ -35,12 +35,13 @@ var ErrClosed = errors.New("paimon: use of closed resource")
 type ErrorCode int32
 
 const (
-	CodeUnexpected   ErrorCode = 0
-	CodeUnsupported  ErrorCode = 1
-	CodeNotFound     ErrorCode = 2
-	CodeAlreadyExist ErrorCode = 3
-	CodeInvalidInput ErrorCode = 4
-	CodeIoError      ErrorCode = 5
+	CodeUnexpected        ErrorCode = 0
+	CodeUnsupported       ErrorCode = 1
+	CodeNotFound          ErrorCode = 2
+	CodeAlreadyExist      ErrorCode = 3
+	CodeInvalidInput      ErrorCode = 4
+	CodeIoError           ErrorCode = 5
+	CodeResourceExhausted ErrorCode = 6
 )
 
 func parseError(ctx context.Context, err *paimonError) error {

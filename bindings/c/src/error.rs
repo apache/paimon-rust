@@ -28,6 +28,7 @@ pub enum PaimonErrorCode {
     AlreadyExists = 3,
     InvalidInput = 4,
     IoError = 5,
+    ResourceExhausted = 6,
 }
 
 /// C-compatible error type.
@@ -64,6 +65,7 @@ impl paimon_error {
             | paimon::Error::DataInvalid { .. }
             | paimon::Error::IdentifierInvalid { .. } => PaimonErrorCode::InvalidInput,
             paimon::Error::IoUnexpected { .. } => PaimonErrorCode::IoError,
+            paimon::Error::ResourceExhausted { .. } => PaimonErrorCode::ResourceExhausted,
             _ => PaimonErrorCode::Unexpected,
         };
         Self::new(code, e.to_string())

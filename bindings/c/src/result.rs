@@ -97,6 +97,12 @@ pub struct paimon_result_read_builder {
 }
 
 #[repr(C)]
+pub struct paimon_result_resource_context {
+    pub context: *mut paimon_resource_context,
+    pub error: *mut paimon_error,
+}
+
+#[repr(C)]
 pub struct paimon_result_table_scan {
     pub scan: *mut paimon_table_scan,
     pub error: *mut paimon_error,
