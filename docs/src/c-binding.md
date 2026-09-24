@@ -707,6 +707,32 @@ Writing uses a **write-then-commit** flow:
 5. Pass the messages to `paimon_table_commit_commit`.
 6. Free the messages, writer, committer, and builder.
 
+### Shared Writer Memory Reservations
+
+Attach an optional resource context to each write builder before creating its
+writer. Use `paimon_write_builder_with_resources` for a standard builder or
+`paimon_postpone_fixed_bucket_write_builder_with_resources` for a postpone
+fixed-bucket builder. The same context can be attached to multiple builders,
+including read builders, so their reservations share one limit. Both write
+builder functions clone the context; the caller may free the original C handle
+after attaching it. Each created writer retains the context it needs even if
+its builder is freed.
+
+These functions return an error for a null builder or context and leave the
+builder unchanged. A zero-byte limit rejects nonempty reservations when writing
+or preparing a commit. The existing `ResourceExhausted` error code is `6`.
+Use `paimon_resource_context_metrics` while the C handle is available to read
+the current and peak reserved bytes. The current count returns to zero after
+all writers and readers holding reservations have released them; the peak count
+remains.
+
+This is a write memory reservation interface, not a limit on total process
+memory. The current write path charges retained key-value input batches and
+unflushed format-writer input batches. Sorting, encoding, transient routing
+batches, file indexes, caller-owned Arrow input, and allocation overhead are
+not fully charged. A reservation failure does not automatically flush or retry
+a writer; handle the error as a failed write operation.
+
 The input Arrow schema must match the table schema exactly, including field
 count, order, names, and types. A non-nullable table field must not contain null
 values.

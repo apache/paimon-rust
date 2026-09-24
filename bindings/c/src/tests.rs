@@ -1249,6 +1249,152 @@ fn test_read_resources_share_budget_and_release_reservations() {
 }
 
 #[test]
+fn test_write_builder_resources_reject_zero_budget_after_handle_free() {
+    let path = "memory:/test_write_builder_resources_zero";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let builder = paimon_table_new_write_builder(handle).write_builder;
+        let budget = paimon_resource_context_create(0).context;
+        assert!(paimon_write_builder_with_resources(builder, budget).is_null());
+        paimon_resource_context_free(budget);
+
+        let result = paimon_write_builder_new_write(builder);
+        assert!(result.error.is_null());
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![1], vec!["a"]));
+        let error = paimon_table_write_write_arrow_batch(
+            result.write,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(!error.is_null());
+        assert_eq!((*error).code, PaimonErrorCode::ResourceExhausted as i32);
+        paimon_error_free(error);
+
+        paimon_table_write_free(result.write);
+        paimon_write_builder_free(builder);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_write_builders_share_resource_budget() {
+    let path = "memory:/test_write_builders_share_resource_budget";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+    let value = "x".repeat(600_000);
+
+    unsafe {
+        let budget = paimon_resource_context_create(1_000_000).context;
+        let first_builder = paimon_table_new_write_builder(handle).write_builder;
+        let second_builder = paimon_table_new_write_builder(handle).write_builder;
+        assert!(paimon_write_builder_with_resources(first_builder, budget).is_null());
+        assert!(paimon_write_builder_with_resources(second_builder, budget).is_null());
+        let first = paimon_write_builder_new_write(first_builder);
+        let second = paimon_write_builder_new_write(second_builder);
+        assert!(first.error.is_null());
+        assert!(second.error.is_null());
+
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![1], vec![&value]));
+        assert!(paimon_table_write_write_arrow_batch(
+            first.write,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        )
+        .is_null());
+        let reserved = resource_metrics(budget).reserved_memory_bytes;
+        assert!(reserved > 0 && reserved <= 1_000_000);
+
+        let (array, schema) = export_batch_to_ffi(make_batch(vec![2], vec![&value]));
+        let error = paimon_table_write_write_arrow_batch(
+            second.write,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(!error.is_null());
+        assert_eq!((*error).code, PaimonErrorCode::ResourceExhausted as i32);
+        paimon_error_free(error);
+        assert_eq!(resource_metrics(budget).reserved_memory_bytes, reserved);
+
+        paimon_table_write_free(first.write);
+        assert_eq!(resource_metrics(budget).reserved_memory_bytes, 0);
+        paimon_table_write_free(second.write);
+        assert_eq!(resource_metrics(budget).reserved_memory_bytes, 0);
+        assert!(resource_metrics(budget).peak_reserved_memory_bytes >= reserved);
+        paimon_write_builder_free(first_builder);
+        paimon_write_builder_free(second_builder);
+        paimon_resource_context_free(budget);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
+fn test_postpone_fixed_bucket_write_builder_resources_reject_zero_budget() {
+    let path = "memory:/test_fixed_bucket_writer_resources_zero";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io,
+        Identifier::new("default", "test"),
+        path.to_string(),
+        partitioned_postpone_table_schema(),
+        None,
+    );
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe {
+        let budget = paimon_resource_context_create(0).context;
+        let builder = paimon_table_new_postpone_fixed_bucket_write_builder(handle).write_builder;
+        assert!(
+            paimon_postpone_fixed_bucket_write_builder_with_resources(builder, budget).is_null()
+        );
+        let (array, schema) =
+            export_batch_to_ffi(make_postpone_bucket_plan_batch(vec!["p"], vec![1]));
+        assert!(paimon_postpone_fixed_bucket_write_builder_with_bucket_plan(
+            builder,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        )
+        .is_null());
+        let result = paimon_postpone_fixed_bucket_write_builder_new_write(builder);
+        assert!(result.error.is_null());
+        let (array, schema) =
+            export_batch_to_ffi(make_partitioned_write_batch(vec!["p"], vec![1], vec!["a"]));
+        let error = paimon_postpone_fixed_bucket_table_write_write_arrow_batch(
+            result.write,
+            (&**array) as *const FFI_ArrowArray as *mut c_void,
+            (&**schema) as *const FFI_ArrowSchema as *mut c_void,
+        );
+        assert!(!error.is_null());
+        assert_eq!((*error).code, PaimonErrorCode::ResourceExhausted as i32);
+        paimon_error_free(error);
+
+        paimon_postpone_fixed_bucket_table_write_free(result.write);
+        assert_eq!(resource_metrics(budget).reserved_memory_bytes, 0);
+        paimon_postpone_fixed_bucket_write_builder_free(builder);
+        paimon_resource_context_free(budget);
+        unwrap_table(handle);
+    }
+}
+
+#[test]
 fn test_read_with_projection() {
     let path = "memory:/test_read_proj";
     let file_io = memory_file_io();
@@ -2686,6 +2832,15 @@ fn test_null_pointer_handling() {
         assert!(!result.error.is_null());
         assert!(result.write.is_null());
         paimon_error_free(result.error);
+
+        let error = paimon_write_builder_with_resources(ptr::null_mut(), ptr::null());
+        assert!(!error.is_null());
+        paimon_error_free(error);
+
+        let error =
+            paimon_postpone_fixed_bucket_write_builder_with_resources(ptr::null_mut(), ptr::null());
+        assert!(!error.is_null());
+        paimon_error_free(error);
 
         let result = paimon_write_builder_new_commit(ptr::null());
         assert!(!result.error.is_null());

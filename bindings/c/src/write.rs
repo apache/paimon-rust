@@ -22,6 +22,7 @@ use std::sync::Arc;
 use arrow_array::ffi::{from_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, StructArray};
 use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
+use paimon::resource::ResourceContext;
 use paimon::table::{PostponeBucketPlan, Table};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
@@ -60,6 +61,7 @@ unsafe fn new_write_builder(
             table: table_ref.clone(),
             commit_user,
             overwrite: false,
+            resources: None,
         },
         Err(error) => {
             return paimon_result_write_builder {
@@ -112,6 +114,7 @@ unsafe fn new_postpone_fixed_bucket_write_builder(
         commit_user,
         overwrite: false,
         bucket_plan: None,
+        resources: None,
     };
     let inner = Box::into_raw(Box::new(state)) as *mut c_void;
     paimon_result_postpone_fixed_bucket_write_builder {
@@ -235,6 +238,31 @@ pub unsafe extern "C" fn paimon_write_builder_with_overwrite(
     ptr::null_mut()
 }
 
+/// Share a resource context with writers created from this builder.
+/// The builder clones the context, so the caller may free its handle afterward.
+/// Passing null returns an error and leaves the builder unchanged.
+///
+/// # Safety
+/// `wb` must be a valid write builder handle, or null (returns error).
+/// `context` must be a valid resource context handle, or null (returns error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_write_builder_with_resources(
+    wb: *mut paimon_write_builder,
+    context: *const paimon_resource_context,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(wb, "wb") {
+        return error;
+    }
+    if let Err(error) = check_non_null(context, "context") {
+        return error;
+    }
+
+    let resources = &*((*context).inner as *const ResourceContext);
+    let state = &mut *((*wb).inner as *mut WriteBuilderState);
+    state.resources = Some(resources.clone());
+    ptr::null_mut()
+}
+
 /// Free a postpone fixed-bucket write builder.
 ///
 /// # Safety
@@ -267,6 +295,31 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_write_builder_with_overwri
     }
     let state = &mut *((*wb).inner as *mut PostponeFixedBucketWriteBuilderState);
     state.overwrite = true;
+    ptr::null_mut()
+}
+
+/// Share a resource context with fixed-bucket writers created from this builder.
+/// The builder clones the context, so the caller may free its handle afterward.
+/// Passing null returns an error and leaves the builder unchanged.
+///
+/// # Safety
+/// `wb` must be a valid fixed-bucket builder handle, or null (returns error).
+/// `context` must be a valid resource context handle, or null (returns error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_postpone_fixed_bucket_write_builder_with_resources(
+    wb: *mut paimon_postpone_fixed_bucket_write_builder,
+    context: *const paimon_resource_context,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(wb, "wb") {
+        return error;
+    }
+    if let Err(error) = check_non_null(context, "context") {
+        return error;
+    }
+
+    let resources = &*((*context).inner as *const ResourceContext);
+    let state = &mut *((*wb).inner as *mut PostponeFixedBucketWriteBuilderState);
+    state.resources = Some(resources.clone());
     ptr::null_mut()
 }
 
@@ -423,6 +476,9 @@ pub unsafe extern "C" fn paimon_write_builder_new_write(
     if state.overwrite {
         builder = builder.with_overwrite();
     }
+    if let Some(resources) = &state.resources {
+        builder = builder.with_resources(resources.clone());
+    }
     let result = builder.new_write().and_then(|write| {
         paimon::arrow::build_target_arrow_schema(state.table.schema().fields())
             .map(|schema| (Box::new(write), schema))
@@ -482,6 +538,9 @@ pub unsafe extern "C" fn paimon_postpone_fixed_bucket_write_builder_new_write(
     }
     if state.overwrite {
         builder = builder.with_overwrite();
+    }
+    if let Some(resources) = &state.resources {
+        builder = builder.with_resources(resources.clone());
     }
     let result = builder.new_write().and_then(|write| {
         paimon::arrow::build_target_arrow_schema(state.table.schema().fields())
@@ -1298,9 +1357,17 @@ const _: unsafe extern "C" fn(
 const _: unsafe extern "C" fn(*const paimon_write_builder) -> paimon_result_table_write =
     paimon_write_builder_new_write;
 const _: unsafe extern "C" fn(
+    *mut paimon_write_builder,
+    *const paimon_resource_context,
+) -> *mut paimon_error = paimon_write_builder_with_resources;
+const _: unsafe extern "C" fn(
     *const paimon_postpone_fixed_bucket_write_builder,
 ) -> paimon_result_postpone_fixed_bucket_table_write =
     paimon_postpone_fixed_bucket_write_builder_new_write;
+const _: unsafe extern "C" fn(
+    *mut paimon_postpone_fixed_bucket_write_builder,
+    *const paimon_resource_context,
+) -> *mut paimon_error = paimon_postpone_fixed_bucket_write_builder_with_resources;
 const _: unsafe extern "C" fn(*const paimon_write_builder) -> paimon_result_table_commit =
     paimon_write_builder_new_commit;
 const _: unsafe extern "C" fn(
