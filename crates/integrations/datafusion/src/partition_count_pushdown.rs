@@ -297,8 +297,8 @@ impl TableProvider for PartitionRowCountProvider {
             .clone();
         let table = self.table.clone();
         let table = crate::runtime::await_with_runtime(async move {
-            // Rules the manifests cannot apply: stay unpinned, so the exact
-            // count declines and the scan runs with the server's grant.
+            // Rules the manifests cannot apply: stay unpinned, so the scan
+            // carries the grant.
             if CoreOptions::new(table.schema().options())
                 .ensure_read_authorized()
                 .is_err()
@@ -407,8 +407,7 @@ impl PartitionRowCountStream {
                 .await
                 {
                     Ok(counts) => counts,
-                    // Refused rather than undecidable: the server's rules apply
-                    // in a scan, which only an unpinned handle can authorize.
+                    // Refused: only an unpinned scan can authorize.
                     Err(paimon::Error::Unsupported { .. }) => {
                         let plan = crate::runtime::await_with_runtime(
                             self.scan_by_reading(&self.unpinned_source),

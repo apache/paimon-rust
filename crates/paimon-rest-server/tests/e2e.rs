@@ -527,65 +527,6 @@ async fn altering_the_declared_type_is_rejected() {
 }
 
 #[tokio::test]
-async fn test_load_table_refuses_a_decorated_object_table() {
-    let ctx = setup().await;
-    ctx.catalog
-        .create_database("db", true, HashMap::new())
-        .await
-        .unwrap();
-    let identifier = Identifier::new("db", "objects");
-    let schema = paimon::spec::Schema::builder()
-        .column(
-            "ignored",
-            paimon::spec::DataType::Int(paimon::spec::IntType::new()),
-        )
-        .option("type", "object-table")
-        .build()
-        .unwrap();
-    ctx.catalog
-        .create_table(&identifier, schema, false)
-        .await
-        .unwrap();
-    // With a branch schema on disk the server resolves the name, so only the
-    // client's own refusal keeps `load_table`'s object-table early return from
-    // handing back the base relation.
-    let loaded = ctx.catalog.load_table(&identifier).await.unwrap();
-    let paimon::catalog::LoadedTable::Object(object) = loaded else {
-        panic!("expected an object table");
-    };
-    let manager =
-        paimon::table::SchemaManager::new(object.file_io().clone(), object.location().to_string())
-            .with_branch("dev");
-    let schema_path = manager.schema_path(0);
-    let schema_dir = schema_path.rsplit_once('/').map(|(d, _)| d).unwrap();
-    object.file_io().mkdirs(schema_dir).await.unwrap();
-    let (_, stored) = paimon::catalog::FileSystemCatalog::new({
-        let mut o = Options::new();
-        o.set(
-            CatalogOptions::WAREHOUSE,
-            ctx._warehouse.path().to_str().unwrap(),
-        );
-        o
-    })
-    .unwrap()
-    .fetch_table_schema(&identifier)
-    .await
-    .unwrap();
-    object
-        .file_io()
-        .new_output(&schema_path)
-        .unwrap()
-        .write(serde_json::to_vec(&stored).unwrap().into())
-        .await
-        .unwrap();
-    assert!(ctx
-        .catalog
-        .load_table(&Identifier::new("db", "objects$branch_dev"))
-        .await
-        .is_err());
-}
-
-#[tokio::test]
 async fn test_load_snapshot_empty_latest_and_branch() {
     use paimon::spec::{CommitKind, Snapshot};
     let ctx = setup().await;

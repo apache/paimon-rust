@@ -525,15 +525,13 @@ impl<'a> PaimonReadBuilder<'a> {
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
-        // Stays here: a table's declared type is known without a grant. Only
-        // query-auth moved to `to_arrow`, where the split's grant is visible.
+        // The declared type needs no grant; only query-auth moved to `to_arrow`.
         self.table
             .schema
             .core_options()
             .ensure_type_paimon_served(&self.table.identifier().full_name())?;
-        // A handle no catalog minted a session for can never hold a grant, so
-        // it is refused here too: bindings skip `to_arrow` for an empty split
-        // list.
+        // A handle no catalog loaded holds no grant; refused here too, as bindings
+        // skip `to_arrow` for an empty split list.
         if self.table.schema.core_options().query_auth_enabled()
             && self.table.query_auth_session().is_none()
         {

@@ -296,8 +296,7 @@ impl<'a> TableRead<'a> {
     }
 }
 
-/// Every leaf's column name. Unlike the index-based walks this sees system
-/// columns, whose leaf index is only a placeholder.
+/// Every leaf's column name, system columns included.
 fn collect_leaf_column_names(predicate: &Predicate, out: &mut std::collections::HashSet<String>) {
     match predicate {
         Predicate::Leaf { column, .. } => {
@@ -486,8 +485,7 @@ impl<'a> PaimonTableRead<'a> {
         &self,
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
-        // Streaming primary-key splits are read raw below, not through
-        // `to_arrow`, so the split-carried decision is taken here for all.
+        // Streaming primary-key splits are read raw below, so decide here for all.
         self.ensure_authorized_by_splits(&self.table.schema.core_options(), data_splits)?;
         let schema = audit_schema_for_read_type(&self.read_type, false)?;
         let (streaming, materialized): (Vec<_>, Vec<_>) = data_splits
@@ -875,8 +873,8 @@ impl<'a> PaimonTableRead<'a> {
         reader.read(splits)
     }
 
-    /// Allowed only if the splits carry a grant saying the server imposed
-    /// nothing. Never fetched here, so a split without one fails closed.
+    /// Reads only splits carrying a grant that the server imposed nothing;
+    /// nothing is fetched here, so a split without one fails closed.
     fn ensure_authorized_by_splits(
         &self,
         core_options: &CoreOptions,
@@ -884,16 +882,14 @@ impl<'a> PaimonTableRead<'a> {
     ) -> crate::Result<()> {
         // Unconditional: unrelated to query-auth.
         core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
-        // Decided at plan time, as in Java. Known limitation: a split predating
-        // the option, or built by hand, has neither flag and is read on the
-        // caller's word — re-plan after an authorization change.
+        // Decided at plan time, as in Java: a split predating the option, or built
+        // by hand, carries neither flag and is read on the caller's word.
         let required = core_options.query_auth_enabled()
             || data_splits.iter().any(|s| s.query_auth_required());
         if !required {
             return Ok(());
         }
-        // Only the catalog mints a session, so a handle without one can never
-        // hold a grant — refused before the splits are even looked at.
+        // Only the catalog mints a session, so a handle without one holds no grant.
         if self.table.query_auth_session().is_none() {
             return Err(super::query_auth::unsupported(
                 "this table handle was assembled rather than loaded",
@@ -910,14 +906,13 @@ impl<'a> PaimonTableRead<'a> {
                 .map(|f| f.name())
                 .chain(filter_columns.iter().map(String::as_str)),
         )?;
-        // By id AND name: older files resolve by id, so a dropped field passed
-        // through the public `with_read_type` returns an uncovered column.
+        // By id and name: older files resolve by id, so a dropped field passed
+        // to `with_read_type` would read an uncovered column.
         super::query_auth::reject_noncanonical_fields(
             &self.read_type,
             self.table.schema().fields(),
         )?;
-        // Per split, as Java binds one `QueryAuthSplit` each: lists get
-        // concatenated and the first grant must not cover the rest.
+        // Per split, as Java binds one `QueryAuthSplit` each.
         for split in data_splits {
             let Some(grant) = split.query_auth_grant() else {
                 return Err(super::query_auth::unsupported(

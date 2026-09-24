@@ -57,8 +57,7 @@ impl<'a> AuditLogRead<'a> {
 
     /// Reads splits planned by an audit scan, retaining winning retract rows.
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        // The primary-key path below builds its readers directly, so the
-        // split-carried decision is taken here rather than in `TableRead`.
+        // The primary-key path below builds its readers directly, so decide here.
         self.read
             .ensure_authorized_by_splits(&self.read.table.schema.core_options(), data_splits)?;
         let output_read_type = self.read.read_type.clone();

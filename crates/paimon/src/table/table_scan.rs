@@ -1275,8 +1275,7 @@ impl<'a> TableScan<'a> {
     }
 
     pub async fn plan(&self) -> crate::Result<Plan> {
-        // Boxed: engines poll this under deep operator stacks, and every layer
-        // above would otherwise embed the planning state.
+        // Boxed: engines poll this under deep operator stacks.
         match &self.0 {
             TableScanKind::Paimon(scan) => Box::pin(scan.plan()).await,
             TableScanKind::Format(scan) => scan.plan().await,
@@ -1549,9 +1548,8 @@ impl<'a> PaimonTableScan<'a> {
         Ok((plan.planned(grant), trace))
     }
 
-    /// The grant predates the manifest read, so the table can have been re-created
-    /// at the same path in between. Also refuses statistics the current schema
-    /// no longer covers.
+    /// The grant predates the manifest read, so the table can have been
+    /// re-created in between. Also refuses stats the schema no longer covers.
     async fn check_planned_files(&self, plan: &Plan, query_auth: bool) -> crate::Result<()> {
         if !query_auth {
             return Ok(());
@@ -1600,8 +1598,7 @@ impl<'a> PaimonTableScan<'a> {
         }
 
         let grant = self.table.authorize_read(query_auth).await?;
-        // A plan carries row counts and bounds that answer COUNT/MIN/MAX without
-        // reading a row.
+        // A plan already answers COUNT/MIN/MAX from row counts and bounds.
         if grant.as_ref().is_some_and(|g| !g.is_unrestricted()) {
             return Err(super::query_auth::unsupported(
                 "a plan already carries file paths, row counts and column bounds that a row \
@@ -1611,8 +1608,8 @@ impl<'a> PaimonTableScan<'a> {
         Ok(grant)
     }
 
-    /// Fail closed on planning paths that do not authorize, including
-    /// `with_scan_all_files`: it exposes stats the client cannot check.
+    /// Fail closed on planning paths that do not authorize, `with_scan_all_files`
+    /// included.
     fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
     }

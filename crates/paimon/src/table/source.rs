@@ -524,8 +524,8 @@ impl DataSplit {
         self.is_streaming
     }
 
-    /// Marks the split as needing authorization whether or not a grant came
-    /// with it, so a plan that produced none still refuses at the read.
+    /// Needs authorization even without a grant, so a plan that produced none
+    /// still refuses at the read.
     pub(crate) fn planned(mut self, grant: Option<Arc<QueryAuthGrant>>) -> Self {
         self.query_auth_required = true;
         self.query_auth_grant = grant;

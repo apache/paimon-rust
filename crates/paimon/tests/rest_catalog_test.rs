@@ -2921,24 +2921,30 @@ async fn test_query_auth_allows_a_nested_projection_but_not_an_extra_nested_fiel
 }
 
 #[tokio::test]
-async fn test_query_auth_refuses_a_decorated_handle() {
+async fn test_a_decorated_name_loads_and_only_query_auth_refuses_it() {
     let ctx = setup_catalog(vec!["default"]).await;
     let tmp = tempfile::tempdir().unwrap();
     let path = format!("file://{}", tmp.path().display());
+    // A literal name the validator permits and the server stores as is: the
+    // catalog hands it back, as on main.
+    ctx.server
+        .add_table_with_schema("default", "plain$files", schema_of(&["id"], &[]), &path);
     for name in ["guarded$branch_dev", "guarded$files"] {
         ctx.server
             .add_table_with_schema("default", name, schema_of(&["id"], GUARDED), &path);
     }
-    // No handle is built from a decorated name; the branch is reached through
-    // `copy_with_branch`.
+    ctx.catalog
+        .get_table(&Identifier::new("default", "plain$files"))
+        .await
+        .expect("an ordinary table's name is the server's business");
+    // The view such a name addresses is not what the server rules on.
     for name in ["guarded$branch_dev", "guarded$files"] {
-        assert!(
-            ctx.catalog
-                .get_table(&Identifier::new("default", name))
-                .await
-                .is_err(),
-            "{name}"
-        );
+        let table = ctx
+            .catalog
+            .get_table(&Identifier::new("default", name))
+            .await
+            .unwrap();
+        assert_refused(plan_err(&table, name).await);
     }
 }
 

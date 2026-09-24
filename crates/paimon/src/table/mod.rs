@@ -208,8 +208,8 @@ pub struct Table {
     schema_manager: SchemaManager,
     branch: String,
     branch_reference: bool,
-    /// Minted only by [`RESTEnv::build_table`], so a handle assembled with the
-    /// public [`Table::new`] cannot replay a grant.
+    /// Minted only by [`RESTEnv::build_table`]; a [`Table::new`] handle cannot
+    /// replay a grant.
     query_auth_session: Option<u64>,
     rest_env: Option<RESTEnv>,
     /// True when this table copy was switched to a historical schema by
@@ -367,12 +367,11 @@ impl Table {
     }
 
     /// Whether this handle reads a schema other than the one the server rules
-    /// on: a time-travel selector (`copy_with_options` adds one without the
-    /// flag), a travelled or branch view, or a `$branch_x` / `$files` name
-    /// whose managers read the base table's own files.
+    /// on: a time-travel option, a travelled or branch view, or a `$branch_x` /
+    /// `$files` name that reads the base table's files.
     pub(crate) fn reads_another_schema(&self) -> Result<bool> {
-        // Presence only: which selector, and whether the set is consistent, is
-        // for planning to decide after it has adapted `scan.version`.
+        // Presence only; planning validates the selector after adapting
+        // `scan.version`.
         let options = self.schema.options();
         let travels = [
             SCAN_SNAPSHOT_ID_OPTION,
@@ -389,8 +388,7 @@ impl Table {
     }
 
     /// Whether this user may read this table; `None` when it is not
-    /// `query-auth.enabled`. `query_auth` is the option loaded with this handle,
-    /// as in Java: a change on the server shows after a re-load.
+    /// `query-auth.enabled`. `query_auth` is the loaded option, as in Java.
     pub(crate) async fn authorize_read(
         &self,
         query_auth: bool,
@@ -418,8 +416,8 @@ impl Table {
             ));
         }
 
-        // Before any RPC: only the catalog mints a session, so a handle the
-        // caller assembled stops here whatever name or files it wears.
+        // Before any RPC: only the catalog mints a session, so an assembled
+        // handle stops here.
         let session = self.query_auth_session.ok_or_else(|| {
             query_auth::unsupported("this table handle was assembled rather than loaded")
         })?;

@@ -19,11 +19,8 @@
 
 use crate::api::AuthTableQueryResponse;
 
-/// The server's answer for one user on one table, kept unparsed.
-///
-/// `session` pins it to the handle that asked: `to_arrow` is public and the
-/// response names neither table nor principal. Routing options are unbound on
-/// purpose — sound only while unrestricted grants authorize.
+/// The server's answer for one user on one table, kept unparsed; `session`
+/// ties it to the handle that asked, as the response names no table or user.
 #[derive(Debug, PartialEq)]
 pub(crate) struct QueryAuthGrant {
     response: AuthTableQueryResponse,
@@ -40,17 +37,14 @@ impl QueryAuthGrant {
         self.response.is_unrestricted()
     }
 
-    /// A view of another schema is not the one the server ruled on. Everything
-    /// else follows from the session, which only the catalog mints.
+    /// A view of another schema is not the one the server ruled on.
     pub(crate) fn matches_table(&self, table: &super::Table) -> bool {
         !table.reads_another_schema().unwrap_or(true)
             && table.query_auth_session() == Some(self.session)
     }
 }
 
-/// `value_stats` and `write_cols` are public on every split and an older file
-/// can name a dropped column. Refused rather than scrubbed — rewriting encoded
-/// stats is how bounds get mismatched.
+/// An older file can name a dropped column; refused rather than scrubbed.
 pub(crate) async fn reject_unauthorized_stats(
     plan: &super::Plan,
     current: &crate::spec::TableSchema,
@@ -76,8 +70,8 @@ pub(crate) async fn reject_unauthorized_stats(
                     return refuse(column);
                 }
             }
-            // The file's own schema is the authority: a name can be dropped and
-            // re-added under a new id, and the lists may be absent entirely.
+            // The file's schema decides: a name can be re-added under a new id, and
+            // either list may be absent.
             if file.schema_id == current.id() || !checked.insert(file.schema_id) {
                 continue;
             }
@@ -96,10 +90,8 @@ pub(crate) async fn reject_unauthorized_stats(
     Ok(())
 }
 
-/// Whether `narrow` reads nothing `wide` does not have: nested children are
-/// matched by id and name and must be contained in turn, so a projection of a
-/// `ROW` passes while an extra child, or one re-added under a new id, does
-/// not. Descriptions are not columns and are ignored.
+/// Whether `narrow` reads nothing `wide` lacks: nested children match by id
+/// and name, so a `ROW` projection passes and a re-added child does not.
 fn contains(wide: &crate::spec::DataType, narrow: &crate::spec::DataType) -> bool {
     use crate::spec::DataType;
     match (wide, narrow) {
@@ -132,8 +124,7 @@ pub(crate) fn unsupported(reason: &str) -> crate::Error {
     }
 }
 
-/// Column permissions cover real schema fields, so the server can neither grant
-/// nor refuse `_ROW_ID` and friends.
+/// Column permissions cover schema fields only, never `_ROW_ID` and friends.
 pub(crate) fn reject_system_columns<'a>(
     names: impl IntoIterator<Item = &'a str>,
 ) -> crate::Result<()> {
@@ -148,8 +139,8 @@ pub(crate) fn reject_system_columns<'a>(
     Ok(())
 }
 
-/// The read resolves older files by field id, so a non-canonical `(id, name)`
-/// pair reads as something no grant covered. System fields have no entry.
+/// Older files resolve by id, so a non-canonical `(id, name)` pair reads
+/// something no grant covered. System fields have no entry.
 pub(crate) fn reject_noncanonical_fields(
     read_type: &[crate::spec::DataField],
     schema_fields: &[crate::spec::DataField],
@@ -225,8 +216,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_conflicting_selector_pair_is_planning_business_not_authorization() {
-        // `scan.version` is adapted before the one-selector rule is checked, so
-        // an ordinary table must reach planning rather than fail here.
+        // `scan.version` is adapted before the one-selector rule, so an ordinary
+        // table must reach planning rather than fail here.
         let table = crate::table::Table::new(
             crate::io::FileIOBuilder::new("file").build().unwrap(),
             crate::catalog::Identifier::new("default", "plain"),

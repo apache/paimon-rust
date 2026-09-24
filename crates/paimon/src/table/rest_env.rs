@@ -82,8 +82,8 @@ impl RESTEnv {
         &self.api
     }
 
-    /// Bracketed by a freshness check: the response names no table, so a drop
-    /// and re-create in between would let a replacement's grant serve this one.
+    /// Bracketed by a freshness check: the response names no table, so a
+    /// re-create in between would serve a replacement's grant.
     pub(crate) async fn table_query_auth(
         &self,
         schema_id: i64,
@@ -96,9 +96,8 @@ impl RESTEnv {
         Ok(response)
     }
 
-    /// Refused unless the name still resolves to the loaded table — a missing
-    /// identity too, which checks nothing. Asserts nothing on its own: an
-    /// ordinary table must not inherit a freshness restriction.
+    /// Refused unless the name still resolves to the loaded table, a missing
+    /// identity included. Asserts nothing on its own.
     pub(crate) async fn current_table_checked(
         &self,
         schema_id: i64,
@@ -123,8 +122,7 @@ impl RESTEnv {
             schema_id.to_string(),
             response.schema_id.map(|id| id.to_string()),
         )?;
-        // An id is not the schema: a handle can carry other fields under the
-        // same id, so the columns the server rules on are compared too.
+        // An id is not the schema: the columns the server rules on are compared too.
         let key =
             |f: &crate::spec::DataField| (f.id(), f.name().to_string(), f.data_type().clone());
         let served: Vec<_> = response
@@ -199,7 +197,6 @@ impl RESTEnv {
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
     ) -> Result<Table> {
-        identifier.reject_decorated()?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
             message: format!("Table {} response missing schema", identifier.full_name()),
             source: None,
