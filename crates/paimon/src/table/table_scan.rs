@@ -2018,13 +2018,6 @@ impl<'a> PaimonTableScan<'a> {
     ) -> crate::Result<(Plan, Plan)> {
         self.ensure_query_auth_allowed()?;
         let core_options = CoreOptions::new(self.table.schema().options());
-        if core_options.deletion_vectors_enabled() {
-            return Err(crate::Error::Unsupported {
-                message:
-                    "Batch incremental Diff does not support tables with deletion-vectors.enabled=true"
-                        .to_string(),
-            });
-        }
         // Both forms: without `first_row_id` a filter stays an ordinary data
         // predicate instead of becoming a row range.
         if self.row_ranges.is_some()
@@ -2049,11 +2042,34 @@ impl<'a> PaimonTableScan<'a> {
             .await?;
         let before_entries = full_state_scan.plan_manifest_entries(before).await?;
         let after_entries = full_state_scan.plan_manifest_entries(after).await?;
+        // Each side is a complete snapshot state. A DV index belongs to that
+        // snapshot, so resolve the two index manifests independently before
+        // building splits. Reusing the endpoint's DVs for the older state can
+        // hide rows that were live at the start of the Diff.
+        let deletion_vectors_needed = core_options.deletion_vectors_enabled();
+        let (before_index_entries, after_index_entries) = futures::try_join!(
+            full_state_scan.read_index_manifest_entries(before, false, deletion_vectors_needed),
+            full_state_scan.read_index_manifest_entries(after, false, deletion_vectors_needed)
+        )?;
         let before_plan = full_state_scan
-            .plan_snapshot_from_entries(before.clone(), before_entries, None, None, None, None)
+            .plan_snapshot_from_entries(
+                before.clone(),
+                before_entries,
+                None,
+                before_index_entries,
+                None,
+                None,
+            )
             .await?;
         let after_plan = full_state_scan
-            .plan_snapshot_from_entries(after.clone(), after_entries, None, None, None, None)
+            .plan_snapshot_from_entries(
+                after.clone(),
+                after_entries,
+                None,
+                after_index_entries,
+                None,
+                None,
+            )
             .await?;
         Ok((before_plan, after_plan))
     }
@@ -4799,17 +4815,14 @@ mod tests {
         )
     }
 
-    fn diff_test_table(table_path: &str, deletion_vectors_enabled: bool) -> Table {
+    fn diff_test_table(table_path: &str) -> Table {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let mut schema = PaimonSchema::builder()
+        let schema = PaimonSchema::builder()
             .column("id", DataType::Int(IntType::new()))
             .column("value", DataType::Int(IntType::new()))
             .primary_key(["id"])
             .option("bucket", "1")
             .option("merge-engine", "deduplicate");
-        if deletion_vectors_enabled {
-            schema = schema.option("deletion-vectors.enabled", "true");
-        }
         Table::new(
             file_io,
             Identifier::new("test_db", "diff_gate"),
@@ -6215,22 +6228,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_diff_rejects_deletion_vectors_enabled() {
-        let table = diff_test_table("memory:/diff_dv_gate", true);
-        let scan = PaimonTableScan::new(&table, None, Vec::new(), None, None, None);
-        let before = diff_snapshot(1);
-        let after = diff_snapshot(2);
-
-        let err = scan.plan_snapshot_diff(&before, &after).await.unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported { ref message } if message.contains("deletion-vectors.enabled=true")),
-            "Diff must fail closed on deletion-vector tables"
-        );
-    }
-
-    #[tokio::test]
     async fn test_diff_rejects_bucket_rescale_from_snapshot_schemas() {
-        let table = diff_test_table("memory:/diff_bucket_rescale_gate", false);
+        let table = diff_test_table("memory:/diff_bucket_rescale_gate");
         let before_schema = table.schema().clone();
         let after_schema = before_schema
             .apply_changes(vec![crate::spec::SchemaChange::set_option(
@@ -6254,7 +6253,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_diff_rejects_row_id_filters() {
-        let table = diff_test_table("memory:/diff_row_id_gate", false);
+        let table = diff_test_table("memory:/diff_row_id_gate");
         let mut builder = table.new_read_builder();
         let filter = Predicate::Leaf {
             column: crate::spec::ROW_ID_FIELD_NAME.to_string(),
