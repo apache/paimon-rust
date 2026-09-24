@@ -32,6 +32,7 @@ use crate::error::to_datafusion_error;
 
 mod audit_log;
 mod branches;
+mod buckets;
 mod consumers;
 mod files;
 mod manifests;
@@ -53,6 +54,7 @@ type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 const TABLES: &[(&str, Builder)] = &[
     ("audit_log", audit_log::build),
     ("branches", branches::build),
+    ("buckets", buckets::build),
     ("consumers", consumers::build),
     ("files", files::build),
     ("manifests", manifests::build),
@@ -68,6 +70,7 @@ const TABLES: &[(&str, Builder)] = &[
 const SYSTEM_TABLE_NAMES: &[&str] = &[
     "audit_log",
     "branches",
+    "buckets",
     "consumers",
     "files",
     "manifests",
@@ -108,6 +111,7 @@ pub(crate) fn is_registered(name: &str) -> bool {
 /// having its time-travel clause silently dropped.
 pub(crate) fn is_system_table_provider(provider: &dyn TableProvider) -> bool {
     provider.is::<branches::BranchesTable>()
+        || provider.is::<buckets::BucketsTable>()
         || provider.is::<consumers::ConsumersTable>()
         || provider.is::<files::FilesTable>()
         || provider.is::<manifests::ManifestsTable>()

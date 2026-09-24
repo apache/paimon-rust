@@ -105,6 +105,7 @@ async fn test_query_auth_system_tables_fail_closed() {
         "SELECT * FROM paimon.default.qa",
         "SELECT * FROM paimon.default.qa$audit_log",
         "SELECT * FROM paimon.default.qa$files",
+        "SELECT * FROM paimon.default.qa$buckets",
         "SELECT value FROM paimon.default.qa$options WHERE key = 's3.secret-key'",
         "SELECT * FROM paimon.default.qa$schemas",
         "SELECT * FROM paimon.default.qa$partitions",
@@ -124,6 +125,7 @@ async fn test_query_auth_system_tables_fail_closed() {
         "SELECT * FROM paimon.default.qa_dynamic",
         "SELECT * FROM paimon.default.qa_dynamic$audit_log",
         "SELECT * FROM paimon.default.qa_dynamic$files",
+        "SELECT * FROM paimon.default.qa_dynamic$buckets",
         "SELECT * FROM paimon.default.qa_dynamic$options",
         "SELECT * FROM paimon.default.qa_dynamic$schemas",
         "SELECT * FROM paimon.default.qa_dynamic$partitions",
@@ -1514,4 +1516,120 @@ async fn test_partitions_system_table() {
             assert!(!done.value(i), "done default for FS catalog");
         }
     }
+}
+
+#[tokio::test]
+async fn test_buckets_system_table() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+
+    // Ground truth: aggregate the tested $files table by (partition, bucket).
+    // $buckets must reproduce it exactly (same partition rendering, same per-file values).
+    let files = run_sql(
+        &ctx,
+        &format!(
+            "SELECT partition, bucket, record_count, file_size_in_bytes \
+             FROM paimon.default.{FIXTURE_TABLE}$files"
+        ),
+    )
+    .await;
+    let mut expected: std::collections::BTreeMap<(String, i32), (i64, i64, i64)> =
+        std::collections::BTreeMap::new();
+    for batch in &files {
+        let parts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let buckets = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let rc = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let sz = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let e = expected
+                .entry((parts.value(i).to_string(), buckets.value(i)))
+                .or_default();
+            e.0 += rc.value(i);
+            e.1 += sz.value(i);
+            e.2 += 1;
+        }
+    }
+    assert!(!expected.is_empty(), "fixture should contain data files");
+
+    let sql = format!("SELECT * FROM paimon.default.{FIXTURE_TABLE}$buckets");
+    let batches = run_sql(&ctx, &sql).await;
+    assert!(!batches.is_empty(), "$buckets should return ≥1 batch");
+
+    let arrow_schema = batches[0].schema();
+    let expected_columns = [
+        ("partition", DataType::Utf8),
+        ("bucket", DataType::Int32),
+        ("record_count", DataType::Int64),
+        ("file_size_in_bytes", DataType::Int64),
+        ("file_count", DataType::Int64),
+        (
+            "last_update_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+    ];
+    for (i, (name, dtype)) in expected_columns.iter().enumerate() {
+        let field = arrow_schema.field(i);
+        assert_eq!(field.name(), name, "column {i} name");
+        assert_eq!(field.data_type(), dtype, "column {i} type");
+    }
+
+    let mut actual: std::collections::BTreeMap<(String, i32), (i64, i64, i64)> =
+        std::collections::BTreeMap::new();
+    for batch in &batches {
+        let parts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let buckets = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let rc = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let sz = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let fc = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let prev = actual.insert(
+                (parts.value(i).to_string(), buckets.value(i)),
+                (rc.value(i), sz.value(i), fc.value(i)),
+            );
+            assert!(
+                prev.is_none(),
+                "$buckets must emit one row per (partition, bucket)"
+            );
+        }
+    }
+
+    assert_eq!(
+        actual, expected,
+        "$buckets must aggregate $files by (partition, bucket)"
+    );
 }
