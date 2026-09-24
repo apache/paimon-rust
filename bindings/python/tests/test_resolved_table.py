@@ -197,7 +197,10 @@ def test_catalog_schema_copy_validates_branch_and_structure(resolved_source):
 
 
 @pytest.mark.parametrize("external", [False, True])
-def test_resolved_rest_response_keeps_snapshot_and_token_refresh(resolved_source, external):
+@pytest.mark.parametrize("object_name", ["t", "t$branch_dev"])
+def test_resolved_rest_response_keeps_snapshot_and_token_refresh(
+    resolved_source, external, object_name
+):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from threading import Thread
 
@@ -235,18 +238,26 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(resolved_source
     thread.start()
     try:
         # PyPaimon and older REST servers do not include `database`.
-        response = {"id": "table-uuid", "name": "t", "path": str(root),
+        response = {"id": "table-uuid", "name": object_name, "path": str(root),
                     "isExternal": external, "schemaId": schema['id'], "schema": schema}
-        table = Table.from_rest_response(json.dumps(response), database='db', table='t', options={
-            'uri': 'http://127.0.0.1:%d' % server.server_port,
-            'warehouse': 'test', 'token.provider': 'bear', 'token': 'test-token',
-            'data-token.enabled': 'true',
-        })
+        table = Table.from_rest_response(
+            json.dumps(response),
+            database='db',
+            table=object_name,
+            options={
+                'uri': 'http://127.0.0.1:%d' % server.server_port,
+                'warehouse': 'test', 'token.provider': 'bear', 'token': 'test-token',
+                'data-token.enabled': 'true',
+            },
+        )
+        assert table.branch() == ('dev' if '$branch_' in object_name else 'main')
         assert len(token_requests) == (0 if external else 1)
         assert all(path.endswith('/token') for path in requests)
         assert _read(table) == (1, [{'id': 1, 'name': 'a'}])
         assert all(path.endswith(('/token', '/snapshot')) for path in requests)
-        assert any(path.endswith('/snapshot') for path in requests)
+        encoded_name = object_name.replace('$', '%24')
+        assert any(path.endswith(
+            f'/databases/db/tables/{encoded_name}/snapshot') for path in requests)
         assert len(token_requests) == (0 if external else 2)
     finally:
         server.shutdown()

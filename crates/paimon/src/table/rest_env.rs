@@ -249,14 +249,16 @@ impl RESTEnv {
             data_token_enabled,
             local_cache,
         );
-
-        Ok(Table::new(
+        let branch = identifier.branch_name_or_default()?;
+        let table = Table::new(
             file_io,
             identifier,
             table_path,
             table_schema,
             Some(rest_env),
-        ))
+        );
+
+        table.copy_with_resolved_schema(table.schema().clone(), &branch)
     }
 
     pub(crate) async fn build_object_table(
