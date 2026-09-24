@@ -124,7 +124,8 @@ impl FileWriter {
 ///
 /// Reference: [pypaimon BatchTableWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/table_write.py)
 pub struct TableWrite {
-    format_writer: Option<FormatTableWriter>,
+    // Keep the Format Table state off ordinary Paimon write futures' stacks.
+    format_writer: Option<Box<FormatTableWriter>>,
     table: Table,
     write_schema: Arc<arrow_schema::Schema>,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
@@ -187,7 +188,7 @@ impl TableWrite {
         // snapshots. Build their public TableWrite wrapper without running
         // Paimon-only option validation or constructing stateful assigners.
         Ok(Self {
-            format_writer: Some(format_writer),
+            format_writer: Some(Box::new(format_writer)),
             table: table.clone(),
             write_schema: build_target_arrow_schema(schema.fields())?,
             partition_writers: HashMap::new(),
