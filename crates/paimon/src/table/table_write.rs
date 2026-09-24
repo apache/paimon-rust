@@ -2009,7 +2009,7 @@ pub(in crate::table) mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_write_truncates_string_value_stats_and_keeps_binary_counts() {
+    async fn test_append_write_truncates_string_and_binary_value_stats() {
         let file_io = test_file_io();
         let table_path = "memory:/test_table_write_skip_variable_length_stats";
         setup_dirs(&file_io, table_path).await;
@@ -2068,8 +2068,8 @@ pub(in crate::table) mod tests {
         assert_eq!(max_values.get_int(0).unwrap(), 2);
         assert_eq!(min_values.get_string(1).unwrap(), "a long string va");
         assert_eq!(max_values.get_string(1).unwrap(), "another long sts");
-        assert!(min_values.is_null_at(2));
-        assert!(max_values.is_null_at(2));
+        assert_eq!(min_values.get_binary(2).unwrap(), b"another-large-bi");
+        assert_eq!(max_values.get_binary(2).unwrap(), b"large-binary-vam");
     }
 
     #[tokio::test]
@@ -2143,8 +2143,8 @@ pub(in crate::table) mod tests {
         assert!(max_values.is_null_at(0));
         assert_eq!(min_values.get_string(1).unwrap(), "alpha-long-value-12345");
         assert_eq!(max_values.get_string(1).unwrap(), "zeta-long-value-99999");
-        assert!(min_values.is_null_at(2));
-        assert!(max_values.is_null_at(2));
+        assert_eq!(min_values.get_binary(2).unwrap(), b"first-binary-value");
+        assert_eq!(max_values.get_binary(2).unwrap(), b"first-binary-value");
     }
 
     #[tokio::test]

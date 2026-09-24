@@ -103,6 +103,7 @@ pub(crate) struct KeyValueWriteConfig {
 }
 
 struct IndexedFileWrite<'a> {
+    is_changelog: bool,
     file_prefix: &'a str,
     file_ordinal: usize,
     file_format: &'a str,
@@ -329,6 +330,7 @@ impl KeyValueFileWriter {
                 data_seq.as_ref(),
                 &data_indices,
                 IndexedFileWrite {
+                    is_changelog: false,
                     file_prefix: &self.config.data_file_prefix,
                     file_ordinal: self.written_files.len(),
                     file_format: &self.config.file_format,
@@ -348,6 +350,7 @@ impl KeyValueFileWriter {
                     seq_array.as_ref(),
                     &sorted_indices,
                     IndexedFileWrite {
+                        is_changelog: true,
                         file_prefix: &self.config.changelog_file_prefix,
                         file_ordinal: self.written_changelog_files.len(),
                         file_format: &self.config.changelog_file_format,
@@ -443,6 +446,10 @@ impl KeyValueFileWriter {
         // Keep the existing unshredded KV layout for this writer.
         let writer: Box<dyn FormatFileWriter> = if write.file_format.eq_ignore_ascii_case("parquet")
         {
+            let mut stats_options = self.config.table_options.clone();
+            let core_options = CoreOptions::new(&self.config.table_options);
+            let stats_mode = core_options.pk_file_metadata_stats_mode(0, write.is_changelog)?;
+            stats_options.insert("metadata.stats-mode".to_string(), stats_mode.to_string());
             Box::new(
                 ParquetFormatWriter::new(
                     &output,
@@ -450,7 +457,7 @@ impl KeyValueFileWriter {
                     write.file_compression,
                     self.config.file_compression_zstd_level,
                     Some(&self.config.value_fields),
-                    &self.config.table_options,
+                    &stats_options,
                 )
                 .await?,
             )
@@ -1170,6 +1177,111 @@ mod tests {
         assert_eq!(min.arity(), 2);
         assert_eq!(min.get_int(0).unwrap(), 1);
         assert!(min.is_null_at(1));
+    }
+
+    #[tokio::test]
+    async fn test_pk_binary_value_stats_match_full_and_truncate_modes() {
+        use crate::spec::{BinaryType, VarBinaryType};
+        use arrow_array::BinaryArray;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("payload", ArrowDataType::Binary, false),
+            ArrowField::new("raw", ArrowDataType::Binary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(BinaryArray::from_iter_values([b"ab1", b"ac0"])),
+                Arc::new(BinaryArray::from_iter_values([
+                    b"\xfe\x01".as_slice(),
+                    b"\xff\x01".as_slice(),
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut config = test_write_config(MergeEngine::Deduplicate);
+        config.value_fields = vec![
+            DataField::new(0, "id".into(), DataType::Int(IntType::new())),
+            DataField::new(
+                1,
+                "payload".into(),
+                DataType::Binary(BinaryType::new(4).unwrap()),
+            ),
+            DataField::new(
+                2,
+                "raw".into(),
+                DataType::VarBinary(VarBinaryType::new(8).unwrap()),
+            ),
+        ];
+        config.write_buffer_size = i64::MAX;
+        config.table_options.extend([
+            ("metadata.stats-mode".to_string(), "full".to_string()),
+            (
+                "fields.payload.stats-mode".to_string(),
+                "truncate(2)".to_string(),
+            ),
+        ]);
+        let mut writer =
+            KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+        let stats = &prepared.data_files[0].value_stats;
+        assert_eq!(stats.null_counts(), &vec![Some(0); 3]);
+        let min = crate::spec::BinaryRow::from_serialized_bytes(stats.min_values()).unwrap();
+        let max = crate::spec::BinaryRow::from_serialized_bytes(stats.max_values()).unwrap();
+        assert_eq!(min.get_binary(1).unwrap(), b"ab");
+        assert_eq!(max.get_binary(1).unwrap(), b"ad");
+        assert_eq!(min.get_binary(2).unwrap(), b"\xfe\x01");
+        assert_eq!(max.get_binary(2).unwrap(), b"\xff\x01");
+    }
+
+    #[tokio::test]
+    async fn test_pk_value_stats_choose_level_and_changelog_modes() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("seq", ArrowDataType::Int64, false),
+            ArrowField::new("value", ArrowDataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        let mut config = test_write_config(MergeEngine::Deduplicate);
+        config.input_changelog = true;
+        config.write_buffer_size = i64::MAX;
+        config.table_options.extend([
+            ("metadata.stats-mode".to_string(), "none".to_string()),
+            (
+                "metadata.stats-mode.per.level".to_string(),
+                "0:counts".to_string(),
+            ),
+            ("changelog-file.stats-mode".to_string(), "full".to_string()),
+        ]);
+        let mut writer =
+            KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+        let data = &prepared.data_files[0].value_stats;
+        assert_eq!(data.null_counts(), &vec![Some(0); 3]);
+        let data_min = crate::spec::BinaryRow::from_serialized_bytes(data.min_values()).unwrap();
+        assert!(data_min.is_null_at(0));
+        assert!(data_min.is_null_at(2));
+
+        let changelog = &prepared.changelog_files[0].value_stats;
+        assert_eq!(changelog.null_counts(), &vec![Some(0); 3]);
+        let changelog_min =
+            crate::spec::BinaryRow::from_serialized_bytes(changelog.min_values()).unwrap();
+        assert_eq!(changelog_min.get_int(0).unwrap(), 1);
+        assert_eq!(changelog_min.get_int(2).unwrap(), 100);
     }
 
     #[test]

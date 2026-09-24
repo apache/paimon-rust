@@ -73,6 +73,7 @@ const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
 const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
 const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
 const METADATA_STATS_MODE_OPTION: &str = "metadata.stats-mode";
+const METADATA_STATS_MODE_PER_LEVEL_OPTION: &str = "metadata.stats-mode.per.level";
 const METADATA_STATS_DENSE_STORE_OPTION: &str = "metadata.stats-dense-store";
 const METADATA_STATS_KEEP_FIRST_N_COLUMNS_OPTION: &str = "metadata.stats-keep-first-n-columns";
 const DEFAULT_METADATA_STATS_MODE: &str = "truncate(16)";
@@ -1410,6 +1411,55 @@ impl<'a> CoreOptions<'a> {
             .map(String::as_str)
             .unwrap_or(DEFAULT_METADATA_STATS_MODE);
         MetadataStatsMode::parse(METADATA_STATS_MODE_OPTION, value)
+    }
+
+    /// Match Java's PK file stats precedence: changelog override, level, table.
+    pub(crate) fn pk_file_metadata_stats_mode(
+        &self,
+        level: i32,
+        is_changelog: bool,
+    ) -> crate::Result<&str> {
+        let mut level_mode = None;
+        if let Some(raw) = self.options.get(METADATA_STATS_MODE_PER_LEVEL_OPTION) {
+            for entry in raw
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+            {
+                let (key, value) =
+                    entry
+                        .split_once(':')
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: format!(
+                                "Invalid {METADATA_STATS_MODE_PER_LEVEL_OPTION} entry: '{entry}'"
+                            ),
+                            source: None,
+                        })?;
+                let parsed_level =
+                    key.trim()
+                        .parse::<i32>()
+                        .map_err(|error| crate::Error::DataInvalid {
+                            message: format!(
+                                "Invalid level in {METADATA_STATS_MODE_PER_LEVEL_OPTION}: '{key}'"
+                            ),
+                            source: Some(Box::new(error)),
+                        })?;
+                if parsed_level == level {
+                    level_mode = Some(value.trim());
+                }
+            }
+        }
+        Ok(if is_changelog {
+            self.changelog_file_stats_mode().or(level_mode)
+        } else {
+            level_mode
+        }
+        .unwrap_or_else(|| {
+            self.options
+                .get(METADATA_STATS_MODE_OPTION)
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_METADATA_STATS_MODE)
+        }))
     }
 
     /// Number of leading columns whose stats should be kept.
@@ -2900,6 +2950,40 @@ mod tests {
                 MetadataStatsMode::None,
             ]
         );
+    }
+
+    #[test]
+    fn test_pk_file_metadata_stats_mode_follows_java_precedence() {
+        let options = HashMap::from([
+            (METADATA_STATS_MODE_OPTION.to_string(), "none".to_string()),
+            (
+                METADATA_STATS_MODE_PER_LEVEL_OPTION.to_string(),
+                "0:counts,1:truncate(8)".to_string(),
+            ),
+            (
+                CHANGELOG_FILE_STATS_MODE_OPTION.to_string(),
+                "full".to_string(),
+            ),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(
+            core.pk_file_metadata_stats_mode(0, false).unwrap(),
+            "counts"
+        );
+        assert_eq!(
+            core.pk_file_metadata_stats_mode(1, false).unwrap(),
+            "truncate(8)"
+        );
+        assert_eq!(core.pk_file_metadata_stats_mode(2, false).unwrap(), "none");
+        assert_eq!(core.pk_file_metadata_stats_mode(0, true).unwrap(), "full");
+
+        let invalid = HashMap::from([(
+            METADATA_STATS_MODE_PER_LEVEL_OPTION.to_string(),
+            "x:counts".to_string(),
+        )]);
+        assert!(CoreOptions::new(&invalid)
+            .pk_file_metadata_stats_mode(0, false)
+            .is_err());
     }
 
     #[test]
