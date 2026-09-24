@@ -2761,17 +2761,6 @@ pub(in crate::table) mod tests {
         let messages2 = table_write.prepare_commit().await.unwrap();
         assert_eq!(messages2.len(), 1);
         assert_eq!(messages2[0].new_files[0].row_count, 3);
-        let prefix1 = messages1[0].new_files[0]
-            .file_name
-            .split_once("-w-")
-            .unwrap()
-            .0;
-        let prefix2 = messages2[0].new_files[0]
-            .file_name
-            .split_once("-w-")
-            .unwrap()
-            .0;
-        assert_eq!(prefix1, prefix2);
 
         // Empty prepare_commit is fine
         let messages3 = table_write.prepare_commit().await.unwrap();
@@ -4281,6 +4270,17 @@ pub(in crate::table) mod tests {
         let messages2 = table_write.prepare_commit().await.unwrap();
         assert_eq!(messages2.len(), 1);
         assert_eq!(messages2[0].new_files[0].row_count, 3);
+        let prefix1 = messages1[0].new_files[0]
+            .file_name
+            .split_once("-w-")
+            .unwrap()
+            .0;
+        let prefix2 = messages2[0].new_files[0]
+            .file_name
+            .split_once("-w-")
+            .unwrap()
+            .0;
+        assert_eq!(prefix1, prefix2);
 
         // Empty prepare_commit
         let messages3 = table_write.prepare_commit().await.unwrap();
