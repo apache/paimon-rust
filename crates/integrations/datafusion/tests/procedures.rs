@@ -17,7 +17,13 @@
 
 mod common;
 
-use common::{assert_sql_error, collect_id_name, exec, row_count, setup_sql_context};
+use common::{
+    assert_sql_error, collect_id_name, create_sql_context, create_test_env, exec, row_count,
+    setup_sql_context,
+};
+use paimon::catalog::Identifier;
+use paimon::table::BranchManager;
+use paimon::Catalog;
 
 async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
     let (tmp, sql_context) = setup_sql_context().await;
@@ -83,6 +89,56 @@ async fn test_create_tag_with_snapshot_id() {
     )
     .await;
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn test_delete_branch() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    // Seed a branch through the core manager (create_branch is a separate PR).
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+    assert!(bm.branch_exists("b1").await.unwrap(), "seed branch exists");
+
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'b1')",
+    )
+    .await;
+
+    assert!(
+        !bm.branch_exists("b1").await.unwrap(),
+        "delete_branch should remove the branch"
+    );
+    let count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b1'",
+    )
+    .await;
+    assert_eq!(count, 0);
+
+    // Deleting a branch that no longer exists is a no-op, not an error.
+    exec(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'b1')",
+    )
+    .await;
 }
 
 #[tokio::test]
