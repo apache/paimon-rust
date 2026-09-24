@@ -197,7 +197,7 @@ def test_catalog_schema_copy_validates_branch_and_structure(resolved_source):
 
 
 @pytest.mark.parametrize("external", [False, True])
-@pytest.mark.parametrize("object_name", ["t", "t$branch_dev"])
+@pytest.mark.parametrize("object_name", ["t", "t$branch_main", "t$branch_dev"])
 def test_resolved_rest_response_keeps_snapshot_and_token_refresh(
     resolved_source, external, object_name
 ):
@@ -250,7 +250,14 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(
                 'data-token.enabled': 'true',
             },
         )
-        assert table.branch() == ('dev' if '$branch_' in object_name else 'main')
+        expected_branch = (
+            object_name.split('$branch_', 1)[-1]
+            if '$branch_' in object_name else 'main'
+        )
+        assert table.branch() == expected_branch
+        if '$branch_' in object_name:
+            with pytest.raises(NotImplementedError, match='Writing to Paimon branch'):
+                table.new_batch_write_builder().new_write()
         assert len(token_requests) == (0 if external else 1)
         assert all(path.endswith('/token') for path in requests)
         assert _read(table) == (1, [{'id': 1, 'name': 'a'}])

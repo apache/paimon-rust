@@ -249,7 +249,9 @@ impl RESTEnv {
             data_token_enabled,
             local_cache,
         );
-        let branch = identifier.branch_name_or_default()?;
+        let parsed_identifier = identifier.parsed_object_name()?;
+        let branch = parsed_identifier.branch_or_default().to_string();
+        let branch_reference = parsed_identifier.branch().is_some();
         let table = Table::new(
             file_io,
             identifier,
@@ -258,7 +260,9 @@ impl RESTEnv {
             Some(rest_env),
         );
 
-        table.copy_with_resolved_schema(table.schema().clone(), &branch)
+        let mut table = table.copy_with_resolved_schema(table.schema().clone(), &branch)?;
+        table.branch_reference = branch_reference;
+        Ok(table)
     }
 
     pub(crate) async fn build_object_table(
@@ -351,11 +355,13 @@ impl RESTEnv {
         &self,
         branch: &str,
     ) -> Result<Option<crate::spec::Snapshot>> {
-        let object = self.identifier.parsed_object_name()?.table().to_string();
-        let object = if branch == crate::catalog::DEFAULT_MAIN_BRANCH {
-            object
+        let parsed_identifier = self.identifier.parsed_object_name()?;
+        let object = if parsed_identifier.branch() == Some(branch) {
+            format!("{}$branch_{branch}", parsed_identifier.table())
+        } else if branch == crate::catalog::DEFAULT_MAIN_BRANCH {
+            parsed_identifier.table().to_string()
         } else {
-            format!("{object}$branch_{branch}")
+            format!("{}$branch_{branch}", parsed_identifier.table())
         };
         let identifier = Identifier::new(self.identifier.database(), object);
         match self.api.load_snapshot(&identifier).await {
