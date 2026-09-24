@@ -1515,3 +1515,99 @@ async fn test_partitions_system_table() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_aggregation_fields_system_table() {
+    let (ctx, _catalog, _tmp) = create_context().await;
+    run_sql(
+        &ctx,
+        "CREATE TABLE paimon.default.agg_fields (
+            id INT NOT NULL,
+            total BIGINT,
+            PRIMARY KEY (id)
+        ) WITH (
+            'bucket' = '1',
+            'merge-engine' = 'aggregation',
+            'fields.total.aggregate-function' = 'sum'
+        )",
+    )
+    .await;
+
+    let batches = run_sql(
+        &ctx,
+        "SELECT * FROM paimon.default.agg_fields$aggregation_fields",
+    )
+    .await;
+    assert!(
+        !batches.is_empty(),
+        "$aggregation_fields should return ≥1 batch"
+    );
+
+    let arrow_schema = batches[0].schema();
+    let expected_columns = [
+        ("field_name", DataType::Utf8),
+        ("field_type", DataType::Utf8),
+        ("function", DataType::Utf8),
+        ("function_options", DataType::Utf8),
+        ("comment", DataType::Utf8),
+    ];
+    for (i, (name, dtype)) in expected_columns.iter().enumerate() {
+        let field = arrow_schema.field(i);
+        assert_eq!(field.name(), name, "column {i} name");
+        assert_eq!(field.data_type(), dtype, "column {i} type");
+    }
+    // MARKER_AGG_FIELDS
+    let mut rows: std::collections::BTreeMap<String, (String, String, String)> =
+        std::collections::BTreeMap::new();
+    for batch in &batches {
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let types = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let functions = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let function_options = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.insert(
+                names.value(i).to_string(),
+                (
+                    types.value(i).to_string(),
+                    functions.value(i).to_string(),
+                    function_options.value(i).to_string(),
+                ),
+            );
+        }
+    }
+
+    let total = rows.get("total").expect("total field must appear");
+    assert!(!total.0.is_empty(), "field_type must be rendered");
+    assert_eq!(total.1, "[sum]", "configured aggregate function");
+    assert_eq!(
+        total.2, "[fields.total.aggregate-function]",
+        "the option key that set the function"
+    );
+
+    let id = rows.get("id").expect("id field must appear");
+    assert!(!id.0.is_empty(), "field_type must be rendered");
+    assert_eq!(
+        id.1, "[]",
+        "a field with no fields.* option has no function"
+    );
+    assert_eq!(
+        id.2, "[]",
+        "a field with no fields.* option has no option key"
+    );
+}

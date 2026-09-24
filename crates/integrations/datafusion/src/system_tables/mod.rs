@@ -30,6 +30,7 @@ use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
 
+mod aggregation_fields;
 mod audit_log;
 mod branches;
 mod consumers;
@@ -51,6 +52,7 @@ type Builder = fn(Table) -> DFResult<Arc<dyn TableProvider>>;
 // in `load` because it needs the catalog handle (for metastore-tracked audit
 // metadata via `Catalog::list_partitions`).
 const TABLES: &[(&str, Builder)] = &[
+    ("aggregation_fields", aggregation_fields::build),
     ("audit_log", audit_log::build),
     ("branches", branches::build),
     ("consumers", consumers::build),
@@ -66,6 +68,7 @@ const TABLES: &[(&str, Builder)] = &[
 ];
 
 const SYSTEM_TABLE_NAMES: &[&str] = &[
+    "aggregation_fields",
     "audit_log",
     "branches",
     "consumers",
@@ -107,7 +110,8 @@ pub(crate) fn is_registered(name: &str) -> bool {
 /// with a `$`. Keep in step with `TABLES`: one missing here goes back to
 /// having its time-travel clause silently dropped.
 pub(crate) fn is_system_table_provider(provider: &dyn TableProvider) -> bool {
-    provider.is::<branches::BranchesTable>()
+    provider.is::<aggregation_fields::AggregationFieldsTable>()
+        || provider.is::<branches::BranchesTable>()
         || provider.is::<consumers::ConsumersTable>()
         || provider.is::<files::FilesTable>()
         || provider.is::<manifests::ManifestsTable>()
