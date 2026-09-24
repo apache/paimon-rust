@@ -36,28 +36,28 @@ impl Table {
     pub async fn from_rest_response(
         identifier: Identifier,
         response: crate::api::GetTableResponse,
-        options: Options,
+        rest_options: Options,
     ) -> Result<Self> {
         identifier.validate()?;
         // Reject a stale or misrouted response before initializing auth or local-cache resources.
         response_identifier(&identifier, &response)?;
-        options
+        rest_options
             .get(CatalogOptions::WAREHOUSE)
             .ok_or_else(|| RestError::BadRequest {
                 message: format!("Missing required option: {}", CatalogOptions::WAREHOUSE),
             })?;
-        let api = Arc::new(RESTApi::new(options.clone(), false).await?);
+        let api = Arc::new(RESTApi::new(rest_options.clone(), false).await?);
         let data_token_enabled = api
             .options()
             .get(CatalogOptions::DATA_TOKEN_ENABLED)
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let local_cache = create_local_cache_with_namespace(&options, api.options())?;
+        let local_cache = create_local_cache_with_namespace(&rest_options, api.options())?;
         RESTEnv::build_table(
             &identifier,
             response,
             api,
-            options,
+            rest_options,
             data_token_enabled,
             local_cache,
         )

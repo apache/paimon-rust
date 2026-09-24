@@ -244,7 +244,7 @@ def test_resolved_rest_response_keeps_snapshot_and_token_refresh(
             json.dumps(response),
             database='db',
             table=object_name,
-            options={
+            rest_options={
                 'uri': 'http://127.0.0.1:%d' % server.server_port,
                 'warehouse': 'test', 'token.provider': 'bear', 'token': 'test-token',
                 'data-token.enabled': 'true',
@@ -273,7 +273,7 @@ def test_resolved_rest_response_rejects_identity_mismatch(resolved_source, datab
     # Identity validation must run before REST auth/cache initialization.
     with pytest.raises(ValueError, match="does not match requested identifier"):
         Table.from_rest_response(
-            json.dumps(response), database=database, table=table, options={})
+            json.dumps(response), database=database, table=table, rest_options={})
 
 
 @pytest.mark.parametrize(("change", "message"), [
@@ -292,7 +292,7 @@ def test_resolved_rest_response_validates_schema_structure(resolved_source, chan
     response = {"id": "table-uuid", "database": "db", "name": "t", "path": str(root),
                 "isExternal": True, "schemaId": schema["id"], "schema": schema}
     with pytest.raises(ValueError, match=message):
-        Table.from_rest_response(json.dumps(response), database="db", table="t", options={
+        Table.from_rest_response(json.dumps(response), database="db", table="t", rest_options={
             "uri": "http://127.0.0.1:1", "warehouse": "test",
             "token.provider": "bear", "token": "test-token",
         })
@@ -301,7 +301,7 @@ def test_resolved_rest_response_validates_schema_structure(resolved_source, chan
 @pytest.mark.parametrize('response', ['{', '{}'])
 def test_resolved_rest_response_rejects_missing_metadata(response):
     with pytest.raises(ValueError):
-        Table.from_rest_response(response, database='db', table='t', options={
+        Table.from_rest_response(response, database='db', table='t', rest_options={
             'uri': 'http://127.0.0.1:1', 'warehouse': 'test',
             'token.provider': 'bear', 'token': 'test-token',
         })

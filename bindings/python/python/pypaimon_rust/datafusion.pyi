@@ -156,9 +156,9 @@ class Table:
         ...
     @staticmethod
     def from_rest_response(
-        response_json: str, *, database: str, table: str, options: Dict[str, str],
+        response_json: str, *, database: str, table: str, rest_options: Dict[str, str],
     ) -> "Table":
-        """Reuse matching REST metadata and merged options; retain snapshots and token refresh."""
+        """Reuse matching REST metadata and merged catalog options."""
         ...
 
     def copy_with_resolved_schema(self, schema_json: str, *, branch: Optional[str] = None) -> "Table":

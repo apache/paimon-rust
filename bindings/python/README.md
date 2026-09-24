@@ -196,7 +196,7 @@ results and branch-scoped requests. Permission and service failures (including
 HTTP 501) are propagated as in Java, and the
 FileIO provider continues to refresh catalog credentials after schema replacement.
 
-`Table.from_rest_response(response_json, database=..., table=..., options=...)`
+`Table.from_rest_response(response_json, database=..., table=..., rest_options=...)`
 reuses the matching REST table response and merged catalog options, skipping
 config/get-table requests while preserving REST snapshots and token refresh.
 Use `copy_with_resolved_schema` to apply branch or dynamic options.

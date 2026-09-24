@@ -87,13 +87,13 @@ impl PyTable {
     /// Reuse the matching REST table response and merged catalog options.
     /// Skips config/get-table requests, preserving REST snapshots and token refresh.
     #[staticmethod]
-    #[pyo3(signature = (response_json, *, database, table, options))]
+    #[pyo3(signature = (response_json, *, database, table, rest_options))]
     fn from_rest_response(
         py: Python<'_>,
         response_json: &str,
         database: &str,
         table: &str,
-        options: HashMap<String, String>,
+        rest_options: HashMap<String, String>,
     ) -> PyResult<Self> {
         let response: paimon::api::GetTableResponse =
             serde_json::from_str(response_json).map_err(|err| {
@@ -105,7 +105,7 @@ impl PyTable {
                 runtime().block_on(paimon::table::Table::from_rest_response(
                     identifier,
                     response,
-                    Options::from_map(options),
+                    Options::from_map(rest_options),
                 ))
             })
             .map_err(to_py_err)?;
