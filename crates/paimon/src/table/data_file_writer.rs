@@ -30,7 +30,7 @@ use crate::io::FileIO;
 use crate::resource::ResourceContext;
 use crate::spec::data_file_to_file_index_file_name;
 use crate::spec::stats::BinaryTableStats;
-use crate::spec::{bucket_path_under, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
+use crate::spec::{bucket_path_under, CoreOptions, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
 use crate::Result;
 use arrow_array::RecordBatch;
 use chrono::Utc;
@@ -56,6 +56,7 @@ pub(crate) struct DataFileWriter {
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
     file_format: String,
+    data_file_prefix: String,
     write_fields: Vec<DataField>,
     format_options: HashMap<String, String>,
     file_source: Option<i32>,
@@ -94,6 +95,9 @@ impl DataFileWriter {
         first_row_id: Option<i64>,
         write_cols: Option<Vec<String>>,
     ) -> Self {
+        let data_file_prefix = CoreOptions::new(&format_options)
+            .data_file_prefix()
+            .to_string();
         Self {
             file_io,
             table_location,
@@ -105,6 +109,7 @@ impl DataFileWriter {
             file_compression_zstd_level,
             write_buffer_size,
             file_format,
+            data_file_prefix,
             write_fields,
             format_options,
             file_source,
@@ -182,7 +187,8 @@ impl DataFileWriter {
             .map(|options| options.create_writer())
             .transpose()?;
         let file_name = format!(
-            "data-{}-{}.{}",
+            "{}{}-{}.{}",
+            self.data_file_prefix,
             uuid::Uuid::new_v4(),
             self.written_files.len(),
             self.file_format,

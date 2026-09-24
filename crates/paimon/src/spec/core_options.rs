@@ -65,6 +65,7 @@ const COMMIT_MAX_RETRY_WAIT_OPTION: &str = "commit.max-retry-wait";
 const FILE_COMPRESSION_OPTION: &str = "file.compression";
 const FILE_COMPRESSION_ZSTD_LEVEL_OPTION: &str = "file.compression.zstd-level";
 const FILE_FORMAT_OPTION: &str = "file.format";
+const DATA_FILE_PREFIX_OPTION: &str = "data-file.prefix";
 const VECTOR_FILE_FORMAT_OPTION: &str = "vector.file.format";
 const VECTOR_TARGET_FILE_SIZE_OPTION: &str = "vector.target-file-size";
 const CHANGELOG_FILE_PREFIX_OPTION: &str = "changelog-file.prefix";
@@ -1345,6 +1346,14 @@ impl<'a> CoreOptions<'a> {
             .get(FILE_COMPRESSION_ZSTD_LEVEL_OPTION)
             .and_then(|v| v.parse().ok())
             .unwrap_or(1)
+    }
+
+    /// File name prefix for data files. Default is `"data-"`.
+    pub fn data_file_prefix(&self) -> &str {
+        self.options
+            .get(DATA_FILE_PREFIX_OPTION)
+            .map(String::as_str)
+            .unwrap_or("data-")
     }
 
     /// File name prefix for changelog files. Default is `"changelog-"`.
@@ -2831,12 +2840,14 @@ mod tests {
         ]);
         let default_core = CoreOptions::new(&default_options);
 
+        assert_eq!(default_core.data_file_prefix(), "data-");
         assert_eq!(default_core.changelog_file_prefix(), "changelog-");
         assert_eq!(default_core.changelog_file_format(), "avro");
         assert_eq!(default_core.changelog_file_compression(), "snappy");
         assert_eq!(default_core.changelog_file_stats_mode(), None);
 
         let custom_options = HashMap::from([
+            (DATA_FILE_PREFIX_OPTION.to_string(), "files-".to_string()),
             (
                 CHANGELOG_FILE_PREFIX_OPTION.to_string(),
                 "custom-".to_string(),
@@ -2856,6 +2867,7 @@ mod tests {
         ]);
         let custom_core = CoreOptions::new(&custom_options);
 
+        assert_eq!(custom_core.data_file_prefix(), "files-");
         assert_eq!(custom_core.changelog_file_prefix(), "custom-");
         assert_eq!(custom_core.changelog_file_format(), "parquet");
         assert_eq!(custom_core.changelog_file_compression(), "zstd");

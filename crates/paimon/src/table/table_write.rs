@@ -136,6 +136,7 @@ pub struct TableWrite {
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
     file_format: String,
+    data_file_prefix: String,
     primary_key_indices: Vec<usize>,
     primary_key_types: Vec<DataType>,
     sequence_field_indices: Vec<usize>,
@@ -251,6 +252,7 @@ impl TableWrite {
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
         let file_format = core_options.file_format().to_string();
+        let data_file_prefix = core_options.data_file_prefix().to_string();
         let vector_file_format = core_options.vector_file_format();
         let changelog_file_prefix = core_options.changelog_file_prefix().to_string();
         let changelog_file_format = core_options.changelog_file_format().to_string();
@@ -419,6 +421,7 @@ impl TableWrite {
             file_compression_zstd_level,
             write_buffer_size,
             file_format,
+            data_file_prefix,
             primary_key_indices,
             primary_key_types,
             sequence_field_indices,
@@ -1118,7 +1121,7 @@ impl TableWrite {
 
     /// Create a postpone writer (KV format, no sorting/dedup, special file naming).
     fn create_postpone_writer(&self, partition_path: String, bucket: i32) -> FileWriter {
-        let data_file_prefix = format!("data-u-{}-s-0-w-", self.commit_user);
+        let data_file_prefix = format!("{}-u-{}-s-0-w-", self.data_file_prefix, self.commit_user);
         FileWriter::Postpone(
             PostponeFileWriter::new(
                 self.table.file_io().clone(),
@@ -1178,6 +1181,7 @@ impl TableWrite {
                     file_compression_zstd_level: self.file_compression_zstd_level,
                     write_buffer_size: self.write_buffer_size,
                     file_format: self.file_format.clone(),
+                    data_file_prefix: self.data_file_prefix.clone(),
                     input_changelog: self.changelog_producer == ChangelogProducer::Input
                         && !self.is_overwrite,
                     changelog_file_prefix: self.changelog_file_prefix.clone(),
@@ -4281,9 +4285,9 @@ pub(in crate::table) mod tests {
         let messages = table_write.prepare_commit().await.unwrap();
         let file = &messages[0].new_files[0];
 
-        // Verify postpone file naming: data-u-{commitUser}-s-{writeId}-w-{uuid}-{index}.parquet
+        // Verify postpone file naming: data--u-{commitUser}-s-{writeId}-w-{uuid}-{index}.parquet
         assert!(
-            file.file_name.starts_with("data-u-my-commit-user-s-"),
+            file.file_name.starts_with("data--u-my-commit-user-s-"),
             "Expected postpone file prefix, got: {}",
             file.file_name
         );
