@@ -148,6 +148,8 @@ pub struct TableWrite {
     partition_seq_cache: HashMap<Vec<u8>, HashMap<i32, i64>>,
     sequence_snapshot: Option<Option<Snapshot>>,
     commit_user: String,
+    /// Shared by this writer's postpone files, as in Java's per-writer writeId.
+    postpone_write_id: i32,
     /// Bucket assignment strategy (fixed, dynamic, or cross-partition).
     bucket_assigner: BucketAssignerEnum,
     /// Whether this is an overwrite operation (skip seq/index restore).
@@ -433,6 +435,7 @@ impl TableWrite {
             partition_seq_cache: HashMap::new(),
             sequence_snapshot: None,
             commit_user,
+            postpone_write_id: (uuid::Uuid::new_v4().as_u128() % i32::MAX as u128) as i32,
             bucket_assigner,
             is_overwrite,
             blob_view_fields,
@@ -1121,7 +1124,10 @@ impl TableWrite {
 
     /// Create a postpone writer (KV format, no sorting/dedup, special file naming).
     fn create_postpone_writer(&self, partition_path: String, bucket: i32) -> FileWriter {
-        let data_file_prefix = format!("{}-u-{}-s-0-w-", self.data_file_prefix, self.commit_user);
+        let data_file_prefix = format!(
+            "{}-u-{}-s-{}-w-",
+            self.data_file_prefix, self.commit_user, self.postpone_write_id
+        );
         FileWriter::Postpone(
             PostponeFileWriter::new(
                 self.table.file_io().clone(),
@@ -2755,6 +2761,17 @@ pub(in crate::table) mod tests {
         let messages2 = table_write.prepare_commit().await.unwrap();
         assert_eq!(messages2.len(), 1);
         assert_eq!(messages2[0].new_files[0].row_count, 3);
+        let prefix1 = messages1[0].new_files[0]
+            .file_name
+            .split_once("-w-")
+            .unwrap()
+            .0;
+        let prefix2 = messages2[0].new_files[0]
+            .file_name
+            .split_once("-w-")
+            .unwrap()
+            .0;
+        assert_eq!(prefix1, prefix2);
 
         // Empty prepare_commit is fine
         let messages3 = table_write.prepare_commit().await.unwrap();
@@ -4268,6 +4285,29 @@ pub(in crate::table) mod tests {
         // Empty prepare_commit
         let messages3 = table_write.prepare_commit().await.unwrap();
         assert!(messages3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_postpone_writers_with_same_commit_user_have_distinct_prefixes() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_writer_prefixes";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let mut prefixes = Vec::new();
+        for id in [1, 2] {
+            let mut write = TableWrite::new(&table, "shared-user".to_string()).unwrap();
+            write
+                .write_arrow_batch(&make_batch(vec![id], vec![id * 10]))
+                .await
+                .unwrap();
+            let messages = write.prepare_commit().await.unwrap();
+            let file_name = &messages[0].new_files[0].file_name;
+            let (prefix, _) = file_name.split_once("-w-").unwrap();
+            assert!(prefix.starts_with("data--u-shared-user-s-"));
+            prefixes.push(prefix.to_string());
+        }
+        assert_ne!(prefixes[0], prefixes[1]);
     }
 
     #[tokio::test]
