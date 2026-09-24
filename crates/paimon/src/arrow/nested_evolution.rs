@@ -33,7 +33,9 @@
 
 use std::sync::Arc;
 
-use arrow_array::{new_null_array, Array, ArrayRef, ListArray, MapArray, StringArray, StructArray};
+use arrow_array::{
+    new_null_array, Array, ArrayRef, Int64Array, ListArray, MapArray, StringArray, StructArray,
+};
 use arrow_cast::cast;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
@@ -107,12 +109,71 @@ pub(crate) fn evolve_column(
         _ => {}
     }
 
+    // Java `NumericPrimitiveToTimestamp` reads an INTEGER/BIGINT column as epoch
+    // *seconds* (`value.longValue() * 1000` millis, fed to `toLocalDateTime`);
+    // Arrow's Int64->Timestamp cast instead reinterprets the raw value directly
+    // in the column's unit, so a BIGINT epoch column evolved to TIMESTAMP(6)
+    // would read 10^6x too small (~1970). Scale seconds into the target unit
+    // first. Scoped to INTEGER/BIGINT into TIMESTAMP *without* local time zone:
+    // Java's `create()` returns null for every other numeric source, and its
+    // TIMESTAMP-with-local-zone target resolves the offset with
+    // `ZoneId.systemDefault()` (environment dependent) -- both are left to the
+    // Arrow fallthrough below rather than guessed at here.
+    if matches!(source_type, DataType::Int(_) | DataType::BigInt(_)) {
+        if let DataType::Timestamp(ts) = target_type {
+            return numeric_epoch_seconds_to_timestamp(source, &target_arrow, ts.precision());
+        }
+    }
+
     cast(source, &target_arrow).map_err(|e| crate::Error::UnexpectedError {
         message: format!(
             "failed to cast nested value from {:?} to {:?} during schema evolution",
             source.data_type(),
             target_arrow
         ),
+        source: Some(Box::new(e)),
+    })
+}
+
+/// Evolve an INTEGER/BIGINT column into a TIMESTAMP (without local time zone)
+/// the way Java `NumericPrimitiveToTimestamp` does: interpret each value as
+/// epoch seconds and scale it into the target time unit. Nulls are preserved,
+/// and a value that overflows `i64` in the target unit becomes NULL, matching
+/// the safe-cast overflow behavior of the surrounding evolution path.
+fn numeric_epoch_seconds_to_timestamp(
+    source: &ArrayRef,
+    target_arrow: &ArrowDataType,
+    precision: u32,
+) -> crate::Result<ArrayRef> {
+    // Ticks per second for the target unit (precision buckets match
+    // `paimon_type_to_arrow`'s `timestamp_time_unit`).
+    let ticks_per_second: i64 = match precision {
+        0 => 1,
+        1..=3 => 1_000,
+        4..=6 => 1_000_000,
+        _ => 1_000_000_000,
+    };
+    let as_i64 =
+        cast(source, &ArrowDataType::Int64).map_err(|e| crate::Error::UnexpectedError {
+            message: format!(
+                "failed to widen {:?} to Int64 before scaling epoch seconds to timestamp",
+                source.data_type()
+            ),
+            source: Some(Box::new(e)),
+        })?;
+    let seconds = as_i64
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("cast to Int64 yields an Int64Array");
+    // Scale seconds into the unit; a null stays null and an overflow becomes null.
+    let scaled: Int64Array = seconds
+        .iter()
+        .map(|value| value.and_then(|v| v.checked_mul(ticks_per_second)))
+        .collect();
+    // Reinterpret the already-scaled value straight into the timestamp unit
+    // (Arrow's Int64->Timestamp copies it verbatim, no further scaling).
+    cast(&(Arc::new(scaled) as ArrayRef), target_arrow).map_err(|e| crate::Error::UnexpectedError {
+        message: format!("failed to build {target_arrow:?} from scaled epoch seconds"),
         source: Some(Box::new(e)),
     })
 }
@@ -480,9 +541,12 @@ fn rebuild_map(
 mod tests {
     use super::*;
     use crate::spec::{
-        ArrayType, BigIntType, DataField, DecimalType, IntType, MapType, VarCharType,
+        ArrayType, BigIntType, DataField, DecimalType, IntType, MapType, TimestampType, VarCharType,
     };
-    use arrow_array::{Decimal128Array, Int32Array, Int64Array, StringArray};
+    use arrow_array::{
+        Decimal128Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampSecondArray,
+    };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Fields};
 
@@ -656,6 +720,56 @@ mod tests {
             "y"
         );
         assert_eq!(inner_out.column_by_name("b").unwrap().null_count(), 2);
+    }
+
+    #[test]
+    fn evolves_bigint_epoch_seconds_to_timestamp_scaled_to_the_column_unit() {
+        // A BIGINT column holding epoch *seconds* (Java's NumericPrimitiveToTimestamp
+        // reads INTEGER/BIGINT that way) evolved to TIMESTAMP must be scaled into
+        // the column's unit, not reinterpreted raw. 1_700_000_000 s is 2023-11-14.
+        let secs = 1_700_000_000_i64;
+        let source: ArrayRef = Arc::new(Int64Array::from(vec![Some(secs), None]));
+        let source_type = DataType::BigInt(BigIntType::new());
+
+        let ts6 = DataType::Timestamp(TimestampType::new(6).unwrap());
+        let micros = evolve_column(&source, &source_type, &ts6).unwrap();
+        assert_eq!(micros.data_type(), &paimon_type_to_arrow(&ts6).unwrap());
+        let micros = micros
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("microsecond timestamps");
+        assert_eq!(micros.value(0), secs * 1_000_000);
+        assert!(micros.is_null(1));
+
+        let ts0 = DataType::Timestamp(TimestampType::new(0).unwrap());
+        let seconds = evolve_column(&source, &source_type, &ts0).unwrap();
+        let seconds = seconds
+            .as_any()
+            .downcast_ref::<TimestampSecondArray>()
+            .expect("second timestamps");
+        assert_eq!(seconds.value(0), secs);
+
+        let ts3 = DataType::Timestamp(TimestampType::new(3).unwrap());
+        let millis = evolve_column(&source, &source_type, &ts3).unwrap();
+        let millis = millis
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("millisecond timestamps");
+        assert_eq!(millis.value(0), secs * 1_000);
+    }
+
+    #[test]
+    fn evolves_int_epoch_seconds_to_timestamp_like_bigint() {
+        // Java switches INTEGER and BIGINT together in the same cast rule.
+        let secs = 1_700_000_000_i32;
+        let source: ArrayRef = Arc::new(Int32Array::from(vec![Some(secs)]));
+        let ts6 = DataType::Timestamp(TimestampType::new(6).unwrap());
+        let out = evolve_column(&source, &DataType::Int(IntType::new()), &ts6).unwrap();
+        let micros = out
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("microsecond timestamps");
+        assert_eq!(micros.value(0), secs as i64 * 1_000_000);
     }
 
     #[test]
