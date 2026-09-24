@@ -20,7 +20,7 @@
 //! Writes data in KV format (`_SEQUENCE_NUMBER`, `_VALUE_KIND` + user columns)
 //! but without sorting or deduplication — compaction assigns real buckets later.
 //!
-//! Uses a special file naming prefix: `data--u-{commitUser}-s-0-w-`.
+//! Uses a special file naming prefix: `data--u-{commitUser}-s-{writeId}-w-`.
 //!
 //! Reference: [PostponeBucketWriter](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/sink/PostponeBucketWriter.java)
 
@@ -47,7 +47,7 @@ pub(crate) struct PostponeWriteConfig {
     pub file_compression_zstd_level: i32,
     pub write_buffer_size: i64,
     pub file_format: String,
-    /// Data file name prefix: `"data--u-{commitUser}-s-0-w-"`.
+    /// Data file name prefix: `"data--u-{commitUser}-s-{writeId}-w-"`.
     pub data_file_prefix: String,
 }
 
