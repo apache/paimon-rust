@@ -1482,6 +1482,12 @@ fn is_diff_supported_type(data_type: &DataType) -> bool {
             | DataType::Char(_)
             | DataType::VarChar(_)
             | DataType::Date(_)
+            | DataType::Binary(_)
+            | DataType::VarBinary(_)
+            | DataType::Decimal(_)
+            | DataType::Time(_)
+            | DataType::Timestamp(_)
+            | DataType::LocalZonedTimestamp(_)
     )
 }
 
@@ -1557,8 +1563,11 @@ fn scalar_compare(
     right_row: usize,
 ) -> crate::Result<Ordering> {
     use arrow_array::{
-        BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-        Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int64Array, Int8Array, StringArray, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
 
     match (left.is_null(left_row), right.is_null(right_row)) {
@@ -1589,6 +1598,35 @@ fn scalar_compare(
     compare!(UInt64Array, |a: &UInt64Array, r| a.value(r));
     compare!(BooleanArray, |a: &BooleanArray, r| a.value(r));
     compare!(Date32Array, |a: &Date32Array, r| a.value(r));
+    compare!(Decimal128Array, |a: &Decimal128Array, r| a.value(r));
+    compare!(Time32SecondArray, |a: &Time32SecondArray, r| a.value(r));
+    compare!(Time32MillisecondArray, |a: &Time32MillisecondArray, r| a
+        .value(r));
+    compare!(Time64MicrosecondArray, |a: &Time64MicrosecondArray, r| a
+        .value(r));
+    compare!(Time64NanosecondArray, |a: &Time64NanosecondArray, r| a
+        .value(r));
+    compare!(TimestampSecondArray, |a: &TimestampSecondArray, r| a
+        .value(r));
+    compare!(
+        TimestampMillisecondArray,
+        |a: &TimestampMillisecondArray, r| a.value(r)
+    );
+    compare!(
+        TimestampMicrosecondArray,
+        |a: &TimestampMicrosecondArray, r| a.value(r)
+    );
+    compare!(
+        TimestampNanosecondArray,
+        |a: &TimestampNanosecondArray, r| a.value(r)
+    );
+
+    if let (Some(a), Some(b)) = (
+        left.as_any().downcast_ref::<BinaryArray>(),
+        right.as_any().downcast_ref::<BinaryArray>(),
+    ) {
+        return Ok(a.value(left_row).cmp(b.value(right_row)));
+    }
 
     if let (Some(a), Some(b)) = (
         left.as_any().downcast_ref::<StringArray>(),
@@ -2009,8 +2047,8 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_rejects_types_without_comparator_support() {
-        use crate::spec::{ArrayType, DecimalType, IntType, TimestampType};
+    fn test_diff_accepts_scalar_types_and_rejects_nested() {
+        use crate::spec::{ArrayType, BinaryType, DecimalType, IntType, TimeType, TimestampType};
 
         let decimal = DataField::new(
             1,
@@ -2027,17 +2065,20 @@ mod tests {
             "created_at".to_string(),
             DataType::Timestamp(TimestampType::new(6).unwrap()),
         );
-        assert!(matches!(
-            ensure_diff_supported_read_type(&[decimal]),
-            Err(crate::Error::Unsupported { message }) if message.contains("amount")
-        ));
+        let binary = DataField::new(
+            4,
+            "payload".to_string(),
+            DataType::Binary(BinaryType::new(8).unwrap()),
+        );
+        let time = DataField::new(
+            5,
+            "time".to_string(),
+            DataType::Time(TimeType::new(3).unwrap()),
+        );
+        ensure_diff_supported_read_type(&[decimal, timestamp, binary, time]).unwrap();
         assert!(matches!(
             ensure_diff_supported_read_type(&[nested]),
             Err(crate::Error::Unsupported { message }) if message.contains("tags")
-        ));
-        assert!(matches!(
-            ensure_diff_supported_read_type(&[timestamp]),
-            Err(crate::Error::Unsupported { message }) if message.contains("created_at")
         ));
     }
 
