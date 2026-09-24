@@ -34,10 +34,11 @@ use crate::io::FileIO;
 use crate::resource::{MemoryReservation, ResourceContext};
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
-    bucket_path_under, extract_datum_from_arrow, AggregationConfig, BinaryRowBuilder, CoreOptions,
-    DataField, DataFileMeta, DataType, MergeEngine, PartialUpdateConfig, RowKind,
-    SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
+    bucket_path_under, data_file_to_file_index_file_name, extract_datum_from_arrow,
+    AggregationConfig, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta, DataType,
+    MergeEngine, PartialUpdateConfig, RowKind, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
+use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::sort_merge::{AggregateMergeFunction, BufferedBatch, MergeRow};
 use crate::Result;
@@ -100,6 +101,8 @@ pub(crate) struct KeyValueWriteConfig {
     /// Merge engine for deduplication.
     pub merge_engine: MergeEngine,
     pub deletion_vectors_enabled: bool,
+    /// File indexes follow the sorted, merged data rows and never changelog rows.
+    pub file_index_options: Option<Arc<FileIndexOptions>>,
 }
 
 struct IndexedFileWrite<'a> {
@@ -423,6 +426,15 @@ impl KeyValueFileWriter {
         let last_row = indices.value(indices.len() - 1) as usize;
         let min_key = self.extract_key_binary_row(batch, first_row)?;
         let max_key = self.extract_key_binary_row(batch, last_row)?;
+        let mut file_index = if write.is_changelog {
+            None
+        } else {
+            self.config
+                .file_index_options
+                .as_ref()
+                .map(|options| options.create_writer())
+                .transpose()?
+        };
 
         let physical_schema = build_physical_schema(&user_schema);
         let file_name = format!(
@@ -537,6 +549,25 @@ impl KeyValueFileWriter {
                 let _ = self.file_io.delete_file(&file_path).await;
                 return Err(error);
             }
+            if let Some(index) = file_index.as_mut() {
+                // The index positions must match the physical file after PK
+                // sorting and flush-time merging. Its field positions refer
+                // to the logical value schema, so omit the two KV metadata
+                // columns from the same output chunk used by the file writer.
+                let logical_indices = (2..chunk_batch.num_columns()).collect::<Vec<_>>();
+                let index_result = chunk_batch
+                    .project(&logical_indices)
+                    .map_err(|error| crate::Error::DataInvalid {
+                        message: format!("Failed to project KV index values: {error}"),
+                        source: None,
+                    })
+                    .and_then(|logical_batch| index.write(&logical_batch));
+                if let Err(error) = index_result {
+                    let _ = writer.close().await;
+                    let _ = self.file_io.delete_file(&file_path).await;
+                    return Err(error);
+                }
+            }
         }
 
         let write_result = writer.close().await?;
@@ -580,7 +611,7 @@ impl KeyValueFileWriter {
             &self.config.primary_key_types,
         )?;
 
-        Ok(DataFileMeta {
+        let mut meta = DataFileMeta {
             file_name,
             file_size,
             row_count: indices.len() as i64,
@@ -602,7 +633,44 @@ impl KeyValueFileWriter {
             first_row_id: None,
             write_cols: None,
             column_max_sequence_numbers: None,
-        })
+        };
+        if let Some(index) = file_index {
+            let index_result = index.serialize();
+            let bytes = match index_result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let _ = self.file_io.delete_file(&file_path).await;
+                    return Err(error);
+                }
+            };
+            let threshold = self
+                .config
+                .file_index_options
+                .as_ref()
+                .expect("file index writer must have options")
+                .in_manifest_threshold;
+            if bytes.len() as u64 > threshold as u64 {
+                let name = data_file_to_file_index_file_name(&meta.file_name);
+                let index_path = format!("{bucket_dir}/{name}");
+                let output = match self.file_io.new_output(&index_path) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let _ = self.file_io.delete_file(&file_path).await;
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = output.write(bytes).await {
+                    let _ = self.file_io.delete_file(&index_path).await;
+                    let _ = self.file_io.delete_file(&file_path).await;
+                    return Err(error);
+                }
+                meta.extra_files.push(name);
+            } else {
+                meta.embedded_index = Some(bytes.to_vec());
+            }
+        }
+
+        Ok(meta)
     }
 
     fn indexed_delete_row_count(batch: &RecordBatch, indices: &UInt32Array) -> Result<i64> {
@@ -1066,6 +1134,7 @@ mod tests {
             sequence_field_indices: vec![1],
             merge_engine,
             deletion_vectors_enabled: false,
+            file_index_options: None,
         }
     }
 

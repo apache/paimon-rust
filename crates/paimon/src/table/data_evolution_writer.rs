@@ -33,6 +33,7 @@ use crate::spec::{
     FileKind, IndexFileMeta, IndexManifest, PartitionComputer, Snapshot, EMPTY_BINARY_ROW,
 };
 use crate::table::commit_message::CommitMessage;
+use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::source::data_evolution_anchor_file;
@@ -1000,6 +1001,7 @@ struct PartialWriteSet {
     write_columns: Vec<String>,
     column_indices: Vec<usize>,
     schema: Arc<arrow_schema::Schema>,
+    file_index_options: Option<Arc<FileIndexOptions>>,
 }
 
 impl DataEvolutionPartialWriter {
@@ -1019,7 +1021,20 @@ impl DataEvolutionPartialWriter {
 
         let partition_keys: Vec<String> = schema.partition_keys().to_vec();
         let fields = schema.fields();
-        let write_sets = Self::build_write_sets(&write_columns, fields, &core_options)?;
+        let mut write_sets = Self::build_write_sets(&write_columns, fields, &core_options)?;
+        let file_index_options = FileIndexOptions::parse(schema.options(), fields)?;
+        for write_set in &mut write_sets {
+            write_set.file_index_options = file_index_options
+                .as_ref()
+                .and_then(|options| options.project_to_fields(&write_set.write_fields))
+                .map(Arc::new);
+            if write_set.kind == PartialFileKind::Vector && write_set.file_index_options.is_some() {
+                return Err(crate::Error::Unsupported {
+                    message: "FileIndex generation does not support dedicated VECTOR partial files"
+                        .to_string(),
+                });
+            }
+        }
         let partition_computer = PartitionComputer::new(
             &partition_keys,
             fields,
@@ -1088,6 +1103,7 @@ impl DataEvolutionPartialWriter {
                 write_columns: normal_columns,
                 column_indices: normal_indices,
                 schema,
+                file_index_options: None,
             });
         }
 
@@ -1102,6 +1118,7 @@ impl DataEvolutionPartialWriter {
                 write_columns: vector_columns,
                 column_indices: vector_indices,
                 schema,
+                file_index_options: None,
             });
         }
 
@@ -1161,7 +1178,8 @@ impl DataEvolutionPartialWriter {
                     Some(0), // file_source: APPEND
                     Some(first_row_id),
                     Some(write_set.write_columns.clone()),
-                );
+                )
+                .with_file_index(write_set.file_index_options.clone());
                 self.writers.insert(key.clone(), writer);
             }
 
