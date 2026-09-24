@@ -1196,6 +1196,7 @@ impl TableWrite {
                     primary_keys: self.table.schema().primary_keys().to_vec(),
                     primary_key_indices: self.primary_key_indices.clone(),
                     primary_key_types: self.primary_key_types.clone(),
+                    value_fields: self.table.schema().fields().to_vec(),
                     sequence_field_indices: self.sequence_field_indices.clone(),
                     merge_engine: self.merge_engine,
                     deletion_vectors_enabled: CoreOptions::new(self.table.schema().options())
@@ -2008,7 +2009,7 @@ pub(in crate::table) mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_write_truncates_string_value_stats_and_keeps_binary_counts() {
+    async fn test_append_write_truncates_string_and_binary_value_stats() {
         let file_io = test_file_io();
         let table_path = "memory:/test_table_write_skip_variable_length_stats";
         setup_dirs(&file_io, table_path).await;
@@ -2067,8 +2068,8 @@ pub(in crate::table) mod tests {
         assert_eq!(max_values.get_int(0).unwrap(), 2);
         assert_eq!(min_values.get_string(1).unwrap(), "a long string va");
         assert_eq!(max_values.get_string(1).unwrap(), "another long sts");
-        assert!(min_values.is_null_at(2));
-        assert!(max_values.is_null_at(2));
+        assert_eq!(min_values.get_binary(2).unwrap(), b"another-large-bi");
+        assert_eq!(max_values.get_binary(2).unwrap(), b"large-binary-vam");
     }
 
     #[tokio::test]
@@ -2142,8 +2143,8 @@ pub(in crate::table) mod tests {
         assert!(max_values.is_null_at(0));
         assert_eq!(min_values.get_string(1).unwrap(), "alpha-long-value-12345");
         assert_eq!(max_values.get_string(1).unwrap(), "zeta-long-value-99999");
-        assert!(min_values.is_null_at(2));
-        assert!(max_values.is_null_at(2));
+        assert_eq!(min_values.get_binary(2).unwrap(), b"first-binary-value");
+        assert_eq!(max_values.get_binary(2).unwrap(), b"first-binary-value");
     }
 
     #[tokio::test]
@@ -3913,6 +3914,12 @@ pub(in crate::table) mod tests {
         assert_eq!(file.level, 0);
         assert_eq!(file.min_sequence_number, 0);
         assert_eq!(file.max_sequence_number, 2);
+        assert_eq!(file.value_stats_cols, None);
+        assert_eq!(file.value_stats.null_counts(), &vec![Some(0), Some(0)]);
+        let min_values = BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        let max_values = BinaryRow::from_serialized_bytes(file.value_stats.max_values()).unwrap();
+        assert_eq!(min_values.get_int(1).unwrap(), 10);
+        assert_eq!(max_values.get_int(1).unwrap(), 30);
         // min_key and max_key should be non-empty (serialized BinaryRow)
         assert!(!file.min_key.is_empty());
         assert!(!file.max_key.is_empty());

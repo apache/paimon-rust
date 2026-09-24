@@ -983,7 +983,6 @@ mod tests {
         use super::*;
         use crate::catalog::Identifier;
         use crate::io::{FileIO, FileIOBuilder};
-        use crate::spec::stats::compute_column_stats;
         use crate::spec::{
             DataType, Datum, FloatType, IntType, PredicateBuilder, Schema, TableSchema, VectorType,
         };
@@ -1088,9 +1087,8 @@ mod tests {
 
         /// Build a real single-file primary-key table via the public write path.
         ///
-        /// The Rust key-value writer records primary-key stats in `key_stats`. For the
-        /// deletion-vector test, also populate `value_stats` so its non-key predicate
-        /// has the same metadata a Java primary-key writer produces.
+        /// The Rust key-value writer records both key and value stats. Under
+        /// deletion vectors, the non-key predicate uses the real value stats.
         async fn build_pruning_test_table(
             with_deletion_vectors: bool,
         ) -> (tempfile::TempDir, Table) {
@@ -1122,23 +1120,17 @@ mod tests {
             let bucket = written.bucket;
             let partition = written.partition.clone();
             assert_eq!(base_meta.key_stats.null_counts(), &vec![Some(0)]);
-            assert!(base_meta.value_stats.null_counts().is_empty());
-            assert_eq!(base_meta.value_stats_cols, Some(vec![]));
+            assert_eq!(base_meta.value_stats.null_counts(), &vec![Some(0); 2]);
+            assert_eq!(
+                base_meta.value_stats_cols,
+                Some(vec!["id".to_string(), "score".to_string()])
+            );
+            let min = BinaryRow::from_serialized_bytes(base_meta.value_stats.min_values()).unwrap();
+            let max = BinaryRow::from_serialized_bytes(base_meta.value_stats.max_values()).unwrap();
+            assert_eq!(min.get_int(1).unwrap(), 0);
+            assert_eq!(max.get_int(1).unwrap(), PRUNE_ROWS - 1);
 
-            let file_meta = if with_deletion_vectors {
-                let int = DataType::Int(IntType::new());
-                let value_stats: BinaryTableStats =
-                    compute_column_stats(&batch, &[0, 1], &[int.clone(), int]).unwrap();
-                DataFileMeta {
-                    value_stats,
-                    value_stats_cols: Some(vec!["id".to_string(), "score".to_string()]),
-                    ..base_meta
-                }
-            } else {
-                base_meta
-            };
-
-            let message = CommitMessage::new(partition, bucket, vec![file_meta]);
+            let message = CommitMessage::new(partition, bucket, vec![base_meta]);
             TableCommit::new(table.clone(), "pkvector-prune".to_string())
                 .commit(vec![message])
                 .await

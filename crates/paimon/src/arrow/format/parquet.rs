@@ -1600,6 +1600,12 @@ fn build_row_group_column_indices(
 ) -> Vec<Option<usize>> {
     let mut by_root_name: HashMap<&str, Option<usize>> = HashMap::new();
     for (column_index, column) in columns.iter().enumerate() {
+        // Only a top-level, non-repeated leaf has row-level statistics for its
+        // logical field. Nested leaf null counts (e.g. payload.child) and
+        // repeated element counts cannot describe their parent column.
+        if column.column_path().parts().len() != 1 || column.column_descr().max_rep_level() != 0 {
+            continue;
+        }
         let Some(root_name) = column.column_path().parts().first() else {
             continue;
         };
@@ -1788,6 +1794,8 @@ fn supports_manifest_min_max(data_type: &DataType) -> bool {
             | DataType::BigInt(_)
             | DataType::Char(_)
             | DataType::VarChar(_)
+            | DataType::Binary(_)
+            | DataType::VarBinary(_)
             | DataType::Decimal(_)
             | DataType::Double(_)
             | DataType::Float(_)
@@ -1808,10 +1816,10 @@ fn apply_stats_mode(
         return (min_datum, max_datum);
     };
     match data_type {
-        DataType::Char(_) | DataType::VarChar(_) => {
-            let min = min_datum.map(|datum| truncate_string_min_datum(datum, length));
+        DataType::Char(_) | DataType::VarChar(_) | DataType::Binary(_) | DataType::VarBinary(_) => {
+            let min = min_datum.map(|datum| truncate_min_datum(datum, length));
             let max = match max_datum {
-                Some(datum) => match truncate_string_max_datum(datum, length) {
+                Some(datum) => match truncate_max_datum(datum, length) {
                     Some(max) => Some(max),
                     None => return (None, None),
                 },
@@ -1823,18 +1831,35 @@ fn apply_stats_mode(
     }
 }
 
-fn truncate_string_min_datum(datum: Datum, length: usize) -> Datum {
+fn truncate_min_datum(datum: Datum, length: usize) -> Datum {
     match datum {
         Datum::String(value) => Datum::String(truncate_string_min(&value, length)),
+        Datum::Bytes(value) => Datum::Bytes(value.into_iter().take(length).collect()),
         other => other,
     }
 }
 
-fn truncate_string_max_datum(datum: Datum, length: usize) -> Option<Datum> {
+fn truncate_max_datum(datum: Datum, length: usize) -> Option<Datum> {
     match datum {
         Datum::String(value) => truncate_string_max(&value, length).map(Datum::String),
+        Datum::Bytes(value) => truncate_binary_max(&value, length).map(Datum::Bytes),
         other => Some(other),
     }
+}
+
+fn truncate_binary_max(value: &[u8], length: usize) -> Option<Vec<u8>> {
+    if value.len() <= length {
+        return Some(value.to_vec());
+    }
+    let mut prefix = value[..length].to_vec();
+    for idx in (0..prefix.len()).rev() {
+        if prefix[idx] != u8::MAX {
+            prefix[idx] += 1;
+            prefix.truncate(idx + 1);
+            return Some(prefix);
+        }
+    }
+    None
 }
 
 fn truncate_string_min(value: &str, length: usize) -> String {
@@ -2787,6 +2812,29 @@ mod tests {
             DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
             DataField::new(1, "score".to_string(), DataType::Int(IntType::new())),
         ]
+    }
+
+    #[test]
+    fn test_truncate_binary_stats_matches_java_unsigned_upper_bound() {
+        use crate::spec::MetadataStatsMode;
+
+        let binary = DataType::VarBinary(crate::spec::VarBinaryType::new(8).unwrap());
+        let (min, max) = super::apply_stats_mode(
+            &binary,
+            MetadataStatsMode::Truncate(2),
+            Some(Datum::Bytes(vec![0x12, 0xff, 0x01])),
+            Some(Datum::Bytes(vec![0x12, 0xff, 0xfe])),
+        );
+        assert_eq!(min, Some(Datum::Bytes(vec![0x12, 0xff])));
+        assert_eq!(max, Some(Datum::Bytes(vec![0x13])));
+
+        let (min, max) = super::apply_stats_mode(
+            &binary,
+            MetadataStatsMode::Truncate(1),
+            Some(Datum::Bytes(vec![0xfe, 0x01])),
+            Some(Datum::Bytes(vec![0xff, 0x01])),
+        );
+        assert_eq!((min, max), (None, None));
     }
 
     fn test_parquet_schema() -> SchemaDescriptor {
