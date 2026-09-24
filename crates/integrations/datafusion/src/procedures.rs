@@ -159,9 +159,28 @@ async fn earlier_or_equal_from_all(
     }
 }
 
-/// The parameter names Java declares for each management procedure, in Java's order.
-fn management_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
+/// The parameter names each `sys.*` procedure declares, in Java's order. Java rejects a
+/// CALL argument that no parameter declares, so a typo cannot be dropped in silence: a
+/// misspelled `snapshot_id` on `create_tag` would otherwise tag the latest snapshot, and
+/// a misspelled `index_type` on `create_global_index` would build the default index.
+fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
     Some(match proc_name {
+        "create_tag" => &["table", "tag", "snapshot_id"],
+        "delete_tag" => &["table", "tag"],
+        "rollback_to" => &["table", "snapshot_id", "tag"],
+        "rollback_to_timestamp" => &["table", "timestamp"],
+        "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
+        "create_global_index" => &["table", "index_column", "index_type", "options"],
+        // `partitions`/`dry_run` are declared but not yet implemented; they still reach
+        // their own "not supported yet" error rather than being reported as unknown.
+        "drop_global_index" => &[
+            "table",
+            "index_column",
+            "index_type",
+            "partitions",
+            "dry_run",
+        ],
+        "create_lumina_index" => &["table", "index_column", "index_type", "options"],
         "grant_permission" => &[
             "resource_type",
             "access",
@@ -224,6 +243,21 @@ fn management_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
     })
 }
 
+/// Reject a CALL argument that no parameter of `proc_name` declares, matching Java's
+/// `ProcedureBase` argument binding. Applies to every procedure with a declared parameter
+/// set; a procedure absent from [`declared_parameters`] is left unchecked.
+fn reject_unknown_args(proc_name: &str, args: &HashMap<String, String>) -> DFResult<()> {
+    if let Some(declared) = declared_parameters(proc_name) {
+        if let Some(unknown) = args.keys().find(|key| !declared.contains(&key.as_str())) {
+            return Err(DataFusionError::Plan(format!(
+                "Argument {unknown} is unknown. Expected one of [{}].",
+                declared.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub async fn execute_call(
     ctx: &SessionContext,
     catalogs: &HashMap<String, Arc<dyn Catalog>>,
@@ -237,16 +271,7 @@ pub async fn execute_call(
         .ok_or_else(|| DataFusionError::Plan(format!("Unknown catalog '{catalog_name}'")))?;
     let args = extract_named_args(&func.args)?;
 
-    // Java rejects an argument name no parameter declares, so a typo cannot be dropped in
-    // silence. `expiretime => ...` on a grant would otherwise send a permanent one.
-    if let Some(declared) = management_parameters(&proc_name) {
-        if let Some(unknown) = args.keys().find(|key| !declared.contains(&key.as_str())) {
-            return Err(DataFusionError::Plan(format!(
-                "Argument {unknown} is unknown. Expected one of [{}].",
-                declared.join(", ")
-            )));
-        }
-    }
+    reject_unknown_args(&proc_name, &args)?;
 
     match proc_name.as_str() {
         "create_tag" => proc_create_tag(ctx, catalog, catalog_name, &args).await,
@@ -1352,5 +1377,40 @@ mod tests {
         assert!(!is_scalar_global_index_type("lumina"));
         // The predicate requires a canonical input; callers normalize first.
         assert!(!is_scalar_global_index_type("BTREE"));
+    }
+
+    #[test]
+    fn test_reject_unknown_args_covers_tag_and_index_procedures() {
+        // A typo'd optional arg on a tag/index procedure used to be silently dropped:
+        // `create_tag(..., snapshotid => 5)` tagged the latest snapshot, not snapshot 5.
+        let typo = HashMap::from([
+            ("table".to_string(), "db.t".to_string()),
+            ("snapshotid".to_string(), "5".to_string()),
+        ]);
+        let err = reject_unknown_args("create_tag", &typo).unwrap_err();
+        assert!(err.to_string().contains("snapshotid"), "{err}");
+
+        // The correctly spelled argument is accepted.
+        let ok = HashMap::from([
+            ("table".to_string(), "db.t".to_string()),
+            ("snapshot_id".to_string(), "5".to_string()),
+        ]);
+        reject_unknown_args("create_tag", &ok).unwrap();
+
+        // `create_global_index` index_type typo is rejected (was: silent default btree).
+        let idx_typo = HashMap::from([
+            ("table".to_string(), "db.t".to_string()),
+            ("index_column".to_string(), "id".to_string()),
+            ("index_typ".to_string(), "bitmap".to_string()),
+        ]);
+        assert!(reject_unknown_args("create_global_index", &idx_typo).is_err());
+
+        // A management procedure is still checked, unchanged.
+        let mgmt_typo = HashMap::from([("resourcetype".to_string(), "TABLE".to_string())]);
+        assert!(reject_unknown_args("grant_permission", &mgmt_typo).is_err());
+
+        // A name with no declared parameter set is left unchecked -- no false positive.
+        let other = HashMap::from([("anything".to_string(), "x".to_string())]);
+        reject_unknown_args("not_a_procedure", &other).unwrap();
     }
 }
