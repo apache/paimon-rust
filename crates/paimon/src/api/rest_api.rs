@@ -1040,6 +1040,7 @@ impl RESTApi {
         &self,
         identifier: &Identifier,
         table_uuid: &str,
+        base_snapshot_uuid: Option<&str>,
         snapshot: &Snapshot,
         statistics: &[PartitionStatistics],
     ) -> Result<bool> {
@@ -1048,7 +1049,8 @@ impl RESTApi {
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
         let path = self.resource_paths.commit_table(database, table);
         let request = serde_json::json!({
-            "tableUuid": table_uuid,
+            "tableId": table_uuid,
+            "baseSnapshotUuid": base_snapshot_uuid,
             "snapshot": snapshot,
             "statistics": statistics,
         });

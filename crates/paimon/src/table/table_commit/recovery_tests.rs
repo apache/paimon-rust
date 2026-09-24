@@ -399,7 +399,7 @@ struct ConcurrentDvCommit {
 
 #[async_trait::async_trait]
 impl SnapshotCommit for ConcurrentDvCommit {
-    async fn commit(&self, snapshot: &Snapshot, _: &[PartitionStatistics]) -> Result<bool> {
+    async fn commit(&self, _: Option<&str>, snapshot: &Snapshot, _: &[PartitionStatistics]) -> Result<bool> {
         if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
             let other = TableCommit::new(self.table.clone(), "concurrent".into());
             match self.change {

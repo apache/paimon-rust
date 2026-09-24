@@ -104,11 +104,12 @@ pub struct ManifestFileMeta {
     )]
     max_row_id: Option<i64>,
 
-    /// Common positive bucket count recorded by an external manifest writer.
-    ///
-    /// Rust consumes this field for manifest pruning but intentionally does not
-    /// serialize it into manifest lists.
-    #[serde(rename = "_TOTAL_BUCKETS", default, skip_serializing)]
+    /// Common positive bucket count for entries in this manifest.
+    #[serde(
+        rename = "_TOTAL_BUCKETS",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     total_buckets: Option<i32>,
 
     /// Files owned by this manifest and sharing its lifecycle.
@@ -244,8 +245,7 @@ impl ManifestFileMeta {
         self
     }
 
-    /// Attach external manifest metadata in read-path tests.
-    #[cfg(test)]
+    /// Record a common positive bucket count for manifest pruning.
     #[inline]
     #[must_use]
     pub(crate) fn with_total_buckets(mut self, total_buckets: Option<i32>) -> Self {
@@ -355,6 +355,7 @@ pub const MANIFEST_FILE_META_SCHEMA: &str = r#"["null", {
         {"name": "_MAX_LEVEL", "type": ["null", "int"], "default": null},
         {"name": "_MIN_ROW_ID", "type": ["null", "long"], "default": null},
         {"name": "_MAX_ROW_ID", "type": ["null", "long"], "default": null},
+        {"name": "_TOTAL_BUCKETS", "type": ["null", "int"], "default": null},
         {"name": "_EXTRA_FILES", "type": ["null", {"type": "array", "items": "string"}], "default": null}
     ]
 }]"#;
