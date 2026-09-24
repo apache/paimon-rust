@@ -567,6 +567,129 @@ async fn diff_identical_rows_are_skipped_from_after_image() {
 }
 
 #[tokio::test]
+async fn diff_detects_binary_decimal_and_temporal_changes() {
+    use arrow_array::{
+        BinaryArray, Decimal128Array, Time32MillisecondArray, TimestampMicrosecondArray,
+    };
+    use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema, TimeUnit};
+    use paimon::spec::{
+        DataType, DecimalType, IntType, Schema, TableSchema, TimeType, TimestampType, VarBinaryType,
+    };
+    use std::sync::Arc;
+
+    let table_path = "memory:/incremental_batch/diff_scalar_types";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "payload",
+            DataType::VarBinary(VarBinaryType::new(8).unwrap()),
+        )
+        .column(
+            "amount",
+            DataType::Decimal(DecimalType::new(10, 2).unwrap()),
+        )
+        .column("event_time", DataType::Time(TimeType::new(3).unwrap()))
+        .column(
+            "created_at",
+            DataType::Timestamp(TimestampType::new(6).unwrap()),
+        )
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(table_path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, table_path).await;
+    persist_table_schema(&file_io, table_path, table.schema()).await;
+
+    let make_batch = |ids: Vec<i32>,
+                      payloads: Vec<&[u8]>,
+                      amounts: Vec<i128>,
+                      times: Vec<i32>,
+                      timestamps: Vec<i64>| {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowDataType::Int32, false),
+                Field::new("payload", ArrowDataType::Binary, false),
+                Field::new("amount", ArrowDataType::Decimal128(10, 2), false),
+                Field::new(
+                    "event_time",
+                    ArrowDataType::Time32(TimeUnit::Millisecond),
+                    false,
+                ),
+                Field::new(
+                    "created_at",
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(BinaryArray::from_iter_values(payloads)),
+                Arc::new(
+                    Decimal128Array::from(amounts)
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ),
+                Arc::new(Time32MillisecondArray::from(times)),
+                Arc::new(TimestampMicrosecondArray::from(timestamps)),
+            ],
+        )
+        .unwrap()
+    };
+
+    write_batch(
+        &table,
+        &make_batch(
+            vec![1, 2, 3, 4, 5],
+            vec![b"a", b"b", b"c", b"d", b"e"],
+            vec![100, 200, 300, 400, 500],
+            vec![1, 2, 3, 4, 5],
+            vec![1000, 2000, 3000, 4000, 5000],
+        ),
+    )
+    .await;
+    write_batch(
+        &table,
+        &make_batch(
+            vec![1, 2, 3, 4, 5, 6],
+            vec![b"z", b"b", b"c", b"d", b"e", b"f"],
+            vec![100, 250, 300, 400, 500, 600],
+            vec![1, 2, 3, 9, 5, 6],
+            vec![1000, 2000, 9000, 4000, 5000, 6000],
+        ),
+    )
+    .await;
+
+    let builder = table.new_read_builder();
+    let plan = builder
+        .new_incremental_scan(IncrementalScanMode::Diff, 1, 2)
+        .plan()
+        .await
+        .unwrap();
+    let batches: Vec<RecordBatch> = builder
+        .new_read()
+        .unwrap()
+        .to_incremental_arrow(&plan)
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.values().iter().copied().collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3, 4, 6]);
+}
+
+#[tokio::test]
 async fn diff_projection_without_primary_key_still_compares_full_rows() {
     let table_path = "memory:/incremental_batch/diff_projection_without_pk";
     let (file_io, table) = memory_table(
