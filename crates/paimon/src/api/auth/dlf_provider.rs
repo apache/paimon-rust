@@ -134,16 +134,14 @@ impl DLFToken {
                 source: None,
             });
         }
-        if token.expiration_at_millis.is_none() {
-            if let Some(expiration) = token.expiration.as_deref() {
-                token.expiration_at_millis =
-                    Some(Self::parse_expiration_to_millis(expiration).ok_or_else(|| {
-                        Error::DataInvalid {
-                            message: "Failed to parse token Expiration".to_string(),
-                            source: None,
-                        }
-                    })?);
-            }
+        if let Some(expiration) = token.expiration.as_deref() {
+            token.expiration_at_millis =
+                Some(Self::parse_expiration_to_millis(expiration).ok_or_else(|| {
+                    Error::DataInvalid {
+                        message: "Failed to parse token Expiration".to_string(),
+                        source: None,
+                    }
+                })?);
         }
         Ok(token)
     }
@@ -606,6 +604,18 @@ mod tests {
             token.expiration_at_millis,
             DLFToken::parse_expiration_to_millis("2099-01-01T00:00:00Z")
         );
+
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"ak-4","AccessKeySecret":"sk-4","ExpirationAt":123,"Expiration":"2099-01-01T00:00:00Z"}"#,
+        )
+        .await
+        .unwrap();
+        let token = loader.read_token(1).await.unwrap();
+        assert_eq!(
+            token.expiration_at_millis,
+            DLFToken::parse_expiration_to_millis("2099-01-01T00:00:00Z")
+        );
     }
 
     #[tokio::test]
@@ -646,6 +656,17 @@ mod tests {
         tokio::fs::write(
             &path,
             r#"{"AccessKeyId":"ak","AccessKeySecret":"sk","Expiration":"invalid"}"#,
+        )
+        .await
+        .unwrap();
+        let error = loader.read_token(1).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Failed to parse token Expiration"));
+
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"ak","AccessKeySecret":"sk","ExpirationAt":123,"Expiration":"invalid"}"#,
         )
         .await
         .unwrap();
