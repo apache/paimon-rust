@@ -304,9 +304,19 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
     }
 
     match op {
-        PredicateOperator::Eq => literals
-            .first()
-            .is_some_and(|literal| min_value == *literal && max_value == *literal),
+        // `must_match` asserts *every* non-null row equals the literal, which
+        // `min == max == literal` only proves when the bounds cover every row.
+        // For FLOAT/DOUBLE a NaN row is left out of min/max without being counted
+        // null (see `equality_exclusion_is_sound`), so `[1.0, NaN]` reports
+        // `min == max == 1.0` yet not every row equals 1.0 -- claiming must_match
+        // there makes `NOT(= 1.0)` wrongly prune the file and drop the NaN row.
+        // The dual `may_match` NotEq/NotIn arms already carry this guard.
+        PredicateOperator::Eq => {
+            equality_exclusion_is_sound(&min_value)
+                && literals
+                    .first()
+                    .is_some_and(|literal| min_value == *literal && max_value == *literal)
+        }
         PredicateOperator::NotEq => literals.first().is_some_and(|literal| {
             matches!(literal.partial_cmp(&min_value), Some(Ordering::Less))
                 || matches!(literal.partial_cmp(&max_value), Some(Ordering::Greater))
@@ -329,7 +339,11 @@ pub(crate) fn data_leaf_must_match<T: StatsAccessor>(
                 Some(Ordering::Greater | Ordering::Equal)
             )
         }),
-        PredicateOperator::In => min_value == max_value && literals.contains(&min_value),
+        PredicateOperator::In => {
+            equality_exclusion_is_sound(&min_value)
+                && min_value == max_value
+                && literals.contains(&min_value)
+        }
         PredicateOperator::Between => {
             let (Some(low), Some(high)) = (literals.first(), literals.get(1)) else {
                 return false;
@@ -879,6 +893,39 @@ mod tests {
             &mapping,
             &fields,
         ));
+    }
+
+    #[test]
+    fn not_eq_and_not_in_on_float_keep_files_that_may_hold_nan() {
+        // A Rust-written FLOAT/DOUBLE column `[1.0, NaN]` reports `min == max ==
+        // 1.0` with `null_count == 0` (the writer leaves NaN out of min/max
+        // without counting it null). `must_match(Eq 1.0)` must NOT claim every
+        // row equals 1.0 -- the NaN row does not -- so `NOT(v = 1.0)` and
+        // `NOT(v IN (1.0))` must KEEP the file (the NaN row satisfies `<> 1.0`).
+        // Mirrors the guard already on the `may_match` NotEq/NotIn arms.
+        let dt = DataType::Double(DoubleType::new());
+        let fields = vec![DataField::new(0, "v".to_string(), dt.clone())];
+        let mapping = vec![Some(0)];
+        let stats = MockStats {
+            row_count: 2,
+            null_count: Some(0),
+            min: Some(Datum::Double(1.0)),
+            max: Some(Datum::Double(1.0)),
+        };
+
+        for op in [PredicateOperator::Eq, PredicateOperator::In] {
+            let not_pred = Predicate::negate(Predicate::Leaf {
+                column: "v".to_string(),
+                index: 0,
+                data_type: dt.clone(),
+                op,
+                literals: vec![Datum::Double(1.0)],
+            });
+            assert!(
+                predicates_may_match_with_schema(&[not_pred], &stats, &mapping, &fields),
+                "NOT({op:?} 1.0) must keep a float file whose min==max==1.0 (may hold NaN)"
+            );
+        }
     }
 
     #[test]
