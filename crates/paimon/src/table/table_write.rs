@@ -1196,6 +1196,7 @@ impl TableWrite {
                     primary_keys: self.table.schema().primary_keys().to_vec(),
                     primary_key_indices: self.primary_key_indices.clone(),
                     primary_key_types: self.primary_key_types.clone(),
+                    value_fields: self.table.schema().fields().to_vec(),
                     sequence_field_indices: self.sequence_field_indices.clone(),
                     merge_engine: self.merge_engine,
                     deletion_vectors_enabled: CoreOptions::new(self.table.schema().options())
@@ -3913,6 +3914,12 @@ pub(in crate::table) mod tests {
         assert_eq!(file.level, 0);
         assert_eq!(file.min_sequence_number, 0);
         assert_eq!(file.max_sequence_number, 2);
+        assert_eq!(file.value_stats_cols, None);
+        assert_eq!(file.value_stats.null_counts(), &vec![Some(0), Some(0)]);
+        let min_values = BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        let max_values = BinaryRow::from_serialized_bytes(file.value_stats.max_values()).unwrap();
+        assert_eq!(min_values.get_int(1).unwrap(), 10);
+        assert_eq!(max_values.get_int(1).unwrap(), 30);
         // min_key and max_key should be non-empty (serialized BinaryRow)
         assert!(!file.min_key.is_empty());
         assert!(!file.max_key.is_empty());

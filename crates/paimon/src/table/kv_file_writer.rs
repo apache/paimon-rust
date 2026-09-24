@@ -27,13 +27,15 @@
 //! Reference: [org.apache.paimon.io.KeyValueDataFileWriterImpl](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/io/KeyValueDataFileWriterImpl.java)
 
 use crate::arrow::arrow_fields_to_paimon;
-use crate::arrow::format::{create_format_writer, with_write_resources};
+use crate::arrow::format::{
+    create_format_writer, parquet::ParquetFormatWriter, with_write_resources, FormatFileWriter,
+};
 use crate::io::FileIO;
 use crate::resource::{MemoryReservation, ResourceContext};
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
     bucket_path_under, extract_datum_from_arrow, AggregationConfig, BinaryRowBuilder, CoreOptions,
-    DataFileMeta, DataType, MergeEngine, PartialUpdateConfig, RowKind, EMPTY_SERIALIZED_ROW,
+    DataField, DataFileMeta, DataType, MergeEngine, PartialUpdateConfig, RowKind,
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::prepared_files::PreparedFiles;
@@ -91,6 +93,8 @@ pub(crate) struct KeyValueWriteConfig {
     pub primary_key_indices: Vec<usize>,
     /// Paimon DataTypes for each primary key column (same order as primary_key_indices).
     pub primary_key_types: Vec<DataType>,
+    /// Logical value fields, in file order, for Parquet footer statistics.
+    pub value_fields: Vec<DataField>,
     /// Sequence field column indices in the user schema (empty if not configured).
     pub sequence_field_indices: Vec<usize>,
     /// Merge engine for deduplication.
@@ -433,16 +437,35 @@ impl KeyValueFileWriter {
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
         let file_path = format!("{bucket_dir}/{file_name}");
         let output = self.file_io.new_output(&file_path)?;
-        let writer = create_format_writer(
-            &output,
-            physical_schema.clone(),
-            write.file_compression,
-            self.config.file_compression_zstd_level,
-            None,
-            None,
-            None,
-        )
-        .await?;
+        // The physical KV file also contains sequence and row-kind columns. Give
+        // Parquet only the logical value fields so metadata stats and their dense
+        // column mapping follow Java's value schema (and its stats options).
+        // Keep the existing unshredded KV layout for this writer.
+        let writer: Box<dyn FormatFileWriter> = if write.file_format.eq_ignore_ascii_case("parquet")
+        {
+            Box::new(
+                ParquetFormatWriter::new(
+                    &output,
+                    physical_schema.clone(),
+                    write.file_compression,
+                    self.config.file_compression_zstd_level,
+                    Some(&self.config.value_fields),
+                    &self.config.table_options,
+                )
+                .await?,
+            )
+        } else {
+            create_format_writer(
+                &output,
+                physical_schema.clone(),
+                write.file_compression,
+                self.config.file_compression_zstd_level,
+                None,
+                None,
+                None,
+            )
+            .await?
+        };
         let mut writer = with_write_resources(writer, self.resources.as_ref());
 
         let vk_idx = batch
@@ -509,7 +532,12 @@ impl KeyValueFileWriter {
             }
         }
 
-        let file_size = writer.close().await?.file_size as i64;
+        let write_result = writer.close().await?;
+        let file_size = write_result.file_size as i64;
+        let (value_stats, value_stats_cols) = match write_result.value_stats {
+            Some(stats) => (stats.stats, stats.columns),
+            None => (BinaryTableStats::empty(), Some(Vec::new())),
+        };
 
         let key_columns: Vec<Arc<dyn Array>> = self
             .config
@@ -552,11 +580,7 @@ impl KeyValueFileWriter {
             min_key,
             max_key,
             key_stats,
-            value_stats: BinaryTableStats::new(
-                EMPTY_SERIALIZED_ROW.clone(),
-                EMPTY_SERIALIZED_ROW.clone(),
-                vec![],
-            ),
+            value_stats,
             min_sequence_number: write.min_sequence_number,
             max_sequence_number: write.max_sequence_number,
             schema_id: self.config.schema_id,
@@ -566,7 +590,7 @@ impl KeyValueFileWriter {
             delete_row_count: Some(write.delete_row_count),
             embedded_index: None,
             file_source: Some(0), // FileSource.APPEND
-            value_stats_cols: Some(vec![]),
+            value_stats_cols,
             external_path: None,
             first_row_id: None,
             write_cols: None,
@@ -1023,6 +1047,15 @@ mod tests {
             primary_keys: vec!["id".into()],
             primary_key_indices: vec![0],
             primary_key_types: vec![DataType::Int(IntType::new())],
+            value_fields: vec![
+                DataField::new(0, "id".into(), DataType::Int(IntType::new())),
+                DataField::new(
+                    1,
+                    "seq".into(),
+                    DataType::BigInt(crate::spec::BigIntType::new()),
+                ),
+                DataField::new(2, "value".into(), DataType::Int(IntType::new())),
+            ],
             sequence_field_indices: vec![1],
             merge_engine,
             deletion_vectors_enabled: false,
@@ -1036,6 +1069,107 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_pk_value_stats_use_emitted_rows_and_logical_columns() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("seq", ArrowDataType::Int64, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 1])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(Int32Array::from(vec![Some(100), None, Some(300)])),
+            ],
+        )
+        .unwrap();
+        let mut config = test_write_config(MergeEngine::Deduplicate);
+        config.input_changelog = true;
+        config.write_buffer_size = i64::MAX;
+        config
+            .table_options
+            .insert("metadata.stats-dense-store".to_string(), "true".to_string());
+        let mut writer =
+            KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+
+        let data = &prepared.data_files[0];
+        assert_eq!(data.row_count, 2);
+        assert_eq!(data.value_stats_cols, None);
+        assert_eq!(
+            data.value_stats.null_counts(),
+            &vec![Some(0), Some(0), Some(1)]
+        );
+        let min =
+            crate::spec::BinaryRow::from_serialized_bytes(data.value_stats.min_values()).unwrap();
+        let max =
+            crate::spec::BinaryRow::from_serialized_bytes(data.value_stats.max_values()).unwrap();
+        assert_eq!(min.arity(), 3);
+        assert_eq!(min.get_int(0).unwrap(), 1);
+        assert_eq!(max.get_int(0).unwrap(), 2);
+        assert_eq!(min.get_long(1).unwrap(), 20);
+        assert_eq!(max.get_long(1).unwrap(), 30);
+        assert_eq!(min.get_int(2).unwrap(), 300);
+        assert_eq!(max.get_int(2).unwrap(), 300);
+
+        let changelog = &prepared.changelog_files[0];
+        assert_eq!(changelog.row_count, 3);
+        assert_eq!(
+            changelog.value_stats.null_counts(),
+            &vec![Some(0), Some(0), Some(1)]
+        );
+        let min = crate::spec::BinaryRow::from_serialized_bytes(changelog.value_stats.min_values())
+            .unwrap();
+        assert_eq!(min.get_int(2).unwrap(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_pk_value_stats_respect_dense_column_modes() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("seq", ArrowDataType::Int64, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![Some(100), None])),
+            ],
+        )
+        .unwrap();
+        let mut config = test_write_config(MergeEngine::Deduplicate);
+        config.write_buffer_size = i64::MAX;
+        config.table_options.extend([
+            ("metadata.stats-mode".to_string(), "none".to_string()),
+            ("metadata.stats-dense-store".to_string(), "true".to_string()),
+            ("fields.id.stats-mode".to_string(), "full".to_string()),
+            ("fields.value.stats-mode".to_string(), "counts".to_string()),
+        ]);
+        let mut writer =
+            KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+        let file = &prepared.data_files[0];
+
+        assert_eq!(
+            file.value_stats_cols,
+            Some(vec!["id".into(), "value".into()])
+        );
+        assert_eq!(file.value_stats.null_counts(), &vec![Some(0), Some(1)]);
+        let min =
+            crate::spec::BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        assert_eq!(min.arity(), 2);
+        assert_eq!(min.get_int(0).unwrap(), 1);
+        assert!(min.is_null_at(1));
     }
 
     #[test]
