@@ -95,13 +95,13 @@ impl DLFAuthProviderFactory {
             .unwrap_or_else(|| Self::parse_signing_algo_from_uri(Some(&uri)))
             .to_string();
 
-        let dlf_provider = DLFAuthProvider::new(
-            uri,
-            region,
-            signing_algorithm,
-            DLFToken::from_options(options),
-            DLFTokenLoaderFactory::create_token_loader(options),
-        )?;
+        let token_loader = DLFTokenLoaderFactory::create_token_loader(options)?;
+        let token = token_loader
+            .is_none()
+            .then(|| DLFToken::from_options(options))
+            .flatten();
+        let dlf_provider =
+            DLFAuthProvider::new(uri, region, signing_algorithm, token, token_loader)?;
 
         Ok(Box::new(dlf_provider))
     }

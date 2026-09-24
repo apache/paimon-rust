@@ -276,6 +276,17 @@ refreshes those credentials before expiration, so callers do not need to load
 the table again. Static `dlf.access-key-id`, `dlf.access-key-secret`, and
 `dlf.security-token` values are not rotated.
 
+To read credentials managed by another process, use a local token file:
+
+```rust
+options.set(CatalogOptions::DLF_TOKEN_LOADER, "local_file");
+options.set(CatalogOptions::DLF_TOKEN_PATH, "/path/to/token.json");
+```
+
+The JSON uses `AccessKeyId`, `AccessKeySecret`, optional `SecurityToken`, and
+optional `Expiration` or `ExpirationAt`. Expiring credentials are reloaded from
+the file before expiration.
+
 Supported metastore types:
 
 | Metastore Type | Description                      |
