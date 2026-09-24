@@ -1120,8 +1120,11 @@ mod tests {
             let bucket = written.bucket;
             let partition = written.partition.clone();
             assert_eq!(base_meta.key_stats.null_counts(), &vec![Some(0)]);
-            assert_eq!(base_meta.value_stats.null_counts(), &vec![Some(0); 3]);
-            assert_eq!(base_meta.value_stats_cols, None);
+            assert_eq!(base_meta.value_stats.null_counts(), &vec![Some(0); 2]);
+            assert_eq!(
+                base_meta.value_stats_cols,
+                Some(vec!["id".to_string(), "score".to_string()])
+            );
             let min = BinaryRow::from_serialized_bytes(base_meta.value_stats.min_values()).unwrap();
             let max = BinaryRow::from_serialized_bytes(base_meta.value_stats.max_values()).unwrap();
             assert_eq!(min.get_int(1).unwrap(), 0);

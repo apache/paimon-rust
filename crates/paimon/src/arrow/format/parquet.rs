@@ -1600,6 +1600,12 @@ fn build_row_group_column_indices(
 ) -> Vec<Option<usize>> {
     let mut by_root_name: HashMap<&str, Option<usize>> = HashMap::new();
     for (column_index, column) in columns.iter().enumerate() {
+        // Only a top-level, non-repeated leaf has row-level statistics for its
+        // logical field. Nested leaf null counts (e.g. payload.child) and
+        // repeated element counts cannot describe their parent column.
+        if column.column_path().parts().len() != 1 || column.column_descr().max_rep_level() != 0 {
+            continue;
+        }
         let Some(root_name) = column.column_path().parts().first() else {
             continue;
         };
