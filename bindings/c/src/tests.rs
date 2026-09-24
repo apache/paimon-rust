@@ -1168,6 +1168,58 @@ fn test_read_with_data() {
 }
 
 #[test]
+fn test_read_builder_with_limit_prunes_plan_splits() {
+    // `with_limit` is a plan-time hint: planning stops selecting splits once the
+    // retained ones already cover the limit (mirrors core `apply_limit_pushdown`).
+    // Assert the FFI threads the hint through to planning -- a zero limit prunes
+    // every split, a generous limit leaves the plan untouched. Without the hint
+    // reaching planning, the zero-limit plan would keep the baseline splits.
+    let path = "memory:/test_read_limit";
+    let file_io = memory_file_io();
+    setup_table_dirs(&file_io, path);
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("default", "test"),
+        path.to_string(),
+        simple_table_schema(),
+        None,
+    );
+    write_data_rust(&table, &[make_batch(vec![1, 2, 3], vec!["a", "b", "c"])]);
+    let handle = unsafe { wrap_table(table) };
+
+    unsafe fn plan_split_count(handle: *const paimon_table, limit: Option<usize>) -> usize {
+        let rb = paimon_table_new_read_builder(handle).read_builder;
+        if let Some(limit) = limit {
+            assert!(paimon_read_builder_with_limit(rb, limit).is_null());
+        }
+        let scan = paimon_read_builder_new_scan(rb).scan;
+        let plan_result = paimon_table_scan_plan(scan);
+        assert!(plan_result.error.is_null());
+        let count = paimon_plan_num_splits(plan_result.plan);
+        paimon_plan_free(plan_result.plan);
+        paimon_table_scan_free(scan);
+        paimon_read_builder_free(rb);
+        count
+    }
+
+    unsafe {
+        let baseline = plan_split_count(handle, None);
+        assert!(baseline >= 1, "a table with rows should plan >= 1 split");
+        assert_eq!(
+            plan_split_count(handle, Some(0)),
+            0,
+            "a zero limit must prune every split at plan time"
+        );
+        assert_eq!(
+            plan_split_count(handle, Some(1000)),
+            baseline,
+            "a limit above the row count must not prune any split"
+        );
+        unwrap_table(handle);
+    }
+}
+
+#[test]
 fn test_read_resources_share_budget_and_release_reservations() {
     let path = "memory:/test_read_resources";
     let file_io = memory_file_io();
