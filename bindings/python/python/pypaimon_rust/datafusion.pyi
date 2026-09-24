@@ -23,7 +23,6 @@ import pyarrow
 ArrowTypeLike: TypeAlias = Union[pyarrow.DataType, pyarrow.Field, str]
 InputFieldsLike: TypeAlias = Union[ArrowTypeLike, Sequence[ArrowTypeLike]]
 VolatilityLike: TypeAlias = Union[str, Any]
-SUPPORTS_CUSTOM_DATA_FILE_PREFIX: bool
 
 class DataField:
     def name(self) -> str: ...

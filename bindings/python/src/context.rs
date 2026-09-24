@@ -536,7 +536,6 @@ impl PySQLContext {
 
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "datafusion")?;
-    this.add("SUPPORTS_CUSTOM_DATA_FILE_PREFIX", true)?;
     this.add_class::<PaimonCatalog>()?;
     this.add_class::<crate::table::PyTable>()?;
     this.add_class::<crate::read::PyReadBuilder>()?;

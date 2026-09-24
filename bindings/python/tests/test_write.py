@@ -22,7 +22,6 @@ from datetime import datetime, timezone
 import pyarrow as pa
 import pytest
 
-from pypaimon_rust import datafusion
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
 
 # The table created by _make_empty_table is (id INT, name STRING). Paimon INT maps
@@ -68,7 +67,6 @@ def test_write_commit_read_roundtrip():
 
 @pytest.mark.parametrize("primary_key", [False, True])
 def test_custom_data_file_prefix_matches_table_option(tmp_path, primary_key):
-    assert datafusion.SUPPORTS_CUSTOM_DATA_FILE_PREFIX
     ctx = SQLContext()
     ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
     ctx.sql("CREATE SCHEMA paimon.wdb")
