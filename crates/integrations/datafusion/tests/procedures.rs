@@ -86,6 +86,46 @@ async fn test_create_tag_with_snapshot_id() {
 }
 
 #[tokio::test]
+async fn test_create_branch() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+
+    exec(
+        &sql_context,
+        "CALL sys.create_branch(table => 'test_db.t1', branch => 'b1')",
+    )
+    .await;
+
+    // The branch now shows up in the $branches system table.
+    let count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b1'",
+    )
+    .await;
+    assert_eq!(count, 1);
+
+    // Recreating the same branch without ignore_if_exists is an error...
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_branch(table => 'test_db.t1', branch => 'b1')",
+        "already exists",
+    )
+    .await;
+
+    // ...while ignore_if_exists makes it a no-op that leaves the one branch.
+    exec(
+        &sql_context,
+        "CALL sys.create_branch(table => 'test_db.t1', branch => 'b1', ignore_if_exists => true)",
+    )
+    .await;
+    let count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b1'",
+    )
+    .await;
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn test_create_lumina_index_requires_index_column() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 
