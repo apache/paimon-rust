@@ -34,8 +34,8 @@ use crate::spec::{
 };
 use crate::DataSplit;
 use arrow_array::{
-    builder::StringBuilder, Array, ArrayRef, RecordBatch, RecordBatchOptions, StringArray,
-    UInt32Array,
+    builder::StringBuilder, Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, RecordBatch,
+    RecordBatchOptions, StringArray, StructArray, UInt32Array,
 };
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat as arrow_concat;
@@ -648,7 +648,8 @@ impl<'a> PaimonTableRead<'a> {
         let audit_schema = audit_schema_for_read_type(&self.read_type, include_sequence)?;
 
         let mut diff_read_type = self.table.schema().fields().to_vec();
-        ensure_diff_supported_read_type(&diff_read_type)?;
+        let key_indices = primary_key_indices(self.table, &diff_read_type)?;
+        ensure_diff_supported_read_type(&diff_read_type, &key_indices)?;
         if include_sequence {
             diff_read_type.insert(
                 0,
@@ -734,8 +735,8 @@ impl<'a> PaimonTableRead<'a> {
         after: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
         let diff_read_type = self.table.schema().fields().to_vec();
-        ensure_diff_supported_read_type(&diff_read_type)?;
         let key_indices = primary_key_indices(self.table, &diff_read_type)?;
+        ensure_diff_supported_read_type(&diff_read_type, &key_indices)?;
         let value_indices = value_indices_for_diff(self.table, &diff_read_type);
         let output_schema = build_target_arrow_schema(&self.read_type)?;
         let output_col_indices = self
@@ -816,16 +817,6 @@ impl<'a> PaimonTableRead<'a> {
     ) -> crate::Result<ArrowRecordBatchStream> {
         if splits.is_empty() {
             return Ok(Box::pin(futures::stream::empty()));
-        }
-        for split in splits {
-            if split
-                .data_deletion_files()
-                .is_some_and(|files| files.iter().any(|file| file.is_some()))
-            {
-                return Err(crate::Error::Unsupported {
-                    message: "Batch incremental Diff does not support deletion vectors".to_string(),
-                });
-            }
         }
         let budget = self.parquet_read_budget()?;
         let parquet_read_budget = budget
@@ -1454,9 +1445,17 @@ fn primary_key_indices(table: &Table, read_type: &[DataField]) -> crate::Result<
     Ok(indices)
 }
 
-fn ensure_diff_supported_read_type(read_type: &[DataField]) -> crate::Result<()> {
-    for field in read_type {
-        if !is_diff_supported_type(field.data_type()) {
+fn ensure_diff_supported_read_type(
+    read_type: &[DataField],
+    key_indices: &[usize],
+) -> crate::Result<()> {
+    for (index, field) in read_type.iter().enumerate() {
+        let supported = if key_indices.contains(&index) {
+            is_diff_supported_scalar_type(field.data_type())
+        } else {
+            is_diff_supported_value_type(field.data_type())
+        };
+        if !supported {
             return Err(crate::Error::Unsupported {
                 message: format!(
                     "Batch incremental Diff does not support column '{}' of type {:?}",
@@ -1469,7 +1468,24 @@ fn ensure_diff_supported_read_type(read_type: &[DataField]) -> crate::Result<()>
     Ok(())
 }
 
-fn is_diff_supported_type(data_type: &DataType) -> bool {
+fn is_diff_supported_value_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Row(row) => row
+            .fields()
+            .iter()
+            .all(|field| is_diff_supported_value_type(field.data_type())),
+        DataType::Array(array) => is_diff_supported_value_type(array.element_type()),
+        DataType::Map(map) => {
+            is_diff_supported_value_type(map.key_type())
+                && is_diff_supported_value_type(map.value_type())
+        }
+        DataType::Multiset(multiset) => is_diff_supported_value_type(multiset.element_type()),
+        DataType::Vector(vector) => is_diff_supported_scalar_type(vector.element_type()),
+        _ => is_diff_supported_scalar_type(data_type),
+    }
+}
+
+fn is_diff_supported_scalar_type(data_type: &DataType) -> bool {
     matches!(
         data_type,
         DataType::Boolean(_)
@@ -1543,17 +1559,121 @@ fn rows_equal_at(
     indices: &[usize],
 ) -> crate::Result<bool> {
     for &idx in indices {
-        let ord = scalar_compare(
+        if !value_equal_at(
             left_batch.column(idx),
             left_row,
             right_batch.column(idx),
             right_row,
-        )?;
-        if ord != Ordering::Equal {
+        )? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Compare logical values, ignoring unused children beneath NULL parents.
+/// Scalar comparisons also preserve Java's NaN and signed-zero behavior.
+fn value_equal_at(
+    left: &dyn Array,
+    left_row: usize,
+    right: &dyn Array,
+    right_row: usize,
+) -> crate::Result<bool> {
+    match (left.is_null(left_row), right.is_null(right_row)) {
+        (true, true) => return Ok(true),
+        (true, false) | (false, true) => return Ok(false),
+        (false, false) => {}
+    }
+
+    if let (Some(left), Some(right)) = (
+        left.as_any().downcast_ref::<StructArray>(),
+        right.as_any().downcast_ref::<StructArray>(),
+    ) {
+        if left.num_columns() != right.num_columns() {
+            return Ok(false);
+        }
+        for (left_child, right_child) in left.columns().iter().zip(right.columns()) {
+            if !value_equal_at(
+                left_child.as_ref(),
+                left_row,
+                right_child.as_ref(),
+                right_row,
+            )? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+
+    if let (Some(left), Some(right)) = (
+        left.as_any().downcast_ref::<ListArray>(),
+        right.as_any().downcast_ref::<ListArray>(),
+    ) {
+        let left_offsets = left.value_offsets();
+        let right_offsets = right.value_offsets();
+        let (left_start, left_end) = (left_offsets[left_row], left_offsets[left_row + 1]);
+        let (right_start, right_end) = (right_offsets[right_row], right_offsets[right_row + 1]);
+        if left_end - left_start != right_end - right_start {
+            return Ok(false);
+        }
+        for offset in 0..(left_end - left_start) {
+            if !value_equal_at(
+                left.values().as_ref(),
+                (left_start + offset) as usize,
+                right.values().as_ref(),
+                (right_start + offset) as usize,
+            )? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+
+    if let (Some(left), Some(right)) = (
+        left.as_any().downcast_ref::<MapArray>(),
+        right.as_any().downcast_ref::<MapArray>(),
+    ) {
+        let left_offsets = left.value_offsets();
+        let right_offsets = right.value_offsets();
+        let (left_start, left_end) = (left_offsets[left_row], left_offsets[left_row + 1]);
+        let (right_start, right_end) = (right_offsets[right_row], right_offsets[right_row + 1]);
+        if left_end - left_start != right_end - right_start {
+            return Ok(false);
+        }
+        for offset in 0..(left_end - left_start) {
+            if !value_equal_at(
+                left.entries(),
+                (left_start + offset) as usize,
+                right.entries(),
+                (right_start + offset) as usize,
+            )? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+
+    if let (Some(left), Some(right)) = (
+        left.as_any().downcast_ref::<FixedSizeListArray>(),
+        right.as_any().downcast_ref::<FixedSizeListArray>(),
+    ) {
+        if left.value_length() != right.value_length() {
+            return Ok(false);
+        }
+        for offset in 0..left.value_length() {
+            if !value_equal_at(
+                left.values().as_ref(),
+                (left.value_offset(left_row) + offset) as usize,
+                right.values().as_ref(),
+                (right.value_offset(right_row) + offset) as usize,
+            )? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+
+    Ok(scalar_compare(left, left_row, right, right_row)? == Ordering::Equal)
 }
 
 fn scalar_compare(
@@ -2047,8 +2167,11 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_accepts_scalar_types_and_rejects_nested() {
-        use crate::spec::{ArrayType, BinaryType, DecimalType, IntType, TimeType, TimestampType};
+    fn test_diff_accepts_nested_values_but_not_nested_keys() {
+        use crate::spec::{
+            ArrayType, BinaryType, BlobType, DecimalType, IntType, MapType, MultisetType, RowType,
+            TimeType, TimestampType, VarCharType,
+        };
 
         let decimal = DataField::new(
             1,
@@ -2075,11 +2198,101 @@ mod tests {
             "time".to_string(),
             DataType::Time(TimeType::new(3).unwrap()),
         );
-        ensure_diff_supported_read_type(&[decimal, timestamp, binary, time]).unwrap();
+        ensure_diff_supported_read_type(&[decimal, timestamp, binary, time], &[0]).unwrap();
+        ensure_diff_supported_read_type(std::slice::from_ref(&nested), &[]).unwrap();
         assert!(matches!(
-            ensure_diff_supported_read_type(&[nested]),
+            ensure_diff_supported_read_type(&[nested], &[0]),
             Err(crate::Error::Unsupported { message }) if message.contains("tags")
         ));
+
+        let complex = DataField::new(
+            6,
+            "complex".to_string(),
+            DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                DataField::new(
+                    7,
+                    "counts".to_string(),
+                    DataType::Map(MapType::new(
+                        DataType::VarChar(VarCharType::string_type()),
+                        DataType::Multiset(MultisetType::new(DataType::Int(IntType::new()))),
+                    )),
+                ),
+            ])))),
+        );
+        ensure_diff_supported_read_type(&[complex], &[]).unwrap();
+
+        let unsupported = DataField::new(
+            8,
+            "blobs".to_string(),
+            DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
+        );
+        assert!(matches!(
+            ensure_diff_supported_read_type(&[unsupported], &[]),
+            Err(crate::Error::Unsupported { message }) if message.contains("blobs")
+        ));
+    }
+
+    #[test]
+    fn test_diff_nested_struct_ignores_children_of_null_parent() {
+        use arrow_array::{Int32Array, StructArray};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::{DataType as ArrowDataType, Field};
+
+        let field = Arc::new(Field::new("child", ArrowDataType::Int32, true));
+        let left = StructArray::try_new(
+            vec![Arc::clone(&field)].into(),
+            vec![Arc::new(Int32Array::from(vec![Some(10), Some(20), None]))],
+            Some(NullBuffer::from(vec![false, true, true])),
+        )
+        .unwrap();
+        let right = StructArray::try_new(
+            vec![field].into(),
+            vec![Arc::new(Int32Array::from(vec![Some(99), Some(21), None]))],
+            Some(NullBuffer::from(vec![false, true, true])),
+        )
+        .unwrap();
+        assert!(value_equal_at(&left, 0, &right, 0).unwrap());
+        assert!(!value_equal_at(&left, 1, &right, 1).unwrap());
+        assert!(value_equal_at(&left, 2, &right, 2).unwrap());
+        assert!(!value_equal_at(&left, 0, &right, 1).unwrap());
+    }
+
+    #[test]
+    fn test_diff_nested_list_compares_sliced_values_and_null_elements() {
+        use arrow_array::{Float32Array, ListArray};
+        use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow_schema::{DataType as ArrowDataType, Field};
+
+        let element = Arc::new(Field::new("element", ArrowDataType::Float32, true));
+        let left = ListArray::new(
+            Arc::clone(&element),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 3, 4, 5])),
+            Arc::new(Float32Array::from(vec![
+                Some(9.0),
+                Some(f32::NAN),
+                None,
+                Some(-0.0),
+                Some(8.0),
+            ])),
+            None,
+        );
+        let right = ListArray::new(
+            element,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 3, 4, 5])),
+            Arc::new(Float32Array::from(vec![
+                Some(7.0),
+                Some(f32::from_bits(0xffc0_0001)),
+                None,
+                Some(0.0),
+                Some(6.0),
+            ])),
+            None,
+        );
+        let left_slice = left.slice(1, 2);
+        let right_slice = right.slice(1, 2);
+        assert!(value_equal_at(&left_slice, 0, &right_slice, 0).unwrap());
+        assert!(!value_equal_at(&left_slice, 1, &right_slice, 1).unwrap());
+        assert!(!value_equal_at(&left, 0, &right, 0).unwrap());
     }
 
     #[test]
