@@ -75,6 +75,18 @@ func (rb *ReadBuilder) WithCaseSensitive(caseSensitive bool) error {
 	return ffiReadBuilderWithCaseSensitive.symbol(rb.ctx)(rb.inner, caseSensitive)
 }
 
+// WithLimit sets a row-count limit hint for scan planning. Planning stops
+// selecting splits once the retained ones already cover the limit, so a preview
+// or sample of the first N rows avoids listing every split's statistics. It is a
+// hint only: it does not guarantee exactly limit rows are returned, so callers
+// still enforce the final row limit when reading.
+func (rb *ReadBuilder) WithLimit(limit int) error {
+	if rb.inner == nil {
+		return ErrClosed
+	}
+	return ffiReadBuilderWithLimit.symbol(rb.ctx)(rb.inner, uintptr(limit))
+}
+
 // WithFilter sets a filter predicate for scan planning and read-side pruning.
 //
 // The predicate is used in two phases:
@@ -210,6 +222,26 @@ var ffiReadBuilderWithCaseSensitive = newFFI(ffiOpts{
 			unsafe.Pointer(&errPtr),
 			unsafe.Pointer(&rb),
 			unsafe.Pointer(&flag),
+		)
+		if errPtr != nil {
+			return parseError(ctx, errPtr)
+		}
+		return nil
+	}
+})
+
+// size_t is passed pointer-width, matching ffiTableReadToArrow's offset/length.
+var ffiReadBuilderWithLimit = newFFI(ffiOpts{
+	sym:    "paimon_read_builder_with_limit",
+	rType:  &ffi.TypePointer,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(rb *paimonReadBuilder, limit uintptr) error {
+	return func(rb *paimonReadBuilder, limit uintptr) error {
+		var errPtr *paimonError
+		ffiCall(
+			unsafe.Pointer(&errPtr),
+			unsafe.Pointer(&rb),
+			unsafe.Pointer(&limit),
 		)
 		if errPtr != nil {
 			return parseError(ctx, errPtr)
