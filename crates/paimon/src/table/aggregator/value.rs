@@ -165,6 +165,14 @@ macro_rules! pick_agg {
                 self.0.agg(array, row_idx);
                 Ok(())
             }
+            fn replace_with_delete(
+                &mut self,
+                array: &dyn Array,
+                row_idx: usize,
+            ) -> crate::Result<()> {
+                self.0.winner = Some(array.slice(row_idx, 1));
+                Ok(())
+            }
             fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
                 self.0.agg_reversed(array, row_idx);
                 Ok(())
@@ -210,6 +218,26 @@ pick_agg!(
     "first_non_null_value",
     PickPolicy::FirstNonNull
 );
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use arrow_array::StringArray;
+
+    #[test]
+    fn delete_replaces_cell_without_resetting_first_non_null_state() {
+        let mut agg = FirstNonNullValueAgg::new(
+            "value",
+            &DataType::VarChar(crate::spec::VarCharType::new(10).unwrap()),
+        )
+        .unwrap();
+        let input = StringArray::from(vec![Some("old"), None, Some("new")]);
+        agg.agg(&input, 0).unwrap();
+        agg.replace_with_delete(&input, 1).unwrap();
+        agg.agg(&input, 2).unwrap();
+        assert!(agg.result().unwrap().is_null(0));
+    }
+}
 
 /// Java's internal `primary-key` function replaces its value for both add and
 /// retract inputs. It can also appear explicitly in Java table options.

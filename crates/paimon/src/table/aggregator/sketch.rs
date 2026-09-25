@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray};
+use datasketches::error::{Error as SketchError, ErrorKind};
 use datasketches::hll::{HllSketch, HllType, HllUnion};
 
 use super::{unsupported_type_error, FieldAggregator};
@@ -45,12 +46,44 @@ impl HllSketchAgg {
     }
 }
 
-fn deserialize_for_union(bytes: &[u8]) -> Result<HllSketch, datasketches::error::Error> {
+fn deserialize_for_union(bytes: &[u8]) -> Result<HllSketch, SketchError> {
+    // datasketches-rs 0.2 skips the register bytes of compact HLL arrays,
+    // although Java's compact array has the same register layout as its
+    // noncompact form. Clear the flag so the registers are actually read.
+    if bytes.len() >= 40 && bytes[2] == 7 && bytes[7] & 3 == 2 && bytes[5] & 8 != 0 {
+        let lg_k = bytes[3];
+        if (4..=21).contains(&lg_k) {
+            let k = 1usize << lg_k;
+            let register_len = match bytes[7] >> 2 {
+                0 => k / 2,
+                1 => k * 3 / 4,
+                2 => k,
+                _ => 0,
+            };
+            let aux_count = u32::from_le_bytes(bytes[36..40].try_into().unwrap()) as usize;
+            if register_len > 0 {
+                if bytes.len() < 40 + register_len + aux_count.saturating_mul(4) {
+                    return Err(SketchError::new(
+                        ErrorKind::InvalidData,
+                        "compact HLL array ends before its registers or auxiliary entries",
+                    ));
+                }
+                let mut expanded = bytes.to_vec();
+                expanded[5] &= !8;
+                // The Rust HLL_6 reader requests one extra byte for a safe
+                // packed-register window at the end of the array.
+                if bytes[7] >> 2 == 1 && expanded.len() == 40 + register_len {
+                    expanded.push(0);
+                }
+                return HllSketch::deserialize(&expanded);
+            }
+        }
+    }
     // datasketches-rs 0.2 deserializes a compact LIST into a backing array of
     // exactly coupon_count slots. A subsequent union silently drops every new
     // coupon because List::update sees no empty slot. Expand only that mode to
-    // the Java noncompact representation before deserializing; SET and HLL
-    // modes already allocate their full backing arrays.
+    // the Java noncompact representation before deserializing; SET already
+    // allocates its full backing array.
     if bytes.len() >= 8 && bytes[2] == 7 && bytes[7] & 3 == 0 && bytes[5] & 8 != 0 {
         let lg_arr = bytes[4] as u32;
         let count = bytes[6] as usize;
@@ -342,6 +375,56 @@ mod tests {
     const JAVA_HLL_SET_A: &str = "AwEHDAYIAAEeAAAAgbxdBsPdUQTEtZ8Hhi/5Dch6JATL18IEfHS5B87wWx/SFnMHWX/UDTWpMQTbUi0EnuSbGK48iBEiO+sF7y33B8HpFwUr8vsGxhlqBG7FNAZGSrcEsFtGEjSiYQ51gWYHNkcJB7g/+Qe4VqkMe2XmCPwtQgr2cfIG";
     const JAVA_HLL_SET_B: &str = "AwEHDAYIAAEeAAAAAiK0BMPdUQTEtZ8HxhlqBMh6JASNxIkJzvBbH4/DsAbOoO8FNkcJB5QHwgSXu2AaWX/UDRq80AXbUi0Eni1qByI76wWTVDEFqnOHFoRpzAVt5R0HbsU0Bu8t9wee5JsYMiViBTWpMQS2LwkGuD/5B7hWqQzXeDQG";
     const JAVA_HLL_SET_UNION: &str = "AwEHDAYIAAEtAAAAgbxdBgIitATD3VEExLWfB4Yv+Q3GGWoEyHokBLhWqQzL18IEjcSJCc7wWx+Pw7AG/C1CCs6g7wXSFnMHk1QxBZQHwgSeLWoHl7tgGkZKtwRZf9QNGrzQBdtSLQSe5JsY9nHyBq48iBEiO+sFwekXBapzhxaEacwFbeUdB27FNAbvLfcHsFtGEjIlYgU0omEOti8JBjWpMQQ2RwkHuD/5B9d4NAZ7ZeYIfHS5Byvy+wZ1gWYH";
+
+    #[test]
+    fn unions_java_compact_dense_hll_sketches() {
+        // Java DataSketches 4.2.0 HLL_4/6/8: integers 0..10000 and
+        // 5000..15000, serialized with toCompactByteArray(). Java Union(12)
+        // estimates 15148.816386062443 for each pair.
+        let fixtures: &[(&[u8], &[u8])] = &[
+            (
+                include_bytes!("../goldens/hll_java_dense_a.bin"),
+                include_bytes!("../goldens/hll_java_dense_b.bin"),
+            ),
+            (
+                include_bytes!("../goldens/hll_java_dense6_a.bin"),
+                include_bytes!("../goldens/hll_java_dense6_b.bin"),
+            ),
+            (
+                include_bytes!("../goldens/hll_java_dense8_a.bin"),
+                include_bytes!("../goldens/hll_java_dense8_b.bin"),
+            ),
+        ];
+        for (a, b) in fixtures {
+            let input = BinaryArray::from(vec![Some(*a), Some(*b)]);
+            let mut agg = HllSketchAgg::new(
+                "sketch",
+                &DataType::VarBinary(VarBinaryType::new(8192).unwrap()),
+            )
+            .unwrap();
+            agg.agg(&input, 0).unwrap();
+            agg.agg(&input, 1).unwrap();
+            let result = agg.result().unwrap();
+            let result = result.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let estimate = HllSketch::deserialize(result.value(0)).unwrap().estimate();
+            assert!((estimate - 15148.816386062443).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_compact_dense_hll() {
+        let valid = include_bytes!("../goldens/hll_java_dense_a.bin");
+        let truncated = &valid[..valid.len() - 1];
+        let input = BinaryArray::from(vec![Some(valid.as_slice()), Some(truncated)]);
+        let mut agg = HllSketchAgg::new(
+            "sketch",
+            &DataType::VarBinary(VarBinaryType::new(4096).unwrap()),
+        )
+        .unwrap();
+        agg.agg(&input, 0).unwrap();
+        let err = agg.agg(&input, 1).unwrap_err();
+        assert!(err.to_string().contains("ends before its registers"));
+    }
 
     #[test]
     fn unions_java_hll_sketches() {

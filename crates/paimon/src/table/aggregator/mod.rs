@@ -81,6 +81,13 @@ pub(crate) trait FieldAggregator: Send + Sync + std::fmt::Debug {
     /// Accumulate one input cell.
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()>;
 
+    /// Replace the accumulator cell with a DELETE row's payload. Java resets
+    /// the row here, while preserving field aggregator state until the next PK.
+    fn replace_with_delete(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.reset();
+        self.agg(array, row_idx)
+    }
+
     /// Accumulate an input that sorts before the current accumulator.
     ///
     /// This mirrors Java `FieldAggregator#aggReversed(accumulator, input)`,
@@ -218,6 +225,9 @@ impl FieldAggregator for IgnoreRetractAgg {
     }
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
         self.0.agg(array, row_idx)
+    }
+    fn replace_with_delete(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.0.replace_with_delete(array, row_idx)
     }
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
         // Java FieldIgnoreRetractAgg inherits FieldAggregator#aggReversed,

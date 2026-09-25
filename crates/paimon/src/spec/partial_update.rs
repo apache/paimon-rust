@@ -293,13 +293,22 @@ impl<'a> PartialUpdateConfig<'a> {
         let projected: HashSet<&str> = projected_fields.iter().map(String::as_str).collect();
         let mut required = Vec::new();
         let mut seen = HashSet::new();
+        let delete_sequences: HashSet<&str> = self
+            .remove_record_on_sequence_group()
+            .into_iter()
+            .flat_map(|fields| fields.split(',').map(str::trim))
+            .collect();
 
         for group in groups {
             let group_is_projected = group
                 .sequence_fields
                 .iter()
                 .chain(group.protected_fields.iter())
-                .any(|field| projected.contains(field.as_str()));
+                .any(|field| projected.contains(field.as_str()))
+                || group
+                    .sequence_fields
+                    .iter()
+                    .any(|field| delete_sequences.contains(field.as_str()));
             if !group_is_projected {
                 continue;
             }
@@ -812,6 +821,27 @@ mod tests {
                 "source_order".to_string(),
                 "profile_version".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_required_sequence_fields_for_whole_row_sequence_delete() {
+        let options = partial_update_options(&[
+            ("fields.version,source_order.sequence-group", "price"),
+            ("partial-update.remove-record-on-sequence-group", "version"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "source_order".to_string(), DataType::Int(IntType::new())),
+            DataField::new(3, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+        assert_eq!(
+            config
+                .required_sequence_fields(&fields, &["id".to_string()], &["id".to_string()])
+                .unwrap(),
+            vec!["version".to_string(), "source_order".to_string()]
         );
     }
 

@@ -886,8 +886,12 @@ impl AggregateMergeFunction {
         for row in rows {
             let kind = RowKind::from_value(row.value_kind)?;
             if self.remove_record_on_delete && kind == RowKind::Delete {
-                for aggregator in aggregators.iter_mut().flatten() {
-                    aggregator.reset();
+                for (col_idx, aggregator) in aggregators.iter_mut().enumerate() {
+                    if let Some(aggregator) = aggregator.as_mut() {
+                        let source_array = batch_buffer[row.batch_idx]
+                            .column_for_output(col_idx, source_output_col_indices);
+                        aggregator.replace_with_delete(source_array, row.row_idx)?;
+                    }
                 }
                 current_delete_row = true;
                 continue;
@@ -3585,6 +3589,55 @@ mod tests {
             .unwrap();
         assert_eq!(amount.value(0), -89);
         assert!(tag.is_null(0));
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_remove_record_on_delete_keeps_delete_payload() {
+        let schema = aggregation_schema();
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 1])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int8Array::from(vec![0, 3, 0])),
+                Arc::new(Int32Array::from(vec![Some(100), Some(10), Some(5)])),
+                Arc::new(StringArray::from(vec![Some("old"), Some("deleted"), None])),
+            ],
+        )
+        .unwrap();
+        let options = agg_options(&[
+            ("aggregation.remove-record-on-delete", "true"),
+            ("fields.amount.aggregate-function", "sum"),
+        ]);
+        let result = SortMergeReaderBuilder::new(
+            vec![stream_from_batches(vec![input])],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3, 4],
+            aggregation_output_schema(),
+            build_agg_function(options),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let amount = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let tag = result[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(amount.value(0), 15);
+        assert_eq!(tag.value(0), "deleted");
     }
 
     #[test]
