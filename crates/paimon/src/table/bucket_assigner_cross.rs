@@ -32,6 +32,9 @@ use std::collections::{HashMap, HashSet};
 enum AssignResult {
     /// Key is new or stays in the same partition.
     SamePartition { bucket: i32 },
+    /// Java UseOldExistingProcessor keeps the existing location for partial
+    /// update and aggregation, and rewrites the incoming partition values.
+    UseOldPartition { partition: Vec<u8>, bucket: i32 },
     /// Key moved to a different partition. Caller must write a DELETE to the old location.
     CrossPartition {
         old_partition: Vec<u8>,
@@ -190,16 +193,10 @@ impl GlobalPartitionIndex {
                         new_bucket,
                     });
                 }
-                MergeEngine::PartialUpdate => {
-                    return Err(crate::Error::Unsupported {
-                        message: "CrossPartitionAssigner does not support merge-engine=partial-update yet".to_string(),
-                    });
-                }
-                MergeEngine::Aggregation => {
-                    return Err(crate::Error::Unsupported {
-                        message:
-                            "CrossPartitionAssigner does not support merge-engine=aggregation yet"
-                                .to_string(),
+                MergeEngine::PartialUpdate | MergeEngine::Aggregation => {
+                    return Ok(AssignResult::UseOldPartition {
+                        partition: existing_partition.clone(),
+                        bucket: *existing_bucket,
                     });
                 }
             }
@@ -313,7 +310,7 @@ impl BucketAssigner for CrossPartitionAssigner {
             self.global_partition_index = Some(index);
         }
 
-        let partition_bytes_vec =
+        let mut partition_bytes_vec =
             batch_to_serialized_bytes(batch, &self.partition_field_indices, fields)?;
         let pk_bytes_vec = batch_to_serialized_bytes(batch, &self.primary_key_indices, fields)?;
 
@@ -326,6 +323,10 @@ impl BucketAssigner for CrossPartitionAssigner {
         for row_idx in 0..num_rows {
             match global_index.assign(&pk_bytes_vec[row_idx], &partition_bytes_vec[row_idx])? {
                 AssignResult::SamePartition { bucket } => {
+                    buckets.push(bucket);
+                }
+                AssignResult::UseOldPartition { partition, bucket } => {
+                    partition_bytes_vec[row_idx] = partition;
                     buckets.push(bucket);
                 }
                 AssignResult::CrossPartition {

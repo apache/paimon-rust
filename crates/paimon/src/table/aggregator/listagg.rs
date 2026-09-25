@@ -64,7 +64,28 @@ fn java_is_blank(value: &str) -> bool {
 pub(crate) struct ListaggAgg {
     field_name: String,
     delimiter: String,
+    distinct: bool,
     acc: Option<String>,
+}
+
+fn merge_listagg(accumulator: &str, incoming: &str, delimiter: &str, distinct: bool) -> String {
+    if java_is_blank(accumulator) {
+        return incoming.to_string();
+    }
+    if !distinct {
+        return format!("{accumulator}{delimiter}{incoming}");
+    }
+    let separator = if delimiter.is_empty() { " " } else { delimiter };
+    let mut existing: std::collections::HashSet<&str> = accumulator.split(separator).collect();
+    let mut result = accumulator.to_string();
+    for token in incoming.split(separator) {
+        if java_is_blank(token) || !existing.insert(token) {
+            continue;
+        }
+        result.push_str(delimiter);
+        result.push_str(token);
+    }
+    result
 }
 
 impl ListaggAgg {
@@ -90,8 +111,33 @@ impl ListaggAgg {
         Ok(Self {
             field_name: field_name.to_string(),
             delimiter: list_agg_delimiter(field_name, table_options).to_string(),
+            distinct: table_options
+                .get(&format!("fields.{field_name}.distinct"))
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
             acc: None,
         })
+    }
+
+    fn input_value<'a>(
+        &self,
+        array: &'a dyn Array,
+        row_idx: usize,
+    ) -> crate::Result<Option<&'a str>> {
+        if array.is_null(row_idx) {
+            return Ok(None);
+        }
+        let arr = array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "listagg column '{}' received non-Utf8 Arrow array {:?}",
+                    self.field_name,
+                    array.data_type()
+                ),
+                source: None,
+            })?;
+        Ok(Some(arr.value(row_idx)))
     }
 }
 
@@ -105,57 +151,39 @@ impl FieldAggregator for ListaggAgg {
     }
 
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        if array.is_null(row_idx) {
+        let Some(v) = self.input_value(array, row_idx)? else {
             return Ok(());
-        }
-        let arr = array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!(
-                    "listagg column '{}' received non-Utf8 Arrow array {:?}",
-                    self.field_name,
-                    array.data_type()
-                ),
-                source: None,
-            })?;
-        let v = arr.value(row_idx);
+        };
         if java_is_blank(v) {
             return Ok(());
         }
-        match &mut self.acc {
-            None => self.acc = Some(v.to_string()),
-            Some(prev) => {
-                prev.push_str(&self.delimiter);
-                prev.push_str(v);
-            }
-        }
+        self.acc = Some(match self.acc.take() {
+            None => v.to_string(),
+            Some(previous) => merge_listagg(&previous, v, &self.delimiter, self.distinct),
+        });
+        Ok(())
+    }
+
+    fn replace_with_delete(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        // AggregateMergeFunction.initRow copies the DELETE field verbatim.
+        self.acc = self.input_value(array, row_idx)?.map(str::to_string);
         Ok(())
     }
 
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        if array.is_null(row_idx) {
-            return Ok(());
-        }
-        let arr = array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!(
-                    "listagg column '{}' received non-Utf8 Arrow array {:?}",
-                    self.field_name,
-                    array.data_type()
-                ),
-                source: None,
-            })?;
-        let value = arr.value(row_idx);
-        if java_is_blank(value) {
-            return Ok(());
-        }
-        self.acc = Some(match self.acc.take() {
-            None => value.to_string(),
-            Some(current) => format!("{value}{}{current}", self.delimiter),
-        });
+        let older = self.input_value(array, row_idx)?.map(str::to_string);
+        self.acc = match (older, self.acc.take()) {
+            (older, None) => older,
+            (older, Some(current)) if java_is_blank(&current) => older,
+            (None, Some(current)) => Some(current),
+            (Some(older), Some(current)) if java_is_blank(&older) => Some(current),
+            (Some(older), Some(current)) => Some(merge_listagg(
+                &older,
+                &current,
+                &self.delimiter,
+                self.distinct,
+            )),
+        };
         Ok(())
     }
 
@@ -212,6 +240,21 @@ mod tests {
             agg.agg(&arr, i).unwrap();
         }
         assert_eq!(collect(agg.result().unwrap()), None);
+    }
+
+    #[test]
+    fn delete_replacement_keeps_blank_until_a_non_blank_input() {
+        let mut agg = ListaggAgg::new("v", &varchar_type(), &HashMap::new()).unwrap();
+        let arr = StringArray::from(vec![Some(" "), None, Some("new"), Some("old")]);
+        agg.replace_with_delete(&arr, 0).unwrap();
+        agg.agg(&arr, 1).unwrap();
+        assert_eq!(collect(agg.result().unwrap()), Some(" ".into()));
+        agg.agg(&arr, 2).unwrap();
+        assert_eq!(collect(agg.result().unwrap()), Some("new".into()));
+
+        agg.replace_with_delete(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 3).unwrap();
+        assert_eq!(collect(agg.result().unwrap()), Some("old".into()));
     }
 
     #[test]
@@ -283,6 +326,23 @@ mod tests {
         agg.agg_reversed(&arr, 1).unwrap();
         agg.agg_reversed(&arr, 2).unwrap();
         assert_eq!(collect(agg.result().unwrap()), Some("a,b".to_string()));
+    }
+
+    #[test]
+    fn test_listagg_distinct_splits_existing_and_incoming_tokens() {
+        let opts = HashMap::from([
+            ("fields.v.list-agg-delimiter".to_string(), "|".to_string()),
+            ("fields.v.distinct".to_string(), "true".to_string()),
+        ]);
+        let mut agg = ListaggAgg::new("v", &varchar_type(), &opts).unwrap();
+        let values = StringArray::from(vec!["a|b", "b|c|c", "a|d"]);
+        agg.agg(&values, 0).unwrap();
+        agg.agg(&values, 1).unwrap();
+        assert_eq!(collect(agg.result().unwrap()), Some("a|b|c".into()));
+        agg.agg_reversed(&values, 2).unwrap();
+        // Java's default aggReversed calls agg(older, accumulator), so the
+        // older input establishes the token order for distinct listagg.
+        assert_eq!(collect(agg.result().unwrap()), Some("a|d|b|c".into()));
     }
 
     #[test]

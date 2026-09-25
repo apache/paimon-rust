@@ -2857,6 +2857,10 @@ mod tests {
                 "fields.seq_b.sequence-group".to_string(),
                 "value_b".to_string(),
             ),
+            (
+                "partial-update.remove-record-on-sequence-group".to_string(),
+                "seq_a".to_string(),
+            ),
         ]));
         let sequence_group_table = Table::new(
             file_io,
@@ -2886,6 +2890,14 @@ mod tests {
                 vec!["id", "value_a", "value_b"]
             );
         }
+
+        // Whole-row deletion still needs seq_a when the user projects only
+        // the primary key. The read path must widen and then trim the schema.
+        let key_only = read_rows(&sequence_group_table, Some(&["id"]), None).await;
+        assert_eq!(int_column(&key_only, "id"), vec![1]);
+        assert!(key_only
+            .iter()
+            .all(|batch| batch.schema().fields().len() == 1));
     }
 
     #[tokio::test]

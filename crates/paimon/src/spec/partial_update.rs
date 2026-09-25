@@ -63,8 +63,7 @@ impl SequenceGroup {
 
 /// Partial-update-specific option inspection and validation.
 ///
-/// Reads support basic partial update, sequence groups, and field aggregation.
-/// Table creation and writes remain restricted to basic partial update.
+/// Supports basic partial update, sequence groups, and field aggregation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PartialUpdateConfig<'a> {
     options: &'a HashMap<String, String>,
@@ -89,11 +88,25 @@ impl<'a> PartialUpdateConfig<'a> {
             Ok(mode) => Ok(mode),
             Err(unsupported_options) => Err(crate::Error::ConfigInvalid {
                 message: format!(
-                    "merge-engine=partial-update only supports the basic mode in this build; unsupported options: {}",
+                    "merge-engine=partial-update has unsupported options: {}",
                     unsupported_options.join(", ")
                 ),
             }),
         }
+    }
+
+    /// Validate field references and aggregate function types before persisting
+    /// a schema. The same checks run when a Java-written table is opened.
+    pub(crate) fn validate_create_fields(
+        &self,
+        fields: &[DataField],
+        primary_keys: &[String],
+    ) -> crate::Result<()> {
+        if self.is_enabled() && !primary_keys.is_empty() {
+            self.validated_aggregate_functions(fields, primary_keys)?;
+            self.validate_delete_config()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_write_mode(
@@ -102,7 +115,10 @@ impl<'a> PartialUpdateConfig<'a> {
         table_name: &str,
     ) -> crate::Result<Option<PartialUpdateMode>> {
         match self.validated_mode(has_primary_keys) {
-            Ok(mode) => Ok(mode),
+            Ok(mode) => {
+                if mode.is_some() { self.validate_delete_config()?; }
+                Ok(mode)
+            }
             Err(unsupported_options) => Err(crate::Error::Unsupported {
                 message: format!(
                     "Table '{table_name}' uses merge-engine=partial-update options not supported by this build: {}",
@@ -120,6 +136,7 @@ impl<'a> PartialUpdateConfig<'a> {
         if !has_primary_keys || !self.is_enabled() {
             return Ok(None);
         }
+        self.validate_delete_config()?;
 
         let unsupported_options = self.read_unsupported_option_keys();
         if !unsupported_options.is_empty() {
@@ -165,6 +182,53 @@ impl<'a> PartialUpdateConfig<'a> {
                 })
             })
             .collect()
+    }
+
+    pub(crate) fn remove_record_on_delete(&self) -> bool {
+        self.options
+            .get(PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    }
+
+    pub(crate) fn remove_record_on_sequence_group(&self) -> Option<&str> {
+        self.options
+            .get(PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP_OPTION)
+            .map(String::as_str)
+    }
+
+    fn validate_delete_config(&self) -> crate::Result<()> {
+        let ignore_delete = self
+            .options
+            .get(IGNORE_DELETE_OPTION)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let groups = self.sequence_groups()?;
+        if ignore_delete
+            && (self.remove_record_on_delete() || self.remove_record_on_sequence_group().is_some())
+        {
+            return Err(crate::Error::ConfigInvalid {
+                message: "ignore-delete conflicts with partial-update.remove-record-on-delete and partial-update.remove-record-on-sequence-group".into(),
+            });
+        }
+        if self.remove_record_on_delete() && !groups.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "partial-update.remove-record-on-delete conflicts with sequence-group"
+                    .into(),
+            });
+        }
+        if let Some(fields) = self.remove_record_on_sequence_group() {
+            let configured: HashSet<&str> = groups
+                .iter()
+                .flat_map(|group| group.sequence_fields.iter().map(String::as_str))
+                .collect();
+            for field in fields.split(',').map(str::trim) {
+                if field.is_empty() || !configured.contains(field) {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!("Field '{field}' in partial-update.remove-record-on-sequence-group must belong to a sequence group"),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn validated_sequence_groups(
@@ -229,13 +293,22 @@ impl<'a> PartialUpdateConfig<'a> {
         let projected: HashSet<&str> = projected_fields.iter().map(String::as_str).collect();
         let mut required = Vec::new();
         let mut seen = HashSet::new();
+        let delete_sequences: HashSet<&str> = self
+            .remove_record_on_sequence_group()
+            .into_iter()
+            .flat_map(|fields| fields.split(',').map(str::trim))
+            .collect();
 
         for group in groups {
             let group_is_projected = group
                 .sequence_fields
                 .iter()
                 .chain(group.protected_fields.iter())
-                .any(|field| projected.contains(field.as_str()));
+                .any(|field| projected.contains(field.as_str()))
+                || group
+                    .sequence_fields
+                    .iter()
+                    .any(|field| delete_sequences.contains(field.as_str()));
             if !group_is_projected {
                 continue;
             }
@@ -375,23 +448,22 @@ impl<'a> PartialUpdateConfig<'a> {
             return Ok(None);
         }
 
-        let unsupported_options = self.unsupported_option_keys();
+        let unsupported_options = self.read_unsupported_option_keys();
         if !unsupported_options.is_empty() {
             return Err(unsupported_options);
         }
 
-        Ok(Some(PartialUpdateMode::Basic))
-    }
-
-    fn unsupported_option_keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self
-            .options
-            .keys()
-            .filter(|key| is_unsupported_partial_update_option(key))
-            .cloned()
-            .collect();
-        keys.sort();
-        keys
+        Ok(Some(
+            if self
+                .options
+                .keys()
+                .any(|key| is_fields_option_with_suffix(key, SEQUENCE_GROUP_SUFFIX))
+            {
+                PartialUpdateMode::SequenceGroup
+            } else {
+                PartialUpdateMode::Basic
+            },
+        ))
     }
 
     fn read_unsupported_option_keys(&self) -> Vec<String> {
@@ -403,6 +475,10 @@ impl<'a> PartialUpdateConfig<'a> {
                     && !is_fields_option_with_suffix(key, SEQUENCE_GROUP_SUFFIX)
                     && !is_fields_option_with_suffix(key, AGGREGATION_FUNCTION_SUFFIX)
                     && !is_fields_option_with_suffix(key, LIST_AGG_DELIMITER_SUFFIX)
+                    && !is_fields_option_with_suffix(key, DISTINCT_SUFFIX)
+                    && !is_fields_option_with_suffix(key, IGNORE_RETRACT_SUFFIX)
+                    && !is_fields_option_with_suffix(key, NESTED_KEY_SUFFIX)
+                    && !is_fields_option_with_suffix(key, COUNT_LIMIT_SUFFIX)
                     && key.as_str() != FIELDS_DEFAULT_AGG_FUNCTION_OPTION
             })
             .cloned()
@@ -416,16 +492,11 @@ fn is_unsupported_partial_update_option(key: &str) -> bool {
     (key.ends_with(IGNORE_DELETE_SUFFIX)
         && key != IGNORE_DELETE_OPTION
         && key != PARTIAL_UPDATE_IGNORE_DELETE_OPTION)
-        || key == PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION
-        || key == PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP_OPTION
         || key == FIELDS_DEFAULT_AGG_FUNCTION_OPTION
         || is_fields_option_with_suffix(key, SEQUENCE_GROUP_SUFFIX)
         || is_fields_option_with_suffix(key, AGGREGATION_FUNCTION_SUFFIX)
         || is_fields_option_with_suffix(key, LIST_AGG_DELIMITER_SUFFIX)
-        || is_fields_option_with_suffix(key, IGNORE_RETRACT_SUFFIX)
         || is_fields_option_with_suffix(key, DISTINCT_SUFFIX)
-        || is_fields_option_with_suffix(key, NESTED_KEY_SUFFIX)
-        || is_fields_option_with_suffix(key, COUNT_LIMIT_SUFFIX)
 }
 
 fn is_fields_option_with_suffix(key: &str, suffix: &str) -> bool {
@@ -520,20 +591,7 @@ mod tests {
 
     #[test]
     fn test_validate_create_mode_rejects_unsupported_partial_update_options() {
-        for key in [
-            PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION,
-            PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP_OPTION,
-            "deduplicate.ignore-delete",
-            "fields.price.ignore-delete",
-            "fields.price.sequence-group",
-            "fields.price.aggregate-function",
-            "fields.price.list-agg-delimiter",
-            "fields.price.ignore-retract",
-            "fields.price.distinct",
-            "fields.price.nested-key",
-            "fields.price.count-limit",
-            FIELDS_DEFAULT_AGG_FUNCTION_OPTION,
-        ] {
+        for key in ["deduplicate.ignore-delete", "fields.price.ignore-delete"] {
             let options = partial_update_options(&[(key, "value")]);
             let config = PartialUpdateConfig::new(&options);
             let err = config.validate_create_mode(true).unwrap_err();
@@ -547,13 +605,12 @@ mod tests {
 
     #[test]
     fn test_validate_write_mode_rejects_unsupported_partial_update_options() {
-        let options =
-            partial_update_options(&[("fields.price.aggregate-function", "last_non_null")]);
+        let options = partial_update_options(&[("fields.price.ignore-delete", "true")]);
         let config = PartialUpdateConfig::new(&options);
         let err = config.validate_write_mode(true, "default.t").unwrap_err();
 
         assert!(
-            matches!(err, crate::Error::Unsupported { ref message } if message.contains("fields.price.aggregate-function")),
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("fields.price.ignore-delete")),
             "expected runtime rejection to mention the unsupported option, got {err:?}"
         );
     }
@@ -597,22 +654,42 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_read_mode_rejects_unsupported_aggregation_modifiers() {
-        for key in [
-            "fields.price.ignore-retract",
-            "fields.price.distinct",
-            "fields.price.nested-key",
-            "fields.price.count-limit",
+    fn test_delete_modes_reject_conflicting_settings() {
+        for options in [
+            partial_update_options(&[
+                ("ignore-delete", "true"),
+                (PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION, "true"),
+            ]),
+            partial_update_options(&[
+                ("fields.version.sequence-group", "price"),
+                (PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION, "true"),
+            ]),
+            partial_update_options(&[
+                ("fields.version.sequence-group", "price"),
+                (
+                    PARTIAL_UPDATE_REMOVE_RECORD_ON_SEQUENCE_GROUP_OPTION,
+                    "other",
+                ),
+            ]),
         ] {
-            let options = partial_update_options(&[(key, "value")]);
-            let config = PartialUpdateConfig::new(&options);
-            let err = config.validate_read_mode(true, "default.t").unwrap_err();
-
-            assert!(
-                matches!(err, crate::Error::Unsupported { ref message } if message.contains(key)),
-                "expected read-time rejection to mention '{key}', got {err:?}"
-            );
+            let err = PartialUpdateConfig::new(&options)
+                .validate_read_mode(true, "default.t")
+                .unwrap_err();
+            assert!(matches!(err, crate::Error::ConfigInvalid { .. }));
         }
+    }
+
+    #[test]
+    fn test_validate_read_mode_rejects_unsupported_aggregation_modifiers() {
+        let key = "fields.price.ignore-delete";
+        let options = partial_update_options(&[(key, "value")]);
+        let config = PartialUpdateConfig::new(&options);
+        let err = config.validate_read_mode(true, "default.t").unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains(key)),
+            "expected read-time rejection to mention '{key}', got {err:?}"
+        );
     }
 
     #[test]
@@ -744,6 +821,27 @@ mod tests {
                 "source_order".to_string(),
                 "profile_version".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn test_required_sequence_fields_for_whole_row_sequence_delete() {
+        let options = partial_update_options(&[
+            ("fields.version,source_order.sequence-group", "price"),
+            ("partial-update.remove-record-on-sequence-group", "version"),
+        ]);
+        let config = PartialUpdateConfig::new(&options);
+        let fields = vec![
+            DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "version".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "source_order".to_string(), DataType::Int(IntType::new())),
+            DataField::new(3, "price".to_string(), DataType::Int(IntType::new())),
+        ];
+        assert_eq!(
+            config
+                .required_sequence_fields(&fields, &["id".to_string()], &["id".to_string()])
+                .unwrap(),
+            vec!["version".to_string(), "source_order".to_string()]
         );
     }
 

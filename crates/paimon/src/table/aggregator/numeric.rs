@@ -17,12 +17,10 @@
 
 //! Numeric aggregators: sum, product, min, max.
 //!
-//! `sum` operates on every integer / floating / Decimal numeric type.
-//! `product` accepts the same numeric family except DECIMAL — basic mode does
-//! not yet implement BigDecimal-style scale rebasing for Decimal product, so
-//! Decimal columns are rejected at construction.  Integer overflow on either
-//! aggregator is reported as [`Error::DataInvalid`] so silent wrap cannot
-//! produce misleading aggregated values.  A Decimal `sum` whose result no
+//! `sum` and `product` operate on integer, floating and Decimal numeric types.
+//! Integer overflow wraps by default, following Java arithmetic, and raises
+//! [`Error::DataInvalid`] when the field's `fail-on-overflow` option is enabled.
+//! A Decimal `sum` whose result no
 //! longer fits the declared precision yields a NULL cell, matching Java
 //! `DecimalUtils.add` / `Decimal.fromBigDecimal` (which return null on
 //! precision or backing `i128` overflow rather than throwing).
@@ -48,6 +46,8 @@ use arrow_array::{
     TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_schema::{DataType as ArrowDataType, TimeUnit};
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive, Zero};
 
 use super::{unsupported_type_error, FieldAggregator};
 use crate::spec::DataType;
@@ -76,10 +76,20 @@ enum SumState {
 pub(crate) struct SumAgg {
     field_name: String,
     state: SumState,
+    fail_on_overflow: bool,
 }
 
 impl SumAgg {
+    #[cfg(test)]
     pub(crate) fn new(field_name: &str, data_type: &DataType) -> crate::Result<Self> {
+        Self::new_with_overflow(field_name, data_type, false)
+    }
+
+    pub(crate) fn new_with_overflow(
+        field_name: &str,
+        data_type: &DataType,
+        fail_on_overflow: bool,
+    ) -> crate::Result<Self> {
         let state = match data_type {
             DataType::TinyInt(_) => SumState::I8(None),
             DataType::SmallInt(_) => SumState::I16(None),
@@ -97,6 +107,7 @@ impl SumAgg {
         Ok(Self {
             field_name: field_name.to_string(),
             state,
+            fail_on_overflow,
         })
     }
 }
@@ -127,36 +138,56 @@ impl FieldAggregator for SumAgg {
                 let v = downcast::<Int8Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(match *acc {
                     None => v,
-                    Some(prev) => prev
-                        .checked_add(v)
-                        .ok_or_else(|| overflow_error("sum", &self.field_name))?,
+                    Some(prev) => {
+                        if self.fail_on_overflow {
+                            prev.checked_add(v)
+                                .ok_or_else(|| overflow_error("sum", &self.field_name))?
+                        } else {
+                            prev.wrapping_add(v)
+                        }
+                    }
                 });
             }
             SumState::I16(acc) => {
                 let v = downcast::<Int16Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(match *acc {
                     None => v,
-                    Some(prev) => prev
-                        .checked_add(v)
-                        .ok_or_else(|| overflow_error("sum", &self.field_name))?,
+                    Some(prev) => {
+                        if self.fail_on_overflow {
+                            prev.checked_add(v)
+                                .ok_or_else(|| overflow_error("sum", &self.field_name))?
+                        } else {
+                            prev.wrapping_add(v)
+                        }
+                    }
                 });
             }
             SumState::I32(acc) => {
                 let v = downcast::<Int32Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(match *acc {
                     None => v,
-                    Some(prev) => prev
-                        .checked_add(v)
-                        .ok_or_else(|| overflow_error("sum", &self.field_name))?,
+                    Some(prev) => {
+                        if self.fail_on_overflow {
+                            prev.checked_add(v)
+                                .ok_or_else(|| overflow_error("sum", &self.field_name))?
+                        } else {
+                            prev.wrapping_add(v)
+                        }
+                    }
                 });
             }
             SumState::I64(acc) => {
                 let v = downcast::<Int64Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(match *acc {
                     None => v,
-                    Some(prev) => prev
-                        .checked_add(v)
-                        .ok_or_else(|| overflow_error("sum", &self.field_name))?,
+                    Some(prev) => {
+                        if self.fail_on_overflow {
+                            prev.checked_add(v)
+                                .ok_or_else(|| overflow_error("sum", &self.field_name))?
+                        } else {
+                            prev.wrapping_add(v)
+                        }
+                    }
                 });
             }
             SumState::F32(acc) => {
@@ -198,6 +229,48 @@ impl FieldAggregator for SumAgg {
         }
     }
 
+    fn retract(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        if array.is_null(row_idx) {
+            return Ok(());
+        }
+        macro_rules! retract_integer {
+            ($array_type:ty, $acc:expr) => {{
+                let value = downcast::<$array_type>(array, &self.field_name)?.value(row_idx);
+                let previous = $acc.unwrap_or(0);
+                let result = if self.fail_on_overflow {
+                    previous
+                        .checked_sub(value)
+                        .ok_or_else(|| overflow_error("sum", &self.field_name))?
+                } else {
+                    previous.wrapping_sub(value)
+                };
+                *$acc = Some(result);
+            }};
+        }
+        match &mut self.state {
+            SumState::I8(acc) => retract_integer!(Int8Array, acc),
+            SumState::I16(acc) => retract_integer!(Int16Array, acc),
+            SumState::I32(acc) => retract_integer!(Int32Array, acc),
+            SumState::I64(acc) => retract_integer!(Int64Array, acc),
+            SumState::F32(acc) => {
+                let value = downcast::<Float32Array>(array, &self.field_name)?.value(row_idx);
+                *acc = Some(acc.unwrap_or(0.0) - value);
+            }
+            SumState::F64(acc) => {
+                let value = downcast::<Float64Array>(array, &self.field_name)?.value(row_idx);
+                *acc = Some(acc.unwrap_or(0.0) - value);
+            }
+            SumState::Decimal128 { precision, acc, .. } => {
+                let value = downcast::<Decimal128Array>(array, &self.field_name)?.value(row_idx);
+                *acc = acc
+                    .unwrap_or(0)
+                    .checked_sub(value)
+                    .filter(|result| decimal_fits_precision(*result, *precision));
+            }
+        }
+        Ok(())
+    }
+
     fn result(&self) -> crate::Result<ArrayRef> {
         Ok(match &self.state {
             SumState::I8(acc) => Arc::new(Int8Array::from(vec![*acc])),
@@ -235,19 +308,31 @@ enum ProductState {
     I64(Option<i64>),
     F32(Option<f32>),
     F64(Option<f64>),
-    // DECIMAL `product` is intentionally rejected at construction (see
-    // `ProductAgg::new`); add a variant here when the BigDecimal-style
-    // scale handling lands.
+    Decimal128 {
+        precision: u8,
+        scale: i8,
+        acc: Option<i128>,
+    },
 }
 
 #[derive(Debug)]
 pub(crate) struct ProductAgg {
     field_name: String,
     state: ProductState,
+    fail_on_overflow: bool,
 }
 
 impl ProductAgg {
+    #[cfg(test)]
     pub(crate) fn new(field_name: &str, data_type: &DataType) -> crate::Result<Self> {
+        Self::new_with_overflow(field_name, data_type, false)
+    }
+
+    pub(crate) fn new_with_overflow(
+        field_name: &str,
+        data_type: &DataType,
+        fail_on_overflow: bool,
+    ) -> crate::Result<Self> {
         let state = match data_type {
             DataType::TinyInt(_) => ProductState::I8(None),
             DataType::SmallInt(_) => ProductState::I16(None),
@@ -255,26 +340,17 @@ impl ProductAgg {
             DataType::BigInt(_) => ProductState::I64(None),
             DataType::Float(_) => ProductState::F32(None),
             DataType::Double(_) => ProductState::F64(None),
-            // Decimal `product` would need BigDecimal-style scale rebasing
-            // (multiply raw i128, then divide by 10^scale, with precision
-            // checks).  The basic mode does not implement that yet, so we
-            // reject DECIMAL columns explicitly rather than silently produce
-            // a scale-shifted result.
-            DataType::Decimal(_) => {
-                return Err(crate::Error::ConfigInvalid {
-                    message: format!(
-                        "Aggregate function 'product' on DECIMAL field '{field_name}' is not \
-                         supported in the basic mode; use a BIGINT/DOUBLE column or wait for a \
-                         follow-up commit that adds Decimal product semantics aligned with Java \
-                         BigDecimal"
-                    ),
-                });
-            }
+            DataType::Decimal(d) => ProductState::Decimal128 {
+                precision: decimal_precision(d.precision(), field_name)?,
+                scale: decimal_scale(d.scale(), field_name)?,
+                acc: None,
+            },
             other => return Err(unsupported_type_error("product", field_name, other)),
         };
         Ok(Self {
             field_name: field_name.to_string(),
             state,
+            fail_on_overflow,
         })
     }
 }
@@ -292,6 +368,7 @@ impl FieldAggregator for ProductAgg {
             ProductState::I64(acc) => *acc = None,
             ProductState::F32(acc) => *acc = None,
             ProductState::F64(acc) => *acc = None,
+            ProductState::Decimal128 { acc, .. } => *acc = None,
         }
     }
 
@@ -304,36 +381,56 @@ impl FieldAggregator for ProductAgg {
                 let v = downcast::<Int8Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(match *acc {
                     None => v,
-                    Some(prev) => prev
-                        .checked_mul(v)
-                        .ok_or_else(|| overflow_error("product", &self.field_name))?,
+                    Some(prev) => {
+                        if self.fail_on_overflow {
+                            prev.checked_mul(v)
+                                .ok_or_else(|| overflow_error("product", &self.field_name))?
+                        } else {
+                            prev.wrapping_mul(v)
+                        }
+                    }
                 });
             }
             ProductState::I16(acc) => {
                 let v = downcast::<Int16Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(match *acc {
                     None => v,
-                    Some(prev) => prev
-                        .checked_mul(v)
-                        .ok_or_else(|| overflow_error("product", &self.field_name))?,
+                    Some(prev) => {
+                        if self.fail_on_overflow {
+                            prev.checked_mul(v)
+                                .ok_or_else(|| overflow_error("product", &self.field_name))?
+                        } else {
+                            prev.wrapping_mul(v)
+                        }
+                    }
                 });
             }
             ProductState::I32(acc) => {
                 let v = downcast::<Int32Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(match *acc {
                     None => v,
-                    Some(prev) => prev
-                        .checked_mul(v)
-                        .ok_or_else(|| overflow_error("product", &self.field_name))?,
+                    Some(prev) => {
+                        if self.fail_on_overflow {
+                            prev.checked_mul(v)
+                                .ok_or_else(|| overflow_error("product", &self.field_name))?
+                        } else {
+                            prev.wrapping_mul(v)
+                        }
+                    }
                 });
             }
             ProductState::I64(acc) => {
                 let v = downcast::<Int64Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(match *acc {
                     None => v,
-                    Some(prev) => prev
-                        .checked_mul(v)
-                        .ok_or_else(|| overflow_error("product", &self.field_name))?,
+                    Some(prev) => {
+                        if self.fail_on_overflow {
+                            prev.checked_mul(v)
+                                .ok_or_else(|| overflow_error("product", &self.field_name))?
+                        } else {
+                            prev.wrapping_mul(v)
+                        }
+                    }
                 });
             }
             ProductState::F32(acc) => {
@@ -343,6 +440,21 @@ impl FieldAggregator for ProductAgg {
             ProductState::F64(acc) => {
                 let v = downcast::<Float64Array>(array, &self.field_name)?.value(row_idx);
                 *acc = Some(acc.map_or(v, |prev| prev * v));
+            }
+            ProductState::Decimal128 {
+                precision,
+                scale,
+                acc,
+            } => {
+                let value = downcast::<Decimal128Array>(array, &self.field_name)?.value(row_idx);
+                *acc = match *acc {
+                    None => Some(value),
+                    Some(previous) => {
+                        let product = BigInt::from(previous) * BigInt::from(value);
+                        let divisor = BigInt::from(10u8).pow(*scale as u32);
+                        rounded_decimal(&product, &divisor, *precision)
+                    }
+                };
             }
         }
         Ok(())
@@ -367,6 +479,86 @@ impl FieldAggregator for ProductAgg {
         }
     }
 
+    fn retract(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        if array.is_null(row_idx) {
+            return Ok(());
+        }
+        macro_rules! retract_integer_product {
+            ($array_type:ty, $acc:expr, $min:expr) => {{
+                let value = downcast::<$array_type>(array, &self.field_name)?.value(row_idx);
+                if let Some(previous) = *$acc {
+                    if value == 0 {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "product retract divides by zero for '{}'",
+                                self.field_name
+                            ),
+                            source: None,
+                        });
+                    }
+                    *$acc = Some(
+                        if previous == $min && value == -1 && !self.fail_on_overflow {
+                            $min
+                        } else {
+                            previous
+                                .checked_div(value)
+                                .ok_or_else(|| overflow_error("product", &self.field_name))?
+                        },
+                    );
+                }
+            }};
+        }
+        match &mut self.state {
+            ProductState::I8(acc) => retract_integer_product!(Int8Array, acc, i8::MIN),
+            ProductState::I16(acc) => retract_integer_product!(Int16Array, acc, i16::MIN),
+            ProductState::I32(acc) => retract_integer_product!(Int32Array, acc, i32::MIN),
+            ProductState::I64(acc) => retract_integer_product!(Int64Array, acc, i64::MIN),
+            ProductState::F32(acc) => {
+                let value = downcast::<Float32Array>(array, &self.field_name)?.value(row_idx);
+                if let Some(previous) = acc {
+                    *previous /= value;
+                }
+            }
+            ProductState::F64(acc) => {
+                let value = downcast::<Float64Array>(array, &self.field_name)?.value(row_idx);
+                if let Some(previous) = acc {
+                    *previous /= value;
+                }
+            }
+            ProductState::Decimal128 {
+                precision,
+                scale,
+                acc,
+            } => {
+                let value = downcast::<Decimal128Array>(array, &self.field_name)?.value(row_idx);
+                if let Some(previous) = *acc {
+                    if value == 0 {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "product retract divides by zero for '{}'",
+                                self.field_name
+                            ),
+                            source: None,
+                        });
+                    }
+                    let numerator = BigInt::from(previous) * BigInt::from(10u8).pow(*scale as u32);
+                    let denominator = BigInt::from(value);
+                    if !decimal_division_terminates(&numerator, &denominator) {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "Non-terminating decimal division in product retract for '{}'",
+                                self.field_name
+                            ),
+                            source: None,
+                        });
+                    }
+                    *acc = rounded_decimal(&numerator, &denominator, *precision);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn result(&self) -> crate::Result<ArrayRef> {
         Ok(match &self.state {
             ProductState::I8(acc) => Arc::new(Int8Array::from(vec![*acc])),
@@ -375,8 +567,49 @@ impl FieldAggregator for ProductAgg {
             ProductState::I64(acc) => Arc::new(Int64Array::from(vec![*acc])),
             ProductState::F32(acc) => Arc::new(Float32Array::from(vec![*acc])),
             ProductState::F64(acc) => Arc::new(Float64Array::from(vec![*acc])),
+            ProductState::Decimal128 {
+                precision,
+                scale,
+                acc,
+            } => decimal_array(*precision, *scale, *acc, "product", &self.field_name)?,
         })
     }
+}
+
+fn rounded_decimal(numerator: &BigInt, denominator: &BigInt, precision: u8) -> Option<i128> {
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    let rounded = if remainder.abs() * 2 >= denominator.abs() {
+        quotient
+            + if numerator.sign() == denominator.sign() {
+                BigInt::from(1)
+            } else {
+                BigInt::from(-1)
+            }
+    } else {
+        quotient
+    };
+    rounded
+        .to_i128()
+        .filter(|value| decimal_fits_precision(*value, precision))
+}
+
+fn decimal_division_terminates(numerator: &BigInt, denominator: &BigInt) -> bool {
+    let mut a = numerator.abs();
+    let mut b = denominator.abs();
+    while !b.is_zero() {
+        let remainder = &a % &b;
+        a = b;
+        b = remainder;
+    }
+    let mut reduced = denominator.abs() / a;
+    for factor in [2u8, 5u8] {
+        let factor = BigInt::from(factor);
+        while (&reduced % &factor).is_zero() {
+            reduced /= &factor;
+        }
+    }
+    reduced == BigInt::from(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -987,11 +1220,16 @@ mod tests {
     }
 
     #[test]
-    fn test_sum_rejects_overflow() {
+    fn test_sum_default_wraps_and_optional_overflow_check_rejects() {
         let mut agg = sum_agg(DataType::Int(IntType::new()));
         let arr = Int32Array::from(vec![i32::MAX, 1]);
         agg.agg(&arr, 0).unwrap();
-        let err = agg.agg(&arr, 1).unwrap_err();
+        agg.agg(&arr, 1).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), Some(i32::MIN));
+        let mut checked =
+            SumAgg::new_with_overflow("v", &DataType::Int(IntType::new()), true).unwrap();
+        checked.agg(&arr, 0).unwrap();
+        let err = checked.agg(&arr, 1).unwrap_err();
         assert!(
             matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("overflowed"))
         );
@@ -1185,11 +1423,25 @@ mod tests {
     }
 
     #[test]
-    fn test_product_rejects_overflow() {
+    fn test_product_default_wraps_and_optional_overflow_check_rejects() {
         let mut agg = ProductAgg::new("v", &DataType::SmallInt(SmallIntType::new())).unwrap();
         let arr = Int16Array::from(vec![i16::MAX, 2]);
         agg.agg(&arr, 0).unwrap();
-        let err = agg.agg(&arr, 1).unwrap_err();
+        agg.agg(&arr, 1).unwrap();
+        assert_eq!(
+            agg.result()
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(0),
+            -2
+        );
+        let mut checked =
+            ProductAgg::new_with_overflow("v", &DataType::SmallInt(SmallIntType::new()), true)
+                .unwrap();
+        checked.agg(&arr, 0).unwrap();
+        let err = checked.agg(&arr, 1).unwrap_err();
         assert!(matches!(err, crate::Error::DataInvalid { .. }));
     }
 
@@ -1204,14 +1456,61 @@ mod tests {
     }
 
     #[test]
-    fn test_product_rejects_decimal_until_scale_handling_lands() {
-        // DECIMAL multiplication needs BigDecimal-style scale rebasing; the
-        // basic mode rejects it explicitly instead of silently shifting the
-        // implied scale.
-        let err =
-            ProductAgg::new("v", &DataType::Decimal(DecimalType::new(10, 2).unwrap())).unwrap_err();
+    fn test_product_decimal_rebases_scale_like_java() {
+        let mut agg =
+            ProductAgg::new("v", &DataType::Decimal(DecimalType::new(10, 2).unwrap())).unwrap();
+        let mut builder = Decimal128Builder::with_capacity(2)
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        builder.append_value(150);
+        builder.append_value(200);
+        let input = builder.finish();
+        agg.agg(&input, 0).unwrap();
+        agg.agg(&input, 1).unwrap();
+        assert_eq!(
+            agg.result()
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            300
+        );
+        agg.retract(&input, 1).unwrap();
+        assert_eq!(
+            agg.result()
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value(0),
+            150
+        );
+    }
+
+    #[test]
+    fn test_sum_retract_before_add_starts_negative() {
+        let mut agg = SumAgg::new("v", &DataType::Int(IntType::new())).unwrap();
+        let input = Int32Array::from(vec![3, 10]);
+        agg.retract(&input, 0).unwrap();
+        agg.agg(&input, 1).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), Some(7));
+    }
+
+    #[test]
+    fn test_product_decimal_retract_rejects_nonterminating_division() {
+        let mut agg =
+            ProductAgg::new("v", &DataType::Decimal(DecimalType::new(10, 2).unwrap())).unwrap();
+        let mut builder = Decimal128Builder::with_capacity(2)
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        builder.append_value(100);
+        builder.append_value(300);
+        let input = builder.finish();
+        agg.agg(&input, 0).unwrap();
+        let err = agg.retract(&input, 1).unwrap_err();
         assert!(
-            matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("DECIMAL"))
+            matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("Non-terminating"))
         );
     }
 

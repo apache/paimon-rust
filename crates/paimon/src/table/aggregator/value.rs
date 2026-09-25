@@ -115,7 +115,7 @@ impl PickValueAgg {
             // Java last_non_null_value keeps a non-null accumulator, otherwise
             // it falls back to the older input.
             PickPolicy::LastNonNull => {
-                if self.winner.is_none() && !is_null {
+                if self.winner.as_ref().is_none_or(|winner| winner.is_null(0)) && !is_null {
                     self.winner = Some(array.slice(row_idx, 1));
                 }
             }
@@ -165,9 +165,39 @@ macro_rules! pick_agg {
                 self.0.agg(array, row_idx);
                 Ok(())
             }
+            fn replace_with_delete(
+                &mut self,
+                array: &dyn Array,
+                row_idx: usize,
+            ) -> crate::Result<()> {
+                self.0.winner = Some(array.slice(row_idx, 1));
+                Ok(())
+            }
             fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
                 self.0.agg_reversed(array, row_idx);
                 Ok(())
+            }
+            fn retract(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+                match self.0.policy {
+                    PickPolicy::Last => {
+                        self.0.winner = None;
+                        Ok(())
+                    }
+                    PickPolicy::LastNonNull => {
+                        if !array.is_null(row_idx) {
+                            self.0.winner = None;
+                        }
+                        Ok(())
+                    }
+                    PickPolicy::First | PickPolicy::FirstNonNull => {
+                        Err(crate::Error::Unsupported {
+                            message: format!(
+                                "Aggregate function '{}' does not support retract",
+                                self.name()
+                            ),
+                        })
+                    }
+                }
             }
             fn result(&self) -> crate::Result<ArrayRef> {
                 Ok(self.0.result())
@@ -188,6 +218,61 @@ pick_agg!(
     "first_non_null_value",
     PickPolicy::FirstNonNull
 );
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use arrow_array::StringArray;
+
+    #[test]
+    fn delete_replaces_cell_without_resetting_first_non_null_state() {
+        let mut agg = FirstNonNullValueAgg::new(
+            "value",
+            &DataType::VarChar(crate::spec::VarCharType::new(10).unwrap()),
+        )
+        .unwrap();
+        let input = StringArray::from(vec![Some("old"), None, Some("new")]);
+        agg.agg(&input, 0).unwrap();
+        agg.replace_with_delete(&input, 1).unwrap();
+        agg.agg(&input, 2).unwrap();
+        assert!(agg.result().unwrap().is_null(0));
+    }
+}
+
+/// Java's internal `primary-key` function replaces its value for both add and
+/// retract inputs. It can also appear explicitly in Java table options.
+#[derive(Debug)]
+pub(crate) struct PrimaryKeyAgg(PickValueAgg);
+
+impl PrimaryKeyAgg {
+    pub(crate) fn new(_field_name: &str, data_type: &DataType) -> crate::Result<Self> {
+        Ok(Self(PickValueAgg::new(PickPolicy::Last, data_type)?))
+    }
+}
+
+impl FieldAggregator for PrimaryKeyAgg {
+    fn name(&self) -> &'static str {
+        "primary-key"
+    }
+    fn reset(&mut self) {
+        self.0.reset();
+    }
+    fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.0.agg(array, row_idx);
+        Ok(())
+    }
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.0.agg_reversed(array, row_idx);
+        Ok(())
+    }
+    fn retract(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.0.agg(array, row_idx);
+        Ok(())
+    }
+    fn result(&self) -> crate::Result<ArrayRef> {
+        Ok(self.0.result())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -314,6 +399,15 @@ mod tests {
         agg.agg(&arr, 0).unwrap();
         agg.agg_reversed(&arr, 1).unwrap();
         agg.agg_reversed(&arr, 2).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), Some(5));
+    }
+
+    #[test]
+    fn test_last_non_null_reversed_fills_raw_null_delete_cell() {
+        let mut agg = LastNonNullValueAgg::new("v", &DataType::Int(IntType::new())).unwrap();
+        let arr = Int32Array::from(vec![None, Some(5)]);
+        agg.replace_with_delete(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 1).unwrap();
         assert_eq!(collect_i32(agg.result().unwrap()), Some(5));
     }
 

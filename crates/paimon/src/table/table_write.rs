@@ -381,22 +381,6 @@ impl TableWrite {
             });
         }
 
-        if is_dynamic_cross_partition && merge_engine == MergeEngine::PartialUpdate {
-            return Err(crate::Error::Unsupported {
-                message:
-                    "merge-engine=partial-update with cross-partition update is not supported yet"
-                        .to_string(),
-            });
-        }
-
-        if is_dynamic_cross_partition && merge_engine == MergeEngine::Aggregation {
-            return Err(crate::Error::Unsupported {
-                message:
-                    "merge-engine=aggregation with cross-partition update is not supported yet"
-                        .to_string(),
-            });
-        }
-
         let row_kind_generator = match core_options.rowkind_field() {
             Some(field_name) if has_primary_keys => {
                 Some(RowKindGenerator::create(schema, field_name)?)
@@ -786,6 +770,12 @@ impl TableWrite {
             || !output.deletes.is_empty();
         for (key, row_indices) in groups {
             let sub_batch = take_rows(batch, &row_indices)?;
+            let sub_batch = if matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
+            {
+                self.with_partition_values(&sub_batch, &key.0)?
+            } else {
+                sub_batch
+            };
             let sub_batch = if needs_value_kind && !batch_has_value_kind {
                 Self::add_value_kind_column(&sub_batch, 0)?
             } else {
@@ -804,44 +794,44 @@ impl TableWrite {
             }
             for (key, row_indices) in delete_groups {
                 let sub_batch = take_rows(batch, &row_indices)?;
-                // Java DeleteExistingProcessor emits the incoming values with
-                // the old partition and DELETE kind. Routing the file alone
-                // leaves incorrect physical values and partition statistics.
-                let partition = BinaryRow::from_serialized_bytes(&key.0)?;
-                let mut columns = sub_batch.columns().to_vec();
-                for (partition_index, field) in
-                    self.table.schema().partition_fields().iter().enumerate()
-                {
-                    let column_index =
-                        sub_batch.schema().index_of(field.name()).map_err(|error| {
-                            crate::Error::DataInvalid {
-                                message: format!(
-                                    "Missing partition field '{}': {error}",
-                                    field.name()
-                                ),
-                                source: Some(Box::new(error)),
-                            }
-                        })?;
-                    columns[column_index] = partition_array(
-                        &partition,
-                        partition_index,
-                        field.data_type(),
-                        sub_batch.num_rows(),
-                    )?;
-                }
-                let sub_batch =
-                    RecordBatch::try_new(sub_batch.schema(), columns).map_err(|error| {
-                        crate::Error::DataInvalid {
-                            message: format!("Failed to restore old partition for delete: {error}"),
-                            source: Some(Box::new(error)),
-                        }
-                    })?;
+                let sub_batch = self.with_partition_values(&sub_batch, &key.0)?;
                 let delete_batch = Self::add_value_kind_column(&sub_batch, 3)?;
                 result.push((key, delete_batch));
             }
         }
 
         Ok(result)
+    }
+
+    /// Keep physical partition columns consistent with the routed partition.
+    /// Cross-partition partial-update/aggregation writes stay in the old
+    /// partition, as Java `UseOldExistingProcessor` does; deduplicate DELETEs
+    /// also carry the old partition values.
+    fn with_partition_values(
+        &self,
+        batch: &RecordBatch,
+        partition_bytes: &[u8],
+    ) -> Result<RecordBatch> {
+        let partition = BinaryRow::from_serialized_bytes(partition_bytes)?;
+        let mut columns = batch.columns().to_vec();
+        for (partition_index, field) in self.table.schema().partition_fields().iter().enumerate() {
+            let column_index = batch.schema().index_of(field.name()).map_err(|error| {
+                crate::Error::DataInvalid {
+                    message: format!("Missing partition field '{}': {error}", field.name()),
+                    source: Some(Box::new(error)),
+                }
+            })?;
+            columns[column_index] = partition_array(
+                &partition,
+                partition_index,
+                field.data_type(),
+                batch.num_rows(),
+            )?;
+        }
+        RecordBatch::try_new(batch.schema(), columns).map_err(|error| crate::Error::DataInvalid {
+            message: format!("Failed to restore routed partition values: {error}"),
+            source: Some(Box::new(error)),
+        })
     }
 
     /// Add a `_VALUE_KIND` column to a batch with the given value for all rows.
@@ -4608,71 +4598,54 @@ pub(in crate::table) mod tests {
         );
     }
 
-    #[test]
-    fn test_rejects_cross_partition_partial_update() {
+    #[tokio::test]
+    async fn test_cross_partition_partial_update_and_aggregation_keep_old_location() {
         let file_io = test_file_io();
-        let table_path = "memory:/test_cross_partial_update";
-        let schema = Schema::builder()
-            .column("pt", DataType::VarChar(VarCharType::string_type()))
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .partition_keys(["pt"])
-            .option("merge-engine", "partial-update")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "test_cross_partial_update"),
-            table_path.to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        );
-
-        let err = match TableWrite::new(&table, "test-user".to_string()) {
-            Ok(_) => panic!("cross-partition partial-update should be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(matches!(
-            err,
-            crate::Error::Unsupported { message }
-            if message.contains("cross-partition update")
-        ));
-    }
-
-    #[test]
-    fn test_rejects_cross_partition_aggregation() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_cross_aggregation";
-        let schema = Schema::builder()
-            .column("pt", DataType::VarChar(VarCharType::string_type()))
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .partition_keys(["pt"])
-            .option("merge-engine", "aggregation")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "test_cross_aggregation"),
-            table_path.to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        );
-
-        let err = match TableWrite::new(&table, "test-user".to_string()) {
-            Ok(_) => panic!("cross-partition aggregation should be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(matches!(
-            err,
-            crate::Error::Unsupported { message }
-            if message.contains("merge-engine=aggregation")
-                && message.contains("cross-partition update")
-        ));
+        for engine in ["partial-update", "aggregation"] {
+            let table_path = format!("memory:/test_cross_{engine}");
+            setup_dirs(&file_io, &table_path).await;
+            let schema = Schema::builder()
+                .column("pt", DataType::VarChar(VarCharType::string_type()))
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .partition_keys(["pt"])
+                .option("merge-engine", engine)
+                .build()
+                .unwrap();
+            let table = Table::new(
+                file_io.clone(),
+                Identifier::new("default", "test_cross"),
+                table_path,
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+            let first = make_partitioned_batch_3col(vec!["old"], vec![1], vec![10]);
+            let first_output = writer.divide_by_partition_bucket(&first).await.unwrap();
+            assert_eq!(first_output.len(), 1);
+            let old_bucket = first_output[0].0 .1;
+            let later = make_partitioned_batch_3col(vec!["new"], vec![1], vec![20]);
+            let later_output = writer.divide_by_partition_bucket(&later).await.unwrap();
+            assert_eq!(
+                later_output.len(),
+                1,
+                "{engine} must not emit a cross-partition delete"
+            );
+            assert_eq!(later_output[0].0 .1, old_bucket);
+            let pt = later_output[0]
+                .1
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(
+                pt.value(0),
+                "old",
+                "{engine} must restore the old partition value"
+            );
+            assert_eq!(later_output[0].0 .0, first_output[0].0 .0);
+        }
     }
 
     #[tokio::test]
