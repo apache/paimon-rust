@@ -31,7 +31,8 @@ datafusion = "54.0.0"
 tokio = { version = "1", features = ["full"] }
 ```
 
-Mosaic support is always available and currently read-only. SQL queries can read existing `.mosaic` files, but Paimon Rust does not write Mosaic data files yet.
+Mosaic support is always available. SQL queries can read existing `.mosaic` files,
+and writes to ordinary Paimon tables can create them with `file.format=mosaic`.
 
 ## SQL Support Scope
 
@@ -779,7 +780,9 @@ For primary-key tables, records with duplicate keys are deduplicated according t
 
 The Mosaic reader supports scalar, temporal, array, and map columns. It uses row-group statistics for conservative pruning when they are present. This pruning is not row-level filter enforcement; DataFusion still applies SQL filters above the reader to produce exact query results.
 
-Unsupported or limited Mosaic areas include writing `.mosaic` files, emitting manifest `value_stats` for Mosaic writes, Mosaic bloom filters, and Mosaic-specific performance tuning.
+Mosaic writes use Zstd and support `mosaic.num-buckets`, `file.block-size`, and
+`mosaic.stats-columns`. Selected statistics are written to the manifest for file
+pruning. Mosaic bloom filters are not supported.
 
 ### INSERT OVERWRITE
 

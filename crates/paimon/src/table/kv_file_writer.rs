@@ -481,7 +481,7 @@ impl KeyValueFileWriter {
                 self.config.file_compression_zstd_level,
                 None,
                 None,
-                None,
+                Some(&self.config.table_options),
             )
             .await?
         };

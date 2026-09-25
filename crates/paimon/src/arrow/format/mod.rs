@@ -19,6 +19,7 @@ mod avro;
 mod avro_write;
 pub(crate) mod blob;
 mod mosaic;
+mod mosaic_write;
 mod orc;
 pub(crate) mod parquet;
 mod row;
@@ -448,6 +449,7 @@ fn supported_write_formats() -> Vec<&'static str> {
         ".blob",
         ".avro",
         ".row",
+        ".mosaic",
         #[cfg(feature = "vortex")]
         ".vortex",
     ]
@@ -507,6 +509,18 @@ pub(crate) async fn create_format_writer(
         };
         Ok(Box::new(
             row::RowFormatWriter::new(output, schema, row_type, zstd_level).await?,
+        ))
+    } else if lower.ends_with(".mosaic") {
+        Ok(Box::new(
+            mosaic_write::MosaicFormatWriter::new(
+                output,
+                schema,
+                compression,
+                zstd_level,
+                write_fields,
+                format_options,
+            )
+            .await?,
         ))
     } else {
         #[cfg(feature = "vortex")]

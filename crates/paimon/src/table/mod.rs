@@ -73,6 +73,8 @@ mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
 pub(crate) mod merge_tree_split_generator;
+#[cfg(test)]
+mod mosaic_table_write_tests;
 mod object_table;
 mod partition_filter;
 mod partition_row_count;

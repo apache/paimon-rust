@@ -131,7 +131,23 @@ change Page Index generation.
 
 ## Mosaic File Format
 
-Mosaic data file reads are always available. The current Mosaic support is read-only: Paimon Rust can read existing `.mosaic` data files, including array and map columns, in a Paimon table, but it does not write Mosaic data files yet.
+Mosaic data file reads and writes are available for ordinary Paimon tables. Set
+`file.format=mosaic` when creating an append or primary-key table. Mosaic supports
+scalar, array, and map columns; `ROW`, `MULTISET`, `VECTOR`, `VARIANT`, and `BLOB`
+columns are unsupported, matching Java Paimon. Mosaic writes use Zstd compression.
+
+The writer accepts `mosaic.num-buckets`, `file.block-size`, and a comma-separated
+`mosaic.stats-columns` list. Statistics are included in manifest entries for the
+selected columns and can prune files during scans. An empty list disables writer
+statistics. For example:
+
+```text
+file.format = mosaic
+file.compression = zstd
+mosaic.num-buckets = 4
+file.block-size = 128mb
+mosaic.stats-columns = id,event_time
+```
 
 ## FileIndexes for Append Writes
 
