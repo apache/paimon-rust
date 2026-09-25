@@ -40,8 +40,8 @@ use crate::spec::{
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
-use crate::table::managed_blob_reference::ManagedBlobReferenceCollector;
-use crate::table::managed_blob_writer::{managed_blob_fields, ManagedBlobWriter};
+use crate::table::managed_blob_reference::ManagedBlobReferences;
+use crate::table::managed_blob_writer::ManagedBlobWriteState;
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::sort_merge::{AggregateMergeFunction, BufferedBatch, MergeRow};
 use crate::Result;
@@ -71,9 +71,7 @@ pub(crate) struct KeyValueFileWriter {
     written_files: Vec<DataFileMeta>,
     /// Completed changelog file metadata.
     written_changelog_files: Vec<DataFileMeta>,
-    // The pack's FileWrite is Send but not Sync. Keep it behind a mutex so
-    // read-only async file writes can borrow `&self` across await points.
-    managed_blob_writer: Option<tokio::sync::Mutex<ManagedBlobWriter>>,
+    managed_blob_writer: ManagedBlobWriteState,
 }
 
 /// Configuration for [`KeyValueFileWriter`], grouping file-location, schema,
@@ -159,17 +157,7 @@ impl KeyValueFileWriter {
             }
         }
 
-        let options = CoreOptions::new(&config.table_options);
-        let managed_fields = managed_blob_fields(&config.value_fields, &options);
-        let managed_blob_writer = ManagedBlobWriter::new(
-            file_io.clone(),
-            &config.table_location,
-            &config.partition_path,
-            config.bucket,
-            &config.data_file_prefix,
-            options.blob_target_file_size(),
-            managed_fields,
-        )?;
+        let managed_blob_writer = ManagedBlobWriteState::new(&file_io, &config)?;
 
         Ok(Self {
             file_io,
@@ -182,7 +170,7 @@ impl KeyValueFileWriter {
             buffer_reservation: None,
             written_files: Vec::new(),
             written_changelog_files: Vec::new(),
-            managed_blob_writer: managed_blob_writer.map(tokio::sync::Mutex::new),
+            managed_blob_writer,
         })
     }
 
@@ -205,11 +193,7 @@ impl KeyValueFileWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let batch = if let Some(writer) = &mut self.managed_blob_writer {
-            writer.get_mut().externalize(&batch).await?
-        } else {
-            batch
-        };
+        let batch = self.managed_blob_writer.externalize(batch).await?;
         let batch_bytes: usize = batch
             .columns()
             .iter()
@@ -461,30 +445,13 @@ impl KeyValueFileWriter {
                 .transpose()?
         };
         let physical_schema = build_physical_schema(&user_schema);
-        let managed_blob_fields = if write.is_changelog || self.managed_blob_writer.is_none() {
-            Vec::new()
-        } else {
-            managed_blob_fields(
-                &self.config.value_fields,
-                &CoreOptions::new(&self.config.table_options),
-            )
-            .into_iter()
-            .map(|(index, kind)| {
-                let name = self.config.value_fields[index].name();
-                physical_schema
-                    .index_of(name)
-                    .map(|physical_index| (physical_index, kind))
-                    .map_err(|error| crate::Error::DataInvalid {
-                        message: format!(
-                            "Managed BLOB field '{name}' is missing from physical schema: {error}"
-                        ),
-                        source: Some(Box::new(error)),
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?
-        };
-        let mut blob_references =
-            (!managed_blob_fields.is_empty()).then(ManagedBlobReferenceCollector::default);
+        let mut blob_references = ManagedBlobReferences::new(
+            &self.config.value_fields,
+            &CoreOptions::new(&self.config.table_options),
+            &physical_schema,
+            self.managed_blob_writer.enabled(),
+            write.is_changelog,
+        )?;
 
         let file_name = format!(
             "{}{}-{}.{}",
@@ -595,12 +562,10 @@ impl KeyValueFileWriter {
                     message: format!("Failed to create physical batch: {e}"),
                     source: None,
                 })?;
-            if let Some(references) = blob_references.as_mut() {
-                if let Err(error) = references.collect_batch(&chunk_batch, &managed_blob_fields) {
-                    let _ = writer.close().await;
-                    let _ = self.file_io.delete_file(&file_path).await;
-                    return Err(error);
-                }
+            if let Err(error) = ManagedBlobReferences::collect(&mut blob_references, &chunk_batch) {
+                let _ = writer.close().await;
+                let _ = self.file_io.delete_file(&file_path).await;
+                return Err(error);
             }
             if let Err(error) = writer.write(&chunk_batch).await {
                 let _ = writer.close().await;
@@ -728,17 +693,14 @@ impl KeyValueFileWriter {
             }
         }
 
-        if let Some(references) = blob_references {
-            match references.write(&self.file_io, &file_path).await {
-                Ok(name) => meta.extra_files.push(name),
-                Err(error) => {
-                    for path in meta.collect_files(&bucket_dir) {
-                        let _ = self.file_io.delete_file(&path).await;
-                    }
-                    return Err(error);
-                }
-            }
-        }
+        ManagedBlobReferences::finish(
+            blob_references,
+            &self.file_io,
+            &file_path,
+            &bucket_dir,
+            &mut meta,
+        )
+        .await?;
 
         Ok(meta)
     }
@@ -1101,17 +1063,13 @@ impl KeyValueFileWriter {
                 let _ = self.file_io.delete_file(&path).await;
             }
         }
-        if let Some(writer) = &mut self.managed_blob_writer {
-            writer.get_mut().abort().await;
-        }
+        self.managed_blob_writer.abort().await;
     }
 
     /// Flush remaining buffer and return all written file metadata.
     pub(crate) async fn prepare_commit(&mut self) -> Result<PreparedFiles> {
         self.flush().await?;
-        if let Some(writer) = &mut self.managed_blob_writer {
-            writer.get_mut().prepare_commit().await?;
-        }
+        self.managed_blob_writer.prepare_commit().await?;
         Ok(PreparedFiles {
             data_files: std::mem::take(&mut self.written_files),
             changelog_files: std::mem::take(&mut self.written_changelog_files),

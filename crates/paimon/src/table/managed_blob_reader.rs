@@ -19,7 +19,8 @@
 
 use super::blob_resolver::{resolve_blob_column, BlobReadLimiter};
 use super::managed_blob_writer::{managed_blob_kind, ManagedBlobKind};
-use super::ArrowRecordBatchStream;
+use super::{ArrowRecordBatchStream, Table};
+use crate::arrow::format::FilePredicates;
 use crate::io::FileIO;
 use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::Result;
@@ -73,21 +74,114 @@ pub(crate) fn resolved_primary_key_blob_fields(
         .collect()
 }
 
-pub(crate) fn predicate_uses_resolved_blob(
-    predicate: &Predicate,
-    fields: &[DataField],
-    options: &CoreOptions<'_>,
-) -> bool {
-    let resolved = resolved_primary_key_blob_fields(fields, options)
+fn resolved_blob_indices(fields: &[DataField], options: &CoreOptions<'_>) -> HashSet<usize> {
+    resolved_primary_key_blob_fields(fields, options)
         .into_iter()
         .map(|(index, _)| index)
-        .collect::<HashSet<_>>();
-    if resolved.is_empty() {
-        return false;
-    }
+        .collect()
+}
+
+fn predicate_uses_resolved_blob(predicate: &Predicate, resolved: &HashSet<usize>) -> bool {
     let mut referenced = HashSet::new();
     predicate.collect_leaf_field_indices(&mut referenced);
     referenced.iter().any(|index| resolved.contains(index))
+}
+
+/// Drop payload predicates from file and stats pruning while retaining safe
+/// predicates on ordinary columns. The full filter remains on TableRead.
+pub(crate) fn scan_predicates(table: &Table, predicates: &[Predicate]) -> Vec<Predicate> {
+    if table.schema().primary_keys().is_empty() {
+        return predicates.to_vec();
+    }
+    let options = table.schema().core_options();
+    let resolved = resolved_blob_indices(table.schema().fields(), &options);
+    if resolved.is_empty() {
+        return predicates.to_vec();
+    }
+    predicates
+        .iter()
+        .filter(|predicate| !predicate_uses_resolved_blob(predicate, &resolved))
+        .cloned()
+        .collect()
+}
+
+/// Holds the extra columns and exact residual filter needed when a primary-key
+/// predicate compares BLOB payloads rather than their Parquet descriptors.
+pub(crate) struct ManagedBlobReadPlan {
+    scan_fields: Vec<DataField>,
+    output_fields: Vec<DataField>,
+    predicates: FilePredicates,
+}
+
+impl ManagedBlobReadPlan {
+    pub(crate) fn new(
+        read_type: &[DataField],
+        predicates: &[Predicate],
+        table_fields: &[DataField],
+        options: &CoreOptions<'_>,
+    ) -> Option<Self> {
+        let resolved = resolved_blob_indices(table_fields, options);
+        if resolved.is_empty() {
+            return None;
+        }
+        predicates
+            .iter()
+            .any(|predicate| predicate_uses_resolved_blob(predicate, &resolved))
+            .then(|| {
+                let predicates = FilePredicates {
+                    predicates: predicates.to_vec(),
+                    row_filter_factory: None,
+                    file_fields: table_fields.to_vec(),
+                };
+                let scan_fields =
+                    crate::arrow::residual::widen_scan_fields(read_type, Some(&predicates));
+                Self {
+                    scan_fields,
+                    output_fields: read_type.to_vec(),
+                    predicates,
+                }
+            })
+    }
+
+    pub(crate) fn scan_fields(&self) -> &[DataField] {
+        &self.scan_fields
+    }
+
+    pub(crate) fn finish(
+        self,
+        stream: ArrowRecordBatchStream,
+        options: &CoreOptions<'_>,
+        file_io: FileIO,
+        parallelism: usize,
+    ) -> ArrowRecordBatchStream {
+        let stream = resolve_primary_key_blob_stream(
+            stream,
+            &self.scan_fields,
+            options,
+            file_io,
+            parallelism,
+        );
+        Box::pin(async_stream::try_stream! {
+            let mut stream = stream;
+            while let Some(batch) = stream.next().await {
+                let batch = crate::arrow::residual::filter_record_batch_by_predicates(
+                    batch?, &self.predicates, &self.scan_fields,
+                )?;
+                let indices = self.output_fields
+                    .iter()
+                    .map(|field| batch.schema().index_of(field.name()))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|error| crate::Error::DataInvalid {
+                        message: format!("Managed BLOB output projection is missing a column: {error}"),
+                        source: Some(Box::new(error)),
+                    })?;
+                yield batch.project(&indices).map_err(|error| crate::Error::DataInvalid {
+                    message: format!("Failed to project managed BLOB read output: {error}"),
+                    source: Some(Box::new(error)),
+                })?;
+            }
+        })
+    }
 }
 
 async fn resolve_batch(

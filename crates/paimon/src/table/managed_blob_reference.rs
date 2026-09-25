@@ -17,11 +17,14 @@
 
 //! Java-compatible `.blobref` sidecars for managed primary-key BLOB packs.
 
-use super::managed_blob_writer::ManagedBlobKind;
+use super::managed_blob_writer::{managed_blob_fields, ManagedBlobKind};
 use crate::io::FileIO;
-use crate::spec::{BlobDescriptor, RowKind, VALUE_KIND_FIELD_NAME};
+use crate::spec::{
+    BlobDescriptor, CoreOptions, DataField, DataFileMeta, RowKind, VALUE_KIND_FIELD_NAME,
+};
 use crate::Result;
 use arrow_array::{Array, Int8Array, LargeBinaryArray, ListArray, MapArray, RecordBatch};
+use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use std::collections::BTreeSet;
 
@@ -41,6 +44,74 @@ pub(crate) struct ManagedBlobReference {
 #[derive(Default)]
 pub(crate) struct ManagedBlobReferenceCollector {
     references: BTreeSet<ManagedBlobReference>,
+}
+
+/// Per-file reference tracking, absent for ordinary and changelog files.
+pub(crate) struct ManagedBlobReferences {
+    fields: Vec<(usize, ManagedBlobKind)>,
+    collector: ManagedBlobReferenceCollector,
+}
+
+impl ManagedBlobReferences {
+    pub(crate) fn new(
+        value_fields: &[DataField],
+        table_options: &CoreOptions<'_>,
+        physical_schema: &ArrowSchema,
+        managed_enabled: bool,
+        is_changelog: bool,
+    ) -> Result<Option<Self>> {
+        if !managed_enabled || is_changelog {
+            return Ok(None);
+        }
+        let fields = managed_blob_fields(value_fields, table_options)
+            .into_iter()
+            .map(|(index, kind)| {
+                let name = value_fields[index].name();
+                physical_schema
+                    .index_of(name)
+                    .map(|physical_index| (physical_index, kind))
+                    .map_err(|error| {
+                        invalid(&format!(
+                            "Managed BLOB field '{name}' is missing from physical schema: {error}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((!fields.is_empty()).then(|| Self {
+            fields,
+            collector: ManagedBlobReferenceCollector::default(),
+        }))
+    }
+
+    pub(crate) fn collect(references: &mut Option<Self>, batch: &RecordBatch) -> Result<()> {
+        if let Some(references) = references {
+            references
+                .collector
+                .collect_batch(batch, &references.fields)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish(
+        references: Option<Self>,
+        file_io: &FileIO,
+        data_path: &str,
+        bucket_dir: &str,
+        meta: &mut DataFileMeta,
+    ) -> Result<()> {
+        if let Some(references) = references {
+            match references.collector.write(file_io, data_path).await {
+                Ok(name) => meta.extra_files.push(name),
+                Err(error) => {
+                    for path in meta.collect_files(bucket_dir) {
+                        let _ = file_io.delete_file(&path).await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ManagedBlobReferenceCollector {

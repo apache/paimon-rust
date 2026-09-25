@@ -24,7 +24,6 @@ use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
-use crate::arrow::format::FilePredicates;
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::ReadBudget;
 use crate::resource::ResourceContext;
@@ -873,64 +872,7 @@ impl<'a> PaimonTableRead<'a> {
                     | MergeEngine::Aggregation
             )
         {
-            // A managed BLOB column is a descriptor in Parquet. Predicates on
-            // its payload must run after key-value merge and descriptor
-            // resolution, including when the column is only used by a filter.
-            if self.data_predicates.iter().any(|predicate| {
-                super::managed_blob_reader::predicate_uses_resolved_blob(
-                    predicate,
-                    self.table.schema().fields(),
-                    &core_options,
-                )
-            }) {
-                let predicates = FilePredicates {
-                    predicates: self.data_predicates.clone(),
-                    row_filter_factory: None,
-                    file_fields: self.table.schema().fields().to_vec(),
-                };
-                let scan_fields =
-                    crate::arrow::residual::widen_scan_fields(self.read_type(), Some(&predicates));
-                let mut inner = self.clone();
-                inner.read_type = scan_fields.clone();
-                inner.data_predicates.clear();
-                let stream = inner.read_pk(data_splits, &core_options)?;
-                let stream = super::managed_blob_reader::resolve_primary_key_blob_stream(
-                    stream,
-                    &scan_fields,
-                    &core_options,
-                    self.table.file_io.clone(),
-                    self.blob_parallelism,
-                );
-                let output_fields = self.read_type.clone();
-                return Ok(Box::pin(async_stream::try_stream! {
-                    let mut stream = stream;
-                    while let Some(batch) = stream.next().await {
-                        let batch = crate::arrow::residual::filter_record_batch_by_predicates(
-                            batch?, &predicates, &scan_fields,
-                        )?;
-                        let indices = output_fields
-                            .iter()
-                            .map(|field| batch.schema().index_of(field.name()))
-                            .collect::<std::result::Result<Vec<_>, _>>()
-                            .map_err(|error| crate::Error::DataInvalid {
-                                message: format!("Managed BLOB output projection is missing a column: {error}"),
-                                source: Some(Box::new(error)),
-                            })?;
-                        yield batch.project(&indices).map_err(|error| crate::Error::DataInvalid {
-                            message: format!("Failed to project managed BLOB read output: {error}"),
-                            source: Some(Box::new(error)),
-                        })?;
-                    }
-                }));
-            }
-            let stream = self.read_pk(data_splits, &core_options)?;
-            return Ok(super::managed_blob_reader::resolve_primary_key_blob_stream(
-                stream,
-                self.read_type(),
-                &core_options,
-                self.table.file_io.clone(),
-                self.blob_parallelism,
-            ));
+            return self.read_pk_with_blob(data_splits, &core_options);
         }
 
         if core_options.data_evolution_enabled() {
@@ -938,6 +880,41 @@ impl<'a> PaimonTableRead<'a> {
         } else {
             self.read_raw(data_splits)
         }
+    }
+
+    fn read_pk_with_blob(
+        &self,
+        data_splits: &[DataSplit],
+        core_options: &CoreOptions<'_>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        use super::managed_blob_reader::{resolve_primary_key_blob_stream, ManagedBlobReadPlan};
+
+        if let Some(plan) = ManagedBlobReadPlan::new(
+            self.read_type(),
+            &self.data_predicates,
+            self.table.schema().fields(),
+            core_options,
+        ) {
+            let mut inner = self.clone();
+            inner.read_type = plan.scan_fields().to_vec();
+            inner.data_predicates.clear();
+            let stream = inner.read_pk(data_splits, core_options)?;
+            return Ok(plan.finish(
+                stream,
+                core_options,
+                self.table.file_io.clone(),
+                self.blob_parallelism,
+            ));
+        }
+
+        let stream = self.read_pk(data_splits, core_options)?;
+        Ok(resolve_primary_key_blob_stream(
+            stream,
+            self.read_type(),
+            core_options,
+            self.table.file_io.clone(),
+            self.blob_parallelism,
+        ))
     }
 
     /// Read PK table. For `Deduplicate` and `FirstRow`, raw-convertible splits from scan

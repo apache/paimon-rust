@@ -23,6 +23,7 @@
 //! Parquet. A separate `.blobref` sidecar records the packs retained by each
 //! physical data file.
 
+use super::kv_file_writer::KeyValueWriteConfig;
 use crate::arrow::format::blob::BlobFormatWriter;
 use crate::arrow::format::FormatFileWriter;
 use crate::io::FileIO;
@@ -87,6 +88,53 @@ pub(crate) struct ManagedBlobWriter {
     target_file_size: u64,
     fields: Vec<ManagedBlobField>,
     uncommitted_paths: Vec<String>,
+}
+
+/// Optional managed-pack state kept off the ordinary key-value write path.
+pub(crate) struct ManagedBlobWriteState {
+    writer: Option<tokio::sync::Mutex<Box<ManagedBlobWriter>>>,
+}
+
+impl ManagedBlobWriteState {
+    pub(crate) fn new(file_io: &FileIO, config: &KeyValueWriteConfig) -> Result<Self> {
+        let options = CoreOptions::new(&config.table_options);
+        let writer = ManagedBlobWriter::new(
+            file_io.clone(),
+            &config.table_location,
+            &config.partition_path,
+            config.bucket,
+            &config.data_file_prefix,
+            options.blob_target_file_size(),
+            managed_blob_fields(&config.value_fields, &options),
+        )?;
+        Ok(Self {
+            writer: writer.map(|writer| tokio::sync::Mutex::new(Box::new(writer))),
+        })
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    pub(crate) async fn externalize(&mut self, batch: RecordBatch) -> Result<RecordBatch> {
+        match &mut self.writer {
+            Some(writer) => writer.get_mut().externalize(&batch).await,
+            None => Ok(batch),
+        }
+    }
+
+    pub(crate) async fn prepare_commit(&mut self) -> Result<()> {
+        if let Some(writer) = &mut self.writer {
+            writer.get_mut().prepare_commit().await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn abort(&mut self) {
+        if let Some(writer) = &mut self.writer {
+            writer.get_mut().abort().await;
+        }
+    }
 }
 
 impl ManagedBlobWriter {
