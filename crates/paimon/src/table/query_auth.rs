@@ -195,6 +195,7 @@ mod tests {
             "scan.version",
             "scan.tag-name",
             "scan.timestamp-millis",
+            "scan.timestamp",
             "scan.watermark",
         ] {
             let table =

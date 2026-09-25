@@ -1063,7 +1063,7 @@ impl<'a> CoreOptions<'a> {
             .and_then(|v| v.parse().ok())
     }
 
-    fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
+    pub(crate) fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
         let mut selectors = Vec::with_capacity(6);
         if self.options.contains_key(SCAN_TIMESTAMP_MILLIS_OPTION) {
             selectors.push(SCAN_TIMESTAMP_MILLIS_OPTION);

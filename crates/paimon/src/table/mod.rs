@@ -386,16 +386,9 @@ impl Table {
     pub(crate) fn reads_another_schema(&self) -> Result<bool> {
         // Presence only; planning validates the selector after adapting
         // `scan.version`.
-        let options = self.schema.options();
-        let travels = [
-            SCAN_SNAPSHOT_ID_OPTION,
-            SCAN_TAG_NAME_OPTION,
-            SCAN_TIMESTAMP_MILLIS_OPTION,
-            SCAN_VERSION_OPTION,
-            SCAN_WATERMARK_OPTION,
-        ]
-        .iter()
-        .any(|key| options.contains_key(*key));
+        let travels = !CoreOptions::new(self.schema.options())
+            .configured_time_travel_selectors()
+            .is_empty();
         let decorated = self.identifier.branch_name()?.is_some()
             || self.identifier.system_table_name()?.is_some();
         Ok(travels || self.time_traveled || self.branch_reference || decorated)
