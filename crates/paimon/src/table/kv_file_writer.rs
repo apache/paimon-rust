@@ -35,8 +35,9 @@ use crate::resource::{MemoryReservation, ResourceContext};
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
     bucket_path_under, data_file_to_file_index_file_name, extract_datum_from_arrow,
-    AggregationConfig, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta, DataType,
-    MergeEngine, PartialUpdateConfig, RowKind, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_NAME,
+    AggregationConfig, BigIntType, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta,
+    DataType, MergeEngine, PartialUpdateConfig, RowKind, TinyIntType, SEQUENCE_NUMBER_FIELD_ID,
+    SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::prepared_files::PreparedFiles;
@@ -94,7 +95,8 @@ pub(crate) struct KeyValueWriteConfig {
     pub primary_key_indices: Vec<usize>,
     /// Paimon DataTypes for each primary key column (same order as primary_key_indices).
     pub primary_key_types: Vec<DataType>,
-    /// Logical value fields, in file order, for Parquet footer statistics.
+    /// Logical value fields, used for footer statistics and to retain Paimon
+    /// types when building the physical file schema.
     pub value_fields: Vec<DataField>,
     /// Sequence field column indices in the user schema (empty if not configured).
     pub sequence_field_indices: Vec<usize>,
@@ -474,13 +476,15 @@ impl KeyValueFileWriter {
                 .await?,
             )
         } else {
+            let physical_fields =
+                build_physical_fields(&physical_schema, &self.config.value_fields)?;
             create_format_writer(
                 &output,
                 physical_schema.clone(),
                 write.file_compression,
                 self.config.file_compression_zstd_level,
                 None,
-                None,
+                Some(&physical_fields),
                 Some(&self.config.table_options),
             )
             .await?
@@ -1081,6 +1085,40 @@ pub(crate) fn build_physical_schema(user_schema: &ArrowSchema) -> Arc<ArrowSchem
         }
     }
     Arc::new(ArrowSchema::new(physical_fields))
+}
+
+/// Describe the actual file columns while retaining logical Paimon types that
+/// Arrow cannot distinguish (for example MULTISET and MAP).
+fn build_physical_fields(
+    physical_schema: &ArrowSchema,
+    value_fields: &[DataField],
+) -> Result<Vec<DataField>> {
+    physical_schema
+        .fields()
+        .iter()
+        .map(|arrow_field| match arrow_field.name().as_str() {
+            SEQUENCE_NUMBER_FIELD_NAME => Ok(DataField::new(
+                SEQUENCE_NUMBER_FIELD_ID,
+                SEQUENCE_NUMBER_FIELD_NAME.into(),
+                DataType::BigInt(BigIntType::new()),
+            )),
+            VALUE_KIND_FIELD_NAME => Ok(DataField::new(
+                VALUE_KIND_FIELD_ID,
+                VALUE_KIND_FIELD_NAME.into(),
+                DataType::TinyInt(TinyIntType::new()),
+            )),
+            name => value_fields
+                .iter()
+                .find(|field| field.name() == name)
+                .cloned()
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "Physical file column '{name}' is missing from the table schema"
+                    ),
+                    source: None,
+                }),
+        })
+        .collect()
 }
 
 #[cfg(test)]

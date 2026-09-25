@@ -918,3 +918,45 @@ async fn append_mosaic_filters_rows_when_predicate_column_has_no_stats() {
     result.sort_unstable();
     assert_eq!(result, vec![(2, 20), (4, 30)]);
 }
+
+#[tokio::test]
+async fn primary_key_mosaic_rejects_multiset_from_table_schema() {
+    use crate::arrow::build_target_arrow_schema;
+    use crate::spec::MultisetType;
+    use arrow_array::new_null_array;
+
+    let io = memory_io();
+    let path = "memory:/native_mosaic_pk_multiset";
+    setup_dirs(&io, path).await;
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "bag",
+            DataType::Multiset(MultisetType::new(DataType::Int(IntType::new()))),
+        )
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("file.format", "mosaic")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        io,
+        Identifier::new("default", "mosaic_pk_multiset"),
+        path.to_owned(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let arrow_schema = build_target_arrow_schema(table.schema().fields()).unwrap();
+    let input = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            new_null_array(arrow_schema.field(1).data_type(), 1),
+        ],
+    )
+    .unwrap();
+    let mut writer = TableWrite::new(&table, "mosaic-test".into()).unwrap();
+    writer.write_arrow_batch(&input).await.unwrap();
+    let error = writer.prepare_commit().await.unwrap_err();
+    assert!(error.to_string().contains("MULTISET"), "{error}");
+}
