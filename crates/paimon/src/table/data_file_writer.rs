@@ -19,7 +19,7 @@
 //! [`DataEvolutionPartialWriter`](super::data_evolution_writer::DataEvolutionPartialWriter).
 //!
 //! `DataFileWriter` streams Arrow `RecordBatch`es to Parquet files on storage,
-//! handles file rolling when `target_file_size` is reached, and collects
+//! handles file rolling when the configured file size or row count is reached, and collects
 //! [`DataFileMeta`] for the commit path.
 
 use super::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
@@ -41,7 +41,7 @@ use tokio::task::JoinSet;
 /// Low-level writer that produces Parquet data files for a single (partition, bucket).
 ///
 /// Batches are accumulated into a single `FormatFileWriter` that streams directly
-/// to storage. When `target_file_size` is reached the current file is rolled
+/// to storage. When the size or row count target is reached the current file is rolled
 /// (closed in the background) and a new one is opened on the next write.
 ///
 /// Call [`prepare_commit`](Self::prepare_commit) to finalize and collect file metadata.
@@ -52,6 +52,7 @@ pub(crate) struct DataFileWriter {
     bucket: i32,
     schema_id: i64,
     target_file_size: i64,
+    target_file_row_num: i64,
     file_compression: String,
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
@@ -62,9 +63,10 @@ pub(crate) struct DataFileWriter {
     file_source: Option<i32>,
     first_row_id: Option<i64>,
     write_cols: Option<Vec<String>>,
-    written_files: Vec<DataFileMeta>,
+    written_files: Vec<(usize, DataFileMeta)>,
+    next_file_ordinal: usize,
     /// Background file close tasks spawned during rolling.
-    in_flight_closes: JoinSet<Result<DataFileMeta>>,
+    in_flight_closes: JoinSet<Result<(usize, DataFileMeta)>>,
     /// Current open format writer, lazily created on first write.
     current_writer: Option<Box<dyn FormatFileWriter>>,
     current_file_name: Option<String>,
@@ -105,6 +107,7 @@ impl DataFileWriter {
             bucket,
             schema_id,
             target_file_size,
+            target_file_row_num: i64::MAX,
             file_compression,
             file_compression_zstd_level,
             write_buffer_size,
@@ -116,6 +119,7 @@ impl DataFileWriter {
             first_row_id,
             write_cols,
             written_files: Vec::new(),
+            next_file_ordinal: 0,
             in_flight_closes: JoinSet::new(),
             current_writer: None,
             current_file_name: None,
@@ -132,6 +136,12 @@ impl DataFileWriter {
         self
     }
 
+    pub(crate) fn with_target_file_row_num(mut self, rows: i64) -> Self {
+        debug_assert!(rows > 0);
+        self.target_file_row_num = rows;
+        self
+    }
+
     pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
         self.resources = resources;
         self
@@ -141,7 +151,7 @@ impl DataFileWriter {
         self.resources = resources;
     }
 
-    /// Write a RecordBatch. Rolls to a new file when target size is reached.
+    /// Write a RecordBatch. Rolls when either target size or row count is reached.
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         let result = self.write_batch(batch).await;
         if self.index_options.is_some() && result.is_err() {
@@ -165,15 +175,17 @@ impl DataFileWriter {
         }
         self.current_row_count += batch.num_rows() as i64;
 
-        // Roll to a new file if target size is reached — close in background
-        if self.current_writer.as_ref().unwrap().num_bytes() as i64 >= self.target_file_size {
+        // Like Java's bundled write, a batch stays intact even if it crosses
+        // the limit. The next batch opens a new file.
+        if self.current_row_count >= self.target_file_row_num
+            || self.current_writer.as_ref().unwrap().num_bytes() as i64 >= self.target_file_size
+        {
             self.roll_file();
         }
 
-        // Flush row group if in-progress buffer exceeds write_buffer_size
-        if let Some(w) = self.current_writer.as_mut() {
-            if w.in_progress_size() as i64 >= self.write_buffer_size {
-                w.flush().await?;
+        if let Some(writer) = self.current_writer.as_mut() {
+            if writer.in_progress_size() as i64 >= self.write_buffer_size {
+                writer.flush().await?;
             }
         }
 
@@ -190,7 +202,7 @@ impl DataFileWriter {
             "{}{}-{}.{}",
             self.data_file_prefix,
             uuid::Uuid::new_v4(),
-            self.written_files.len(),
+            self.next_file_ordinal,
             self.file_format,
         );
         let bucket_dir = self.bucket_dir();
@@ -225,7 +237,9 @@ impl DataFileWriter {
     /// Close the current file writer and record the file metadata.
     pub(crate) async fn close_current_file(&mut self) -> Result<()> {
         if let Some(close) = self.take_close() {
-            self.written_files.push(close.await?);
+            let ordinal = self.next_file_ordinal;
+            self.next_file_ordinal += 1;
+            self.written_files.push((ordinal, close.await?));
         }
         Ok(())
     }
@@ -233,7 +247,10 @@ impl DataFileWriter {
     /// Spawn the current writer's close in the background for non-blocking rolling.
     fn roll_file(&mut self) {
         if let Some(close) = self.take_close() {
-            self.in_flight_closes.spawn(close);
+            let ordinal = self.next_file_ordinal;
+            self.next_file_ordinal += 1;
+            self.in_flight_closes
+                .spawn(async move { Ok((ordinal, close.await?)) });
         }
     }
 
@@ -297,14 +314,16 @@ impl DataFileWriter {
     async fn finish(&mut self) -> Result<Vec<DataFileMeta>> {
         self.close_current_file().await?;
         while let Some(result) = self.in_flight_closes.join_next().await {
-            let meta = result.map_err(|e| crate::Error::DataInvalid {
+            let file = result.map_err(|e| crate::Error::DataInvalid {
                 message: format!("Background file close task panicked: {e}"),
                 source: None,
             })??;
-            self.written_files.push(meta);
+            self.written_files.push(file);
         }
         self.created_paths.clear();
-        Ok(std::mem::take(&mut self.written_files))
+        let mut files = std::mem::take(&mut self.written_files);
+        files.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        Ok(files.into_iter().map(|(_, meta)| meta).collect())
     }
 
     pub(super) async fn abort(&mut self) {
@@ -370,6 +389,7 @@ mod tests {
     use super::*;
     use crate::io::{FileIOBuilder, FileIOProvider};
     use crate::spec::{DataType, IntType};
+    use arrow_array::Int32Array;
     use arrow_schema::{DataType as ArrowDataType, Field, Schema};
     use opendal::Operator;
     use std::sync::{Arc, Mutex};
@@ -437,5 +457,49 @@ mod tests {
             .unwrap()
             .iter()
             .all(|path| !path.contains("//")));
+    }
+
+    #[tokio::test]
+    async fn row_limit_rolls_after_whole_batches_and_preserves_file_order() {
+        let mut writer = DataFileWriter::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            "memory:///row-limit-test".to_string(),
+            String::new(),
+            0,
+            0,
+            i64::MAX,
+            "none".to_string(),
+            0,
+            i64::MAX,
+            "parquet".to_string(),
+            vec![DataField::new(
+                0,
+                "id".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            HashMap::new(),
+            Some(0),
+            None,
+            None,
+        )
+        .with_target_file_row_num(2);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )]));
+        for values in [vec![1], vec![2], vec![3, 4, 5], vec![6]] {
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))])
+                    .unwrap();
+            writer.write(&batch).await.unwrap();
+        }
+
+        let files = writer.prepare_commit().await.unwrap();
+        // Two single-row batches share a file; the three-row batch stays intact.
+        assert_eq!(
+            files.iter().map(|file| file.row_count).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
     }
 }

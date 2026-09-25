@@ -69,6 +69,7 @@ impl AppendDedicatedFormatFileWriter {
         bucket: i32,
         schema_id: i64,
         target_file_size: i64,
+        target_file_row_num: i64,
         blob_target_file_size: i64,
         file_compression: String,
         file_compression_zstd_level: i32,
@@ -120,7 +121,8 @@ impl AppendDedicatedFormatFileWriter {
                         Some(0),
                         None,
                         Some(vec![field.name().to_string()]),
-                    ),
+                    )
+                    .with_target_file_row_num(target_file_row_num),
                     field_name: field.name().to_string(),
                     column_index: idx,
                 });
@@ -158,7 +160,8 @@ impl AppendDedicatedFormatFileWriter {
                         Some(0),
                         None,
                         Some(vector_field_names.clone()),
-                    ),
+                    )
+                    .with_target_file_row_num(target_file_row_num),
                     field_names: vector_field_names,
                     column_indices: vector_column_indices,
                     schema: vector_schema,
@@ -184,7 +187,8 @@ impl AppendDedicatedFormatFileWriter {
             Some(0),
             None,
             Some(normal_field_names),
-        );
+        )
+        .with_target_file_row_num(target_file_row_num);
 
         Self {
             normal_writer,

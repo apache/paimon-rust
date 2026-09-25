@@ -236,6 +236,7 @@ impl CopyOnWriteMergeWriter {
         )?;
 
         let target_file_size = core_options.target_file_size();
+        let target_file_row_num = core_options.target_file_row_num()?;
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
         let write_buffer_size = core_options.write_parquet_buffer_size();
@@ -319,7 +320,8 @@ impl CopyOnWriteMergeWriter {
                         Some(0),
                         None,
                         None,
-                    );
+                    )
+                    .with_target_file_row_num(target_file_row_num);
                     writer.write(&rewritten).await?;
                     writer.prepare_commit().await?
                 } else {

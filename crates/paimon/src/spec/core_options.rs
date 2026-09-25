@@ -1292,6 +1292,24 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
     }
 
+    /// Maximum rows in a newly written data file. Java defaults to `Long.MAX_VALUE`.
+    pub fn target_file_row_num(&self) -> crate::Result<i64> {
+        let Some(raw) = self.options.get("target-file-row-num") else {
+            return Ok(i64::MAX);
+        };
+        let rows = raw
+            .parse::<i64>()
+            .map_err(|_| crate::Error::ConfigInvalid {
+                message: format!("target-file-row-num must be a positive integer, got '{raw}'"),
+            })?;
+        if rows <= 0 {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("target-file-row-num must be positive, got {rows}"),
+            });
+        }
+        Ok(rows)
+    }
+
     /// Explicit `file.block-size`, in bytes. Formats choose their own default.
     pub(crate) fn file_block_size(&self) -> crate::Result<Option<i64>> {
         self.options

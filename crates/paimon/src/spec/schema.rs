@@ -1213,6 +1213,10 @@ impl Schema {
         Self::validate_bucket_keys(options, fields, partition_keys, primary_keys)?;
         Self::validate_sequence_field(options, fields, partition_keys, primary_keys)?;
         Self::validate_read_batch_size(options)?;
+        let core_options = CoreOptions::new(options);
+        if !core_options.is_format_table() {
+            core_options.target_file_row_num()?;
+        }
         Self::validate_primary_key_vector_index(fields, primary_keys, options)?;
         Self::validate_primary_key_full_text_index(fields, primary_keys, options)?;
         Ok(())

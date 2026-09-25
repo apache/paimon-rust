@@ -244,6 +244,16 @@ fn format_partition_value(
             s.to_string()
         }
 
+        DataType::Binary(_) | DataType::VarBinary(_) if !legacy => {
+            // Java's BinaryToStringCastRule wraps the raw bytes in a
+            // BinaryString, whose toString decodes them as UTF-8.
+            let value = String::from_utf8_lossy(row.get_binary(pos)?).into_owned();
+            if value.trim().is_empty() {
+                return Ok(default_partition_name.to_string());
+            }
+            value
+        }
+
         DataType::Date(_) => {
             if legacy {
                 // Legacy: field.toString() on the epoch-day Integer → raw int value.
@@ -1120,7 +1130,8 @@ mod tests {
 
     #[test]
     fn test_unsupported_types() {
-        // Binary
+        // Legacy binary uses byte[].toString() in Java, which contains an
+        // allocation-specific identity hash and cannot name a stable path.
         assert_single_partition_err(
             "data",
             DataType::Binary(BinaryType::new(10).unwrap()),
@@ -1147,6 +1158,31 @@ mod tests {
             DataType::Double(DoubleType::new()),
             |b| b.write_int(0, 0),
             true,
+        );
+    }
+
+    #[test]
+    fn test_binary_partition_uses_utf8_cast_and_path_escaping() {
+        assert_single_partition(
+            "bin",
+            DataType::Binary(BinaryType::new(16).unwrap()),
+            |b| b.write_string(0, "a/b=c"),
+            "bin=a%2Fb%3Dc/",
+            false,
+        );
+        assert_single_partition(
+            "bin",
+            DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+            |b| b.write_string(0, "汉字"),
+            "bin=汉字/",
+            false,
+        );
+        assert_single_partition(
+            "bin",
+            DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+            |b| b.write_string(0, "  "),
+            "bin=__DEFAULT_PARTITION__/",
+            false,
         );
     }
 

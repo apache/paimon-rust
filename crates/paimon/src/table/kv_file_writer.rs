@@ -61,6 +61,7 @@ use std::sync::Arc;
 pub(crate) struct KeyValueFileWriter {
     file_io: FileIO,
     config: KeyValueWriteConfig,
+    target_file_row_num: usize,
     ignore_delete: bool,
     /// Next sequence number to assign (bucket-local, always auto-incremented).
     next_sequence_number: i64,
@@ -130,8 +131,13 @@ impl KeyValueFileWriter {
         config: KeyValueWriteConfig,
         next_sequence_number: i64,
     ) -> Result<Self> {
-        let ignore_delete = config.merge_engine == MergeEngine::PartialUpdate
-            && CoreOptions::new(&config.table_options).ignore_delete();
+        let core_options = CoreOptions::new(&config.table_options);
+        let target_file_row_num = core_options
+            .target_file_row_num()?
+            .try_into()
+            .unwrap_or(usize::MAX);
+        let ignore_delete =
+            config.merge_engine == MergeEngine::PartialUpdate && core_options.ignore_delete();
         if config.merge_engine == MergeEngine::PartialUpdate {
             let partial_update = PartialUpdateConfig::new(&config.table_options);
             partial_update.validate_write_mode(true, &config.table_name)?;
@@ -167,6 +173,7 @@ impl KeyValueFileWriter {
         Ok(Self {
             file_io,
             config,
+            target_file_row_num,
             ignore_delete,
             next_sequence_number,
             buffer: Vec::new(),
@@ -268,11 +275,13 @@ impl KeyValueFileWriter {
                 }),
             });
         }
+        let user_sequence_descending =
+            !CoreOptions::new(&self.config.table_options).sequence_field_sort_order_is_ascending();
         for &idx in &self.config.sequence_field_indices {
             sort_columns.push(SortColumn {
                 values: combined.column(idx).clone(),
                 options: Some(SortOptions {
-                    descending: false,
+                    descending: user_sequence_descending,
                     nulls_first: true,
                 }),
             });
@@ -290,7 +299,7 @@ impl KeyValueFileWriter {
                 source: None,
             })?;
 
-        // After sorting by PK + seq fields + auto-seq (all ascending), merge
+        // After sorting by PK + configured user sequence + auto-seq, merge
         // each key group down to one row, mirroring Java's
         // MergeTreeWriter#flushWriteBuffer (the write buffer runs the merge
         // function before any file is written, so a flushed file never holds
@@ -324,61 +333,77 @@ impl KeyValueFileWriter {
             }
         };
 
-        let data_delete_row_count = Self::indexed_delete_row_count(&data_batch, &data_indices)?;
-        let changelog_delete_row_count = if self.config.input_changelog {
-            Some(Self::indexed_delete_row_count(&combined, &sorted_indices)?)
-        } else {
-            None
-        };
-
-        // Java derives file sequence bounds from emitted rows; allocation still
-        // advances over all buffered inputs, including rows folded away.
-        let output_sequences = data_seq.as_any().downcast_ref::<Int64Array>().unwrap();
-        let (min_output_seq, max_output_seq) = data_indices
-            .values()
-            .iter()
-            .map(|&idx| output_sequences.value(idx as usize))
-            .fold((i64::MAX, i64::MIN), |(min, max), seq| {
-                (min.min(seq), max.max(seq))
-            });
-        let data_file = self
-            .write_indexed_file(
-                &data_batch,
-                data_seq.as_ref(),
-                &data_indices,
-                IndexedFileWrite {
-                    is_changelog: false,
-                    file_prefix: &self.config.data_file_prefix,
-                    file_ordinal: self.written_files.len(),
-                    file_format: &self.config.file_format,
-                    file_compression: &self.config.file_compression,
-                    min_sequence_number: min_output_seq,
-                    max_sequence_number: max_output_seq,
-                    delete_row_count: data_delete_row_count,
-                },
-            )
-            .await?;
-        self.written_files.push(data_file);
-
-        if let Some(delete_row_count) = changelog_delete_row_count {
-            let changelog_file = self
+        // The sorted output is already materialized in FLUSH_CHUNK_ROWS batches.
+        // Use the row target as an upper bound for each emitted batch and keep
+        // every file's key bounds, sequence bounds, and index local to its rows.
+        let data_sequences = data_seq.as_any().downcast_ref::<Int64Array>().unwrap();
+        for offset in (0..data_indices.len()).step_by(self.target_file_row_num) {
+            let len = self.target_file_row_num.min(data_indices.len() - offset);
+            let file_indices = data_indices.slice(offset, len);
+            let (min_sequence_number, max_sequence_number) = file_indices
+                .values()
+                .iter()
+                .map(|&idx| data_sequences.value(idx as usize))
+                .fold((i64::MAX, i64::MIN), |(min, max), seq| {
+                    (min.min(seq), max.max(seq))
+                });
+            let file = self
                 .write_indexed_file(
-                    &combined,
-                    seq_array.as_ref(),
-                    &sorted_indices,
+                    &data_batch,
+                    data_seq.as_ref(),
+                    &file_indices,
                     IndexedFileWrite {
-                        is_changelog: true,
-                        file_prefix: &self.config.changelog_file_prefix,
-                        file_ordinal: self.written_changelog_files.len(),
-                        file_format: &self.config.changelog_file_format,
-                        file_compression: &self.config.changelog_file_compression,
-                        min_sequence_number: start_seq,
-                        max_sequence_number: end_seq,
-                        delete_row_count,
+                        is_changelog: false,
+                        file_prefix: &self.config.data_file_prefix,
+                        file_ordinal: self.written_files.len(),
+                        file_format: &self.config.file_format,
+                        file_compression: &self.config.file_compression,
+                        min_sequence_number,
+                        max_sequence_number,
+                        delete_row_count: Self::indexed_delete_row_count(
+                            &data_batch,
+                            &file_indices,
+                        )?,
                     },
                 )
                 .await?;
-            self.written_changelog_files.push(changelog_file);
+            self.written_files.push(file);
+        }
+
+        if self.config.input_changelog {
+            let input_sequences = seq_array.as_any().downcast_ref::<Int64Array>().unwrap();
+            for offset in (0..sorted_indices.len()).step_by(self.target_file_row_num) {
+                let len = self.target_file_row_num.min(sorted_indices.len() - offset);
+                let file_indices = sorted_indices.slice(offset, len);
+                let (min_sequence_number, max_sequence_number) = file_indices
+                    .values()
+                    .iter()
+                    .map(|&idx| input_sequences.value(idx as usize))
+                    .fold((i64::MAX, i64::MIN), |(min, max), seq| {
+                        (min.min(seq), max.max(seq))
+                    });
+                let file = self
+                    .write_indexed_file(
+                        &combined,
+                        seq_array.as_ref(),
+                        &file_indices,
+                        IndexedFileWrite {
+                            is_changelog: true,
+                            file_prefix: &self.config.changelog_file_prefix,
+                            file_ordinal: self.written_changelog_files.len(),
+                            file_format: &self.config.changelog_file_format,
+                            file_compression: &self.config.changelog_file_compression,
+                            min_sequence_number,
+                            max_sequence_number,
+                            delete_row_count: Self::indexed_delete_row_count(
+                                &combined,
+                                &file_indices,
+                            )?,
+                        },
+                    )
+                    .await?;
+                self.written_changelog_files.push(file);
+            }
         }
         Ok(())
     }
@@ -839,7 +864,7 @@ impl KeyValueFileWriter {
                 row_idx: idx as usize,
                 // Ordering is already established by the write buffer's Arrow sort.
                 sequence_number: 0,
-                user_sequences: Vec::new(),
+                user_sequence: None,
                 value_kind: value_kinds
                     .filter(|kinds| kinds.is_valid(idx as usize))
                     .map_or(0, |kinds| kinds.value(idx as usize)),
@@ -945,11 +970,15 @@ impl KeyValueFileWriter {
         let rows: Vec<_> = sorted_indices
             .values()
             .iter()
-            .map(|&idx| MergeRow {
+            .enumerate()
+            .map(|(sorted_rank, &idx)| MergeRow {
                 batch_idx: 0,
                 row_idx: idx as usize,
-                sequence_number: 0,
-                user_sequences: Vec::new(),
+                // The write buffer has already sorted by user sequence and
+                // arrival sequence. Preserve that order when the shared merge
+                // function sorts MergeRows again.
+                sequence_number: sorted_rank as i64,
+                user_sequence: None,
                 value_kind: value_kinds
                     .filter(|kinds| kinds.is_valid(idx as usize))
                     .map_or(0, |kinds| kinds.value(idx as usize)),
@@ -1267,6 +1296,49 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn target_file_row_num_rolls_data_and_changelog_with_local_metadata() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("seq", ArrowDataType::Int64, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![5, 1, 4, 2, 3])),
+                Arc::new(Int64Array::from(vec![50, 10, 40, 20, 30])),
+                Arc::new(Int32Array::from(vec![50, 10, 40, 20, 30])),
+            ],
+        )
+        .unwrap();
+        let mut config = test_write_config(MergeEngine::Deduplicate);
+        config.input_changelog = true;
+        config.write_buffer_size = i64::MAX;
+        config
+            .table_options
+            .insert("target-file-row-num".into(), "2".into());
+        let mut writer =
+            KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+
+        for files in [&prepared.data_files, &prepared.changelog_files] {
+            assert_eq!(
+                files.iter().map(|file| file.row_count).collect::<Vec<_>>(),
+                vec![2, 2, 1]
+            );
+            assert_eq!(
+                files
+                    .iter()
+                    .map(|file| (file.min_sequence_number, file.max_sequence_number))
+                    .collect::<Vec<_>>(),
+                vec![(1, 3), (2, 4), (0, 0)]
+            );
+        }
     }
 
     #[tokio::test]
@@ -2088,6 +2160,10 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
+        let user_converter = RowConverter::new(vec![SortField::new(ArrowDataType::Int64)]).unwrap();
+        let user_sequences = user_converter
+            .convert_columns(&[Arc::new(seq_col.clone())])
+            .unwrap();
 
         for (group_idx, group_rows) in [vec![0usize, 2, 3], vec![1usize, 4]].iter().enumerate() {
             let rows: Vec<MergeRow> = group_rows
@@ -2097,7 +2173,7 @@ mod tests {
                     row_idx,
                     sequence_number: seq_values[row_idx],
                     value_kind: 0,
-                    user_sequences: vec![Some(seq_col.value(row_idx) as i128)],
+                    user_sequence: Some(user_sequences.row(row_idx).owned()),
                 })
                 .collect();
             let result = merge_fn.merge(&rows, &buffer, &identity, &schema).unwrap();
