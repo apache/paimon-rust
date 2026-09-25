@@ -26,6 +26,7 @@ use crate::spec::{
     IntType, MapType, Schema, TableSchema, TinyIntType, VarCharType, SEQUENCE_NUMBER_FIELD_ID,
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
+use crate::spec::{Datum, PredicateBuilder};
 use arrow_array::{
     Array, Int32Array, LargeBinaryArray, ListArray, MapArray, RecordBatch, StringArray, StructArray,
 };
@@ -439,6 +440,193 @@ async fn primary_key_array_and_map_blob_values_round_trip_through_managed_packs(
             ),
         ]
     );
+}
+
+#[tokio::test]
+async fn sliced_primary_key_blob_collections_only_externalize_visible_children() {
+    for (suffix, columns) in [
+        ("array", vec![0, 1]),
+        ("map", vec![0, 2]),
+        ("both", vec![0, 1, 2]),
+    ] {
+        for start in [0, 3] {
+            let file_io = test_file_io();
+            let path = format!("memory:/managed_blob_sliced_{suffix}_{start}");
+            setup_dirs(&file_io, &path).await;
+            let template = nested_table(&file_io, &path);
+            let table = if columns.len() == 3 {
+                template.clone()
+            } else {
+                let field = &template.schema().fields()[columns[1]];
+                let schema = Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column(field.name(), field.data_type().clone())
+                    .primary_key(["id"])
+                    .option("bucket", "1")
+                    .build()
+                    .unwrap();
+                Table::new(
+                    file_io.clone(),
+                    Identifier::new("default", "managed_blob_sliced"),
+                    path.clone(),
+                    TableSchema::new(0, &schema),
+                    None,
+                )
+            };
+            let input = nested_batch(&template)
+                .project(&columns)
+                .unwrap()
+                .slice(start, 1);
+            let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+            writer.write_arrow_batch(&input).await.unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            TableCommit::new(table.clone(), "test-user".to_string())
+                .commit(messages)
+                .await
+                .unwrap();
+            let mut builder = table.new_read_builder();
+            let projection = if columns == [0, 1] {
+                vec!["id", "items"]
+            } else if columns == [0, 2] {
+                vec!["id", "named"]
+            } else {
+                vec!["id", "items", "named"]
+            };
+            builder.with_projection(&projection).unwrap();
+            let plan = builder.new_scan().plan().await.unwrap();
+            let batches: Vec<RecordBatch> = builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            let batch = &batches[0];
+            assert_eq!(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .value(0),
+                start as i32 + 1
+            );
+            if let Some(index) = projection.iter().position(|name| *name == "items") {
+                let array = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap();
+                let expected = if start == 0 {
+                    vec![Some(b"alpha".to_vec()), None, Some(b"beta".to_vec())]
+                } else {
+                    vec![Some(b"gamma".to_vec())]
+                };
+                assert_eq!(array_values(array, 0), Some(expected));
+            }
+            if let Some(index) = projection.iter().position(|name| *name == "named") {
+                let map = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<MapArray>()
+                    .unwrap();
+                let expected = if start == 0 {
+                    vec![
+                        ("one".to_string(), Some(b"first".to_vec())),
+                        ("two".to_string(), None),
+                    ]
+                } else {
+                    vec![("three".to_string(), Some(b"third".to_vec()))]
+                };
+                assert_eq!(map_values(map, 0), Some(expected));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn primary_key_blob_payload_filter_runs_after_resolution() {
+    let file_io = test_file_io();
+    let path = "memory:/managed_blob_payload_filter";
+    setup_dirs(&file_io, path).await;
+    let table = scalar_table(&file_io, path, &[]);
+    let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+    writer
+        .write_arrow_batch(&scalar_batch(&[(1, Some(b"hello")), (2, Some(b"world"))]))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "test-user".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("payload", Datum::Bytes(b"hello".to_vec()))
+        .unwrap();
+    for projection in [vec!["id", "payload"], vec!["id"]] {
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&projection).unwrap();
+        builder.with_filter(predicate.clone());
+        let plan = builder.new_scan().plan().await.unwrap();
+        assert!(!plan.splits().is_empty());
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(batches[0].num_columns(), projection.len());
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn primary_key_blob_retract_accepts_non_nullable_arrow_inputs() {
+    let file_io = test_file_io();
+    let scalar_path = "memory:/managed_blob_nonnullable_retract_scalar";
+    setup_dirs(&file_io, scalar_path).await;
+    let scalar_table = scalar_table(&file_io, scalar_path, &[]);
+    let scalar = scalar_batch_with_kinds(&[(1, Some(b"hello"), 3)]);
+    let scalar_schema = Arc::new(ArrowSchema::new(vec![
+        scalar.schema().field(0).clone(),
+        ArrowField::new("payload", ArrowDataType::LargeBinary, false),
+        scalar.schema().field(2).clone(),
+    ]));
+    let scalar = RecordBatch::try_new(scalar_schema, scalar.columns().to_vec()).unwrap();
+    let mut writer = TableWrite::new(&scalar_table, "test-user".to_string()).unwrap();
+    writer.write_arrow_batch(&scalar).await.unwrap();
+    writer.prepare_commit().await.unwrap();
+
+    let nested_path = "memory:/managed_blob_nonnullable_retract_nested";
+    setup_dirs(&file_io, nested_path).await;
+    let nested_table = nested_table(&file_io, nested_path);
+    let nested = nested_batch(&nested_table).slice(0, 1);
+    let nested_schema = Arc::new(ArrowSchema::new(vec![
+        nested.schema().field(0).clone(),
+        nested.schema().field(1).clone().with_nullable(false),
+        nested.schema().field(2).clone().with_nullable(false),
+        ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+    ]));
+    let mut columns = nested.columns().to_vec();
+    columns.push(Arc::new(arrow_array::Int8Array::from(vec![3])));
+    let nested = RecordBatch::try_new(nested_schema, columns).unwrap();
+    let mut writer = TableWrite::new(&nested_table, "test-user".to_string()).unwrap();
+    writer.write_arrow_batch(&nested).await.unwrap();
+    writer.prepare_commit().await.unwrap();
 }
 
 #[tokio::test]

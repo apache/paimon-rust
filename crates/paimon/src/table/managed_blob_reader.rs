@@ -21,7 +21,7 @@ use super::blob_resolver::{resolve_blob_column, BlobReadLimiter};
 use super::managed_blob_writer::{managed_blob_kind, ManagedBlobKind};
 use super::ArrowRecordBatchStream;
 use crate::io::FileIO;
-use crate::spec::{CoreOptions, DataField};
+use crate::spec::{CoreOptions, DataField, Predicate};
 use crate::Result;
 use arrow_array::builder::LargeBinaryBuilder;
 use arrow_array::{
@@ -29,6 +29,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType as ArrowDataType;
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub(crate) fn resolve_primary_key_blob_stream(
@@ -38,20 +39,7 @@ pub(crate) fn resolve_primary_key_blob_stream(
     file_io: FileIO,
     parallelism: usize,
 ) -> ArrowRecordBatchStream {
-    if options.blob_as_descriptor() {
-        return stream;
-    }
-    let descriptor_fields = options.blob_descriptor_fields();
-    let inline_fields = options.blob_inline_fields();
-    let selected = fields
-        .iter()
-        .enumerate()
-        .filter_map(|(index, field)| {
-            let kind = managed_blob_kind(field.data_type())?;
-            (!inline_fields.contains(field.name()) || descriptor_fields.contains(field.name()))
-                .then_some((index, kind))
-        })
-        .collect::<Vec<_>>();
+    let selected = resolved_primary_key_blob_fields(fields, options);
     if selected.is_empty() {
         return stream;
     }
@@ -63,6 +51,43 @@ pub(crate) fn resolve_primary_key_blob_stream(
             yield resolve_batch(batch, &selected, &file_io, &limiter).await?;
         }
     })
+}
+
+pub(crate) fn resolved_primary_key_blob_fields(
+    fields: &[DataField],
+    options: &CoreOptions<'_>,
+) -> Vec<(usize, ManagedBlobKind)> {
+    if options.blob_as_descriptor() {
+        return Vec::new();
+    }
+    let descriptor_fields = options.blob_descriptor_fields();
+    let inline_fields = options.blob_inline_fields();
+    fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            let kind = managed_blob_kind(field.data_type())?;
+            (!inline_fields.contains(field.name()) || descriptor_fields.contains(field.name()))
+                .then_some((index, kind))
+        })
+        .collect()
+}
+
+pub(crate) fn predicate_uses_resolved_blob(
+    predicate: &Predicate,
+    fields: &[DataField],
+    options: &CoreOptions<'_>,
+) -> bool {
+    let resolved = resolved_primary_key_blob_fields(fields, options)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect::<HashSet<_>>();
+    if resolved.is_empty() {
+        return false;
+    }
+    let mut referenced = HashSet::new();
+    predicate.collect_leaf_field_indices(&mut referenced);
+    referenced.iter().any(|index| resolved.contains(index))
 }
 
 async fn resolve_batch(

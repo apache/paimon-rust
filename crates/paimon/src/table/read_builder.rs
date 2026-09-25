@@ -530,10 +530,21 @@ impl<'a> PaimonReadBuilder<'a> {
             PartitionFilter::from_predicate(pred, &self.table.schema().partition_fields())
         });
         let read_type = self.resolve_read_type().unwrap_or(None);
+        let mut scan_predicates = self.filter.data_predicates.clone();
+        if !self.table.schema().primary_keys().is_empty() {
+            let options = self.table.schema().core_options();
+            scan_predicates.retain(|predicate| {
+                !super::managed_blob_reader::predicate_uses_resolved_blob(
+                    predicate,
+                    self.table.schema().fields(),
+                    &options,
+                )
+            });
+        }
         TableScan::new(
             self.table,
             partition_filter,
-            self.filter.data_predicates.clone(),
+            scan_predicates,
             self.filter.bucket_predicate.clone(),
             self.limit,
             self.effective_row_ranges(),

@@ -33,7 +33,7 @@ use arrow_array::{
     Array, ArrayRef, Int8Array, LargeBinaryArray, ListArray, MapArray, RecordBatch, StructArray,
 };
 use arrow_buffer::NullBuffer;
-use arrow_schema::DataType as ArrowDataType;
+use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,7 +169,8 @@ impl ManagedBlobWriter {
                         .downcast_ref::<ListArray>()
                         .ok_or_else(|| invalid_blob_column("ARRAY<BLOB> requires ListArray"))?;
                     let values = downcast_blob_column(array.values().as_ref())?;
-                    let child_retract = child_retract_mask(array.value_offsets(), array, &retract)?;
+                    let child_retract =
+                        child_retract_mask(array.value_offsets(), array, values.len(), &retract)?;
                     let values = Arc::new(
                         self.externalize_values(field_index, values, &child_retract)
                             .await?,
@@ -193,7 +194,8 @@ impl ManagedBlobWriter {
                         .downcast_ref::<MapArray>()
                         .ok_or_else(|| invalid_blob_column("MAP<X, BLOB> requires MapArray"))?;
                     let values = downcast_blob_column(map.entries().column(1).as_ref())?;
-                    let child_retract = child_retract_mask(map.value_offsets(), map, &retract)?;
+                    let child_retract =
+                        child_retract_mask(map.value_offsets(), map, values.len(), &retract)?;
                     let values = Arc::new(
                         self.externalize_values(field_index, values, &child_retract)
                             .await?,
@@ -224,7 +226,21 @@ impl ManagedBlobWriter {
             };
             columns[column_index] = column;
         }
-        RecordBatch::try_new(batch.schema(), columns)
+        // Retractions discard BLOB payloads even when the caller supplied a
+        // stricter, non-nullable Arrow field than the table schema. Keep the
+        // internal descriptor batch nullable for every managed BLOB field.
+        let mut fields = batch.schema().fields().to_vec();
+        for field in &self.fields {
+            let input = &fields[field.index];
+            if !input.is_nullable() {
+                fields[field.index] = Arc::new(input.as_ref().clone().with_nullable(true));
+            }
+        }
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            fields,
+            batch.schema().metadata().clone(),
+        ));
+        RecordBatch::try_new(schema, columns)
             .map_err(|error| invalid_blob_column(&error.to_string()))
     }
 
@@ -316,17 +332,30 @@ fn invalid_blob_column(message: &str) -> crate::Error {
     }
 }
 
-fn child_retract_mask(offsets: &[i32], array: &dyn Array, retract: &[bool]) -> Result<Vec<bool>> {
-    let length = usize::try_from(*offsets.last().unwrap_or(&0))
-        .map_err(|_| invalid_blob_column("Negative BLOB child offset"))?;
-    let mut mask = vec![false; length];
+fn child_retract_mask(
+    offsets: &[i32],
+    array: &dyn Array,
+    child_len: usize,
+    retract: &[bool],
+) -> Result<Vec<bool>> {
+    if offsets.len() != array.len() + 1 || retract.len() != array.len() {
+        return Err(invalid_blob_column(
+            "Managed BLOB collection offsets do not match parent rows",
+        ));
+    }
+    // A sliced ListArray or MapArray still exposes its whole backing child.
+    // Ignore children outside the visible, non-retract parent ranges.
+    let mut mask = vec![true; child_len];
     for (row, is_retract) in retract.iter().enumerate() {
-        if *is_retract || array.is_null(row) {
+        if !*is_retract && array.is_valid(row) {
             let start = usize::try_from(offsets[row])
                 .map_err(|_| invalid_blob_column("Negative BLOB child offset"))?;
             let end = usize::try_from(offsets[row + 1])
                 .map_err(|_| invalid_blob_column("Negative BLOB child offset"))?;
-            mask[start..end].fill(true);
+            let visible = mask
+                .get_mut(start..end)
+                .ok_or_else(|| invalid_blob_column("BLOB collection offset exceeds child array"))?;
+            visible.fill(false);
         }
     }
     Ok(mask)
