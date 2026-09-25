@@ -32,9 +32,11 @@ use crate::Result;
 use arrow_array::builder::LargeBinaryBuilder;
 use arrow_array::{
     Array, ArrayRef, Int8Array, LargeBinaryArray, ListArray, MapArray, RecordBatch, StructArray,
+    UInt32Array,
 };
-use arrow_buffer::NullBuffer;
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema};
+use arrow_select::take::take;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,10 +219,14 @@ impl ManagedBlobWriter {
                         .downcast_ref::<ListArray>()
                         .ok_or_else(|| invalid_blob_column("ARRAY<BLOB> requires ListArray"))?;
                     let values = downcast_blob_column(array.values().as_ref())?;
-                    let child_retract =
-                        child_retract_mask(array.value_offsets(), array, values.len(), &retract)?;
+                    let (offsets, indices) = visible_child_indices(
+                        array.value_offsets(),
+                        array,
+                        values.len(),
+                        &retract,
+                    )?;
                     let values = Arc::new(
-                        self.externalize_values(field_index, values, &child_retract)
+                        self.externalize_selected_values(field_index, values, &indices)
                             .await?,
                     );
                     let ArrowDataType::List(element) = array.data_type() else {
@@ -229,7 +235,7 @@ impl ManagedBlobWriter {
                     Arc::new(
                         ListArray::try_new(
                             element.clone(),
-                            array.offsets().clone(),
+                            offsets,
                             values,
                             combined_nulls(array, &retract),
                         )
@@ -242,10 +248,10 @@ impl ManagedBlobWriter {
                         .downcast_ref::<MapArray>()
                         .ok_or_else(|| invalid_blob_column("MAP<X, BLOB> requires MapArray"))?;
                     let values = downcast_blob_column(map.entries().column(1).as_ref())?;
-                    let child_retract =
-                        child_retract_mask(map.value_offsets(), map, values.len(), &retract)?;
+                    let (offsets, indices) =
+                        visible_child_indices(map.value_offsets(), map, values.len(), &retract)?;
                     let values = Arc::new(
-                        self.externalize_values(field_index, values, &child_retract)
+                        self.externalize_selected_values(field_index, values, &indices)
                             .await?,
                     );
                     let ArrowDataType::Map(entries_field, ordered) = map.data_type() else {
@@ -256,14 +262,18 @@ impl ManagedBlobWriter {
                     };
                     let entries = StructArray::try_new(
                         entry_fields.clone(),
-                        vec![map.entries().column(0).clone(), values],
+                        vec![
+                            take(map.entries().column(0).as_ref(), &indices, None)
+                                .map_err(|error| invalid_blob_column(&error.to_string()))?,
+                            values,
+                        ],
                         None,
                     )
                     .map_err(|error| invalid_blob_column(&error.to_string()))?;
                     Arc::new(
                         MapArray::try_new(
                             entries_field.clone(),
-                            map.offsets().clone(),
+                            offsets,
                             entries,
                             combined_nulls(map, &retract),
                             *ordered,
@@ -311,6 +321,25 @@ impl ManagedBlobWriter {
             }
             let descriptor = self.write_value(field_index, values.value(index)).await?;
             builder.append_value(descriptor.serialize());
+        }
+        Ok(builder.finish())
+    }
+
+    async fn externalize_selected_values(
+        &mut self,
+        field_index: usize,
+        values: &LargeBinaryArray,
+        indices: &UInt32Array,
+    ) -> Result<LargeBinaryArray> {
+        let mut builder = LargeBinaryBuilder::new();
+        for &index in indices.values().iter() {
+            let index = index as usize;
+            if values.is_null(index) {
+                builder.append_null();
+            } else {
+                let descriptor = self.write_value(field_index, values.value(index)).await?;
+                builder.append_value(descriptor.serialize());
+            }
         }
         Ok(builder.finish())
     }
@@ -380,33 +409,51 @@ fn invalid_blob_column(message: &str) -> crate::Error {
     }
 }
 
-fn child_retract_mask(
+fn visible_child_indices(
     offsets: &[i32],
     array: &dyn Array,
     child_len: usize,
     retract: &[bool],
-) -> Result<Vec<bool>> {
+) -> Result<(OffsetBuffer<i32>, UInt32Array)> {
     if offsets.len() != array.len() + 1 || retract.len() != array.len() {
         return Err(invalid_blob_column(
             "Managed BLOB collection offsets do not match parent rows",
         ));
     }
-    // A sliced ListArray or MapArray still exposes its whole backing child.
-    // Ignore children outside the visible, non-retract parent ranges.
-    let mut mask = vec![true; child_len];
+    // Slices retain backing children outside their visible rows. A retract or
+    // null parent also has no logical children. Rebase offsets and retain only
+    // visible children so non-nullable element/value fields stay valid.
+    let mut indices = Vec::new();
+    let mut rebased = Vec::with_capacity(array.len() + 1);
+    rebased.push(0);
     for (row, is_retract) in retract.iter().enumerate() {
         if !*is_retract && array.is_valid(row) {
             let start = usize::try_from(offsets[row])
                 .map_err(|_| invalid_blob_column("Negative BLOB child offset"))?;
             let end = usize::try_from(offsets[row + 1])
                 .map_err(|_| invalid_blob_column("Negative BLOB child offset"))?;
-            let visible = mask
-                .get_mut(start..end)
-                .ok_or_else(|| invalid_blob_column("BLOB collection offset exceeds child array"))?;
-            visible.fill(false);
+            if start > end || end > child_len {
+                return Err(invalid_blob_column(
+                    "BLOB collection offset exceeds child array",
+                ));
+            }
+            for index in start..end {
+                indices.push(
+                    u32::try_from(index).map_err(|_| {
+                        invalid_blob_column("BLOB collection child index exceeds u32")
+                    })?,
+                );
+            }
         }
+        rebased.push(
+            i32::try_from(indices.len())
+                .map_err(|_| invalid_blob_column("BLOB collection offset exceeds i32"))?,
+        );
     }
-    Ok(mask)
+    Ok((
+        OffsetBuffer::new(ScalarBuffer::from(rebased)),
+        UInt32Array::from(indices),
+    ))
 }
 
 fn combined_nulls(array: &dyn Array, retract: &[bool]) -> Option<NullBuffer> {

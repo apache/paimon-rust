@@ -162,6 +162,88 @@ fn nested_batch(table: &Table) -> RecordBatch {
     .unwrap()
 }
 
+fn nonnullable_nested_table(file_io: &FileIO, path: &str) -> Table {
+    let nonnullable_blob = DataType::Blob(BlobType::with_nullable(false));
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "items",
+            DataType::Array(ArrayType::new(nonnullable_blob.clone())),
+        )
+        .column(
+            "named",
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                nonnullable_blob,
+            )),
+        )
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .build()
+        .unwrap();
+    Table::new(
+        file_io.clone(),
+        Identifier::new("default", "managed_blob_nonnullable_children"),
+        path.to_string(),
+        TableSchema::new(0, &schema),
+        None,
+    )
+}
+
+fn nonnullable_nested_batch(table: &Table) -> RecordBatch {
+    let schema = crate::arrow::build_target_arrow_schema(table.schema().fields()).unwrap();
+    let ArrowDataType::List(element) = schema.field(1).data_type() else {
+        panic!("ARRAY<BLOB NOT NULL> must use Arrow List");
+    };
+    assert!(!element.is_nullable());
+    let array = ListArray::try_new(
+        element.clone(),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2])),
+        Arc::new(LargeBinaryArray::from(vec![
+            Some(b"array-one".as_slice()),
+            Some(b"array-two".as_slice()),
+        ])),
+        None,
+    )
+    .unwrap();
+    let ArrowDataType::Map(entries_field, ordered) = schema.field(2).data_type() else {
+        panic!("MAP<STRING, BLOB NOT NULL> must use Arrow Map");
+    };
+    let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
+        panic!("MAP entries must be Struct");
+    };
+    assert!(!entry_fields[1].is_nullable());
+    let entries = StructArray::try_new(
+        entry_fields.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["one", "two"])),
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(b"map-one".as_slice()),
+                Some(b"map-two".as_slice()),
+            ])),
+        ],
+        None,
+    )
+    .unwrap();
+    let map = MapArray::try_new(
+        entries_field.clone(),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2])),
+        entries,
+        None,
+        *ordered,
+    )
+    .unwrap();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(array),
+            Arc::new(map),
+        ],
+    )
+    .unwrap()
+}
+
 fn array_values(array: &ListArray, row: usize) -> Option<Vec<Option<Vec<u8>>>> {
     if array.is_null(row) {
         return None;
@@ -543,6 +625,89 @@ async fn sliced_primary_key_blob_collections_only_externalize_visible_children()
                 assert_eq!(map_values(map, 0), Some(expected));
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn nonnullable_blob_collection_children_survive_sliced_writes() {
+    for start in [0, 1] {
+        let file_io = test_file_io();
+        let path = format!("memory:/managed_blob_nonnullable_sliced_{start}");
+        setup_dirs(&file_io, &path).await;
+        let table = nonnullable_nested_table(&file_io, &path);
+        let batch = nonnullable_nested_batch(&table).slice(start, 1);
+        let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let builder = table.new_read_builder();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let batch = &batches[0];
+        let items = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let named = batch.column(2).as_any().downcast_ref::<MapArray>().unwrap();
+        let expected_array = if start == 0 {
+            b"array-one"
+        } else {
+            b"array-two"
+        };
+        let expected_map = if start == 0 { b"map-one" } else { b"map-two" };
+        assert_eq!(
+            array_values(items, 0),
+            Some(vec![Some(expected_array.to_vec())])
+        );
+        assert_eq!(
+            map_values(named, 0),
+            Some(vec![(
+                if start == 0 { "one" } else { "two" }.to_string(),
+                Some(expected_map.to_vec()),
+            )])
+        );
+    }
+}
+
+#[tokio::test]
+async fn nonnullable_blob_collection_children_survive_retractions() {
+    for start in [0, 1] {
+        let file_io = test_file_io();
+        let path = format!("memory:/managed_blob_nonnullable_delete_{start}");
+        setup_dirs(&file_io, &path).await;
+        let table = nonnullable_nested_table(&file_io, &path);
+        let input = nonnullable_nested_batch(&table).slice(start, 1);
+        let mut fields = input.schema().fields().iter().cloned().collect::<Vec<_>>();
+        fields[1] = Arc::new(fields[1].as_ref().clone().with_nullable(false));
+        fields[2] = Arc::new(fields[2].as_ref().clone().with_nullable(false));
+        fields.push(Arc::new(ArrowField::new(
+            VALUE_KIND_FIELD_NAME,
+            ArrowDataType::Int8,
+            false,
+        )));
+        let mut columns = input.columns().to_vec();
+        columns.push(Arc::new(arrow_array::Int8Array::from(vec![3])));
+        let delete = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+        let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        writer.write_arrow_batch(&delete).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
     }
 }
 
