@@ -64,6 +64,8 @@ public class JavaFileIndexTableFixtureGeneratorTest {
         writeTable(catalog, "bitmap_sidecar", "bitmap", "1 B");
         writeTable(catalog, "bloom_filter_embedded", "bloom-filter", "1 MB");
         writeTable(catalog, "bloom_filter_sidecar", "bloom-filter", "1 B");
+        writeTable(catalog, "range_bitmap_embedded", "range-bitmap", "1 MB");
+        writeTable(catalog, "range_bitmap_sidecar", "range-bitmap", "1 B");
     }
 
     private static void writeTable(
@@ -97,7 +99,11 @@ public class JavaFileIndexTableFixtureGeneratorTest {
             write.write(row(1, "keep"));
             write.write(row(1, "drop"));
             write.write(row(null, "null-id"));
-            write.write(row(3, "three"));
+            if ("range-bitmap".equals(indexType)) {
+                write.write(row(9, "nine"));
+            } else {
+                write.write(row(3, "three"));
+            }
             commit.commit(write.prepareCommit());
         }
     }

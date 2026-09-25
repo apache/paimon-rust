@@ -40,24 +40,39 @@ const FIXTURE: &str = "testdata/file_index/default.db";
 struct FixtureCase {
     table: &'static str,
     embedded: bool,
+    range_bitmap: bool,
 }
 
 const CASES: &[FixtureCase] = &[
     FixtureCase {
         table: "bitmap_embedded",
         embedded: true,
+        range_bitmap: false,
     },
     FixtureCase {
         table: "bitmap_sidecar",
         embedded: false,
+        range_bitmap: false,
     },
     FixtureCase {
         table: "bloom_filter_embedded",
         embedded: true,
+        range_bitmap: false,
     },
     FixtureCase {
         table: "bloom_filter_sidecar",
         embedded: false,
+        range_bitmap: false,
+    },
+    FixtureCase {
+        table: "range_bitmap_embedded",
+        embedded: true,
+        range_bitmap: true,
+    },
+    FixtureCase {
+        table: "range_bitmap_sidecar",
+        embedded: false,
+        range_bitmap: true,
     },
 ];
 
@@ -198,7 +213,13 @@ async fn reads_java_written_file_indexes_and_prunes_data_files() {
         let predicates = PredicateBuilder::new(table.schema().fields());
         let id_one = predicates.equal("id", Datum::Int(1)).unwrap();
         let null_id = predicates.is_null("id").unwrap();
-        let missing_id = predicates.equal("id", Datum::Int(2)).unwrap();
+        let missing = if case.range_bitmap {
+            predicates
+                .between("id", Datum::Int(3), Datum::Int(7))
+                .unwrap()
+        } else {
+            predicates.equal("id", Datum::Int(2)).unwrap()
+        };
         let residual = Predicate::and(vec![
             id_one.clone(),
             predicates
@@ -207,7 +228,7 @@ async fn reads_java_written_file_indexes_and_prunes_data_files() {
         ]);
 
         let mut planning_builder = table.new_read_builder();
-        planning_builder.with_filter(missing_id.clone());
+        planning_builder.with_filter(missing.clone());
         let (plan, trace) = planning_builder
             .new_scan()
             .plan_with_trace()
@@ -253,15 +274,26 @@ async fn reads_java_written_file_indexes_and_prunes_data_files() {
                 "{} must retain row-level residual filtering with FileIndex enabled={enabled}",
                 case.table
             );
+            if case.range_bitmap {
+                let range_hit = predicates
+                    .between("id", Datum::Int(1), Datum::Int(3))
+                    .unwrap();
+                assert_eq!(
+                    query(&table, enabled, range_hit).await,
+                    vec![(Some(1), "drop".to_string()), (Some(1), "keep".to_string())],
+                    "{} range query with FileIndex enabled={enabled}",
+                    case.table
+                );
+            }
             assert!(
-                query(&table, enabled, missing_id.clone()).await.is_empty(),
+                query(&table, enabled, missing.clone()).await.is_empty(),
                 "{} with FileIndex enabled={enabled}",
                 case.table
             );
         }
 
         probe.reset();
-        assert!(query(&table, true, missing_id.clone()).await.is_empty());
+        assert!(query(&table, true, missing.clone()).await.is_empty());
         assert_eq!(
             probe.data_file_opens(),
             0,
@@ -270,7 +302,7 @@ async fn reads_java_written_file_indexes_and_prunes_data_files() {
         );
 
         probe.reset();
-        assert!(query(&table, false, missing_id).await.is_empty());
+        assert!(query(&table, false, missing).await.is_empty());
         assert!(
             probe.data_file_opens() > 0,
             "{} must open the data file when FileIndex reads are disabled",
