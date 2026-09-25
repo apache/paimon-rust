@@ -24,10 +24,11 @@ use crate::Error;
 use apache_avro::types::Value;
 use apache_avro::Reader;
 use arrow_array::{
-    BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray, MapArray,
-    RecordBatch, StringArray, StructArray, Time32MillisecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeListArray, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray,
+    MapArray, RecordBatch, StringArray, StructArray, Time32MillisecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::SchemaRef;
@@ -413,6 +414,16 @@ fn build_column(
             num_rows,
         )?,
         DataType::Row(row_type) => build_row_column(records, name, row_type, num_rows)?,
+        // Java encodes VECTOR<element, length> in Avro exactly like ARRAY (an Avro
+        // `array` of the element), see `AvroSchemaConverter` ARRAY/VECTOR fall-through.
+        // On read it maps to an Arrow FixedSizeList of `length` elements.
+        DataType::Vector(vector_type) => build_vector_column(
+            records,
+            name,
+            vector_type.element_type(),
+            vector_type.length() as usize,
+            num_rows,
+        )?,
         other => {
             return Err(Error::Unsupported {
                 message: format!("Avro reader does not support data type: {other:?}"),
@@ -502,6 +513,77 @@ fn build_array_column(
         source: Some(Box::new(e)),
     })?;
     Ok(Arc::new(list_arr))
+}
+
+/// Build a fixed-size `VECTOR` column. Avro stores it as an `array` of the element
+/// type (identical wire form to `ARRAY`), so each present row must carry exactly
+/// `length` elements; a null/absent row contributes `length` masked placeholder
+/// slots to keep the child array aligned with the fixed stride.
+fn build_vector_column(
+    records: &[Value],
+    name: &str,
+    element_type: &DataType,
+    length: usize,
+    num_rows: usize,
+) -> crate::Result<Arc<dyn arrow_array::Array>> {
+    let arrow_element_type = crate::arrow::paimon_type_to_arrow(element_type)?;
+    let arrow_element_field =
+        arrow_schema::Field::new("element", arrow_element_type, element_type.is_nullable());
+
+    let idx = field_index(records, name);
+    let mut element_records: Vec<Value> = Vec::with_capacity(num_rows * length);
+    let mut validity: Vec<bool> = Vec::with_capacity(num_rows);
+
+    for record in records.iter().take(num_rows) {
+        match get_field_at(record, idx) {
+            Some(Value::Array(arr)) => {
+                if arr.len() != length {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "Avro VECTOR field '{name}' expects {length} elements, got {}",
+                            arr.len()
+                        ),
+                        source: None,
+                    });
+                }
+                for elem in arr {
+                    element_records
+                        .push(Value::Record(vec![("element".to_string(), elem.clone())]));
+                }
+                validity.push(true);
+            }
+            _ => {
+                for _ in 0..length {
+                    element_records.push(Value::Record(vec![("element".to_string(), Value::Null)]));
+                }
+                validity.push(false);
+            }
+        }
+    }
+
+    let element_col = build_column(
+        &element_records,
+        "element",
+        element_type,
+        element_records.len(),
+    )?;
+
+    let size = i32::try_from(length).map_err(|e| Error::DataInvalid {
+        message: format!("Avro VECTOR field '{name}' length {length} exceeds i32"),
+        source: Some(Box::new(e)),
+    })?;
+    let nulls = NullBuffer::new(BooleanBuffer::from(validity));
+    let vector_arr = FixedSizeListArray::try_new(
+        Arc::new(arrow_element_field),
+        size,
+        element_col,
+        Some(nulls),
+    )
+    .map_err(|e| Error::UnexpectedError {
+        message: format!("Failed to build FixedSizeListArray: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+    Ok(Arc::new(vector_arr))
 }
 
 fn build_map_column(
@@ -726,6 +808,7 @@ mod tests {
     use crate::spec::{
         BigIntType, BlobType, BooleanType, DataField, DataType, DecimalType, DoubleType, FloatType,
         IntType, MultisetType, SmallIntType, TimeType, TinyIntType, VarBinaryType, VarCharType,
+        VectorType,
     };
     use arrow_array::Array;
 
@@ -1493,5 +1576,55 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["apple", "apricot"]);
+    }
+
+    #[test]
+    fn test_build_column_vector_float() {
+        // Avro stores VECTOR like ARRAY (an array of the element), so the reader must
+        // turn it into a FixedSizeList<Float32, 3>. Before this arm existed build_column
+        // returned Unsupported for VECTOR, failing the whole read.
+        let records = vec![
+            Value::Record(vec![(
+                "v".to_string(),
+                Value::Array(vec![
+                    Value::Float(1.0),
+                    Value::Float(2.0),
+                    Value::Float(3.0),
+                ]),
+            )]),
+            Value::Record(vec![("v".to_string(), Value::Null)]),
+            Value::Record(vec![(
+                "v".to_string(),
+                Value::Array(vec![
+                    Value::Float(4.0),
+                    Value::Float(5.0),
+                    Value::Float(6.0),
+                ]),
+            )]),
+        ];
+        let vector_type = VectorType::try_new(true, 3, DataType::Float(FloatType::new())).unwrap();
+        let col = build_column(&records, "v", &DataType::Vector(vector_type), 3).unwrap();
+        let vectors = col.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        assert_eq!(vectors.len(), 3);
+        assert_eq!(vectors.value_length(), 3);
+        assert!(!vectors.is_null(0));
+        assert!(vectors.is_null(1), "an absent vector row must be null");
+        assert!(!vectors.is_null(2));
+        let third = vectors.value(2);
+        let floats = third.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(floats.values(), &[4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_build_column_vector_rejects_wrong_length() {
+        // A present row whose element count differs from the declared length is
+        // malformed data, not a silently-truncated read.
+        let records = vec![Value::Record(vec![(
+            "v".to_string(),
+            Value::Array(vec![Value::Float(1.0), Value::Float(2.0)]),
+        )])];
+        let vector_type = VectorType::try_new(true, 3, DataType::Float(FloatType::new())).unwrap();
+        let err = build_column(&records, "v", &DataType::Vector(vector_type), 1).unwrap_err();
+        assert!(matches!(err, Error::DataInvalid { .. }));
     }
 }
