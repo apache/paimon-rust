@@ -22,6 +22,7 @@
 
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::partition::partition_array;
+use crate::resource::ResourceContext;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
@@ -38,6 +39,7 @@ use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
+use crate::table::format_table_writer::FormatTableWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
@@ -89,13 +91,24 @@ impl FileWriter {
     }
 
     async fn prepare_commit(mut self) -> Result<PreparedFiles> {
+        let result = match &mut self {
+            FileWriter::Append(w) => w.prepare_commit().await.map(PreparedFiles::data),
+            FileWriter::AppendDedicated(w) => w.prepare_commit().await.map(PreparedFiles::data),
+            FileWriter::KeyValue(w) => w.prepare_commit().await,
+            FileWriter::Postpone(w) => w.prepare_commit().await.map(PreparedFiles::data),
+        };
+        if result.is_err() {
+            self.abort().await;
+        }
+        result
+    }
+
+    async fn abort(&mut self) {
         match self {
-            FileWriter::Append(ref mut w) => w.prepare_commit().await.map(PreparedFiles::data),
-            FileWriter::AppendDedicated(ref mut w) => {
-                w.prepare_commit().await.map(PreparedFiles::data)
-            }
-            FileWriter::KeyValue(ref mut w) => w.prepare_commit().await,
-            FileWriter::Postpone(ref mut w) => w.prepare_commit().await.map(PreparedFiles::data),
+            FileWriter::Append(w) => w.abort().await,
+            FileWriter::AppendDedicated(w) => w.abort().await,
+            FileWriter::KeyValue(w) => w.abort().await,
+            FileWriter::Postpone(w) => w.abort().await,
         }
     }
 }
@@ -107,9 +120,12 @@ impl FileWriter {
 ///
 /// Call `prepare_commit()` to close all writers and collect
 /// `CommitMessage`s for use with `TableCommit`.
+/// A failed write discards pending output; create a new `TableWrite` before retrying.
 ///
 /// Reference: [pypaimon BatchTableWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/table_write.py)
 pub struct TableWrite {
+    // Keep the Format Table state off ordinary Paimon write futures' stacks.
+    format_writer: Option<Box<FormatTableWriter>>,
     table: Table,
     write_schema: Arc<arrow_schema::Schema>,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
@@ -123,6 +139,7 @@ pub struct TableWrite {
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
     file_format: String,
+    data_file_prefix: String,
     primary_key_indices: Vec<usize>,
     primary_key_types: Vec<DataType>,
     sequence_field_indices: Vec<usize>,
@@ -134,6 +151,8 @@ pub struct TableWrite {
     partition_seq_cache: HashMap<Vec<u8>, HashMap<i32, i64>>,
     sequence_snapshot: Option<Option<Snapshot>>,
     commit_user: String,
+    /// Shared by this writer's postpone files, as in Java's per-writer writeId.
+    postpone_write_id: i32,
     /// Bucket assignment strategy (fixed, dynamic, or cross-partition).
     bucket_assigner: BucketAssignerEnum,
     /// Whether this is an overwrite operation (skip seq/index restore).
@@ -151,9 +170,74 @@ pub struct TableWrite {
     row_kind_generator: Option<RowKindGenerator>,
     row_kind_filter: Option<RowKindFilter>,
     file_index_options: Option<Arc<FileIndexOptions>>,
+    resources: Option<ResourceContext>,
+    failed: bool,
 }
 
 impl TableWrite {
+    pub(crate) fn new_format(
+        table: &Table,
+        commit_user: String,
+        resources: Option<ResourceContext>,
+        overwrite: bool,
+    ) -> Result<Self> {
+        let format_writer = FormatTableWriter::new(table, resources.clone())?;
+        let schema = table.schema();
+        let options = CoreOptions::new(schema.options());
+        // Format Tables do not use Paimon buckets, indexes, changelogs or
+        // snapshots. Build their public TableWrite wrapper without running
+        // Paimon-only option validation or constructing stateful assigners.
+        Ok(Self {
+            format_writer: Some(Box::new(format_writer)),
+            table: table.clone(),
+            write_schema: build_target_arrow_schema(schema.fields())?,
+            partition_writers: HashMap::new(),
+            partition_computer: PartitionComputer::new(
+                schema.partition_keys(),
+                schema.fields(),
+                options.partition_default_name(),
+                options.legacy_partition_name(),
+            )?,
+            partition_keys: schema.partition_keys().to_vec(),
+            schema_id: schema.id(),
+            target_file_size: 0,
+            blob_target_file_size: 0,
+            vector_target_file_size: 0,
+            file_compression: String::new(),
+            file_compression_zstd_level: 0,
+            write_buffer_size: 0,
+            file_format: String::new(),
+            data_file_prefix: String::new(),
+            primary_key_indices: Vec::new(),
+            primary_key_types: Vec::new(),
+            sequence_field_indices: Vec::new(),
+            merge_engine: MergeEngine::Deduplicate,
+            changelog_producer: ChangelogProducer::None,
+            changelog_file_prefix: String::new(),
+            changelog_file_format: String::new(),
+            changelog_file_compression: String::new(),
+            partition_seq_cache: HashMap::new(),
+            sequence_snapshot: None,
+            commit_user,
+            postpone_write_id: 0,
+            bucket_assigner: BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
+                Vec::new(),
+                0,
+            )),
+            is_overwrite: overwrite,
+            blob_view_fields: HashSet::new(),
+            blob_inline_fields: HashSet::new(),
+            has_blob_fields: false,
+            vector_file_format: None,
+            has_dedicated_vector_fields: false,
+            row_kind_generator: None,
+            row_kind_filter: None,
+            file_index_options: None,
+            resources,
+            failed: false,
+        })
+    }
+
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
         // A dynamic-bucket write reads the persisted PK hash index; the rest are
         // refused too, since their commit is blocked anyway.
@@ -236,6 +320,7 @@ impl TableWrite {
         let file_compression = core_options.file_compression().to_string();
         let file_compression_zstd_level = core_options.file_compression_zstd_level();
         let file_format = core_options.file_format().to_string();
+        let data_file_prefix = core_options.data_file_prefix().to_string();
         let vector_file_format = core_options.vector_file_format();
         let changelog_file_prefix = core_options.changelog_file_prefix().to_string();
         let changelog_file_format = core_options.changelog_file_format().to_string();
@@ -293,22 +378,6 @@ impl TableWrite {
                     table.identifier().full_name(),
                     changelog_producer.as_str()
                 ),
-            });
-        }
-
-        if is_dynamic_cross_partition && merge_engine == MergeEngine::PartialUpdate {
-            return Err(crate::Error::Unsupported {
-                message:
-                    "merge-engine=partial-update with cross-partition update is not supported yet"
-                        .to_string(),
-            });
-        }
-
-        if is_dynamic_cross_partition && merge_engine == MergeEngine::Aggregation {
-            return Err(crate::Error::Unsupported {
-                message:
-                    "merge-engine=aggregation with cross-partition update is not supported yet"
-                        .to_string(),
             });
         }
 
@@ -379,18 +448,16 @@ impl TableWrite {
 
         let file_index_options = FileIndexOptions::parse(schema.options(), schema.fields())?;
         if file_index_options.is_some()
-            && (has_primary_keys
-                || has_blob_fields
-                || has_dedicated_vector_fields
-                || !blob_view_fields.is_empty()
-                || core_options.data_evolution_enabled())
+            && (has_blob_fields || has_dedicated_vector_fields || !blob_view_fields.is_empty())
         {
             return Err(crate::Error::Unsupported {
-                message: "FileIndex generation supports ordinary append writes only; primary-key, data-evolution and dedicated Blob/Vector writes are not supported".to_string(),
+                message: "FileIndex generation does not support dedicated Blob/Vector writes"
+                    .to_string(),
             });
         }
 
         Ok(Self {
+            format_writer: None,
             table: table.clone(),
             write_schema,
             partition_writers: HashMap::new(),
@@ -404,6 +471,7 @@ impl TableWrite {
             file_compression_zstd_level,
             write_buffer_size,
             file_format,
+            data_file_prefix,
             primary_key_indices,
             primary_key_types,
             sequence_field_indices,
@@ -415,6 +483,7 @@ impl TableWrite {
             partition_seq_cache: HashMap::new(),
             sequence_snapshot: None,
             commit_user,
+            postpone_write_id: (uuid::Uuid::new_v4().as_u128() % i32::MAX as u128) as i32,
             bucket_assigner,
             is_overwrite,
             blob_view_fields,
@@ -425,6 +494,8 @@ impl TableWrite {
             row_kind_generator,
             row_kind_filter,
             file_index_options: file_index_options.map(Arc::new),
+            resources: None,
+            failed: false,
         })
     }
 
@@ -500,8 +571,24 @@ impl TableWrite {
         self
     }
 
+    /// Share write-buffer reservations with other consumers of this operation.
+    /// Input batches remain the caller's responsibility; charges here estimate
+    /// retained key-value batches and unflushed format-writer input. Call this
+    /// before the first write.
+    pub fn with_resources(mut self, resources: ResourceContext) -> Self {
+        if let Some(writer) = self.format_writer.as_mut() {
+            writer.set_resources(resources.clone());
+        }
+        self.resources = Some(resources);
+        self
+    }
+
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if let Some(writer) = self.format_writer.as_mut() {
+            return writer.write(batch).await;
+        }
+        self.ensure_active()?;
         let Some(batch) = self.normalize_write_batch(batch)? else {
             return Ok(());
         };
@@ -683,6 +770,12 @@ impl TableWrite {
             || !output.deletes.is_empty();
         for (key, row_indices) in groups {
             let sub_batch = take_rows(batch, &row_indices)?;
+            let sub_batch = if matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
+            {
+                self.with_partition_values(&sub_batch, &key.0)?
+            } else {
+                sub_batch
+            };
             let sub_batch = if needs_value_kind && !batch_has_value_kind {
                 Self::add_value_kind_column(&sub_batch, 0)?
             } else {
@@ -701,44 +794,44 @@ impl TableWrite {
             }
             for (key, row_indices) in delete_groups {
                 let sub_batch = take_rows(batch, &row_indices)?;
-                // Java DeleteExistingProcessor emits the incoming values with
-                // the old partition and DELETE kind. Routing the file alone
-                // leaves incorrect physical values and partition statistics.
-                let partition = BinaryRow::from_serialized_bytes(&key.0)?;
-                let mut columns = sub_batch.columns().to_vec();
-                for (partition_index, field) in
-                    self.table.schema().partition_fields().iter().enumerate()
-                {
-                    let column_index =
-                        sub_batch.schema().index_of(field.name()).map_err(|error| {
-                            crate::Error::DataInvalid {
-                                message: format!(
-                                    "Missing partition field '{}': {error}",
-                                    field.name()
-                                ),
-                                source: Some(Box::new(error)),
-                            }
-                        })?;
-                    columns[column_index] = partition_array(
-                        &partition,
-                        partition_index,
-                        field.data_type(),
-                        sub_batch.num_rows(),
-                    )?;
-                }
-                let sub_batch =
-                    RecordBatch::try_new(sub_batch.schema(), columns).map_err(|error| {
-                        crate::Error::DataInvalid {
-                            message: format!("Failed to restore old partition for delete: {error}"),
-                            source: Some(Box::new(error)),
-                        }
-                    })?;
+                let sub_batch = self.with_partition_values(&sub_batch, &key.0)?;
                 let delete_batch = Self::add_value_kind_column(&sub_batch, 3)?;
                 result.push((key, delete_batch));
             }
         }
 
         Ok(result)
+    }
+
+    /// Keep physical partition columns consistent with the routed partition.
+    /// Cross-partition partial-update/aggregation writes stay in the old
+    /// partition, as Java `UseOldExistingProcessor` does; deduplicate DELETEs
+    /// also carry the old partition values.
+    fn with_partition_values(
+        &self,
+        batch: &RecordBatch,
+        partition_bytes: &[u8],
+    ) -> Result<RecordBatch> {
+        let partition = BinaryRow::from_serialized_bytes(partition_bytes)?;
+        let mut columns = batch.columns().to_vec();
+        for (partition_index, field) in self.table.schema().partition_fields().iter().enumerate() {
+            let column_index = batch.schema().index_of(field.name()).map_err(|error| {
+                crate::Error::DataInvalid {
+                    message: format!("Missing partition field '{}': {error}", field.name()),
+                    source: Some(Box::new(error)),
+                }
+            })?;
+            columns[column_index] = partition_array(
+                &partition,
+                partition_index,
+                field.data_type(),
+                batch.num_rows(),
+            )?;
+        }
+        RecordBatch::try_new(batch.schema(), columns).map_err(|error| crate::Error::DataInvalid {
+            message: format!("Failed to restore routed partition values: {error}"),
+            source: Some(Box::new(error)),
+        })
     }
 
     /// Add a `_VALUE_KIND` column to a batch with the given value for all rows.
@@ -850,6 +943,7 @@ impl TableWrite {
         bucket: i32,
         batch: RecordBatch,
     ) -> Result<()> {
+        self.ensure_active()?;
         let result = async {
             let key = (partition_bytes, bucket);
             if !self.partition_writers.contains_key(&key) {
@@ -862,14 +956,21 @@ impl TableWrite {
                 .await
         }
         .await;
-        if result.is_err() && self.file_index_options.is_some() {
-            for (_, writer) in self.partition_writers.drain() {
-                if let FileWriter::Append(mut writer) = writer {
-                    writer.abort().await;
-                }
-            }
+        if result.is_err() {
+            self.close().await;
+            self.failed = true;
         }
         result
+    }
+
+    fn ensure_active(&self) -> Result<()> {
+        if self.failed {
+            return Err(crate::Error::DataInvalid {
+                message: "TableWrite cannot be reused after a write failure".to_string(),
+                source: None,
+            });
+        }
+        Ok(())
     }
 
     /// Write multiple Arrow RecordBatches.
@@ -883,52 +984,82 @@ impl TableWrite {
     /// Close without preparing another commit, discarding only outstanding output.
     /// Files already returned by prepare_commit belong to the caller.
     pub async fn close(&mut self) {
-        for (_, writer) in self.partition_writers.drain() {
-            match writer {
-                FileWriter::Append(mut writer) => writer.abort().await,
-                FileWriter::AppendDedicated(mut writer) => writer.abort().await,
-                FileWriter::KeyValue(mut writer) => writer.abort().await,
-                FileWriter::Postpone(mut writer) => writer.abort().await,
-            }
+        if let Some(writer) = self.format_writer.as_mut() {
+            writer.close().await;
+            return;
+        }
+        for (_, mut writer) in self.partition_writers.drain() {
+            writer.abort().await;
         }
     }
 
     /// Close all writers and collect CommitMessages for use with TableCommit.
     /// Writers are cleared after this call, allowing the TableWrite to be reused.
+    ///
+    /// The per-bucket primary-key sequence cache is invalidated here too: it
+    /// memoizes `max_sequence_number + 1` scanned from the latest snapshot, which
+    /// this commit advances. Keeping it would make the next reuse cycle re-seed
+    /// from the pre-commit value and assign sequence numbers that overlap the
+    /// just-written files, so the highest-sequence-wins merge would silently drop
+    /// the newer rows -- Java's `MergeTreeWriter` advances its counter across
+    /// commits. (`sequence_snapshot` is pinned only by the postpone path, which
+    /// forbids reuse, so it is left untouched.)
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
-        if self.file_index_options.is_some() {
-            return self.prepare_indexed_append_commit().await;
+        if let Some(writer) = self.format_writer.as_mut() {
+            return writer.prepare_commit().await;
         }
+        self.ensure_active()?;
+        self.partition_seq_cache.clear();
         let writers: Vec<(PartitionBucketKey, FileWriter)> =
             self.partition_writers.drain().collect();
 
         let futures: Vec<_> = writers
             .into_iter()
             .map(|((partition_bytes, bucket), writer)| async move {
-                let files = writer.prepare_commit().await?;
-                Ok::<_, crate::Error>((partition_bytes, bucket, files))
+                (partition_bytes, bucket, writer.prepare_commit().await)
             })
             .collect();
 
-        let results = futures::future::try_join_all(futures).await?;
+        let results = futures::future::join_all(futures).await;
+
+        let mut messages = Vec::new();
+        let mut error = None;
+        for (partition_bytes, bucket, result) in results {
+            match result {
+                Ok(files) if !files.data_files.is_empty() || !files.changelog_files.is_empty() => {
+                    let mut message = CommitMessage::new(partition_bytes, bucket, files.data_files);
+                    message.new_changelog_files = files.changelog_files;
+                    messages.push(message);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    error.get_or_insert(err);
+                }
+            }
+        }
+        if let Some(error) = error {
+            self.failed = true;
+            let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
+            let _ = commit.abort(&messages).await;
+            return Err(error);
+        }
 
         // Collect index files from bucket assigner
         let file_io = self.table.file_io();
-        let mut index_files_by_key = self.bucket_assigner.prepare_commit_index(file_io).await?;
-
-        let mut messages = Vec::new();
-        for (partition_bytes, bucket, files) in results {
-            let key = (partition_bytes.clone(), bucket);
-            let index_files = index_files_by_key.remove(&key).unwrap_or_default();
-            if !files.data_files.is_empty()
-                || !files.changelog_files.is_empty()
-                || !index_files.is_empty()
-            {
-                let mut msg = CommitMessage::new(partition_bytes, bucket, files.data_files);
-                msg.new_changelog_files = files.changelog_files;
-                msg.new_index_files = index_files;
-                messages.push(msg);
+        let mut index_files_by_key = match self.bucket_assigner.prepare_commit_index(file_io).await
+        {
+            Ok(files) => files,
+            Err(error) => {
+                self.failed = true;
+                let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
+                let _ = commit.abort(&messages).await;
+                return Err(error);
             }
+        };
+
+        for message in &mut messages {
+            let key = (message.partition.clone(), message.bucket);
+            message.new_index_files = index_files_by_key.remove(&key).unwrap_or_default();
         }
         // Emit index-only messages for (partition, bucket) pairs that had no data writer
         // (e.g., old buckets where keys migrated away in cross-partition mode).
@@ -938,37 +1069,6 @@ impl TableWrite {
                 msg.new_index_files = idx_files;
                 messages.push(msg);
             }
-        }
-        Ok(messages)
-    }
-
-    async fn prepare_indexed_append_commit(&mut self) -> Result<Vec<CommitMessage>> {
-        let closes =
-            self.partition_writers
-                .drain()
-                .map(|((partition, bucket), writer)| async move {
-                    (partition, bucket, writer.prepare_commit().await)
-                });
-        // Do not cancel another partition's close when one fails: its completed
-        // files must remain reachable for abort cleanup.
-        let results = futures::future::join_all(closes).await;
-        let mut messages = Vec::new();
-        let mut error = None;
-        for (partition, bucket, result) in results {
-            match result {
-                Ok(files) if !files.data_files.is_empty() => {
-                    messages.push(CommitMessage::new(partition, bucket, files.data_files));
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    error.get_or_insert(err);
-                }
-            }
-        }
-        if let Some(error) = error {
-            let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
-            let _ = commit.abort(&messages).await;
-            return Err(error);
         }
         Ok(messages)
     }
@@ -1026,7 +1126,8 @@ impl TableWrite {
                     self.table.schema().options(),
                     &self.blob_inline_fields,
                     &self.blob_view_fields,
-                ),
+                )
+                .with_resources(self.resources.clone()),
             )))
         } else {
             Ok(FileWriter::Append(
@@ -1047,29 +1148,37 @@ impl TableWrite {
                     None,
                     None,
                 )
-                .with_file_index(self.file_index_options.clone()),
+                .with_file_index(self.file_index_options.clone())
+                .with_resources(self.resources.clone()),
             ))
         }
     }
 
     /// Create a postpone writer (KV format, no sorting/dedup, special file naming).
     fn create_postpone_writer(&self, partition_path: String, bucket: i32) -> FileWriter {
-        let data_file_prefix = format!("data-u-{}-s-0-w-", self.commit_user);
-        FileWriter::Postpone(PostponeFileWriter::new(
-            self.table.file_io().clone(),
-            PostponeWriteConfig {
-                table_location: self.table.location().to_string(),
-                partition_path,
-                bucket,
-                schema_id: self.schema_id,
-                target_file_size: self.target_file_size,
-                file_compression: self.file_compression.clone(),
-                file_compression_zstd_level: self.file_compression_zstd_level,
-                write_buffer_size: self.write_buffer_size,
-                file_format: self.file_format.clone(),
-                data_file_prefix,
-            },
-        ))
+        let data_file_prefix = format!(
+            "{}-u-{}-s-{}-w-",
+            self.data_file_prefix, self.commit_user, self.postpone_write_id
+        );
+        FileWriter::Postpone(
+            PostponeFileWriter::new(
+                self.table.file_io().clone(),
+                PostponeWriteConfig {
+                    table_location: self.table.location().to_string(),
+                    partition_path,
+                    bucket,
+                    schema_id: self.schema_id,
+                    target_file_size: self.target_file_size,
+                    file_compression: self.file_compression.clone(),
+                    file_compression_zstd_level: self.file_compression_zstd_level,
+                    write_buffer_size: self.write_buffer_size,
+                    file_format: self.file_format.clone(),
+                    data_file_prefix,
+                    file_index_options: self.file_index_options.clone(),
+                },
+            )
+            .with_resources(self.resources.clone()),
+        )
     }
 
     /// Create a key-value writer for PK tables with normal buckets.
@@ -1097,34 +1206,40 @@ impl TableWrite {
             .copied()
             .unwrap_or(0);
 
-        Ok(FileWriter::KeyValue(KeyValueFileWriter::new(
-            self.table.file_io().clone(),
-            KeyValueWriteConfig {
-                table_name: self.table.identifier().full_name(),
-                table_options: self.table.schema().options().clone(),
-                table_location: self.table.location().to_string(),
-                partition_path,
-                bucket,
-                schema_id: self.schema_id,
-                file_compression: self.file_compression.clone(),
-                file_compression_zstd_level: self.file_compression_zstd_level,
-                write_buffer_size: self.write_buffer_size,
-                file_format: self.file_format.clone(),
-                input_changelog: self.changelog_producer == ChangelogProducer::Input
-                    && !self.is_overwrite,
-                changelog_file_prefix: self.changelog_file_prefix.clone(),
-                changelog_file_compression: self.changelog_file_compression.clone(),
-                changelog_file_format: self.changelog_file_format.clone(),
-                primary_keys: self.table.schema().primary_keys().to_vec(),
-                primary_key_indices: self.primary_key_indices.clone(),
-                primary_key_types: self.primary_key_types.clone(),
-                sequence_field_indices: self.sequence_field_indices.clone(),
-                merge_engine: self.merge_engine,
-                deletion_vectors_enabled: CoreOptions::new(self.table.schema().options())
-                    .deletion_vectors_enabled(),
-            },
-            next_seq,
-        )?))
+        Ok(FileWriter::KeyValue(
+            KeyValueFileWriter::new(
+                self.table.file_io().clone(),
+                KeyValueWriteConfig {
+                    table_name: self.table.identifier().full_name(),
+                    table_options: self.table.schema().options().clone(),
+                    table_location: self.table.location().to_string(),
+                    partition_path,
+                    bucket,
+                    schema_id: self.schema_id,
+                    file_compression: self.file_compression.clone(),
+                    file_compression_zstd_level: self.file_compression_zstd_level,
+                    write_buffer_size: self.write_buffer_size,
+                    file_format: self.file_format.clone(),
+                    data_file_prefix: self.data_file_prefix.clone(),
+                    input_changelog: self.changelog_producer == ChangelogProducer::Input
+                        && !self.is_overwrite,
+                    changelog_file_prefix: self.changelog_file_prefix.clone(),
+                    changelog_file_compression: self.changelog_file_compression.clone(),
+                    changelog_file_format: self.changelog_file_format.clone(),
+                    primary_keys: self.table.schema().primary_keys().to_vec(),
+                    primary_key_indices: self.primary_key_indices.clone(),
+                    primary_key_types: self.primary_key_types.clone(),
+                    value_fields: self.table.schema().fields().to_vec(),
+                    sequence_field_indices: self.sequence_field_indices.clone(),
+                    merge_engine: self.merge_engine,
+                    deletion_vectors_enabled: CoreOptions::new(self.table.schema().options())
+                        .deletion_vectors_enabled(),
+                    file_index_options: self.file_index_options.clone(),
+                },
+                next_seq,
+            )?
+            .with_resources(self.resources.clone()),
+        ))
     }
 }
 
@@ -1928,7 +2043,7 @@ pub(in crate::table) mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_write_truncates_string_value_stats_and_keeps_binary_counts() {
+    async fn test_append_write_truncates_string_and_binary_value_stats() {
         let file_io = test_file_io();
         let table_path = "memory:/test_table_write_skip_variable_length_stats";
         setup_dirs(&file_io, table_path).await;
@@ -1987,8 +2102,8 @@ pub(in crate::table) mod tests {
         assert_eq!(max_values.get_int(0).unwrap(), 2);
         assert_eq!(min_values.get_string(1).unwrap(), "a long string va");
         assert_eq!(max_values.get_string(1).unwrap(), "another long sts");
-        assert!(min_values.is_null_at(2));
-        assert!(max_values.is_null_at(2));
+        assert_eq!(min_values.get_binary(2).unwrap(), b"another-large-bi");
+        assert_eq!(max_values.get_binary(2).unwrap(), b"large-binary-vam");
     }
 
     #[tokio::test]
@@ -2062,8 +2177,8 @@ pub(in crate::table) mod tests {
         assert!(max_values.is_null_at(0));
         assert_eq!(min_values.get_string(1).unwrap(), "alpha-long-value-12345");
         assert_eq!(max_values.get_string(1).unwrap(), "zeta-long-value-99999");
-        assert!(min_values.is_null_at(2));
-        assert!(max_values.is_null_at(2));
+        assert_eq!(min_values.get_binary(2).unwrap(), b"first-binary-value");
+        assert_eq!(max_values.get_binary(2).unwrap(), b"first-binary-value");
     }
 
     #[tokio::test]
@@ -2262,6 +2377,80 @@ pub(in crate::table) mod tests {
 
         assert_eq!(collect_i32(&batches, 0), vec![1, 2, 3]);
         assert_eq!(collect_i32(&batches, 1), vec![10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn test_primary_key_non_parquet_formats_roundtrip_with_typed_physical_fields() {
+        for format in ["row", "avro"] {
+            let file_io = test_file_io();
+            let table_path = format!("memory:/test_pk_typed_fields_{format}");
+            setup_dirs(&file_io, &table_path).await;
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("file.format", format)
+                .build()
+                .unwrap();
+            let table = Table::new(
+                file_io,
+                Identifier::new("default", "test_pk_typed_fields"),
+                table_path,
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let mut writer = TableWrite::new(&table, "test-user".into()).unwrap();
+            writer
+                .write_arrow_batch(&make_batch(vec![2, 1], vec![20, 10]))
+                .await
+                .unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            assert_eq!(messages[0].new_files.len(), 1);
+            assert!(messages[0].new_files[0].file_name.ends_with(format));
+            let file = &messages[0].new_files[0];
+            let file_path = format!(
+                "{}/{}/{}",
+                table.location(),
+                bucket_dir_name(messages[0].bucket),
+                file.file_name
+            );
+            let physical_fields = vec![
+                DataField::new(
+                    SEQUENCE_NUMBER_FIELD_ID,
+                    SEQUENCE_NUMBER_FIELD_NAME.into(),
+                    DataType::BigInt(BigIntType::new()),
+                ),
+                DataField::new(
+                    VALUE_KIND_FIELD_ID,
+                    VALUE_KIND_FIELD_NAME.into(),
+                    DataType::TinyInt(TinyIntType::new()),
+                ),
+                table.schema().fields()[0].clone(),
+                table.schema().fields()[1].clone(),
+            ];
+            let format_reader = create_format_reader(&file_path, false, &physical_fields).unwrap();
+            let input = table.file_io().new_input(&file_path).unwrap();
+            let stream = format_reader
+                .read_batch_stream(
+                    Box::new(input.reader().await.unwrap()),
+                    file.file_size as u64,
+                    &physical_fields,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let batches: Vec<RecordBatch> =
+                futures::TryStreamExt::try_collect(stream).await.unwrap();
+            assert_eq!(collect_i32(&batches, 2), vec![1, 2], "{format}");
+            assert_eq!(collect_i32(&batches, 3), vec![10, 20], "{format}");
+            TableCommit::new(table.clone(), "test-user".into())
+                .commit(messages)
+                .await
+                .unwrap();
+        }
     }
 
     #[test]
@@ -3833,6 +4022,12 @@ pub(in crate::table) mod tests {
         assert_eq!(file.level, 0);
         assert_eq!(file.min_sequence_number, 0);
         assert_eq!(file.max_sequence_number, 2);
+        assert_eq!(file.value_stats_cols, None);
+        assert_eq!(file.value_stats.null_counts(), &vec![Some(0), Some(0)]);
+        let min_values = BinaryRow::from_serialized_bytes(file.value_stats.min_values()).unwrap();
+        let max_values = BinaryRow::from_serialized_bytes(file.value_stats.max_values()).unwrap();
+        assert_eq!(min_values.get_int(1).unwrap(), 10);
+        assert_eq!(max_values.get_int(1).unwrap(), 30);
         // min_key and max_key should be non-empty (serialized BinaryRow)
         assert!(!file.min_key.is_empty());
         assert!(!file.max_key.is_empty());
@@ -4190,10 +4385,44 @@ pub(in crate::table) mod tests {
         let messages2 = table_write.prepare_commit().await.unwrap();
         assert_eq!(messages2.len(), 1);
         assert_eq!(messages2[0].new_files[0].row_count, 3);
+        let prefix1 = messages1[0].new_files[0]
+            .file_name
+            .split_once("-w-")
+            .unwrap()
+            .0;
+        let prefix2 = messages2[0].new_files[0]
+            .file_name
+            .split_once("-w-")
+            .unwrap()
+            .0;
+        assert_eq!(prefix1, prefix2);
 
         // Empty prepare_commit
         let messages3 = table_write.prepare_commit().await.unwrap();
         assert!(messages3.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_postpone_writers_with_same_commit_user_have_distinct_prefixes() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_postpone_writer_prefixes";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_postpone_pk_table(&file_io, table_path);
+        let mut prefixes = Vec::new();
+        for id in [1, 2] {
+            let mut write = TableWrite::new(&table, "shared-user".to_string()).unwrap();
+            write
+                .write_arrow_batch(&make_batch(vec![id], vec![id * 10]))
+                .await
+                .unwrap();
+            let messages = write.prepare_commit().await.unwrap();
+            let file_name = &messages[0].new_files[0].file_name;
+            let (prefix, _) = file_name.split_once("-w-").unwrap();
+            assert!(prefix.starts_with("data--u-shared-user-s-"));
+            prefixes.push(prefix.to_string());
+        }
+        assert_ne!(prefixes[0], prefixes[1]);
     }
 
     #[tokio::test]
@@ -4211,9 +4440,9 @@ pub(in crate::table) mod tests {
         let messages = table_write.prepare_commit().await.unwrap();
         let file = &messages[0].new_files[0];
 
-        // Verify postpone file naming: data-u-{commitUser}-s-{writeId}-w-{uuid}-{index}.parquet
+        // Verify postpone file naming: data--u-{commitUser}-s-{writeId}-w-{uuid}-{index}.parquet
         assert!(
-            file.file_name.starts_with("data-u-my-commit-user-s-"),
+            file.file_name.starts_with("data--u-my-commit-user-s-"),
             "Expected postpone file prefix, got: {}",
             file.file_name
         );
@@ -4369,71 +4598,54 @@ pub(in crate::table) mod tests {
         );
     }
 
-    #[test]
-    fn test_rejects_cross_partition_partial_update() {
+    #[tokio::test]
+    async fn test_cross_partition_partial_update_and_aggregation_keep_old_location() {
         let file_io = test_file_io();
-        let table_path = "memory:/test_cross_partial_update";
-        let schema = Schema::builder()
-            .column("pt", DataType::VarChar(VarCharType::string_type()))
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .partition_keys(["pt"])
-            .option("merge-engine", "partial-update")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "test_cross_partial_update"),
-            table_path.to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        );
-
-        let err = match TableWrite::new(&table, "test-user".to_string()) {
-            Ok(_) => panic!("cross-partition partial-update should be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(matches!(
-            err,
-            crate::Error::Unsupported { message }
-            if message.contains("cross-partition update")
-        ));
-    }
-
-    #[test]
-    fn test_rejects_cross_partition_aggregation() {
-        let file_io = test_file_io();
-        let table_path = "memory:/test_cross_aggregation";
-        let schema = Schema::builder()
-            .column("pt", DataType::VarChar(VarCharType::string_type()))
-            .column("id", DataType::Int(IntType::new()))
-            .column("value", DataType::Int(IntType::new()))
-            .primary_key(["id"])
-            .partition_keys(["pt"])
-            .option("merge-engine", "aggregation")
-            .build()
-            .unwrap();
-        let table = Table::new(
-            file_io,
-            Identifier::new("default", "test_cross_aggregation"),
-            table_path.to_string(),
-            TableSchema::new(0, &schema),
-            None,
-        );
-
-        let err = match TableWrite::new(&table, "test-user".to_string()) {
-            Ok(_) => panic!("cross-partition aggregation should be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(matches!(
-            err,
-            crate::Error::Unsupported { message }
-            if message.contains("merge-engine=aggregation")
-                && message.contains("cross-partition update")
-        ));
+        for engine in ["partial-update", "aggregation"] {
+            let table_path = format!("memory:/test_cross_{engine}");
+            setup_dirs(&file_io, &table_path).await;
+            let schema = Schema::builder()
+                .column("pt", DataType::VarChar(VarCharType::string_type()))
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .partition_keys(["pt"])
+                .option("merge-engine", engine)
+                .build()
+                .unwrap();
+            let table = Table::new(
+                file_io.clone(),
+                Identifier::new("default", "test_cross"),
+                table_path,
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+            let first = make_partitioned_batch_3col(vec!["old"], vec![1], vec![10]);
+            let first_output = writer.divide_by_partition_bucket(&first).await.unwrap();
+            assert_eq!(first_output.len(), 1);
+            let old_bucket = first_output[0].0 .1;
+            let later = make_partitioned_batch_3col(vec!["new"], vec![1], vec![20]);
+            let later_output = writer.divide_by_partition_bucket(&later).await.unwrap();
+            assert_eq!(
+                later_output.len(),
+                1,
+                "{engine} must not emit a cross-partition delete"
+            );
+            assert_eq!(later_output[0].0 .1, old_bucket);
+            let pt = later_output[0]
+                .1
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(
+                pt.value(0),
+                "old",
+                "{engine} must restore the old partition value"
+            );
+            assert_eq!(later_output[0].0 .0, first_output[0].0 .0);
+        }
     }
 
     #[tokio::test]

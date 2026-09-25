@@ -161,11 +161,10 @@ fn rewrite_aggregate(aggregate: &Aggregate) -> DFResult<Option<LogicalPlan>> {
         return Ok(None);
     }
     match &analysis.pushed_predicate {
-        Some(predicate) => {
-            if !table.new_read_builder().is_exact_filter_pushdown(predicate) {
-                return Ok(None);
-            }
+        Some(predicate) if !table.new_read_builder().is_exact_filter_pushdown(predicate) => {
+            return Ok(None);
         }
+        Some(_) => {}
         None if !scan.filters.is_empty() => return Ok(None),
         None => {}
     }

@@ -655,7 +655,10 @@ fn build_file_column_indices(
         .collect()
 }
 
-fn mosaic_value_to_datum(value: &MosaicValue, data_type: &PaimonDataType) -> Option<Datum> {
+pub(super) fn mosaic_value_to_datum(
+    value: &MosaicValue,
+    data_type: &PaimonDataType,
+) -> Option<Datum> {
     match (value, data_type) {
         (MosaicValue::Boolean(value), PaimonDataType::Boolean(_)) => Some(Datum::Bool(*value)),
         (MosaicValue::TinyInt(value), PaimonDataType::TinyInt(_)) => Some(Datum::TinyInt(*value)),
@@ -801,7 +804,7 @@ fn block_on_file_read(
         .map_err(|_| io::Error::other("mosaic async read task was cancelled"))?
 }
 
-fn validate_mosaic_schema(schema: &SchemaRef) -> crate::Result<()> {
+pub(super) fn validate_mosaic_schema(schema: &SchemaRef) -> crate::Result<()> {
     for field in schema.fields() {
         validate_mosaic_arrow_type(field.data_type()).map_err(|message| Error::Unsupported {
             message: format!(

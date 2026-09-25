@@ -17,19 +17,20 @@
 
 //! Scan implementation for Java-compatible `type=format-table` metadata.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::format_partition::{
     format_partition_value, is_storage_not_found, parse_format_partition_value,
     FormatTablePartitionPaths,
 };
+use super::format_partition_location::FormatPartitionLocations;
 use super::{Plan, RESTEnv, ScanTrace, Table};
 use crate::api::RestError;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
     escape_path_name, extract_datum, unescape_path_name, BinaryRow, BinaryRowBuilder, CoreOptions,
     DataField, DataFileMeta, DataType, Datum, Partition, PartitionComputer, Predicate,
-    PredicateOperator, PATH_OPTION,
+    PredicateOperator,
 };
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::source::{DataSplitBuilder, RowRange};
@@ -105,9 +106,19 @@ impl<'a> FormatTableScan<'a> {
         let listed: Vec<Vec<crate::DataSplit>> = futures::stream::iter(scan_roots)
             .map(|scan_root| async move {
                 let root_segments = path_segments(&scan_root.path);
-                let partition_levels_below_root = partition_fields
-                    .len()
-                    .saturating_sub(root_segments.len().saturating_sub(table_depth));
+                // Catalog locations may live at any filesystem depth. A root
+                // with a complete catalog partition has no partition levels
+                // below it even when its path is shorter than the table path.
+                let partition_levels_below_root = if scan_root.partition.arity()
+                    == partition_fields.len() as i32
+                    && !scan_root.partition.is_empty()
+                {
+                    0
+                } else {
+                    partition_fields
+                        .len()
+                        .saturating_sub(root_segments.len().saturating_sub(table_depth))
+                };
                 let files = list_format_table_data_files(
                     self.table.file_io(),
                     &scan_root.path,
@@ -275,16 +286,13 @@ impl<'a> FormatTableScan<'a> {
         let partitions = self
             .list_catalog_partitions(rest_env, pattern.as_deref(), filter.as_deref())
             .await?;
-        let mut seen_paths = HashSet::with_capacity(partitions.len());
+        let mut locations = FormatPartitionLocations::new(table_path)?;
         let mut roots = Vec::with_capacity(partitions.len());
         for partition in partitions {
             let partition_path = partition_paths
                 .relative_path(&partition.spec)
                 .map_err(|error| self.invalid_catalog_partition_metadata(error))?;
-            if !seen_paths.insert(partition_path.clone()) {
-                continue;
-            }
-            let path = join_path(table_path, &partition_path);
+            let default_path = join_path(table_path, &partition_path);
             let row = partition_row_from_catalog_spec(
                 &partition.spec,
                 partition_fields,
@@ -295,22 +303,9 @@ impl<'a> FormatTableScan<'a> {
             if !self.partition_matches(&row)? {
                 continue;
             }
-            // The Rust reader cannot resolve a partition's own location yet, and reading the
-            // default directory in its place would return whatever happens to be there.
-            if partition
-                .options
-                .as_ref()
-                .is_some_and(|options| options.contains_key(PATH_OPTION))
-            {
-                return Err(crate::Error::Unsupported {
-                    message: format!(
-                        "Partition {:?} of Format Table {} is registered at a custom location, \
-                         which the Rust reader does not support yet",
-                        partition.spec,
-                        self.table.identifier().full_name()
-                    ),
-                });
-            }
+            let Some(path) = locations.resolve(&partition, &default_path)? else {
+                continue;
+            };
             roots.push(ScanRoot {
                 path,
                 partition: row,

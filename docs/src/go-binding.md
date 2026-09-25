@@ -696,6 +696,31 @@ pred, _ := pb.Eq("amount", paimon.NewDecimal(12345, 10, 2))
 pred, _ := pb.Eq("ts", paimon.Timestamp{Millis: 1700000000000, Nanos: 0})
 ```
 
+## Shared Memory Reservations
+
+Create a `ResourceContext` to share one reservation budget across read and write
+builders. Attach it before creating a reader or writer. The builder keeps its own
+reference, so the original handle may be closed after attachment.
+
+```go
+resources, err := paimon.NewResourceContext(256 * 1024 * 1024)
+if err != nil { log.Fatal(err) }
+defer resources.Close()
+
+if err := readBuilder.WithResources(resources); err != nil { log.Fatal(err) }
+if err := writeBuilder.WithResources(resources); err != nil { log.Fatal(err) }
+
+metrics, err := resources.Metrics()
+if err != nil { log.Fatal(err) }
+fmt.Println(metrics.ReservedMemoryBytes, metrics.PeakReservedMemoryBytes)
+```
+
+`PostponeFixedBucketWriteBuilder.WithResources` accepts the same context. When a
+reservation exceeds the limit, the operation returns `CodeResourceExhausted`.
+These counters track estimated reservations held by Paimon, not total process
+memory. Current reservations fall as readers and writers release them; the peak
+remains available while the context handle is open.
+
 ## Resource Management
 
 Paimon objects with a `Close` method hold native resources and must be closed.

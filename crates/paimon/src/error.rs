@@ -23,6 +23,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Error type for paimon.
 #[derive(Debug, Snafu)]
 pub enum Error {
+    /// A configured resource budget could not admit the requested reservation.
+    #[snafu(display("Paimon resource exhausted: {}", message))]
+    ResourceExhausted { message: String },
     #[snafu(whatever, display("Paimon data invalid for {}: {:?}", message, source))]
     DataInvalid {
         message: String,

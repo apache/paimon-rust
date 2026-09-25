@@ -2780,8 +2780,7 @@ async fn test_pk_aggregation_sequence_field_forced_last_value() {
     assert_eq!(ts.value(0), 250); // forced last_value over default sum
 }
 
-/// Aggregation engine reads must surface Unsupported when a DELETE/UPDATE
-/// row appears.
+/// Aggregation without ignore-retract must reject a DELETE/UPDATE row.
 #[tokio::test]
 async fn test_pk_aggregation_rejects_delete() {
     let (_tmp, sql_context) = setup_sql_context().await;
@@ -2882,14 +2881,14 @@ async fn test_pk_aggregation_default_fallback_is_last_non_null_value() {
     assert_eq!(amount.value(0), 20); // last_non_null_value
 }
 
-/// CREATE TABLE should reject unsupported aggregation knobs in basic mode.
+/// Java allows a per-field ignore-retract wrapper for aggregation tables.
 #[tokio::test]
-async fn test_pk_aggregation_rejects_unsupported_options_at_create() {
+async fn test_pk_aggregation_accepts_ignore_retract_at_create() {
     let (_tmp, sql_context) = setup_sql_context().await;
 
-    let err = sql_context
+    sql_context
         .sql(
-            "CREATE TABLE paimon.test_db.t_agg_bad (
+            "CREATE TABLE paimon.test_db.t_agg_ignore_retract (
                 id INT NOT NULL, amount INT,
                 PRIMARY KEY (id)
             ) WITH (
@@ -2900,12 +2899,37 @@ async fn test_pk_aggregation_rejects_unsupported_options_at_create() {
             )",
         )
         .await
-        .expect_err("CREATE TABLE with ignore-retract should fail in basic mode");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("ignore-retract"),
-        "expected create-time rejection to mention ignore-retract, got {msg}"
-    );
+        .unwrap();
+
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_agg_ignore_retract VALUES (1, 10), (1, 5)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batches = sql_context
+        .sql("SELECT amount FROM paimon.test_db.t_agg_ignore_retract")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let amounts = batches
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column_by_name("amount")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            (0..values.len())
+                .map(|row| values.value(row))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(amounts, vec![15]);
 }
 
 /// CREATE TABLE should reject `fields.<typo>.aggregate-function` referring to

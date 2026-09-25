@@ -34,15 +34,29 @@ use arrow_array::{Array, ArrayRef};
 
 use crate::spec::DataType;
 
+mod bitmap;
+mod bitmap64;
 mod bool_agg;
+mod collect;
 mod listagg;
+mod merge_map;
+mod nested;
 mod numeric;
+mod sketch;
 mod value;
 
+pub(crate) use bitmap::Roaring32Agg;
+pub(crate) use bitmap64::Roaring64Agg;
 pub(crate) use bool_agg::{BoolAndAgg, BoolOrAgg};
+pub(crate) use collect::CollectAgg;
 pub(crate) use listagg::ListaggAgg;
+pub(crate) use merge_map::MergeMapAgg;
+pub(crate) use nested::NestedAgg;
 pub(crate) use numeric::{MaxAgg, MinAgg, ProductAgg, SumAgg};
-pub(crate) use value::{FirstNonNullValueAgg, FirstValueAgg, LastNonNullValueAgg, LastValueAgg};
+pub(crate) use sketch::{HllSketchAgg, ThetaSketchAgg};
+pub(crate) use value::{
+    FirstNonNullValueAgg, FirstValueAgg, LastNonNullValueAgg, LastValueAgg, PrimaryKeyAgg,
+};
 
 /// Per-field aggregator.
 ///
@@ -67,6 +81,13 @@ pub(crate) trait FieldAggregator: Send + Sync + std::fmt::Debug {
     /// Accumulate one input cell.
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()>;
 
+    /// Replace the accumulator cell with a DELETE row's payload. Java resets
+    /// the row here, while preserving field aggregator state until the next PK.
+    fn replace_with_delete(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.reset();
+        self.agg(array, row_idx)
+    }
+
     /// Accumulate an input that sorts before the current accumulator.
     ///
     /// This mirrors Java `FieldAggregator#aggReversed(accumulator, input)`,
@@ -74,6 +95,23 @@ pub(crate) trait FieldAggregator: Send + Sync + std::fmt::Debug {
     /// must define this explicitly so order-sensitive aggregators cannot
     /// silently fall back to forward accumulation.
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()>;
+
+    /// Reverse through Java's default `agg(input, accumulator)` behavior.
+    /// Wrappers use this instead of a wrapped function's optional override.
+    fn agg_reversed_via_agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.agg_reversed(array, row_idx)
+    }
+
+    /// Apply a DELETE / UPDATE_BEFORE cell. Java's default implementation
+    /// rejects retracts unless the field uses `ignore-retract=true`.
+    fn retract(&mut self, _array: &dyn Array, _row_idx: usize) -> crate::Result<()> {
+        Err(crate::Error::Unsupported {
+            message: format!(
+                "Aggregate function '{}' does not support retract",
+                self.name()
+            ),
+        })
+    }
 
     /// Materialize the current accumulator as a 1-row Arrow array.
     fn result(&self) -> crate::Result<ArrayRef>;
@@ -105,9 +143,17 @@ pub(crate) fn new_aggregator(
     // ever built. Java's non-nullable diagnostic
     // (`AggregateMergeFunction`: "Field <i> can not be null") names no function
     // at all, so the Rust equivalent in `sort_merge` is strictly more specific.
-    match crate::spec::canonical_aggregator_name(name) {
-        "sum" => Ok(Box::new(SumAgg::new(field_name, data_type)?)),
-        "product" => Ok(Box::new(ProductAgg::new(field_name, data_type)?)),
+    let aggregator: crate::Result<Box<dyn FieldAggregator>> = match crate::spec::canonical_aggregator_name(name) {
+        "sum" => Ok(Box::new(SumAgg::new_with_overflow(
+            field_name, data_type,
+            table_options.get(&format!("fields.{field_name}.sum.fail-on-overflow"))
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+        )?)),
+        "product" => Ok(Box::new(ProductAgg::new_with_overflow(
+            field_name, data_type,
+            table_options.get(&format!("fields.{field_name}.product.fail-on-overflow"))
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+        )?)),
         "min" => Ok(Box::new(MinAgg::new(field_name, data_type)?)),
         "max" => Ok(Box::new(MaxAgg::new(field_name, data_type)?)),
         "last_value" => Ok(Box::new(LastValueAgg::new(field_name, data_type)?)),
@@ -121,13 +167,85 @@ pub(crate) fn new_aggregator(
             data_type,
             table_options,
         )?)),
+        "collect" => Ok(Box::new(CollectAgg::new(
+            field_name,
+            data_type,
+            table_options
+                .get(&format!("fields.{field_name}.distinct"))
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+        )?)),
+        "merge_map" => Ok(Box::new(MergeMapAgg::new(field_name, data_type)?)),
+        "merge_map_with_keytime" => Ok(Box::new(MergeMapAgg::new_with_keytime(
+            field_name,
+            data_type,
+            table_options,
+        )?)),
+        "nested_update" | "nested_partial_update" => Ok(Box::new(NestedAgg::new(
+            name,
+            field_name,
+            data_type,
+            table_options,
+        )?)),
+        "rbm32" => Ok(Box::new(Roaring32Agg::new(field_name, data_type)?)),
+        "rbm64" => Ok(Box::new(Roaring64Agg::new(field_name, data_type)?)),
+        "hll_sketch" => Ok(Box::new(HllSketchAgg::new(field_name, data_type)?)),
+        "theta_sketch" => Ok(Box::new(ThetaSketchAgg::new(field_name, data_type)?)),
+        "primary-key" => Ok(Box::new(PrimaryKeyAgg::new(field_name, data_type)?)),
         _ => Err(crate::Error::ConfigInvalid {
             message: format!(
                 "Unknown aggregate function '{name}' for field '{field_name}'; \
                  supported: sum, product, min, max, last_value, first_value, \
-                 last_non_null_value, first_non_null_value, bool_and, bool_or, listagg"
+                 last_non_null_value, first_non_null_value, bool_and, bool_or, listagg, collect, merge_map, merge_map_with_keytime, nested_update, nested_partial_update, rbm32, rbm64, hll_sketch, theta_sketch, primary-key"
             ),
         }),
+    };
+    let aggregator = aggregator?;
+    let ignore_retract = table_options
+        .get(&format!("fields.{field_name}.ignore-retract"))
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if ignore_retract
+        && table_options
+            .get("aggregation.remove-record-on-delete")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return Err(crate::Error::ConfigInvalid {
+            message: format!("aggregation.remove-record-on-delete conflicts with fields.{field_name}.ignore-retract"),
+        });
+    }
+    if ignore_retract {
+        Ok(Box::new(IgnoreRetractAgg(aggregator)))
+    } else {
+        Ok(aggregator)
+    }
+}
+
+#[derive(Debug)]
+struct IgnoreRetractAgg(Box<dyn FieldAggregator>);
+
+impl FieldAggregator for IgnoreRetractAgg {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+    fn reset(&mut self) {
+        self.0.reset();
+    }
+    fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.0.agg(array, row_idx)
+    }
+    fn replace_with_delete(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.0.replace_with_delete(array, row_idx)
+    }
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        // Java FieldIgnoreRetractAgg inherits FieldAggregator#aggReversed,
+        // which invokes wrapper.agg(input, accumulator). Keep the wrapped
+        // function's state (notably first_value's initialized flag).
+        self.0.agg_reversed_via_agg(array, row_idx)
+    }
+    fn retract(&mut self, _array: &dyn Array, _row_idx: usize) -> crate::Result<()> {
+        Ok(())
+    }
+    fn result(&self) -> crate::Result<ArrayRef> {
+        self.0.result()
     }
 }
 
@@ -152,6 +270,38 @@ mod tests {
 
     use super::*;
     use crate::spec::IntType;
+
+    #[test]
+    fn test_remove_record_on_delete_conflicts_with_field_ignore_retract() {
+        let options = HashMap::from([
+            ("aggregation.remove-record-on-delete".into(), "true".into()),
+            ("fields.v.ignore-retract".into(), "true".into()),
+        ]);
+        let err = new_aggregator("sum", "v", &DataType::Int(IntType::new()), &options).unwrap_err();
+        assert!(matches!(err, crate::Error::ConfigInvalid { message }
+            if message.contains("aggregation.remove-record-on-delete")
+                && message.contains("fields.v.ignore-retract")));
+    }
+
+    #[test]
+    fn ignore_retract_reverse_preserves_first_value_state() {
+        let options = HashMap::from([("fields.v.ignore-retract".into(), "true".into())]);
+        let data_type = DataType::Int(IntType::new());
+        let input = Int32Array::from(vec![Some(20), Some(5), Some(10), None]);
+
+        let mut first = new_aggregator("first_value", "v", &data_type, &options).unwrap();
+        first.replace_with_delete(&input, 0).unwrap();
+        first.agg_reversed(&input, 1).unwrap();
+        let result = first.result().unwrap();
+        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(result.value(0), 20);
+
+        let mut first_non_null =
+            new_aggregator("first_non_null_value", "v", &data_type, &options).unwrap();
+        first_non_null.agg(&input, 2).unwrap();
+        first_non_null.agg_reversed(&input, 3).unwrap();
+        assert!(first_non_null.result().unwrap().is_null(0));
+    }
 
     /// Java's legacy alias must build the very same aggregator, not merely pass
     /// validation: `FieldFirstNonNullValueAggLegacyFactory` returns a

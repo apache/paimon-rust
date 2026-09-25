@@ -307,7 +307,7 @@ struct LostResponseCommit {
 
 #[async_trait::async_trait]
 impl SnapshotCommit for LostResponseCommit {
-    async fn commit(&self, snapshot: &Snapshot, _: &[PartitionStatistics]) -> Result<bool> {
+    async fn commit(&self, _: Option<&str>, snapshot: &Snapshot, _: &[PartitionStatistics]) -> Result<bool> {
         let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if attempt == 0 {
             if self.publish_first {

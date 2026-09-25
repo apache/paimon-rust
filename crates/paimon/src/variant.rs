@@ -1103,6 +1103,20 @@ fn get_decimal(value: &[u8], pos: usize) -> Result<VariantDecimal> {
     })
 }
 
+/// A non-finite float/double serializes as a quoted `"Infinity"` /
+/// `"-Infinity"` / `"NaN"` token, matching Java `GenericVariant.toJson`
+/// (`appendQuoted(sb, Double.toString(d))`). Rust's `to_string` would emit a
+/// bare `inf`/`NaN`, which is not valid JSON and breaks any downstream parser.
+fn non_finite_json_token(d: f64) -> &'static str {
+    if d.is_nan() {
+        "\"NaN\""
+    } else if d > 0.0 {
+        "\"Infinity\""
+    } else {
+        "\"-Infinity\""
+    }
+}
+
 fn write_json(value: &[u8], metadata: &[u8], pos: usize, out: &mut String) -> Result<()> {
     match value_kind(value, pos)? {
         VariantKind::Object => {
@@ -1160,9 +1174,23 @@ fn write_json(value: &[u8], metadata: &[u8], pos: usize, out: &mut String) -> Re
                 source: Some(Box::new(e)),
             })?,
         ),
-        VariantKind::Double => out.push_str(&get_double(value, pos)?.to_string()),
+        VariantKind::Double => {
+            let d = get_double(value, pos)?;
+            if d.is_finite() {
+                out.push_str(&d.to_string());
+            } else {
+                out.push_str(non_finite_json_token(d));
+            }
+        }
         VariantKind::Decimal => out.push_str(&get_decimal(value, pos)?.to_plain_string()),
-        VariantKind::Float => out.push_str(&get_float(value, pos)?.to_string()),
+        VariantKind::Float => {
+            let f = get_float(value, pos)?;
+            if f.is_finite() {
+                out.push_str(&f.to_string());
+            } else {
+                out.push_str(non_finite_json_token(f as f64));
+            }
+        }
         VariantKind::Binary => {
             let encoded = general_purpose::STANDARD.encode(get_binary(value, pos)?);
             out.push_str(
@@ -2685,10 +2713,40 @@ fn cast_variant_to_i64(variant: VariantRef<'_>) -> Option<i64> {
         VariantKind::String => variant.get_string().ok()?.parse::<i64>().ok(),
         VariantKind::Decimal => {
             let decimal = variant.get_decimal().ok()?;
-            rescale_decimal_exact(decimal.unscaled, decimal.scale, 0)
-                .and_then(|value| i64::try_from(value).ok())
+            decimal_to_i64_truncating(decimal.unscaled, decimal.scale)
         }
+        VariantKind::Double => f64_to_i64_truncating(variant.get_double().ok()?),
+        VariantKind::Float => f64_to_i64_truncating(variant.get_float().ok()? as f64),
         _ => None,
+    }
+}
+
+/// Cast a variant decimal to i64 the way Spark/Java `VariantGet` does: drop the fractional
+/// digits toward zero (`RoundingMode.DOWN`), returning `None` when it overflows i64. Rust
+/// integer division truncates toward zero, so this matches Java `DOWN` for negatives too.
+fn decimal_to_i64_truncating(unscaled: i128, scale: i8) -> Option<i64> {
+    let integral = if scale <= 0 {
+        let factor = 10_i128.checked_pow((-(scale as i32)) as u32)?;
+        unscaled.checked_mul(factor)?
+    } else {
+        let factor = 10_i128.checked_pow(scale as u32)?;
+        unscaled / factor
+    };
+    i64::try_from(integral).ok()
+}
+
+/// Cast a variant float/double to i64 by truncating toward zero, returning `None` for NaN,
+/// infinity, and out-of-range values -- mirroring Java `VariantGet`'s `RoundingMode.DOWN`
+/// plus its integral-fit check.
+fn f64_to_i64_truncating(value: f64) -> Option<i64> {
+    let truncated = value.trunc();
+    // The representable i64 range as f64 is [-2^63, 2^63); 2^63 is i64::MAX + 1.
+    if truncated.is_finite()
+        && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&truncated)
+    {
+        Some(truncated as i64)
+    } else {
+        None
     }
 }
 
@@ -3414,6 +3472,21 @@ mod tests {
     }
 
     #[test]
+    fn to_json_quotes_non_finite_floats_like_java() {
+        // A non-finite double/float must serialize as a quoted "Infinity" /
+        // "-Infinity" / "NaN" token, matching Java `GenericVariant.toJson`
+        // (`appendQuoted(sb, Double.toString(d))`). A bare `inf`/`NaN` from
+        // Rust's `to_string` is invalid JSON that breaks any downstream parser.
+        let pos_inf = GenericVariant::parse_json("1e400").unwrap();
+        assert_eq!(pos_inf.to_json().unwrap(), r#""Infinity""#);
+        let neg_inf = GenericVariant::parse_json("-1e400").unwrap();
+        assert_eq!(neg_inf.to_json().unwrap(), r#""-Infinity""#);
+        // Finite values are unchanged (still bare JSON numbers).
+        let finite = GenericVariant::parse_json("1.5").unwrap();
+        assert_eq!(finite.to_json().unwrap(), "1.5");
+    }
+
+    #[test]
     fn parse_json_rejects_duplicate_object_keys() {
         let err = GenericVariant::parse_json(r#"{"a":1,"a":2}"#).unwrap_err();
         assert!(err.to_string().contains("VARIANT_DUPLICATE_KEY"));
@@ -3465,6 +3538,32 @@ mod tests {
         assert_eq!(
             double.get_path("$.d").unwrap().unwrap().kind().unwrap(),
             VariantKind::Double
+        );
+    }
+
+    #[test]
+    fn cast_variant_to_i64_truncates_decimals_and_floats() {
+        // Pushdown-extraction counterpart of the variant_get UDF int cast: Spark/Java
+        // truncate a JSON number toward zero (RoundingMode.DOWN) when casting to an
+        // integer. This path previously returned None (NULL / "cannot cast") for any
+        // decimal with a fractional part and every float.
+        let pos = GenericVariant::parse_json(r#"{"a":19.99}"#).unwrap();
+        assert_eq!(
+            cast_variant_to_i64(pos.get_path("$.a").unwrap().unwrap()),
+            Some(19),
+            "19.99 truncates to 19"
+        );
+        let neg = GenericVariant::parse_json(r#"{"a":-3.9}"#).unwrap();
+        assert_eq!(
+            cast_variant_to_i64(neg.get_path("$.a").unwrap().unwrap()),
+            Some(-3),
+            "-3.9 truncates toward zero to -3, not -4"
+        );
+        let dbl = GenericVariant::parse_json(r#"{"a":2.5e0}"#).unwrap();
+        assert_eq!(
+            cast_variant_to_i64(dbl.get_path("$.a").unwrap().unwrap()),
+            Some(2),
+            "2.5 truncates to 2"
         );
     }
 }

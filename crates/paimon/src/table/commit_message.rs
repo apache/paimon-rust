@@ -17,6 +17,7 @@
 
 use super::source::{read_i32, read_i64, take};
 use crate::spec::{BinaryRow, DataFileMeta, DataFileMetaRowLayout, IndexFileMeta};
+use std::collections::HashMap;
 
 /// Current Java `CommitMessageSerializer` body version. The version is carried
 /// by an enclosing serializer, not embedded in the body.
@@ -71,6 +72,9 @@ fn read_rows<T>(
 /// Reference: [org.apache.paimon.table.sink.CommitMessage](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/sink/CommitMessageImpl.java)
 #[derive(Debug, Clone)]
 pub struct CommitMessage {
+    /// A staged Format Table file. Format Tables have no manifest or snapshot;
+    /// this message is published by the Format Table committer instead.
+    pub(crate) format_file: Option<FormatFileCommit>,
     /// Binary row bytes for the partition.
     pub partition: Vec<u8>,
     /// Bucket id.
@@ -102,6 +106,7 @@ pub struct CommitMessage {
 impl CommitMessage {
     pub fn new(partition: Vec<u8>, bucket: i32, new_files: Vec<DataFileMeta>) -> Self {
         Self {
+            format_file: None,
             partition,
             bucket,
             total_buckets: None,
@@ -132,6 +137,12 @@ impl CommitMessage {
 
     /// Write the unframed Java v14 `CommitMessageSerializer.serialize` body.
     pub fn serialize(&self) -> crate::Result<Vec<u8>> {
+        if self.format_file.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "Format Table two-phase file messages use a different Java serializer"
+                    .into(),
+            });
+        }
         let mut out = Vec::new();
         // The partition normally is SerializationUtils.serializeBinaryRow:
         // i32 arity followed by a raw BinaryRow. Internal unpartitioned writers
@@ -225,6 +236,7 @@ impl CommitMessage {
             )));
         }
         Ok(Self {
+            format_file: None,
             partition,
             bucket,
             total_buckets,
@@ -254,6 +266,16 @@ impl CommitMessage {
         message.mark_fixed_bucket_overwrite();
         Ok(message)
     }
+}
+
+/// A file prepared below `_temporary`, awaiting publish into its partition.
+#[derive(Debug, Clone)]
+pub(crate) struct FormatFileCommit {
+    pub staged_path: String,
+    pub target_path: String,
+    pub partition: HashMap<String, String>,
+    pub record_count: i64,
+    pub file_size: i64,
 }
 
 #[cfg(test)]

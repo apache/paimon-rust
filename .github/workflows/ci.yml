@@ -185,6 +185,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Limit Windows test build memory
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Full-feature test binaries can exhaust the runner's paging file.
+          "CARGO_BUILD_JOBS=2" >> $env:GITHUB_ENV
+          "CARGO_PROFILE_TEST_DEBUG=line-tables-only" >> $env:GITHUB_ENV
+
       - name: Test
         run: cargo test --locked -p paimon --all-targets --features fulltext,vortex
         env:

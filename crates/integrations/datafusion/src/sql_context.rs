@@ -109,7 +109,11 @@ pub struct SQLContext {
 ///
 /// The builder preserves Paimon's session configuration while allowing callers
 /// to customize DataFusion runtime resources such as memory pools, temporary
-/// directories, and object store registries.
+/// directories, and object store registries. Parquet scans reserve projected
+/// row-group working estimates from the execution's memory pool. These readers
+/// cannot spill; supported downstream DataFusion operators may spill their state.
+/// Output batches are accounted by consumers that retain them, not by the reader.
+/// The pool does not cover every allocation or bound process RSS.
 ///
 /// # Example
 ///
@@ -1461,13 +1465,14 @@ impl SQLContext {
     fn ensure_no_time_travel_for_write(&self, operation: &str) -> DFResult<()> {
         use paimon::spec::{
             SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION, SCAN_TIMESTAMP_MILLIS_OPTION,
-            SCAN_VERSION_OPTION,
+            SCAN_TIMESTAMP_OPTION, SCAN_VERSION_OPTION,
         };
 
         let options = self.dynamic_options.read().unwrap();
         for key in [
             SCAN_VERSION_OPTION,
             SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_TIMESTAMP_OPTION,
             SCAN_SNAPSHOT_ID_OPTION,
             SCAN_TAG_NAME_OPTION,
         ] {

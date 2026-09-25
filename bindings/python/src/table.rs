@@ -21,6 +21,7 @@ use std::sync::Arc;
 use paimon::catalog::Identifier;
 use paimon::io::FileIO;
 use paimon::spec::TableSchema;
+use paimon::Options;
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -83,6 +84,34 @@ impl PyTable {
         Ok(Self::new(Arc::new(table)))
     }
 
+    /// Reuse the matching REST table response and merged catalog options.
+    /// Skips config/get-table requests, preserving REST snapshots and token refresh.
+    #[staticmethod]
+    #[pyo3(signature = (response_json, *, database, table, rest_options))]
+    fn from_rest_response(
+        py: Python<'_>,
+        response_json: &str,
+        database: &str,
+        table: &str,
+        rest_options: HashMap<String, String>,
+    ) -> PyResult<Self> {
+        let response: paimon::api::GetTableResponse =
+            serde_json::from_str(response_json).map_err(|err| {
+                PyValueError::new_err(format!("Invalid REST table response JSON: {err}"))
+            })?;
+        let identifier = Identifier::new(database, table);
+        let table = py
+            .detach(|| {
+                runtime().block_on(paimon::table::Table::from_rest_response(
+                    identifier,
+                    response,
+                    Options::from_map(rest_options),
+                ))
+            })
+            .map_err(to_py_err)?;
+        Ok(Self::new(Arc::new(table)))
+    }
+
     /// Replace the complete schema while retaining FileIO, REST credentials and branch.
     /// The caller has already resolved fields and options; no schema is reloaded.
     #[pyo3(signature = (schema_json, *, branch=None))]
@@ -108,6 +137,11 @@ impl PyTable {
 
     fn location(&self) -> String {
         self.inner.location().to_string()
+    }
+
+    /// REST catalog table identity used by callers with an already resolved schema.
+    fn rest_table_uuid(&self) -> Option<&str> {
+        self.inner.rest_env().map(|env| env.uuid())
     }
 
     fn schema(&self) -> PyTableSchema {

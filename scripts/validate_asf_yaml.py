@@ -66,6 +66,7 @@ VALID_FEATURES_KEYS = {
 # Known keys under 'github.enabled_merge_buttons'
 VALID_MERGE_BUTTON_KEYS = {
     "squash",
+    "squash_commit_message",
     "merge",
     "rebase",
 }

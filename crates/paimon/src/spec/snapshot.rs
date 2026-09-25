@@ -54,6 +54,10 @@ impl std::fmt::Display for CommitKind {
 pub struct Snapshot {
     /// version of snapshot
     version: i32,
+    /// Unique identity for optimistic REST catalog publication.
+    #[builder(default = None)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uuid: Option<String>,
     id: i64,
     schema_id: i64,
     /// a manifest list recording all changes from the previous snapshots
@@ -118,6 +122,10 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub fn uuid(&self) -> Option<&str> {
+        self.uuid.as_deref()
+    }
+
     /// Get the version of this snapshot.
     #[inline]
     pub fn version(&self) -> i32 {

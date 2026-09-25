@@ -209,6 +209,9 @@ pub struct CreatePartitionsRequest {
     /// present only together with `partition_statistics`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replace_statistics: Option<bool>,
+    /// Per-partition catalog options, aligned with `partition_specs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_options: Option<Vec<HashMap<String, String>>>,
 }
 
 impl CreatePartitionsRequest {
@@ -219,6 +222,7 @@ impl CreatePartitionsRequest {
             ignore_if_exists,
             partition_statistics: None,
             replace_statistics: None,
+            partition_options: None,
         }
     }
 
@@ -226,6 +230,12 @@ impl CreatePartitionsRequest {
     pub fn with_statistics(mut self, statistics: Vec<PartitionStatistics>, replace: bool) -> Self {
         self.partition_statistics = Some(statistics);
         self.replace_statistics = Some(replace);
+        self
+    }
+
+    /// Set catalog options for each partition in the request.
+    pub fn with_partition_options(mut self, options: Vec<HashMap<String, String>>) -> Self {
+        self.partition_options = Some(options);
         self
     }
 }

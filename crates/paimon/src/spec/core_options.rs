@@ -65,6 +65,7 @@ const COMMIT_MAX_RETRY_WAIT_OPTION: &str = "commit.max-retry-wait";
 const FILE_COMPRESSION_OPTION: &str = "file.compression";
 const FILE_COMPRESSION_ZSTD_LEVEL_OPTION: &str = "file.compression.zstd-level";
 const FILE_FORMAT_OPTION: &str = "file.format";
+const DATA_FILE_PREFIX_OPTION: &str = "data-file.prefix";
 const VECTOR_FILE_FORMAT_OPTION: &str = "vector.file.format";
 const VECTOR_TARGET_FILE_SIZE_OPTION: &str = "vector.target-file-size";
 const CHANGELOG_FILE_PREFIX_OPTION: &str = "changelog-file.prefix";
@@ -72,6 +73,7 @@ const CHANGELOG_FILE_FORMAT_OPTION: &str = "changelog-file.format";
 const CHANGELOG_FILE_COMPRESSION_OPTION: &str = "changelog-file.compression";
 const CHANGELOG_FILE_STATS_MODE_OPTION: &str = "changelog-file.stats-mode";
 const METADATA_STATS_MODE_OPTION: &str = "metadata.stats-mode";
+const METADATA_STATS_MODE_PER_LEVEL_OPTION: &str = "metadata.stats-mode.per.level";
 const METADATA_STATS_DENSE_STORE_OPTION: &str = "metadata.stats-dense-store";
 const METADATA_STATS_KEEP_FIRST_N_COLUMNS_OPTION: &str = "metadata.stats-keep-first-n-columns";
 const DEFAULT_METADATA_STATS_MODE: &str = "truncate(16)";
@@ -125,6 +127,8 @@ const DEFAULT_COMMIT_TIMEOUT_MS: u64 = u64::MAX;
 const DEFAULT_COMMIT_MIN_RETRY_WAIT_MS: u64 = 10;
 const DEFAULT_COMMIT_MAX_RETRY_WAIT_MS: u64 = 10_000;
 pub const SCAN_TIMESTAMP_MILLIS_OPTION: &str = "scan.timestamp-millis";
+/// Local date/time string used for snapshot time travel, matching Java Paimon.
+pub const SCAN_TIMESTAMP_OPTION: &str = "scan.timestamp";
 pub const SCAN_VERSION_OPTION: &str = "scan.version";
 pub const SCAN_SNAPSHOT_ID_OPTION: &str = "scan.snapshot-id";
 pub const SCAN_TAG_NAME_OPTION: &str = "scan.tag-name";
@@ -502,7 +506,7 @@ impl<'a> CoreOptions<'a> {
                     SCAN_WATERMARK_OPTION,
                 ]
             } else if mode.eq_ignore_ascii_case("from-timestamp") {
-                &[SCAN_TIMESTAMP_MILLIS_OPTION]
+                &[SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_TIMESTAMP_OPTION]
             } else {
                 return Err(crate::Error::Unsupported {
                     message: format!(
@@ -1060,9 +1064,12 @@ impl<'a> CoreOptions<'a> {
     }
 
     fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
-        let mut selectors = Vec::with_capacity(5);
+        let mut selectors = Vec::with_capacity(6);
         if self.options.contains_key(SCAN_TIMESTAMP_MILLIS_OPTION) {
             selectors.push(SCAN_TIMESTAMP_MILLIS_OPTION);
+        }
+        if self.options.contains_key(SCAN_TIMESTAMP_OPTION) {
+            selectors.push(SCAN_TIMESTAMP_OPTION);
         }
         if self.options.contains_key(SCAN_WATERMARK_OPTION) {
             selectors.push(SCAN_WATERMARK_OPTION);
@@ -1124,6 +1131,10 @@ impl<'a> CoreOptions<'a> {
 
         if let Some(ts) = self.parse_i64_option(SCAN_TIMESTAMP_MILLIS_OPTION)? {
             Ok(Some(TimeTravelSelector::TimestampMillis(ts)))
+        } else if let Some(value) = self.options.get(SCAN_TIMESTAMP_OPTION) {
+            Ok(Some(TimeTravelSelector::TimestampMillis(
+                parse_scan_timestamp(value, &jiff::tz::TimeZone::system())?,
+            )))
         } else if let Some(watermark) = self.parse_i64_option(SCAN_WATERMARK_OPTION)? {
             Ok(Some(TimeTravelSelector::Watermark(watermark)))
         } else if let Some(value) = self.options.get(SCAN_VERSION_OPTION).map(String::as_str) {
@@ -1281,6 +1292,18 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
     }
 
+    /// Explicit `file.block-size`, in bytes. Formats choose their own default.
+    pub(crate) fn file_block_size(&self) -> crate::Result<Option<i64>> {
+        self.options
+            .get("file.block-size")
+            .map(|raw| {
+                parse_memory_size(raw).ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: format!("Invalid file.block-size: {raw}"),
+                })
+            })
+            .transpose()
+    }
+
     pub fn blob_target_file_size(&self) -> i64 {
         self.options
             .get("blob.target-file-size")
@@ -1338,6 +1361,14 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(1)
     }
 
+    /// File name prefix for data files. Default is `"data-"`.
+    pub fn data_file_prefix(&self) -> &str {
+        self.options
+            .get(DATA_FILE_PREFIX_OPTION)
+            .map(String::as_str)
+            .unwrap_or("data-")
+    }
+
     /// File name prefix for changelog files. Default is `"changelog-"`.
     pub fn changelog_file_prefix(&self) -> &str {
         self.options
@@ -1392,6 +1423,55 @@ impl<'a> CoreOptions<'a> {
             .map(String::as_str)
             .unwrap_or(DEFAULT_METADATA_STATS_MODE);
         MetadataStatsMode::parse(METADATA_STATS_MODE_OPTION, value)
+    }
+
+    /// Match Java's PK file stats precedence: changelog override, level, table.
+    pub(crate) fn pk_file_metadata_stats_mode(
+        &self,
+        level: i32,
+        is_changelog: bool,
+    ) -> crate::Result<&str> {
+        let mut level_mode = None;
+        if let Some(raw) = self.options.get(METADATA_STATS_MODE_PER_LEVEL_OPTION) {
+            for entry in raw
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+            {
+                let (key, value) =
+                    entry
+                        .split_once(':')
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: format!(
+                                "Invalid {METADATA_STATS_MODE_PER_LEVEL_OPTION} entry: '{entry}'"
+                            ),
+                            source: None,
+                        })?;
+                let parsed_level =
+                    key.trim()
+                        .parse::<i32>()
+                        .map_err(|error| crate::Error::DataInvalid {
+                            message: format!(
+                                "Invalid level in {METADATA_STATS_MODE_PER_LEVEL_OPTION}: '{key}'"
+                            ),
+                            source: Some(Box::new(error)),
+                        })?;
+                if parsed_level == level {
+                    level_mode = Some(value.trim());
+                }
+            }
+        }
+        Ok(if is_changelog {
+            self.changelog_file_stats_mode().or(level_mode)
+        } else {
+            level_mode
+        }
+        .unwrap_or_else(|| {
+            self.options
+                .get(METADATA_STATS_MODE_OPTION)
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_METADATA_STATS_MODE)
+        }))
     }
 
     /// Number of leading columns whose stats should be kept.
@@ -1612,6 +1692,66 @@ impl<'a> CoreOptions<'a> {
             Some(raw) => raw.split(',').map(|c| c.trim().to_string()).collect(),
         }
     }
+}
+
+/// Java DateTimeUtils accepts a date, a space-separated timestamp, or an ISO
+/// local timestamp (whose seconds are optional). It truncates to milliseconds
+/// and resolves the date/time in the process's default time zone.
+fn parse_scan_timestamp(value: &str, zone: &jiff::tz::TimeZone) -> crate::Result<i64> {
+    use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
+
+    let datetime = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M"))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map(|date| date.and_hms_opt(0, 0, 0).unwrap())
+        })
+        .map_err(|error| crate::Error::DataInvalid {
+            message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+            source: Some(Box::new(error)),
+        })?;
+    // Chrono also accepts leap seconds and fractions longer than nanoseconds;
+    // Java's local timestamp parser does not.
+    if datetime.nanosecond() >= 1_000_000_000
+        || value
+            .rsplit_once('.')
+            .is_some_and(|(_, fraction)| fraction.len() > 9)
+    {
+        return Err(crate::Error::DataInvalid {
+            message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+            source: None,
+        });
+    }
+    // Java parses with precision 3 before applying the system time zone.
+    // Truncating here also preserves the correct millisecond for instants
+    // immediately before the Unix epoch.
+    let year = i16::try_from(datetime.year()).map_err(|error| crate::Error::DataInvalid {
+        message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+        source: Some(Box::new(error)),
+    })?;
+    let civil = jiff::civil::DateTime::new(
+        year,
+        datetime.month() as i8,
+        datetime.day() as i8,
+        datetime.hour() as i8,
+        datetime.minute() as i8,
+        datetime.second() as i8,
+        (datetime.nanosecond() / 1_000_000 * 1_000_000) as i32,
+    )
+    .map_err(|error| crate::Error::DataInvalid {
+        message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+        source: Some(Box::new(error)),
+    })?;
+    // Jiff's compatible disambiguation matches Java LocalDateTime.atZone:
+    // the earlier instant in a fold, and the later local time in a gap.
+    zone.to_ambiguous_timestamp(civil)
+        .compatible()
+        .map(|timestamp| timestamp.as_millisecond())
+        .map_err(|error| crate::Error::DataInvalid {
+            message: format!("Invalid local time for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+            source: Some(Box::new(error)),
+        })
 }
 
 /// Parse a memory size string to bytes using binary (1024-based) semantics,
@@ -2286,6 +2426,23 @@ mod tests {
     }
 
     #[test]
+    fn file_block_size_reports_invalid_input_and_preserves_format_default() {
+        let empty = HashMap::new();
+        assert_eq!(CoreOptions::new(&empty).file_block_size().unwrap(), None);
+        let valid = HashMap::from([("file.block-size".into(), "64 kb".into())]);
+        assert_eq!(
+            CoreOptions::new(&valid).file_block_size().unwrap(),
+            Some(65_536)
+        );
+        let invalid = HashMap::from([("file.block-size".into(), "nope".into())]);
+        assert!(CoreOptions::new(&invalid)
+            .file_block_size()
+            .unwrap_err()
+            .to_string()
+            .contains("file.block-size"));
+    }
+
+    #[test]
     fn test_parse_memory_size_accepts_every_java_unit_spelling() {
         // Every alias in Java `MemorySize.MemoryUnit`, which lists three
         // spellings per unit (e.g. `m`, `mb`, `mebibytes`).
@@ -2495,6 +2652,156 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_timestamp_parses_local_time_and_truncates_to_millis() {
+        let zone = jiff::tz::db().get("Asia/Shanghai").unwrap();
+        let midnight = 1_704_124_800_000_i64; // 2024-01-01T16:00:00Z
+        let noon = 1_704_168_184_000_i64; // 2024-01-02T04:03:04Z
+        for (value, expected) in [
+            ("2024-01-02", midnight),
+            ("2024-1-2 12:3:4", noon),
+            ("2024-01-02 12:03:04", noon),
+            ("2024-01-02 12:03:04.123456789", noon + 123),
+            ("2024-01-02T12:03:04.9", noon + 900),
+            ("2024-01-02T12:03", noon - 4000),
+        ] {
+            assert_eq!(
+                parse_scan_timestamp(value, &zone).unwrap(),
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_timestamp_matches_java_zone_transitions() {
+        for (zone, value, expected) in [
+            (
+                "America/New_York",
+                "2024-11-03 01:30:00",
+                "2024-11-03T05:30:00Z",
+            ),
+            (
+                "America/New_York",
+                "2024-11-03 02:00:00",
+                "2024-11-03T07:00:00Z",
+            ),
+            (
+                "America/New_York",
+                "2024-11-03 02:00:00.999",
+                "2024-11-03T07:00:00.999Z",
+            ),
+            (
+                "America/New_York",
+                "2024-03-10 02:30:00",
+                "2024-03-10T07:30:00Z",
+            ),
+            (
+                "Australia/Lord_Howe",
+                "2024-10-06 02:15:00",
+                "2024-10-05T15:45:00Z",
+            ),
+            (
+                "Pacific/Apia",
+                "2011-12-30 12:00:00",
+                "2011-12-30T22:00:00Z",
+            ),
+            (
+                "UTC",
+                "1969-12-31 23:59:59.999999999",
+                "1969-12-31T23:59:59.999Z",
+            ),
+        ] {
+            let zone = jiff::tz::db().get(zone).unwrap();
+            assert_eq!(
+                parse_scan_timestamp(value, &zone).unwrap(),
+                chrono::DateTime::parse_from_rfc3339(expected)
+                    .unwrap()
+                    .timestamp_millis(),
+                "{value} in {zone:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_timestamp_local_overlap_uses_earlier_instant() {
+        const CHILD: &str = "PAIMON_SCAN_TIMESTAMP_OVERLAP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Resolve the system zone in a fresh process, including on Windows.
+            let actual =
+                parse_scan_timestamp("2024-11-03 01:30:00", &jiff::tz::TimeZone::system()).unwrap();
+            assert_eq!(actual, 1_730_611_800_000); // 2024-11-03T05:30:00Z
+            let overlap_end =
+                parse_scan_timestamp("2024-11-03 02:00:00", &jiff::tz::TimeZone::system()).unwrap();
+            assert_eq!(overlap_end, 1_730_617_200_000); // 2024-11-03T07:00:00Z
+            let gap =
+                parse_scan_timestamp("2024-03-10 02:30:00", &jiff::tz::TimeZone::system()).unwrap();
+            assert_eq!(gap, 1_710_055_800_000); // 2024-03-10T07:30:00Z
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "spec::core_options::tests::test_scan_timestamp_local_overlap_uses_earlier_instant",
+            ])
+            .env("TZ", "America/New_York")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn test_scan_timestamp_rejects_invalid_values_and_conflicts() {
+        for value in [
+            "",
+            "invalid",
+            "1700000000000",
+            "2024-13-01",
+            "2024-01-01 25:00:00",
+            "2024-01-01T00:00:00Z",
+            "2024-01-01 23:59:60",
+            "2024-01-01 00:00:00.1234567890",
+        ] {
+            let options = HashMap::from([("scan.timestamp".to_string(), value.to_string())]);
+            let core = CoreOptions::new(&options);
+            assert!(core.has_time_travel_selector());
+            let err = core.try_time_travel_selector().unwrap_err();
+            assert!(
+                matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("scan.timestamp")),
+                "{value}"
+            );
+        }
+        for selector in [
+            SCAN_TIMESTAMP_MILLIS_OPTION,
+            SCAN_WATERMARK_OPTION,
+            SCAN_VERSION_OPTION,
+            SCAN_SNAPSHOT_ID_OPTION,
+            SCAN_TAG_NAME_OPTION,
+        ] {
+            let options = HashMap::from([
+                ("scan.timestamp".to_string(), "2024-01-02".to_string()),
+                (selector.to_string(), "1".to_string()),
+            ]);
+            let err = CoreOptions::new(&options)
+                .try_time_travel_selector()
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("Only one") && message.contains("scan.timestamp") && message.contains(selector))
+            );
+        }
+        let options = HashMap::from([
+            ("scan.timestamp".to_string(), "2024-01-02".to_string()),
+            ("scan.mode".to_string(), "from-timestamp".to_string()),
+        ]);
+        assert!(CoreOptions::new(&options).validate_scan_options().is_ok());
+    }
+
+    #[test]
     fn test_try_time_travel_selector_rejects_conflicting_selectors() {
         let options = HashMap::from([
             (SCAN_VERSION_OPTION.to_string(), "tag1".to_string()),
@@ -2612,12 +2919,14 @@ mod tests {
         ]);
         let default_core = CoreOptions::new(&default_options);
 
+        assert_eq!(default_core.data_file_prefix(), "data-");
         assert_eq!(default_core.changelog_file_prefix(), "changelog-");
         assert_eq!(default_core.changelog_file_format(), "avro");
         assert_eq!(default_core.changelog_file_compression(), "snappy");
         assert_eq!(default_core.changelog_file_stats_mode(), None);
 
         let custom_options = HashMap::from([
+            (DATA_FILE_PREFIX_OPTION.to_string(), "files-".to_string()),
             (
                 CHANGELOG_FILE_PREFIX_OPTION.to_string(),
                 "custom-".to_string(),
@@ -2637,6 +2946,7 @@ mod tests {
         ]);
         let custom_core = CoreOptions::new(&custom_options);
 
+        assert_eq!(custom_core.data_file_prefix(), "files-");
         assert_eq!(custom_core.changelog_file_prefix(), "custom-");
         assert_eq!(custom_core.changelog_file_format(), "parquet");
         assert_eq!(custom_core.changelog_file_compression(), "zstd");
@@ -2669,6 +2979,40 @@ mod tests {
                 MetadataStatsMode::None,
             ]
         );
+    }
+
+    #[test]
+    fn test_pk_file_metadata_stats_mode_follows_java_precedence() {
+        let options = HashMap::from([
+            (METADATA_STATS_MODE_OPTION.to_string(), "none".to_string()),
+            (
+                METADATA_STATS_MODE_PER_LEVEL_OPTION.to_string(),
+                "0:counts,1:truncate(8)".to_string(),
+            ),
+            (
+                CHANGELOG_FILE_STATS_MODE_OPTION.to_string(),
+                "full".to_string(),
+            ),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(
+            core.pk_file_metadata_stats_mode(0, false).unwrap(),
+            "counts"
+        );
+        assert_eq!(
+            core.pk_file_metadata_stats_mode(1, false).unwrap(),
+            "truncate(8)"
+        );
+        assert_eq!(core.pk_file_metadata_stats_mode(2, false).unwrap(), "none");
+        assert_eq!(core.pk_file_metadata_stats_mode(0, true).unwrap(), "full");
+
+        let invalid = HashMap::from([(
+            METADATA_STATS_MODE_PER_LEVEL_OPTION.to_string(),
+            "x:counts".to_string(),
+        )]);
+        assert!(CoreOptions::new(&invalid)
+            .pk_file_metadata_stats_mode(0, false)
+            .is_err());
     }
 
     #[test]

@@ -19,11 +19,14 @@
 
 use super::write_builder::validate_commit_user;
 use super::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
+use crate::resource::ResourceContext;
 use uuid::Uuid;
 
 pub(crate) struct FormatWriteBuilder<'a> {
     table: &'a Table,
     commit_user: String,
+    overwrite: bool,
+    resources: Option<ResourceContext>,
 }
 
 impl<'a> FormatWriteBuilder<'a> {
@@ -31,6 +34,8 @@ impl<'a> FormatWriteBuilder<'a> {
         Self {
             table,
             commit_user: Uuid::new_v4().to_string(),
+            overwrite: false,
+            resources: None,
         }
     }
 
@@ -48,7 +53,13 @@ impl<'a> FormatWriteBuilder<'a> {
         Ok(self)
     }
 
-    pub(crate) fn with_overwrite(self) -> Self {
+    pub(crate) fn with_overwrite(mut self) -> Self {
+        self.overwrite = true;
+        self
+    }
+
+    pub(crate) fn with_resources(mut self, resources: ResourceContext) -> Self {
+        self.resources = Some(resources);
         self
     }
 
@@ -62,9 +73,12 @@ impl<'a> FormatWriteBuilder<'a> {
     }
 
     pub(crate) fn new_write(&self) -> crate::Result<TableWrite> {
-        Err(crate::Error::Unsupported {
-            message: "Writing format tables is not supported by the Rust client yet".to_string(),
-        })
+        TableWrite::new_format(
+            self.table,
+            self.commit_user.clone(),
+            self.resources.clone(),
+            self.overwrite,
+        )
     }
 
     pub(crate) fn new_update(&self, _update_columns: Vec<String>) -> crate::Result<TableUpdate> {

@@ -397,4 +397,107 @@ async fn test_timestamp_as_of_uses_snapshot_schema() {
         .unwrap();
     assert_eq!(column_names(&batches), vec!["id", "name"]);
     assert_eq!(total_rows(&batches), 3);
+
+    sql_context
+        .sql("SET 'paimon.scan.timestamp' = '1970-01-03 00:00:00.123'")
+        .await
+        .unwrap();
+    let batches = sql_context
+        .sql("SELECT * FROM paimon.default.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(column_names(&batches), vec!["id", "name"]);
+    assert_eq!(total_rows(&batches), 3);
+    let error = match sql_context
+        .sql("DELETE FROM paimon.default.t WHERE id = 1")
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("writes with scan.timestamp must fail"),
+    };
+    assert!(error.to_string().contains("scan.timestamp"), "{error}");
+    sql_context
+        .sql("RESET 'paimon.scan.timestamp'")
+        .await
+        .unwrap();
+    let batches = sql_context
+        .sql("SELECT * FROM paimon.default.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(column_names(&batches), vec!["id", "name", "age"]);
+    assert_eq!(total_rows(&batches), 5);
+}
+
+#[tokio::test]
+async fn test_session_scan_timestamp_overlap_reads_earlier_snapshot() {
+    const CHILD: &str = "PAIMON_SCAN_TIMESTAMP_SQL_OVERLAP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // The system local timezone is process-global. Isolate this case so
+        // parallel tests cannot change how the ambiguous time is resolved.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "test_session_scan_timestamp_overlap_reads_earlier_snapshot",
+            ])
+            .env("TZ", "America/New_York")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let (tmp, sql_context) = setup_evolved_table().await;
+    for (snapshot_id, time_millis) in [
+        (1, 1_730_610_000_000_u64), // 2024-11-03T05:00:00Z
+        (2, 1_730_613_600_000_u64), // 2024-11-03T06:00:00Z
+    ] {
+        let path = tmp
+            .path()
+            .join("default.db/t/snapshot")
+            .join(format!("snapshot-{snapshot_id}"));
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        snapshot["timeMillis"] = serde_json::json!(time_millis);
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    }
+
+    sql_context
+        .sql("SET 'paimon.scan.timestamp' = '2024-11-03 01:30:00'")
+        .await
+        .unwrap();
+    let batches = sql_context
+        .sql("SELECT * FROM paimon.default.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(column_names(&batches), vec!["id", "name"]);
+    assert_eq!(total_rows(&batches), 3);
+
+    sql_context
+        .sql("SET 'paimon.scan.timestamp' = '2024-11-03 02:00:00'")
+        .await
+        .unwrap();
+    let batches = sql_context
+        .sql("SELECT * FROM paimon.default.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(column_names(&batches), vec!["id", "name", "age"]);
+    assert_eq!(total_rows(&batches), 5);
 }

@@ -79,6 +79,23 @@ func (wb *PostponeFixedBucketWriteBuilder) Close() {
 	})
 }
 
+// WithResources shares the context's reservation budget with writers from this builder.
+// The builder retains the context after the caller closes its handle.
+func (wb *PostponeFixedBucketWriteBuilder) WithResources(resources *ResourceContext) error {
+	if wb.inner == nil {
+		return ErrClosed
+	}
+	if resources == nil {
+		return errNilResourceContext
+	}
+	resources.mu.RLock()
+	defer resources.mu.RUnlock()
+	if resources.inner == nil {
+		return ErrClosed
+	}
+	return ffiPostponeFixedBucketWriteBuilderWithResources.symbol(wb.ctx)(wb.inner, resources.inner)
+}
+
 // WithOverwrite enables overwrite mode for both writers and committers created
 // by this builder.
 func (wb *PostponeFixedBucketWriteBuilder) WithOverwrite() error {

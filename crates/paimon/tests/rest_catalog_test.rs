@@ -1098,7 +1098,7 @@ async fn test_rest_catalog_reads_format_table() {
     let table = ctx.catalog.get_table(&identifier).await.unwrap();
     assert_eq!(table.location(), format_path);
     assert_eq!(table.schema().options().get("path"), Some(&format_path));
-    assert!(table.new_write_builder().new_write().is_err());
+    assert!(table.new_write_builder().new_write().is_ok());
 
     let read_builder = table.new_read_builder();
     let plan = read_builder.new_scan().plan().await.unwrap();

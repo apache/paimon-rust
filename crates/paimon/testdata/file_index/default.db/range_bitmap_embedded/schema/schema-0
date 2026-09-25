@@ -1,0 +1,25 @@
+{
+  "version" : 3,
+  "id" : 0,
+  "fields" : [ {
+    "id" : 0,
+    "name" : "id",
+    "type" : "INT"
+  }, {
+    "id" : 1,
+    "name" : "payload",
+    "type" : "STRING"
+  } ],
+  "highestFieldId" : 1,
+  "partitionKeys" : [ ],
+  "primaryKeys" : [ ],
+  "options" : {
+    "bucket" : "1",
+    "file-index.range-bitmap.columns" : "id",
+    "bucket-key" : "id",
+    "file-index.read.enabled" : "true",
+    "file.format" : "parquet",
+    "file-index.in-manifest-threshold" : "1 MB"
+  },
+  "timeMillis" : 1790306753711
+}

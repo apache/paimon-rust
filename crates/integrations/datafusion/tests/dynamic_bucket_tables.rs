@@ -696,7 +696,7 @@ async fn test_pk_dynamic_bucket_partitioned_partial_update() {
 }
 
 #[tokio::test]
-async fn test_rejects_cross_partition_dynamic_bucket_partial_update() {
+async fn test_cross_partition_dynamic_bucket_partial_update_keeps_existing_partition() {
     let (_tmp, sql_context) = setup_sql_context().await;
 
     sql_context
@@ -710,18 +710,58 @@ async fn test_rejects_cross_partition_dynamic_bucket_partial_update() {
         .await
         .unwrap();
 
-    let result = sql_context
+    sql_context
         .sql("INSERT INTO paimon.test_db.t_cross_partial_update VALUES ('2024-01-01', 1, 10)")
         .await
         .unwrap()
         .collect()
-        .await;
+        .await
+        .unwrap();
 
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("cross-partition update"),
-        "expected cross-partition partial-update rejection, got: {err}"
-    );
+    sql_context
+        .sql("INSERT INTO paimon.test_db.t_cross_partial_update VALUES ('2024-01-02', 1, 20)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = sql_context
+        .sql("SELECT dt, id, v_int FROM paimon.test_db.t_cross_partial_update")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rows: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            let dt = batch.column_by_name("dt").unwrap();
+            let id = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let value = batch
+                .column_by_name("v_int")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|row| {
+                    (
+                        string_value(dt.as_ref(), row).to_string(),
+                        id.value(row),
+                        value.value(row),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    assert_eq!(rows, vec![("2024-01-01".to_string(), 1, 20)]);
 }
 
 #[tokio::test]

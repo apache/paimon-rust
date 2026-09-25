@@ -64,6 +64,31 @@ def test_write_commit_read_roundtrip():
         assert result == {"id": [1, 2, 3], "name": ["a", "b", "c"]}
 
 
+
+@pytest.mark.parametrize("primary_key", [False, True])
+def test_custom_data_file_prefix_matches_table_option(tmp_path, primary_key):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.wdb")
+    key = ", PRIMARY KEY (id)" if primary_key else ""
+    bucket = ", 'bucket' = '1'" if primary_key else ""
+    ctx.sql(
+        "CREATE TABLE paimon.wdb.t (id INT, name STRING{}) "
+        "WITH ('data-file.prefix' = 'custom-'{})".format(key, bucket)
+    )
+    table = _get_table(str(tmp_path))
+    builder = table.new_batch_write_builder()
+    writer = builder.new_write()
+    writer.write_arrow(_batch([1], ["a"]))
+    builder.new_commit().commit(writer.prepare_commit())
+
+    files = list(tmp_path.rglob("*.parquet"))
+    assert len(files) == 1
+    assert files[0].name.startswith("custom-")
+    assert pa.Table.from_batches(ctx.sql("SELECT id, name FROM paimon.wdb.t")).to_pydict() == {
+        "id": [1], "name": ["a"]}
+
+
 def test_write_multiple_batches():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = _make_empty_table(warehouse)

@@ -375,6 +375,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scan_timestamp_reads_historical_schema_and_rows() {
+        use chrono::{Local, TimeZone};
+        use futures::TryStreamExt;
+
+        let (io, path) = setup_evolved_table().await;
+        let table = latest_table(&io, &path);
+        let sm = table.snapshot_manager();
+        let base = Local
+            .with_ymd_and_hms(2024, 1, 2, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        // Fix commit times so the exact/between/before boundaries never depend
+        // on how quickly the fixture commits complete.
+        for (id, millis) in [(1, base + 123), (2, base + 1000)] {
+            let mut snapshot = serde_json::to_value(sm.get_snapshot(id).await.unwrap()).unwrap();
+            snapshot["timeMillis"] = serde_json::json!(millis);
+            io.new_output(&sm.snapshot_path(id))
+                .unwrap()
+                .write(serde_json::to_vec(&snapshot).unwrap().into())
+                .await
+                .unwrap();
+        }
+
+        for timestamp in ["2024-01-02 12:00:00.123", "2024-01-02T12:00:00.999999999"] {
+            let opts = options(&[
+                ("scan.timestamp", timestamp),
+                ("scan.mode", "from-timestamp"),
+            ]);
+            let traveled = table
+                .copy_with_time_travel_strict(opts.clone())
+                .await
+                .unwrap();
+            assert_eq!(traveled.schema().id(), 0);
+            assert_eq!(traveled.travel_snapshot().unwrap().id(), 1);
+            assert!(traveled.new_write_builder().new_write().is_err());
+            assert!(table
+                .copy_with_options(opts)
+                .new_write_builder()
+                .new_write()
+                .is_err());
+            let builder = traveled.new_read_builder();
+            let plan = builder.new_scan().plan().await.unwrap();
+            let batches: Vec<RecordBatch> = builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let ids: Vec<i32> = batches
+                .iter()
+                .flat_map(|batch| {
+                    assert_eq!(batch.num_columns(), 2);
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(ids, vec![1, 2, 3]);
+
+            let changed =
+                traveled.copy_with_options(options(&[("scan.timestamp", "2024-01-02 12:00:01")]));
+            assert!(changed.travel_snapshot().is_none());
+            let resolved = changed
+                .copy_with_time_travel_strict(HashMap::new())
+                .await
+                .unwrap();
+            assert_eq!(resolved.travel_snapshot().unwrap().id(), 2);
+            assert_eq!(resolved.schema().id(), 1);
+
+            let pinned = traveled.copy_with_pinned_snapshot(traveled.travel_snapshot().unwrap());
+            assert!(!pinned.schema().options().contains_key("scan.timestamp"));
+        }
+        for timestamp in ["2024-01-02 12:00:01", "2024-01-02 12:00:02"] {
+            let selected = super::resolve_snapshot(
+                &table.copy_with_options(options(&[("scan.timestamp", timestamp)])),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(selected.id(), 2);
+        }
+        for timestamp in ["2024-01-02 12:00:00.122", "bad timestamp"] {
+            let selected = table.copy_with_options(options(&[("scan.timestamp", timestamp)]));
+            assert!(selected.new_read_builder().new_scan().plan().await.is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn test_copy_with_time_travel_switches_to_snapshot_schema() {
         let (file_io, table_path) = setup_evolved_table().await;
         let table = latest_table(&file_io, &table_path);

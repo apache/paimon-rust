@@ -373,8 +373,9 @@ pub unsafe extern "C" fn paimon_table_latest_snapshot(
 }
 
 /// Time-travel selector option names, in the core's resolution priority order.
-const TIME_TRAVEL_SELECTORS: [&str; 5] = [
+const TIME_TRAVEL_SELECTORS: [&str; 6] = [
     "scan.timestamp-millis",
+    "scan.timestamp",
     "scan.watermark",
     "scan.version",
     "scan.snapshot-id",
@@ -427,6 +428,7 @@ unsafe fn new_read_builder_state(
 
     Ok(ReadBuilderState {
         table: resolved,
+        resources: None,
         projected_columns: None,
         filter: None,
         case_sensitive: true,
@@ -446,7 +448,7 @@ pub unsafe extern "C" fn paimon_table_new_read_builder(
 }
 
 /// Create a ReadBuilder from a Table with scan options (e.g. time-travel
-/// selectors `scan.snapshot-id` / `scan.tag-name` / `scan.timestamp-millis` /
+/// selectors `scan.snapshot-id` / `scan.tag-name` / `scan.timestamp-millis` / `scan.timestamp` /
 /// `scan.watermark` / `scan.version`). At most one time-travel selector may be
 /// set. A selector that does not resolve to a snapshot is an error (never a
 /// silent read-of-latest).
@@ -514,6 +516,32 @@ pub unsafe extern "C" fn paimon_table_new_read_builder_with_options(
 }
 
 // ======================= ReadBuilder ===============================
+
+/// Share a resource context with reads created from this builder.
+///
+/// The builder clones the context, so the caller may free its handle after this call.
+/// Passing null returns an error and leaves the builder unchanged.
+///
+/// # Safety
+/// `rb` must be a valid read builder handle, or null (returns error).
+/// `context` must be a valid resource context handle, or null (returns error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_read_builder_with_resources(
+    rb: *mut paimon_read_builder,
+    context: *const paimon_resource_context,
+) -> *mut paimon_error {
+    if let Err(error) = check_non_null(rb, "rb") {
+        return error;
+    }
+    if let Err(error) = check_non_null(context, "context") {
+        return error;
+    }
+
+    let resources = &*((*context).inner as *const paimon::resource::ResourceContext);
+    let state = &mut *((*rb).inner as *mut ReadBuilderState);
+    state.resources = Some(resources.clone());
+    std::ptr::null_mut()
+}
 
 /// Free a paimon_read_builder.
 ///
@@ -709,6 +737,7 @@ pub unsafe extern "C" fn paimon_read_builder_new_read(
         Ok(table_read) => {
             let read_state = TableReadState {
                 table: state.table.clone(),
+                resources: state.resources.clone(),
                 read_type: table_read.read_type().to_vec(),
                 data_predicates: table_read.data_predicates().to_vec(),
             };
@@ -907,11 +936,14 @@ pub unsafe extern "C" fn paimon_table_read_to_arrow(
     let end = (offset.saturating_add(length)).min(all_splits.len());
     let selected = &all_splits[start..end];
 
-    let table_read = paimon::table::TableRead::new(
+    let mut table_read = paimon::table::TableRead::new(
         &state.table,
         state.read_type.clone(),
         state.data_predicates.clone(),
     );
+    if let Some(resources) = &state.resources {
+        table_read = table_read.with_resources(resources.clone());
+    }
 
     match table_read.to_arrow(selected) {
         Ok(stream) => {
@@ -1924,13 +1956,24 @@ unsafe fn build_leaf_predicate_datums(
 
 /// Combine two predicates with AND. Consumes both inputs.
 ///
+/// If either input is null — e.g. forwarded straight from a leaf constructor
+/// that failed and returned a null predicate — both inputs are freed and null
+/// is returned instead of dereferencing the null pointer (which is undefined
+/// behavior and crashes the host). This mirrors the null tolerance of
+/// `paimon_predicate_free` and `paimon_read_builder_with_filter`.
+///
 /// # Safety
-/// `a` and `b` must be valid pointers from predicate functions.
+/// `a` and `b` must each be a valid pointer from a predicate function, or null.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_and(
     a: *mut paimon_predicate,
     b: *mut paimon_predicate,
 ) -> *mut paimon_predicate {
+    if a.is_null() || b.is_null() {
+        paimon_predicate_free(a);
+        paimon_predicate_free(b);
+        return std::ptr::null_mut();
+    }
     let pred_a = *Box::from_raw(Box::from_raw(a).inner as *mut Predicate);
     let pred_b = *Box::from_raw(Box::from_raw(b).inner as *mut Predicate);
     let combined = Predicate::and(vec![pred_a, pred_b]);
@@ -1940,13 +1983,24 @@ pub unsafe extern "C" fn paimon_predicate_and(
 
 /// Combine two predicates with OR. Consumes both inputs.
 ///
+/// If either input is null — e.g. forwarded straight from a leaf constructor
+/// that failed and returned a null predicate — both inputs are freed and null
+/// is returned instead of dereferencing the null pointer (which is undefined
+/// behavior and crashes the host). This mirrors the null tolerance of
+/// `paimon_predicate_free` and `paimon_read_builder_with_filter`.
+///
 /// # Safety
-/// `a` and `b` must be valid pointers from predicate functions.
+/// `a` and `b` must each be a valid pointer from a predicate function, or null.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_or(
     a: *mut paimon_predicate,
     b: *mut paimon_predicate,
 ) -> *mut paimon_predicate {
+    if a.is_null() || b.is_null() {
+        paimon_predicate_free(a);
+        paimon_predicate_free(b);
+        return std::ptr::null_mut();
+    }
     let pred_a = *Box::from_raw(Box::from_raw(a).inner as *mut Predicate);
     let pred_b = *Box::from_raw(Box::from_raw(b).inner as *mut Predicate);
     let combined = Predicate::or(vec![pred_a, pred_b]);
@@ -1956,10 +2010,18 @@ pub unsafe extern "C" fn paimon_predicate_or(
 
 /// Negate a predicate with NOT. Consumes the input.
 ///
+/// If the input is null — e.g. forwarded straight from a leaf constructor that
+/// failed and returned a null predicate — null is returned instead of
+/// dereferencing the null pointer (which is undefined behavior and crashes the
+/// host). This mirrors the null tolerance of `paimon_predicate_free`.
+///
 /// # Safety
-/// `p` must be a valid pointer from a predicate function.
+/// `p` must be a valid pointer from a predicate function, or null.
 #[no_mangle]
 pub unsafe extern "C" fn paimon_predicate_not(p: *mut paimon_predicate) -> *mut paimon_predicate {
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
     let pred = *Box::from_raw(Box::from_raw(p).inner as *mut Predicate);
     let negated = Predicate::negate(pred);
     let inner = Box::into_raw(Box::new(negated)) as *mut c_void;
@@ -2520,20 +2582,22 @@ mod tests {
     fn malformed_selector_value_does_not_silently_read_latest() {
         unsafe {
             let table = boxed_test_table();
-            let k = CString::new("scan.snapshot-id").unwrap();
-            let v = CString::new("abc").unwrap();
-            let opts = [opt(&k, &v)];
-            // Core swallows the parse error and falls back; the binding reports
-            // the unified "did not resolve" error rather than building a
-            // latest-reading builder.
-            let (code, message) = assert_rb_err_code_message(
-                paimon_table_new_read_builder_with_options(table, opts.as_ptr(), 1),
-            );
-            assert_eq!(code, PaimonErrorCode::InvalidInput as i32);
-            assert!(
-                message.contains("did not resolve"),
-                "message should report the selector did not resolve, got: {message}"
-            );
+            for selector in ["scan.snapshot-id", "scan.timestamp"] {
+                let k = CString::new(selector).unwrap();
+                let v = CString::new("abc").unwrap();
+                let opts = [opt(&k, &v)];
+                // Core swallows the parse error and falls back; the binding reports
+                // the unified "did not resolve" error rather than building a
+                // latest-reading builder.
+                let (code, message) = assert_rb_err_code_message(
+                    paimon_table_new_read_builder_with_options(table, opts.as_ptr(), 1),
+                );
+                assert_eq!(code, PaimonErrorCode::InvalidInput as i32);
+                assert!(
+                    message.contains("did not resolve"),
+                    "message should report the selector did not resolve, got: {message}"
+                );
+            }
             paimon_table_free(table);
         }
     }

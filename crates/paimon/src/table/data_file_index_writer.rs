@@ -34,7 +34,7 @@ struct IndexColumnOptions {
     indexes: BTreeMap<String, Options>,
 }
 
-/// Validated top-level column indexes, enabled explicitly by ordinary append writes.
+/// Validated top-level column indexes for the logical table schema.
 #[derive(Clone)]
 pub(super) struct FileIndexOptions {
     columns: Vec<IndexColumnOptions>,
@@ -175,6 +175,30 @@ impl FileIndexOptions {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(DataFileIndexWriter { columns })
+    }
+
+    /// Keep indexes for fields physically present in a partial-column file.
+    /// A partial file may have a different column order from the table schema;
+    /// its index positions must refer to that file's RecordBatch layout.
+    pub(super) fn project_to_fields(&self, fields: &[DataField]) -> Option<Self> {
+        let columns = self
+            .columns
+            .iter()
+            .filter_map(|column| {
+                fields
+                    .iter()
+                    .position(|field| field.id() == column.field.id())
+                    .map(|position| IndexColumnOptions {
+                        field: column.field.clone(),
+                        position,
+                        indexes: column.indexes.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        (!columns.is_empty()).then_some(Self {
+            columns,
+            in_manifest_threshold: self.in_manifest_threshold,
+        })
     }
 }
 

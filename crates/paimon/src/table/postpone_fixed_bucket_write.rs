@@ -19,6 +19,7 @@ use super::postpone_bucket_plan::data_invalid;
 use super::postpone_fixed_bucket_router::{
     validate_postpone_fixed_bucket_table, PostponeFixedBucketRouter,
 };
+use crate::resource::ResourceContext;
 use crate::spec::CoreOptions;
 use crate::table::{CommitMessage, PostponeBucketPlan, Table, TableCommit, TableWrite};
 use crate::Result;
@@ -38,9 +39,13 @@ impl PostponeFixedBucketTableWrite {
         commit_user: String,
         plan: PostponeBucketPlan,
         overwrite: bool,
+        resources: Option<ResourceContext>,
     ) -> Result<Self> {
         validate_postpone_fixed_bucket_write(table)?;
-        let inner = TableWrite::new(table, commit_user)?;
+        let mut inner = TableWrite::new(table, commit_user)?;
+        if let Some(resources) = resources {
+            inner = inner.with_resources(resources);
+        }
         Ok(Self {
             inner: if overwrite {
                 inner.with_overwrite()

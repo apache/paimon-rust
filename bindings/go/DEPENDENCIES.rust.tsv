@@ -84,6 +84,7 @@ ctutils@0.4.2		X									X
 darling@0.23.0											X				
 darling_core@0.23.0											X				
 darling_macro@0.23.0											X				
+datasketches@0.2.0		X													
 der@0.7.10		X									X				
 diff@0.1.13		X									X				
 digest@0.10.7		X									X				

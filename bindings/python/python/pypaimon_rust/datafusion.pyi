@@ -59,6 +59,14 @@ class Plan:
 class TableScan:
     def with_row_position_slice(self, start: int, end: int) -> "TableScan": ...
     def with_row_position_shard(self, index: int, count: int) -> "TableScan": ...
+    def with_chunk_shuffle(self, seed: str, chunk_size: int) -> "TableScan":
+        """Deterministically shuffle fixed-live-row chunks. ``seed`` is a decimal
+        integer string so arbitrarily large seeds keep Python ``random.Random``
+        semantics."""
+        ...
+    def with_shard(self, index: int, count: int) -> "TableScan":
+        """Select one balanced worker shard (``index`` of ``count``) for a distributed scan."""
+        ...
     def plan(self) -> Plan: ...
 
 class RecordBatchReader:
@@ -77,6 +85,10 @@ class TableRead:
 
 class ReadBuilder:
     def with_projection(self, columns: List[str]) -> "ReadBuilder": ...
+    def with_nested_projection(self, paths: List[List[str]]) -> "ReadBuilder":
+        """Project top-level fields or nested ROW leaves by exact name paths. A MAP
+        path keeps the complete MAP so the caller can extract literal keys."""
+        ...
     def with_case_sensitive(self, case_sensitive: bool) -> "ReadBuilder":
         """
         Set whether column-name matching (projection and predicate column
@@ -154,6 +166,13 @@ class Table:
         REST authorization or credential refresh is required.
         """
         ...
+    @staticmethod
+    def from_rest_response(
+        response_json: str, *, database: str, table: str, rest_options: Dict[str, str],
+    ) -> "Table":
+        """Reuse matching REST metadata and merged catalog options."""
+        ...
+
     def copy_with_resolved_schema(self, schema_json: str, *, branch: Optional[str] = None) -> "Table":
         """Replace all fields/options, preserving FileIO, REST context and branch."""
         ...
@@ -252,6 +271,9 @@ class StreamTableCommit:
     def abort(self, messages: Sequence[CommitMessage]) -> None: ...
 
 class BatchWriteBuilder:
+    def _with_commit_user(self, commit_user: str) -> "BatchWriteBuilder":
+        """Internal PyPaimon bridge for commits produced by an external Python writer."""
+        ...
     def with_overwrite(self, static_partition: Optional[Dict[str, Any]] = {}) -> "BatchWriteBuilder":
         """Configure both writer and committer. Explicit None restores append.
 

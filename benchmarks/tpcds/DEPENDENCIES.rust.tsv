@@ -129,6 +129,7 @@ datafusion-physical-plan@54.0.0		X
 datafusion-pruning@54.0.0		X														
 datafusion-session@54.0.0		X														
 datafusion-sql@54.0.0		X														
+datasketches@0.2.0		X														
 diff@0.1.13		X									X					
 digest@0.10.7		X									X					
 digest@0.11.3		X									X					

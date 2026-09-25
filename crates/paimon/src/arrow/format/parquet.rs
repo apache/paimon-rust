@@ -54,8 +54,8 @@ use parquet::file::statistics::Statistics as ParquetStatistics;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 
 pub(crate) struct ParquetFormatReader {
     read_budget: Option<Arc<ReadBudget>>,
@@ -465,6 +465,10 @@ impl FormatFileWriter for ParquetFormatWriter {
         self.inner.in_progress_size()
     }
 
+    fn pending_rows(&self) -> Option<usize> {
+        Some(self.inner.in_progress_rows())
+    }
+
     async fn flush(&mut self) -> crate::Result<()> {
         self.inner
             .flush()
@@ -723,6 +727,21 @@ impl FormatFileReader for ParquetFormatReader {
             }
         }
 
+        let mut memory_mask = mask.clone();
+        for predicate in &decoder_predicates {
+            memory_mask.union(predicate.projection());
+        }
+        // Resource-aware sequential reads build one row-group stream at a time,
+        // so admission precedes its data I/O. Preserve stateful decoder filters
+        // across those streams instead of recreating the engine's factory.
+        let shared_filters = if self.read_budget.as_ref().is_some_and(|b| b.has_resources()) {
+            std::mem::take(&mut decoder_predicates)
+                .into_iter()
+                .map(SharedParquetPredicate::new)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         if !decoder_predicates.is_empty() {
             batch_stream_builder =
                 batch_stream_builder.with_row_filter(ParquetRowFilter::new(decoder_predicates));
@@ -766,7 +785,8 @@ impl FormatFileReader for ParquetFormatReader {
         //
         // Row-group receivers are consumed in order and buffer one batch each,
         // preserving positional `_ROW_ID`, sort order, and batch backpressure.
-        // Reads with predicates retain the original single-stream path.
+        // Reads with predicates stay sequential; resource-aware reads reserve
+        // each row group before opening its decoder.
         let read_budget = self
             .read_budget
             .as_ref()
@@ -781,7 +801,9 @@ impl FormatFileReader for ParquetFormatReader {
         let selected_row_groups = self
             .read_budget
             .as_ref()
-            .filter(|budget| row_group_parallelism > 1 || budget.diagnostics_enabled())
+            .filter(|budget| {
+                row_group_parallelism > 1 || budget.diagnostics_enabled() || budget.has_resources()
+            })
             .map(|budget| {
                 let mut row_group_selection = combined_selection;
                 let selected_row_groups = batch_stream_builder
@@ -799,7 +821,12 @@ impl FormatFileReader for ParquetFormatReader {
                         {
                             return None;
                         }
-                        let projected_bytes = projected_row_group_bytes(row_group, &mask);
+                        let projection = if budget.has_resources() {
+                            &memory_mask
+                        } else {
+                            &mask
+                        };
+                        let projected_bytes = projected_row_group_bytes(row_group, projection);
                         Some((row_group_index, selection, projected_bytes))
                     })
                     .collect::<Vec<_>>();
@@ -825,17 +852,38 @@ impl FormatFileReader for ParquetFormatReader {
                     let Ok(slot) = row_group_tx.reserve().await else {
                         return;
                     };
-                    let permit = match tokio::select! {
+                    let (batch_tx, batch_rx) = mpsc::channel(1);
+                    let (demand_tx, demand_rx) = oneshot::channel();
+                    slot.send((batch_rx, demand_tx));
+                    let admitted = tokio::select! {
                         _ = row_group_tx.closed() => return,
                         permit = read_budget.acquire(projected_bytes) => permit,
-                    } {
+                    };
+                    let admitted = match admitted {
+                        Err(Error::ResourceExhausted { .. }) => {
+                            // Speculative prefetch must not fail a read merely
+                            // because an earlier group is still decoding. Retry
+                            // once this group is actually requested, after the
+                            // consumer has drained its predecessors. Never wait
+                            // for the caller to drop retained output buffers.
+                            tokio::select! {
+                                _ = row_group_tx.closed() => return,
+                                _ = demand_rx => {},
+                            }
+                            tokio::select! {
+                                _ = row_group_tx.closed() => return,
+                                permit = read_budget.acquire(projected_bytes) => permit,
+                            }
+                        }
+                        other => other,
+                    };
+                    let permit = match admitted {
                         Ok(permit) => permit,
                         Err(error) => {
-                            slot.send(Err(error));
+                            let _ = batch_tx.send(ParquetRowGroupMessage::Error(error)).await;
                             return;
                         }
                     };
-                    let (batch_tx, batch_rx) = mpsc::channel(1);
                     let row_group_reader = Arc::clone(&shared_reader);
                     let row_group_metadata = reader_metadata.clone();
                     let row_group_mask = mask.clone();
@@ -850,17 +898,17 @@ impl FormatFileReader for ParquetFormatReader {
                         permit,
                         batch_tx,
                     ));
-                    slot.send(Ok(batch_rx));
                 }
             });
             let stream = async_stream::try_stream! {
                 for _ in 0..row_group_count {
-                    let mut batches = row_group_rx.recv().await.ok_or_else(|| {
+                    let (mut batches, demand) = row_group_rx.recv().await.ok_or_else(|| {
                         Error::UnexpectedError {
                             message: "Parquet row-group coordinator stopped early".to_string(),
                             source: None,
                         }
-                    })??;
+                    })?;
+                    let _ = demand.send(());
                     let mut completed = false;
                     while let Some(message) = batches.recv().await {
                         match message {
@@ -886,6 +934,46 @@ impl FormatFileReader for ParquetFormatReader {
                 }
             };
             return Ok(stream.boxed());
+        }
+
+        if let Some(budget) = self.read_budget.as_ref().filter(|b| b.has_resources()) {
+            let budget = Arc::clone(budget);
+            let selected = selected_row_groups.expect("resource-aware reads need a selection plan");
+            let metadata = ArrowReaderMetadata::try_new(
+                batch_stream_builder.metadata().clone(),
+                ArrowReaderOptions::new(),
+            )?;
+            let residual = (!all_enforced).then(|| FilePredicates {
+                predicates: preds.to_vec(),
+                row_filter_factory: None,
+                file_fields: file_fields.to_vec(),
+            });
+            return Ok(async_stream::try_stream! {
+                for (index, selection, estimated_bytes) in selected {
+                    // Foreground and merge reads only try memory admission. They
+                    // never hold a shared scheduling slot while awaiting another
+                    // merge input, nor wait for output buffers owned downstream.
+                    let _permit = budget.reserve_memory(estimated_bytes)?;
+                    let mut stream = build_row_group_stream(
+                        Arc::clone(&shared_reader), file_size, metadata.clone(), mask.clone(),
+                        index, batch_size, selection, shared_filters.clone(),
+                    )?;
+                    while let Some(batch) = stream.next().await {
+                        let batch = batch.map_err(Error::from)?;
+                        let batch = match &map_read_plan {
+                            Some(plan) => plan.assemble_batch(&batch)?,
+                            None => batch,
+                        };
+                        let batch = match &residual {
+                            Some(predicates) => crate::arrow::residual::filter_record_batch_by_predicates(
+                                batch, predicates, &scan_fields,
+                            )?,
+                            None => batch,
+                        };
+                        yield batch;
+                    }
+                }
+            }.boxed());
         }
 
         let batch_stream = batch_stream_builder.build()?;
@@ -977,58 +1065,139 @@ async fn read_row_group(
     row_group_index: usize,
     batch_size: Option<usize>,
     selection: Option<RowSelection>,
-    _permit: ReadPermit,
+    permit: ReadPermit,
     sender: mpsc::Sender<ParquetRowGroupMessage>,
 ) {
+    let stream = match build_row_group_stream(
+        reader,
+        file_size,
+        reader_metadata,
+        projection,
+        row_group_index,
+        batch_size,
+        selection,
+        Vec::new(),
+    ) {
+        Ok(stream) => stream,
+        Err(error) => {
+            drop(permit);
+            let _ = sender.send(ParquetRowGroupMessage::Error(error)).await;
+            return;
+        }
+    };
+    forward_row_group_batches(stream, sender, Some(permit)).await;
+}
+
+#[derive(Clone)]
+struct SharedParquetPredicate {
+    projection: ProjectionMask,
+    inner: Arc<Mutex<Box<dyn ArrowPredicate>>>,
+}
+
+impl SharedParquetPredicate {
+    fn new(predicate: Box<dyn ArrowPredicate>) -> Self {
+        Self {
+            projection: predicate.projection().clone(),
+            inner: Arc::new(Mutex::new(predicate)),
+        }
+    }
+}
+
+impl ArrowPredicate for SharedParquetPredicate {
+    fn projection(&self) -> &ProjectionMask {
+        &self.projection
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, arrow_schema::ArrowError> {
+        self.inner
+            .lock()
+            .map_err(|_| {
+                arrow_schema::ArrowError::ComputeError(
+                    "Parquet row predicate mutex was poisoned".into(),
+                )
+            })?
+            .evaluate(batch)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_row_group_stream(
+    reader: Arc<dyn FileRead>,
+    file_size: u64,
+    metadata: ArrowReaderMetadata,
+    projection: ProjectionMask,
+    index: usize,
+    batch_size: Option<usize>,
+    selection: Option<RowSelection>,
+    predicates: Vec<SharedParquetPredicate>,
+) -> crate::Result<parquet::arrow::async_reader::ParquetRecordBatchStream<ArrowFileReader>> {
     let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
         ArrowFileReader::new(file_size, reader),
-        reader_metadata,
+        metadata,
     )
     .with_projection(projection)
-    .with_row_groups(vec![row_group_index]);
+    .with_row_groups(vec![index]);
     if let Some(selection) = selection {
         builder = builder.with_row_selection(selection);
     }
     if let Some(size) = batch_size {
         builder = builder.with_batch_size(size);
     }
-    let mut stream = match builder.build() {
-        Ok(stream) => stream,
-        Err(error) => {
-            let _ = sender
-                .send(ParquetRowGroupMessage::Error(error.into()))
-                .await;
-            return;
-        }
-    };
-
-    forward_row_group_batches(&mut stream, sender).await;
+    if !predicates.is_empty() {
+        builder = builder.with_row_filter(ParquetRowFilter::new(
+            predicates
+                .into_iter()
+                .map(|p| Box::new(p) as Box<dyn ArrowPredicate>)
+                .collect(),
+        ));
+    }
+    builder.build().map_err(Error::from)
 }
 
-async fn forward_row_group_batches<S, E>(
-    mut stream: S,
+fn forward_row_group_batches<S, E>(
+    stream: S,
     sender: mpsc::Sender<ParquetRowGroupMessage>,
-) where
+    permit: Option<ReadPermit>,
+) -> impl std::future::Future<Output = ()>
+where
     S: futures::Stream<Item = std::result::Result<RecordBatch, E>> + Unpin,
     E: Into<Error>,
 {
-    loop {
-        let Ok(slot) = sender.reserve().await else {
-            return;
-        };
-        let next = tokio::select! {
-            _ = sender.closed() => return,
-            next = stream.next() => next,
-        };
-        match next {
-            Some(Ok(batch)) => slot.send(ParquetRowGroupMessage::Batch(batch)),
-            Some(Err(error)) => {
-                slot.send(ParquetRowGroupMessage::Error(error.into()));
+    // Struct fields drop in declaration order, even if the future is cancelled
+    // before its first poll. Keep the working reservation until the decoder drops.
+    struct ReservedDecoder<S> {
+        stream: S,
+        _permit: Option<ReadPermit>,
+    }
+    let mut decoder = ReservedDecoder {
+        stream,
+        _permit: permit,
+    };
+    async move {
+        loop {
+            let Ok(slot) = sender.reserve().await else {
                 return;
-            }
-            None => {
-                slot.send(ParquetRowGroupMessage::Done);
-                return;
+            };
+            let next = tokio::select! {
+                _ = sender.closed() => return,
+                next = decoder.stream.next() => next,
+            };
+            match next {
+                Some(Ok(batch)) => {
+                    slot.send(ParquetRowGroupMessage::Batch(batch));
+                }
+                Some(Err(error)) => {
+                    drop(decoder);
+                    slot.send(ParquetRowGroupMessage::Error(error.into()));
+                    return;
+                }
+                None => {
+                    // Release decoder buffers and their working estimate before
+                    // the next demanded group retries.
+                    drop(decoder);
+                    slot.send(ParquetRowGroupMessage::Done);
+                    return;
+                }
             }
         }
     }
@@ -1431,6 +1600,12 @@ fn build_row_group_column_indices(
 ) -> Vec<Option<usize>> {
     let mut by_root_name: HashMap<&str, Option<usize>> = HashMap::new();
     for (column_index, column) in columns.iter().enumerate() {
+        // Only a top-level, non-repeated leaf has row-level statistics for its
+        // logical field. Nested leaf null counts (e.g. payload.child) and
+        // repeated element counts cannot describe their parent column.
+        if column.column_path().parts().len() != 1 || column.column_descr().max_rep_level() != 0 {
+            continue;
+        }
         let Some(root_name) = column.column_path().parts().first() else {
             continue;
         };
@@ -1619,6 +1794,8 @@ fn supports_manifest_min_max(data_type: &DataType) -> bool {
             | DataType::BigInt(_)
             | DataType::Char(_)
             | DataType::VarChar(_)
+            | DataType::Binary(_)
+            | DataType::VarBinary(_)
             | DataType::Decimal(_)
             | DataType::Double(_)
             | DataType::Float(_)
@@ -1639,10 +1816,10 @@ fn apply_stats_mode(
         return (min_datum, max_datum);
     };
     match data_type {
-        DataType::Char(_) | DataType::VarChar(_) => {
-            let min = min_datum.map(|datum| truncate_string_min_datum(datum, length));
+        DataType::Char(_) | DataType::VarChar(_) | DataType::Binary(_) | DataType::VarBinary(_) => {
+            let min = min_datum.map(|datum| truncate_min_datum(datum, length));
             let max = match max_datum {
-                Some(datum) => match truncate_string_max_datum(datum, length) {
+                Some(datum) => match truncate_max_datum(datum, length) {
                     Some(max) => Some(max),
                     None => return (None, None),
                 },
@@ -1654,18 +1831,35 @@ fn apply_stats_mode(
     }
 }
 
-fn truncate_string_min_datum(datum: Datum, length: usize) -> Datum {
+fn truncate_min_datum(datum: Datum, length: usize) -> Datum {
     match datum {
         Datum::String(value) => Datum::String(truncate_string_min(&value, length)),
+        Datum::Bytes(value) => Datum::Bytes(value.into_iter().take(length).collect()),
         other => other,
     }
 }
 
-fn truncate_string_max_datum(datum: Datum, length: usize) -> Option<Datum> {
+fn truncate_max_datum(datum: Datum, length: usize) -> Option<Datum> {
     match datum {
         Datum::String(value) => truncate_string_max(&value, length).map(Datum::String),
+        Datum::Bytes(value) => truncate_binary_max(&value, length).map(Datum::Bytes),
         other => Some(other),
     }
+}
+
+fn truncate_binary_max(value: &[u8], length: usize) -> Option<Vec<u8>> {
+    if value.len() <= length {
+        return Some(value.to_vec());
+    }
+    let mut prefix = value[..length].to_vec();
+    for idx in (0..prefix.len()).rev() {
+        if prefix[idx] != u8::MAX {
+            prefix[idx] += 1;
+            prefix.truncate(idx + 1);
+            return Some(prefix);
+        }
+    }
+    None
 }
 
 fn truncate_string_min(value: &str, length: usize) -> String {
@@ -2583,10 +2777,12 @@ mod tests {
         PredicateOperator, RowSelection,
     };
     use crate::arrow::format::{
-        create_format_reader, create_format_writer, FormatFileReader, FormatFileWriter,
+        create_format_reader, create_format_writer, with_write_resources, FormatFileReader,
+        FormatFileWriter,
     };
     use crate::arrow::{build_target_arrow_schema, variant_arrow_type, ReadBudget};
     use crate::io::FileIOBuilder;
+    use crate::resource::ResourceContext;
     use crate::spec::{
         ArrayType, BigIntType, DataField, DataType, Datum, IntType, LocalZonedTimestampType,
         MapType, PredicateBuilder, TimestampType, VarCharType, VariantType,
@@ -2602,7 +2798,7 @@ mod tests {
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::{StreamExt, TryStreamExt};
     use parquet::basic::{Compression, GzipLevel, ZstdLevel};
-    use parquet::file::properties::EnabledStatistics;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::file::statistics::Statistics as ParquetStatistics;
     use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
     use std::collections::HashMap;
@@ -2616,6 +2812,29 @@ mod tests {
             DataField::new(0, "id".to_string(), DataType::Int(IntType::new())),
             DataField::new(1, "score".to_string(), DataType::Int(IntType::new())),
         ]
+    }
+
+    #[test]
+    fn test_truncate_binary_stats_matches_java_unsigned_upper_bound() {
+        use crate::spec::MetadataStatsMode;
+
+        let binary = DataType::VarBinary(crate::spec::VarBinaryType::new(8).unwrap());
+        let (min, max) = super::apply_stats_mode(
+            &binary,
+            MetadataStatsMode::Truncate(2),
+            Some(Datum::Bytes(vec![0x12, 0xff, 0x01])),
+            Some(Datum::Bytes(vec![0x12, 0xff, 0xfe])),
+        );
+        assert_eq!(min, Some(Datum::Bytes(vec![0x12, 0xff])));
+        assert_eq!(max, Some(Datum::Bytes(vec![0x13])));
+
+        let (min, max) = super::apply_stats_mode(
+            &binary,
+            MetadataStatsMode::Truncate(1),
+            Some(Datum::Bytes(vec![0xfe, 0x01])),
+            Some(Datum::Bytes(vec![0xff, 0x01])),
+        );
+        assert_eq!((min, max), (None, None));
     }
 
     fn test_parquet_schema() -> SchemaDescriptor {
@@ -3401,7 +3620,7 @@ mod tests {
                     tracked_polls.fetch_add(1, AtomicOrdering::SeqCst);
                 });
         let (tx, mut rx) = mpsc::channel(1);
-        let task = tokio::spawn(forward_row_group_batches(stream, tx));
+        let task = tokio::spawn(forward_row_group_batches(stream, tx, None));
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
@@ -3421,6 +3640,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_row_group_drops_decoder_before_returning_memory() {
+        use crate::resource::ResourceContext;
+
+        struct Decoder {
+            resources: ResourceContext,
+            charge_at_drop: Arc<AtomicUsize>,
+        }
+        impl futures::Stream for Decoder {
+            type Item = Result<RecordBatch, Error>;
+
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+        impl Drop for Decoder {
+            fn drop(&mut self) {
+                self.charge_at_drop.store(
+                    self.resources.metrics().reserved_memory_bytes,
+                    AtomicOrdering::SeqCst,
+                );
+            }
+        }
+
+        for mode in 0..3 {
+            let resources = ResourceContext::builder().memory_limit(8).build().unwrap();
+            let budget = ReadBudget::default().with_resources(resources.clone());
+            let permit = budget.reserve_memory(8).unwrap();
+            let charge_at_drop = Arc::new(AtomicUsize::new(usize::MAX));
+            let decoder = Decoder {
+                resources: resources.clone(),
+                charge_at_drop: charge_at_drop.clone(),
+            };
+            let (tx, rx) = mpsc::channel(1);
+            let mut forwarding = Box::pin(forward_row_group_batches(decoder, tx, Some(permit)));
+            if mode > 0 {
+                assert!(futures::poll!(&mut forwarding).is_pending());
+            }
+            if mode == 2 {
+                drop(rx);
+                forwarding.as_mut().await;
+            }
+            // Cover an unpolled future, cancellation during I/O, and a closed receiver.
+            drop(forwarding);
+            assert_eq!(
+                charge_at_drop.load(AtomicOrdering::SeqCst),
+                8,
+                "mode {mode}"
+            );
+            assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
     async fn test_row_group_batch_forwarding_stops_during_pending_io() {
         let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
         let mut polled_tx = Some(polled_tx);
@@ -3431,7 +3706,7 @@ mod tests {
             std::task::Poll::Pending::<Option<Result<RecordBatch, Error>>>
         });
         let (tx, rx) = mpsc::channel(1);
-        let task = tokio::spawn(forward_row_group_batches(stream, tx));
+        let task = tokio::spawn(forward_row_group_batches(stream, tx, None));
 
         polled_rx.await.unwrap();
         drop(rx);
@@ -3439,6 +3714,65 @@ mod tests {
             .await
             .expect("dropping the receiver must cancel a pending row-group read")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_resource_charge_releases_auto_flushed_row_group_with_tail() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_parquet_writer_resource_auto_flush.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let schema = writer_arrow_schema();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build();
+        let inner = AsyncArrowWriter::try_new(
+            output.async_writer().await.unwrap(),
+            schema.clone(),
+            Some(props),
+        )
+        .unwrap();
+        let first = writer_test_batch(&schema, vec![1, 2, 3, 4, 5], vec![10, 20, 30, 40, 50]);
+        let second = writer_test_batch(&schema, vec![6, 7, 8, 9], vec![60, 70, 80, 90]);
+        let first_bytes = first.get_array_memory_size();
+        let second_bytes = second.get_array_memory_size();
+        let resources = ResourceContext::builder()
+            .memory_limit(first_bytes + second_bytes / 2)
+            .build()
+            .unwrap();
+        let mut writer = with_write_resources(
+            Box::new(ParquetFormatWriter {
+                inner,
+                input_schema: schema.clone(),
+                schema,
+                write_fields: None,
+                stats_modes: None,
+                stats_dense_store: false,
+            }),
+            Some(&resources),
+        );
+
+        writer.write(&first).await.unwrap();
+        assert!(writer.in_progress_size() > 0);
+        assert_eq!(
+            resources.metrics().reserved_memory_bytes,
+            first_bytes.div_ceil(5)
+        );
+        writer.write(&second).await.unwrap();
+        assert_eq!(
+            resources.metrics().reserved_memory_bytes,
+            second_bytes.div_ceil(4)
+        );
+        writer.close().await.unwrap();
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        let reader =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
+        let total_rows: usize = reader
+            .into_iter()
+            .map(|batch| batch.unwrap().num_rows())
+            .sum();
+        assert_eq!(total_rows, 9);
     }
 
     #[tokio::test]
@@ -4334,6 +4668,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_admission_precedes_data_reads_on_all_parquet_paths() {
+        use crate::resource::ResourceContext;
+        for (group_rows, parallelism, filtered) in [
+            (16, 4, false),
+            (64, 4, false),
+            (16, 1, false),
+            (16, 4, true),
+        ] {
+            let data = Bytes::from(
+                write_multi_row_group_parquet(group_rows, 64, EnabledStatistics::None, true).await,
+            );
+            let tracker = TrackingFileRead::new(data.clone());
+            let resources = ResourceContext::builder().memory_limit(0).build().unwrap();
+            let budget = Arc::new(
+                ReadBudget::new(parallelism, 1024 * 1024)
+                    .unwrap()
+                    .with_resources(resources.clone()),
+            );
+            let fields = vec![int_field("id"), int_field("value")];
+            let predicates = filtered.then(|| FilePredicates {
+                predicates: vec![PredicateBuilder::new(&fields)
+                    .greater_than("value", Datum::Int(10))
+                    .unwrap()],
+                row_filter_factory: None,
+                file_fields: fields.clone(),
+            });
+            let mut stream = ParquetFormatReader::with_read_budget(budget)
+                .read_batch_stream(
+                    Box::new(tracker.clone()),
+                    data.len() as u64,
+                    &fields[..1],
+                    predicates.as_ref(),
+                    Some(16),
+                    None,
+                )
+                .await
+                .unwrap();
+            tracker.reset();
+            assert!(matches!(
+                stream.next().await.unwrap(),
+                Err(Error::ResourceExhausted { .. })
+            ));
+            assert!(stream.next().await.is_none());
+            assert_eq!(
+                tracker.bytes_read(),
+                0,
+                "rejected work must not start data I/O"
+            );
+            assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_memory_pressure_reduces_prefetch_without_failing_the_read() {
+        use crate::resource::ResourceContext;
+        let data = Bytes::from(
+            write_multi_row_group_parquet(64, 256, EnabledStatistics::Chunk, false).await,
+        );
+        let metadata = load_metadata_with_page_index(&data, true);
+        let mask = super::ProjectionMask::roots(metadata.file_metadata().schema_descr(), [0]);
+        let limit = metadata
+            .row_groups()
+            .iter()
+            .map(|rg| super::projected_row_group_bytes(rg, &mask))
+            .max()
+            .unwrap() as usize;
+        // Only one row group fits; the consumer owns its output batches.
+        let resources = ResourceContext::builder()
+            .memory_limit(limit)
+            .build()
+            .unwrap();
+        let budget = Arc::new(
+            ReadBudget::new(8, 256 * 1024 * 1024)
+                .unwrap()
+                .with_resources(resources.clone()),
+        );
+        budget.enable_diagnostics();
+        let mut stream = ParquetFormatReader::with_read_budget(budget.clone())
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &[int_field("id")],
+                None,
+                Some(16),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        while let Some(batch) = tokio::time::timeout(Duration::from_secs(2), stream.try_next())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ids.extend_from_slice(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values(),
+            );
+        }
+        assert_eq!(ids, (0..256).collect::<Vec<_>>());
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        assert!(resources.metrics().peak_reserved_memory_bytes <= limit);
+        assert_eq!(budget.diagnostics().peak_inflight, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_shared_budget_prefetch_releases_memory_with_escaped_output() {
+        use crate::resource::ResourceContext;
+        let data = Bytes::from(
+            write_multi_row_group_parquet(64, 256, EnabledStatistics::Chunk, false).await,
+        );
+        let resources = ResourceContext::builder()
+            .memory_limit(1024 * 1024)
+            .build()
+            .unwrap();
+        let budget = Arc::new(
+            ReadBudget::new(4, 256 * 1024 * 1024)
+                .unwrap()
+                .with_resources(resources.clone()),
+        );
+        budget.enable_diagnostics();
+        let mut stream = ParquetFormatReader::with_read_budget(budget.clone())
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &[int_field("id")],
+                None,
+                Some(16),
+                None,
+            )
+            .await
+            .unwrap();
+        let batch = stream.try_next().await.unwrap().unwrap();
+        let escaped = batch.column(0).slice(0, 1);
+        drop(batch);
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.diagnostics().current_inflight != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        assert_eq!(
+            escaped
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            0
+        );
+        drop(escaped);
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn filtered_resource_reads_reserve_predicate_columns_and_preserve_row_selection() {
+        use crate::resource::ResourceContext;
+        let data =
+            Bytes::from(write_multi_row_group_parquet(16, 64, EnabledStatistics::None, true).await);
+        let metadata = load_metadata_with_page_index(&data, false);
+        let mask = super::ProjectionMask::roots(metadata.file_metadata().schema_descr(), [0]);
+        let id_only = super::projected_row_group_bytes(&metadata.row_groups()[0], &mask) as usize;
+        let fields = vec![int_field("id"), int_field("value")];
+        let predicates = FilePredicates {
+            predicates: vec![PredicateBuilder::new(&fields)
+                .greater_or_equal("value", Datum::Int(250))
+                .unwrap()],
+            row_filter_factory: None,
+            file_fields: fields.clone(),
+        };
+        for limit in [id_only, 1024 * 1024] {
+            let resources = ResourceContext::builder()
+                .memory_limit(limit)
+                .build()
+                .unwrap();
+            let budget = Arc::new(
+                ReadBudget::new(4, 1024 * 1024)
+                    .unwrap()
+                    .with_resources(resources.clone()),
+            );
+            let mut stream = ParquetFormatReader::with_read_budget(budget)
+                .read_batch_stream(
+                    Box::new(TrackingFileRead::new(data.clone())),
+                    data.len() as u64,
+                    &fields[..1],
+                    Some(&predicates),
+                    Some(8),
+                    Some(vec![RowRange::new(10, 54)]),
+                )
+                .await
+                .unwrap();
+            if limit == id_only {
+                assert!(matches!(
+                    stream.next().await.unwrap(),
+                    Err(Error::ResourceExhausted { .. })
+                ));
+                assert!(stream.next().await.is_none());
+            } else {
+                let mut ids = Vec::new();
+                while let Some(batch) = stream.try_next().await.unwrap() {
+                    ids.extend_from_slice(
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values(),
+                    );
+                }
+                assert_eq!(ids, (25..=54).collect::<Vec<_>>());
+            }
+            assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
     async fn test_sparse_read_buffer_owners_and_cancellation() {
         use crate::io::FileRead;
         use rand::{RngCore, SeedableRng};
@@ -5013,6 +5569,7 @@ mod tests {
         .unwrap();
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+            .set_max_row_group_row_count(Some(16))
             .build();
         let mut bytes = Vec::new();
         {
@@ -5045,22 +5602,38 @@ mod tests {
             file_fields: fields.clone(),
         };
 
-        ParquetFormatReader::default()
-            .read_batch_stream(
-                Box::new(input.reader().await.unwrap()),
-                file_size,
-                &fields[..1],
-                Some(&predicates),
-                None,
-                None,
-            )
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
+        let resources = crate::resource::ResourceContext::builder()
+            .memory_limit(1024 * 1024)
+            .build()
             .unwrap();
+        for reader in [
+            ParquetFormatReader::default(),
+            ParquetFormatReader::with_read_budget(Arc::new(
+                ReadBudget::default().with_resources(resources.clone()),
+            )),
+        ] {
+            order.lock().unwrap().clear();
+            reader
+                .read_batch_stream(
+                    Box::new(input.reader().await.unwrap()),
+                    file_size,
+                    &fields[..1],
+                    Some(&predicates),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
 
-        assert_eq!(*order.lock().unwrap(), vec!["small", "large"]);
+            assert_eq!(
+                *order.lock().unwrap(),
+                vec!["small", "large", "small", "large"]
+            );
+            assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        }
     }
 
     /// Read `[name]` from the `(id, name, age)` parquet file under `predicates`

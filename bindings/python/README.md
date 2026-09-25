@@ -97,7 +97,8 @@ commit_messages = writer.prepare_commit()
 write_builder.new_commit().commit(commit_messages)
 
 # --- Time travel: read a past version ---
-# Supported options: scan.version, scan.timestamp-millis, scan.snapshot-id, or scan.tag-name
+# Supported selectors: scan.version, scan.timestamp, scan.timestamp-millis,
+# scan.snapshot-id, scan.tag-name, or scan.watermark
 read_builder_tt = table.new_read_builder({"scan.snapshot-id": "1"})
 scan_tt = read_builder_tt.new_scan()
 plan_tt = scan_tt.plan()
@@ -195,6 +196,11 @@ REST tables load the latest snapshot through the catalog, including empty
 results and branch-scoped requests. Permission and service failures (including
 HTTP 501) are propagated as in Java, and the
 FileIO provider continues to refresh catalog credentials after schema replacement.
+
+`Table.from_rest_response(response_json, database=..., table=..., rest_options=...)`
+reuses the matching REST table response and merged catalog options, skipping
+config/get-table requests while preserving REST snapshots and token refresh.
+Use `copy_with_resolved_schema` to apply branch or dynamic options.
 
 ## Setup
 

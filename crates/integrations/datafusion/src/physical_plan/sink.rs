@@ -137,13 +137,15 @@ impl DataSink for PaimonDataSink {
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
+        context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
         let wb = if self.overwrite {
             self.table.new_write_builder().with_overwrite()
         } else {
             self.table.new_write_builder()
         };
+        let resources = crate::memory::writer_resources(context).map_err(to_datafusion_error)?;
+        let wb = wb.with_resources(resources);
         let mut tw = wb.new_write().map_err(to_datafusion_error)?;
         let mut row_count = 0u64;
 

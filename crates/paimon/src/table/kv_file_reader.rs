@@ -25,7 +25,7 @@
 //!
 //! Reference: Java Paimon `SortMergeReaderWithMinHeap`.
 
-use super::data_file_reader::DataFileReader;
+use super::data_file_reader::{file_index_selection_to_local_ranges, DataFileReader};
 use super::sort_merge::{
     AggregateMergeFunction, DeduplicateMergeFunction, FirstRowMergeFunction, MergeFunction,
     PartialUpdateMergeFunction, SortMergeReaderBuilder,
@@ -33,6 +33,8 @@ use super::sort_merge::{
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::{build_target_arrow_schema, ReadBudget};
 use crate::deletion_vector::DeletionVectorFactory;
+use crate::file_index::evaluator::evaluate_file_index;
+use crate::file_index::file_index_result::FileIndexResult;
 use crate::io::FileIO;
 use crate::spec::{
     BigIntType, CoreOptions, DataField, DataFileMeta, DataType as PaimonDataType, MergeEngine,
@@ -566,6 +568,8 @@ impl KeyValueFileReader {
         let config = self.config;
         let table_schema_id = config.table_schema_id;
         let pushdown_predicates = self.pushdown_predicates;
+        let file_index_read_enabled =
+            CoreOptions::new(&config.table_options).file_index_read_enabled();
         #[cfg(test)]
         let input_batch_sizes = self.input_batch_sizes;
 
@@ -616,7 +620,9 @@ impl KeyValueFileReader {
                     let group_parquet_read_budget = if input_stream_count == 1 {
                         config.parquet_read_budget.clone()
                     } else {
-                        None
+                        config.parquet_read_budget.as_ref()
+                            .filter(|budget| budget.has_resources())
+                            .map(|budget| Arc::new(budget.without_prefetch()))
                     };
                     let mut file_streams: Vec<ArrowRecordBatchStream> = Vec::new();
 
@@ -637,6 +643,7 @@ impl KeyValueFileReader {
                         let run_table_fields = config.table_fields.clone();
                         let run_primary_keys = config.primary_keys.clone();
                         let run_file_io = file_io.clone();
+                        let run_index_predicates = pushdown_predicates.clone();
                         let deletion_files_by_split = deletion_files_by_split.clone();
                         let run_stream: ArrowRecordBatchStream = Box::pin(try_stream! {
                             for MergeFile { split, file: file_meta } in files {
@@ -656,6 +663,32 @@ impl KeyValueFileReader {
                                 let key_names = file_key_names.as_deref().unwrap_or(&run_primary_keys);
                                 let data_schema_fields =
                                     key_value_data_schema_fields(file_fields, key_names)?;
+                                // Only the PK-only predicate projection may run before
+                                // sort-merge. A value index can match an old version of
+                                // a key, so it must not prune merge inputs here.
+                                let row_ranges = if file_index_read_enabled {
+                                    match evaluate_file_index(
+                                        &run_file_io,
+                                        split.bucket_path(),
+                                        &file_meta,
+                                        &run_table_fields,
+                                        file_fields,
+                                        &run_index_predicates,
+                                    ).await? {
+                                        FileIndexResult::Skip => continue,
+                                        FileIndexResult::Selection(selection)
+                                            if split.row_ranges().is_none()
+                                                && file_meta.first_row_id.is_none() => {
+                                            file_index_selection_to_local_ranges(
+                                                &selection,
+                                                file_meta.row_count,
+                                            )?
+                                        }
+                                        _ => split.row_ranges().map(|ranges| ranges.to_vec()),
+                                    }
+                                } else {
+                                    split.row_ranges().map(|ranges| ranges.to_vec())
+                                };
                                 let deletion_file = deletion_files_by_split
                                     .get(&(Arc::as_ptr(&split) as usize))
                                     .and_then(|files| files.get(&file_meta.file_name))
@@ -672,7 +705,7 @@ impl KeyValueFileReader {
                                     data_fields,
                                     data_schema_fields,
                                     deletion_vector,
-                                    split.row_ranges().map(|ranges| ranges.to_vec()),
+                                    row_ranges,
                                 )?;
                                 while let Some(batch) = file_stream.next().await {
                                     yield batch?;
@@ -2035,43 +2068,70 @@ mod tests {
         let planned = plan_merge_groups(std::slice::from_ref(&split), Some(&comparator), false);
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].len(), 2);
-        let core_options = table.schema().core_options();
-        let reader = KeyValueFileReader::new(
-            table.file_io().clone(),
-            KeyValueReadConfig {
-                table_name: table.identifier().full_name(),
-                table_options: table.schema().options().clone(),
-                schema_manager: table.schema_manager().clone(),
-                table_schema_id: table.schema().id(),
-                table_fields: table.schema().fields().to_vec(),
-                read_type: table.schema().fields().to_vec(),
-                predicates: Vec::new(),
-                primary_keys: table.schema().trimmed_primary_keys(),
-                table_primary_keys: table.schema().primary_keys().to_vec(),
-                merge_engine: core_options.merge_engine().unwrap(),
-                sequence_fields: Vec::new(),
-                read_batch_size: core_options.read_batch_size().unwrap(),
-                merge_splits: false,
-                max_merge_input_streams: None,
-                parquet_read_budget: Some(Arc::new(ReadBudget::new(2, 256 << 20).unwrap())),
-                mosaic_prefetch: MosaicPrefetchOptions::default(),
-            },
-        );
-        let batches = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            reader
-                .read(std::slice::from_ref(split.as_ref()))
-                .unwrap()
-                .try_collect::<Vec<_>>(),
-        )
-        .await
-        .expect("multiple sorted-run inputs must not deadlock on shared Parquet permits")
-        .unwrap();
+        for limit in [None, Some(0), Some(1024 * 1024)] {
+            let core_options = table.schema().core_options();
+            let budget = ReadBudget::new(2, 256 << 20).unwrap();
+            let resources = limit.map(|limit| {
+                crate::resource::ResourceContext::builder()
+                    .memory_limit(limit)
+                    .build()
+                    .unwrap()
+            });
+            let budget = match &resources {
+                Some(resources) => budget.with_resources(resources.clone()),
+                None => budget,
+            };
+            let reader = KeyValueFileReader::new(
+                table.file_io().clone(),
+                KeyValueReadConfig {
+                    table_name: table.identifier().full_name(),
+                    table_options: table.schema().options().clone(),
+                    schema_manager: table.schema_manager().clone(),
+                    table_schema_id: table.schema().id(),
+                    table_fields: table.schema().fields().to_vec(),
+                    read_type: table.schema().fields().to_vec(),
+                    predicates: Vec::new(),
+                    primary_keys: table.schema().trimmed_primary_keys(),
+                    table_primary_keys: table.schema().primary_keys().to_vec(),
+                    merge_engine: core_options.merge_engine().unwrap(),
+                    sequence_fields: Vec::new(),
+                    read_batch_size: core_options.read_batch_size().unwrap(),
+                    merge_splits: false,
+                    max_merge_input_streams: None,
+                    parquet_read_budget: Some(Arc::new(budget)),
+                    mosaic_prefetch: MosaicPrefetchOptions::default(),
+                },
+            );
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader
+                    .read(std::slice::from_ref(split.as_ref()))
+                    .unwrap()
+                    .try_collect::<Vec<_>>(),
+            )
+            .await
+            .expect("multiple sorted-run inputs must not deadlock on shared Parquet permits");
+            if limit == Some(0) {
+                assert!(matches!(
+                    result,
+                    Err(crate::Error::ResourceExhausted { .. })
+                ));
+            } else {
+                let batches = result.unwrap();
 
-        assert_eq!(
-            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            128
-        );
+                assert_eq!(
+                    batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    128
+                );
+                drop(batches);
+                if let Some(resources) = &resources {
+                    assert!(resources.metrics().peak_reserved_memory_bytes > 0);
+                }
+            }
+            if let Some(resources) = resources {
+                assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+            }
+        }
     }
 
     #[tokio::test]
@@ -2797,6 +2857,10 @@ mod tests {
                 "fields.seq_b.sequence-group".to_string(),
                 "value_b".to_string(),
             ),
+            (
+                "partial-update.remove-record-on-sequence-group".to_string(),
+                "seq_a".to_string(),
+            ),
         ]));
         let sequence_group_table = Table::new(
             file_io,
@@ -2826,6 +2890,14 @@ mod tests {
                 vec!["id", "value_a", "value_b"]
             );
         }
+
+        // Whole-row deletion still needs seq_a when the user projects only
+        // the primary key. The read path must widen and then trim the schema.
+        let key_only = read_rows(&sequence_group_table, Some(&["id"]), None).await;
+        assert_eq!(int_column(&key_only, "id"), vec![1]);
+        assert!(key_only
+            .iter()
+            .all(|batch| batch.schema().fields().len() == 1));
     }
 
     #[tokio::test]

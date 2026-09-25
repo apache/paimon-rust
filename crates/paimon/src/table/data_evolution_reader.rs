@@ -19,17 +19,20 @@ mod blob_fallback;
 
 use super::blob_resolver::BlobReadLimiter;
 use super::data_file_reader::{
-    append_null_row_id_column, attach_row_id, expand_selected_row_ids, insert_column_at,
-    DataFileReadTiming, DataFileReader,
+    append_null_row_id_column, attach_row_id, expand_selected_row_ids,
+    file_index_selection_to_local_ranges, insert_column_at, DataFileReadTiming, DataFileReader,
 };
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
 use crate::arrow::format::MosaicPrefetchOptions;
 use crate::arrow::{build_target_arrow_schema, ReadBudget};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
+use crate::file_index::evaluator::evaluate_file_index;
+use crate::file_index::file_index_result::FileIndexResult;
 use crate::io::FileIO;
 use crate::spec::{
-    BlobDescriptor, BlobViewStruct, DataField, DataFileMeta, DataType, Predicate, ROW_ID_FIELD_NAME,
+    BlobDescriptor, BlobViewStruct, CoreOptions, DataField, DataFileMeta, DataType, Predicate,
+    ROW_ID_FIELD_NAME,
 };
 use crate::table::dedicated_format_file_writer::is_blob_file_name;
 use crate::table::schema_manager::SchemaManager;
@@ -470,6 +473,8 @@ impl DataEvolutionReader {
             let push_down_raw_predicates = !self.predicates.is_empty()
                 && self.row_id_index.is_none()
                 && filter_before_blob_resolution;
+            let read_raw_file_index = push_down_raw_predicates
+                && CoreOptions::new(&self.table_options).file_index_read_enabled();
             // A managed BLOB file fetches payloads as its batch is decoded.
             // Keep batches small and restrict predicate-free file selections
             // to the remaining output quota below.
@@ -529,6 +534,43 @@ impl DataEvolutionReader {
 
                             let has_row_id = file_meta.first_row_id.is_some();
                             let mut effective_row_ranges = if has_row_id { row_ranges.clone() } else { None };
+                            if read_raw_file_index {
+                                // Independent files can apply a physical row selection
+                                // before decoding. Column-merge groups cannot: an older
+                                // file may hold values still needed by a newer file.
+                                match evaluate_file_index(
+                                    &self.file_io,
+                                    split.bucket_path(),
+                                    &file_meta,
+                                    &self.table_fields,
+                                    data_fields.as_deref().unwrap_or(&self.table_fields),
+                                    &self.predicates,
+                                ).await? {
+                                    FileIndexResult::Skip => continue,
+                                    FileIndexResult::Selection(selection) => {
+                                        if let Some(local_ranges) =
+                                            file_index_selection_to_local_ranges(
+                                                &selection,
+                                                file_meta.row_count,
+                                            )? {
+                                            let base = file_meta.first_row_id.unwrap_or(0);
+                                            let index_ranges = local_ranges
+                                                .into_iter()
+                                                .map(|range| RowRange::new(
+                                                    base + range.from(),
+                                                    base + range.to(),
+                                                ))
+                                                .collect::<Vec<_>>();
+                                            effective_row_ranges = Some(match effective_row_ranges {
+                                                Some(ref ranges) =>
+                                                    intersect_local_ranges(ranges, &index_ranges),
+                                                None => index_ranges,
+                                            });
+                                        }
+                                    }
+                                    FileIndexResult::Remain => {}
+                                }
+                            }
                             if self.predicates.is_empty() {
                                 if let Some(left) = remaining {
                                     let selected = selected_absolute_row_ranges_for_file(
@@ -991,7 +1033,9 @@ impl DataEvolutionReader {
             let source_parquet_read_budget = if active_source_indices.len() == 1 {
                 parquet_read_budget.clone()
             } else {
-                None
+                parquet_read_budget.as_ref()
+                    .filter(|budget| budget.has_resources())
+                    .map(|budget| Arc::new(budget.without_prefetch()))
             };
             let mut source_streams: Vec<Option<ArrowRecordBatchStream>> = source_plan
                 .sources
@@ -7602,6 +7646,87 @@ mod tests {
             let schema = batch.schema();
             let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
             assert_eq!(names, vec!["id"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evolution_multi_source_merge_preserves_memory_admission() {
+        let tempdir = tempdir().unwrap();
+        let table_path = local_file_path(tempdir.path());
+        let bucket_dir = tempdir.path().join("bucket-0");
+        fs::create_dir_all(&bucket_dir).unwrap();
+
+        let id_path = bucket_dir.join("id.parquet");
+        write_int_parquet_file(&id_path, vec![("id", vec![1, 2, 3, 4])], Some(2));
+        let value_path = bucket_dir.join("value.parquet");
+        write_int_parquet_file(&value_path, vec![("value", vec![10, 20, 30, 40])], Some(2));
+
+        let table = two_col_evolution_table(table_path);
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(local_file_path(&bucket_dir))
+            .with_total_buckets(1)
+            .with_data_files(vec![
+                data_file_meta_with_path(
+                    "id.parquet",
+                    0,
+                    4,
+                    1,
+                    id_path.metadata().unwrap().len() as i64,
+                    Some(vec!["id"]),
+                ),
+                data_file_meta_with_path(
+                    "value.parquet",
+                    0,
+                    4,
+                    2,
+                    value_path.metadata().unwrap().len() as i64,
+                    Some(vec!["value"]),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        for limit in [None, Some(0), Some(1024 * 1024)] {
+            let resources = limit.map(|limit| {
+                crate::resource::ResourceContext::builder()
+                    .memory_limit(limit)
+                    .build()
+                    .unwrap()
+            });
+            let mut builder = table.new_read_builder();
+            builder.with_parquet_read_budget(Arc::new(ReadBudget::new(2, 1).unwrap()));
+            if let Some(resources) = &resources {
+                builder.with_resources(resources.clone());
+            }
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                builder
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(std::slice::from_ref(&split))
+                    .unwrap()
+                    .try_collect::<Vec<_>>(),
+            )
+            .await
+            .expect("column merges must not wait on shared prefetch permits");
+
+            if limit == Some(0) {
+                assert!(matches!(result, Err(Error::ResourceExhausted { .. })));
+            } else {
+                let batches = result.unwrap();
+                assert_eq!(collect_int_values(&batches, "id"), vec![1, 2, 3, 4]);
+                assert_eq!(collect_int_values(&batches, "value"), vec![10, 20, 30, 40]);
+                if let Some(resources) = &resources {
+                    let peak = resources.metrics().peak_reserved_memory_bytes;
+                    assert!(peak > 0 && peak <= limit.unwrap());
+                }
+            }
+            if let Some(resources) = &resources {
+                assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+            }
         }
     }
 

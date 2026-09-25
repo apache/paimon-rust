@@ -23,11 +23,14 @@
 //! [`DataFileMeta`] for the commit path.
 
 use super::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
-use crate::arrow::format::{create_format_writer, FormatFileWriter, FormatValueStats};
+use crate::arrow::format::{
+    create_format_writer, with_write_resources, FormatFileWriter, FormatValueStats,
+};
 use crate::io::FileIO;
+use crate::resource::ResourceContext;
 use crate::spec::data_file_to_file_index_file_name;
 use crate::spec::stats::BinaryTableStats;
-use crate::spec::{bucket_path_under, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
+use crate::spec::{bucket_path_under, CoreOptions, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
 use crate::Result;
 use arrow_array::RecordBatch;
 use chrono::Utc;
@@ -53,6 +56,7 @@ pub(crate) struct DataFileWriter {
     file_compression_zstd_level: i32,
     write_buffer_size: i64,
     file_format: String,
+    data_file_prefix: String,
     write_fields: Vec<DataField>,
     format_options: HashMap<String, String>,
     file_source: Option<i32>,
@@ -67,6 +71,7 @@ pub(crate) struct DataFileWriter {
     current_row_count: i64,
     index_options: Option<Arc<FileIndexOptions>>,
     current_index: Option<DataFileIndexWriter>,
+    resources: Option<ResourceContext>,
     /// Paths owned by this write until prepare_commit hands them to the caller.
     created_paths: Vec<String>,
 }
@@ -90,6 +95,9 @@ impl DataFileWriter {
         first_row_id: Option<i64>,
         write_cols: Option<Vec<String>>,
     ) -> Self {
+        let data_file_prefix = CoreOptions::new(&format_options)
+            .data_file_prefix()
+            .to_string();
         Self {
             file_io,
             table_location,
@@ -101,6 +109,7 @@ impl DataFileWriter {
             file_compression_zstd_level,
             write_buffer_size,
             file_format,
+            data_file_prefix,
             write_fields,
             format_options,
             file_source,
@@ -113,6 +122,7 @@ impl DataFileWriter {
             current_row_count: 0,
             index_options: None,
             current_index: None,
+            resources: None,
             created_paths: Vec::new(),
         }
     }
@@ -122,10 +132,19 @@ impl DataFileWriter {
         self
     }
 
+    pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
+        self.resources = resources;
+        self
+    }
+
+    pub(crate) fn set_resources(&mut self, resources: Option<ResourceContext>) {
+        self.resources = resources;
+    }
+
     /// Write a RecordBatch. Rolls to a new file when target size is reached.
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         let result = self.write_batch(batch).await;
-        if result.is_err() && self.index_options.is_some() {
+        if self.index_options.is_some() && result.is_err() {
             self.abort().await;
         }
         result
@@ -168,7 +187,8 @@ impl DataFileWriter {
             .map(|options| options.create_writer())
             .transpose()?;
         let file_name = format!(
-            "data-{}-{}.{}",
+            "{}{}-{}.{}",
+            self.data_file_prefix,
             uuid::Uuid::new_v4(),
             self.written_files.len(),
             self.file_format,
@@ -195,7 +215,7 @@ impl DataFileWriter {
             Some(&self.format_options),
         )
         .await?;
-        self.current_writer = Some(writer);
+        self.current_writer = Some(with_write_resources(writer, self.resources.as_ref()));
         self.current_index = index;
         self.current_file_name = Some(file_name);
         self.current_row_count = 0;

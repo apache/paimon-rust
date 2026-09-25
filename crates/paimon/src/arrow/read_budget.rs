@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::resource::{MemoryReservation, ResourceContext};
+
 use crate::spec::PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION;
 
 const BYTE_PERMIT_UNIT: u64 = 1024 * 1024;
@@ -27,19 +29,23 @@ const DEFAULT_BYTE_OPTION: &str = "the row-group read budget";
 const DEFAULT_PARALLELISM: usize = 8;
 const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Resource budget for concurrent row-group reads, bounding both the number of
-/// row groups in flight and their estimated bytes. Parquet holds one per scan;
-/// Mosaic builds one per open file from its own prefetch options.
-#[derive(Debug)]
+/// Scheduling window for concurrent row-group reads, with memory reservations
+/// backed by a [`ResourceContext`]. Slot and prefetch-byte limits control how
+/// much work may start; the context admits the full estimate without clamping.
+/// Without an explicit context, memory reservations have no additional limit
+/// and the existing oversized-row-group scheduling behavior is preserved.
+#[derive(Debug, Clone)]
 pub struct ReadBudget {
     parallelism: usize,
     row_groups: Arc<Semaphore>,
-    bytes: Arc<Semaphore>,
+    // A look-ahead window, independent of shared memory accounting.
+    prefetch: Arc<Semaphore>,
+    resources: Option<ResourceContext>,
     byte_permits: u32,
     byte_permit_unit: u64,
     max_inflight_bytes: u64,
     byte_option: &'static str,
-    oversized_warning_logged: AtomicBool,
+    oversized_warning_logged: Arc<AtomicBool>,
     diagnostics: Arc<ReadBudgetDiagnostics>,
 }
 
@@ -79,8 +85,8 @@ pub(crate) struct ReadBudgetDiagnosticsSnapshot {
 }
 
 impl ReadBudget {
-    /// Scan-wide budget with MiB-granular byte permits, as the Parquet reader
-    /// takes it; its oversized-row-group warning names the Parquet option.
+    /// Scan-wide scheduling window with MiB-granular prefetch permits.
+    /// Its oversized-row-group warning names the Parquet option.
     pub fn new(parallelism: usize, max_inflight_bytes: u64) -> crate::Result<Self> {
         Ok(
             Self::with_byte_granularity(parallelism, max_inflight_bytes, BYTE_PERMIT_UNIT)?
@@ -88,9 +94,9 @@ impl ReadBudget {
         )
     }
 
-    /// Budget whose byte permits count `byte_permit_unit` bytes each. Mosaic
-    /// charges the exact estimated bytes of a row group, so it passes `1`; at
-    /// most `u32::MAX` permits are tracked, which caps that unit at 4 GiB.
+    /// Scheduling window whose permits count `byte_permit_unit` bytes each.
+    /// Mosaic passes `1`; at most `u32::MAX` permits are tracked, which caps
+    /// that window at 4 GiB. Memory reservations always use the full estimate.
     pub(crate) fn with_byte_granularity(
         parallelism: usize,
         max_inflight_bytes: u64,
@@ -120,12 +126,13 @@ impl ReadBudget {
         Ok(Self {
             parallelism,
             row_groups: Arc::new(Semaphore::new(parallelism)),
-            bytes: Arc::new(Semaphore::new(byte_permits as usize)),
+            prefetch: Arc::new(Semaphore::new(byte_permits as usize)),
+            resources: None,
             byte_permits,
             byte_permit_unit,
             max_inflight_bytes,
             byte_option: DEFAULT_BYTE_OPTION,
-            oversized_warning_logged: AtomicBool::new(false),
+            oversized_warning_logged: Arc::new(AtomicBool::new(false)),
             diagnostics: Arc::new(ReadBudgetDiagnostics::default()),
         })
     }
@@ -191,28 +198,88 @@ impl ReadBudget {
         }
     }
 
-    /// Wait for a row-group slot and the estimated bytes. The Parquet reader
-    /// acquires from its async tasks.
+    /// Bind a shared memory budget while preserving this scheduling window.
+    /// Working estimates draw from this context. An
+    /// oversized row group must still fit the context's memory limit.
+    pub fn with_resources(&self, resources: ResourceContext) -> Self {
+        Self {
+            resources: Some(resources),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn has_resources(&self) -> bool {
+        self.resources.is_some()
+    }
+
+    /// Merge inputs need to advance in lockstep. Keep memory admission, while
+    /// disabling background row-group prefetch that could hold slots they need.
+    pub(crate) fn without_prefetch(&self) -> Self {
+        Self {
+            parallelism: 1,
+            ..self.clone()
+        }
+    }
+
+    /// Wait for scheduling capacity, then try memory admission. Memory rejection
+    /// is immediate: waiting for a caller's retained buffers could deadlock.
     pub(crate) async fn acquire(&self, estimated_bytes: u64) -> crate::Result<ReadPermit> {
         let row_group = Arc::clone(&self.row_groups)
             .acquire_owned()
             .await
             .map_err(|_| Self::closed("row-group"))?;
-        let bytes = Arc::clone(&self.bytes)
+        let prefetch = Arc::clone(&self.prefetch)
             .acquire_many_owned(self.byte_permits_for(estimated_bytes))
             .await
-            .map_err(|_| Self::closed("byte"))?;
-        Ok(self.permit(row_group, bytes))
+            .map_err(|_| Self::closed("prefetch"))?;
+        let mut permit = self.reserve_memory(estimated_bytes)?;
+        permit.prefetch = Some((row_group, prefetch));
+        Ok(permit)
     }
 
-    /// Take a row-group slot and the estimated bytes if both are free now. The
-    /// Mosaic reader refills its look-ahead without waiting.
+    /// Take scheduling capacity and memory if both are available now.
     pub(crate) fn try_acquire(&self, estimated_bytes: u64) -> Option<ReadPermit> {
         let row_group = Arc::clone(&self.row_groups).try_acquire_owned().ok()?;
-        let bytes = Arc::clone(&self.bytes)
+        let prefetch = Arc::clone(&self.prefetch)
             .try_acquire_many_owned(self.byte_permits_for(estimated_bytes))
             .ok()?;
-        Some(self.permit(row_group, bytes))
+        let mut permit = self.reserve_memory(estimated_bytes).ok()?;
+        permit.prefetch = Some((row_group, prefetch));
+        Some(permit)
+    }
+
+    /// Foreground reads, including merge inputs, must not wait while another
+    /// input holds a scheduling slot. They still reserve from the shared pool.
+    pub(crate) fn reserve_memory(&self, estimated_bytes: u64) -> crate::Result<ReadPermit> {
+        let bytes =
+            usize::try_from(estimated_bytes).map_err(|_| crate::Error::ResourceExhausted {
+                message: format!("Row-group estimate {estimated_bytes} exceeds addressable memory"),
+            })?;
+        let memory = self
+            .resources
+            .as_ref()
+            .map(|resources| {
+                let mut memory = resources.reservation();
+                memory.try_grow(bytes)?;
+                Ok::<_, crate::Error>(memory)
+            })
+            .transpose()?;
+        let diagnostics = self.diagnostics_enabled().then(|| {
+            let current = self
+                .diagnostics
+                .current_inflight
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            self.diagnostics
+                .peak_inflight
+                .fetch_max(current, Ordering::Relaxed);
+            Arc::clone(&self.diagnostics)
+        });
+        Ok(ReadPermit {
+            _memory: memory,
+            prefetch: None,
+            diagnostics,
+        })
     }
 
     /// Block until a row-group slot and the estimated bytes are free. The
@@ -234,7 +301,7 @@ impl ReadBudget {
         {
             log::warn!(
                 "A row group's estimated size ({estimated_bytes} bytes) exceeds {} ({} bytes); it \
-                 will consume the entire byte budget and may reduce row-group read parallelism; \
+                 will occupy the entire prefetch window and may reduce row-group read parallelism; \
                  increase the option if memory allows",
                 self.byte_option,
                 self.max_inflight_bytes
@@ -244,25 +311,6 @@ impl ReadBudget {
             .max(1)
             .div_ceil(self.byte_permit_unit)
             .min(u64::from(self.byte_permits)) as u32
-    }
-
-    fn permit(&self, row_group: OwnedSemaphorePermit, bytes: OwnedSemaphorePermit) -> ReadPermit {
-        let diagnostics = self.diagnostics_enabled().then(|| {
-            let current = self
-                .diagnostics
-                .current_inflight
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-            self.diagnostics
-                .peak_inflight
-                .fetch_max(current, Ordering::Relaxed);
-            Arc::clone(&self.diagnostics)
-        });
-        ReadPermit {
-            _row_group: row_group,
-            _bytes: bytes,
-            diagnostics,
-        }
     }
 }
 
@@ -275,8 +323,9 @@ impl Default for ReadBudget {
 
 #[derive(Debug)]
 pub(crate) struct ReadPermit {
-    _row_group: OwnedSemaphorePermit,
-    _bytes: OwnedSemaphorePermit,
+    // Return memory before waking scheduling waiters.
+    _memory: Option<MemoryReservation>,
+    prefetch: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
     diagnostics: Option<Arc<ReadBudgetDiagnostics>>,
 }
 
@@ -437,5 +486,67 @@ mod tests {
         );
         drop(held);
         waiter.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn row_groups_and_other_consumers_share_one_memory_limit() {
+        let resources = ResourceContext::builder().memory_limit(32).build().unwrap();
+        let first = ReadBudget::new(2, 1024 * 1024)
+            .unwrap()
+            .with_resources(resources.clone());
+        let second = ReadBudget::new(2, 1024 * 1024)
+            .unwrap()
+            .with_resources(resources.clone());
+        let read = first.acquire(20).await.unwrap();
+        let mut consumer = resources.reservation();
+        consumer.try_grow(8).unwrap();
+        assert!(matches!(
+            second.acquire(5).await,
+            Err(crate::Error::ResourceExhausted { .. })
+        ));
+        assert_eq!(resources.metrics().reserved_memory_bytes, 28);
+        // Rejected memory admission must release both scheduling resources.
+        let other = second.acquire(4).await.unwrap();
+        assert_eq!(resources.metrics().reserved_memory_bytes, 32);
+        drop((read, other, consumer));
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        assert_eq!(resources.metrics().peak_reserved_memory_bytes, 32);
+    }
+
+    #[tokio::test]
+    async fn oversized_prefetch_admission_cannot_bypass_the_memory_limit() {
+        let resources = ResourceContext::builder().memory_limit(3).build().unwrap();
+        let budget = ReadBudget::with_byte_granularity(2, 1, 1)
+            .unwrap()
+            .with_resources(resources.clone());
+        assert!(matches!(
+            budget.acquire(4).await,
+            Err(crate::Error::ResourceExhausted { .. })
+        ));
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        let permit = budget.acquire(3).await.unwrap();
+        // The prefetch window is clamped to one; the memory charge is all three.
+        assert_eq!(resources.metrics().reserved_memory_bytes, 3);
+        drop(permit);
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_prefetch_waiter_does_not_hold_slots_or_memory() {
+        let resources = ResourceContext::builder().memory_limit(32).build().unwrap();
+        let budget = ReadBudget::new(2, 1024 * 1024)
+            .unwrap()
+            .with_resources(resources.clone());
+        let first = budget.acquire(16).await.unwrap();
+        let mut waiting = Box::pin(budget.acquire(16));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        assert_eq!(resources.metrics().reserved_memory_bytes, 16);
+        drop(waiting);
+        drop(first);
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
+        let first = budget.acquire(32).await.unwrap();
+        drop(first);
+        assert_eq!(budget.row_groups.available_permits(), 2);
+        assert_eq!(resources.metrics().reserved_memory_bytes, 0);
     }
 }
