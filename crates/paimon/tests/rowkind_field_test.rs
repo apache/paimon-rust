@@ -29,11 +29,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{Int32Builder, ListBuilder};
-use arrow_array::{Array, BinaryArray, Int32Array, Int8Array, ListArray, RecordBatch};
+use arrow_array::{
+    new_null_array, Array, ArrayRef, BinaryArray, Int32Array, Int8Array, ListArray, RecordBatch,
+    StructArray,
+};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::StreamExt;
+use paimon::arrow::paimon_type_to_arrow;
 use paimon::spec::{
-    ArrayType, DataType, IntType, Schema, TableSchema, VarBinaryType, VALUE_KIND_FIELD_NAME,
+    ArrayType, DataField, DataType, IntType, RowType, Schema, TableSchema, VarBinaryType,
+    VALUE_KIND_FIELD_NAME,
 };
 
 #[tokio::test]
@@ -284,7 +290,7 @@ fn partial_update_batch(version: i32, value: Option<i32>, kind: i8) -> RecordBat
     .unwrap()
 }
 
-async fn scan_single_value(table: &paimon::table::Table) -> Option<i32> {
+async fn scan_single_version_value(table: &paimon::table::Table) -> (i32, Option<i32>) {
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
     let mut stream = table
         .new_read_builder()
@@ -299,15 +305,25 @@ async fn scan_single_value(table: &paimon::table::Table) -> Option<i32> {
         .as_any()
         .downcast_ref::<Int32Array>()
         .unwrap();
+    let versions = batch
+        .column_by_name("version")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
     assert_eq!(batch.num_rows(), 1);
     assert!(stream.next().await.is_none());
-    (!values.is_null(0)).then(|| values.value(0))
+    (
+        versions.value(0),
+        (!values.is_null(0)).then(|| values.value(0)),
+    )
 }
 
 async fn partial_update_table(
     path: &str,
     function: &str,
     whole_row_delete: bool,
+    ignore_retract: bool,
 ) -> paimon::table::Table {
     let mut builder = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
@@ -321,6 +337,9 @@ async fn partial_update_table(
     if whole_row_delete {
         builder = builder.option("partial-update.remove-record-on-sequence-group", "version");
     }
+    if ignore_retract {
+        builder = builder.option("fields.value.ignore-retract", "true");
+    }
     let schema = builder.build().unwrap();
     let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
     setup_dirs(&file_io, path).await;
@@ -330,11 +349,16 @@ async fn partial_update_table(
 
 #[tokio::test]
 async fn partial_update_sum_retracts_singleton_delete_in_later_commit() {
-    let table =
-        partial_update_table("memory:/rowkind_field/partial_sum_retract", "sum", false).await;
+    let table = partial_update_table(
+        "memory:/rowkind_field/partial_sum_retract",
+        "sum",
+        false,
+        false,
+    )
+    .await;
     write_batch(&table, &partial_update_batch(1, Some(100), 0)).await;
     write_batch(&table, &partial_update_batch(2, Some(20), 3)).await;
-    assert_eq!(scan_single_value(&table).await, Some(80));
+    assert_eq!(scan_single_version_value(&table).await, (2, Some(80)));
 }
 
 #[tokio::test]
@@ -343,12 +367,152 @@ async fn partial_update_first_non_null_keeps_state_after_whole_row_delete() {
         "memory:/rowkind_field/partial_first_non_null_delete",
         "first_non_null_value",
         true,
+        false,
     )
     .await;
     write_batch(&table, &partial_update_batch(1, Some(100), 0)).await;
     write_batch(&table, &partial_update_batch(2, None, 3)).await;
     write_batch(&table, &partial_update_batch(3, Some(5), 0)).await;
-    assert_eq!(scan_single_value(&table).await, None);
+    assert_eq!(scan_single_version_value(&table).await, (3, None));
+}
+
+#[tokio::test]
+async fn partial_update_ignore_retract_first_value_preserves_uninitialized_state() {
+    let table = partial_update_table(
+        "memory:/rowkind_field/ignore_retract_first_value",
+        "first_value",
+        false,
+        true,
+    )
+    .await;
+    write_batch(&table, &partial_update_batch(3, Some(20), 3)).await;
+    write_batch(&table, &partial_update_batch(2, Some(5), 0)).await;
+    assert_eq!(scan_single_version_value(&table).await, (3, Some(20)));
+}
+
+#[tokio::test]
+async fn partial_update_ignore_retract_first_non_null_keeps_older_null() {
+    let table = partial_update_table(
+        "memory:/rowkind_field/ignore_retract_first_non_null",
+        "first_non_null_value",
+        false,
+        true,
+    )
+    .await;
+    write_batch(&table, &partial_update_batch(3, Some(10), 0)).await;
+    write_batch(&table, &partial_update_batch(1, None, 0)).await;
+    assert_eq!(scan_single_version_value(&table).await, (3, None));
+}
+
+#[tokio::test]
+async fn partial_update_last_non_null_reverses_over_null_delete_payload() {
+    let table = partial_update_table(
+        "memory:/rowkind_field/last_non_null_delete",
+        "last_non_null_value",
+        true,
+        false,
+    )
+    .await;
+    write_batch(&table, &partial_update_batch(1, Some(100), 0)).await;
+    write_batch(&table, &partial_update_batch(2, None, 3)).await;
+    write_batch(&table, &partial_update_batch(1, Some(5), 0)).await;
+    assert_eq!(scan_single_version_value(&table).await, (2, Some(5)));
+}
+
+#[tokio::test]
+async fn partial_update_nested_reverse_keeps_older_rows_beyond_count_limit() {
+    let path = "memory:/rowkind_field/nested_reverse_count_limit";
+    let items_type = DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+        DataField::new(3, "item_id".into(), DataType::Int(IntType::new())),
+    ]))));
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("version", DataType::Int(IntType::new()))
+        .column("items", items_type.clone())
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "partial-update")
+        .option("fields.version.sequence-group", "items")
+        .option("fields.items.aggregate-function", "nested_update")
+        .option("fields.items.count-limit", "1")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+
+    let items_arrow_type = paimon_type_to_arrow(&items_type).unwrap();
+    let ArrowDataType::List(element) = &items_arrow_type else {
+        panic!("expected ARRAY<ROW>");
+    };
+    let ArrowDataType::Struct(fields) = element.data_type() else {
+        panic!("expected ROW element");
+    };
+    let rows = StructArray::try_new(
+        fields.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        None,
+    )
+    .unwrap();
+    let older_items = ListArray::try_new(
+        element.clone(),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 2])),
+        Arc::new(rows),
+        None,
+    )
+    .unwrap();
+    let batch_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int32, false),
+        ArrowField::new("version", ArrowDataType::Int32, false),
+        ArrowField::new("items", items_arrow_type.clone(), true),
+    ]));
+    for (version, items) in [
+        (3, new_null_array(&items_arrow_type, 1)),
+        (1, Arc::new(older_items) as ArrayRef),
+    ] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&batch_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![version])),
+                items,
+            ],
+        )
+        .unwrap();
+        write_batch(&table, &batch).await;
+    }
+
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let mut stream = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap();
+    let batch = stream.next().await.unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let versions = batch
+        .column_by_name("version")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(versions.value(0), 3);
+    let items = batch
+        .column_by_name("items")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    let items = items.as_any().downcast_ref::<StructArray>().unwrap();
+    let item_ids = items
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(item_ids.values().as_ref(), &[1, 2]);
+    assert!(stream.next().await.is_none());
 }
 
 fn table_with_options(

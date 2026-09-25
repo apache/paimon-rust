@@ -233,10 +233,13 @@ impl NestedAgg {
         Ok(Arc::new(result))
     }
 
-    fn add_row(&mut self, incoming: ArrayRef) -> crate::Result<()> {
+    fn add_row(&mut self, incoming: ArrayRef, limit_new_keys: bool) -> crate::Result<()> {
+        if incoming.is_null(0) {
+            return Ok(());
+        }
         let row = self.row(incoming.as_ref())?;
         if self.key_indices.is_empty() {
-            if self.rows.len() < self.count_limit {
+            if !limit_new_keys || self.rows.len() < self.count_limit {
                 self.rows.push(incoming);
             }
             return Ok(());
@@ -262,7 +265,8 @@ impl NestedAgg {
                 };
                 self.rows[index] = replacement;
             }
-            None if matches!(self.mode, NestedMode::PartialUpdate)
+            None if !limit_new_keys
+                || matches!(self.mode, NestedMode::PartialUpdate)
                 || self.rows.len() < self.count_limit =>
             {
                 self.rows.push(incoming)
@@ -272,7 +276,12 @@ impl NestedAgg {
         Ok(())
     }
 
-    fn consume(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+    fn consume(
+        &mut self,
+        array: &dyn Array,
+        row_idx: usize,
+        limit_new_keys: bool,
+    ) -> crate::Result<()> {
         if array.is_null(row_idx) {
             return Ok(());
         }
@@ -291,9 +300,32 @@ impl NestedAgg {
         let values = list.value(row_idx);
         for index in 0..values.len() {
             if values.is_valid(index) {
-                self.add_row(values.slice(index, 1))?;
+                self.add_row(values.slice(index, 1), limit_new_keys)?;
             }
         }
+        Ok(())
+    }
+
+    fn preserve_raw_accumulator(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        if array.is_null(row_idx) {
+            return Ok(());
+        }
+        let list =
+            array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| Error::DataInvalid {
+                    message: format!(
+                        "Nested aggregator for '{}' requires Arrow List",
+                        self.field_name
+                    ),
+                    source: None,
+                })?;
+        let values = list.value(row_idx);
+        self.rows = (0..values.len())
+            .map(|index| values.slice(index, 1))
+            .collect();
+        self.seen_input = true;
         Ok(())
     }
 }
@@ -337,16 +369,23 @@ impl FieldAggregator for NestedAgg {
     }
 
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        self.consume(array, row_idx)
+        self.consume(array, row_idx, true)
     }
 
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        if !self.seen_input {
+            // Java agg(older, NULL) returns the older accumulator untouched,
+            // including rows beyond count-limit and any null elements.
+            return self.preserve_raw_accumulator(array, row_idx);
+        }
         let current = std::mem::take(&mut self.rows);
         let current_seen = self.seen_input;
         self.seen_input = false;
-        self.consume(array, row_idx)?;
+        // Java agg(older, current) treats older as an accumulator: count-limit
+        // only applies while adding current rows (or new nested keys).
+        self.consume(array, row_idx, false)?;
         for row in current {
-            self.add_row(row)?;
+            self.add_row(row, true)?;
         }
         self.seen_input |= current_seen;
         Ok(())
@@ -523,6 +562,22 @@ mod tests {
                 vec![Some(2), Some(1)],
             )
         );
+    }
+
+    #[test]
+    fn nested_reverse_keeps_raw_older_accumulator_beyond_count_limit() {
+        let (data_type, input) = input();
+        let options = HashMap::from([("fields.items.count-limit".into(), "1".into())]);
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        let null = new_null_array(input.data_type(), 1);
+        agg.agg(null.as_ref(), 0).unwrap();
+        agg.agg_reversed(&input, 0).unwrap();
+        assert_eq!(result_rows(&agg).0, vec![Some(1), Some(2)]);
+
+        agg.reset();
+        agg.agg(&input, 1).unwrap();
+        agg.agg_reversed(&input, 0).unwrap();
+        assert_eq!(result_rows(&agg).0, vec![Some(1), Some(2)]);
     }
 
     #[test]

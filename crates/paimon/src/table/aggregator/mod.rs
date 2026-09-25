@@ -96,6 +96,12 @@ pub(crate) trait FieldAggregator: Send + Sync + std::fmt::Debug {
     /// silently fall back to forward accumulation.
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()>;
 
+    /// Reverse through Java's default `agg(input, accumulator)` behavior.
+    /// Wrappers use this instead of a wrapped function's optional override.
+    fn agg_reversed_via_agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.agg_reversed(array, row_idx)
+    }
+
     /// Apply a DELETE / UPDATE_BEFORE cell. Java's default implementation
     /// rejects retracts unless the field uses `ignore-retract=true`.
     fn retract(&mut self, _array: &dyn Array, _row_idx: usize) -> crate::Result<()> {
@@ -231,12 +237,9 @@ impl FieldAggregator for IgnoreRetractAgg {
     }
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
         // Java FieldIgnoreRetractAgg inherits FieldAggregator#aggReversed,
-        // which invokes wrapper.agg(input, accumulator) even if the wrapped
-        // function overrides its own reverse behavior.
-        let current = self.0.result()?;
-        self.0.reset();
-        self.0.agg(array, row_idx)?;
-        self.0.agg(current.as_ref(), 0)
+        // which invokes wrapper.agg(input, accumulator). Keep the wrapped
+        // function's state (notably first_value's initialized flag).
+        self.0.agg_reversed_via_agg(array, row_idx)
     }
     fn retract(&mut self, _array: &dyn Array, _row_idx: usize) -> crate::Result<()> {
         Ok(())
@@ -278,6 +281,26 @@ mod tests {
         assert!(matches!(err, crate::Error::ConfigInvalid { message }
             if message.contains("aggregation.remove-record-on-delete")
                 && message.contains("fields.v.ignore-retract")));
+    }
+
+    #[test]
+    fn ignore_retract_reverse_preserves_first_value_state() {
+        let options = HashMap::from([("fields.v.ignore-retract".into(), "true".into())]);
+        let data_type = DataType::Int(IntType::new());
+        let input = Int32Array::from(vec![Some(20), Some(5), Some(10), None]);
+
+        let mut first = new_aggregator("first_value", "v", &data_type, &options).unwrap();
+        first.replace_with_delete(&input, 0).unwrap();
+        first.agg_reversed(&input, 1).unwrap();
+        let result = first.result().unwrap();
+        let result = result.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(result.value(0), 20);
+
+        let mut first_non_null =
+            new_aggregator("first_non_null_value", "v", &data_type, &options).unwrap();
+        first_non_null.agg(&input, 2).unwrap();
+        first_non_null.agg_reversed(&input, 3).unwrap();
+        assert!(first_non_null.result().unwrap().is_null(0));
     }
 
     /// Java's legacy alias must build the very same aggregator, not merely pass

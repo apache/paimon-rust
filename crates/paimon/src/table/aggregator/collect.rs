@@ -112,6 +112,28 @@ impl FieldAggregator for CollectAgg {
         self.collect(array, row_idx)
     }
 
+    fn agg_reversed_via_agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        // FieldIgnoreRetractAgg inherits the default reverse method, so it
+        // calls collect.agg(older, current), not collect.aggReversed. Preserve
+        // the current elements while prepending the older operand.
+        let current = std::mem::take(&mut self.elements);
+        let current_seen = self.seen_input;
+        self.seen_input = false;
+        self.collect(array, row_idx)?;
+        for element in current {
+            if !self.distinct
+                || !self
+                    .elements
+                    .iter()
+                    .any(|existing| existing.as_ref() == element.as_ref())
+            {
+                self.elements.push(element);
+            }
+        }
+        self.seen_input |= current_seen;
+        Ok(())
+    }
+
     fn retract(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
         if !self.seen_input || array.is_null(row_idx) {
             return Ok(());
@@ -187,6 +209,8 @@ impl FieldAggregator for CollectAgg {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::spec::{ArrayType, IntType};
     use arrow_array::Int32Array;
@@ -239,5 +263,26 @@ mod tests {
         let values = list.value(0);
         let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(values.values().to_vec(), vec![1, 2]);
+    }
+
+    #[test]
+    fn ignore_retract_reversed_uses_default_order_instead_of_collect_override() {
+        let data_type = DataType::Array(ArrayType::new(DataType::Int(IntType::new())));
+        let input = input();
+        for (distinct, expected) in [(false, vec![1, 2, 2, 3]), (true, vec![1, 2, 3])] {
+            let options = HashMap::from([
+                ("fields.items.ignore-retract".into(), "true".into()),
+                ("fields.items.distinct".into(), distinct.to_string()),
+            ]);
+            let mut agg =
+                super::super::new_aggregator("collect", "items", &data_type, &options).unwrap();
+            agg.agg(&input, 1).unwrap();
+            agg.agg_reversed(&input, 0).unwrap();
+            let result = agg.result().unwrap();
+            let list = result.as_any().downcast_ref::<ListArray>().unwrap();
+            let values = list.value(0);
+            let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(values.values().to_vec(), expected);
+        }
     }
 }

@@ -115,7 +115,7 @@ impl PickValueAgg {
             // Java last_non_null_value keeps a non-null accumulator, otherwise
             // it falls back to the older input.
             PickPolicy::LastNonNull => {
-                if self.winner.is_none() && !is_null {
+                if self.winner.as_ref().is_none_or(|winner| winner.is_null(0)) && !is_null {
                     self.winner = Some(array.slice(row_idx, 1));
                 }
             }
@@ -399,6 +399,15 @@ mod tests {
         agg.agg(&arr, 0).unwrap();
         agg.agg_reversed(&arr, 1).unwrap();
         agg.agg_reversed(&arr, 2).unwrap();
+        assert_eq!(collect_i32(agg.result().unwrap()), Some(5));
+    }
+
+    #[test]
+    fn test_last_non_null_reversed_fills_raw_null_delete_cell() {
+        let mut agg = LastNonNullValueAgg::new("v", &DataType::Int(IntType::new())).unwrap();
+        let arr = Int32Array::from(vec![None, Some(5)]);
+        agg.replace_with_delete(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 1).unwrap();
         assert_eq!(collect_i32(agg.result().unwrap()), Some(5));
     }
 
