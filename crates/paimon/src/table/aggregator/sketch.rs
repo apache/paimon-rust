@@ -221,8 +221,8 @@ fn parse_theta(bytes: &[u8]) -> crate::Result<CompactTheta> {
         THETA_MAX
     };
     let mut entries = BTreeSet::new();
-    for chunk in bytes[header_len..payload_len].chunks_exact(8) {
-        let hash = u64::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in bytes[header_len..payload_len].as_chunks::<8>().0 {
+        let hash = u64::from_le_bytes(*chunk);
         if !compact && hash == 0 {
             continue;
         }

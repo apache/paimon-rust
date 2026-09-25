@@ -4605,10 +4605,8 @@ mod tests {
 
     #[test]
     fn test_rename_column_rewrites_remaining_case2_suffixes() {
-        // `ignore-retract` / `distinct` are rejected by Rust's create-time
-        // merge-engine validation; the fixture carries them (and the
-        // map-shredding options, which Rust does honor) as plain metadata,
-        // like a Java-written schema.
+        // Carry field-scoped aggregation and map-shredding options as schema
+        // metadata so renaming keeps every option attached to its column.
         let table_schema = TableSchema::new(
             0,
             &Schema::builder()
