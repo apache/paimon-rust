@@ -197,6 +197,19 @@ impl<'a> PartialUpdateConfig<'a> {
     }
 
     fn validate_delete_config(&self) -> crate::Result<()> {
+        if let Some(value) = self
+            .options
+            .get(PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION)
+        {
+            if !value.eq_ignore_ascii_case("true") && !value.eq_ignore_ascii_case("false") {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Invalid value '{value}' for option \
+                         '{PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION}': expected true or false"
+                    ),
+                });
+            }
+        }
         let ignore_delete = self
             .options
             .get(IGNORE_DELETE_OPTION)
@@ -676,6 +689,30 @@ mod tests {
                 .validate_read_mode(true, "default.t")
                 .unwrap_err();
             assert!(matches!(err, crate::Error::ConfigInvalid { .. }));
+        }
+    }
+
+    #[test]
+    fn test_remove_record_on_delete_rejects_invalid_boolean() {
+        for value in ["tru", "", "1"] {
+            let options =
+                partial_update_options(&[(PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION, value)]);
+            let config = PartialUpdateConfig::new(&options);
+            for error in [
+                config
+                    .validate_create_fields(&[], &["id".to_string()])
+                    .unwrap_err(),
+                config.validate_write_mode(true, "default.t").unwrap_err(),
+                config.validate_read_mode(true, "default.t").unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, crate::Error::ConfigInvalid { ref message }
+                        if message.contains(PARTIAL_UPDATE_REMOVE_RECORD_ON_DELETE_OPTION)
+                            && message.contains(value)
+                            && message.contains("true or false")),
+                    "got {error:?}"
+                );
+            }
         }
     }
 

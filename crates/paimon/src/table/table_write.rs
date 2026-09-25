@@ -26,8 +26,8 @@ use crate::resource::ResourceContext;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
-    DataType, MergeEngine, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
-    VALUE_KIND_FIELD_NAME,
+    DataType, MergeEngine, PartialUpdateConfig, RowKindFilter, EMPTY_SERIALIZED_ROW,
+    POSTPONE_BUCKET, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
@@ -607,6 +607,18 @@ impl TableWrite {
             return Ok(None);
         }
         let batch = self.enrich_rowkind_batch(batch)?;
+        let config = PartialUpdateConfig::new(self.table.schema().options());
+        let batch = if config.is_enabled()
+            && config.remove_record_on_delete()
+            && batch
+                .schema()
+                .column_with_name(VALUE_KIND_FIELD_NAME)
+                .is_none()
+        {
+            Self::add_value_kind_column(&batch, 0)?
+        } else {
+            batch
+        };
         Ok((batch.num_rows() != 0).then_some(batch))
     }
 
@@ -761,10 +773,8 @@ impl TableWrite {
             .schema()
             .column_with_name(VALUE_KIND_FIELD_NAME)
             .is_some();
-        // Cross-partition writers must always include _VALUE_KIND to keep the
-        // Arrow schema stable across batches (some batches may have deletes,
-        // others may not — KeyValueFileWriter's concat_batches requires a
-        // consistent schema).
+        // These writers must always include _VALUE_KIND to keep the Arrow
+        // schema stable when a later batch contains deletes.
         let needs_value_kind = batch_has_value_kind
             || matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
             || !output.deletes.is_empty();
