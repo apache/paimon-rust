@@ -46,10 +46,12 @@ mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
 mod format_partition;
+mod format_partition_location;
 mod format_partition_stats;
 mod format_partition_truncate;
 mod format_read_builder;
 mod format_table_commit;
+mod format_table_defaults;
 mod format_table_read;
 mod format_table_scan;
 #[cfg(test)]

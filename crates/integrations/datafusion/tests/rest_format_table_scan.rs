@@ -396,7 +396,7 @@ async fn test_managed_scan_filter_on_a_partition_column_reads_the_registered_val
 
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_managed_scan_refuses_a_partition_at_a_custom_location() {
+async fn test_managed_scan_reads_a_partition_at_a_custom_location() {
     let temp_dir = tempfile::tempdir().unwrap();
     let external_dir = tempfile::tempdir().unwrap();
     let table = ManagedTable::new(&temp_dir, &[("dt", varchar())]).await;
@@ -405,6 +405,7 @@ async fn test_managed_scan_refuses_a_partition_at_a_custom_location() {
     // Another engine registered dt=b somewhere else; the table directory still has a stale copy.
     write_ids(&temp_dir.path().join("dt=b"), &[2]);
     write_ids(external_dir.path(), &[3]);
+    write_ids(&external_dir.path().join("_temporary"), &[999]);
     table.server.set_table_partition_options(
         DATABASE,
         TABLE,
@@ -415,13 +416,131 @@ async fn test_managed_scan_refuses_a_partition_at_a_custom_location() {
         )]),
     );
 
-    // Reading the default directory would return the stale row, so a scan that reaches the
-    // partition fails instead. One that does not reach it is unaffected.
-    for predicate in ["dt = 'b'", "TRUE"] {
-        let error = table.error(predicate).await;
-        assert!(error.contains("custom location"), "{predicate}: {error}");
-    }
+    // A scan must use the catalog's location and ignore the stale default directory.
+    assert_eq!(table.ids("dt = 'b'").await, vec![3]);
+    assert_eq!(table.ids("TRUE").await, vec![1, 3]);
     assert_eq!(table.ids("dt = 'a'").await, vec![1]);
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_managed_scan_rejects_overlapping_external_partition_locations() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let table = ManagedTable::new(&temp_dir, &[("dt", varchar())]).await;
+    table.register(&[&[("dt", "a")], &[("dt", "b")]]).await;
+    let shared = format!("file://{}", external_dir.path().display());
+    for dt in ["a", "b"] {
+        table.server.set_table_partition_options(
+            DATABASE,
+            TABLE,
+            &spec(&[("dt", dt)]),
+            HashMap::from([("path".to_string(), shared.clone())]),
+        );
+    }
+    let error = table.error("TRUE").await;
+    assert!(error.contains("overlapping locations"), "{error}");
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_managed_scan_rejects_external_location_inside_table_directory() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table = ManagedTable::new(&temp_dir, &[("dt", varchar())]).await;
+    table.register(&[&[("dt", "a")]]).await;
+    table.server.set_table_partition_options(
+        DATABASE,
+        TABLE,
+        &spec(&[("dt", "a")]),
+        HashMap::from([(
+            "path".to_string(),
+            format!("file://{}/other-partition", temp_dir.path().display()),
+        )]),
+    );
+    let error = table.error("dt = 'a'").await;
+    assert!(
+        error.contains("overlaps the Format Table directory"),
+        "{error}"
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_managed_scan_rejects_encoded_traversal_without_reading_external_data() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table = ManagedTable::new(&temp_dir, &[("dt", varchar())]).await;
+    table.register(&[&[("dt", "a")]]).await;
+    write_ids(&temp_dir.path().join("dt=a"), &[1]);
+    for invalid in [
+        "file:/external/%2e%2e/secret",
+        "file:/external/%252e%252e/secret",
+        "file:/external/a?query=1",
+        "file:/external/%ZZ",
+    ] {
+        table.server.set_table_partition_options(
+            DATABASE,
+            TABLE,
+            &spec(&[("dt", "a")]),
+            HashMap::from([("path".to_string(), invalid.to_string())]),
+        );
+        let error = table.error("dt = 'a'").await;
+        assert!(
+            error.contains("invalid custom location"),
+            "{invalid}: {error}"
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_managed_scan_prunes_unrelated_invalid_custom_location() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let table = ManagedTable::new(&temp_dir, &[("dt", varchar())]).await;
+    table.register(&[&[("dt", "a")], &[("dt", "b")]]).await;
+    write_ids(&temp_dir.path().join("dt=a"), &[1]);
+    table.server.set_table_partition_options(
+        DATABASE,
+        TABLE,
+        &spec(&[("dt", "b")]),
+        HashMap::from([("path".to_string(), "file:/external/../secret".to_string())]),
+    );
+
+    // Only the reached partition is opened. A full-table scan still fails on
+    // the bad catalog metadata before it can return a partial answer.
+    assert_eq!(table.ids("dt = 'a'").await, vec![1]);
+    assert!(table
+        .error("TRUE")
+        .await
+        .contains("invalid custom location"));
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_managed_scan_uses_catalog_values_for_external_multi_key_partition() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let table = ManagedTable::new(
+        &temp_dir,
+        &[
+            ("dt", varchar()),
+            ("active", DataType::Boolean(BooleanType::new())),
+        ],
+    )
+    .await;
+    table.register(&[&[("dt", "a"), ("active", "true")]]).await;
+    write_ids(external_dir.path(), &[10, 11]);
+    table.server.set_table_partition_options(
+        DATABASE,
+        TABLE,
+        &spec(&[("dt", "a"), ("active", "true")]),
+        HashMap::from([(
+            "path".to_string(),
+            format!("file://{}", external_dir.path().display()),
+        )]),
+    );
+
+    assert_eq!(table.ids("active").await, vec![10, 11]);
+    assert_eq!(table.ids("NOT active").await, Vec::<i64>::new());
 }
 
 #[cfg(not(windows))]

@@ -1292,6 +1292,18 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
     }
 
+    /// Explicit `file.block-size`, in bytes. Formats choose their own default.
+    pub(crate) fn file_block_size(&self) -> crate::Result<Option<i64>> {
+        self.options
+            .get("file.block-size")
+            .map(|raw| {
+                parse_memory_size(raw).ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: format!("Invalid file.block-size: {raw}"),
+                })
+            })
+            .transpose()
+    }
+
     pub fn blob_target_file_size(&self) -> i64 {
         self.options
             .get("blob.target-file-size")
@@ -2411,6 +2423,23 @@ mod tests {
         assert_eq!(parse_memory_size("100 b"), Some(100));
         assert_eq!(parse_memory_size(""), None);
         assert_eq!(parse_memory_size("abc"), None);
+    }
+
+    #[test]
+    fn file_block_size_reports_invalid_input_and_preserves_format_default() {
+        let empty = HashMap::new();
+        assert_eq!(CoreOptions::new(&empty).file_block_size().unwrap(), None);
+        let valid = HashMap::from([("file.block-size".into(), "64 kb".into())]);
+        assert_eq!(
+            CoreOptions::new(&valid).file_block_size().unwrap(),
+            Some(65_536)
+        );
+        let invalid = HashMap::from([("file.block-size".into(), "nope".into())]);
+        assert!(CoreOptions::new(&invalid)
+            .file_block_size()
+            .unwrap_err()
+            .to_string()
+            .contains("file.block-size"));
     }
 
     #[test]

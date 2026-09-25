@@ -16,6 +16,7 @@
 // under the License.
 
 mod avro;
+mod avro_write;
 pub(crate) mod blob;
 mod mosaic;
 mod orc;
@@ -445,6 +446,7 @@ fn supported_write_formats() -> Vec<&'static str> {
     vec![
         ".parquet",
         ".blob",
+        ".avro",
         ".row",
         #[cfg(feature = "vortex")]
         ".vortex",
@@ -481,6 +483,22 @@ pub(crate) async fn create_format_writer(
     } else if lower.ends_with(".blob") {
         Ok(Box::new(
             blob::BlobFormatWriter::new(output, file_io).await?,
+        ))
+    } else if lower.ends_with(".avro") {
+        let fields = match write_fields {
+            Some(fields) => fields.to_vec(),
+            None => row::row_type_from_arrow_schema(&schema)?,
+        };
+        Ok(Box::new(
+            avro_write::AvroFormatWriter::new(
+                output,
+                schema,
+                fields,
+                compression,
+                zstd_level,
+                format_options,
+            )
+            .await?,
         ))
     } else if lower.ends_with(".row") {
         let row_type = match write_fields {

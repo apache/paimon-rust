@@ -229,8 +229,8 @@ async fn format_table_ignores_paimon_bucket_configuration() {
     assert_eq!(ids(&table).await, [1]);
 }
 
-#[test]
-fn declared_column_default_is_rejected_before_opening_a_writer() {
+#[tokio::test]
+async fn declared_column_default_routes_null_partition_to_default_directory() {
     let table = memory_table("format_column_default", true, &[]);
     let mut schema = serde_json::to_value(table.schema()).unwrap();
     schema["fields"][0]["defaultValue"] = serde_json::json!("'fallback'");
@@ -242,8 +242,21 @@ fn declared_column_default_is_rejected_before_opening_a_writer() {
         schema,
         None,
     );
-    let error = table.new_write_builder().new_write().err().unwrap();
-    assert!(error.to_string().contains("column default"));
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("dt", ArrowType::Utf8, true),
+            Field::new("id", ArrowType::Int32, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec![None, Some("given")])),
+            Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+        ],
+    )
+    .unwrap();
+    append(&table, &batch).await;
+    assert_eq!(ids(&table).await, [1, 2]);
+    assert_eq!(visible_files(&table, "dt=fallback").await.len(), 1);
+    assert_eq!(visible_files(&table, "dt=given").await.len(), 1);
 }
 
 #[tokio::test]
@@ -700,7 +713,7 @@ fn unsupported_format_is_rejected_before_a_writer_is_opened() {
 
 #[test]
 fn readable_but_unwritable_formats_are_rejected_before_staging() {
-    for format in ["avro", "orc", "mosaic"] {
+    for format in ["orc", "mosaic"] {
         let table = memory_table(
             &format!("format_no_{format}_writer"),
             false,
@@ -714,4 +727,13 @@ fn readable_but_unwritable_formats_are_rejected_before_staging() {
             "format={format}, error={error}"
         );
     }
+}
+
+#[tokio::test]
+async fn avro_format_table_append_is_readable_through_native_scan() {
+    let table = memory_table("format_avro_append", true, &[("file.format", "avro")]);
+    append(&table, &batch(&[("a", 1), ("a", 2), ("b", 3)])).await;
+    assert_eq!(ids(&table).await, [1, 2, 3]);
+    assert_eq!(visible_files(&table, "dt=a").await.len(), 1);
+    assert_eq!(visible_files(&table, "dt=b").await.len(), 1);
 }
