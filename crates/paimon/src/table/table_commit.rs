@@ -31,6 +31,7 @@ use crate::spec::{
     EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA, POSTPONE_BUCKET,
 };
 use crate::table::commit_message::CommitMessage;
+use crate::table::format_table_commit::FormatTableCommit;
 use crate::table::global_index_build_common::same_extra_field_ids;
 use crate::table::index_file_path::committed_index_file_path;
 use crate::table::partition_filter::PartitionFilter;
@@ -318,6 +319,11 @@ impl TableCommit {
         commit_messages: Vec<CommitMessage>,
         commit_identifier: i64,
     ) -> Result<()> {
+        if self.table.is_format_table() {
+            return FormatTableCommit::new(&self.table)
+                .append(&commit_messages)
+                .await;
+        }
         self.commit_with_identifier_impl(commit_messages, commit_identifier, false)
             .await
     }
@@ -342,6 +348,11 @@ impl TableCommit {
         commit_identifier: i64,
         filter_committed: bool,
     ) -> Result<()> {
+        if self.table.is_format_table() {
+            return Err(crate::Error::Unsupported {
+                message: "Format Table commits have no checkpoint identifiers".into(),
+            });
+        }
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.table.ensure_not_branch_reference_for_write()?;
@@ -446,6 +457,11 @@ impl TableCommit {
         commit_messages: Vec<CommitMessage>,
         static_partitions: Option<HashMap<String, Option<Datum>>>,
     ) -> Result<()> {
+        if self.table.is_format_table() {
+            return FormatTableCommit::new(&self.table)
+                .overwrite(&commit_messages, static_partitions.as_ref())
+                .await;
+        }
         self.overwrite_impl(
             commit_messages,
             static_partitions,
@@ -465,6 +481,11 @@ impl TableCommit {
         static_partitions: Option<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
     ) -> Result<()> {
+        if self.table.is_format_table() {
+            return Err(crate::Error::Unsupported {
+                message: "Format Table overwrites have no checkpoint identifiers".into(),
+            });
+        }
         self.overwrite_impl(commit_messages, static_partitions, commit_identifier, true)
             .await
     }
@@ -862,6 +883,11 @@ impl TableCommit {
     /// files or storage errors are ignored so abort cleanup never masks the
     /// original write failure.
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
+        if self.table.is_format_table() {
+            return FormatTableCommit::new(&self.table)
+                .abort(commit_messages)
+                .await;
+        }
         CoreOptions::new(self.table.schema().options())
             .ensure_type_paimon_served(&self.table.identifier().full_name())?;
         self.table.ensure_not_branch_reference_for_write()?;

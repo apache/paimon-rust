@@ -39,6 +39,7 @@ use crate::table::commit_message::CommitMessage;
 use crate::table::data_file_index_writer::FileIndexOptions;
 use crate::table::data_file_writer::DataFileWriter;
 use crate::table::dedicated_format_file_writer::AppendDedicatedFormatFileWriter;
+use crate::table::format_table_writer::FormatTableWriter;
 use crate::table::kv_file_writer::{KeyValueFileWriter, KeyValueWriteConfig};
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
@@ -123,6 +124,8 @@ impl FileWriter {
 ///
 /// Reference: [pypaimon BatchTableWrite](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/table_write.py)
 pub struct TableWrite {
+    // Keep the Format Table state off ordinary Paimon write futures' stacks.
+    format_writer: Option<Box<FormatTableWriter>>,
     table: Table,
     write_schema: Arc<arrow_schema::Schema>,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
@@ -172,6 +175,69 @@ pub struct TableWrite {
 }
 
 impl TableWrite {
+    pub(crate) fn new_format(
+        table: &Table,
+        commit_user: String,
+        resources: Option<ResourceContext>,
+        overwrite: bool,
+    ) -> Result<Self> {
+        let format_writer = FormatTableWriter::new(table, resources.clone())?;
+        let schema = table.schema();
+        let options = CoreOptions::new(schema.options());
+        // Format Tables do not use Paimon buckets, indexes, changelogs or
+        // snapshots. Build their public TableWrite wrapper without running
+        // Paimon-only option validation or constructing stateful assigners.
+        Ok(Self {
+            format_writer: Some(Box::new(format_writer)),
+            table: table.clone(),
+            write_schema: build_target_arrow_schema(schema.fields())?,
+            partition_writers: HashMap::new(),
+            partition_computer: PartitionComputer::new(
+                schema.partition_keys(),
+                schema.fields(),
+                options.partition_default_name(),
+                options.legacy_partition_name(),
+            )?,
+            partition_keys: schema.partition_keys().to_vec(),
+            schema_id: schema.id(),
+            target_file_size: 0,
+            blob_target_file_size: 0,
+            vector_target_file_size: 0,
+            file_compression: String::new(),
+            file_compression_zstd_level: 0,
+            write_buffer_size: 0,
+            file_format: String::new(),
+            data_file_prefix: String::new(),
+            primary_key_indices: Vec::new(),
+            primary_key_types: Vec::new(),
+            sequence_field_indices: Vec::new(),
+            merge_engine: MergeEngine::Deduplicate,
+            changelog_producer: ChangelogProducer::None,
+            changelog_file_prefix: String::new(),
+            changelog_file_format: String::new(),
+            changelog_file_compression: String::new(),
+            partition_seq_cache: HashMap::new(),
+            sequence_snapshot: None,
+            commit_user,
+            postpone_write_id: 0,
+            bucket_assigner: BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
+                Vec::new(),
+                0,
+            )),
+            is_overwrite: overwrite,
+            blob_view_fields: HashSet::new(),
+            blob_inline_fields: HashSet::new(),
+            has_blob_fields: false,
+            vector_file_format: None,
+            has_dedicated_vector_fields: false,
+            row_kind_generator: None,
+            row_kind_filter: None,
+            file_index_options: None,
+            resources,
+            failed: false,
+        })
+    }
+
     pub(crate) fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
         // A dynamic-bucket write reads the persisted PK hash index; the rest are
         // refused too, since their commit is blocked anyway.
@@ -407,6 +473,7 @@ impl TableWrite {
         }
 
         Ok(Self {
+            format_writer: None,
             table: table.clone(),
             write_schema,
             partition_writers: HashMap::new(),
@@ -525,12 +592,18 @@ impl TableWrite {
     /// retained key-value batches and unflushed format-writer input. Call this
     /// before the first write.
     pub fn with_resources(mut self, resources: ResourceContext) -> Self {
+        if let Some(writer) = self.format_writer.as_mut() {
+            writer.set_resources(resources.clone());
+        }
         self.resources = Some(resources);
         self
     }
 
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if let Some(writer) = self.format_writer.as_mut() {
+            return writer.write(batch).await;
+        }
         self.ensure_active()?;
         let Some(batch) = self.normalize_write_batch(batch)? else {
             return Ok(());
@@ -921,6 +994,10 @@ impl TableWrite {
     /// Close without preparing another commit, discarding only outstanding output.
     /// Files already returned by prepare_commit belong to the caller.
     pub async fn close(&mut self) {
+        if let Some(writer) = self.format_writer.as_mut() {
+            writer.close().await;
+            return;
+        }
         for (_, mut writer) in self.partition_writers.drain() {
             writer.abort().await;
         }
@@ -938,6 +1015,9 @@ impl TableWrite {
     /// commits. (`sequence_snapshot` is pinned only by the postpone path, which
     /// forbids reuse, so it is left untouched.)
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
+        if let Some(writer) = self.format_writer.as_mut() {
+            return writer.prepare_commit().await;
+        }
         self.ensure_active()?;
         self.partition_seq_cache.clear();
         let writers: Vec<(PartitionBucketKey, FileWriter)> =

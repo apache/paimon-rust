@@ -1075,6 +1075,8 @@ pub struct DataField {
     typ: DataType,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    #[serde(rename = "defaultValue", skip_serializing_if = "Option::is_none")]
+    default_value: Option<String>,
 }
 
 impl DataField {
@@ -1084,6 +1086,7 @@ impl DataField {
             name,
             typ,
             description: None,
+            default_value: None,
         }
     }
 
@@ -1103,6 +1106,10 @@ impl DataField {
         self.description.as_deref()
     }
 
+    pub fn default_value(&self) -> Option<&str> {
+        self.default_value.as_deref()
+    }
+
     pub fn with_id(mut self, new_id: i32) -> Self {
         self.id = new_id;
         self
@@ -1115,6 +1122,11 @@ impl DataField {
 
     pub fn with_description(mut self, new_description: Option<String>) -> Self {
         self.description = new_description;
+        self
+    }
+
+    pub fn with_default_value(mut self, default_value: Option<String>) -> Self {
+        self.default_value = default_value;
         self
     }
 }

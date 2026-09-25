@@ -295,12 +295,16 @@ impl<'a> FormatTableScan<'a> {
             if !self.partition_matches(&row)? {
                 continue;
             }
-            // The Rust reader cannot resolve a partition's own location yet, and reading the
-            // default directory in its place would return whatever happens to be there.
+            // An overwrite explicitly rebinds a formerly custom partition to
+            // its default directory. That path option is safe to read here;
+            // other custom locations still need their own resolver.
             if partition
                 .options
                 .as_ref()
-                .is_some_and(|options| options.contains_key(PATH_OPTION))
+                .and_then(|options| options.get(PATH_OPTION))
+                .is_some_and(|location| {
+                    location.trim_end_matches('/') != path.trim_end_matches('/')
+                })
             {
                 return Err(crate::Error::Unsupported {
                     message: format!(

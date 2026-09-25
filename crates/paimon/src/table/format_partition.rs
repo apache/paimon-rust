@@ -111,6 +111,44 @@ impl FormatTablePartitionPaths {
             .join("/"))
     }
 
+    /// Physical path for a leading static partition prefix. Java creates this
+    /// directory even when an overwrite writes no rows. An empty spec denotes
+    /// the table root; a gap or an unknown key is rejected.
+    pub(crate) fn relative_prefix_path(
+        &self,
+        spec: &HashMap<String, String>,
+    ) -> crate::Result<String> {
+        if spec.len() > self.partition_keys.len() {
+            return Err(crate::Error::DataInvalid {
+                message: "Static partition is not a leading prefix".into(),
+                source: None,
+            });
+        }
+        let mut segments = Vec::with_capacity(spec.len());
+        for key in self.partition_keys.iter().take(spec.len()) {
+            let value = spec.get(key).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("Static partition is missing leading key '{key}'"),
+                source: None,
+            })?;
+            if value.is_empty() || (self.only_value_in_path && matches!(value.as_str(), "." | ".."))
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Partition value {value:?} cannot be used as a path component"
+                    ),
+                    source: None,
+                });
+            }
+            let segment = if self.only_value_in_path {
+                escape_path_name(value)
+            } else {
+                format!("{}={}", escape_path_name(key), escape_path_name(value))
+            };
+            segments.push(segment);
+        }
+        Ok(segments.join("/"))
+    }
+
     /// Discover complete raw partition specs from the table directory, sorted and deduplicated.
     /// Skips hidden or non-matching entries; a malformed or non-canonical segment is an error.
     pub async fn discover(
@@ -419,6 +457,24 @@ mod tests {
             ("hour".to_string(), "10".to_string()),
         ]);
         assert!(value_only.relative_path(&traversal).is_err());
+    }
+
+    #[test]
+    fn test_relative_static_partition_prefix_path() {
+        let keyed = FormatTablePartitionPaths::new(["dt", "hour"], false);
+        let values = FormatTablePartitionPaths::new(["dt", "hour"], true);
+        let empty = HashMap::new();
+        assert_eq!(keyed.relative_prefix_path(&empty).unwrap(), "");
+        assert_eq!(values.relative_prefix_path(&empty).unwrap(), "");
+        let prefix = HashMap::from([("dt".to_string(), "a/b".to_string())]);
+        assert_eq!(keyed.relative_prefix_path(&prefix).unwrap(), "dt=a%2Fb");
+        assert_eq!(values.relative_prefix_path(&prefix).unwrap(), "a%2Fb");
+        let gap = HashMap::from([("hour".to_string(), "12".to_string())]);
+        assert!(keyed.relative_prefix_path(&gap).is_err());
+        let unknown = HashMap::from([("other".to_string(), "x".to_string())]);
+        assert!(values.relative_prefix_path(&unknown).is_err());
+        let invalid = HashMap::from([("dt".to_string(), "..".to_string())]);
+        assert!(values.relative_prefix_path(&invalid).is_err());
     }
 
     #[test]
