@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::common::options::{parse_memory_size, CatalogOptions};
 use crate::error::*;
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
@@ -92,6 +93,8 @@ pub struct FileIO {
     backend: FileIOBackend,
     cache: Option<Arc<LocalCache>>,
     cache_namespace: usize,
+    context_id: u64,
+    file_format_metadata_cache_max_bytes: usize,
 }
 
 static NEXT_FILE_IO_CACHE_NAMESPACE: AtomicUsize = AtomicUsize::new(1);
@@ -100,11 +103,24 @@ fn next_file_io_cache_namespace() -> usize {
     NEXT_FILE_IO_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed)
 }
 
+pub(crate) const DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES: usize = 50 * 1024 * 1024;
+
+static NEXT_FILE_IO_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_file_io_context_id() -> u64 {
+    NEXT_FILE_IO_CONTEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 impl std::fmt::Debug for FileIO {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileIO")
             .field("backend", &self.backend)
             .field("cache", &self.cache)
+            .field("context_id", &self.context_id)
+            .field(
+                "file_format_metadata_cache_max_bytes",
+                &self.file_format_metadata_cache_max_bytes,
+            )
             .finish()
     }
 }
@@ -135,6 +151,7 @@ impl FileIO {
     pub fn with_provider(mut self, provider: Arc<dyn FileIOProvider>) -> Self {
         self.backend = FileIOBackend::Provider(provider);
         self.cache_namespace = next_file_io_cache_namespace();
+        self.context_id = next_file_io_context_id();
         self
     }
 
@@ -221,6 +238,8 @@ impl FileIO {
             source: self.file_source(path)?,
             path: path.to_string(),
             cache_namespace: self.cache_namespace,
+            context_id: self.context_id,
+            file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
             cache: self
                 .cache
                 .as_ref()
@@ -238,6 +257,8 @@ impl FileIO {
             source: self.file_source(path)?,
             path: path.to_string(),
             cache_namespace: self.cache_namespace,
+            context_id: self.context_id,
+            file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
             cache: self
                 .cache
                 .as_ref()
@@ -683,6 +704,22 @@ impl FileIOBuilder {
 
     pub fn build(mut self) -> crate::Result<FileIO> {
         let cache = self.cache.clone();
+        let file_format_metadata_cache_max_bytes = self
+            .props
+            .get(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE)
+            .map(|value| {
+                parse_memory_size(value)
+                    .ok()
+                    .and_then(|bytes| usize::try_from(bytes).ok())
+                    .ok_or_else(|| Error::ConfigInvalid {
+                        message: format!(
+                            "Invalid value for {}: {value}",
+                            CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE
+                        ),
+                    })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES);
         let backend = if let Some(provider) = self.provider.take() {
             if self.operator.is_some() {
                 return Err(Error::ConfigInvalid {
@@ -697,6 +734,8 @@ impl FileIOBuilder {
             backend,
             cache,
             cache_namespace: next_file_io_cache_namespace(),
+            context_id: next_file_io_context_id(),
+            file_format_metadata_cache_max_bytes,
         })
     }
 }
@@ -709,6 +748,15 @@ pub trait FileRead: Send + Sync + Unpin + 'static {
     fn cache_namespace(&self) -> Option<usize> {
         None
     }
+
+    /// Stable identity of an immutable file within one storage context.
+    fn cache_key(&self) -> Option<&str> {
+        None
+    }
+
+    fn file_format_metadata_cache_max_bytes(&self) -> usize {
+        DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES
+    }
 }
 
 #[async_trait::async_trait]
@@ -719,22 +767,56 @@ impl FileRead for opendal::Reader {
 }
 
 enum InputFileReader {
-    Direct(opendal::Reader, usize),
-    Cached(CachedFileReader, usize),
+    Direct {
+        reader: opendal::Reader,
+        cache_namespace: usize,
+        cache_key: String,
+        file_format_metadata_cache_max_bytes: usize,
+    },
+    Cached {
+        reader: CachedFileReader,
+        cache_namespace: usize,
+        cache_key: String,
+        file_format_metadata_cache_max_bytes: usize,
+    },
 }
 
 #[async_trait::async_trait]
 impl FileRead for InputFileReader {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         match self {
-            Self::Direct(reader, _) => FileRead::read(reader, range).await,
-            Self::Cached(reader, _) => FileRead::read(reader, range).await,
+            Self::Direct { reader, .. } => FileRead::read(reader, range).await,
+            Self::Cached { reader, .. } => FileRead::read(reader, range).await,
+        }
+    }
+
+    fn cache_key(&self) -> Option<&str> {
+        match self {
+            Self::Direct { cache_key, .. } | Self::Cached { cache_key, .. } => Some(cache_key),
+        }
+    }
+
+    fn file_format_metadata_cache_max_bytes(&self) -> usize {
+        match self {
+            Self::Direct {
+                file_format_metadata_cache_max_bytes,
+                ..
+            }
+            | Self::Cached {
+                file_format_metadata_cache_max_bytes,
+                ..
+            } => *file_format_metadata_cache_max_bytes,
         }
     }
 
     fn cache_namespace(&self) -> Option<usize> {
         Some(match self {
-            Self::Direct(_, namespace) | Self::Cached(_, namespace) => *namespace,
+            Self::Direct {
+                cache_namespace, ..
+            }
+            | Self::Cached {
+                cache_namespace, ..
+            } => *cache_namespace,
         })
     }
 }
@@ -874,6 +956,8 @@ pub struct InputFile {
     source: FileSource,
     path: String,
     cache_namespace: usize,
+    context_id: u64,
+    file_format_metadata_cache_max_bytes: usize,
     cache: Option<Arc<LocalCache>>,
 }
 
@@ -922,9 +1006,15 @@ impl InputFile {
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
+        let metadata_cache_key = format!("{}\0{cache_path}", self.context_id);
         let reader = op.reader(&relative_path).await?;
         let Some(cache) = &self.cache else {
-            return Ok(InputFileReader::Direct(reader, self.cache_namespace));
+            return Ok(InputFileReader::Direct {
+                reader,
+                cache_namespace: self.cache_namespace,
+                cache_key: metadata_cache_key,
+                file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
+            });
         };
         let read_token = cache.read_token(&cache_path);
         let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
@@ -934,16 +1024,18 @@ impl InputFile {
             cache.put_file_size(&cache_path, size, &read_token).await;
             size
         };
-        Ok(InputFileReader::Cached(
-            CachedFileReader::new_with_token(
+        Ok(InputFileReader::Cached {
+            reader: CachedFileReader::new_with_token(
                 Arc::new(reader),
                 &cache_path,
                 size,
                 cache.clone(),
                 read_token,
             ),
-            self.cache_namespace,
-        ))
+            cache_namespace: self.cache_namespace,
+            cache_key: metadata_cache_key,
+            file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
+        })
     }
 }
 
@@ -952,6 +1044,8 @@ pub struct OutputFile {
     source: FileSource,
     path: String,
     cache_namespace: usize,
+    context_id: u64,
+    file_format_metadata_cache_max_bytes: usize,
     cache: Option<Arc<LocalCache>>,
 }
 
@@ -971,6 +1065,8 @@ impl OutputFile {
             source: self.source,
             path: self.path,
             cache_namespace: self.cache_namespace,
+            context_id: self.context_id,
+            file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
             cache,
         }
     }
@@ -1734,6 +1830,114 @@ mod input_output_test {
     async fn test_input_file_partial_read_memory() {
         let file_io = setup_memory_file_io();
         common_test_input_file_partial_read(&file_io, "memory:/test_file_part_read_mem").await;
+    }
+
+    #[tokio::test]
+    async fn test_file_read_cache_key_is_scoped_to_file_io_context() {
+        let path = "memory:/cache-key.parquet";
+        let first = setup_memory_file_io();
+        first
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        let first_key = first
+            .new_input(path)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap()
+            .cache_key()
+            .unwrap()
+            .to_string();
+        let clone_key = first
+            .clone()
+            .new_input(path)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap()
+            .cache_key()
+            .unwrap()
+            .to_string();
+
+        let second = setup_memory_file_io();
+        second
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+        let second_key = second
+            .new_input(path)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap()
+            .cache_key()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(first_key, clone_key);
+        assert_ne!(first_key, second_key);
+    }
+
+    #[tokio::test]
+    async fn test_file_format_metadata_cache_size_reaches_file_reader() {
+        let path = "memory:/metadata-cache-size.parquet";
+        let default = setup_memory_file_io();
+        default
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(
+            default
+                .new_input(path)
+                .unwrap()
+                .reader()
+                .await
+                .unwrap()
+                .file_format_metadata_cache_max_bytes(),
+            DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES
+        );
+
+        let configured = FileIOBuilder::new("memory")
+            .with_prop(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE, "1 mb")
+            .build()
+            .unwrap();
+        configured
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(
+            configured
+                .new_input(path)
+                .unwrap()
+                .reader()
+                .await
+                .unwrap()
+                .file_format_metadata_cache_max_bytes(),
+            1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_file_format_metadata_cache_size_rejects_invalid_value() {
+        let error = FileIOBuilder::new("memory")
+            .with_prop(
+                CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE,
+                "invalid",
+            )
+            .build()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE));
     }
 
     #[tokio::test]

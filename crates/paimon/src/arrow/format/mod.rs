@@ -18,6 +18,7 @@
 mod avro;
 mod avro_write;
 pub(crate) mod blob;
+mod metadata_cache;
 mod mosaic;
 mod mosaic_write;
 mod orc;
