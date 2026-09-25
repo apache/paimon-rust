@@ -2801,6 +2801,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kv_read_partial_update_remove_record_on_delete() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_partial_update_remove_record_on_delete";
+        setup_dirs(&file_io, table_path).await;
+        let table = pk_table(
+            &file_io,
+            table_path,
+            &[
+                ("merge-engine", "partial-update"),
+                ("partial-update.remove-record-on-delete", "true"),
+            ],
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+            ArrowField::new(
+                crate::spec::VALUE_KIND_FIELD_NAME,
+                ArrowDataType::Int8,
+                false,
+            ),
+        ]));
+        let make = |value: Option<i32>, kind: i8| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1])),
+                    Arc::new(Int32Array::from(vec![value])),
+                    Arc::new(Int8Array::from(vec![kind])),
+                ],
+            )
+            .unwrap()
+        };
+
+        write_commit(&table, &make(Some(10), 0)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![10]
+        );
+
+        write_commit(&table, &make(Some(99), 1)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![10]
+        );
+
+        write_commit(&table, &make(Some(20), 2)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![20]
+        );
+
+        write_commit(&table, &make(None, 3)).await;
+        let rows = read_rows(&table, None, None).await;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0), "{rows:?}");
+
+        write_commit(&table, &make(None, 0)).await;
+        let rows = read_rows(&table, None, None).await;
+        assert_eq!(int_column(&rows, "id"), vec![1]);
+        let value = rows[0].column(rows[0].schema().index_of("value").unwrap());
+        assert!(value.is_null(0));
+
+        write_commit(&table, &make(Some(30), 3)).await;
+        write_commit(&table, &make(None, 0)).await;
+        assert_eq!(
+            int_column(&read_rows(&table, None, None).await, "value"),
+            vec![30]
+        );
+
+        let mut write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        write
+            .write_arrow_batch(&int_batch(vec![1], vec![Some(40)]))
+            .await
+            .unwrap();
+        write.write_arrow_batch(&make(None, 3)).await.unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+        let rows = read_rows(&table, None, None).await;
+        assert!(rows.iter().all(|batch| batch.num_rows() == 0), "{rows:?}");
+    }
+
+    #[tokio::test]
     async fn kv_read_partial_update_sequence_groups_with_projection() {
         let file_io = test_file_io();
         let table_path = "memory:/kv_partial_update_sequence_groups";
