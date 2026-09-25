@@ -2429,6 +2429,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_map_reader_returns_inline_values_and_descriptors() {
+        let file_path = "file:///tmp/map-values-and-descriptors.blob";
         let payload = build_blob_map_payload(&[
             ("video", Some(b"alpha")),
             ("thumbnail", None),
@@ -2437,7 +2438,7 @@ mod tests {
         let file_bytes = blob_test_utils::build_blob_file_bytes(&[Some(payload.as_slice()), None]);
         let fields = blob_map_read_fields();
 
-        let inline = BlobFormatReader::new("file:///tmp/map.blob".to_string(), false)
+        let inline = BlobFormatReader::new(file_path.to_string(), false)
             .read_batch_stream(
                 Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
                 file_bytes.len() as u64,
@@ -2463,7 +2464,7 @@ mod tests {
             ]
         );
 
-        let descriptors = BlobFormatReader::new("file:///tmp/map.blob".to_string(), true)
+        let descriptors = BlobFormatReader::new(file_path.to_string(), true)
             .read_batch_stream(
                 Box::new(BytesFileRead(Bytes::from(file_bytes.clone()))),
                 file_bytes.len() as u64,
@@ -2480,7 +2481,7 @@ mod tests {
         let rows = collect_blob_map_values(&descriptors[0]);
         let entries = rows[0].as_ref().unwrap();
         let video = BlobDescriptor::deserialize(entries[0].1.as_ref().unwrap()).unwrap();
-        assert_eq!(video.uri(), "file:///tmp/map.blob");
+        assert_eq!(video.uri(), file_path);
         assert_eq!(video.length(), 5);
         assert!(entries[1].1.is_none());
         let empty = BlobDescriptor::deserialize(entries[2].1.as_ref().unwrap()).unwrap();
@@ -2530,7 +2531,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_blob_map_descriptor_read_skips_values() {
-        let file_path = "file:///tmp/map.blob";
+        let file_path = "file:///tmp/map-descriptor-skip-values.blob";
         let payload =
             build_blob_map_payload(&[("first", Some(b"alpha")), ("second", Some(b"beta"))]);
         let file_bytes = blob_test_utils::build_blob_file_bytes(&[Some(payload.as_slice())]);
