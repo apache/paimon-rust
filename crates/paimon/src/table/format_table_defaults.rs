@@ -22,9 +22,10 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, Date32Array, ListArray, MapArray, RecordBatch, StringArray,
-    StructArray, Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray,
+    Array, ArrayRef, BinaryArray, Date32Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    ListArray, MapArray, RecordBatch, StringArray, StructArray, Time32MillisecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{
@@ -159,6 +160,28 @@ fn cast_default(
             let bytes = &bytes[..bytes.len().min(typ.length() as usize)];
             Ok(Arc::new(BinaryArray::from(vec![bytes])))
         }
+        // Java BinaryStringUtils.toByte/toShort/toInt/toLong accept a decimal
+        // suffix, validate its digits and truncate it toward zero.
+        DataType::TinyInt(_) => Ok(Arc::new(Int8Array::from(vec![parse_java_integer(
+            text,
+            i64::from(i8::MIN),
+            i64::from(i8::MAX),
+        )? as i8]))),
+        DataType::SmallInt(_) => Ok(Arc::new(Int16Array::from(vec![parse_java_integer(
+            text,
+            i64::from(i16::MIN),
+            i64::from(i16::MAX),
+        )? as i16]))),
+        DataType::Int(_) => Ok(Arc::new(Int32Array::from(vec![parse_java_integer(
+            text,
+            i64::from(i32::MIN),
+            i64::from(i32::MAX),
+        )? as i32]))),
+        DataType::BigInt(_) => Ok(Arc::new(Int64Array::from(vec![parse_java_integer(
+            text,
+            i64::MIN,
+            i64::MAX,
+        )?]))),
         // Java's BinaryStringUtils treats an all-digit DATE/TIME value as the
         // internal day/millisecond count and a TIMESTAMP value as the count in
         // the requested precision, rather than parsing it as a calendar string.
@@ -346,7 +369,9 @@ fn cast_default(
                     return Err(cast_error("MAP default has an odd number of tokens"));
                 }
                 tokens
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| (pair[0].clone(), pair[1].clone()))
                     .collect()
             };
@@ -399,6 +424,40 @@ fn cast_default(
 
 fn numeric_default(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn parse_java_integer(text: &str, min: i64, max: i64) -> std::result::Result<i64, ArrowError> {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return Err(cast_error("Empty integer default"));
+    }
+    let negative = bytes[0] == b'-';
+    let mut index = usize::from(negative || bytes[0] == b'+');
+    if index == bytes.len() {
+        return Err(cast_error(format!("Invalid integer default: {text}")));
+    }
+
+    // Accumulate a negative value so the signed minimum remains representable.
+    // Like Java, the digits before '.' may be empty; the fractional part does
+    // not affect the result but must contain only decimal digits.
+    let limit = if negative { min } else { -max };
+    let mut value = 0_i64;
+    while index < bytes.len() && bytes[index] != b'.' {
+        let digit = bytes[index];
+        if !digit.is_ascii_digit() {
+            return Err(cast_error(format!("Invalid integer default: {text}")));
+        }
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_sub(i64::from(digit - b'0')))
+            .filter(|value| *value >= limit)
+            .ok_or_else(|| cast_error(format!("Integer default overflow: {text}")))?;
+        index += 1;
+    }
+    if index < bytes.len() && !bytes[index + 1..].iter().all(u8::is_ascii_digit) {
+        return Err(cast_error(format!("Invalid integer default: {text}")));
+    }
+    Ok(if negative { value } else { -value })
 }
 
 #[derive(Clone)]
@@ -696,6 +755,93 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("Unsupported default value"));
+    }
+
+    #[test]
+    fn integer_defaults_truncate_fraction_like_java() {
+        use crate::spec::{IntType, SmallIntType, TinyIntType};
+        use arrow_array::{Int16Array, Int32Array, Int8Array};
+
+        let fields = vec![
+            DataField::new(0, "tiny".into(), DataType::TinyInt(TinyIntType::new()))
+                .with_default_value(Some("42.9".into())),
+            DataField::new(1, "small".into(), DataType::SmallInt(SmallIntType::new()))
+                .with_default_value(Some("-42.9".into())),
+            DataField::new(2, "int".into(), DataType::Int(IntType::new()))
+                .with_default_value(Some("2147483647.9".into())),
+            DataField::new(3, "big".into(), DataType::BigInt(BigIntType::new()))
+                .with_default_value(Some("-9223372036854775808.9".into())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            schema
+                .fields()
+                .iter()
+                .map(|field| arrow_array::new_null_array(field.data_type(), 1))
+                .collect(),
+        )
+        .unwrap();
+        let actual = defaults.apply(&input).unwrap();
+        assert_eq!(
+            actual
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
+        assert_eq!(
+            actual
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(0),
+            -42
+        );
+        assert_eq!(
+            actual
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            i32::MAX
+        );
+        assert_eq!(
+            actual
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            i64::MIN
+        );
+    }
+
+    #[test]
+    fn integer_defaults_reject_overflow_and_invalid_fraction() {
+        use crate::spec::{IntType, SmallIntType, TinyIntType};
+
+        for (data_type, text) in [
+            (DataType::TinyInt(TinyIntType::new()), "128.1"),
+            (DataType::SmallInt(SmallIntType::new()), "32768.1"),
+            (DataType::Int(IntType::new()), "2147483648.1"),
+            (DataType::BigInt(BigIntType::new()), "9223372036854775808.1"),
+            (DataType::Int(IntType::new()), "42.x"),
+        ] {
+            let fields =
+                [DataField::new(0, "number".into(), data_type)
+                    .with_default_value(Some(text.into()))];
+            let schema = build_target_arrow_schema(&fields).unwrap();
+            assert!(
+                FormatTableDefaults::new(&fields, &schema).is_err(),
+                "{text}"
+            );
+        }
     }
 
     #[test]
