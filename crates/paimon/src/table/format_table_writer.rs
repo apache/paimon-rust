@@ -27,6 +27,7 @@ use arrow_schema::{Field, Schema as ArrowSchema};
 
 use super::commit_message::{CommitMessage, FormatFileCommit};
 use super::format_partition::FormatTablePartitionPaths;
+use super::format_table_defaults::FormatTableDefaults;
 use super::format_table_scan::supported_format_table_extension;
 use super::table_write::take_rows;
 use super::Table;
@@ -56,6 +57,7 @@ struct PartitionWriter {
 pub(crate) struct FormatTableWriter {
     table: Table,
     full_schema: Arc<ArrowSchema>,
+    defaults: FormatTableDefaults,
     file_schema: Arc<ArrowSchema>,
     file_fields: Vec<DataField>,
     partition_indices: Vec<usize>,
@@ -84,18 +86,6 @@ impl FormatTableWriter {
     pub(crate) fn new(table: &Table, resources: Option<ResourceContext>) -> Result<Self> {
         table.ensure_not_branch_reference_for_write()?;
         let schema = table.schema();
-        if let Some(field) = schema
-            .fields()
-            .iter()
-            .find(|field| field.default_value().is_some())
-        {
-            return Err(crate::Error::Unsupported {
-                message: format!(
-                    "Format Table column default for '{}' is not supported by the Rust writer",
-                    field.name()
-                ),
-            });
-        }
         let options = CoreOptions::new(schema.options());
         let format = options.file_format();
         let extension = supported_format_table_extension(&format)?.to_string();
@@ -103,7 +93,7 @@ impl FormatTableWriter {
         // unsupported formats before staging any files, rather than failing
         // after the first RecordBatch has been routed.
         match format.as_str() {
-            "parquet" | "row" => {}
+            "parquet" | "row" | "avro" => {}
             #[cfg(feature = "vortex")]
             "vortex" => {}
             _ => {
@@ -115,6 +105,7 @@ impl FormatTableWriter {
             }
         }
         let full_schema = build_target_arrow_schema(schema.fields())?;
+        let defaults = FormatTableDefaults::new(schema.fields(), &full_schema)?;
         let partition_indices = schema
             .partition_keys()
             .iter()
@@ -172,6 +163,7 @@ impl FormatTableWriter {
         Ok(Self {
             table: table.clone(),
             full_schema,
+            defaults,
             file_schema,
             file_fields,
             partition_indices,
@@ -228,6 +220,8 @@ impl FormatTableWriter {
             }
         }
 
+        let batch = self.defaults.apply(batch)?;
+
         let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
         let mut specs = HashMap::new();
         let partition_fields = self.table.schema().partition_fields();
@@ -240,7 +234,7 @@ impl FormatTableWriter {
         )?;
         for row_index in 0..batch.num_rows() {
             let partition = BinaryRow::from_arrow(
-                batch,
+                &batch,
                 row_index,
                 &self.partition_indices,
                 &partition_fields,
@@ -258,7 +252,7 @@ impl FormatTableWriter {
         }
 
         for (key, rows) in groups {
-            let input = take_rows(batch, &rows)?;
+            let input = take_rows(&batch, &rows)?;
             let file_batch = self.project_data_columns(&input)?;
             if !self.writers.contains_key(&key) {
                 let spec = specs.remove(&key).unwrap();
@@ -472,4 +466,105 @@ fn format_table_compression(options: &HashMap<String, String>, format: &str) -> 
             }
             .to_string()
         })
+}
+
+#[cfg(test)]
+mod defaults_tests {
+    use std::sync::Arc;
+
+    use apache_avro::types::Value;
+    use arrow_array::{Int64Array, StringArray};
+
+    use super::*;
+    use crate::catalog::Identifier;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{BigIntType, DataType, Schema, TableSchema, VarCharType};
+
+    fn table_with_defaults(dt_default: &str, id_default: &str) -> Table {
+        let schema = Schema::builder()
+            .column("dt", DataType::VarChar(VarCharType::string_type()))
+            .column("id", DataType::BigInt(BigIntType::new()))
+            .partition_keys(["dt"])
+            .option("type", "format-table")
+            .option("file.format", "avro")
+            .build()
+            .unwrap();
+        let mut json = serde_json::to_value(&schema).unwrap();
+        json["fields"][0]["defaultValue"] = dt_default.into();
+        json["fields"][1]["defaultValue"] = id_default.into();
+        let schema: Schema = serde_json::from_value(json).unwrap();
+        Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "format_defaults"),
+            "memory:/format_defaults".into(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn defaults_route_rows_and_are_written_to_avro_data_file() {
+        let table = table_with_defaults("'fallback'", "42");
+        let mut writer = FormatTableWriter::new(&table, None).unwrap();
+        let input = RecordBatch::try_new(
+            writer.full_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![None, Some("given")])),
+                Arc::new(Int64Array::from(vec![None, Some(7)])),
+            ],
+        )
+        .unwrap();
+        writer.write(&input).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 2);
+        for message in messages {
+            let file = message.format_file.unwrap();
+            let dt = file.partition.get("dt").unwrap();
+            let expected = if dt == "fallback" { 42 } else { 7 };
+            assert_eq!(file.record_count, 1);
+            assert!(file.target_path.contains(&format!("dt={dt}/")));
+            let bytes = table
+                .file_io()
+                .new_input(&file.staged_path)
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let rows = apache_avro::Reader::new(bytes.as_ref())
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            let Value::Record(columns) = &rows[0] else {
+                panic!("expected Avro record");
+            };
+            assert_eq!(columns[0].0, "id");
+            assert_eq!(
+                columns[0].1,
+                Value::Union(1, Box::new(Value::Long(expected)))
+            );
+            table
+                .file_io()
+                .delete_file(&file.staged_path)
+                .await
+                .unwrap();
+        }
+        assert_eq!(input.column(0).null_count(), 1);
+        assert_eq!(input.column(1).null_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_default_fails_before_any_file_is_staged() {
+        let table = table_with_defaults("'fallback'", "bad-integer");
+        let error = FormatTableWriter::new(&table, None).err().unwrap();
+        assert!(error.to_string().contains("Unsupported default value"));
+        let staging = "memory:/format_defaults/_temporary";
+        assert!(!table
+            .file_io()
+            .new_input(staging)
+            .unwrap()
+            .exists()
+            .await
+            .unwrap());
+    }
 }
