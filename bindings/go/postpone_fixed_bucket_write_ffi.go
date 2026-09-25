@@ -86,6 +86,18 @@ var ffiPostponeFixedBucketWriteBuilderFree = newFFI(ffiOpts{
 	}
 })
 
+var ffiPostponeFixedBucketWriteBuilderWithResources = newFFI(ffiOpts{
+	sym:    "paimon_postpone_fixed_bucket_write_builder_with_resources",
+	rType:  &ffi.TypePointer,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonPostponeFixedBucketWriteBuilder, *paimonResourceContext) error {
+	return func(builder *paimonPostponeFixedBucketWriteBuilder, resources *paimonResourceContext) error {
+		var ffiError *paimonError
+		ffiCall(unsafe.Pointer(&ffiError), unsafe.Pointer(&builder), unsafe.Pointer(&resources))
+		return parseError(ctx, ffiError)
+	}
+})
+
 var ffiPostponeFixedBucketWriteBuilderWithOverwrite = newFFI(ffiOpts{
 	sym:    "paimon_postpone_fixed_bucket_write_builder_with_overwrite",
 	rType:  &ffi.TypePointer,

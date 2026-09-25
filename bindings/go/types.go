@@ -29,6 +29,15 @@ import (
 
 // FFI type definitions mirroring C repr structs from paimon-c.
 var (
+	typeResultResourceContext = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
 	typeResultBlobReader = ffi.Type{
 		Type: ffi.Struct,
 		Elements: &[]*ffi.Type{
@@ -350,6 +359,7 @@ type paimonBlobReader struct{}
 type paimonBlobStream struct{}
 type paimonIdentifier struct{}
 type paimonTable struct{}
+type paimonResourceContext struct{}
 type paimonReadBuilder struct{}
 type paimonTableScan struct{}
 type paimonTableRead struct{}
@@ -366,6 +376,16 @@ type paimonPostponeFixedBucketTableCommit struct{}
 type paimonPostponeFixedBucketCommitMessages struct{}
 
 // Result types matching the C repr structs
+type resultResourceContext struct {
+	context *paimonResourceContext
+	error   *paimonError
+}
+
+type paimonResourceMetrics struct {
+	reservedMemoryBytes     uintptr
+	peakReservedMemoryBytes uintptr
+}
+
 type resultCatalogNew struct {
 	catalog *paimonCatalog
 	error   *paimonError
