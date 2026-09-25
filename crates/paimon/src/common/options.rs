@@ -87,6 +87,10 @@ impl CatalogOptions {
 
     /// Comma-separated file types eligible for local caching.
     pub const LOCAL_CACHE_WHITELIST: &'static str = "local-cache.whitelist";
+
+    /// Maximum process-local cache size for parsed file-format metadata.
+    pub const FILE_FORMAT_METADATA_CACHE_MAX_SIZE: &'static str =
+        "file-format.metadata-cache.max-size";
 }
 
 /// Configuration options container.
@@ -276,6 +280,10 @@ mod tests {
         assert_eq!(
             CatalogOptions::LOCAL_CACHE_WHITELIST,
             "local-cache.whitelist"
+        );
+        assert_eq!(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE,
+            "file-format.metadata-cache.max-size"
         );
     }
 

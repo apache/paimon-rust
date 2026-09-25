@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::metadata_cache::FileMetadataCache;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::build_target_arrow_schema;
 use crate::io::{FileRead, FileWrite};
@@ -33,8 +34,9 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
+use std::mem::size_of;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 pub(crate) struct BlobFormatReader {
     descriptor_mode: bool,
@@ -60,7 +62,7 @@ impl BlobFormatReader {
 
 pub(crate) struct IndexedBlobReader {
     reader: Box<dyn FileRead>,
-    index: BlobFileIndex,
+    index: Arc<BlobFileIndex>,
     descriptor_mode: bool,
     file_path: String,
     blob_parallelism: usize,
@@ -91,8 +93,50 @@ impl IndexedBlobReader {
         descriptor_mode: bool,
         blob_parallelism: usize,
     ) -> crate::Result<Self> {
+        Self::open_with_index_cache(
+            reader,
+            file_size,
+            file_path,
+            descriptor_mode,
+            blob_parallelism,
+            true,
+        )
+        .await
+    }
+
+    async fn open_with_index_cache(
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        file_path: String,
+        descriptor_mode: bool,
+        blob_parallelism: usize,
+        index_cache_enabled: bool,
+    ) -> crate::Result<Self> {
+        Self::open_with_cache(
+            reader,
+            file_size,
+            file_path,
+            descriptor_mode,
+            blob_parallelism,
+            index_cache_enabled,
+            &BLOB_FILE_INDEX_CACHE,
+        )
+        .await
+    }
+
+    async fn open_with_cache(
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        file_path: String,
+        descriptor_mode: bool,
+        blob_parallelism: usize,
+        index_cache_enabled: bool,
+        index_cache: &BlobFileIndexCache,
+    ) -> crate::Result<Self> {
         debug_assert!(blob_parallelism > 0);
-        let index = BlobFileIndex::load(reader.as_ref(), file_size).await?;
+        let index = index_cache
+            .load(reader.as_ref(), file_size, index_cache_enabled)
+            .await?;
         Ok(Self {
             reader,
             index,
@@ -213,12 +257,13 @@ impl FormatFileReader for BlobFormatReader {
 
         let target_schema = build_target_arrow_schema(read_fields)?;
         let batch_size = batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
-        let blob_reader = IndexedBlobReader::open_with_parallelism(
+        let blob_reader = IndexedBlobReader::open_with_index_cache(
             reader,
             file_size,
             self.file_path.clone(),
             self.descriptor_mode,
             self.blob_parallelism,
+            true,
         )
         .await?;
         let mut selection = RowSelectionCursor::new(blob_reader.num_rows(), row_selection)?;
@@ -1653,6 +1698,64 @@ struct BlobArrayLayout {
     element_index_range: Range<u64>,
 }
 
+const BLOB_FILE_INDEX_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const BLOB_FILE_INDEX_CACHE_MAX_ENTRIES: usize = 4096;
+
+static BLOB_FILE_INDEX_CACHE: LazyLock<BlobFileIndexCache> =
+    LazyLock::new(|| BlobFileIndexCache::new(BLOB_FILE_INDEX_CACHE_MAX_BYTES));
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BlobFileIndexCacheKey {
+    file: String,
+    size: u64,
+}
+
+struct BlobFileIndexCache {
+    inner: FileMetadataCache<BlobFileIndexCacheKey, BlobFileIndex>,
+}
+
+impl BlobFileIndexCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            inner: FileMetadataCache::new(max_bytes, BLOB_FILE_INDEX_CACHE_MAX_ENTRIES),
+        }
+    }
+
+    #[cfg(test)]
+    fn entry_weight(key: &str, index: &BlobFileIndex) -> usize {
+        FileMetadataCache::<BlobFileIndexCacheKey, BlobFileIndex>::entry_weight(
+            key.len(),
+            index.estimated_memory_size(),
+        )
+    }
+
+    async fn load(
+        &self,
+        reader: &dyn FileRead,
+        file_size: u64,
+        enabled: bool,
+    ) -> crate::Result<Arc<BlobFileIndex>> {
+        let key = enabled
+            .then(|| reader.cache_key())
+            .flatten()
+            .filter(|key| !key.is_empty())
+            .map(|file| BlobFileIndexCacheKey {
+                file: file.to_string(),
+                // Paimon data files are immutable; size separates supported replacements.
+                size: file_size,
+            });
+        let key_heap_bytes = key.as_ref().map_or(0, |key| key.file.capacity());
+        self.inner
+            .get_or_try_insert_with(
+                key,
+                key_heap_bytes,
+                || async { BlobFileIndex::load(reader, file_size).await.map(Arc::new) },
+                BlobFileIndex::estimated_memory_size,
+            )
+            .await
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BlobFileIndex {
     entries: Vec<BlobEntry>,
@@ -1730,6 +1833,14 @@ impl BlobFileIndex {
 
     fn entry(&self, position: usize) -> Option<&BlobEntry> {
         self.entries.get(position)
+    }
+
+    fn estimated_memory_size(&self) -> usize {
+        size_of::<Self>().saturating_add(
+            self.entries
+                .capacity()
+                .saturating_mul(size_of::<BlobEntry>()),
+        )
     }
 }
 
@@ -2349,6 +2460,262 @@ mod tests {
             collect_binary_values(&selected[0]),
             vec![Some(b"world".to_vec()), Some(Vec::new())]
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_reuses_index_across_readers() {
+        let bytes = Bytes::from(load_blob_fixture("blob-basic.blob"));
+        let reader = TrackingFileRead::new(bytes.clone()).with_cache_key("storage-a\0basic.blob");
+        let cache = BlobFileIndexCache::new(1024 * 1024);
+
+        for _ in 0..10 {
+            IndexedBlobReader::open_with_cache(
+                Box::new(reader.clone()),
+                bytes.len() as u64,
+                "file:///basic.blob".to_string(),
+                true,
+                DEFAULT_BLOB_READ_PARALLELISM,
+                true,
+                &cache,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_blob_index_loads(&reader, &bytes, 1);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_can_be_bypassed() {
+        let bytes = Bytes::from(load_blob_fixture("blob-basic.blob"));
+        let reader = TrackingFileRead::new(bytes.clone()).with_cache_key("storage-a\0basic.blob");
+        let unidentified = TrackingFileRead::new(bytes.clone());
+        let cache = BlobFileIndexCache::new(1024 * 1024);
+
+        for _ in 0..10 {
+            IndexedBlobReader::open_with_cache(
+                Box::new(reader.clone()),
+                bytes.len() as u64,
+                "file:///basic.blob".to_string(),
+                true,
+                DEFAULT_BLOB_READ_PARALLELISM,
+                false,
+                &cache,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_blob_index_loads(&reader, &bytes, 10);
+        for _ in 0..2 {
+            IndexedBlobReader::open_with_cache(
+                Box::new(unidentified.clone()),
+                bytes.len() as u64,
+                String::new(),
+                true,
+                DEFAULT_BLOB_READ_PARALLELISM,
+                true,
+                &cache,
+            )
+            .await
+            .unwrap();
+        }
+        assert_blob_index_loads(&unidentified, &bytes, 2);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_coalesces_concurrent_loads() {
+        let bytes = Bytes::from(load_blob_fixture("blob-basic.blob"));
+        let reader = TrackingFileRead::new(bytes.clone()).with_cache_key("storage-a\0basic.blob");
+        let cache = BlobFileIndexCache::new(1024 * 1024);
+        let opens = (0..10).map(|_| {
+            IndexedBlobReader::open_with_cache(
+                Box::new(reader.clone()),
+                bytes.len() as u64,
+                "file:///basic.blob".to_string(),
+                true,
+                DEFAULT_BLOB_READ_PARALLELISM,
+                true,
+                &cache,
+            )
+        });
+
+        futures::future::try_join_all(opens).await.unwrap();
+
+        assert_blob_index_loads(&reader, &bytes, 1);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_isolates_storage_contexts() {
+        let bytes = Bytes::from(load_blob_fixture("blob-basic.blob"));
+        let first = TrackingFileRead::new(bytes.clone()).with_cache_key("storage-a\0shared.blob");
+        let second = TrackingFileRead::new(bytes.clone()).with_cache_key("storage-b\0shared.blob");
+        let cache = BlobFileIndexCache::new(1024 * 1024);
+
+        for reader in [first.clone(), second.clone()] {
+            IndexedBlobReader::open_with_cache(
+                Box::new(reader),
+                bytes.len() as u64,
+                "file:///shared.blob".to_string(),
+                true,
+                DEFAULT_BLOB_READ_PARALLELISM,
+                true,
+                &cache,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_blob_index_loads(&first, &bytes, 1);
+        assert_blob_index_loads(&second, &bytes, 1);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_preserves_independent_selections() {
+        let bytes = Bytes::from(load_blob_fixture("blob-basic.blob"));
+        let reader = TrackingFileRead::new(bytes.clone()).with_cache_key("storage-a\0basic.blob");
+        let cache = BlobFileIndexCache::new(1024 * 1024);
+        let descriptor_reader = IndexedBlobReader::open_with_cache(
+            Box::new(reader.clone()),
+            bytes.len() as u64,
+            "file:///basic.blob".to_string(),
+            true,
+            DEFAULT_BLOB_READ_PARALLELISM,
+            true,
+            &cache,
+        )
+        .await
+        .unwrap();
+        let value_reader = IndexedBlobReader::open_with_cache(
+            Box::new(reader.clone()),
+            bytes.len() as u64,
+            "file:///basic.blob".to_string(),
+            false,
+            DEFAULT_BLOB_READ_PARALLELISM,
+            true,
+            &cache,
+        )
+        .await
+        .unwrap();
+
+        let descriptors = descriptor_reader.read_positions(&[0, 2]).await.unwrap();
+        let values = value_reader.read_positions(&[2, 1]).await.unwrap();
+        let BlobReadValue::Value(descriptor) = &descriptors[0] else {
+            panic!("expected descriptor");
+        };
+        let descriptor = BlobDescriptor::deserialize(descriptor).unwrap();
+        assert_eq!(descriptor.uri(), "file:///basic.blob");
+        assert_eq!(descriptor.length(), 5);
+        assert!(matches!(&values[0], BlobReadValue::Value(value) if value.as_ref() == b"world"));
+        assert!(matches!(&values[1], BlobReadValue::Null));
+        assert_eq!(reader.ranges().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_evicts_by_estimated_memory() {
+        let bytes = Bytes::from(load_blob_fixture("blob-basic.blob"));
+        let first_key = "storage-a\0first.blob";
+        let index = BlobFileIndex::load(&BytesFileRead(bytes.clone()), bytes.len() as u64)
+            .await
+            .unwrap();
+        let max_bytes = BlobFileIndexCache::entry_weight(first_key, &index);
+        let cache = BlobFileIndexCache::new(max_bytes);
+        let first = TrackingFileRead::new(bytes.clone()).with_cache_key(first_key);
+        let second = TrackingFileRead::new(bytes.clone()).with_cache_key("storage-a\0other.blob");
+
+        for reader in [first.clone(), second, first.clone()] {
+            IndexedBlobReader::open_with_cache(
+                Box::new(reader),
+                bytes.len() as u64,
+                "file:///blob.blob".to_string(),
+                true,
+                DEFAULT_BLOB_READ_PARALLELISM,
+                true,
+                &cache,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(first.ranges().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_retries_after_load_failure() {
+        let bytes = Bytes::from(load_blob_fixture("blob-basic.blob"));
+        let tracking = TrackingFileRead::new(bytes.clone()).with_cache_key("storage-a\0retry.blob");
+        let reader = FailFirstFileRead {
+            inner: tracking.clone(),
+            failures: Arc::new(AtomicUsize::new(1)),
+        };
+        let cache = BlobFileIndexCache::new(1024 * 1024);
+
+        assert!(IndexedBlobReader::open_with_cache(
+            Box::new(reader.clone()),
+            bytes.len() as u64,
+            "file:///retry.blob".to_string(),
+            true,
+            DEFAULT_BLOB_READ_PARALLELISM,
+            true,
+            &cache,
+        )
+        .await
+        .is_err());
+        IndexedBlobReader::open_with_cache(
+            Box::new(reader),
+            bytes.len() as u64,
+            "file:///retry.blob".to_string(),
+            true,
+            DEFAULT_BLOB_READ_PARALLELISM,
+            true,
+            &cache,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(tracking.ranges().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_key_includes_file_size() {
+        let first_bytes = Bytes::from(load_blob_fixture("blob-basic.blob"));
+        let second_bytes = Bytes::from(blob_test_utils::build_blob_file_bytes(&[Some(
+            b"a different payload".as_slice(),
+        )]));
+        assert_ne!(first_bytes.len(), second_bytes.len());
+        let first = TrackingFileRead::new(first_bytes.clone())
+            .with_cache_key("storage-a\0mutable-name.blob");
+        let second = TrackingFileRead::new(second_bytes.clone())
+            .with_cache_key("storage-a\0mutable-name.blob");
+        let cache = BlobFileIndexCache::new(1024 * 1024);
+
+        let first_index = IndexedBlobReader::open_with_cache(
+            Box::new(first.clone()),
+            first_bytes.len() as u64,
+            "file:///mutable-name.blob".to_string(),
+            true,
+            DEFAULT_BLOB_READ_PARALLELISM,
+            true,
+            &cache,
+        )
+        .await
+        .unwrap();
+        let second_index = IndexedBlobReader::open_with_cache(
+            Box::new(second.clone()),
+            second_bytes.len() as u64,
+            "file:///mutable-name.blob".to_string(),
+            true,
+            DEFAULT_BLOB_READ_PARALLELISM,
+            true,
+            &cache,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first_index.num_rows(), 4);
+        assert_eq!(second_index.num_rows(), 1);
+        assert_blob_index_loads(&first, &first_bytes, 1);
+        assert_blob_index_loads(&second, &second_bytes, 1);
     }
 
     #[tokio::test]
@@ -3687,9 +4054,31 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {path}: {e}"))
     }
 
+    fn assert_blob_index_loads(reader: &TrackingFileRead, bytes: &Bytes, expected: usize) {
+        let file_size = bytes.len() as u64;
+        let footer = file_size - BLOB_FOOTER_SIZE..file_size;
+        let index_length = i32::from_le_bytes(
+            bytes[bytes.len() - BLOB_FOOTER_SIZE as usize..bytes.len() - 1]
+                .try_into()
+                .unwrap(),
+        ) as u64;
+        let index = footer.start - index_length..footer.start;
+        let ranges = reader.ranges();
+        assert_eq!(
+            ranges.iter().filter(|range| **range == footer).count(),
+            expected
+        );
+        assert_eq!(
+            ranges.iter().filter(|range| **range == index).count(),
+            expected
+        );
+        assert_eq!(ranges.len(), expected * 2);
+    }
+
     #[derive(Clone)]
     struct TrackingFileRead {
         bytes: Bytes,
+        cache_key: Option<String>,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
         ranges: Arc<Mutex<Vec<Range<u64>>>>,
@@ -3699,10 +4088,16 @@ mod tests {
         fn new(bytes: Bytes) -> Self {
             Self {
                 bytes,
+                cache_key: None,
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
                 ranges: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn with_cache_key(mut self, cache_key: impl Into<String>) -> Self {
+            self.cache_key = Some(cache_key.into());
+            self
         }
 
         fn max_in_flight(&self) -> usize {
@@ -3723,6 +4118,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+
+        fn cache_key(&self) -> Option<&str> {
+            self.cache_key.as_deref()
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailFirstFileRead {
+        inner: TrackingFileRead,
+        failures: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for FailFirstFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            let bytes = self.inner.read(range).await?;
+            if self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    if remaining > 0 {
+                        Some(remaining - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err(Error::UnexpectedError {
+                    message: "injected blob index read failure".to_string(),
+                    source: None,
+                });
+            }
+            Ok(bytes)
+        }
+
+        fn cache_key(&self) -> Option<&str> {
+            self.inner.cache_key()
         }
     }
 

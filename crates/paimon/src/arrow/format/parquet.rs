@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::metadata_cache::FileMetadataCache;
 use super::shredding::PhysicalFormatWriterFactory;
 use super::{
     timestamp_millis_schema, FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult,
@@ -54,7 +55,7 @@ use parquet::file::statistics::Statistics as ParquetStatistics;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) struct ParquetFormatReader {
@@ -2451,6 +2452,79 @@ fn build_row_ranges_selection(
 // ArrowFileReader — async Parquet IO adapter
 // ---------------------------------------------------------------------------
 
+const PARQUET_METADATA_CACHE_MAX_ENTRIES: usize = 4096;
+const PARQUET_METADATA_CACHE_MIN_ENTRY_BYTES: usize = 8 * 1024;
+
+static PARQUET_METADATA_CACHE: LazyLock<ParquetMetadataCache> =
+    LazyLock::new(ParquetMetadataCache::new);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ParquetMetadataCacheKey {
+    file: String,
+    size: u64,
+    column_index: u8,
+    offset_index: u8,
+}
+
+struct ParquetMetadataCache {
+    inner: FileMetadataCache<ParquetMetadataCacheKey, ParquetMetaData>,
+}
+
+impl ParquetMetadataCache {
+    fn new() -> Self {
+        Self {
+            inner: FileMetadataCache::new(
+                crate::io::DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES,
+                PARQUET_METADATA_CACHE_MAX_ENTRIES,
+            ),
+        }
+    }
+
+    async fn load(
+        &self,
+        reader: &mut ArrowFileReader,
+        options: Option<&ArrowReaderOptions>,
+        enabled: bool,
+    ) -> parquet::errors::Result<Arc<ParquetMetaData>> {
+        self.inner
+            .resize(reader.r.file_format_metadata_cache_max_bytes());
+        let column_index = options.map_or(PageIndexPolicy::Skip, |o| o.column_index_policy());
+        let offset_index = options.map_or(PageIndexPolicy::Skip, |o| o.offset_index_policy());
+        let key = enabled
+            .then(|| reader.r.cache_key())
+            .flatten()
+            .filter(|key| !key.is_empty())
+            .map(|file| ParquetMetadataCacheKey {
+                file: file.to_string(),
+                // Paimon data files are immutable; size separates supported replacements.
+                size: reader.file_size,
+                column_index: page_index_policy_tag(column_index),
+                offset_index: page_index_policy_tag(offset_index),
+            });
+        let key_heap_bytes = key.as_ref().map_or(0, |key| key.file.capacity());
+        self.inner
+            .get_or_try_insert_with(
+                key,
+                key_heap_bytes,
+                || reader.load_metadata(options),
+                |metadata| {
+                    metadata
+                        .memory_size()
+                        .max(PARQUET_METADATA_CACHE_MIN_ENTRY_BYTES)
+                },
+            )
+            .await
+    }
+}
+
+fn page_index_policy_tag(policy: PageIndexPolicy) -> u8 {
+    match policy {
+        PageIndexPolicy::Skip => 0,
+        PageIndexPolicy::Optional => 1,
+        PageIndexPolicy::Required => 2,
+    }
+}
+
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 ///
 /// # TODO
@@ -2483,10 +2557,9 @@ pub(crate) async fn read_row_count(
     reader: Box<dyn FileRead>,
     file_size: u64,
 ) -> crate::Result<i64> {
-    let reader = ArrowFileReader::new(file_size, Arc::from(reader));
-    let metadata = ParquetMetaDataReader::new()
-        .with_prefetch_hint(Some(METADATA_SIZE_HINT))
-        .load_and_finish(reader, file_size)
+    let mut reader = ArrowFileReader::new(file_size, Arc::from(reader));
+    let metadata = reader
+        .get_metadata(None)
         .await
         .map_err(|error| Error::UnexpectedError {
             message: format!("Failed to read the Parquet footer: {error}"),
@@ -2505,6 +2578,26 @@ impl ArrowFileReader {
             let err_msg = format!("{err}");
             parquet::errors::ParquetError::External(err_msg.into())
         }))
+    }
+
+    async fn load_metadata(
+        &mut self,
+        options: Option<&ArrowReaderOptions>,
+    ) -> parquet::errors::Result<Arc<ParquetMetaData>> {
+        let metadata_opts = options.map(|o| o.metadata_options().clone());
+        let column_index_policy = options.map(|o| o.column_index_policy());
+        let offset_index_policy = options.map(|o| o.offset_index_policy());
+        let file_size = self.file_size;
+        let mut reader = ParquetMetaDataReader::new()
+            .with_prefetch_hint(Some(METADATA_SIZE_HINT))
+            .with_metadata_options(metadata_opts);
+        if let Some(policy) = column_index_policy {
+            reader = reader.with_column_index_policy(policy);
+        }
+        if let Some(policy) = offset_index_policy {
+            reader = reader.with_offset_index_policy(policy);
+        }
+        Ok(Arc::new(reader.load_and_finish(self, file_size).await?))
     }
 }
 
@@ -2635,28 +2728,11 @@ impl AsyncFileReader for ArrowFileReader {
         &mut self,
         options: Option<&ArrowReaderOptions>,
     ) -> BoxFuture<'_, parquet::errors::Result<Arc<ParquetMetaData>>> {
-        let metadata_opts = options.map(|o| o.metadata_options().clone());
-        // The page-index policies live on `ArrowReaderOptions` directly, not
-        // inside `metadata_options`, so they must be forwarded explicitly (the
-        // upstream default `AsyncFileReader::get_metadata` does the same).
-        // Without this, `with_page_index_policy` would silently no-op here and
-        // no page index would ever be loaded.
-        let column_index_policy = options.map(|o| o.column_index_policy());
-        let offset_index_policy = options.map(|o| o.offset_index_policy());
-        let prefetch_hint = Some(METADATA_SIZE_HINT);
+        let options = options.cloned();
         Box::pin(async move {
-            let file_size = self.file_size;
-            let mut reader = ParquetMetaDataReader::new()
-                .with_prefetch_hint(prefetch_hint)
-                .with_metadata_options(metadata_opts);
-            if let Some(policy) = column_index_policy {
-                reader = reader.with_column_index_policy(policy);
-            }
-            if let Some(policy) = offset_index_policy {
-                reader = reader.with_offset_index_policy(policy);
-            }
-            let metadata = reader.load_and_finish(self, file_size).await?;
-            Ok(Arc::new(metadata))
+            PARQUET_METADATA_CACHE
+                .load(self, options.as_ref(), true)
+                .await
         })
     }
 }
@@ -4602,6 +4678,8 @@ mod tests {
         ranges: Arc<std::sync::Mutex<Vec<std::ops::Range<u64>>>>,
         resident_bytes: Arc<AtomicUsize>,
         peak_resident_bytes: Arc<AtomicUsize>,
+        cache_key: Option<Arc<str>>,
+        metadata_cache_max_bytes: usize,
     }
 
     struct TrackedReadBuffer {
@@ -4629,7 +4707,23 @@ mod tests {
                 ranges: Arc::new(std::sync::Mutex::new(Vec::new())),
                 resident_bytes: Arc::new(AtomicUsize::new(0)),
                 peak_resident_bytes: Arc::new(AtomicUsize::new(0)),
+                cache_key: None,
+                metadata_cache_max_bytes: crate::io::DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES,
             }
+        }
+
+        fn with_cache_key(mut self, cache_key: &str) -> Self {
+            self.cache_key = Some(Arc::from(cache_key));
+            self
+        }
+
+        fn with_metadata_cache_max_bytes(mut self, max_bytes: usize) -> Self {
+            self.metadata_cache_max_bytes = max_bytes;
+            self
+        }
+
+        fn read_count(&self) -> usize {
+            self.ranges.lock().unwrap().len()
         }
 
         fn bytes_read(&self) -> u64 {
@@ -4665,6 +4759,118 @@ mod tests {
                 resident_bytes: Arc::clone(&self.resident_bytes),
             }))
         }
+
+        fn cache_key(&self) -> Option<&str> {
+            self.cache_key.as_deref()
+        }
+
+        fn file_format_metadata_cache_max_bytes(&self) -> usize {
+            self.metadata_cache_max_bytes
+        }
+    }
+
+    #[tokio::test]
+    async fn parquet_metadata_cache_reuses_metadata_across_readers() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
+        let cache = super::ParquetMetadataCache::new();
+
+        for _ in 0..10 {
+            let mut reader =
+                super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+            cache.load(&mut reader, None, true).await.unwrap();
+        }
+
+        assert_eq!(tracker.read_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn parquet_metadata_cache_can_be_bypassed() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
+        let unidentified = TrackingFileRead::new(data.clone());
+        let cache = super::ParquetMetadataCache::new();
+
+        for _ in 0..2 {
+            let mut reader =
+                super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+            cache.load(&mut reader, None, false).await.unwrap();
+            let mut reader =
+                super::ArrowFileReader::new(data.len() as u64, Arc::new(unidentified.clone()));
+            cache.load(&mut reader, None, true).await.unwrap();
+        }
+
+        assert_eq!(tracker.read_count(), 2);
+        assert_eq!(unidentified.read_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn parquet_metadata_cache_zero_disables_and_clears_cache() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
+        let cache = super::ParquetMetadataCache::new();
+
+        let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+        cache.load(&mut reader, None, true).await.unwrap();
+
+        let disabled = tracker.clone().with_metadata_cache_max_bytes(0);
+        let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(disabled));
+        cache.load(&mut reader, None, true).await.unwrap();
+
+        let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+        cache.load(&mut reader, None, true).await.unwrap();
+
+        assert_eq!(tracker.read_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn parquet_metadata_cache_coalesces_concurrent_loads() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
+        let cache = super::ParquetMetadataCache::new();
+        let loads = (0..10).map(|_| {
+            let tracker = tracker.clone();
+            let data = data.clone();
+            let cache = &cache;
+            async move {
+                let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker));
+                cache.load(&mut reader, None, true).await
+            }
+        });
+
+        futures::future::try_join_all(loads).await.unwrap();
+
+        assert_eq!(tracker.read_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn parquet_metadata_cache_separates_storage_and_page_index_policy() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let first = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
+        let second = TrackingFileRead::new(data.clone()).with_cache_key("storage-b\0data.parquet");
+        let cache = super::ParquetMetadataCache::new();
+
+        let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(first.clone()));
+        cache.load(&mut reader, None, true).await.unwrap();
+        let options =
+            super::ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional);
+        let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(first.clone()));
+        cache.load(&mut reader, Some(&options), true).await.unwrap();
+        let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(second.clone()));
+        cache.load(&mut reader, None, true).await.unwrap();
+
+        assert_eq!(first.read_count(), 2);
+        assert_eq!(second.read_count(), 1);
     }
 
     #[tokio::test]
