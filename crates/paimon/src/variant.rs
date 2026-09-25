@@ -2713,10 +2713,40 @@ fn cast_variant_to_i64(variant: VariantRef<'_>) -> Option<i64> {
         VariantKind::String => variant.get_string().ok()?.parse::<i64>().ok(),
         VariantKind::Decimal => {
             let decimal = variant.get_decimal().ok()?;
-            rescale_decimal_exact(decimal.unscaled, decimal.scale, 0)
-                .and_then(|value| i64::try_from(value).ok())
+            decimal_to_i64_truncating(decimal.unscaled, decimal.scale)
         }
+        VariantKind::Double => f64_to_i64_truncating(variant.get_double().ok()?),
+        VariantKind::Float => f64_to_i64_truncating(variant.get_float().ok()? as f64),
         _ => None,
+    }
+}
+
+/// Cast a variant decimal to i64 the way Spark/Java `VariantGet` does: drop the fractional
+/// digits toward zero (`RoundingMode.DOWN`), returning `None` when it overflows i64. Rust
+/// integer division truncates toward zero, so this matches Java `DOWN` for negatives too.
+fn decimal_to_i64_truncating(unscaled: i128, scale: i8) -> Option<i64> {
+    let integral = if scale <= 0 {
+        let factor = 10_i128.checked_pow((-(scale as i32)) as u32)?;
+        unscaled.checked_mul(factor)?
+    } else {
+        let factor = 10_i128.checked_pow(scale as u32)?;
+        unscaled / factor
+    };
+    i64::try_from(integral).ok()
+}
+
+/// Cast a variant float/double to i64 by truncating toward zero, returning `None` for NaN,
+/// infinity, and out-of-range values -- mirroring Java `VariantGet`'s `RoundingMode.DOWN`
+/// plus its integral-fit check.
+fn f64_to_i64_truncating(value: f64) -> Option<i64> {
+    let truncated = value.trunc();
+    // The representable i64 range as f64 is [-2^63, 2^63); 2^63 is i64::MAX + 1.
+    if truncated.is_finite()
+        && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&truncated)
+    {
+        Some(truncated as i64)
+    } else {
+        None
     }
 }
 
@@ -3508,6 +3538,32 @@ mod tests {
         assert_eq!(
             double.get_path("$.d").unwrap().unwrap().kind().unwrap(),
             VariantKind::Double
+        );
+    }
+
+    #[test]
+    fn cast_variant_to_i64_truncates_decimals_and_floats() {
+        // Pushdown-extraction counterpart of the variant_get UDF int cast: Spark/Java
+        // truncate a JSON number toward zero (RoundingMode.DOWN) when casting to an
+        // integer. This path previously returned None (NULL / "cannot cast") for any
+        // decimal with a fractional part and every float.
+        let pos = GenericVariant::parse_json(r#"{"a":19.99}"#).unwrap();
+        assert_eq!(
+            cast_variant_to_i64(pos.get_path("$.a").unwrap().unwrap()),
+            Some(19),
+            "19.99 truncates to 19"
+        );
+        let neg = GenericVariant::parse_json(r#"{"a":-3.9}"#).unwrap();
+        assert_eq!(
+            cast_variant_to_i64(neg.get_path("$.a").unwrap().unwrap()),
+            Some(-3),
+            "-3.9 truncates toward zero to -3, not -4"
+        );
+        let dbl = GenericVariant::parse_json(r#"{"a":2.5e0}"#).unwrap();
+        assert_eq!(
+            cast_variant_to_i64(dbl.get_path("$.a").unwrap().unwrap()),
+            Some(2),
+            "2.5 truncates to 2"
         );
     }
 }

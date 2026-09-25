@@ -454,10 +454,44 @@ fn cast_to_i64(variant: VariantRef<'_>) -> DFResult<i64> {
             .map_err(|_| invalid_cast()),
         VariantKind::Decimal => {
             let decimal = variant.get_decimal().map_err(to_df_error)?;
-            rescale_decimal(decimal.unscaled, decimal.scale, 0)
-                .and_then(|v| i64::try_from(v).map_err(|_| invalid_cast()))
+            decimal_to_i64_truncating(decimal.unscaled, decimal.scale)
+        }
+        VariantKind::Double => f64_to_i64_truncating(variant.get_double().map_err(to_df_error)?),
+        VariantKind::Float => {
+            f64_to_i64_truncating(variant.get_float().map_err(to_df_error)? as f64)
         }
         _ => Err(invalid_cast()),
+    }
+}
+
+/// Cast a variant decimal to i64 the way Spark/Java `VariantGet` does: drop the fractional
+/// digits toward zero (`RoundingMode.DOWN`), then require the result to fit. Rust integer
+/// division truncates toward zero, so this matches Java `DOWN` for negatives too.
+fn decimal_to_i64_truncating(unscaled: i128, scale: i8) -> DFResult<i64> {
+    let integral = if scale <= 0 {
+        let factor = 10_i128
+            .checked_pow(-(scale as i32) as u32)
+            .ok_or_else(invalid_cast)?;
+        unscaled.checked_mul(factor).ok_or_else(invalid_cast)?
+    } else {
+        let factor = 10_i128.checked_pow(scale as u32).ok_or_else(invalid_cast)?;
+        unscaled / factor
+    };
+    i64::try_from(integral).map_err(|_| invalid_cast())
+}
+
+/// Cast a variant float/double to i64 by truncating toward zero, rejecting NaN, infinity,
+/// and out-of-range values -- mirroring Java `VariantGet`'s `RoundingMode.DOWN` plus its
+/// integral-fit check.
+fn f64_to_i64_truncating(value: f64) -> DFResult<i64> {
+    let truncated = value.trunc();
+    // The representable i64 range as f64 is [-2^63, 2^63); 2^63 is i64::MAX + 1.
+    if truncated.is_finite()
+        && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&truncated)
+    {
+        Ok(truncated as i64)
+    } else {
+        Err(invalid_cast())
     }
 }
 
@@ -873,5 +907,33 @@ mod tests {
         assert!(err
             .to_string()
             .contains("variant_get type argument must be a string literal"));
+    }
+
+    #[tokio::test]
+    async fn variant_get_int_truncates_decimals_and_floats_like_spark() {
+        // Spark/Java cast a JSON number to an integer with RoundingMode.DOWN (truncate
+        // toward zero). Rust previously rejected any decimal with a fractional part and
+        // every float, so this whole query used to error / return NULL.
+        let batch = collect_one(
+            r#"SELECT
+              variant_get(parse_json('{"a":19.99}'), '$.a', 'int') AS pos_dec,
+              variant_get(parse_json('{"a":-3.9}'), '$.a', 'int') AS neg_dec,
+              try_variant_get(parse_json('{"a":19.99}'), '$.a', 'int') AS try_dec,
+              variant_get(parse_json('{"a":2.5e0}'), '$.a', 'int') AS flt
+            "#,
+        )
+        .await;
+        let col = |i: usize| {
+            batch
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(col(0), 19, "19.99 truncates to 19");
+        assert_eq!(col(1), -3, "-3.9 truncates toward zero to -3, not -4");
+        assert_eq!(col(2), 19, "try_variant_get truncates too");
+        assert_eq!(col(3), 2, "a fractional number truncates to 2");
     }
 }
