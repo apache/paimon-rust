@@ -1196,6 +1196,7 @@ impl Schema {
         CoreOptions::new(options).table_type()?;
         validate_no_reserved_field_names(fields)?;
         Self::validate_key_field_types(fields, primary_keys, options)?;
+        Self::validate_bucket_count(options)?;
         Self::validate_row_tracking(primary_keys, options)?;
         Self::validate_blob_fields(fields, partition_keys, primary_keys, options)?;
         Self::validate_primary_key_blob_configuration(fields, primary_keys, options)?;
@@ -1215,6 +1216,36 @@ impl Schema {
         Self::validate_read_batch_size(options)?;
         Self::validate_primary_key_vector_index(fields, primary_keys, options)?;
         Self::validate_primary_key_full_text_index(fields, primary_keys, options)?;
+        Ok(())
+    }
+
+    /// Reject an out-of-range or non-integer `bucket` option at create/alter time.
+    ///
+    /// `bucket()` parses the option with `unwrap_or(DEFAULT_BUCKET)`, so `bucket='0'`
+    /// is taken verbatim (silently disabling read-side bucket pruning) and a
+    /// non-integer such as `bucket='abc'` silently falls back to dynamic (-1) rather
+    /// than the fixed bucketing the user asked for. Mirror Java `validateBucket`'s
+    /// "number of buckets needs to be greater than 0" check: allow -1 (dynamic),
+    /// -2 (postpone), and any value >= 1. (The Java `bucket=-1` + `bucket-key` arm is
+    /// intentionally not ported here; it is enforced separately by bucket-key
+    /// validation.)
+    fn validate_bucket_count(options: &HashMap<String, String>) -> crate::Result<()> {
+        let Some(raw) = options.get("bucket") else {
+            return Ok(());
+        };
+        let bucket: i32 = raw
+            .trim()
+            .parse()
+            .map_err(|_| crate::Error::ConfigInvalid {
+                message: format!("Option 'bucket' must be an integer, got: '{raw}'."),
+            })?;
+        if bucket < 1 && bucket != -1 && bucket != -2 {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "The number of buckets needs to be greater than 0, got: {bucket}."
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -5805,6 +5836,50 @@ mod tests {
             matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("rowkind.field")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn bucket_zero_is_rejected() {
+        // bucket='0' is taken verbatim and silently disables read-side bucket
+        // pruning; Java rejects it as "needs to be greater than 0".
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("bucket", "0")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("greater than 0")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bucket_non_integer_is_rejected() {
+        // A non-integer would silently fall back to dynamic (-1) rather than the
+        // fixed bucketing the user intended.
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("bucket", "abc")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("must be an integer")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bucket_dynamic_and_fixed_values_are_accepted() {
+        // -1 (dynamic), -2 (postpone) and any value >= 1 stay valid.
+        for value in ["-1", "-2", "1", "16"] {
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("bucket", value)
+                .build()
+                .unwrap_or_else(|e| panic!("bucket={value} should be accepted, got {e:?}"));
+        }
     }
 
     #[test]
