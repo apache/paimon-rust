@@ -24,10 +24,10 @@ use std::collections::HashMap;
 use apache_avro::types::Value;
 use apache_avro::{Codec, Schema, Writer};
 use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray, MapArray,
-    RecordBatch, StringArray, StructArray, Time32MillisecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampSecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeListArray,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
+    ListArray, MapArray, RecordBatch, StringArray, StructArray, Time32MillisecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -36,7 +36,7 @@ use serde_json::{json, Value as JsonValue};
 
 use super::{FormatFileWriter, FormatWriteResult};
 use crate::io::{FileWrite, OutputFile};
-use crate::spec::{CoreOptions, DataField, DataType};
+use crate::spec::{BlobDescriptor, BlobViewStruct, CoreOptions, DataField, DataType};
 use crate::{Error, Result};
 
 pub(crate) struct AvroFormatWriter {
@@ -233,6 +233,9 @@ fn avro_type(typ: &DataType, name: &str) -> Result<JsonValue> {
         DataType::Array(array) => {
             json!({"type": "array", "items": avro_type(array.element_type(), name)?})
         }
+        DataType::Vector(vector) => {
+            json!({"type": "array", "items": avro_type(vector.element_type(), name)?})
+        }
         DataType::Row(row) => {
             let fields = row
                 .fields()
@@ -339,7 +342,20 @@ fn nonnull_value_at(array: &dyn Array, row: usize, typ: &DataType) -> Result<Val
         DataType::Binary(_) | DataType::VarBinary(_) => {
             Value::Bytes(downcast::<BinaryArray>(array)?.value(row).to_vec())
         }
-        DataType::Blob(_) => Value::Bytes(downcast::<LargeBinaryArray>(array)?.value(row).to_vec()),
+        DataType::Blob(_) => {
+            let bytes = downcast::<LargeBinaryArray>(array)?.value(row);
+            let serialized = if BlobViewStruct::is_blob_view_struct(bytes) {
+                BlobViewStruct::deserialize(bytes)?.serialize()?
+            } else {
+                BlobDescriptor::deserialize(bytes)
+                    .map_err(|source| Error::DataInvalid {
+                        message: "Avro BLOB requires a BlobDescriptor or BlobViewStruct".into(),
+                        source: Some(Box::new(source)),
+                    })?
+                    .serialize()
+            };
+            Value::Bytes(serialized)
+        }
         DataType::Date(_) => Value::Date(downcast::<Date32Array>(array)?.value(row)),
         DataType::Time(_) => {
             Value::TimeMillis(downcast::<Time32MillisecondArray>(array)?.value(row))
@@ -374,6 +390,25 @@ fn nonnull_value_at(array: &dyn Array, row: usize, typ: &DataType) -> Result<Val
             Value::Array(
                 (0..values.len())
                     .map(|index| value_at(values.as_ref(), index, array_type.element_type()))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        }
+        DataType::Vector(vector_type) => {
+            let list = downcast::<FixedSizeListArray>(array)?;
+            let values = list.value(row);
+            if values.len() != vector_type.length() as usize {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Avro vector has {} elements, expected {}",
+                        values.len(),
+                        vector_type.length()
+                    ),
+                    source: None,
+                });
+            }
+            Value::Array(
+                (0..values.len())
+                    .map(|index| value_at(values.as_ref(), index, vector_type.element_type()))
                     .collect::<Result<Vec<_>>>()?,
             )
         }
@@ -478,15 +513,22 @@ mod tests {
 
     use arrow_array::builder::{Int32Builder, MapBuilder, MapFieldNames, StringBuilder};
     use arrow_array::types::Int32Type;
-    use arrow_array::{ArrayRef, Int32Array, Int64Array, StringArray};
+    use arrow_array::{
+        ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, StringArray,
+    };
+    use arrow_buffer::{BooleanBuffer, NullBuffer};
     use futures::TryStreamExt;
 
     use super::*;
     use crate::arrow::build_target_arrow_schema;
     use crate::arrow::format::{avro::AvroFormatReader, FormatFileReader};
     use crate::btree::test_util::BytesFileRead;
+    use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
-    use crate::spec::{ArrayType, BigIntType, IntType, MapType, RowType, VarCharType};
+    use crate::spec::{
+        ArrayType, BigIntType, BlobType, FloatType, IntType, MapType, RowType, VarCharType,
+        VectorType,
+    };
 
     fn fields() -> Vec<DataField> {
         vec![
@@ -614,6 +656,37 @@ mod tests {
         assert_eq!(decimal_bytes(128), vec![0, 128]);
         assert_eq!(decimal_bytes(-1), vec![255]);
         assert_eq!(decimal_bytes(-129), vec![255, 127]);
+    }
+
+    #[test]
+    fn blob_fields_require_java_serializable_references() {
+        let typ = DataType::Blob(BlobType::new());
+        let descriptor = BlobDescriptor::new("memory:/blob-data".into(), 2, 4).serialize();
+        let view = BlobViewStruct::new(Identifier::new("db", "source"), 3, 42)
+            .serialize()
+            .unwrap();
+        let valid = LargeBinaryArray::from(vec![
+            Some(descriptor.as_slice()),
+            Some(view.as_slice()),
+            None,
+        ]);
+        assert_eq!(
+            value_at(&valid, 0, &typ).unwrap(),
+            Value::Union(1, Box::new(Value::Bytes(descriptor)))
+        );
+        assert_eq!(
+            value_at(&valid, 1, &typ).unwrap(),
+            Value::Union(1, Box::new(Value::Bytes(view)))
+        );
+        assert_eq!(
+            value_at(&valid, 2, &typ).unwrap(),
+            Value::Union(0, Box::new(Value::Null))
+        );
+        let raw = LargeBinaryArray::from(vec![b"raw blob".as_slice()]);
+        assert!(value_at(&raw, 0, &typ)
+            .unwrap_err()
+            .to_string()
+            .contains("BlobDescriptor or BlobViewStruct"));
     }
 
     #[test]
@@ -835,6 +908,68 @@ mod tests {
             .unwrap();
         assert_eq!(decoded_map.value_length(0), 1);
         assert_eq!(decoded_map.value_length(1), 0);
+    }
+
+    #[tokio::test]
+    async fn vector_uses_java_array_schema_and_roundtrips_nullable_rows() {
+        let fields = vec![DataField::new(
+            0,
+            "embedding".into(),
+            DataType::Vector(VectorType::new(3, DataType::Float(FloatType::new())).unwrap()),
+        )];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let values: ArrayRef = Arc::new(Float32Array::from(vec![
+            Some(1.0),
+            Some(2.0),
+            Some(3.0),
+            None,
+            None,
+            None,
+        ]));
+        let vector: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(arrow_schema::Field::new(
+                    "element",
+                    arrow_schema::DataType::Float32,
+                    true,
+                )),
+                3,
+                values,
+                Some(NullBuffer::new(BooleanBuffer::from(vec![true, false]))),
+            )
+            .unwrap(),
+        );
+        let batch = RecordBatch::try_new(schema.clone(), vec![vector]).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/avro-writer/vector.avro";
+        let output = file_io.new_output(path).unwrap();
+        let mut writer = AvroFormatWriter::new(&output, schema, fields.clone(), "snappy", 1, None)
+            .await
+            .unwrap();
+        writer.write(&batch).await.unwrap();
+        Box::new(writer).close().await.unwrap();
+
+        let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+        assert_eq!(
+            row_schema(&fields).unwrap()["fields"][0]["type"][1]["type"],
+            "array"
+        );
+        let decoded = AvroFormatReader
+            .read_batch_stream(
+                Box::new(BytesFileRead(bytes.clone())),
+                bytes.len() as u64,
+                &fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0], batch);
     }
 
     #[tokio::test]

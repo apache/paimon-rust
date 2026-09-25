@@ -24,10 +24,11 @@ use crate::Error;
 use apache_avro::types::Value;
 use apache_avro::Reader;
 use arrow_array::{
-    BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray, MapArray,
-    RecordBatch, StringArray, StructArray, Time32MillisecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeListArray, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, ListArray,
+    MapArray, RecordBatch, StringArray, StructArray, Time32MillisecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::SchemaRef;
@@ -398,6 +399,13 @@ fn build_column(
         DataType::Array(arr_type) => {
             build_array_column(records, name, arr_type.element_type(), num_rows)?
         }
+        DataType::Vector(vector_type) => build_vector_column(
+            records,
+            name,
+            vector_type.element_type(),
+            vector_type.length() as usize,
+            num_rows,
+        )?,
         DataType::Map(map_type) => build_map_column(records, name, map_type, num_rows)?,
         // Java encodes MULTISET<T> as a map from the element to an INT count,
         // sharing the MAP path (`AvroSchemaConverter#extractValueTypeToAvroMap`
@@ -502,6 +510,71 @@ fn build_array_column(
         source: Some(Box::new(e)),
     })?;
     Ok(Arc::new(list_arr))
+}
+
+fn build_vector_column(
+    records: &[Value],
+    name: &str,
+    element_type: &DataType,
+    length: usize,
+    num_rows: usize,
+) -> crate::Result<Arc<dyn arrow_array::Array>> {
+    let idx = field_index(records, name);
+    let mut elements = Vec::with_capacity(num_rows.saturating_mul(length));
+    let mut valid = Vec::with_capacity(num_rows);
+    for record in records.iter().take(num_rows) {
+        match get_field_at(record, idx) {
+            Some(Value::Array(values)) if values.len() == length => {
+                valid.push(true);
+                elements.extend(values.iter().cloned());
+            }
+            Some(Value::Array(values)) => {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Avro vector '{name}' has {} elements, expected {length}",
+                        values.len()
+                    ),
+                    source: None,
+                });
+            }
+            Some(other) => {
+                return Err(Error::DataInvalid {
+                    message: format!("Avro vector '{name}' is not an array: {other:?}"),
+                    source: None,
+                });
+            }
+            None => {
+                valid.push(false);
+                elements.extend(std::iter::repeat_n(Value::Null, length));
+            }
+        }
+    }
+    let element_records = elements
+        .into_iter()
+        .map(|element| Value::Record(vec![("element".to_string(), element)]))
+        .collect::<Vec<_>>();
+    let values = build_column(
+        &element_records,
+        "element",
+        element_type,
+        element_records.len(),
+    )?;
+    let field = Arc::new(arrow_schema::Field::new(
+        "element",
+        crate::arrow::paimon_type_to_arrow(element_type)?,
+        element_type.is_nullable(),
+    ));
+    let array = FixedSizeListArray::try_new(
+        field,
+        length as i32,
+        values,
+        Some(NullBuffer::new(BooleanBuffer::from(valid))),
+    )
+    .map_err(|source| Error::DataInvalid {
+        message: format!("Cannot build Avro vector '{name}'"),
+        source: Some(Box::new(source)),
+    })?;
+    Ok(Arc::new(array))
 }
 
 fn build_map_column(

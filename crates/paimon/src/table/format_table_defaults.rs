@@ -21,10 +21,14 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, Date32Array, RecordBatch, StringArray, Time32MillisecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray,
+};
 use arrow_schema::Schema as ArrowSchema;
 
-use crate::spec::DataField;
+use crate::spec::{DataField, DataType};
 use crate::{Error, Result};
 
 pub(super) struct FormatTableDefaults {
@@ -46,8 +50,7 @@ impl FormatTableDefaults {
                             .strip_prefix('\'')
                             .and_then(|text| text.strip_suffix('\''))
                             .unwrap_or(text);
-                        let source = StringArray::from(vec![text]);
-                        let value = arrow_cast::cast(&source, schema.field(index).data_type())
+                        let value = cast_default(field.data_type(), text, schema.field(index))
                             .map_err(|source| Error::DataInvalid {
                                 message: format!(
                                     "Unsupported default value '{}' for Format Table column '{}'",
@@ -119,6 +122,110 @@ impl FormatTableDefaults {
             }
         })
     }
+}
+
+fn cast_default(
+    data_type: &DataType,
+    text: &str,
+    arrow_field: &arrow_schema::Field,
+) -> std::result::Result<ArrayRef, arrow_schema::ArrowError> {
+    match data_type {
+        // Java's StringToStringCastRule counts characters, then pads CHAR with
+        // spaces or truncates VARCHAR to its declared length.
+        DataType::Char(typ) => {
+            let mut value = text.chars().take(typ.length()).collect::<String>();
+            value.extend(std::iter::repeat_n(
+                ' ',
+                typ.length().saturating_sub(value.chars().count()),
+            ));
+            Ok(Arc::new(StringArray::from(vec![value])))
+        }
+        DataType::VarChar(typ) => Ok(Arc::new(StringArray::from(vec![text
+            .chars()
+            .take(typ.length() as usize)
+            .collect::<String>()]))),
+        // Java's StringToBinaryCastRule uses UTF-8 bytes and pads only BINARY.
+        DataType::Binary(typ) => {
+            let mut value = text.as_bytes().to_vec();
+            value.resize(typ.length(), 0);
+            value.truncate(typ.length());
+            Ok(Arc::new(BinaryArray::from(vec![value.as_slice()])))
+        }
+        DataType::VarBinary(typ) => {
+            let bytes = text.as_bytes();
+            let bytes = &bytes[..bytes.len().min(typ.length() as usize)];
+            Ok(Arc::new(BinaryArray::from(vec![bytes])))
+        }
+        // Java's BinaryStringUtils treats an all-digit DATE/TIME value as the
+        // internal day/millisecond count and a TIMESTAMP value as the count in
+        // the requested precision, rather than parsing it as a calendar string.
+        DataType::Date(_) if numeric_default(text) => Ok(Arc::new(Date32Array::from(vec![text
+            .parse::<i32>()
+            .map_err(|source| arrow_schema::ArrowError::CastError(source.to_string()))?]))),
+        DataType::Time(_) if numeric_default(text) => {
+            Ok(Arc::new(Time32MillisecondArray::from(vec![text
+                .parse::<i32>()
+                .map_err(|source| {
+                    arrow_schema::ArrowError::CastError(source.to_string())
+                })?])))
+        }
+        DataType::Timestamp(typ) if numeric_default(text) => {
+            let value = text
+                .parse::<i64>()
+                .map_err(|source| arrow_schema::ArrowError::CastError(source.to_string()))?;
+            match typ.precision() {
+                0 => Ok(Arc::new(TimestampSecondArray::from(vec![value]))),
+                3 => Ok(Arc::new(TimestampMillisecondArray::from(vec![value]))),
+                6 => Ok(Arc::new(TimestampMicrosecondArray::from(vec![value]))),
+                9 => Ok(Arc::new(TimestampNanosecondArray::from(vec![value]))),
+                precision => Err(arrow_schema::ArrowError::CastError(format!(
+                    "Java does not support a numeric TIMESTAMP default at precision {precision}"
+                ))),
+            }
+        }
+        DataType::LocalZonedTimestamp(typ) => {
+            let datetime = arrow_cast::parse::string_to_datetime(&chrono::Local, text)?;
+            let precision = typ.precision();
+            let quantum = 10_u32.pow(9 - precision);
+            let nanos = datetime.timestamp_subsec_nanos() / quantum * quantum;
+            let (units_per_second, fraction) = match precision {
+                0 => (1_i128, 0_i128),
+                1..=3 => (1_000, i128::from(nanos / 1_000_000)),
+                4..=6 => (1_000_000, i128::from(nanos / 1_000)),
+                7..=9 => (1_000_000_000, i128::from(nanos)),
+                _ => {
+                    return Err(arrow_schema::ArrowError::CastError(format!(
+                        "Unsupported local timestamp precision {precision}"
+                    )))
+                }
+            };
+            let value =
+                i64::try_from(i128::from(datetime.timestamp()) * units_per_second + fraction)
+                    .map_err(|source| arrow_schema::ArrowError::CastError(source.to_string()))?;
+            match precision {
+                0 => Ok(Arc::new(
+                    TimestampSecondArray::from(vec![value]).with_timezone("UTC"),
+                )),
+                1..=3 => Ok(Arc::new(
+                    TimestampMillisecondArray::from(vec![value]).with_timezone("UTC"),
+                )),
+                4..=6 => Ok(Arc::new(
+                    TimestampMicrosecondArray::from(vec![value]).with_timezone("UTC"),
+                )),
+                _ => Ok(Arc::new(
+                    TimestampNanosecondArray::from(vec![value]).with_timezone("UTC"),
+                )),
+            }
+        }
+        DataType::Blob(_) => Err(arrow_schema::ArrowError::CastError(
+            "Java does not support casting a string default to BLOB".into(),
+        )),
+        _ => arrow_cast::cast(&StringArray::from(vec![text]), arrow_field.data_type()),
+    }
+}
+
+fn numeric_default(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -275,5 +382,208 @@ mod tests {
         assert!(enabled.value(0));
         assert_eq!(amount.value(0), 1234);
         assert_eq!(input.column(0).null_count(), 1);
+    }
+
+    #[test]
+    fn character_and_binary_defaults_follow_java_length_rules() {
+        use crate::spec::{BinaryType, CharType, VarBinaryType};
+        let fields = vec![
+            DataField::new(
+                0,
+                "fixed_text".into(),
+                DataType::Char(CharType::new(3).unwrap()),
+            )
+            .with_default_value(Some("'猫'".into())),
+            DataField::new(
+                1,
+                "short_text".into(),
+                DataType::VarChar(VarCharType::new(2).unwrap()),
+            )
+            .with_default_value(Some("'猫狗鱼'".into())),
+            DataField::new(
+                2,
+                "fixed_bytes".into(),
+                DataType::Binary(BinaryType::new(4).unwrap()),
+            )
+            .with_default_value(Some("'é'".into())),
+            DataField::new(
+                3,
+                "short_bytes".into(),
+                DataType::VarBinary(VarBinaryType::new(2).unwrap()),
+            )
+            .with_default_value(Some("'猫'".into())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let input = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
+                Arc::new(BinaryArray::from(vec![None::<&[u8]>])),
+            ],
+        )
+        .unwrap();
+        let actual = defaults.apply(&input).unwrap();
+        assert_eq!(
+            actual
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "猫  "
+        );
+        assert_eq!(
+            actual
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "猫狗"
+        );
+        assert_eq!(
+            actual
+                .column(2)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            &[0xc3, 0xa9, 0, 0]
+        );
+        assert_eq!(
+            actual
+                .column(3)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            &[0xe7, 0x8c]
+        );
+    }
+
+    #[test]
+    fn numeric_temporal_defaults_use_java_internal_units() {
+        use crate::spec::{DateType, TimeType, TimestampType};
+        let fields = vec![
+            DataField::new(0, "day".into(), DataType::Date(DateType::new()))
+                .with_default_value(Some("42".into())),
+            DataField::new(1, "time".into(), DataType::Time(TimeType::new(3).unwrap()))
+                .with_default_value(Some("12345".into())),
+            DataField::new(
+                2,
+                "seconds".into(),
+                DataType::Timestamp(TimestampType::new(0).unwrap()),
+            )
+            .with_default_value(Some("123".into())),
+            DataField::new(
+                3,
+                "micros".into(),
+                DataType::Timestamp(TimestampType::new(6).unwrap()),
+            )
+            .with_default_value(Some("123456".into())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let input = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Date32Array::from(vec![None])),
+                Arc::new(Time32MillisecondArray::from(vec![None])),
+                Arc::new(TimestampSecondArray::from(vec![None])),
+                Arc::new(TimestampMicrosecondArray::from(vec![None])),
+            ],
+        )
+        .unwrap();
+        let actual = defaults.apply(&input).unwrap();
+        assert_eq!(
+            actual
+                .column(0)
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(0),
+            42
+        );
+        assert_eq!(
+            actual
+                .column(1)
+                .as_any()
+                .downcast_ref::<Time32MillisecondArray>()
+                .unwrap()
+                .value(0),
+            12345
+        );
+        assert_eq!(
+            actual
+                .column(2)
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .value(0),
+            123
+        );
+        assert_eq!(
+            actual
+                .column(3)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            123456
+        );
+    }
+
+    #[test]
+    fn rejects_blob_default_like_java() {
+        use crate::spec::BlobType;
+        let fields = vec![
+            DataField::new(0, "blob".into(), DataType::Blob(BlobType::new()))
+                .with_default_value(Some("'raw bytes'".into())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        assert!(FormatTableDefaults::new(&fields, &schema).is_err());
+    }
+
+    #[test]
+    fn local_timestamp_default_uses_system_timezone_and_declared_precision() {
+        use crate::spec::LocalZonedTimestampType;
+        use chrono::TimeZone;
+        let fields = vec![DataField::new(
+            0,
+            "local_time".into(),
+            DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(3).unwrap()),
+        )
+        .with_default_value(Some("'2025-01-02 03:04:05.123456'".into()))];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let input = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                TimestampMillisecondArray::from(vec![None]).with_timezone("UTC"),
+            )],
+        )
+        .unwrap();
+        let actual = defaults.apply(&input).unwrap();
+        let local = chrono::NaiveDate::from_ymd_opt(2025, 1, 2)
+            .unwrap()
+            .and_hms_milli_opt(3, 4, 5, 123)
+            .unwrap();
+        let expected = chrono::Local
+            .from_local_datetime(&local)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            actual
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .value(0),
+            expected
+        );
     }
 }
