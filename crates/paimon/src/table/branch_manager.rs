@@ -93,6 +93,17 @@ impl BranchManager {
                 source: None,
             });
         }
+        // A path separator would place the branch directory at a nested path
+        // (`branch-b1/hidden`), so the branch is created but never listed back by
+        // `$branches`, leaving it silently orphaned. Reject it up front.
+        if branch_name.contains('/') || branch_name.contains('\\') {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Branch name '{branch_name}' must not contain a path separator ('/' or '\\')."
+                ),
+                source: None,
+            });
+        }
         Ok(())
     }
 
@@ -407,6 +418,17 @@ mod tests {
     async fn test_validate_branch_name_accepts_valid() {
         assert!(BranchManager::validate_branch_name("my_branch").is_ok());
         assert!(BranchManager::validate_branch_name("branch-1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_branch_name_rejects_path_separator() {
+        // A '/'-bearing rename target creates an unlistable, orphaned branch.
+        for name in ["b1/hidden", "a\\b"] {
+            let result = BranchManager::validate_branch_name(name);
+            assert!(result.is_err(), "'{name}' should be rejected");
+            let msg = format!("{}", result.unwrap_err());
+            assert!(msg.contains("path separator"), "got: {msg}");
+        }
     }
 
     #[tokio::test]
