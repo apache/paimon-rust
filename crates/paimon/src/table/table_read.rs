@@ -872,7 +872,14 @@ impl<'a> PaimonTableRead<'a> {
                     | MergeEngine::Aggregation
             )
         {
-            return self.read_pk(data_splits, &core_options);
+            let stream = self.read_pk(data_splits, &core_options)?;
+            return Ok(super::managed_blob_reader::resolve_primary_key_blob_stream(
+                stream,
+                self.read_type(),
+                &core_options,
+                self.table.file_io.clone(),
+                self.blob_parallelism,
+            ));
         }
 
         if core_options.data_evolution_enabled() {

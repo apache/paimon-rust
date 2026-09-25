@@ -55,7 +55,7 @@ use std::sync::Arc;
 enum FileWriter {
     Append(DataFileWriter),
     AppendDedicated(Box<AppendDedicatedFormatFileWriter>),
-    KeyValue(KeyValueFileWriter),
+    KeyValue(Box<KeyValueFileWriter>),
     Postpone(PostponeFileWriter),
 }
 
@@ -1216,7 +1216,7 @@ impl TableWrite {
             .copied()
             .unwrap_or(0);
 
-        Ok(FileWriter::KeyValue(
+        Ok(FileWriter::KeyValue(Box::new(
             KeyValueFileWriter::new(
                 self.table.file_io().clone(),
                 KeyValueWriteConfig {
@@ -1249,7 +1249,7 @@ impl TableWrite {
                 next_seq,
             )?
             .with_resources(self.resources.clone()),
-        ))
+        )))
     }
 }
 

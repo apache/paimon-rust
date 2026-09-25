@@ -1998,6 +1998,58 @@ impl BlobFormatWriter {
             lengths: Vec::new(),
         })
     }
+
+    /// Append one managed BLOB and return the payload range in this pack.
+    /// The range excludes the four-byte entry magic and twelve-byte trailer,
+    /// matching Java `BlobFormatWriter`'s descriptor callback.
+    pub(crate) async fn write_managed_value(&mut self, value: &[u8]) -> crate::Result<(i64, i64)> {
+        let start = self.bytes_written;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "blob",
+            ArrowDataType::LargeBinary,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(LargeBinaryArray::from(vec![Some(value)]))],
+        )
+        .map_err(|error| Error::DataInvalid {
+            message: format!("Failed to build managed BLOB input: {error}"),
+            source: Some(Box::new(error)),
+        })?;
+        self.write(&batch).await?;
+        let entry_len =
+            self.bytes_written
+                .checked_sub(start)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "Managed BLOB writer position moved backwards".to_string(),
+                    source: None,
+                })?;
+        let payload_len =
+            entry_len
+                .checked_sub(BLOB_ENTRY_OVERHEAD)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "Managed BLOB entry is shorter than its framing".to_string(),
+                    source: None,
+                })?;
+        let offset =
+            start
+                .checked_add(BLOB_INLINE_HEADER_SIZE)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "Managed BLOB payload offset overflows u64".to_string(),
+                    source: None,
+                })?;
+        Ok((
+            i64::try_from(offset).map_err(|error| Error::DataInvalid {
+                message: "Managed BLOB payload offset exceeds i64".to_string(),
+                source: Some(Box::new(error)),
+            })?,
+            i64::try_from(payload_len).map_err(|error| Error::DataInvalid {
+                message: "Managed BLOB payload length exceeds i64".to_string(),
+                source: Some(Box::new(error)),
+            })?,
+        ))
+    }
 }
 
 const BLOB_WRITE_BUFFER_SIZE: u64 = 8 * 1024 * 1024; // 8 MB
