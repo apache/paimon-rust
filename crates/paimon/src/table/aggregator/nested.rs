@@ -56,6 +56,7 @@ pub(crate) struct NestedAgg {
     null_key_strategy: NullKeyStrategy,
     count_limit: usize,
     seen_input: bool,
+    raw_accumulator: bool,
     rows: Vec<ArrayRef>,
 }
 
@@ -143,6 +144,7 @@ impl NestedAgg {
             null_key_strategy,
             count_limit,
             seen_input: false,
+            raw_accumulator: false,
             rows: Vec::new(),
         })
     }
@@ -233,13 +235,18 @@ impl NestedAgg {
         Ok(Arc::new(result))
     }
 
-    fn add_row(&mut self, incoming: ArrayRef, limit_new_keys: bool) -> crate::Result<()> {
+    fn add_row(
+        &mut self,
+        incoming: ArrayRef,
+        limit_new_keys: bool,
+        row_limit: usize,
+    ) -> crate::Result<()> {
         if incoming.is_null(0) {
             return Ok(());
         }
         let row = self.row(incoming.as_ref())?;
         if self.key_indices.is_empty() {
-            if !limit_new_keys || self.rows.len() < self.count_limit {
+            if !limit_new_keys || self.rows.len() < row_limit {
                 self.rows.push(incoming);
             }
             return Ok(());
@@ -267,7 +274,7 @@ impl NestedAgg {
             }
             None if !limit_new_keys
                 || matches!(self.mode, NestedMode::PartialUpdate)
-                || self.rows.len() < self.count_limit =>
+                || self.rows.len() < row_limit =>
             {
                 self.rows.push(incoming)
             }
@@ -281,6 +288,7 @@ impl NestedAgg {
         array: &dyn Array,
         row_idx: usize,
         limit_new_keys: bool,
+        row_limit: usize,
     ) -> crate::Result<()> {
         if array.is_null(row_idx) {
             return Ok(());
@@ -300,7 +308,7 @@ impl NestedAgg {
         let values = list.value(row_idx);
         for index in 0..values.len() {
             if values.is_valid(index) {
-                self.add_row(values.slice(index, 1), limit_new_keys)?;
+                self.add_row(values.slice(index, 1), limit_new_keys, row_limit)?;
             }
         }
         Ok(())
@@ -326,7 +334,53 @@ impl NestedAgg {
             .map(|index| values.slice(index, 1))
             .collect();
         self.seen_input = true;
+        self.raw_accumulator = true;
         Ok(())
+    }
+
+    fn normalize_raw_accumulator(&mut self, for_retract: bool) -> crate::Result<()> {
+        if !self.raw_accumulator {
+            return Ok(());
+        }
+        self.raw_accumulator = false;
+        let raw_rows = std::mem::take(&mut self.rows);
+        for row in raw_rows {
+            if row.is_null(0) {
+                continue;
+            }
+            if for_retract && !self.key_indices.is_empty() {
+                // Java retract() builds its map with unconditional put(),
+                // unlike agg(), which compares nested sequence fields.
+                let nested_row = self.row(row.as_ref())?;
+                if !self.key_is_valid(nested_row)? {
+                    continue;
+                }
+                let position = self.rows.iter().position(|existing| {
+                    self.same_key(
+                        self.row(existing.as_ref()).expect("stored Struct row"),
+                        nested_row,
+                    )
+                });
+                if let Some(index) = position {
+                    self.rows[index] = row;
+                } else {
+                    self.rows.push(row);
+                }
+            } else {
+                self.add_row(row, false, self.count_limit)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn input_row_limit(&self, raw_size: Option<usize>) -> usize {
+        if self.key_indices.is_empty() {
+            raw_size.map_or(self.count_limit, |size| {
+                self.rows.len() + (self.count_limit - size)
+            })
+        } else {
+            self.count_limit
+        }
     }
 }
 
@@ -365,11 +419,32 @@ impl FieldAggregator for NestedAgg {
 
     fn reset(&mut self) {
         self.seen_input = false;
+        self.raw_accumulator = false;
         self.rows.clear();
     }
 
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        self.consume(array, row_idx, true)
+        if array.is_null(row_idx) {
+            return Ok(());
+        }
+        // Java returns the accumulator itself when its raw ARRAY already
+        // reaches the limit. Otherwise it rebuilds that ARRAY before adding
+        // the new input, including nested-key deduplication.
+        let raw_size = self.raw_accumulator.then_some(self.rows.len());
+        if self.raw_accumulator
+            && self.key_indices.is_empty()
+            && self.rows.len() >= self.count_limit
+        {
+            return Ok(());
+        }
+        self.normalize_raw_accumulator(false)?;
+        let row_limit = self.input_row_limit(raw_size);
+        self.consume(array, row_idx, true, row_limit)
+    }
+
+    fn replace_with_delete(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.reset();
+        self.preserve_raw_accumulator(array, row_idx)
     }
 
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
@@ -380,12 +455,21 @@ impl FieldAggregator for NestedAgg {
         }
         let current = std::mem::take(&mut self.rows);
         let current_seen = self.seen_input;
-        self.seen_input = false;
+        self.reset();
         // Java agg(older, current) treats older as an accumulator: count-limit
         // only applies while adding current rows (or new nested keys).
-        self.consume(array, row_idx, false)?;
+        self.preserve_raw_accumulator(array, row_idx)?;
+        let raw_size = self.raw_accumulator.then_some(self.rows.len());
+        if self.raw_accumulator
+            && self.key_indices.is_empty()
+            && self.rows.len() >= self.count_limit
+        {
+            return Ok(());
+        }
+        self.normalize_raw_accumulator(false)?;
+        let row_limit = self.input_row_limit(raw_size);
         for row in current {
-            self.add_row(row, true)?;
+            self.add_row(row, true, row_limit)?;
         }
         self.seen_input |= current_seen;
         Ok(())
@@ -400,6 +484,7 @@ impl FieldAggregator for NestedAgg {
         if !self.seen_input || array.is_null(row_idx) {
             return Ok(());
         }
+        self.normalize_raw_accumulator(true)?;
         let list =
             array
                 .as_any()
@@ -578,6 +663,62 @@ mod tests {
         agg.agg(&input, 1).unwrap();
         agg.agg_reversed(&input, 0).unwrap();
         assert_eq!(result_rows(&agg).0, vec![Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn nested_raw_null_element_still_counts_toward_remaining_limit() {
+        let (data_type, input) = input();
+        let options = HashMap::from([("fields.items.count-limit".into(), "2".into())]);
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        let ArrowDataType::List(element) = input.data_type() else {
+            unreachable!()
+        };
+        let raw = ListArray::try_new(
+            element.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1])),
+            new_null_array(element.data_type(), 1),
+            None,
+        )
+        .unwrap();
+        agg.replace_with_delete(&raw, 0).unwrap();
+        agg.agg(&input, 0).unwrap();
+        assert_eq!(result_rows(&agg).0, vec![Some(1)]);
+    }
+
+    #[test]
+    fn nested_retract_normalizes_raw_keys_without_sequence_comparison() {
+        let (data_type, input) = input();
+        let options = HashMap::from([
+            ("fields.items.nested-key".into(), "id".into()),
+            ("fields.items.nested-sequence-field".into(), "seq".into()),
+        ]);
+        let mut agg = NestedAgg::new("nested_update", "items", &data_type, &options).unwrap();
+        let ArrowDataType::List(element) = input.data_type() else {
+            unreachable!()
+        };
+        let values = input.values();
+        let raw_values =
+            concat(&[values.slice(0, 1).as_ref(), values.slice(2, 1).as_ref()]).unwrap();
+        let raw = ListArray::try_new(
+            element.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 2])),
+            raw_values,
+            None,
+        )
+        .unwrap();
+        agg.replace_with_delete(&raw, 0).unwrap();
+        let retract = ListArray::try_new(
+            element.clone(),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1])),
+            values.slice(1, 1),
+            None,
+        )
+        .unwrap();
+        agg.retract(&retract, 0).unwrap();
+        assert_eq!(
+            result_rows(&agg),
+            (vec![Some(1)], vec![None], vec![Some(1)])
+        );
     }
 
     #[test]

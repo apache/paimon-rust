@@ -31,7 +31,7 @@ use std::sync::Arc;
 use arrow_array::builder::{Int32Builder, ListBuilder};
 use arrow_array::{
     new_null_array, Array, ArrayRef, BinaryArray, Int32Array, Int8Array, ListArray, RecordBatch,
-    StructArray,
+    StringArray, StructArray,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
@@ -39,7 +39,7 @@ use futures::StreamExt;
 use paimon::arrow::paimon_type_to_arrow;
 use paimon::spec::{
     ArrayType, DataField, DataType, IntType, RowType, Schema, TableSchema, VarBinaryType,
-    VALUE_KIND_FIELD_NAME,
+    VarCharType, VALUE_KIND_FIELD_NAME,
 };
 
 #[tokio::test]
@@ -512,6 +512,226 @@ async fn partial_update_nested_reverse_keeps_older_rows_beyond_count_limit() {
         .downcast_ref::<Int32Array>()
         .unwrap();
     assert_eq!(item_ids.values().as_ref(), &[1, 2]);
+    assert!(stream.next().await.is_none());
+}
+
+fn keyed_items_type() -> DataType {
+    DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+        DataField::new(3, "item_id".into(), DataType::Int(IntType::new())),
+        DataField::new(4, "amount".into(), DataType::Int(IntType::new())),
+    ]))))
+}
+
+fn nested_items_batch(
+    items_type: &DataType,
+    version: Option<i32>,
+    items: Option<&[(i32, i32)]>,
+    kind: i8,
+) -> RecordBatch {
+    let items_arrow_type = paimon_type_to_arrow(items_type).unwrap();
+    let item_array: ArrayRef = if let Some(items) = items {
+        let ArrowDataType::List(element) = &items_arrow_type else {
+            panic!("expected ARRAY<ROW>");
+        };
+        let ArrowDataType::Struct(fields) = element.data_type() else {
+            panic!("expected ROW element");
+        };
+        let rows = StructArray::try_new(
+            fields.clone(),
+            vec![
+                Arc::new(Int32Array::from(
+                    items.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int32Array::from(
+                    items.iter().map(|(_, amount)| *amount).collect::<Vec<_>>(),
+                )),
+            ],
+            None,
+        )
+        .unwrap();
+        Arc::new(
+            ListArray::try_new(
+                element.clone(),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, items.len() as i32])),
+                Arc::new(rows),
+                None,
+            )
+            .unwrap(),
+        )
+    } else {
+        new_null_array(&items_arrow_type, 1)
+    };
+    let mut fields = vec![ArrowField::new("id", ArrowDataType::Int32, false)];
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![1]))];
+    if let Some(version) = version {
+        fields.push(ArrowField::new("version", ArrowDataType::Int32, false));
+        columns.push(Arc::new(Int32Array::from(vec![version])));
+    }
+    fields.push(ArrowField::new("items", items_arrow_type, true));
+    columns.push(item_array);
+    fields.push(ArrowField::new(
+        VALUE_KIND_FIELD_NAME,
+        ArrowDataType::Int8,
+        false,
+    ));
+    columns.push(Arc::new(Int8Array::from(vec![kind])));
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap()
+}
+
+async fn scan_keyed_items(table: &paimon::table::Table) -> Vec<(i32, i32)> {
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let mut stream = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap();
+    let batch = stream.next().await.unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let values = batch
+        .column_by_name("items")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .value(0);
+    let rows = values.as_any().downcast_ref::<StructArray>().unwrap();
+    let ids = rows
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let amounts = rows
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let mut result = (0..rows.len())
+        .map(|index| (ids.value(index), amounts.value(index)))
+        .collect::<Vec<_>>();
+    result.sort_unstable();
+    assert!(stream.next().await.is_none());
+    result
+}
+
+#[tokio::test]
+async fn partial_update_raw_nested_accumulator_normalizes_on_next_agg_or_retract() {
+    let items_type = keyed_items_type();
+    for (function, final_kind, expected) in [
+        ("nested_update", 0, vec![(1, 20), (2, 30)]),
+        ("nested_partial_update", 0, vec![(1, 20), (2, 30)]),
+        ("nested_update", 3, vec![(1, 20)]),
+    ] {
+        let path = format!("memory:/rowkind_field/nested_raw_{function}_{final_kind}");
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("version", DataType::Int(IntType::new()))
+            .column("items", items_type.clone())
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "partial-update")
+            .option("fields.version.sequence-group", "items")
+            .option("fields.items.aggregate-function", function)
+            .option("fields.items.nested-key", "item_id")
+            .build()
+            .unwrap();
+        let (file_io, table) = memory_table(&path, TableSchema::new(0, &schema));
+        setup_dirs(&file_io, &path).await;
+        persist_table_schema(&file_io, &path, table.schema()).await;
+        write_batch(&table, &nested_items_batch(&items_type, Some(3), None, 0)).await;
+        write_batch(
+            &table,
+            &nested_items_batch(&items_type, Some(1), Some(&[(1, 10), (1, 20)]), 0),
+        )
+        .await;
+        write_batch(
+            &table,
+            &nested_items_batch(&items_type, Some(4), Some(&[(2, 30)]), final_kind),
+        )
+        .await;
+        assert_eq!(
+            scan_keyed_items(&table).await,
+            expected,
+            "{function}, {final_kind}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn aggregation_whole_row_delete_preserves_nested_values_beyond_count_limit() {
+    let path = "memory:/rowkind_field/aggregation_raw_nested_delete";
+    let items_type = keyed_items_type();
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("items", items_type.clone())
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "aggregation")
+        .option("aggregation.remove-record-on-delete", "true")
+        .option("fields.items.aggregate-function", "nested_update")
+        .option("fields.items.count-limit", "1")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    write_batch(&table, &nested_items_batch(&items_type, None, None, 0)).await;
+    write_batch(
+        &table,
+        &nested_items_batch(&items_type, None, Some(&[(1, 10), (2, 20)]), 3),
+    )
+    .await;
+    write_batch(&table, &nested_items_batch(&items_type, None, None, 0)).await;
+    assert_eq!(scan_keyed_items(&table).await, vec![(1, 10), (2, 20)]);
+}
+
+#[tokio::test]
+async fn aggregation_whole_row_delete_preserves_blank_listagg_value() {
+    let path = "memory:/rowkind_field/aggregation_raw_listagg_delete";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::VarChar(VarCharType::string_type()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "aggregation")
+        .option("aggregation.remove-record-on-delete", "true")
+        .option("fields.value.aggregate-function", "listagg")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    for (value, kind) in [(Some("old"), 0), (Some(" "), 3), (None, 0)] {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Utf8, true),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec![value])),
+                Arc::new(Int8Array::from(vec![kind])),
+            ],
+        )
+        .unwrap();
+        write_batch(&table, &batch).await;
+    }
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let mut stream = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap();
+    let batch = stream.next().await.unwrap().unwrap();
+    let values = batch
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.value(0), " ");
     assert!(stream.next().await.is_none());
 }
 

@@ -117,6 +117,28 @@ impl ListaggAgg {
             acc: None,
         })
     }
+
+    fn input_value<'a>(
+        &self,
+        array: &'a dyn Array,
+        row_idx: usize,
+    ) -> crate::Result<Option<&'a str>> {
+        if array.is_null(row_idx) {
+            return Ok(None);
+        }
+        let arr = array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "listagg column '{}' received non-Utf8 Arrow array {:?}",
+                    self.field_name,
+                    array.data_type()
+                ),
+                source: None,
+            })?;
+        Ok(Some(arr.value(row_idx)))
+    }
 }
 
 impl FieldAggregator for ListaggAgg {
@@ -129,21 +151,9 @@ impl FieldAggregator for ListaggAgg {
     }
 
     fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        if array.is_null(row_idx) {
+        let Some(v) = self.input_value(array, row_idx)? else {
             return Ok(());
-        }
-        let arr = array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!(
-                    "listagg column '{}' received non-Utf8 Arrow array {:?}",
-                    self.field_name,
-                    array.data_type()
-                ),
-                source: None,
-            })?;
-        let v = arr.value(row_idx);
+        };
         if java_is_blank(v) {
             return Ok(());
         }
@@ -154,29 +164,26 @@ impl FieldAggregator for ListaggAgg {
         Ok(())
     }
 
+    fn replace_with_delete(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        // AggregateMergeFunction.initRow copies the DELETE field verbatim.
+        self.acc = self.input_value(array, row_idx)?.map(str::to_string);
+        Ok(())
+    }
+
     fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
-        if array.is_null(row_idx) {
-            return Ok(());
-        }
-        let arr = array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| crate::Error::DataInvalid {
-                message: format!(
-                    "listagg column '{}' received non-Utf8 Arrow array {:?}",
-                    self.field_name,
-                    array.data_type()
-                ),
-                source: None,
-            })?;
-        let value = arr.value(row_idx);
-        if java_is_blank(value) {
-            return Ok(());
-        }
-        self.acc = Some(match self.acc.take() {
-            None => value.to_string(),
-            Some(current) => merge_listagg(value, &current, &self.delimiter, self.distinct),
-        });
+        let older = self.input_value(array, row_idx)?.map(str::to_string);
+        self.acc = match (older, self.acc.take()) {
+            (older, None) => older,
+            (older, Some(current)) if java_is_blank(&current) => older,
+            (None, Some(current)) => Some(current),
+            (Some(older), Some(current)) if java_is_blank(&older) => Some(current),
+            (Some(older), Some(current)) => Some(merge_listagg(
+                &older,
+                &current,
+                &self.delimiter,
+                self.distinct,
+            )),
+        };
         Ok(())
     }
 
@@ -233,6 +240,21 @@ mod tests {
             agg.agg(&arr, i).unwrap();
         }
         assert_eq!(collect(agg.result().unwrap()), None);
+    }
+
+    #[test]
+    fn delete_replacement_keeps_blank_until_a_non_blank_input() {
+        let mut agg = ListaggAgg::new("v", &varchar_type(), &HashMap::new()).unwrap();
+        let arr = StringArray::from(vec![Some(" "), None, Some("new"), Some("old")]);
+        agg.replace_with_delete(&arr, 0).unwrap();
+        agg.agg(&arr, 1).unwrap();
+        assert_eq!(collect(agg.result().unwrap()), Some(" ".into()));
+        agg.agg(&arr, 2).unwrap();
+        assert_eq!(collect(agg.result().unwrap()), Some("new".into()));
+
+        agg.replace_with_delete(&arr, 0).unwrap();
+        agg.agg_reversed(&arr, 3).unwrap();
+        assert_eq!(collect(agg.result().unwrap()), Some("old".into()));
     }
 
     #[test]
