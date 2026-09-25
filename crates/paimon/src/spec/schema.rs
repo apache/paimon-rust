@@ -1200,7 +1200,9 @@ impl Schema {
         Self::validate_blob_fields(fields, partition_keys, primary_keys, options)?;
         Self::validate_primary_key_blob_configuration(fields, primary_keys, options)?;
         Self::validate_vector_store_fields(fields, partition_keys, options)?;
-        PartialUpdateConfig::new(options).validate_create_mode(!primary_keys.is_empty())?;
+        let partial_update = PartialUpdateConfig::new(options);
+        partial_update.validate_create_mode(!primary_keys.is_empty())?;
+        partial_update.validate_create_fields(fields, primary_keys)?;
         validate_no_aggregation_on_sequence_field(options)?;
         AggregationConfig::new(options).validate_create_mode(primary_keys, fields)?;
         Self::validate_first_row_changelog_producer(options)?;
@@ -3348,12 +3350,7 @@ mod tests {
     fn test_aggregation_schema_validation_rejects_unsupported_options() {
         for (key, value) in [
             ("ignore-delete", "true"),
-            ("aggregation.remove-record-on-delete", "true"),
-            ("fields.value.ignore-retract", "true"),
-            ("fields.value.distinct", "true"),
             ("fields.value.sequence-group", "g1"),
-            ("fields.value.nested-key", "id"),
-            ("fields.value.count-limit", "10"),
         ] {
             let err = Schema::builder()
                 .column("id", DataType::Int(IntType::new()))
@@ -4301,13 +4298,13 @@ mod tests {
         let err = table_schema
             .apply_changes(vec![crate::spec::SchemaChange::set_option(
                 "fields.value.sequence-group".to_string(),
-                "value".to_string(),
+                "missing".to_string(),
             )])
             .unwrap_err();
         assert!(
             matches!(err, crate::Error::ConfigInvalid { ref message }
-                if message.contains("partial-update") && message.contains("sequence-group")),
-            "unsupported partial-update option should be rejected on alter, got {err:?}"
+                if message.contains("sequence-group") && message.contains("missing")),
+            "invalid partial-update field should be rejected on alter, got {err:?}"
         );
     }
 

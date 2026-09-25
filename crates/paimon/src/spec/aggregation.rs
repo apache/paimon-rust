@@ -32,13 +32,15 @@ const IGNORE_RETRACT_SUFFIX: &str = ".ignore-retract";
 const DISTINCT_SUFFIX: &str = ".distinct";
 const SEQUENCE_GROUP_SUFFIX: &str = ".sequence-group";
 const NESTED_KEY_SUFFIX: &str = ".nested-key";
+const NESTED_SEQUENCE_FIELD_SUFFIX: &str = ".nested-sequence-field";
+const NESTED_KEY_NULL_STRATEGY_SUFFIX: &str = ".nested-key-null-strategy";
 const COUNT_LIMIT_SUFFIX: &str = ".count-limit";
 const MAP_STORAGE_LAYOUT_SUFFIX: &str = ".map.storage-layout";
 const MAP_SHARED_SHREDDING_MAX_COLUMNS_SUFFIX: &str = ".map.shared-shredding.max-columns";
 const MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY_SUFFIX: &str =
     ".map.shared-shredding.column-placement-policy";
 
-/// Minimal aggregation mode recognized by the current Rust implementation.
+/// Aggregation merge mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AggregationMode {
     Basic,
@@ -46,16 +48,9 @@ pub(crate) enum AggregationMode {
 
 /// Aggregation-merge-engine option inspection and validation.
 ///
-/// The basic mode accepts only `merge-engine=aggregation` on a PK table with
-/// the following option keys:
-/// - `fields.default-aggregate-function`
-/// - `fields.<col>.aggregate-function`
-/// - `fields.<col>.list-agg-delimiter`
-///
-/// All other aggregation-specific knobs (`ignore-retract`, `distinct`,
-/// `nested-key`, `count-limit`, `aggregation.remove-record-on-delete`,
-/// `sequence-group`, `ignore-delete`) are rejected.  Retract rows
-/// (DELETE / UPDATE_BEFORE) are rejected at runtime by the merge function.
+/// Supports Java's per-field aggregate functions and their field options,
+/// including retracts and `aggregation.remove-record-on-delete`. Sequence
+/// groups belong to partial update and are rejected for this engine.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AggregationConfig<'a> {
     options: &'a HashMap<String, String>,
@@ -70,6 +65,12 @@ impl<'a> AggregationConfig<'a> {
         self.options
             .get(MERGE_ENGINE_OPTION)
             .is_some_and(|value| value.eq_ignore_ascii_case(AGGREGATION_ENGINE))
+    }
+
+    pub(crate) fn remove_record_on_delete(&self) -> bool {
+        self.options
+            .get(AGGREGATION_REMOVE_RECORD_ON_DELETE_OPTION)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
     }
 
     /// Validate options at CREATE TABLE time, using the schema's fields and
@@ -91,7 +92,7 @@ impl<'a> AggregationConfig<'a> {
             Err(unsupported_options) => {
                 return Err(crate::Error::ConfigInvalid {
                     message: format!(
-                        "merge-engine=aggregation only supports the basic mode in this build; unsupported options: {}",
+                        "merge-engine=aggregation has unsupported options: {}",
                         unsupported_options.join(", ")
                     ),
                 });
@@ -242,6 +243,12 @@ impl<'a> AggregationConfig<'a> {
 enum FieldScopedOptionKind {
     AggregateFunction,
     ListAggDelimiter,
+    Distinct,
+    NestedKey,
+    NestedSequenceField,
+    NestedKeyNullStrategy,
+    CountLimit,
+    IgnoreRetract,
 }
 
 /// Parse the `<col>` segment and option kind out of a
@@ -258,6 +265,18 @@ fn parse_field_scoped_option_key(key: &str) -> Option<(&str, FieldScopedOptionKi
             LIST_AGG_DELIMITER_SUFFIX,
             FieldScopedOptionKind::ListAggDelimiter,
         ),
+        (DISTINCT_SUFFIX, FieldScopedOptionKind::Distinct),
+        (NESTED_KEY_SUFFIX, FieldScopedOptionKind::NestedKey),
+        (
+            NESTED_SEQUENCE_FIELD_SUFFIX,
+            FieldScopedOptionKind::NestedSequenceField,
+        ),
+        (
+            NESTED_KEY_NULL_STRATEGY_SUFFIX,
+            FieldScopedOptionKind::NestedKeyNullStrategy,
+        ),
+        (COUNT_LIMIT_SUFFIX, FieldScopedOptionKind::CountLimit),
+        (IGNORE_RETRACT_SUFFIX, FieldScopedOptionKind::IgnoreRetract),
     ] {
         if let Some(col) = inner.strip_suffix(suffix) {
             if col.is_empty() {
@@ -356,7 +375,7 @@ pub(crate) fn remove_field_scoped_options(options: &mut HashMap<String, String>,
 }
 
 const SUPPORTED_AGGREGATOR_NAMES_HINT: &str = "supported: sum, product, min, max, last_value, \
-    first_value, last_non_null_value, first_non_null_value, bool_and, bool_or, listagg";
+    first_value, last_non_null_value, first_non_null_value, bool_and, bool_or, listagg, collect, merge_map, merge_map_with_keytime, nested_update, nested_partial_update, rbm32, rbm64, hll_sketch, theta_sketch, primary-key";
 
 /// Java keeps `first_not_null_value` registered as an SPI alias of
 /// `first_non_null_value`: `FieldFirstNonNullValueAggLegacyFactory` is listed in
@@ -396,6 +415,16 @@ pub(crate) fn is_known_aggregator_name(name: &str) -> bool {
             | "bool_and"
             | "bool_or"
             | "listagg"
+            | "collect"
+            | "merge_map"
+            | "merge_map_with_keytime"
+            | "nested_update"
+            | "nested_partial_update"
+            | "rbm32"
+            | "rbm64"
+            | "hll_sketch"
+            | "theta_sketch"
+            | "primary-key"
     )
 }
 
@@ -429,6 +458,7 @@ pub(crate) fn validate_aggregator_for_type(
                 | DataType::BigInt(_)
                 | DataType::Float(_)
                 | DataType::Double(_)
+                | DataType::Decimal(_)
         ),
         // Java `FieldMinAggFactory` / `FieldMaxAggFactory` accept anything
         // `TypeCheckUtils#isComparable` allows, i.e. everything except MAP,
@@ -456,7 +486,20 @@ pub(crate) fn validate_aggregator_for_type(
         // Java `FieldListaggAggFactory` only accepts unbounded VARCHAR (STRING);
         // CHAR and bounded VARCHAR(n) are rejected.
         "listagg" => matches!(dt, DataType::VarChar(v) if v.length() == VarCharType::MAX_LENGTH),
-        "last_value" | "first_value" | "last_non_null_value" | "first_non_null_value" => true,
+        "collect" => matches!(dt, DataType::Array(_)),
+        "merge_map" => matches!(dt, DataType::Map(_)),
+        "merge_map_with_keytime" => {
+            matches!(dt, DataType::Map(map) if matches!(map.value_type(), DataType::Row(row) if row.fields().len() >= 2))
+        }
+        "nested_update" | "nested_partial_update" => {
+            matches!(dt, DataType::Array(array) if matches!(array.element_type(), DataType::Row(_)))
+        }
+        "rbm32" | "rbm64" | "hll_sketch" | "theta_sketch" => matches!(dt, DataType::VarBinary(_)),
+        "last_value"
+        | "first_value"
+        | "last_non_null_value"
+        | "first_non_null_value"
+        | "primary-key" => true,
         _ => {
             return Err(crate::Error::ConfigInvalid {
                 message: format!(
@@ -506,12 +549,7 @@ pub(crate) fn validate_no_aggregation_on_sequence_field(
 fn is_unsupported_aggregation_option(key: &str) -> bool {
     key == IGNORE_DELETE_OPTION
         || key.ends_with(IGNORE_DELETE_SUFFIX)
-        || key == AGGREGATION_REMOVE_RECORD_ON_DELETE_OPTION
-        || is_fields_option_with_suffix(key, IGNORE_RETRACT_SUFFIX)
-        || is_fields_option_with_suffix(key, DISTINCT_SUFFIX)
         || is_fields_option_with_suffix(key, SEQUENCE_GROUP_SUFFIX)
-        || is_fields_option_with_suffix(key, NESTED_KEY_SUFFIX)
-        || is_fields_option_with_suffix(key, COUNT_LIMIT_SUFFIX)
 }
 
 fn is_fields_option_with_suffix(key: &str, suffix: &str) -> bool {
@@ -612,12 +650,7 @@ mod tests {
         for key in [
             IGNORE_DELETE_OPTION,
             "fields.price.ignore-delete",
-            AGGREGATION_REMOVE_RECORD_ON_DELETE_OPTION,
-            "fields.price.ignore-retract",
-            "fields.tags.distinct",
             "fields.price.sequence-group",
-            "fields.payload.nested-key",
-            "fields.payload.count-limit",
         ] {
             let options = aggregation_options(&[(key, "value")]);
             let config = AggregationConfig::new(&options);
@@ -633,12 +666,12 @@ mod tests {
 
     #[test]
     fn test_validate_runtime_mode_rejects_unsupported_options() {
-        let options = aggregation_options(&[("fields.price.ignore-retract", "true")]);
+        let options = aggregation_options(&[("fields.price.sequence-group", "true")]);
         let config = AggregationConfig::new(&options);
         let err = config.validate_runtime_mode(true, "default.t").unwrap_err();
 
         assert!(
-            matches!(err, crate::Error::Unsupported { ref message } if message.contains("fields.price.ignore-retract")),
+            matches!(err, crate::Error::Unsupported { ref message } if message.contains("fields.price.sequence-group")),
             "expected runtime rejection to mention the unsupported option, got {err:?}"
         );
     }
@@ -849,9 +882,9 @@ mod tests {
     #[test]
     fn validation_table_matches_constructors() {
         use crate::spec::{
-            BigIntType, BinaryType, BlobType, BooleanType, DateType, DecimalType, DoubleType,
-            FloatType, LocalZonedTimestampType, SmallIntType, TimeType, TimestampType, TinyIntType,
-            VarBinaryType,
+            ArrayType, BigIntType, BinaryType, BlobType, BooleanType, DateType, DecimalType,
+            DoubleType, FloatType, LocalZonedTimestampType, MapType, RowType, SmallIntType,
+            TimeType, TimestampType, TinyIntType, VarBinaryType,
         };
 
         let names = [
@@ -869,6 +902,16 @@ mod tests {
             "bool_and",
             "bool_or",
             "listagg",
+            "collect",
+            "merge_map",
+            "merge_map_with_keytime",
+            "nested_update",
+            "nested_partial_update",
+            "rbm32",
+            "rbm64",
+            "hll_sketch",
+            "theta_sketch",
+            "primary-key",
         ];
 
         let sample_types: Vec<DataType> = vec![
@@ -895,9 +938,30 @@ mod tests {
             // (listagg must accept) — exercises both sides of the listagg rule.
             DataType::VarChar(VarCharType::new(255).unwrap()),
             DataType::VarChar(VarCharType::string_type()),
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            DataType::Array(ArrayType::new(DataType::Row(RowType::new(vec![
+                DataField::new(1, "id".into(), DataType::Int(IntType::new())),
+                DataField::new(2, "value".into(), DataType::Int(IntType::new())),
+            ])))),
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Int(IntType::new()),
+            )),
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Row(RowType::new(vec![
+                    DataField::new(1, "value".into(), DataType::Int(IntType::new())),
+                    DataField::new(
+                        2,
+                        "timestamp".into(),
+                        DataType::VarChar(VarCharType::string_type()),
+                    ),
+                ])),
+            )),
         ];
 
-        let opts: HashMap<String, String> = HashMap::new();
+        let opts: HashMap<String, String> =
+            HashMap::from([("fields.field.nested-key".to_string(), "id".to_string())]);
         for name in names {
             for dt in &sample_types {
                 let from_validator = validate_aggregator_for_type(name, "field", dt);

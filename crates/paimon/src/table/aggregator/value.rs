@@ -169,6 +169,28 @@ macro_rules! pick_agg {
                 self.0.agg_reversed(array, row_idx);
                 Ok(())
             }
+            fn retract(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+                match self.0.policy {
+                    PickPolicy::Last => {
+                        self.0.winner = None;
+                        Ok(())
+                    }
+                    PickPolicy::LastNonNull => {
+                        if !array.is_null(row_idx) {
+                            self.0.winner = None;
+                        }
+                        Ok(())
+                    }
+                    PickPolicy::First | PickPolicy::FirstNonNull => {
+                        Err(crate::Error::Unsupported {
+                            message: format!(
+                                "Aggregate function '{}' does not support retract",
+                                self.name()
+                            ),
+                        })
+                    }
+                }
+            }
             fn result(&self) -> crate::Result<ArrayRef> {
                 Ok(self.0.result())
             }
@@ -188,6 +210,41 @@ pick_agg!(
     "first_non_null_value",
     PickPolicy::FirstNonNull
 );
+
+/// Java's internal `primary-key` function replaces its value for both add and
+/// retract inputs. It can also appear explicitly in Java table options.
+#[derive(Debug)]
+pub(crate) struct PrimaryKeyAgg(PickValueAgg);
+
+impl PrimaryKeyAgg {
+    pub(crate) fn new(_field_name: &str, data_type: &DataType) -> crate::Result<Self> {
+        Ok(Self(PickValueAgg::new(PickPolicy::Last, data_type)?))
+    }
+}
+
+impl FieldAggregator for PrimaryKeyAgg {
+    fn name(&self) -> &'static str {
+        "primary-key"
+    }
+    fn reset(&mut self) {
+        self.0.reset();
+    }
+    fn agg(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.0.agg(array, row_idx);
+        Ok(())
+    }
+    fn agg_reversed(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.0.agg_reversed(array, row_idx);
+        Ok(())
+    }
+    fn retract(&mut self, array: &dyn Array, row_idx: usize) -> crate::Result<()> {
+        self.0.agg(array, row_idx);
+        Ok(())
+    }
+    fn result(&self) -> crate::Result<ArrayRef> {
+        Ok(self.0.result())
+    }
+}
 
 #[cfg(test)]
 mod tests {

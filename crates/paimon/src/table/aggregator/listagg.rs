@@ -64,7 +64,28 @@ fn java_is_blank(value: &str) -> bool {
 pub(crate) struct ListaggAgg {
     field_name: String,
     delimiter: String,
+    distinct: bool,
     acc: Option<String>,
+}
+
+fn merge_listagg(accumulator: &str, incoming: &str, delimiter: &str, distinct: bool) -> String {
+    if java_is_blank(accumulator) {
+        return incoming.to_string();
+    }
+    if !distinct {
+        return format!("{accumulator}{delimiter}{incoming}");
+    }
+    let separator = if delimiter.is_empty() { " " } else { delimiter };
+    let mut existing: std::collections::HashSet<&str> = accumulator.split(separator).collect();
+    let mut result = accumulator.to_string();
+    for token in incoming.split(separator) {
+        if java_is_blank(token) || !existing.insert(token) {
+            continue;
+        }
+        result.push_str(delimiter);
+        result.push_str(token);
+    }
+    result
 }
 
 impl ListaggAgg {
@@ -90,6 +111,9 @@ impl ListaggAgg {
         Ok(Self {
             field_name: field_name.to_string(),
             delimiter: list_agg_delimiter(field_name, table_options).to_string(),
+            distinct: table_options
+                .get(&format!("fields.{field_name}.distinct"))
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
             acc: None,
         })
     }
@@ -123,13 +147,10 @@ impl FieldAggregator for ListaggAgg {
         if java_is_blank(v) {
             return Ok(());
         }
-        match &mut self.acc {
-            None => self.acc = Some(v.to_string()),
-            Some(prev) => {
-                prev.push_str(&self.delimiter);
-                prev.push_str(v);
-            }
-        }
+        self.acc = Some(match self.acc.take() {
+            None => v.to_string(),
+            Some(previous) => merge_listagg(&previous, v, &self.delimiter, self.distinct),
+        });
         Ok(())
     }
 
@@ -154,7 +175,7 @@ impl FieldAggregator for ListaggAgg {
         }
         self.acc = Some(match self.acc.take() {
             None => value.to_string(),
-            Some(current) => format!("{value}{}{current}", self.delimiter),
+            Some(current) => merge_listagg(value, &current, &self.delimiter, self.distinct),
         });
         Ok(())
     }
@@ -283,6 +304,23 @@ mod tests {
         agg.agg_reversed(&arr, 1).unwrap();
         agg.agg_reversed(&arr, 2).unwrap();
         assert_eq!(collect(agg.result().unwrap()), Some("a,b".to_string()));
+    }
+
+    #[test]
+    fn test_listagg_distinct_splits_existing_and_incoming_tokens() {
+        let opts = HashMap::from([
+            ("fields.v.list-agg-delimiter".to_string(), "|".to_string()),
+            ("fields.v.distinct".to_string(), "true".to_string()),
+        ]);
+        let mut agg = ListaggAgg::new("v", &varchar_type(), &opts).unwrap();
+        let values = StringArray::from(vec!["a|b", "b|c|c", "a|d"]);
+        agg.agg(&values, 0).unwrap();
+        agg.agg(&values, 1).unwrap();
+        assert_eq!(collect(agg.result().unwrap()), Some("a|b|c".into()));
+        agg.agg_reversed(&values, 2).unwrap();
+        // Java's default aggReversed calls agg(older, accumulator), so the
+        // older input establishes the token order for distinct listagg.
+        assert_eq!(collect(agg.result().unwrap()), Some("a|d|b|c".into()));
     }
 
     #[test]

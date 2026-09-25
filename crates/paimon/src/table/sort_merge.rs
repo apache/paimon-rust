@@ -114,6 +114,8 @@ pub(crate) enum MergeResult {
     SourceRow { batch_idx: usize, row_idx: usize },
     /// Emit a synthesized one-row batch matching the merge output schema.
     MaterializedRow(RecordBatch),
+    /// Persist a synthesized tombstone during a write; scans omit it.
+    MaterializedDeleteRow(RecordBatch),
     /// Omit this key from the output.
     Omit,
 }
@@ -232,6 +234,8 @@ impl MergeFunction for FirstRowMergeFunction {
 #[derive(Debug)]
 pub(crate) struct PartialUpdateMergeFunction {
     ignore_delete: bool,
+    remove_record_on_delete: bool,
+    sequence_group_partial_delete: HashSet<usize>,
     sequence_groups: Vec<RuntimeSequenceGroup>,
     grouped_fields: HashSet<usize>,
     aggregators: Option<Mutex<FieldAggregatorSlots>>,
@@ -246,6 +250,64 @@ struct RuntimeSequenceGroup {
 }
 
 impl PartialUpdateMergeFunction {
+    fn materialize_source_row(
+        batch_idx: usize,
+        row_idx: usize,
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = output_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let column = batch_buffer[batch_idx]
+                    .column_for_output(index, source_output_col_indices)
+                    .slice(row_idx, 1);
+                if !field.is_nullable() && column.is_null(0) {
+                    return Err(Error::DataInvalid {
+                        message: format!(
+                            "Partial-update delete row has NULL for non-nullable field '{}'",
+                            field.name()
+                        ),
+                        source: None,
+                    });
+                }
+                Ok(column)
+            })
+            .collect::<crate::Result<_>>()?;
+        RecordBatch::try_new(output_schema.clone(), columns).map_err(|error| Error::DataInvalid {
+            message: format!("Failed to materialize partial-update delete row: {error}"),
+            source: Some(Box::new(error)),
+        })
+    }
+
+    /// Java replaces the current row with the DELETE value. Later inserts may
+    /// leave some columns null, so their merge must start from that value.
+    fn reset_to_source(
+        selected_by_col: &mut [Option<(usize, usize)>],
+        aggregators: Option<&mut [Option<Box<dyn FieldAggregator>>]>,
+        batch_idx: usize,
+        row_idx: usize,
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+    ) -> crate::Result<()> {
+        selected_by_col.fill(Some((batch_idx, row_idx)));
+        if let Some(aggregators) = aggregators {
+            for (index, aggregator) in aggregators.iter_mut().enumerate() {
+                if let Some(aggregator) = aggregator {
+                    aggregator.reset();
+                    aggregator.agg(
+                        batch_buffer[batch_idx].column_for_output(index, source_output_col_indices),
+                        row_idx,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         table_options: &HashMap<String, String>,
@@ -254,6 +316,9 @@ impl PartialUpdateMergeFunction {
         PartialUpdateConfig::new(table_options).validate_write_mode(true, table_name)?;
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            remove_record_on_delete: PartialUpdateConfig::new(table_options)
+                .remove_record_on_delete(),
+            sequence_group_partial_delete: HashSet::new(),
             sequence_groups: Vec::new(),
             grouped_fields: HashSet::new(),
             aggregators: None,
@@ -270,6 +335,26 @@ impl PartialUpdateMergeFunction {
         let config = PartialUpdateConfig::new(table_options);
         config.validate_read_mode(true, table_name)?;
         let groups = config.validated_sequence_groups(table_fields, primary_keys)?;
+        let declared_group_sequences: HashSet<&str> = groups
+            .iter()
+            .flat_map(|group| group.sequence_fields.iter().map(String::as_str))
+            .collect();
+        let sequence_group_partial_delete = config
+            .remove_record_on_sequence_group()
+            .map(|fields| {
+                fields.split(',').map(str::trim).map(|field| {
+                    if !declared_group_sequences.contains(field) {
+                        return Err(Error::ConfigInvalid {
+                            message: format!("Field '{field}' in partial-update.remove-record-on-sequence-group must belong to a sequence group"),
+                        });
+                    }
+                    output_fields.iter().position(|candidate| candidate.name() == field)
+                        .ok_or_else(|| Error::ConfigInvalid {
+                            message: format!("Projected sequence group is missing field '{field}' required for partial delete"),
+                        })
+                }).collect::<crate::Result<HashSet<_>>>()
+            })
+            .transpose()?.unwrap_or_default();
         let aggregate_functions =
             config.validated_aggregate_functions(table_fields, primary_keys)?;
         let field_indices: HashMap<&str, usize> = output_fields
@@ -340,6 +425,8 @@ impl PartialUpdateMergeFunction {
 
         Ok(Self {
             ignore_delete: CoreOptions::new(table_options).ignore_delete(),
+            remove_record_on_delete: config.remove_record_on_delete(),
+            sequence_group_partial_delete,
             sequence_groups,
             grouped_fields,
             aggregators: aggregators
@@ -388,18 +475,120 @@ impl MergeFunction for PartialUpdateMergeFunction {
             }
         }
         let mut saw_add = false;
+        let mut current_delete_row = false;
+        let mut last_retract_source = None;
 
         for row_idx in ordered_row_indices {
             let row = &rows[row_idx];
-            if !RowKind::from_value(row.value_kind)?.is_add() {
+            let kind = RowKind::from_value(row.value_kind)?;
+            if !kind.is_add() {
                 if self.ignore_delete {
                     continue;
                 }
+                if !saw_add && last_retract_source.is_none() {
+                    // Java initializes the row from the first retract before
+                    // applying sequence-group retractions. That row also
+                    // becomes the DELETE payload when no insert follows.
+                    Self::reset_to_source(
+                        &mut selected_by_col,
+                        aggregators.as_mut().map(|guard| guard.as_mut_slice()),
+                        row.batch_idx,
+                        row.row_idx,
+                        batch_buffer,
+                        source_output_col_indices,
+                    )?;
+                    group_sequence_rows.fill(Some((row.batch_idx, row.row_idx)));
+                }
+                last_retract_source = Some((row.batch_idx, row.row_idx));
+                current_delete_row = false;
+                if !self.sequence_groups.is_empty() {
+                    let mut full_delete = false;
+                    for (group_idx, group) in self.sequence_groups.iter().enumerate() {
+                        let sequence_is_empty = group.sequence_indices.iter().all(|&index| {
+                            batch_buffer[row.batch_idx]
+                                .column_for_output(index, source_output_col_indices)
+                                .is_null(row.row_idx)
+                        });
+                        if sequence_is_empty {
+                            continue;
+                        }
+                        let ordering = match group_sequence_rows[group_idx] {
+                            None => Ordering::Greater,
+                            Some((current_batch, current_row)) => compare_sequence_group_rows(
+                                row.batch_idx,
+                                row.row_idx,
+                                current_batch,
+                                current_row,
+                                &group.sequence_indices,
+                                batch_buffer,
+                                source_output_col_indices,
+                            )?,
+                        };
+                        let advance = ordering.is_ge();
+                        if advance
+                            && kind == RowKind::Delete
+                            && group
+                                .sequence_indices
+                                .iter()
+                                .any(|index| self.sequence_group_partial_delete.contains(index))
+                        {
+                            full_delete = true;
+                            break;
+                        }
+                        if advance {
+                            group_sequence_rows[group_idx] = Some((row.batch_idx, row.row_idx));
+                            for &index in &group.sequence_indices {
+                                selected_by_col[index] = Some((row.batch_idx, row.row_idx));
+                            }
+                        }
+                        for &index in &group.protected_indices {
+                            if let Some(aggregator) = aggregators
+                                .as_mut()
+                                .and_then(|slots| slots.get_mut(index))
+                                .and_then(Option::as_mut)
+                            {
+                                let source = batch_buffer[row.batch_idx]
+                                    .column_for_output(index, source_output_col_indices);
+                                aggregator.retract(source, row.row_idx)?;
+                            } else if advance {
+                                selected_by_col[index] = None;
+                            }
+                        }
+                    }
+                    if full_delete {
+                        current_delete_row = true;
+                        Self::reset_to_source(
+                            &mut selected_by_col,
+                            aggregators.as_mut().map(|guard| guard.as_mut_slice()),
+                            row.batch_idx,
+                            row.row_idx,
+                            batch_buffer,
+                            source_output_col_indices,
+                        )?;
+                        group_sequence_rows.fill(Some((row.batch_idx, row.row_idx)));
+                    }
+                    continue;
+                }
+                if self.remove_record_on_delete {
+                    if kind == RowKind::Delete {
+                        current_delete_row = true;
+                        Self::reset_to_source(
+                            &mut selected_by_col,
+                            aggregators.as_mut().map(|guard| guard.as_mut_slice()),
+                            row.batch_idx,
+                            row.row_idx,
+                            batch_buffer,
+                            source_output_col_indices,
+                        )?;
+                    }
+                    continue;
+                }
                 return Err(crate::Error::Unsupported {
-                    message: "merge-engine=partial-update basic mode does not support DELETE or UPDATE_BEFORE rows".to_string(),
+                    message: "merge-engine=partial-update does not support DELETE or UPDATE_BEFORE without ignore-delete, sequence-group, or remove-record-on-delete".into(),
                 });
             }
             saw_add = true;
+            current_delete_row = false;
 
             for (output_col_idx, selected) in selected_by_col.iter_mut().enumerate() {
                 if self.grouped_fields.contains(&output_col_idx) {
@@ -471,7 +660,21 @@ impl MergeFunction for PartialUpdateMergeFunction {
             }
         }
 
-        if !saw_add {
+        if current_delete_row {
+            return match last_retract_source {
+                Some((batch_idx, row_idx)) => Ok(MergeResult::MaterializedDeleteRow(
+                    Self::materialize_source_row(
+                        batch_idx,
+                        row_idx,
+                        batch_buffer,
+                        source_output_col_indices,
+                        output_schema,
+                    )?,
+                )),
+                None => Ok(MergeResult::Omit),
+            };
+        }
+        if !saw_add && last_retract_source.is_none() {
             return Ok(MergeResult::Omit);
         }
 
@@ -493,7 +696,7 @@ impl MergeFunction for PartialUpdateMergeFunction {
                         None => new_null_array(field.data_type(), 1),
                     },
                 };
-                if !field.is_nullable() && column.is_null(0) {
+                if saw_add && !field.is_nullable() && column.is_null(0) {
                     return Err(Error::DataInvalid {
                         message: format!(
                             "merge-engine=partial-update produced NULL for non-nullable field '{}'",
@@ -513,7 +716,11 @@ impl MergeFunction for PartialUpdateMergeFunction {
             }
         })?;
 
-        Ok(MergeResult::MaterializedRow(batch))
+        if saw_add {
+            Ok(MergeResult::MaterializedRow(batch))
+        } else {
+            Ok(MergeResult::MaterializedDeleteRow(batch))
+        }
     }
 }
 
@@ -555,7 +762,7 @@ fn compare_sequence_group_rows(
 // AggregateMergeFunction
 // ---------------------------------------------------------------------------
 
-/// Basic aggregation merge: apply a per-field aggregator across all rows
+/// Aggregation merge: apply a per-field aggregator across all rows
 /// sharing the same primary key.
 ///
 /// For each output column, the aggregator is selected by the following
@@ -574,8 +781,8 @@ fn compare_sequence_group_rows(
 /// Sequence is checked before primary key so a column that is both a PK
 /// and a sequence field still gets `last_value`.
 ///
-/// DELETE / UPDATE_BEFORE rows are rejected at runtime; retract handling
-/// is left to a follow-up commit.
+/// DELETE / UPDATE_BEFORE rows call each field aggregator's retract method.
+/// `aggregation.remove-record-on-delete` turns DELETE into a full-row tombstone.
 ///
 /// `aggregators` is held behind a `Mutex` so the implementation can mutate
 /// per-key accumulators inside `MergeFunction::merge(&self, ...)` without
@@ -589,6 +796,7 @@ pub(crate) struct AggregateMergeFunction {
     /// One slot per output column.  `None` marks primary-key columns that are
     /// copied through; `Some` holds the aggregator that owns the column.
     aggregators: Mutex<Vec<Option<Box<dyn FieldAggregator>>>>,
+    remove_record_on_delete: bool,
 }
 
 impl AggregateMergeFunction {
@@ -640,6 +848,7 @@ impl AggregateMergeFunction {
 
         Ok(Self {
             aggregators: Mutex::new(aggregators),
+            remove_record_on_delete: config.remove_record_on_delete(),
         })
     }
 
@@ -652,22 +861,12 @@ impl AggregateMergeFunction {
         batch_buffer: &[BufferedBatch],
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
-    ) -> crate::Result<RecordBatch> {
+    ) -> crate::Result<(RecordBatch, bool)> {
         if rows.is_empty() {
             return Err(Error::UnexpectedError {
                 message: "merge called with empty rows".to_string(),
                 source: None,
             });
-        }
-
-        // Reject retract rows up-front so partial accumulation cannot leak
-        // into the output if a DELETE shows up mid-group.
-        for row in rows {
-            if !RowKind::from_value(row.value_kind)?.is_add() {
-                return Err(crate::Error::Unsupported {
-                    message: "merge-engine=aggregation basic mode does not support DELETE or UPDATE_BEFORE rows".to_string(),
-                });
-            }
         }
 
         let mut aggregators = self
@@ -683,12 +882,26 @@ impl AggregateMergeFunction {
             }
         }
 
+        let mut current_delete_row = false;
         for row in rows {
+            let kind = RowKind::from_value(row.value_kind)?;
+            if self.remove_record_on_delete && kind == RowKind::Delete {
+                for aggregator in aggregators.iter_mut().flatten() {
+                    aggregator.reset();
+                }
+                current_delete_row = true;
+                continue;
+            }
+            current_delete_row = false;
             for (col_idx, slot) in aggregators.iter_mut().enumerate() {
                 if let Some(agg) = slot.as_mut() {
                     let source_array = batch_buffer[row.batch_idx]
                         .column_for_output(col_idx, source_output_col_indices);
-                    agg.agg(source_array, row.row_idx)?;
+                    if kind.is_add() {
+                        agg.agg(source_array, row.row_idx)?;
+                    } else {
+                        agg.retract(source_array, row.row_idx)?;
+                    }
                 }
             }
         }
@@ -702,6 +915,11 @@ impl AggregateMergeFunction {
             .iter()
             .enumerate()
             .map(|(col_idx, slot)| -> crate::Result<ArrayRef> {
+                if current_delete_row {
+                    return Ok(batch_buffer[pk_source.batch_idx]
+                        .column_for_output(col_idx, source_output_col_indices)
+                        .slice(pk_source.row_idx, 1));
+                }
                 match slot {
                     Some(agg) => agg.result(),
                     None => Ok(batch_buffer[pk_source.batch_idx]
@@ -745,7 +963,7 @@ impl AggregateMergeFunction {
             }
         })?;
 
-        Ok(batch)
+        Ok((batch, current_delete_row))
     }
 }
 
@@ -760,13 +978,17 @@ impl MergeFunction for AggregateMergeFunction {
         let mut ordered: Vec<_> = rows.iter().collect();
         // Stable sorting keeps input order for equal sequences.
         ordered.sort_by(|lhs, rhs| compare_sequence_order(lhs, rhs));
-        self.merge_ordered(
+        let (batch, delete) = self.merge_ordered(
             &ordered,
             batch_buffer,
             source_output_col_indices,
             output_schema,
-        )
-        .map(MergeResult::MaterializedRow)
+        )?;
+        Ok(if delete {
+            MergeResult::MaterializedDeleteRow(batch)
+        } else {
+            MergeResult::MaterializedRow(batch)
+        })
     }
 }
 
@@ -1236,7 +1458,7 @@ fn sort_merge_stream(
                     batch_buffer.push(BufferedBatch::Materialized(batch));
                     output_indices.push((batch_idx, 0));
                 }
-                MergeResult::Omit => {}
+                MergeResult::Omit | MergeResult::MaterializedDeleteRow(_) => {}
             }
 
             // Yield a batch when we've accumulated enough rows.
@@ -2889,7 +3111,7 @@ mod tests {
         assert!(matches!(
             err,
             Error::Unsupported { message }
-            if message.contains("partial-update basic mode does not support DELETE or UPDATE_BEFORE")
+            if message.contains("partial-update does not support DELETE or UPDATE_BEFORE")
         ));
     }
 
@@ -3010,6 +3232,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_partial_update_delete_value_is_baseline_for_later_sparse_insert() {
+        let schema = make_schema();
+        let stream = stream_from_batches(vec![make_batch_with_kind(
+            &schema,
+            vec![1, 1],
+            vec![1, 2],
+            vec![3, 0],
+            vec![Some("from-delete"), None],
+        )]);
+        let options = HashMap::from([
+            ("merge-engine".into(), "partial-update".into()),
+            (
+                "partial-update.remove-record-on-delete".into(),
+                "true".into(),
+            ),
+        ]);
+        let output = SortMergeReaderBuilder::new(
+            vec![stream],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(PartialUpdateMergeFunction::new(&options, "test_table").unwrap()),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].num_rows(), 1);
+        assert_eq!(
+            output[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "from-delete"
+        );
+    }
+
+    #[tokio::test]
     async fn test_partial_update_merge_omits_retract_only_key_when_configured() {
         let schema = make_schema();
         let output_schema = make_output_schema();
@@ -3049,10 +3317,7 @@ mod tests {
     fn test_partial_update_merge_function_new_rejects_unsupported_options() {
         let options = HashMap::from([
             ("merge-engine".to_string(), "partial-update".to_string()),
-            (
-                "fields.price.aggregate-function".to_string(),
-                "last_non_null".to_string(),
-            ),
+            ("fields.price.ignore-delete".to_string(), "true".to_string()),
         ]);
 
         let err = PartialUpdateMergeFunction::new(&options, "default.t").unwrap_err();
@@ -3060,7 +3325,7 @@ mod tests {
         assert!(matches!(
             err,
             Error::Unsupported { message }
-            if message.contains("fields.price.aggregate-function")
+            if message.contains("fields.price.ignore-delete")
         ));
     }
 
@@ -3259,7 +3524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_aggregate_merge_rejects_delete_rows() {
+    async fn test_aggregate_merge_retracts_delete_rows() {
         let schema = aggregation_schema();
         let output_schema = aggregation_output_schema();
         let s0 = stream_from_batches(vec![RecordBatch::try_new(
@@ -3291,7 +3556,7 @@ mod tests {
             ("fields.tag.aggregate-function", "last_value"),
         ]);
 
-        let err = SortMergeReaderBuilder::new(
+        let result = SortMergeReaderBuilder::new(
             vec![s0, s1],
             schema,
             vec![0],
@@ -3306,13 +3571,20 @@ mod tests {
         .unwrap()
         .try_collect::<Vec<_>>()
         .await
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            Error::Unsupported { ref message }
-            if message.contains("aggregation basic mode does not support DELETE")
-        ));
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let amount = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let tag = result[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(amount.value(0), -89);
+        assert!(tag.is_null(0));
     }
 
     #[test]
@@ -3418,7 +3690,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_merge_function_rejects_unsupported_options() {
-        let options = agg_options(&[("fields.amount.ignore-retract", "true")]);
+        let options = agg_options(&[("fields.amount.sequence-group", "true")]);
         let err = AggregateMergeFunction::new(
             &options,
             "test_table",
@@ -3428,7 +3700,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, Error::Unsupported { message } if message.contains("ignore-retract"))
+            matches!(err, Error::Unsupported { message } if message.contains("sequence-group"))
         );
     }
 }
