@@ -2389,6 +2389,80 @@ pub(in crate::table) mod tests {
         assert_eq!(collect_i32(&batches, 1), vec![10, 20, 30]);
     }
 
+    #[tokio::test]
+    async fn test_primary_key_non_parquet_formats_roundtrip_with_typed_physical_fields() {
+        for format in ["row", "avro"] {
+            let file_io = test_file_io();
+            let table_path = format!("memory:/test_pk_typed_fields_{format}");
+            setup_dirs(&file_io, &table_path).await;
+            let schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("file.format", format)
+                .build()
+                .unwrap();
+            let table = Table::new(
+                file_io,
+                Identifier::new("default", "test_pk_typed_fields"),
+                table_path,
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let mut writer = TableWrite::new(&table, "test-user".into()).unwrap();
+            writer
+                .write_arrow_batch(&make_batch(vec![2, 1], vec![20, 10]))
+                .await
+                .unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            assert_eq!(messages[0].new_files.len(), 1);
+            assert!(messages[0].new_files[0].file_name.ends_with(format));
+            let file = &messages[0].new_files[0];
+            let file_path = format!(
+                "{}/{}/{}",
+                table.location(),
+                bucket_dir_name(messages[0].bucket),
+                file.file_name
+            );
+            let physical_fields = vec![
+                DataField::new(
+                    SEQUENCE_NUMBER_FIELD_ID,
+                    SEQUENCE_NUMBER_FIELD_NAME.into(),
+                    DataType::BigInt(BigIntType::new()),
+                ),
+                DataField::new(
+                    VALUE_KIND_FIELD_ID,
+                    VALUE_KIND_FIELD_NAME.into(),
+                    DataType::TinyInt(TinyIntType::new()),
+                ),
+                table.schema().fields()[0].clone(),
+                table.schema().fields()[1].clone(),
+            ];
+            let format_reader = create_format_reader(&file_path, false, &physical_fields).unwrap();
+            let input = table.file_io().new_input(&file_path).unwrap();
+            let stream = format_reader
+                .read_batch_stream(
+                    Box::new(input.reader().await.unwrap()),
+                    file.file_size as u64,
+                    &physical_fields,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let batches: Vec<RecordBatch> =
+                futures::TryStreamExt::try_collect(stream).await.unwrap();
+            assert_eq!(collect_i32(&batches, 2), vec![1, 2], "{format}");
+            assert_eq!(collect_i32(&batches, 3), vec![10, 20], "{format}");
+            TableCommit::new(table.clone(), "test-user".into())
+                .commit(messages)
+                .await
+                .unwrap();
+        }
+    }
+
     #[test]
     fn test_allows_append_blob_table() {
         let table = Table::new(
