@@ -19,6 +19,7 @@
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
+use crate::api::GetTableResponse;
 use crate::catalog::{Identifier, RESTTokenFileIO};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
@@ -116,6 +117,66 @@ impl RESTEnv {
         &self.api
     }
 
+    /// Bracketed by a freshness check: the response names no table, so a
+    /// re-create in between would serve a replacement's grant.
+    pub(crate) async fn table_query_auth(
+        &self,
+        schema_id: i64,
+        fields: &[crate::spec::DataField],
+        select: Option<Vec<String>>,
+    ) -> Result<crate::api::AuthTableQueryResponse> {
+        self.current_table_checked(schema_id, fields).await?;
+        let response = self.api.auth_table_query(&self.identifier, select).await?;
+        self.current_table_checked(schema_id, fields).await?;
+        Ok(response)
+    }
+
+    /// Refused unless the name still resolves to the loaded table, a missing
+    /// identity included. Asserts nothing on its own.
+    pub(crate) async fn current_table_checked(
+        &self,
+        schema_id: i64,
+        fields: &[crate::spec::DataField],
+    ) -> Result<GetTableResponse> {
+        let response = self.api.get_table(&self.identifier).await?;
+        let name = self.identifier.full_name();
+        let same = |what: &str, loaded: String, now: Option<String>| match now {
+            Some(now) if now == loaded => Ok(()),
+            now => Err(crate::Error::DataInvalid {
+                message: format!(
+                    "table '{name}' now resolves to {what} {}, not the {loaded} this handle was \
+                     loaded with; re-load the table before reading it",
+                    now.as_deref().unwrap_or("nothing the server reports")
+                ),
+                source: None,
+            }),
+        };
+        same("uuid", self.uuid.clone(), response.id.clone())?;
+        same(
+            "schema",
+            schema_id.to_string(),
+            response.schema_id.map(|id| id.to_string()),
+        )?;
+        // An id is not the schema: the columns the server rules on are compared too.
+        let key =
+            |f: &crate::spec::DataField| (f.id(), f.name().to_string(), f.data_type().clone());
+        let served: Vec<_> = response
+            .schema
+            .as_ref()
+            .map(|schema| schema.fields().iter().map(key).collect())
+            .unwrap_or_default();
+        if served != fields.iter().map(key).collect::<Vec<_>>() {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "table '{name}' serves other columns than this handle carries under schema \
+                     {schema_id}; re-load the table before reading it"
+                ),
+                source: None,
+            });
+        }
+        Ok(response)
+    }
+
     /// Get the table identifier.
     pub fn identifier(&self) -> &Identifier {
         &self.identifier
@@ -168,8 +229,6 @@ impl RESTEnv {
             .map_err(|e| map_rest_error_for_table(e, identifier))
     }
 
-    /// Build a Table from an already-fetched response, so routing can
-    /// inspect the declared type first.
     pub(crate) async fn build_table(
         identifier: &Identifier,
         response: crate::api::GetTableResponse,
@@ -265,9 +324,10 @@ impl RESTEnv {
             Some(rest_env),
         );
 
+        // Minted after the schema-replacing copy, which drops any session.
         let mut table = table.copy_with_resolved_schema(table.schema().clone(), &branch)?;
         table.branch_reference = branch_reference;
-        Ok(table)
+        Ok(table.with_query_auth_session())
     }
 
     pub(crate) async fn build_object_table(

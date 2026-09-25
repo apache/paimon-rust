@@ -2574,6 +2574,409 @@ async fn test_load_table_rejects_unknown_declared_type() {
     );
 }
 
+// Skipped on Windows for the same opendal `fs` StripPrefixError as the
+// blob-view regression above: it writes through FileSystemCatalog.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_unrestricted_user_can_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let warehouse = format!("file://{}", tmp.path().display());
+    let mut fs_options = Options::new();
+    fs_options.set(CatalogOptions::WAREHOUSE, &warehouse);
+    let fs_catalog = FileSystemCatalog::new(fs_options).expect("create filesystem catalog");
+    fs_catalog
+        .create_database("default", true, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("default", "guarded");
+    let columns = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    fs_catalog
+        .create_table(&identifier, columns, false)
+        .await
+        .unwrap();
+    let plain = fs_catalog.get_table(&identifier).await.unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            false,
+        )])),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    write_batch(&plain, batch, "query-auth-fixture").await;
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    let guarded_schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .option("query-auth.enabled", "true")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "guarded", guarded_schema, plain.location());
+
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    let read_builder = table.new_read_builder();
+    let plan = read_builder.new_scan().plan().await.unwrap();
+    assert!(
+        !plan.splits().is_empty(),
+        "the fixture must produce a split, or the read below proves nothing"
+    );
+
+    let batches = read_builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .expect("an unrestricted user must be allowed to read")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("and the rows must decode");
+    assert_eq!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        3,
+        "every written row must come back"
+    );
+}
+
+fn schema_of(columns: &[&str], options: &[(&str, &str)]) -> Schema {
+    let mut builder = Schema::builder();
+    for name in columns {
+        builder = builder.column(*name, DataType::Int(IntType::new()));
+    }
+    for (key, value) in options {
+        builder = builder.option(*key, *value);
+    }
+    builder.build().unwrap()
+}
+
+const GUARDED: &[(&str, &str)] = &[("query-auth.enabled", "true")];
+
+struct Guarded {
+    ctx: TestContext,
+    table: Table,
+    identifier: Identifier,
+    _tmp: tempfile::TempDir,
+}
+
+async fn guarded(name: &str, columns: &[&str]) -> Guarded {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = format!("file://{}", tmp.path().display());
+    ctx.server
+        .add_table_with_schema("default", name, schema_of(columns, GUARDED), &path);
+    let identifier = Identifier::new("default", name);
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    Guarded {
+        ctx,
+        table,
+        identifier,
+        _tmp: tmp,
+    }
+}
+
+async fn plan_err(table: &Table, why: &str) -> paimon::Error {
+    table
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .expect_err(why)
+}
+
+#[track_caller]
+fn assert_refused(err: paimon::Error) {
+    assert!(
+        matches!(err, paimon::Error::Unsupported { ref message }
+            if message.contains("query-auth.enabled")),
+        "{err:?}"
+    );
+}
+
+#[track_caller]
+fn assert_drifted(err: paimon::Error, what: &str) {
+    assert!(
+        matches!(err, paimon::Error::DataInvalid { ref message, .. }
+            if message.contains(what)),
+        "{err:?}"
+    );
+}
+
+fn restricted() -> paimon::api::AuthTableQueryResponse {
+    paimon::api::AuthTableQueryResponse {
+        filter: Some(vec!["{\"field\":\"id\"}".to_string()]),
+        column_masking: None,
+    }
+}
+
+#[tokio::test]
+async fn test_query_auth_restricted_user_is_refused_at_plan_time() {
+    let g = guarded("restricted", &["id"]).await;
+    g.ctx
+        .server
+        .set_auth_response("default", "restricted", restricted());
+
+    assert_refused(
+        plan_err(
+            &g.table,
+            "a restricted user must be refused before a plan exists",
+        )
+        .await,
+    );
+}
+
+#[tokio::test]
+async fn test_query_auth_refuses_a_stale_handle() {
+    let g = guarded("drifting", &["id"]).await;
+    g.ctx.server.set_table_schema_id(
+        "default",
+        "drifting",
+        schema_of(&["id", "extra"], GUARDED),
+        7,
+    );
+
+    assert_drifted(
+        plan_err(&g.table, "a handle whose schema drifted must be refused").await,
+        "now resolves to schema",
+    );
+}
+
+#[tokio::test]
+async fn test_query_auth_refuses_other_columns_under_the_same_schema_id() {
+    // Same id, other fields: the id alone does not say what the server rules on.
+    let g = guarded("edited", &["id"]).await;
+    g.ctx
+        .server
+        .set_table_schema_id("default", "edited", schema_of(&["id", "extra"], GUARDED), 0);
+
+    assert_drifted(
+        plan_err(
+            &g.table,
+            "a handle whose columns differ from the server's must be refused",
+        )
+        .await,
+        "serves other columns",
+    );
+}
+
+#[tokio::test]
+async fn test_query_auth_refuses_a_schema_replaced_copy() {
+    // A caller can restore a dropped column under the current schema id; the
+    // copy is no longer the handle the catalog loaded.
+    let g = guarded("replaced", &["id"]).await;
+    let forged = g
+        .table
+        .copy_with_resolved_schema(
+            paimon::spec::TableSchema::new(0, &schema_of(&["id", "secret"], GUARDED)),
+            "main",
+        )
+        .unwrap();
+
+    assert_refused(plan_err(&forged, "a schema-replaced copy must not plan").await);
+}
+
+#[tokio::test]
+async fn test_query_auth_refuses_a_recreated_table() {
+    let g = guarded("recreated", &["id"]).await;
+    g.ctx
+        .server
+        .set_table_uuid("default", "recreated", "uuid-of-the-replacement");
+
+    assert_drifted(
+        plan_err(
+            &g.table,
+            "a re-created table must not reuse this handle's grant",
+        )
+        .await,
+        "now resolves to uuid",
+    );
+}
+
+#[tokio::test]
+async fn test_query_auth_refuses_a_table_recreated_while_planning() {
+    let g = guarded("planned", &["id"]).await;
+    g.ctx
+        .server
+        .set_table_uuid_after_calls("default", "planned", "uuid-of-the-replacement", 2);
+
+    assert_drifted(
+        plan_err(&g.table, "the files just planned belong to the replacement").await,
+        "now resolves to uuid",
+    );
+}
+
+#[tokio::test]
+async fn test_query_auth_refuses_a_table_recreated_mid_exchange() {
+    let g = guarded("swapped", &["id"]).await;
+    g.ctx
+        .server
+        .set_table_uuid_after_auth("default", "swapped", "uuid-after-the-exchange");
+
+    assert_drifted(
+        plan_err(&g.table, "a table replaced mid-exchange must be refused").await,
+        "now resolves to uuid",
+    );
+}
+
+#[tokio::test]
+async fn test_query_auth_refuses_a_server_that_reports_no_identity() {
+    let g = guarded("anonymous", &["id"]).await;
+    g.ctx.server.clear_table_identity("default", "anonymous");
+
+    assert_drifted(
+        plan_err(
+            &g.table,
+            "a check that cannot establish the table has not checked anything",
+        )
+        .await,
+        "nothing the server reports",
+    );
+}
+
+#[tokio::test]
+async fn test_query_auth_user_granted_all_business_columns_can_read() {
+    let g = guarded("granted", &["id", "name"]).await;
+    g.ctx.server.set_column_auth(
+        "default",
+        "granted",
+        vec!["id".to_string(), "name".to_string()],
+    );
+
+    g.table
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .expect("a user granted every column must be authorized");
+}
+
+#[tokio::test]
+async fn test_query_auth_is_not_weakened_by_a_table_recreated_under_the_same_name() {
+    let g = guarded("guarded", &["id"]).await;
+    g.ctx
+        .server
+        .set_table_schema_id("default", "guarded", schema_of(&["id"], &[]), 0);
+
+    let err = g
+        .table
+        .new_read_builder()
+        .new_scan()
+        .with_scan_all_files()
+        .plan()
+        .await
+        .expect_err("the answer is now about a different table over the same files");
+    assert_refused(err);
+}
+
+#[tokio::test]
+async fn test_query_auth_allows_a_nested_projection_but_not_an_extra_nested_field() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = format!("file://{}", tmp.path().display());
+    let nested = |names: &[&str]| {
+        let children = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                paimon::spec::DataField::new(
+                    i as i32 + 1,
+                    name.to_string(),
+                    DataType::Int(IntType::new()),
+                )
+            })
+            .collect();
+        DataType::Row(paimon::spec::RowType::new(children))
+    };
+    let served = Schema::builder()
+        .column("info", nested(&["a", "b"]))
+        .option("query-auth.enabled", "true")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "nested", served, &path);
+
+    let table = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "nested"))
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let read_with = |info: DataType| {
+        let field =
+            paimon::spec::DataField::new(table.schema().fields()[0].id(), "info".to_string(), info);
+        let mut builder = table.new_read_builder();
+        builder.with_read_type(vec![field]);
+        builder.new_read().unwrap().to_arrow(plan.splits())
+    };
+
+    // Reading a subset of the authorized children is a projection.
+    assert!(read_with(nested(&["a"])).is_ok());
+    // Reading one the server never ruled on is not.
+    let Err(err) = read_with(nested(&["a", "b", "hidden"])) else {
+        panic!("a nested child the server never ruled on must be refused")
+    };
+    assert_refused(err);
+}
+
+#[tokio::test]
+async fn test_a_decorated_name_loads_and_only_query_auth_refuses_it() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = format!("file://{}", tmp.path().display());
+    // A literal name the validator permits and the server stores as is: the
+    // catalog hands it back, as on main.
+    ctx.server
+        .add_table_with_schema("default", "plain$files", schema_of(&["id"], &[]), &path);
+    for name in ["guarded$branch_dev", "guarded$files"] {
+        ctx.server
+            .add_table_with_schema("default", name, schema_of(&["id"], GUARDED), &path);
+    }
+    ctx.catalog
+        .get_table(&Identifier::new("default", "plain$files"))
+        .await
+        .expect("an ordinary table's name is the server's business");
+    // The view such a name addresses is not what the server rules on.
+    for name in ["guarded$branch_dev", "guarded$files"] {
+        let table = ctx
+            .catalog
+            .get_table(&Identifier::new("default", name))
+            .await
+            .unwrap();
+        assert_refused(plan_err(&table, name).await);
+    }
+}
+
+#[tokio::test]
+async fn test_query_auth_refuses_an_assembled_handle() {
+    let g = guarded("guarded", &["id"]).await;
+    let elsewhere = tempfile::tempdir().unwrap();
+    for (schema, location) in [
+        (g.table.schema().clone(), g.table.location().to_string()),
+        (
+            paimon::spec::TableSchema::new(
+                g.table.schema().id(),
+                &schema_of(&["id", "dropped"], GUARDED),
+            ),
+            g.table.location().to_string(),
+        ),
+        (
+            g.table.schema().clone(),
+            format!("file://{}", elsewhere.path().display()),
+        ),
+    ] {
+        let assembled = paimon::table::Table::new(
+            g.table.file_io().clone(),
+            g.identifier.clone(),
+            location,
+            schema,
+            g.table.rest_env().cloned(),
+        );
+        assert_refused(plan_err(&assembled, "an assembled handle carries no session").await);
+    }
+}
+
 #[tokio::test]
 async fn test_rest_catalog_manages_permissions_end_to_end() {
     let ctx = setup_catalog(vec!["default"]).await;
