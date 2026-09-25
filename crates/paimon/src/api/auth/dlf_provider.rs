@@ -47,7 +47,7 @@ pub struct DLFToken {
     /// Security token for temporary credentials (optional).
     #[serde(rename = "SecurityToken")]
     pub security_token: Option<String>,
-    /// Expiration timestamp in milliseconds.
+    /// Expiration timestamp in milliseconds (PyPaimon compatibility).
     #[serde(rename = "ExpirationAt", default, skip_serializing)]
     pub expiration_at_millis: Option<i64>,
     /// Expiration time string (ISO 8601 format).
@@ -715,11 +715,13 @@ mod tests {
     async fn test_local_file_provider_refreshes_expiring_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("token.json");
-        let expires_soon = Utc::now().timestamp_millis() + TOKEN_EXPIRATION_SAFE_TIME_MILLIS / 2;
+        let expires_soon = (Utc::now()
+            + chrono::Duration::milliseconds(TOKEN_EXPIRATION_SAFE_TIME_MILLIS / 2))
+        .format(DLFToken::TOKEN_DATE_FORMAT);
         tokio::fs::write(
             &path,
             format!(
-                r#"{{"AccessKeyId":"old-ak","AccessKeySecret":"old-sk","ExpirationAt":{expires_soon}}}"#
+                r#"{{"AccessKeyId":"old-ak","AccessKeySecret":"old-sk","Expiration":"{expires_soon}"}}"#
             ),
         )
         .await
@@ -740,11 +742,13 @@ mod tests {
             .await
             .unwrap();
         assert!(headers[AUTHORIZATION_HEADER_KEY].contains("old-ak"));
-        let expires_later = Utc::now().timestamp_millis() + TOKEN_EXPIRATION_SAFE_TIME_MILLIS * 2;
+        let expires_later = (Utc::now()
+            + chrono::Duration::milliseconds(TOKEN_EXPIRATION_SAFE_TIME_MILLIS * 2))
+        .format(DLFToken::TOKEN_DATE_FORMAT);
         tokio::fs::write(
             &path,
             format!(
-                r#"{{"AccessKeyId":"new-ak","AccessKeySecret":"new-sk","ExpirationAt":{expires_later}}}"#
+                r#"{{"AccessKeyId":"new-ak","AccessKeySecret":"new-sk","Expiration":"{expires_later}"}}"#
             ),
         )
         .await

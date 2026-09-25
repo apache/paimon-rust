@@ -284,8 +284,9 @@ options.set(CatalogOptions::DLF_TOKEN_PATH, "/path/to/token.json");
 ```
 
 The JSON uses `AccessKeyId`, `AccessKeySecret`, optional `SecurityToken`, and
-optional `Expiration` or `ExpirationAt`. Expiring credentials are reloaded from
-the file before expiration.
+optional `Expiration`. Use `Expiration` for files shared with Java;
+`ExpirationAt` is also accepted for PyPaimon compatibility. Expiring
+credentials are reloaded before expiration.
 
 Supported metastore types:
 
