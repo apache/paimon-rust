@@ -224,6 +224,9 @@ impl<'a> TableRead<'a> {
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
+    ///
+    /// A `query-auth.enabled` table reads only splits from this handle's plan;
+    /// re-plan after a permission change.
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
         match &self.0 {
             TableReadKind::Paimon(read) => read.to_arrow(data_splits),
