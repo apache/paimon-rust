@@ -1197,7 +1197,8 @@ impl Schema {
         validate_no_reserved_field_names(fields)?;
         Self::validate_key_field_types(fields, primary_keys, options)?;
         Self::validate_row_tracking(primary_keys, options)?;
-        Self::validate_blob_fields(fields, partition_keys, options)?;
+        Self::validate_blob_fields(fields, partition_keys, primary_keys, options)?;
+        Self::validate_primary_key_blob_configuration(fields, primary_keys, options)?;
         Self::validate_vector_store_fields(fields, partition_keys, options)?;
         PartialUpdateConfig::new(options).validate_create_mode(!primary_keys.is_empty())?;
         validate_no_aggregation_on_sequence_field(options)?;
@@ -1480,9 +1481,23 @@ impl Schema {
     fn validate_blob_fields(
         fields: &[DataField],
         partition_keys: &[String],
+        primary_keys: &[String],
         options: &HashMap<String, String>,
     ) -> crate::Result<()> {
         let blob_field_names = Self::top_level_blob_field_names(fields);
+        for field in fields {
+            if !Self::is_top_level_blob_file_type(field.data_type())
+                && Self::contains_blob_type(field.data_type())
+            {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Field '{}' has unsupported nested BLOB type {:?}. BLOB is only supported as a top-level BLOB, ARRAY<BLOB>, or MAP<X, BLOB> field.",
+                        field.name(),
+                        field.data_type()
+                    ),
+                });
+            }
+        }
         if blob_field_names.is_empty() {
             return Ok(());
         }
@@ -1504,10 +1519,36 @@ impl Schema {
             });
         }
 
-        if !core_options.data_evolution_enabled() {
+        for name in core_options.blob_fields() {
+            if !blob_field_names.contains(&name.as_str()) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "Field '{name}' in '{BLOB_FIELD_OPTION}' must be a BLOB, ARRAY<BLOB> or MAP<X, BLOB> field in table schema."
+                    ),
+                });
+            }
+        }
+        for (option_name, names) in [
+            (BLOB_DESCRIPTOR_FIELD_OPTION, &blob_descriptor_fields),
+            (BLOB_VIEW_FIELD_OPTION, &blob_view_fields),
+        ] {
+            for name in names {
+                let scalar_blob = fields.iter().any(|field| {
+                    field.name() == name && matches!(field.data_type(), DataType::Blob(_))
+                });
+                if !scalar_blob {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Field '{name}' in '{option_name}' must be a scalar BLOB field in table schema. ARRAY<BLOB> and MAP<X, BLOB> are only supported by '{BLOB_FIELD_OPTION}'."
+                        ),
+                    });
+                }
+            }
+        }
+
+        if primary_keys.is_empty() && !core_options.data_evolution_enabled() {
             return Err(crate::Error::ConfigInvalid {
-                message: "Data evolution config must enabled for table with BLOB type column."
-                    .to_string(),
+                message: "Data evolution config must enabled for table with BLOB, ARRAY<BLOB> or MAP<X, BLOB> type column.".to_string(),
             });
         }
 
@@ -1527,6 +1568,80 @@ impl Schema {
             });
         }
 
+        Ok(())
+    }
+
+    fn validate_primary_key_blob_configuration(
+        fields: &[DataField],
+        primary_keys: &[String],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<()> {
+        if primary_keys.is_empty() {
+            return Ok(());
+        }
+        let core = CoreOptions::new(options);
+        let inline = core.blob_inline_fields();
+        let managed = fields
+            .iter()
+            .filter(|field| {
+                Self::is_top_level_blob_file_type(field.data_type())
+                    && !inline.contains(field.name())
+            })
+            .map(|field| field.name())
+            .collect::<Vec<_>>();
+        if managed.is_empty() {
+            return Ok(());
+        }
+        if !matches!(
+            core.merge_engine()?,
+            MergeEngine::Deduplicate | MergeEngine::PartialUpdate | MergeEngine::FirstRow
+        ) {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Primary-key managed BLOB tables only support deduplicate, partial-update or first-row merge engine.".to_string(),
+            });
+        }
+        if core.try_changelog_producer()? != ChangelogProducer::None {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Primary-key managed BLOB tables only support changelog-producer 'none'."
+                    .to_string(),
+            });
+        }
+        if options.contains_key("data-file.external-paths") {
+            return Err(crate::Error::ConfigInvalid {
+                message:
+                    "Primary-key managed BLOB tables do not support 'data-file.external-paths'."
+                        .to_string(),
+            });
+        }
+        if options
+            .get("pk-clustering-override")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Primary-key managed BLOB tables do not support 'pk-clustering-override'."
+                    .to_string(),
+            });
+        }
+        for (name, keys) in [
+            ("primary keys", primary_keys.to_vec()),
+            ("bucket keys", core.bucket_key().unwrap_or_default()),
+            (
+                "sequence fields",
+                core.sequence_fields()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+        ] {
+            if let Some(field) = managed
+                .iter()
+                .find(|field| keys.iter().any(|key| key == **field))
+            {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!("Managed BLOB field '{field}' cannot be used as {name}."),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -2018,11 +2133,35 @@ impl Schema {
     fn top_level_blob_field_names(fields: &[DataField]) -> Vec<&str> {
         fields
             .iter()
-            .filter_map(|field| match field.data_type() {
-                DataType::Blob(_) => Some(field.name()),
-                _ => None,
-            })
+            .filter(|field| Self::is_top_level_blob_file_type(field.data_type()))
+            .map(|field| field.name())
             .collect()
+    }
+
+    fn is_top_level_blob_file_type(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Blob(_) => true,
+            DataType::Array(array) => matches!(array.element_type(), DataType::Blob(_)),
+            DataType::Map(map) => matches!(map.value_type(), DataType::Blob(_)),
+            _ => false,
+        }
+    }
+
+    fn contains_blob_type(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Blob(_) => true,
+            DataType::Array(array) => Self::contains_blob_type(array.element_type()),
+            DataType::Map(map) => {
+                Self::contains_blob_type(map.key_type())
+                    || Self::contains_blob_type(map.value_type())
+            }
+            DataType::Multiset(multiset) => Self::contains_blob_type(multiset.element_type()),
+            DataType::Row(row) => row
+                .fields()
+                .iter()
+                .any(|field| Self::contains_blob_type(field.data_type())),
+            _ => false,
+        }
     }
 
     /// Returns top-level Vector field names for dedicated vector-store checks.
@@ -2815,6 +2954,131 @@ mod tests {
             .unwrap();
 
         assert_eq!(schema.fields().len(), 2);
+    }
+
+    #[test]
+    fn test_primary_key_managed_blob_does_not_require_data_evolution() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Blob(BlobType::new()))
+            .column(
+                "payloads",
+                DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
+            )
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .build()
+            .unwrap();
+        assert_eq!(schema.primary_keys(), &["id"]);
+        assert!(!CoreOptions::new(schema.options()).data_evolution_enabled());
+    }
+
+    #[test]
+    fn test_primary_key_managed_blob_rejects_incompatible_write_modes() {
+        for (option, value, expected) in [
+            ("merge-engine", "aggregation", "merge engine"),
+            ("changelog-producer", "input", "changelog-producer"),
+            (
+                "data-file.external-paths",
+                "file:///tmp/external",
+                "external-paths",
+            ),
+            ("pk-clustering-override", "true", "pk-clustering-override"),
+        ] {
+            let result = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option(option, value)
+                .build();
+            assert!(
+                matches!(result, Err(crate::Error::ConfigInvalid { ref message })
+                    if message.contains(expected)),
+                "expected '{option}={value}' to be rejected for {expected}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_primary_key_managed_blob_rejects_key_and_ordering_fields() {
+        let result = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Blob(BlobType::new()))
+            .primary_key(["payload"])
+            .option("bucket", "1")
+            .build();
+        assert!(
+            matches!(result, Err(crate::Error::ConfigInvalid { ref message })
+            if message.contains("Managed BLOB") && message.contains("primary keys"))
+        );
+
+        for (option, value, expected) in [
+            ("bucket-key", "payload", "bucket keys"),
+            ("sequence.field", "payload", "sequence fields"),
+        ] {
+            let result = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .primary_key(["id"])
+                .option("bucket", "2")
+                .option(option, value)
+                .build();
+            assert!(
+                matches!(result, Err(crate::Error::ConfigInvalid { ref message })
+                if message.contains("Managed BLOB") && message.contains(expected)),
+                "expected {option} to reject managed BLOB values, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_blob_schema_validation_rejects_unsupported_nested_shapes_and_inline_options() {
+        let nested = DataType::Row(RowType::new(vec![DataField::new(
+            0,
+            "inner".to_string(),
+            DataType::Blob(BlobType::new()),
+        )]));
+        for field_type in [
+            nested,
+            DataType::Map(MapType::new(
+                DataType::Blob(BlobType::new()),
+                DataType::Int(IntType::new()),
+            )),
+            DataType::Array(ArrayType::new(DataType::Array(ArrayType::new(
+                DataType::Blob(BlobType::new()),
+            )))),
+        ] {
+            let result = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("payload", field_type)
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .build();
+            assert!(
+                matches!(result, Err(crate::Error::ConfigInvalid { ref message })
+                if message.contains("unsupported nested BLOB")),
+                "unsupported nesting should fail at schema validation: {result:?}"
+            );
+        }
+
+        for option in ["blob-descriptor-field", "blob-view-field"] {
+            let result = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column(
+                    "payloads",
+                    DataType::Array(ArrayType::new(DataType::Blob(BlobType::new()))),
+                )
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option(option, "payloads")
+                .build();
+            assert!(
+                matches!(result, Err(crate::Error::ConfigInvalid { ref message })
+                if message.contains("scalar BLOB")),
+                "{option} is scalar-only in Java: {result:?}"
+            );
+        }
     }
 
     #[test]

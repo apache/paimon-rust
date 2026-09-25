@@ -72,6 +72,11 @@ pub(crate) mod index_file_path;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
+mod managed_blob_reader;
+mod managed_blob_reference;
+#[cfg(test)]
+mod managed_blob_table_tests;
+mod managed_blob_writer;
 pub(crate) mod merge_tree_split_generator;
 #[cfg(test)]
 mod mosaic_table_write_tests;

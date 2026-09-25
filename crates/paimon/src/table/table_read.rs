@@ -872,7 +872,7 @@ impl<'a> PaimonTableRead<'a> {
                     | MergeEngine::Aggregation
             )
         {
-            return self.read_pk(data_splits, &core_options);
+            return self.read_pk_with_blob(data_splits, &core_options);
         }
 
         if core_options.data_evolution_enabled() {
@@ -880,6 +880,41 @@ impl<'a> PaimonTableRead<'a> {
         } else {
             self.read_raw(data_splits)
         }
+    }
+
+    fn read_pk_with_blob(
+        &self,
+        data_splits: &[DataSplit],
+        core_options: &CoreOptions<'_>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        use super::managed_blob_reader::{resolve_primary_key_blob_stream, ManagedBlobReadPlan};
+
+        if let Some(plan) = ManagedBlobReadPlan::new(
+            self.read_type(),
+            &self.data_predicates,
+            self.table.schema().fields(),
+            core_options,
+        ) {
+            let mut inner = self.clone();
+            inner.read_type = plan.scan_fields().to_vec();
+            inner.data_predicates.clear();
+            let stream = inner.read_pk(data_splits, core_options)?;
+            return Ok(plan.finish(
+                stream,
+                core_options,
+                self.table.file_io.clone(),
+                self.blob_parallelism,
+            ));
+        }
+
+        let stream = self.read_pk(data_splits, core_options)?;
+        Ok(resolve_primary_key_blob_stream(
+            stream,
+            self.read_type(),
+            core_options,
+            self.table.file_io.clone(),
+            self.blob_parallelism,
+        ))
     }
 
     /// Read PK table. For `Deduplicate` and `FirstRow`, raw-convertible splits from scan

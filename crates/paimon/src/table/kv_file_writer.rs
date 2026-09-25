@@ -40,6 +40,8 @@ use crate::spec::{
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
+use crate::table::managed_blob_reference::ManagedBlobReferences;
+use crate::table::managed_blob_writer::ManagedBlobWriteState;
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::sort_merge::{AggregateMergeFunction, BufferedBatch, MergeRow};
 use crate::Result;
@@ -69,6 +71,7 @@ pub(crate) struct KeyValueFileWriter {
     written_files: Vec<DataFileMeta>,
     /// Completed changelog file metadata.
     written_changelog_files: Vec<DataFileMeta>,
+    managed_blob_writer: ManagedBlobWriteState,
 }
 
 /// Configuration for [`KeyValueFileWriter`], grouping file-location, schema,
@@ -154,6 +157,8 @@ impl KeyValueFileWriter {
             }
         }
 
+        let managed_blob_writer = ManagedBlobWriteState::new(&file_io, &config)?;
+
         Ok(Self {
             file_io,
             config,
@@ -165,6 +170,7 @@ impl KeyValueFileWriter {
             buffer_reservation: None,
             written_files: Vec::new(),
             written_changelog_files: Vec::new(),
+            managed_blob_writer,
         })
     }
 
@@ -187,6 +193,7 @@ impl KeyValueFileWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
+        let batch = self.managed_blob_writer.externalize(batch).await?;
         let batch_bytes: usize = batch
             .columns()
             .iter()
@@ -437,8 +444,15 @@ impl KeyValueFileWriter {
                 .map(|options| options.create_writer())
                 .transpose()?
         };
-
         let physical_schema = build_physical_schema(&user_schema);
+        let mut blob_references = ManagedBlobReferences::new(
+            &self.config.value_fields,
+            &CoreOptions::new(&self.config.table_options),
+            &physical_schema,
+            self.managed_blob_writer.enabled(),
+            write.is_changelog,
+        )?;
+
         let file_name = format!(
             "{}{}-{}.{}",
             write.file_prefix,
@@ -548,6 +562,11 @@ impl KeyValueFileWriter {
                     message: format!("Failed to create physical batch: {e}"),
                     source: None,
                 })?;
+            if let Err(error) = ManagedBlobReferences::collect(&mut blob_references, &chunk_batch) {
+                let _ = writer.close().await;
+                let _ = self.file_io.delete_file(&file_path).await;
+                return Err(error);
+            }
             if let Err(error) = writer.write(&chunk_batch).await {
                 let _ = writer.close().await;
                 let _ = self.file_io.delete_file(&file_path).await;
@@ -673,6 +692,15 @@ impl KeyValueFileWriter {
                 meta.embedded_index = Some(bytes.to_vec());
             }
         }
+
+        ManagedBlobReferences::finish(
+            blob_references,
+            &self.file_io,
+            &file_path,
+            &bucket_dir,
+            &mut meta,
+        )
+        .await?;
 
         Ok(meta)
     }
@@ -1035,11 +1063,13 @@ impl KeyValueFileWriter {
                 let _ = self.file_io.delete_file(&path).await;
             }
         }
+        self.managed_blob_writer.abort().await;
     }
 
     /// Flush remaining buffer and return all written file metadata.
     pub(crate) async fn prepare_commit(&mut self) -> Result<PreparedFiles> {
         self.flush().await?;
+        self.managed_blob_writer.prepare_commit().await?;
         Ok(PreparedFiles {
             data_files: std::mem::take(&mut self.written_files),
             changelog_files: std::mem::take(&mut self.written_changelog_files),
