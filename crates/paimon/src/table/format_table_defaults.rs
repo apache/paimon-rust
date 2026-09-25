@@ -22,11 +22,14 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, Date32Array, RecordBatch, StringArray, Time32MillisecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
+    Array, ArrayRef, BinaryArray, Date32Array, ListArray, MapArray, RecordBatch, StringArray,
+    StructArray, Time32MillisecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow_schema::Schema as ArrowSchema;
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::{
+    ArrowError, DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+};
 
 use crate::spec::{DataField, DataType};
 use crate::{Error, Result};
@@ -183,6 +186,56 @@ fn cast_default(
                 ))),
             }
         }
+        DataType::Timestamp(typ) => {
+            // Arrow stores timestamps at 0, 3, 6 or 9 digits, while Java's
+            // DateTimeUtils.parseTimestampData truncates to the declared
+            // precision before creating the internal timestamp.
+            let value = arrow_cast::cast(&StringArray::from(vec![text]), arrow_field.data_type())?;
+            if value.is_null(0) {
+                return Ok(value);
+            }
+            let precision = typ.precision();
+            let stored_precision = match precision {
+                0 => 0,
+                1..=3 => 3,
+                4..=6 => 6,
+                7..=9 => 9,
+                _ => {
+                    return Err(arrow_schema::ArrowError::CastError(format!(
+                        "Unsupported timestamp precision {precision}"
+                    )))
+                }
+            };
+            let divisor = 10_i64.pow(stored_precision - precision);
+            if divisor == 1 {
+                return Ok(value);
+            }
+            let raw = match stored_precision {
+                3 => value
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .unwrap()
+                    .value(0),
+                6 => value
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .value(0),
+                9 => value
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .value(0),
+                _ => unreachable!(),
+            };
+            let truncated = raw.div_euclid(divisor) * divisor;
+            match stored_precision {
+                3 => Ok(Arc::new(TimestampMillisecondArray::from(vec![truncated]))),
+                6 => Ok(Arc::new(TimestampMicrosecondArray::from(vec![truncated]))),
+                9 => Ok(Arc::new(TimestampNanosecondArray::from(vec![truncated]))),
+                _ => unreachable!(),
+            }
+        }
         DataType::LocalZonedTimestamp(typ) => {
             let datetime = arrow_cast::parse::string_to_datetime(&chrono::Local, text)?;
             let precision = typ.precision();
@@ -217,6 +270,126 @@ fn cast_default(
                 )),
             }
         }
+        DataType::Array(typ) => {
+            let ArrowDataType::List(element_field) = arrow_field.data_type() else {
+                return Err(cast_error("ARRAY default has a non-list Arrow field"));
+            };
+            let content = literal_content(text, '[', ']', "ARRAY")?;
+            let elements = split_tokens(content)
+                .iter()
+                .map(|token| cast_token(typ.element_type(), token, element_field))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let values = concat_default_values(&elements, element_field.data_type())?;
+            Ok(Arc::new(ListArray::try_new(
+                Arc::clone(element_field),
+                single_offset(elements.len())?,
+                values,
+                None,
+            )?))
+        }
+        DataType::Row(typ) => {
+            let ArrowDataType::Struct(arrow_fields) = arrow_field.data_type() else {
+                return Err(cast_error("ROW default has a non-struct Arrow field"));
+            };
+            let content = literal_content(text, '{', '}', "STRUCT")?;
+            let tokens = split_tokens(content);
+            if !content.is_empty() && tokens.len() != typ.fields().len() {
+                return Err(cast_error(format!(
+                    "ROW default has {} fields, expected {}",
+                    tokens.len(),
+                    typ.fields().len()
+                )));
+            }
+            let values = typ
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| match tokens.get(index) {
+                    Some(token) => cast_token(field.data_type(), token, &arrow_fields[index]),
+                    None => Ok(arrow_array::new_null_array(
+                        arrow_fields[index].data_type(),
+                        1,
+                    )),
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(Arc::new(StructArray::try_new(
+                arrow_fields.clone(),
+                values,
+                None,
+            )?))
+        }
+        DataType::Map(typ) => {
+            let ArrowDataType::Map(entries_field, sorted) = arrow_field.data_type() else {
+                return Err(cast_error("MAP default has a non-map Arrow field"));
+            };
+            let ArrowDataType::Struct(entry_fields) = entries_field.data_type() else {
+                return Err(cast_error("MAP default entries are not a struct"));
+            };
+            let trimmed = text.trim();
+            let pairs: Vec<(DefaultToken, DefaultToken)> = if trimmed.starts_with('{') {
+                let content = literal_content(trimmed, '{', '}', "MAP")?;
+                split_raw(content, ",", 0)
+                    .into_iter()
+                    .filter(|entry| !entry.is_empty())
+                    .map(|entry| {
+                        let pair = split_raw(&entry, "->", 2);
+                        if pair.len() != 2 {
+                            return Err(cast_error(format!("Invalid MAP entry: {entry}")));
+                        }
+                        Ok((single_token(&pair[0])?, single_token(&pair[1])?))
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            } else {
+                let content = literal_content(trimmed, '{', '}', "MAP")?;
+                let tokens = split_tokens(content);
+                if !tokens.len().is_multiple_of(2) {
+                    return Err(cast_error("MAP default has an odd number of tokens"));
+                }
+                tokens
+                    .chunks_exact(2)
+                    .map(|pair| (pair[0].clone(), pair[1].clone()))
+                    .collect()
+            };
+            let mut keys: Vec<ArrayRef> = Vec::with_capacity(pairs.len());
+            let mut values: Vec<ArrayRef> = Vec::with_capacity(pairs.len());
+            for (key_token, value_token) in &pairs {
+                let key = cast_token(typ.key_type(), key_token, &entry_fields[0])?;
+                let value = cast_token(typ.value_type(), value_token, &entry_fields[1])?;
+                // Java builds a HashMap, so a later entry replaces an earlier
+                // value with the same cast key.
+                if let Some(index) = keys.iter().position(|old| old.to_data() == key.to_data()) {
+                    values[index] = value;
+                } else {
+                    keys.push(key);
+                    values.push(value);
+                }
+            }
+            let count = keys.len();
+            let entries = StructArray::try_new(
+                entry_fields.clone(),
+                vec![
+                    concat_default_values(&keys, entry_fields[0].data_type())?,
+                    concat_default_values(&values, entry_fields[1].data_type())?,
+                ],
+                None,
+            )?;
+            Ok(Arc::new(MapArray::try_new(
+                Arc::clone(entries_field),
+                single_offset(count)?,
+                entries,
+                None,
+                *sorted,
+            )?))
+        }
+        DataType::Multiset(_) => Err(cast_error(
+            "Java does not support casting a string default to MULTISET",
+        )),
+        DataType::Vector(_) => Err(cast_error(
+            "Java does not support casting a string default to VECTOR",
+        )),
+        DataType::Variant(_) => Err(cast_error(
+            "Java does not support casting a string default to VARIANT",
+        )),
         DataType::Blob(_) => Err(arrow_schema::ArrowError::CastError(
             "Java does not support casting a string default to BLOB".into(),
         )),
@@ -226,6 +399,217 @@ fn cast_default(
 
 fn numeric_default(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[derive(Clone)]
+struct DefaultToken {
+    value: String,
+    literal: bool,
+}
+
+fn cast_error(message: impl Into<String>) -> ArrowError {
+    ArrowError::CastError(message.into())
+}
+
+fn cast_token(
+    data_type: &DataType,
+    token: &DefaultToken,
+    arrow_field: &ArrowField,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    if !token.literal && token.value == "null" {
+        return Ok(arrow_array::new_null_array(arrow_field.data_type(), 1));
+    }
+    let value = cast_default(data_type, &token.value, arrow_field)?;
+    if value.is_null(0) {
+        return Err(cast_error(format!(
+            "Cannot cast '{}' to {data_type}",
+            token.value
+        )));
+    }
+    Ok(value)
+}
+
+fn concat_default_values(
+    values: &[ArrayRef],
+    data_type: &ArrowDataType,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    if values.is_empty() {
+        return Ok(arrow_array::new_empty_array(data_type));
+    }
+    let arrays = values
+        .iter()
+        .map(|value| value.as_ref())
+        .collect::<Vec<_>>();
+    arrow_select::concat::concat(&arrays)
+}
+
+fn single_offset(count: usize) -> std::result::Result<OffsetBuffer<i32>, ArrowError> {
+    let count = i32::try_from(count).map_err(|source| cast_error(source.to_string()))?;
+    Ok(OffsetBuffer::new(ScalarBuffer::from(vec![0, count])))
+}
+
+// Java StringToArrayCastRule, StringToMapCastRule and StringToRowCastRule
+// accept both bracket syntax and SQL function syntax.
+fn literal_content<'a>(
+    text: &'a str,
+    open: char,
+    close: char,
+    function: &str,
+) -> std::result::Result<&'a str, ArrowError> {
+    let text = text.trim();
+    if let Some(content) = text.strip_prefix(open).and_then(|v| v.strip_suffix(close)) {
+        return Ok(content.trim());
+    }
+    let prefix = text.get(..function.len());
+    if prefix.is_some_and(|prefix| prefix.eq_ignore_ascii_case(function)) {
+        let tail = text[function.len()..].trim_start();
+        if let Some(content) = tail.strip_prefix('(').and_then(|v| v.strip_suffix(')')) {
+            return Ok(content.trim());
+        }
+    }
+    Err(cast_error(format!("Invalid {function} default: {text}")))
+}
+
+fn single_token(text: &str) -> std::result::Result<DefaultToken, ArrowError> {
+    let tokens = split_tokens(text);
+    if tokens.len() != 1 {
+        return Err(cast_error(format!("Invalid MAP entry token: {text}")));
+    }
+    Ok(tokens.into_iter().next().unwrap())
+}
+
+// Port of Java TokenSplitter.split. At the current level quotes and escapes
+// make a token literal; nested punctuation is retained for recursive casting.
+fn split_tokens(content: &str) -> Vec<DefaultToken> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut brackets = Vec::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut literal = false;
+    let mut end = 0;
+    for ch in content.chars() {
+        let nested = !brackets.is_empty();
+        if escaped {
+            escaped = false;
+            current.push(ch);
+            end = current.len();
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            if nested {
+                current.push(ch);
+                end = current.len();
+            } else {
+                literal = true;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            if nested {
+                current.push(ch);
+                end = current.len();
+            } else {
+                literal = true;
+            }
+            continue;
+        }
+        if !in_quotes {
+            if is_open_bracket(ch) {
+                brackets.push(ch);
+            } else if is_close_bracket(ch) && !brackets.is_empty() {
+                brackets.pop();
+            } else if ch == ',' && brackets.is_empty() {
+                push_token(&mut tokens, &current, end, literal);
+                current.clear();
+                end = 0;
+                literal = false;
+                continue;
+            } else if ch.is_whitespace() && end == 0 {
+                continue;
+            }
+        }
+        current.push(ch);
+        if in_quotes || !ch.is_whitespace() {
+            end = current.len();
+        }
+    }
+    push_token(&mut tokens, &current, end, literal);
+    tokens
+}
+
+fn push_token(tokens: &mut Vec<DefaultToken>, current: &str, end: usize, literal: bool) {
+    if end > 0 || literal {
+        tokens.push(DefaultToken {
+            value: current[..end].to_string(),
+            literal,
+        });
+    }
+}
+
+// Java TokenSplitter.splitRaw leaves quotes and escapes in place for its
+// second pass, where a MAP entry is split on `->`.
+fn split_raw(content: &str, delimiter: &str, limit: usize) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut brackets = Vec::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut splits = 0;
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+            current.push(ch);
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            current.push(ch);
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            current.push(ch);
+            continue;
+        }
+        if !in_quotes {
+            if is_open_bracket(ch) {
+                brackets.push(ch);
+            } else if is_close_bracket(ch) && !brackets.is_empty() {
+                brackets.pop();
+            } else if brackets.is_empty()
+                && (limit == 0 || splits < limit - 1)
+                && ch == delimiter.chars().next().unwrap()
+                && chars
+                    .clone()
+                    .take(delimiter.chars().count() - 1)
+                    .collect::<String>()
+                    == delimiter.chars().skip(1).collect::<String>()
+            {
+                tokens.push(current.trim().to_string());
+                current.clear();
+                splits += 1;
+                for _ in 1..delimiter.chars().count() {
+                    chars.next();
+                }
+                continue;
+            }
+        }
+        current.push(ch);
+    }
+    tokens.push(current.trim().to_string());
+    tokens
+}
+
+fn is_open_bracket(ch: char) -> bool {
+    matches!(ch, '[' | '{' | '(')
+}
+
+fn is_close_bracket(ch: char) -> bool {
+    matches!(ch, ']' | '}' | ')')
 }
 
 #[cfg(test)]
@@ -585,5 +969,290 @@ mod tests {
                 .value(0),
             expected
         );
+    }
+
+    #[test]
+    fn array_default_parses_each_element_like_java() {
+        use crate::spec::{ArrayType, IntType};
+        use arrow_array::{Int32Array, ListArray};
+
+        let fields = vec![DataField::new(
+            0,
+            "numbers".into(),
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+        )
+        .with_default_value(Some("'[1,2]'".into()))];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let empty = arrow_array::new_null_array(schema.field(0).data_type(), 1);
+        let input = RecordBatch::try_new(schema, vec![empty]).unwrap();
+        let actual = defaults.apply(&input).unwrap();
+        let values = actual
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), vec![Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn timestamp_default_truncates_to_declared_precision() {
+        use crate::spec::TimestampType;
+
+        let fields = vec![DataField::new(
+            0,
+            "time".into(),
+            DataType::Timestamp(TimestampType::new(1).unwrap()),
+        )
+        .with_default_value(Some("'1970-01-01 00:00:00.123456'".into()))];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let input = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampMillisecondArray::from(vec![None]))],
+        )
+        .unwrap();
+        let actual = defaults.apply(&input).unwrap();
+        assert_eq!(
+            actual
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .value(0),
+            100
+        );
+    }
+
+    #[test]
+    fn intermediate_timestamp_precisions_follow_java() {
+        use crate::spec::TimestampType;
+
+        for (precision, expected) in [
+            (1, 100_i64),
+            (2, 120),
+            (4, 123_400),
+            (5, 123_450),
+            (7, 123_456_700),
+        ] {
+            let field = DataField::new(
+                0,
+                "time".into(),
+                DataType::Timestamp(TimestampType::new(precision).unwrap()),
+            );
+            let schema = build_target_arrow_schema(std::slice::from_ref(&field)).unwrap();
+            let value = cast_default(
+                field.data_type(),
+                "1970-01-01 00:00:00.123456789",
+                schema.field(0),
+            )
+            .unwrap();
+            let actual = match precision {
+                1 | 2 => value
+                    .as_any()
+                    .downcast_ref::<TimestampMillisecondArray>()
+                    .unwrap()
+                    .value(0),
+                4 | 5 => value
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .value(0),
+                _ => value
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .value(0),
+            };
+            assert_eq!(actual, expected, "precision {precision}");
+        }
+    }
+
+    #[test]
+    fn nested_array_and_quoted_null_defaults_follow_java() {
+        use crate::spec::{ArrayType, IntType};
+        use arrow_array::{Int32Array, ListArray};
+
+        let nested = DataField::new(
+            0,
+            "nested".into(),
+            DataType::Array(ArrayType::new(DataType::Array(ArrayType::new(
+                DataType::Int(IntType::new()),
+            )))),
+        )
+        .with_default_value(Some("'[[1, 2], ARRAY(3, null)]'".into()));
+        let labels = DataField::new(
+            1,
+            "labels".into(),
+            DataType::Array(ArrayType::new(
+                DataType::VarChar(VarCharType::string_type()),
+            )),
+        )
+        .with_default_value(Some("'[null, \"null\", \"a,b\"]'".into()));
+        let fields = [nested, labels];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let nested = defaults.values[0]
+            .as_ref()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let values = nested.value(0);
+        let values = values.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(
+            values
+                .value(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
+        assert_eq!(
+            values
+                .value(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(3), None]
+        );
+        let labels = defaults.values[1]
+            .as_ref()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let values = labels.value(0);
+        let values = values.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            vec![None, Some("null"), Some("a,b")]
+        );
+    }
+
+    #[test]
+    fn map_and_row_defaults_use_java_token_parsing() {
+        use crate::spec::{ArrayType, IntType, MapType, RowType};
+        use arrow_array::{Int32Array, MapArray, StructArray};
+
+        let fields = [
+            DataField::new(
+                0,
+                "lookup".into(),
+                DataType::Map(MapType::new(
+                    DataType::VarChar(VarCharType::string_type()),
+                    DataType::Int(IntType::new()),
+                )),
+            )
+            .with_default_value(Some("'{\"a,b\" -> 1, c -> null}'".into())),
+            DataField::new(
+                1,
+                "record".into(),
+                DataType::Row(RowType::new(vec![
+                    DataField::new(
+                        10,
+                        "name".into(),
+                        DataType::VarChar(VarCharType::string_type()),
+                    ),
+                    DataField::new(
+                        11,
+                        "items".into(),
+                        DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+                    ),
+                ])),
+            )
+            .with_default_value(Some("'STRUCT(\"a,b\", [1,2])'".into())),
+        ];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        let defaults = FormatTableDefaults::new(&fields, &schema).unwrap();
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            schema
+                .fields()
+                .iter()
+                .map(|field| arrow_array::new_null_array(field.data_type(), 1))
+                .collect(),
+        )
+        .unwrap();
+        let actual = defaults.apply(&input).unwrap();
+        let map = actual
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_eq!(
+            map.keys()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("a,b"), Some("c")]
+        );
+        assert_eq!(
+            map.values()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(1), None]
+        );
+        let row = actual
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(
+            row.column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "a,b"
+        );
+        let items = row.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(
+            items
+                .value(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(2)]
+        );
+
+        let value =
+            cast_default(fields[0].data_type(), "MAP(a, 1, a, 2)", schema.field(0)).unwrap();
+        let map = value.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.keys().len(), 1);
+        assert_eq!(
+            map.values()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+    }
+
+    #[test]
+    fn malformed_complex_default_fails_before_writing() {
+        use crate::spec::{ArrayType, IntType};
+        let fields = [DataField::new(
+            0,
+            "numbers".into(),
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+        )
+        .with_default_value(Some("'[1, bad]'".into()))];
+        let schema = build_target_arrow_schema(&fields).unwrap();
+        assert!(FormatTableDefaults::new(&fields, &schema).is_err());
     }
 }
