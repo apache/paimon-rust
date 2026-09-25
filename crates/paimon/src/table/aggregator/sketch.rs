@@ -183,7 +183,15 @@ impl FieldAggregator for HllSketchAgg {
         let mut union = HllUnion::new(left.lg_config_k().max(right.lg_config_k()));
         union.update(&right);
         union.update(&left);
-        self.value = Some(union.get_result(HllType::Hll4).serialize());
+        let mut result = union.get_result(HllType::Hll4).serialize();
+        // datasketches-rs serializes HLL_4 auxiliary coupons consecutively,
+        // but leaves the header marked updatable. Java and our next union
+        // would then interpret those coupons as a sparse hash table. This is
+        // the compact HLL_4 layout, so mark it as such when emitting it.
+        if result.len() >= 40 && result[2] == 7 && result[7] == 2 {
+            result[5] |= 8;
+        }
+        self.value = Some(result);
         Ok(())
     }
 
@@ -423,7 +431,7 @@ mod tests {
         let compact = include_bytes!("../goldens/hll_java_compact_aux.bin");
         let updatable = include_bytes!("../goldens/hll_java_updatable_aux.bin");
         for bytes in [compact.as_slice(), updatable.as_slice()] {
-            let input = BinaryArray::from(vec![Some(bytes), Some(bytes)]);
+            let input = BinaryArray::from(vec![Some(bytes), Some(bytes), Some(bytes)]);
             let mut agg = HllSketchAgg::new(
                 "sketch",
                 &DataType::VarBinary(VarBinaryType::new(65535).unwrap()),
@@ -431,9 +439,13 @@ mod tests {
             .unwrap();
             agg.agg(&input, 0).unwrap();
             agg.agg(&input, 1).unwrap();
+            let second = agg.result().unwrap();
+            let second = second.as_any().downcast_ref::<BinaryArray>().unwrap();
+            assert_eq!(second.value(0)[5] & 8, 8, "HLL_4 output must be compact");
+            agg.agg(&input, 2).unwrap();
             let output = agg.result().unwrap();
             let output = output.as_any().downcast_ref::<BinaryArray>().unwrap();
-            let estimate = HllSketch::deserialize(output.value(0)).unwrap().estimate();
+            let estimate = deserialize_for_union(output.value(0)).unwrap().estimate();
             assert!((estimate - 200552.41133627715).abs() < 1e-6, "{estimate}");
         }
     }
@@ -468,7 +480,7 @@ mod tests {
             agg.agg(&input, 1).unwrap();
             let result = agg.result().unwrap();
             let result = result.as_any().downcast_ref::<BinaryArray>().unwrap();
-            let estimate = HllSketch::deserialize(result.value(0)).unwrap().estimate();
+            let estimate = deserialize_for_union(result.value(0)).unwrap().estimate();
             assert!((estimate - 15148.816386062443).abs() < 1e-9);
         }
     }

@@ -120,6 +120,22 @@ pub(crate) enum MergeResult {
     Omit,
 }
 
+/// Java's reducer wrapper returns its first KeyValue unchanged when no
+/// second version arrives. The user-row reader drops a lone retract.
+fn singleton_reducer_result(rows: &[MergeRow]) -> crate::Result<Option<MergeResult>> {
+    let [row] = rows else {
+        return Ok(None);
+    };
+    Ok(Some(if RowKind::from_value(row.value_kind)?.is_add() {
+        MergeResult::SourceRow {
+            batch_idx: row.batch_idx,
+            row_idx: row.row_idx,
+        }
+    } else {
+        MergeResult::Omit
+    }))
+}
+
 /// Merge function applied to rows sharing the same primary key.
 ///
 /// Deduplicate-style engines can keep returning a source row. Future
@@ -449,6 +465,9 @@ impl MergeFunction for PartialUpdateMergeFunction {
                 message: "merge called with empty rows".to_string(),
                 source: None,
             });
+        }
+        if let Some(result) = singleton_reducer_result(rows)? {
+            return Ok(result);
         }
 
         let mut ordered_row_indices: Vec<usize> = (0..rows.len()).collect();
@@ -978,6 +997,9 @@ impl MergeFunction for AggregateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
+        if let Some(result) = singleton_reducer_result(rows)? {
+            return Ok(result);
+        }
         let mut ordered: Vec<_> = rows.iter().collect();
         // Stable sorting keeps input order for equal sequences.
         ordered.sort_by(|lhs, rhs| compare_sequence_order(lhs, rhs));

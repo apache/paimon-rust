@@ -29,10 +29,136 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{Int32Builder, ListBuilder};
-use arrow_array::{Array, Int32Array, Int8Array, ListArray, RecordBatch};
+use arrow_array::{Array, BinaryArray, Int32Array, Int8Array, ListArray, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::StreamExt;
-use paimon::spec::{ArrayType, DataType, IntType, Schema, TableSchema, VALUE_KIND_FIELD_NAME};
+use paimon::spec::{
+    ArrayType, DataType, IntType, Schema, TableSchema, VarBinaryType, VALUE_KIND_FIELD_NAME,
+};
+
+#[tokio::test]
+async fn aggregation_delete_only_stays_invisible_with_sum_and_product() {
+    for function in ["sum", "product"] {
+        let path = format!("memory:/rowkind_field/delete_only_{function}");
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "aggregation")
+            .option("fields.value.aggregate-function", function)
+            .build()
+            .unwrap();
+        let (file_io, table) = memory_table(&path, TableSchema::new(0, &schema));
+        setup_dirs(&file_io, &path).await;
+        persist_table_schema(&file_io, &path, table.schema()).await;
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, true),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![Some(20)])),
+                Arc::new(Int8Array::from(vec![3])),
+            ],
+        )
+        .unwrap();
+        write_batch(&table, &batch).await;
+        assert!(scan_id_values(&table).await.is_empty(), "{function}");
+    }
+}
+
+#[tokio::test]
+async fn partial_update_singleton_delete_stays_invisible_without_delete_options() {
+    let path = "memory:/rowkind_field/partial_update_delete_only";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "partial-update")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+            ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![Some(20)])),
+            Arc::new(Int8Array::from(vec![3])),
+        ],
+    )
+    .unwrap();
+    write_batch(&table, &batch).await;
+    assert!(scan_id_values(&table).await.is_empty());
+}
+
+#[tokio::test]
+async fn aggregation_hll_compact_auxiliary_survives_three_commits() {
+    let path = "memory:/rowkind_field/hll_three_commits";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "value",
+            DataType::VarBinary(VarBinaryType::new(65535).unwrap()),
+        )
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "aggregation")
+        .option("fields.value.aggregate-function", "hll_sketch")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    let fixture = include_bytes!("../src/table/goldens/hll_java_compact_aux.bin");
+    for _ in 0..3 {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Binary, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(BinaryArray::from(vec![Some(fixture.as_slice())])),
+            ],
+        )
+        .unwrap();
+        write_batch(&table, &batch).await;
+    }
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let mut stream = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap();
+    let batch = stream.next().await.unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let value = batch
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap()
+        .value(0);
+    assert_eq!(value[5] & 8, 8);
+    let mut for_rust_reader = value.to_vec();
+    for_rust_reader[5] &= !8;
+    let estimate = datasketches::hll::HllSketch::deserialize(&for_rust_reader)
+        .unwrap()
+        .estimate();
+    assert!((estimate - 200552.41133627715).abs() < 1e-6);
+    assert!(stream.next().await.is_none());
+}
 
 #[tokio::test]
 async fn aggregation_product_retracts_singleton_delete_in_later_commit() {
