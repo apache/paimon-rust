@@ -18,7 +18,7 @@
 //! Java Roaring64Bitmap 1.2.1 wire format: ART over high 48 bits followed by
 //! serialized 16-bit containers. This is distinct from Rust RoaringTreemap.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray};
@@ -78,10 +78,15 @@ impl FieldAggregator for Roaring64Agg {
             ),
             source: None,
         })?;
-        values.extend(decode(bytes).map_err(|message| Error::DataInvalid {
+        for (key, ranges) in decode(bytes).map_err(|message| Error::DataInvalid {
             message: format!("Invalid rbm64 input for '{}': {message}", self.field_name),
             source: None,
-        })?);
+        })? {
+            values.entry(key).or_default().extend(ranges);
+        }
+        for ranges in values.values_mut() {
+            normalize_ranges(ranges);
+        }
         self.value = Some(encode(&values)?);
         Ok(())
     }
@@ -190,10 +195,26 @@ fn read_art_node(
     Ok(())
 }
 
-fn decode(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
+type Ranges = BTreeMap<[u8; 6], Vec<(u16, u16)>>;
+
+fn normalize_ranges(ranges: &mut Vec<(u16, u16)>) {
+    ranges.sort_unstable();
+    let mut write = 0;
+    for read in 0..ranges.len() {
+        if write > 0 && u32::from(ranges[read].0) <= u32::from(ranges[write - 1].1) + 1 {
+            ranges[write - 1].1 = ranges[write - 1].1.max(ranges[read].1);
+        } else {
+            ranges[write] = ranges[read];
+            write += 1;
+        }
+    }
+    ranges.truncate(write);
+}
+
+fn decode(bytes: &[u8]) -> Result<Ranges, String> {
     let mut reader = Reader { bytes, offset: 0 };
     match reader.u8()? {
-        0 if reader.offset == bytes.len() => return Ok(BTreeSet::new()),
+        0 if reader.offset == bytes.len() => return Ok(BTreeMap::new()),
         1 => {}
         tag => return Err(format!("invalid rbm64 empty tag {tag}")),
     }
@@ -236,7 +257,7 @@ fn decode(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
             if cardinality > 65536 {
                 return Err("invalid rbm64 container cardinality".into());
             }
-            let mut lows = Vec::with_capacity(cardinality);
+            let mut ranges = Vec::new();
             match kind {
                 0 => {
                     let runs = usize::from(reader.u16()?);
@@ -247,30 +268,39 @@ fn decode(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
                         if end >= 65536 {
                             return Err("invalid rbm64 run container".into());
                         }
-                        lows.extend((u32::from(start)..=end).map(|value| value as u16));
+                        ranges.push((start, end as u16));
                     }
                 }
                 1 => {
                     for word_index in 0..1024u32 {
                         let word = reader.u64()?;
-                        for bit in 0..64 {
-                            if word & (1u64 << bit) != 0 {
-                                lows.push((word_index * 64 + bit) as u16);
-                            }
+                        let mut remaining = word;
+                        while remaining != 0 {
+                            let bit = remaining.trailing_zeros();
+                            let low = (word_index * 64 + bit) as u16;
+                            ranges.push((low, low));
+                            remaining &= remaining - 1;
                         }
                     }
                 }
                 2 => {
                     for _ in 0..cardinality {
-                        lows.push(reader.u16()?);
+                        let low = reader.u16()?;
+                        ranges.push((low, low));
                     }
                 }
                 _ => return Err(format!("unknown rbm64 container type {kind}")),
             }
-            if lows.len() != cardinality {
+            normalize_ranges(&mut ranges);
+            if ranges
+                .iter()
+                .map(|(start, end)| usize::from(*end) - usize::from(*start) + 1)
+                .sum::<usize>()
+                != cardinality
+            {
                 return Err("rbm64 container cardinality mismatch".into());
             }
-            inner.push(Some(lows));
+            inner.push(Some(ranges));
         }
         containers.push(inner);
     }
@@ -280,7 +310,7 @@ fn decode(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
     if reader.offset != bytes.len() || container_size != key_size {
         return Err("rbm64 trailing bytes or container count mismatch".into());
     }
-    let mut result = BTreeSet::new();
+    let mut result = BTreeMap::new();
     for (high, index) in leaves {
         let first = usize::try_from(index >> 32).map_err(|_| "rbm64 index overflow")?;
         let second = usize::try_from(index as u32).map_err(|_| "rbm64 index overflow")?;
@@ -289,10 +319,9 @@ fn decode(bytes: &[u8]) -> Result<BTreeSet<u64>, String> {
             .and_then(|array| array.get(second))
             .and_then(Option::as_ref)
             .ok_or("ART references missing rbm64 container")?;
-        let high = high
-            .iter()
-            .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
-        result.extend(lows.iter().map(|low| (high << 16) | u64::from(*low)));
+        if result.insert(high, lows.clone()).is_some() {
+            return Err("duplicate rbm64 ART key".into());
+        }
     }
     Ok(result)
 }
@@ -335,19 +364,11 @@ fn write_art_node(keys: &[[u8; 6]], depth: usize, base_index: usize, out: &mut V
     }
 }
 
-fn encode(values: &BTreeSet<u64>) -> crate::Result<Vec<u8>> {
+fn encode(values: &Ranges) -> crate::Result<Vec<u8>> {
     if values.is_empty() {
         return Ok(vec![0]);
     }
-    let mut grouped: BTreeMap<[u8; 6], Vec<u16>> = BTreeMap::new();
-    for &value in values {
-        let bytes = value.to_be_bytes();
-        grouped
-            .entry(bytes[..6].try_into().unwrap())
-            .or_default()
-            .push(value as u16);
-    }
-    let keys: Vec<[u8; 6]> = grouped.keys().copied().collect();
+    let keys: Vec<[u8; 6]> = values.keys().copied().collect();
     let count = u32::try_from(keys.len()).map_err(|_| Error::DataInvalid {
         message: "rbm64 has too many high-bit containers".into(),
         source: None,
@@ -359,21 +380,44 @@ fn encode(values: &BTreeSet<u64>) -> crate::Result<Vec<u8>> {
     out.extend_from_slice(&1u32.to_le_bytes()); // one first-level container array
     out.push(0xfe); // NOT_TRIMMED_MARK
     out.extend_from_slice(&count.to_le_bytes());
-    for lows in grouped.values() {
+    for ranges in values.values() {
+        let cardinality: usize = ranges
+            .iter()
+            .map(|(start, end)| usize::from(*end) - usize::from(*start) + 1)
+            .sum();
+        let array_bytes = cardinality * 2;
+        let run_bytes = 2 + ranges.len() * 4;
+        let kind = if run_bytes <= array_bytes && run_bytes <= 8192 {
+            0
+        } else if array_bytes <= 8192 {
+            2
+        } else {
+            1
+        };
         out.push(1); // non-null
-        out.push(if lows.len() > 4096 { 1 } else { 2 }); // bitmap or array
-        out.extend_from_slice(&(lows.len() as u32).to_le_bytes());
-        if lows.len() > 4096 {
+        out.push(kind);
+        out.extend_from_slice(&(cardinality as u32).to_le_bytes());
+        if kind == 0 {
+            out.extend_from_slice(&(ranges.len() as u16).to_le_bytes());
+            for &(start, end) in ranges {
+                out.extend_from_slice(&start.to_le_bytes());
+                out.extend_from_slice(&(end - start).to_le_bytes());
+            }
+        } else if kind == 1 {
             let mut words = [0u64; 1024];
-            for &low in lows {
-                words[usize::from(low) / 64] |= 1u64 << (low % 64);
+            for &(start, end) in ranges {
+                for low in start..=end {
+                    words[usize::from(low) / 64] |= 1u64 << (low % 64);
+                }
             }
             for word in words {
                 out.extend_from_slice(&word.to_le_bytes());
             }
         } else {
-            for low in lows {
-                out.extend_from_slice(&low.to_le_bytes());
+            for &(start, end) in ranges {
+                for low in start..=end {
+                    out.extend_from_slice(&low.to_le_bytes());
+                }
             }
         }
     }
@@ -387,16 +431,47 @@ fn encode(values: &BTreeSet<u64>) -> crate::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::spec::VarBinaryType;
+    use std::collections::BTreeSet;
 
     const JAVA_BITMAP: &str = "AQIAAAAAAAAAAAIAAwAAAAAAAQAEAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAQAAAQAAAAAAAAABAAAA/gIAAAABAgEAAAABAAECAQAAAAEAAgAAAAAAAAAAAAAAAQAAAA==";
+
+    fn ranges_from_values(values: impl IntoIterator<Item = u64>) -> Ranges {
+        let mut result = Ranges::new();
+        for value in values {
+            let bytes = value.to_be_bytes();
+            let low = value as u16;
+            result
+                .entry(bytes[..6].try_into().unwrap())
+                .or_default()
+                .push((low, low));
+        }
+        for ranges in result.values_mut() {
+            normalize_ranges(ranges);
+        }
+        result
+    }
+
+    fn values_from_ranges(ranges: &Ranges) -> BTreeSet<u64> {
+        ranges
+            .iter()
+            .flat_map(|(high, ranges)| {
+                let high = high
+                    .iter()
+                    .fold(0u64, |value, byte| (value << 8) | u64::from(*byte));
+                ranges.iter().flat_map(move |&(start, end)| {
+                    (start..=end).map(move |low| (high << 16) | u64::from(low))
+                })
+            })
+            .collect()
+    }
 
     #[test]
     fn unions_java_roaring64_bytes_and_roundtrips_java_format() {
         let java = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, JAVA_BITMAP)
             .unwrap();
         let parsed = decode(&java).unwrap();
-        assert_eq!(parsed, BTreeSet::from([1, 4294967297]));
-        let extra = encode(&BTreeSet::from([3, 4, 1u64 << 40])).unwrap();
+        assert_eq!(values_from_ranges(&parsed), BTreeSet::from([1, 4294967297]));
+        let extra = encode(&ranges_from_values([3, 4, 1u64 << 40])).unwrap();
         let input = BinaryArray::from(vec![Some(java.as_slice()), Some(extra.as_slice())]);
         let mut agg = Roaring64Agg::new(
             "bitmap",
@@ -408,9 +483,32 @@ mod tests {
         let result = agg.result().unwrap();
         let result = result.as_any().downcast_ref::<BinaryArray>().unwrap();
         assert_eq!(
-            decode(result.value(0)).unwrap(),
+            values_from_ranges(&decode(result.value(0)).unwrap()),
             BTreeSet::from([1, 3, 4, 4294967297, 1u64 << 40])
         );
+    }
+
+    #[test]
+    fn unions_java_dense_run_without_expanding_one_million_values() {
+        let dense = include_bytes!("../goldens/roaring64_java_dense.bin");
+        assert_eq!(dense.len(), 542);
+        let decoded = decode(dense).unwrap();
+        assert_eq!(decoded.len(), 16);
+        let input = BinaryArray::from(vec![Some(dense.as_slice()), Some(dense.as_slice())]);
+        let mut agg = Roaring64Agg::new(
+            "bitmap",
+            &DataType::VarBinary(VarBinaryType::new(65535).unwrap()),
+        )
+        .unwrap();
+        agg.agg(&input, 0).unwrap();
+        agg.agg(&input, 1).unwrap();
+        let output = agg.result().unwrap();
+        let output = output.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(
+            output.value(0).len() <= 1024,
+            "dense union lost run compression"
+        );
+        assert_eq!(decode(output.value(0)).unwrap(), decoded);
     }
 
     #[test]

@@ -766,6 +766,27 @@ impl KeyValueFileWriter {
         }
     }
 
+    /// Java's reducer wrapper keeps a one-row key group byte-for-byte. In
+    /// particular, a lone retract must reach an older file with its original
+    /// kind and payload instead of being aggregated against an empty state.
+    fn singleton_merge_row(
+        batch: &RecordBatch,
+        row_idx: usize,
+        output_indices: &[usize],
+        output_schema: &Arc<ArrowSchema>,
+    ) -> Result<RecordBatch> {
+        let columns = output_indices
+            .iter()
+            .map(|&index| batch.column(index).slice(row_idx, 1))
+            .collect();
+        RecordBatch::try_new(output_schema.clone(), columns).map_err(|error| {
+            crate::Error::DataInvalid {
+                message: format!("Failed to keep singleton merge row: {error}"),
+                source: Some(Box::new(error)),
+            }
+        })
+    }
+
     fn merge_aggregation_rows(
         &self,
         batch: &RecordBatch,
@@ -837,15 +858,25 @@ impl KeyValueFileWriter {
             {
                 end += 1;
             }
-            let group = rows[start..end].iter().collect::<Vec<_>>();
-            let (row, delete) =
-                merge.merge_ordered(&group, &buffers, &output_indices, &output_schema)?;
-            merged.push(row);
-            merged_kinds.push(if delete {
-                RowKind::Delete as i8
+            if end - start == 1 {
+                merged.push(Self::singleton_merge_row(
+                    batch,
+                    rows[start].row_idx,
+                    &output_indices,
+                    &output_schema,
+                )?);
+                merged_kinds.push(rows[start].value_kind);
             } else {
-                RowKind::Insert as i8
-            });
+                let group = rows[start..end].iter().collect::<Vec<_>>();
+                let (row, delete) =
+                    merge.merge_ordered(&group, &buffers, &output_indices, &output_schema)?;
+                merged.push(row);
+                merged_kinds.push(if delete {
+                    RowKind::Delete as i8
+                } else {
+                    RowKind::Insert as i8
+                });
+            }
             // Java retains the last row in sequence-field order, which need not
             // have the largest arrival sequence number.
             last_indices.push(sorted_indices.value(end - 1));
@@ -936,6 +967,18 @@ impl KeyValueFileWriter {
                 && key_rows.row(rows[end].row_idx) == key_rows.row(rows[start].row_idx)
             {
                 end += 1;
+            }
+            if end - start == 1 {
+                merged.push(Self::singleton_merge_row(
+                    batch,
+                    rows[start].row_idx,
+                    &output_indices,
+                    &output_schema,
+                )?);
+                merged_kinds.push(rows[start].value_kind);
+                last_indices.push(sorted_indices.value(start));
+                start = end;
+                continue;
             }
             match merge.merge(&rows[start..end], &buffers, &output_indices, &output_schema)? {
                 MergeResult::MaterializedRow(row) => {
@@ -1729,7 +1772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_flush_partial_update_explicit_false_rejects_retract() {
+    async fn test_flush_partial_update_explicit_false_preserves_singleton_retract() {
         let schema = Arc::new(ArrowSchema::new(vec![
             Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
             Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
@@ -1752,21 +1795,22 @@ mod tests {
         config
             .table_options
             .insert("ignore-delete".to_string(), "false".to_string());
-        let mut writer =
-            KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
-                .unwrap();
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let mut writer = KeyValueFileWriter::new(io.clone(), config, 0).unwrap();
 
         writer.write(&batch).await.unwrap();
-        let err = match writer.prepare_commit().await {
-            Ok(_) => panic!("explicit ignore-delete=false must reject retract rows"),
-            Err(err) => err,
-        };
-
-        assert!(matches!(
-            err,
-            crate::Error::Unsupported { message }
-            if message.contains("does not support DELETE or UPDATE_BEFORE")
-        ));
+        let prepared = writer.prepare_commit().await.unwrap();
+        let stored = read_kv_file(&io, &prepared.data_files[0]).await;
+        assert_eq!(
+            stored
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap()
+                .value(0),
+            RowKind::Delete as i8
+        );
     }
 
     /// Partial-update merges each key group down to one row at flush: every
@@ -2068,10 +2112,9 @@ mod tests {
         }
     }
 
-    /// Retract rows are rejected at flush, matching the read-side
-    /// PartialUpdateMergeFunction error.
+    /// Java's reducer preserves a singleton retract row and its sequence.
     #[test]
-    fn test_merge_partial_update_rows_rejects_retract() {
+    fn test_merge_partial_update_rows_preserves_singleton_retract() {
         let schema = Arc::new(ArrowSchema::new(vec![
             Arc::new(ArrowField::new("id", ArrowDataType::Int32, false)),
             Arc::new(ArrowField::new("seq", ArrowDataType::Int64, false)),
@@ -2094,13 +2137,17 @@ mod tests {
         let sorted_indices = UInt32Array::from(vec![0]);
         let seq_array = Int64Array::from(vec![1000]);
 
-        let err = partial_update_writer()
+        let (merged, sequence) = partial_update_writer()
             .merge_partial_update_rows(&batch, &seq_array, &sorted_indices)
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported { ref message }
-                if message.contains("does not support DELETE or UPDATE_BEFORE")),
-            "got {err:?}"
+            .unwrap();
+        assert_eq!(merged, batch);
+        assert_eq!(
+            sequence
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1000
         );
     }
 
@@ -2367,7 +2414,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_flush_aggregation_rejects_non_nullable_retract_before_writing_files() {
+    async fn test_flush_aggregation_preserves_non_nullable_singleton_retract() {
         for kind in [1, 3] {
             let schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("id", ArrowDataType::Int32, false),
@@ -2383,20 +2430,27 @@ mod tests {
                 ],
             )
             .unwrap();
-            let mut writer = KeyValueFileWriter::new(
-                FileIOBuilder::new("memory").build().unwrap(),
-                test_write_config(MergeEngine::Aggregation),
-                0,
-            )
-            .unwrap();
+            let io = FileIOBuilder::new("memory").build().unwrap();
+            let mut writer =
+                KeyValueFileWriter::new(io.clone(), test_write_config(MergeEngine::Aggregation), 0)
+                    .unwrap();
             writer.write(&batch).await.unwrap();
-            let err = writer.prepare_commit().await.err().unwrap();
-            assert!(
-                matches!(err, crate::Error::DataInvalid { ref message, .. } if message.contains("non-nullable field 'seq'")),
-                "unexpected error: {err:?}"
-            );
-            assert!(writer.written_files.is_empty());
-            assert!(writer.written_changelog_files.is_empty());
+            let prepared = writer.prepare_commit().await.unwrap();
+            let stored = read_kv_file(&io, &prepared.data_files[0]).await;
+            let kinds = stored
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .unwrap();
+            assert_eq!(kinds.values(), &[0, kind]);
+            let seq = stored
+                .column_by_name("seq")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(seq.values(), &[10, 20]);
         }
     }
 

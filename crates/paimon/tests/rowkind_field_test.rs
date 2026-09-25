@@ -26,6 +26,204 @@ use rowkind_helpers::{
     write_batch, write_batch_expect_err,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow_array::builder::{Int32Builder, ListBuilder};
+use arrow_array::{Array, Int32Array, Int8Array, ListArray, RecordBatch};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use futures::StreamExt;
+use paimon::spec::{ArrayType, DataType, IntType, Schema, TableSchema, VALUE_KIND_FIELD_NAME};
+
+#[tokio::test]
+async fn aggregation_product_retracts_singleton_delete_in_later_commit() {
+    let path = "memory:/rowkind_field/product_retract_across_commits";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "aggregation")
+        .option("fields.value.aggregate-function", "product")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+
+    for (value, kind) in [(100, 0), (20, 3)] {
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![value])),
+                Arc::new(Int8Array::from(vec![kind])),
+            ],
+        )
+        .unwrap();
+        write_batch(&table, &batch).await;
+    }
+    assert_eq!(scan_id_values(&table).await.get(&1), Some(&5));
+}
+
+#[tokio::test]
+async fn aggregation_collect_retracts_singleton_delete_in_later_commit() {
+    let path = "memory:/rowkind_field/collect_retract_across_commits";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "value",
+            DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+        )
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "aggregation")
+        .option("fields.value.aggregate-function", "collect")
+        .build()
+        .unwrap();
+    let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    for (values, kind) in [(&[1, 2, 2][..], 0), (&[2][..], 3)] {
+        let mut list = ListBuilder::new(Int32Builder::new()).with_field(Arc::new(ArrowField::new(
+            "element",
+            ArrowDataType::Int32,
+            true,
+        )));
+        for &value in values {
+            list.values().append_value(value);
+        }
+        list.append(true);
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new(
+                    "value",
+                    ArrowDataType::List(Arc::new(ArrowField::new(
+                        "element",
+                        ArrowDataType::Int32,
+                        true,
+                    ))),
+                    true,
+                ),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(list.finish()),
+                Arc::new(Int8Array::from(vec![kind])),
+            ],
+        )
+        .unwrap();
+        write_batch(&table, &batch).await;
+    }
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let mut stream = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap();
+    let batch = stream.next().await.unwrap().unwrap();
+    let list = batch
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let values = list.value(0);
+    let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(values.values().as_ref(), &[1, 2]);
+    assert!(stream.next().await.is_none());
+}
+
+fn partial_update_batch(version: i32, value: Option<i32>, kind: i8) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("version", ArrowDataType::Int32, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+            ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Int32Array::from(vec![version])),
+            Arc::new(Int32Array::from(vec![value])),
+            Arc::new(Int8Array::from(vec![kind])),
+        ],
+    )
+    .unwrap()
+}
+
+async fn scan_single_value(table: &paimon::table::Table) -> Option<i32> {
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let mut stream = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap();
+    let batch = stream.next().await.unwrap().unwrap();
+    let values = batch
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(stream.next().await.is_none());
+    (!values.is_null(0)).then(|| values.value(0))
+}
+
+async fn partial_update_table(
+    path: &str,
+    function: &str,
+    whole_row_delete: bool,
+) -> paimon::table::Table {
+    let mut builder = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("version", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .primary_key(["id"])
+        .option("bucket", "1")
+        .option("merge-engine", "partial-update")
+        .option("fields.version.sequence-group", "value")
+        .option("fields.value.aggregate-function", function);
+    if whole_row_delete {
+        builder = builder.option("partial-update.remove-record-on-sequence-group", "version");
+    }
+    let schema = builder.build().unwrap();
+    let (file_io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&file_io, path).await;
+    persist_table_schema(&file_io, path, table.schema()).await;
+    table
+}
+
+#[tokio::test]
+async fn partial_update_sum_retracts_singleton_delete_in_later_commit() {
+    let table =
+        partial_update_table("memory:/rowkind_field/partial_sum_retract", "sum", false).await;
+    write_batch(&table, &partial_update_batch(1, Some(100), 0)).await;
+    write_batch(&table, &partial_update_batch(2, Some(20), 3)).await;
+    assert_eq!(scan_single_value(&table).await, Some(80));
+}
+
+#[tokio::test]
+async fn partial_update_first_non_null_keeps_state_after_whole_row_delete() {
+    let table = partial_update_table(
+        "memory:/rowkind_field/partial_first_non_null_delete",
+        "first_non_null_value",
+        true,
+    )
+    .await;
+    write_batch(&table, &partial_update_batch(1, Some(100), 0)).await;
+    write_batch(&table, &partial_update_batch(2, None, 3)).await;
+    write_batch(&table, &partial_update_batch(3, Some(5), 0)).await;
+    assert_eq!(scan_single_value(&table).await, None);
+}
 
 fn table_with_options(
     table: &paimon::table::Table,

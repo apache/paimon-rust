@@ -285,7 +285,7 @@ impl PartialUpdateMergeFunction {
 
     /// Java replaces the current row with the DELETE value. Later inserts may
     /// leave some columns null, so their merge must start from that value.
-    fn reset_to_source(
+    fn replace_with_source(
         selected_by_col: &mut [Option<(usize, usize)>],
         aggregators: Option<&mut [Option<Box<dyn FieldAggregator>>]>,
         batch_idx: usize,
@@ -297,8 +297,7 @@ impl PartialUpdateMergeFunction {
         if let Some(aggregators) = aggregators {
             for (index, aggregator) in aggregators.iter_mut().enumerate() {
                 if let Some(aggregator) = aggregator {
-                    aggregator.reset();
-                    aggregator.agg(
+                    aggregator.replace_with_delete(
                         batch_buffer[batch_idx].column_for_output(index, source_output_col_indices),
                         row_idx,
                     )?;
@@ -489,7 +488,7 @@ impl MergeFunction for PartialUpdateMergeFunction {
                     // Java initializes the row from the first retract before
                     // applying sequence-group retractions. That row also
                     // becomes the DELETE payload when no insert follows.
-                    Self::reset_to_source(
+                    Self::replace_with_source(
                         &mut selected_by_col,
                         aggregators.as_mut().map(|guard| guard.as_mut_slice()),
                         row.batch_idx,
@@ -557,7 +556,7 @@ impl MergeFunction for PartialUpdateMergeFunction {
                     }
                     if full_delete {
                         current_delete_row = true;
-                        Self::reset_to_source(
+                        Self::replace_with_source(
                             &mut selected_by_col,
                             aggregators.as_mut().map(|guard| guard.as_mut_slice()),
                             row.batch_idx,
@@ -572,7 +571,7 @@ impl MergeFunction for PartialUpdateMergeFunction {
                 if self.remove_record_on_delete {
                     if kind == RowKind::Delete {
                         current_delete_row = true;
-                        Self::reset_to_source(
+                        Self::replace_with_source(
                             &mut selected_by_col,
                             aggregators.as_mut().map(|guard| guard.as_mut_slice()),
                             row.batch_idx,

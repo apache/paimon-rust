@@ -47,14 +47,16 @@ impl HllSketchAgg {
 }
 
 fn deserialize_for_union(bytes: &[u8]) -> Result<HllSketch, SketchError> {
-    // datasketches-rs 0.2 skips the register bytes of compact HLL arrays,
-    // although Java's compact array has the same register layout as its
-    // noncompact form. Clear the flag so the registers are actually read.
-    if bytes.len() >= 40 && bytes[2] == 7 && bytes[7] & 3 == 2 && bytes[5] & 8 != 0 {
+    // datasketches-rs 0.2 reads HLL_4 auxiliary coupons as a packed list.
+    // Java's updatable form instead stores them in a sparse hash table. It
+    // also skips the registers of compact HLL arrays. Normalize both forms
+    // before handing them to the Rust reader.
+    if bytes.len() >= 40 && bytes[2] == 7 && bytes[7] & 3 == 2 {
         let lg_k = bytes[3];
         if (4..=21).contains(&lg_k) {
             let k = 1usize << lg_k;
-            let register_len = match bytes[7] >> 2 {
+            let hll_type = bytes[7] >> 2;
+            let register_len = match hll_type {
                 0 => k / 2,
                 1 => k * 3 / 4,
                 2 => k,
@@ -62,17 +64,55 @@ fn deserialize_for_union(bytes: &[u8]) -> Result<HllSketch, SketchError> {
             };
             let aux_count = u32::from_le_bytes(bytes[36..40].try_into().unwrap()) as usize;
             if register_len > 0 {
-                if bytes.len() < 40 + register_len + aux_count.saturating_mul(4) {
+                let compact = bytes[5] & 8 != 0;
+                let payload_start = 40 + register_len;
+                let slots = if !compact && hll_type == 0 && aux_count > 0 {
+                    1usize.checked_shl(bytes[4] as u32).ok_or_else(|| {
+                        SketchError::new(
+                            ErrorKind::InvalidData,
+                            "invalid HLL_4 auxiliary table size",
+                        )
+                    })?
+                } else {
+                    aux_count
+                };
+                let payload_end = slots
+                    .checked_mul(4)
+                    .and_then(|len| payload_start.checked_add(len));
+                if payload_end.is_none_or(|end| bytes.len() < end) {
                     return Err(SketchError::new(
                         ErrorKind::InvalidData,
-                        "compact HLL array ends before its registers or auxiliary entries",
+                        "HLL array ends before its registers or auxiliary entries",
                     ));
+                }
+                if !compact && hll_type == 0 && aux_count > 0 {
+                    let mut normalized = bytes[..payload_start].to_vec();
+                    let mut found = 0;
+                    for coupon in bytes[payload_start..payload_end.unwrap()]
+                        .as_chunks::<4>()
+                        .0
+                    {
+                        if *coupon != [0; 4] {
+                            normalized.extend_from_slice(coupon);
+                            found += 1;
+                        }
+                    }
+                    if found != aux_count {
+                        return Err(SketchError::new(
+                            ErrorKind::InvalidData,
+                            "HLL_4 auxiliary table count does not match coupons",
+                        ));
+                    }
+                    return HllSketch::deserialize(&normalized);
+                }
+                if !compact {
+                    return HllSketch::deserialize(bytes);
                 }
                 let mut expanded = bytes.to_vec();
                 expanded[5] &= !8;
                 // The Rust HLL_6 reader requests one extra byte for a safe
                 // packed-register window at the end of the array.
-                if bytes[7] >> 2 == 1 && expanded.len() == 40 + register_len {
+                if hll_type == 1 && expanded.len() == payload_start {
                     expanded.push(0);
                 }
                 return HllSketch::deserialize(&expanded);
@@ -375,6 +415,28 @@ mod tests {
     const JAVA_HLL_SET_A: &str = "AwEHDAYIAAEeAAAAgbxdBsPdUQTEtZ8Hhi/5Dch6JATL18IEfHS5B87wWx/SFnMHWX/UDTWpMQTbUi0EnuSbGK48iBEiO+sF7y33B8HpFwUr8vsGxhlqBG7FNAZGSrcEsFtGEjSiYQ51gWYHNkcJB7g/+Qe4VqkMe2XmCPwtQgr2cfIG";
     const JAVA_HLL_SET_B: &str = "AwEHDAYIAAEeAAAAAiK0BMPdUQTEtZ8HxhlqBMh6JASNxIkJzvBbH4/DsAbOoO8FNkcJB5QHwgSXu2AaWX/UDRq80AXbUi0Eni1qByI76wWTVDEFqnOHFoRpzAVt5R0HbsU0Bu8t9wee5JsYMiViBTWpMQS2LwkGuD/5B7hWqQzXeDQG";
     const JAVA_HLL_SET_UNION: &str = "AwEHDAYIAAEtAAAAgbxdBgIitATD3VEExLWfB4Yv+Q3GGWoEyHokBLhWqQzL18IEjcSJCc7wWx+Pw7AG/C1CCs6g7wXSFnMHk1QxBZQHwgSeLWoHl7tgGkZKtwRZf9QNGrzQBdtSLQSe5JsY9nHyBq48iBEiO+sFwekXBapzhxaEacwFbeUdB27FNAbvLfcHsFtGEjIlYgU0omEOti8JBjWpMQQ2RwkHuD/5B9d4NAZ7ZeYIfHS5Byvy+wZ1gWYH";
+
+    #[test]
+    fn unions_java_updatable_hll4_with_sparse_auxiliary_table() {
+        // Java DataSketches 4.2.0, HLL_4 lgK=16, integers 0..200000.
+        // Its updatable form has 12 coupons in 256 sparse auxiliary slots.
+        let compact = include_bytes!("../goldens/hll_java_compact_aux.bin");
+        let updatable = include_bytes!("../goldens/hll_java_updatable_aux.bin");
+        for bytes in [compact.as_slice(), updatable.as_slice()] {
+            let input = BinaryArray::from(vec![Some(bytes), Some(bytes)]);
+            let mut agg = HllSketchAgg::new(
+                "sketch",
+                &DataType::VarBinary(VarBinaryType::new(65535).unwrap()),
+            )
+            .unwrap();
+            agg.agg(&input, 0).unwrap();
+            agg.agg(&input, 1).unwrap();
+            let output = agg.result().unwrap();
+            let output = output.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let estimate = HllSketch::deserialize(output.value(0)).unwrap().estimate();
+            assert!((estimate - 200552.41133627715).abs() < 1e-6, "{estimate}");
+        }
+    }
 
     #[test]
     fn unions_java_compact_dense_hll_sketches() {

@@ -41,5 +41,11 @@ public class GenerateHllDense {
             Files.write(output.resolve("hll_java_dense" + suffix + "_a.bin"), a.toCompactByteArray());
             Files.write(output.resolve("hll_java_dense" + suffix + "_b.bin"), b.toCompactByteArray());
         }
+        HllSketch updatable = new HllSketch(16, TgtHllType.HLL_4);
+        for (int value = 0; value < 200000; value++) {
+            updatable.update(value);
+        }
+        Files.write(output.resolve("hll_java_updatable_aux.bin"), updatable.toUpdatableByteArray());
+        Files.write(output.resolve("hll_java_compact_aux.bin"), updatable.toCompactByteArray());
     }
 }
