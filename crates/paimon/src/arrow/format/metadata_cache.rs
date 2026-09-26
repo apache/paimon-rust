@@ -1,0 +1,381 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use lru::LruCache;
+use std::future::Future;
+use std::hash::Hash;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::OnceCell;
+
+struct Entry<V> {
+    value: OnceCell<Arc<V>>,
+    base_weight: usize,
+    weight: AtomicUsize,
+    users: AtomicUsize,
+}
+
+struct State<K, V> {
+    entries: LruCache<K, Arc<Entry<V>>>,
+    weight: usize,
+}
+
+pub(super) struct FileMetadataCache<K, V> {
+    max_bytes: usize,
+    max_entries: usize,
+    state: Mutex<State<K, V>>,
+}
+
+struct EntryGuard<'a, K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    cache: &'a FileMetadataCache<K, V>,
+    key: K,
+    entry: Arc<Entry<V>>,
+}
+
+impl<'a, K, V> EntryGuard<'a, K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    fn new(cache: &'a FileMetadataCache<K, V>, key: K, entry: Arc<Entry<V>>) -> Self {
+        Self { cache, key, entry }
+    }
+}
+
+impl<K, V> Drop for EntryGuard<'_, K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    fn drop(&mut self) {
+        self.cache.release(&self.key, &self.entry);
+    }
+}
+
+impl<K, V> FileMetadataCache<K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    pub(super) fn new(max_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            max_bytes,
+            max_entries,
+            state: Mutex::new(State {
+                entries: LruCache::unbounded(),
+                weight: 0,
+            }),
+        }
+    }
+
+    pub(super) fn entry_weight(key_heap_bytes: usize, value_weight: usize) -> usize {
+        std::mem::size_of::<K>()
+            .saturating_add(std::mem::size_of::<Entry<V>>())
+            .saturating_add(key_heap_bytes)
+            .saturating_add(value_weight)
+    }
+
+    pub(super) async fn get_or_try_insert_with<E, F, Fut, W>(
+        &self,
+        key: Option<K>,
+        key_heap_bytes: usize,
+        load: F,
+        value_weight: W,
+    ) -> Result<Arc<V>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<V>, E>>,
+        W: FnOnce(&V) -> usize,
+    {
+        let Some(key) = key else {
+            return load().await;
+        };
+        let base_weight = Self::entry_weight(key_heap_bytes, 0);
+        if self.max_bytes == 0 || base_weight > self.max_bytes {
+            return load().await;
+        }
+
+        let entry = {
+            let mut state = self.state.lock().unwrap();
+            let entry = if let Some(entry) = state.entries.get(&key) {
+                Arc::clone(entry)
+            } else {
+                let entry = Arc::new(Entry {
+                    value: OnceCell::new(),
+                    base_weight,
+                    weight: AtomicUsize::new(base_weight),
+                    users: AtomicUsize::new(0),
+                });
+                state.weight = state.weight.saturating_add(base_weight);
+                state.entries.put(key.clone(), Arc::clone(&entry));
+                entry
+            };
+            entry.users.fetch_add(1, Ordering::Relaxed);
+            entry
+        };
+        let _guard = EntryGuard::new(self, key.clone(), Arc::clone(&entry));
+
+        let value = entry.value.get_or_try_init(load).await.map(Arc::clone)?;
+        let loaded_weight = entry
+            .base_weight
+            .saturating_add(value_weight(value.as_ref()).max(1));
+        let mut state = self.state.lock().unwrap();
+        if state
+            .entries
+            .peek(&key)
+            .is_some_and(|cached| Arc::ptr_eq(cached, &entry))
+            && entry.weight.load(Ordering::Relaxed) == entry.base_weight
+        {
+            if loaded_weight > self.max_bytes {
+                state.entries.pop(&key);
+                state.weight = state.weight.saturating_sub(entry.base_weight);
+                return Ok(value);
+            }
+            entry.weight.store(loaded_weight, Ordering::Relaxed);
+            state.weight = state
+                .weight
+                .saturating_sub(entry.base_weight)
+                .saturating_add(loaded_weight);
+            state.entries.promote(&key);
+            self.evict(&mut state);
+        }
+        Ok(value)
+    }
+
+    fn release(&self, key: &K, entry: &Arc<Entry<V>>) {
+        let mut state = self.state.lock().unwrap();
+        let users = entry.users.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(users > 0);
+        if users == 1
+            && entry.value.get().is_none()
+            && state
+                .entries
+                .peek(key)
+                .is_some_and(|cached| Arc::ptr_eq(cached, entry))
+        {
+            state.entries.pop(key);
+            state.weight = state
+                .weight
+                .saturating_sub(entry.weight.load(Ordering::Relaxed));
+        }
+    }
+
+    fn evict(&self, state: &mut State<K, V>) {
+        while state.weight > self.max_bytes || state.entries.len() > self.max_entries {
+            let Some(key) = state
+                .entries
+                .iter()
+                .rev()
+                .find(|(_, entry)| entry.weight.load(Ordering::Relaxed) != entry.base_weight)
+                .map(|(key, _)| key.clone())
+            else {
+                // In-flight loads remain addressable so callers still coalesce.
+                break;
+            };
+            let Some(entry) = state.entries.pop(&key) else {
+                state.weight = 0;
+                break;
+            };
+            state.weight = state
+                .weight
+                .saturating_sub(entry.weight.load(Ordering::Relaxed));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+    use std::future::pending;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn evicts_least_recently_used_entry_by_count() {
+        let cache = FileMetadataCache::<String, usize>::new(usize::MAX, 2);
+        let loads = AtomicUsize::new(0);
+
+        for key in ["first", "second", "third", "first"] {
+            cache
+                .get_or_try_insert_with(
+                    Some(key.to_string()),
+                    key.len(),
+                    || async {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(Arc::new(1))
+                    },
+                    |_| 1,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(loads.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn removes_cancelled_load() {
+        let cache = Arc::new(FileMetadataCache::<String, usize>::new(1024, 2));
+        let task_cache = Arc::clone(&cache);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            task_cache
+                .get_or_try_insert_with(
+                    Some("cancelled".to_string()),
+                    9,
+                    || async move {
+                        started_tx.send(()).unwrap();
+                        pending::<Result<Arc<usize>, Infallible>>().await
+                    },
+                    |_| 1,
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let state = cache.state.lock().unwrap();
+        assert!(state.entries.is_empty());
+        assert_eq!(state.weight, 0);
+    }
+
+    #[tokio::test]
+    async fn waiter_caches_value_after_initializer_is_cancelled() {
+        let cache = Arc::new(FileMetadataCache::<String, usize>::new(1024, 2));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let first_cache = Arc::clone(&cache);
+        let first_loads = Arc::clone(&loads);
+        let first = tokio::spawn(async move {
+            first_cache
+                .get_or_try_insert_with(
+                    Some("shared".to_string()),
+                    6,
+                    || async move {
+                        first_loads.fetch_add(1, Ordering::Relaxed);
+                        started_tx.send(()).unwrap();
+                        pending::<Result<Arc<usize>, Infallible>>().await
+                    },
+                    |_| 1,
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+
+        let second_cache = Arc::clone(&cache);
+        let second_loads = Arc::clone(&loads);
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(async move {
+            waiting_tx.send(()).unwrap();
+            second_cache
+                .get_or_try_insert_with(
+                    Some("shared".to_string()),
+                    6,
+                    || async move {
+                        second_loads.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(Arc::new(7))
+                    },
+                    |_| 1,
+                )
+                .await
+        });
+        waiting_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let users = cache
+                    .state
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .1
+                    .users
+                    .load(Ordering::Relaxed);
+                if users == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(*second.await.unwrap().unwrap(), 7);
+
+        let third_loads = Arc::clone(&loads);
+        let value = cache
+            .get_or_try_insert_with(
+                Some("shared".to_string()),
+                6,
+                || async move {
+                    third_loads.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, Infallible>(Arc::new(8))
+                },
+                |_| 1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*value, 7);
+        assert_eq!(loads.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_load_does_not_evict_cached_entries() {
+        let cache = FileMetadataCache::<String, usize>::new(512, 2);
+        let small_loads = AtomicUsize::new(0);
+        let oversized_loads = AtomicUsize::new(0);
+
+        for _ in 0..2 {
+            cache
+                .get_or_try_insert_with(
+                    Some("small".to_string()),
+                    5,
+                    || async {
+                        small_loads.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(Arc::new(1))
+                    },
+                    |value| *value,
+                )
+                .await
+                .unwrap();
+
+            cache
+                .get_or_try_insert_with(
+                    Some("oversized".to_string()),
+                    9,
+                    || async {
+                        oversized_loads.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(Arc::new(1024))
+                    },
+                    |value| *value,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(small_loads.load(Ordering::Relaxed), 1);
+        assert_eq!(oversized_loads.load(Ordering::Relaxed), 2);
+    }
+}

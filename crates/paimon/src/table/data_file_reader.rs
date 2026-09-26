@@ -107,6 +107,14 @@ impl FileRead for TimedFileRead {
         self.timing.add_file_read(start.elapsed());
         result
     }
+
+    fn cache_key(&self) -> Option<&str> {
+        self.inner.cache_key()
+    }
+
+    fn file_format_metadata_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.inner.file_format_metadata_cache()
+    }
 }
 
 /// Reads data files through their format-specific readers.

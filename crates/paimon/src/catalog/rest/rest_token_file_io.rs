@@ -31,7 +31,7 @@ use crate::api::rest_util::RESTUtil;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
 use crate::io::cache::LocalCache;
-use crate::io::{FileIO, FileIOProvider};
+use crate::io::{FileFormatMetadataCacheContext, FileIO, FileIOProvider};
 use crate::Result;
 
 use super::rest_token::RESTToken;
@@ -55,6 +55,7 @@ pub struct RESTTokenFileIO {
     state: RwLock<Option<TokenState>>,
     refresh_lock: Mutex<()>,
     local_cache: Option<Arc<LocalCache>>,
+    file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
 }
 
 impl std::fmt::Debug for RESTTokenFileIO {
@@ -73,6 +74,7 @@ impl RESTTokenFileIO {
         catalog_options: Options,
         api: Arc<RESTApi>,
         local_cache: Option<Arc<LocalCache>>,
+        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
     ) -> Self {
         Self {
             identifier,
@@ -82,6 +84,7 @@ impl RESTTokenFileIO {
             state: RwLock::new(None),
             refresh_lock: Mutex::new(()),
             local_cache,
+            file_format_metadata_cache,
         }
     }
 
@@ -121,6 +124,7 @@ impl RESTTokenFileIO {
     fn build_static_file_io(&self, token: &RESTToken) -> Result<FileIO> {
         let merged_props = RESTUtil::merge(Some(self.catalog_options.to_map()), Some(&token.token));
         let mut builder = FileIO::from_path(&self.path)?.with_props(merged_props);
+        builder = builder.with_file_format_metadata_cache(self.file_format_metadata_cache.clone());
         if let Some(local_cache) = &self.local_cache {
             builder = builder.with_local_cache(local_cache.clone());
         }
@@ -229,18 +233,24 @@ mod tests {
         (options, api, requests, server)
     }
 
+    fn metadata_cache(options: &Options) -> Arc<FileFormatMetadataCacheContext> {
+        FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap()
+    }
+
     #[tokio::test]
     async fn test_token_file_io_keeps_catalog_local_cache() {
         let table_directory = tempfile::tempdir().unwrap();
         let (mut options, api, _, server) = token_api().await;
         options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
         let local_cache = create_local_cache(&options).unwrap();
+        let metadata_cache = metadata_cache(&options);
         let token_file_io = Arc::new(RESTTokenFileIO::new(
             Identifier::new("database", "table"),
             table_directory.path().to_string_lossy().into_owned(),
             options,
             api,
             local_cache,
+            metadata_cache,
         ));
 
         let file_io = token_file_io.build_file_io().await.unwrap();
@@ -254,12 +264,14 @@ mod tests {
         let table_directory = tempfile::tempdir().unwrap();
         let file_path = table_directory.path().join("data");
         let (options, api, requests, server) = token_api().await;
+        let metadata_cache = metadata_cache(&options);
         let token_file_io = Arc::new(RESTTokenFileIO::new(
             Identifier::new("database", "table"),
             table_directory.path().to_string_lossy().into_owned(),
             options,
             api,
             None,
+            metadata_cache,
         ));
 
         let file_io = token_file_io.build_file_io().await.unwrap();
@@ -301,12 +313,14 @@ mod tests {
         let file_path = table_directory.path().join("blob");
         std::fs::write(&file_path, b"abcdefghij").unwrap();
         let (options, api, requests, server) = token_api().await;
+        let metadata_cache = metadata_cache(&options);
         let token_file_io = Arc::new(RESTTokenFileIO::new(
             Identifier::new("database", "table"),
             table_directory.path().to_string_lossy().into_owned(),
             options,
             api,
             None,
+            metadata_cache,
         ));
 
         let file_io = token_file_io.build_file_io().await.unwrap();
@@ -329,12 +343,14 @@ mod tests {
         let file_path = table_directory.path().join("blob");
         std::fs::write(&file_path, b"abcdefghij").unwrap();
         let (options, api, requests, server) = token_api().await;
+        let metadata_cache = metadata_cache(&options);
         let token_file_io = Arc::new(RESTTokenFileIO::new(
             Identifier::new("database", "table"),
             table_directory.path().to_string_lossy().into_owned(),
             options,
             api,
             None,
+            metadata_cache,
         ));
 
         let file_io = token_file_io.build_file_io().await.unwrap();
