@@ -1108,6 +1108,7 @@ mod tests {
         stat_requests: Arc<AtomicUsize>,
         list_page_requests: Arc<AtomicUsize>,
         range_requests: Arc<AtomicUsize>,
+        unavailable_requests: Arc<AtomicUsize>,
     }
 
     #[cfg(target_os = "linux")]
@@ -1118,8 +1119,19 @@ mod tests {
         headers: HeaderMap,
     ) -> Response<Body> {
         const DATA: &[u8] = b"0123456789";
-
         if method == Method::HEAD {
+            if uri.path().ends_with("/collision") {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-length", DATA.len())
+                    .header("etag", "\"jindo-test-collision\"")
+                    .header("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT")
+                    .header("x-oss-object-type", "Normal")
+                    .header("x-oss-storage-class", "Standard")
+                    .header("x-oss-request-id", "jindo-test-collision")
+                    .body(Body::empty())
+                    .unwrap();
+            }
             if !uri.path().contains("data.bin") {
                 return Response::builder()
                     .status(StatusCode::NOT_FOUND)
@@ -1142,6 +1154,19 @@ mod tests {
 
         if method == Method::GET {
             if let Some(range) = headers.get("range") {
+                if uri.path().contains("unavailable.bin") {
+                    state.unavailable_requests.fetch_add(1, Ordering::SeqCst);
+                    return Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header("content-type", "application/xml")
+                        .header("x-oss-request-id", "jindo-test-unavailable")
+                        .body(Body::from(
+                            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>ServiceUnavailable</Code><Message>try later</Message>
+<RequestId>jindo-test-unavailable</RequestId></Error>"#,
+                        ))
+                        .unwrap();
+                }
                 state.range_requests.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(range, "bytes=2-5");
                 return Response::builder()
@@ -1158,6 +1183,25 @@ mod tests {
             let parameters = url::form_urlencoded::parse(query.as_bytes())
                 .into_owned()
                 .collect::<HashMap<_, _>>();
+            let prefix = parameters.get("prefix").cloned().unwrap_or_default();
+            if prefix.contains("missing.bin") {
+                let body = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com">
+  <Name>jindo-test-bucket</Name>
+  <Prefix>{prefix}</Prefix>
+  <MaxKeys>1</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+</ListBucketResult>"#
+                );
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/xml")
+                    .header("content-length", body.len())
+                    .header("x-oss-request-id", "jindo-test-empty-list")
+                    .body(Body::from(body))
+                    .unwrap();
+            }
             let marker = parameters.get("marker").cloned();
             let probe = parameters.get("max-keys").map(String::as_str) == Some("1");
             let (key, truncated, next_marker) = if probe {
@@ -1208,7 +1252,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires pyjindosdk"]
-    async fn test_real_sdk_stat_paginated_list_and_range_read() {
+    async fn test_real_sdk_io_and_failure_mapping() {
         let library_path = std::env::var("PAIMON_JINDO_SDK_LIBRARY")
             .expect("PAIMON_JINDO_SDK_LIBRARY must point to the real Jindo SDK");
         let state = OssMockState::default();
@@ -1250,9 +1294,24 @@ mod tests {
         let reader = operator.reader("objects/data.bin").await.unwrap();
         assert_eq!(reader.read(2..6).await.unwrap().to_bytes(), &b"2345"[..]);
 
+        let not_found = operator.stat("objects/missing.bin").await.unwrap_err();
+        assert_eq!(not_found.kind(), ErrorKind::NotFound);
+
+        let reader = operator.reader("objects/unavailable.bin").await.unwrap();
+        let unavailable = reader.read(0..4).await.unwrap_err();
+        assert_eq!(unavailable.kind(), ErrorKind::RateLimited);
+        assert!(unavailable.is_temporary());
+
+        let collision = operator.list("collision/").await.unwrap_err();
+        assert_eq!(collision.kind(), ErrorKind::Unexpected);
+        assert!(collision
+            .to_string()
+            .contains("Jindo list failed with a C++ exception"));
+
         assert_eq!(state.stat_requests.load(Ordering::SeqCst), 1);
         assert_eq!(state.list_page_requests.load(Ordering::SeqCst), 2);
         assert_eq!(state.range_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(state.unavailable_requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
 }

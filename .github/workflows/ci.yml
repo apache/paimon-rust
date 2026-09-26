@@ -332,7 +332,7 @@ jobs:
         if: matrix.suite == 'jindo'
         run: >
           cargo test --locked -p paimon --features storage-jindo --lib
-          io::storage_jindo::tests::test_real_sdk_stat_paginated_list_and_range_read
+          io::storage_jindo::tests::test_real_sdk_io_and_failure_mapping
           -- --ignored --exact
 
       - name: Stop Docker containers
