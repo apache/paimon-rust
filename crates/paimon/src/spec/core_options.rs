@@ -174,6 +174,14 @@ pub(crate) const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
 pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
 const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
 const PK_FULL_TEXT_INDEX_COLUMNS_OPTION: &str = "pk-full-text.index.columns";
+const SNAPSHOT_NUM_RETAINED_MIN_OPTION: &str = "snapshot.num-retained.min";
+const SNAPSHOT_NUM_RETAINED_MAX_OPTION: &str = "snapshot.num-retained.max";
+const SNAPSHOT_TIME_RETAINED_OPTION: &str = "snapshot.time-retained";
+const SNAPSHOT_EXPIRE_LIMIT_OPTION: &str = "snapshot.expire.limit";
+const DEFAULT_SNAPSHOT_NUM_RETAINED_MIN: i32 = 10;
+const DEFAULT_SNAPSHOT_NUM_RETAINED_MAX: i32 = i32::MAX;
+const DEFAULT_SNAPSHOT_TIME_RETAINED_MS: u64 = 60 * 60 * 1000;
+const DEFAULT_SNAPSHOT_EXPIRE_LIMIT: i32 = 50;
 
 /// Merge engine for primary-key tables.
 ///
@@ -1222,6 +1230,59 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_COMMIT_MAX_RETRY_WAIT_MS)
     }
 
+    /// Minimum number of completed snapshots to retain
+    /// (`snapshot.num-retained.min`, default 10). Must be at least 1.
+    pub fn snapshot_num_retained_min(&self) -> crate::Result<i32> {
+        self.positive_i32_option(
+            SNAPSHOT_NUM_RETAINED_MIN_OPTION,
+            DEFAULT_SNAPSHOT_NUM_RETAINED_MIN,
+        )
+    }
+
+    /// Maximum number of completed snapshots to retain
+    /// (`snapshot.num-retained.max`, default unbounded). Must be at least 1.
+    pub fn snapshot_num_retained_max(&self) -> crate::Result<i32> {
+        self.positive_i32_option(
+            SNAPSHOT_NUM_RETAINED_MAX_OPTION,
+            DEFAULT_SNAPSHOT_NUM_RETAINED_MAX,
+        )
+    }
+
+    /// How long a completed snapshot is retained (`snapshot.time-retained`,
+    /// default 1 h), in milliseconds.
+    pub fn snapshot_time_retained_ms(&self) -> crate::Result<u64> {
+        match self.options.get(SNAPSHOT_TIME_RETAINED_OPTION) {
+            None => Ok(DEFAULT_SNAPSHOT_TIME_RETAINED_MS),
+            Some(value) => parse_duration_millis(value).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("Invalid value for {SNAPSHOT_TIME_RETAINED_OPTION}: '{value}'"),
+                source: None,
+            }),
+        }
+    }
+
+    /// Maximum number of snapshots expired in one run (`snapshot.expire.limit`,
+    /// default 50). Must be at least 1.
+    pub fn snapshot_expire_limit(&self) -> crate::Result<i32> {
+        self.positive_i32_option(SNAPSHOT_EXPIRE_LIMIT_OPTION, DEFAULT_SNAPSHOT_EXPIRE_LIMIT)
+    }
+
+    fn positive_i32_option(&self, option_name: &'static str, default: i32) -> crate::Result<i32> {
+        let Some(value) = self.options.get(option_name) else {
+            return Ok(default);
+        };
+        match value.trim().parse::<i32>() {
+            Ok(parsed) if parsed >= 1 => Ok(parsed),
+            Ok(_) => Err(crate::Error::DataInvalid {
+                message: format!("{option_name} must be at least 1, got '{value}'"),
+                source: None,
+            }),
+            Err(e) => Err(crate::Error::DataInvalid {
+                message: format!("Invalid value for {option_name}: '{value}'"),
+                source: Some(Box::new(e)),
+            }),
+        }
+    }
+
     pub fn row_tracking_enabled(&self) -> bool {
         self.options
             .get(ROW_TRACKING_ENABLED_OPTION)
@@ -1848,6 +1909,45 @@ fn parse_duration_millis(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_snapshot_expire_options() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.snapshot_num_retained_min().unwrap(), 10);
+        assert_eq!(core.snapshot_num_retained_max().unwrap(), i32::MAX);
+        assert_eq!(core.snapshot_time_retained_ms().unwrap(), 3_600_000);
+        assert_eq!(core.snapshot_expire_limit().unwrap(), 50);
+
+        let options = HashMap::from([
+            ("snapshot.num-retained.min".to_string(), "2".to_string()),
+            ("snapshot.num-retained.max".to_string(), "5".to_string()),
+            ("snapshot.time-retained".to_string(), "10 min".to_string()),
+            ("snapshot.expire.limit".to_string(), "3".to_string()),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.snapshot_num_retained_min().unwrap(), 2);
+        assert_eq!(core.snapshot_num_retained_max().unwrap(), 5);
+        assert_eq!(core.snapshot_time_retained_ms().unwrap(), 600_000);
+        assert_eq!(core.snapshot_expire_limit().unwrap(), 3);
+
+        for (key, value) in [
+            ("snapshot.num-retained.min", "0"),
+            ("snapshot.num-retained.max", "abc"),
+            ("snapshot.expire.limit", "-1"),
+            ("snapshot.time-retained", "1 fortnight"),
+        ] {
+            let options = HashMap::from([(key.to_string(), value.to_string())]);
+            let core = CoreOptions::new(&options);
+            let result = match key {
+                "snapshot.time-retained" => core.snapshot_time_retained_ms().map(|_| ()),
+                "snapshot.num-retained.min" => core.snapshot_num_retained_min().map(|_| ()),
+                "snapshot.num-retained.max" => core.snapshot_num_retained_max().map(|_| ()),
+                _ => core.snapshot_expire_limit().map(|_| ()),
+            };
+            assert!(result.is_err(), "{key}={value} must be rejected");
+        }
+    }
 
     #[test]
     fn test_read_batch_size() {

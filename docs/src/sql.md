@@ -1096,6 +1096,46 @@ Rollback a table to a specific timestamp:
 CALL sys.rollback_to_timestamp(table => 'paimon.my_db.my_table', timestamp => 1234567890000);
 ```
 
+### expire_snapshots
+
+Expire old snapshots and delete the files that only they reference:
+
+```sql
+CALL sys.expire_snapshots(
+  table => 'paimon.my_db.my_table',
+  retain_max => 10,
+  retain_min => 2,
+  older_than => '2024-01-01 12:00:00',
+  max_deletes => 100
+);
+
+-- Use the table options, overriding them for this call only.
+CALL sys.expire_snapshots(
+  table => 'paimon.my_db.my_table',
+  options => 'snapshot.time-retained=30 min'
+);
+```
+
+It returns `deleted_snapshots_count`. Every argument except `table` is optional
+and falls back to a table option:
+
+| Argument | Table option | Default | Meaning |
+|---|---|---|---|
+| `retain_max` | `snapshot.num-retained.max` | unbounded | Maximum number of snapshots to keep. |
+| `retain_min` | `snapshot.num-retained.min` | `10` | Minimum number of snapshots to keep. |
+| `older_than` | `snapshot.time-retained` | `1 h` | Expire snapshots older than this timestamp (epoch milliseconds, or `yyyy-MM-dd HH:mm:ss[.SSS]` in the local time zone). Without it, the cut-off is now minus `snapshot.time-retained`. |
+| `max_deletes` | `snapshot.expire.limit` | `50` | Maximum number of snapshots to expire in one call. |
+
+A snapshot expires only when every rule allows it: it is outside `retain_min`,
+the snapshot after it is older than the cut-off, and no consumer
+(`consumer-id`) still reads from it. Data files, changelog files, manifests,
+index files and statistics that a remaining snapshot or any tag still uses are
+kept, so tagged snapshots stay readable. Snapshot files are removed last, so an
+interrupted call leaves the table readable and a later call finishes the work.
+This follows Java's `expire_snapshots` procedure; changelog files are expired
+together with their snapshots (`changelog.num-retained.*` and
+`changelog.time-retained` are not applied).
+
 ### create_global_index
 
 Build and commit a global index for a table column:
