@@ -436,7 +436,9 @@ impl TableCommit {
             commit_identifier,
             false,
         )
-        .await
+        .await?;
+        self.maintain().await;
+        Ok(())
     }
 
     /// Overwrite partitions with new data.
