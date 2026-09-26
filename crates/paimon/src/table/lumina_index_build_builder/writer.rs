@@ -23,14 +23,12 @@ use super::LuminaIndexBuildBuilder;
 use crate::lumina::ffi::LuminaBuilder;
 use crate::lumina::{LuminaIndexMeta, LUMINA_IDENTIFIER};
 use crate::spec::{GlobalIndexMeta, IndexFileMeta};
+use crate::table::global_index_build_common::copy_local_file_to_output;
 use crate::table::{CommitMessage, TableCommit};
 use crate::{Error, Result};
-use bytes::Bytes;
-use std::path::{Path, PathBuf};
-use tokio::io::AsyncReadExt;
+use std::path::PathBuf;
 
 const INDEX_DIR: &str = "index";
-const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
 impl LuminaIndexBuildBuilder<'_> {
     pub(super) async fn build_index_file(
@@ -189,34 +187,4 @@ impl Drop for TempFileGuard {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-async fn copy_local_file_to_output(
-    source_path: &Path,
-    output: crate::io::OutputFile,
-) -> Result<()> {
-    let mut source =
-        tokio::fs::File::open(source_path)
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to open temporary Lumina index file: {e}"),
-                source: None,
-            })?;
-    let mut writer = output.writer().await?;
-    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
-
-    loop {
-        let len = source
-            .read(&mut buffer)
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to read temporary Lumina index file: {e}"),
-                source: None,
-            })?;
-        if len == 0 {
-            break;
-        }
-        writer.write(Bytes::copy_from_slice(&buffer[..len])).await?;
-    }
-    writer.close().await
 }
