@@ -1079,3 +1079,79 @@ async fn test_failed_expiration_does_not_fail_the_commit() {
     assert_eq!(snapshot_ids(&table).await, vec![1, 2, 3]);
     assert_eq!(read_ids(&table).await, vec![3]);
 }
+
+#[tokio::test]
+async fn test_every_commit_path_expires() {
+    let keep_one = [
+        ("snapshot.num-retained.min", "1"),
+        ("snapshot.num-retained.max", "1"),
+    ];
+    let latest_only = |table: Table| async move {
+        let ids = snapshot_ids(&table).await;
+        assert_eq!(ids.len(), 1, "{ids:?}");
+    };
+
+    // Truncating the whole table.
+    let table = test_table("memory:/expire_path_truncate", &keep_one, false);
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    TableCommit::new(table.clone(), "u".to_string())
+        .truncate_table()
+        .await
+        .unwrap();
+    latest_only(table.clone()).await;
+    assert_eq!(read_ids(&table).await, Vec::<i32>::new());
+
+    // Dropping a partition.
+    let table = test_table("memory:/expire_path_drop", &keep_one, true);
+    setup_dirs(&table).await;
+    for dt in ["x", "y"] {
+        let messages = write(&table, &[1], dt).await;
+        TableCommit::new(table.clone(), "u".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+    }
+    TableCommit::new(table.clone(), "u".to_string())
+        .drop_partitions(vec![HashMap::from([(
+            "dt".to_string(),
+            Some(crate::spec::Datum::String("x".to_string())),
+        )])])
+        .await
+        .unwrap();
+    latest_only(table.clone()).await;
+    assert_files_match_references(&table).await;
+
+    // Recovery commits through `filter_and_commit`.
+    let table = test_table("memory:/expire_path_filter", &keep_one, false);
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    let messages = write(&table, &[2], "a").await;
+    TableCommit::new(table.clone(), "u".to_string())
+        .filter_and_commit(vec![(7, messages)])
+        .await
+        .unwrap();
+    latest_only(table.clone()).await;
+    assert_eq!(read_ids(&table).await, vec![1, 2]);
+
+    // A global index build commits with `commit_if_latest_snapshot`.
+    let mut options = keep_one.to_vec();
+    options.extend([
+        ("row-tracking.enabled", "true"),
+        ("data-evolution.enabled", "true"),
+        ("global-index.enabled", "true"),
+    ]);
+    let table = test_table("memory:/expire_path_index", &options, false);
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    append(&table, &[2]).await;
+    latest_only(table.clone()).await;
+    table
+        .new_btree_global_index_build_builder()
+        .with_index_column("id")
+        .execute()
+        .await
+        .unwrap();
+    latest_only(table.clone()).await;
+    assert_files_match_references(&table).await;
+}
