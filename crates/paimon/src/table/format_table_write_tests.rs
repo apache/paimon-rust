@@ -761,6 +761,17 @@ async fn java_format_table_formats_round_trip() {
     }
 }
 
+#[test]
+fn orc_rejects_compression_it_cannot_write() {
+    let table = memory_table(
+        "format_orc_unsupported_compression",
+        false,
+        &[("file.format", "orc"), ("file.compression", "zstd")],
+    );
+    let error = table.new_write_builder().new_write().err().unwrap();
+    assert!(error.to_string().contains("ORC compression"), "{error}");
+}
+
 #[tokio::test]
 async fn csv_header_round_trips_and_java_json_string_numbers_are_readable() {
     let csv = memory_table(
@@ -1043,6 +1054,46 @@ async fn csv_reads_java_doubled_and_backslash_quoted_fields() {
         values.iter().collect::<Vec<_>>(),
         [Some("a\"b"), Some("c\"d")]
     );
+}
+
+#[tokio::test]
+async fn csv_blank_lines_have_null_fields_like_java() {
+    let schema = Schema::builder()
+        .column("left", DataType::VarChar(VarCharType::string_type()))
+        .column("right", DataType::VarChar(VarCharType::string_type()))
+        .option("type", "format-table")
+        .option("file.format", "csv")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_java_csv_blank"),
+        "memory:/format_java_csv_blank".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    table
+        .file_io()
+        .new_output(&format!("{}/java.csv", table.location()))
+        .unwrap()
+        .write(Bytes::from_static(b"\n  \na,b\n"))
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    for column in batches[0].columns() {
+        assert!(column.is_null(0));
+        assert!(column.is_null(1));
+    }
 }
 
 #[tokio::test]

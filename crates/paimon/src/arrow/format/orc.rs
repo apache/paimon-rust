@@ -29,20 +29,44 @@ use orc_rust::predicate::PredicateValue;
 use orc_rust::projection::ProjectionMask;
 use orc_rust::reader::AsyncChunkReader;
 use orc_rust::ArrowReaderBuilder;
+use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 
 const ORC_IN_PREDICATE_MAX_LITERALS: usize = 20;
 
 pub(crate) struct OrcFormatReader;
 
-/// `orc-rust` currently exposes a synchronous writer. Keep its encoded output
-/// in a shared buffer and publish it through Paimon's async FileWrite on close.
+const ORC_STRIPE_SIZE: usize = 64 * 1024 * 1024;
+const ORC_WORKER_COUNT: usize = 4;
+static NEXT_ORC_WRITER_ID: AtomicU64 = AtomicU64::new(1);
+static ORC_WORKER_POOL: Mutex<Option<Vec<mpsc::UnboundedSender<WriterCommand>>>> = Mutex::new(None);
+
+/// `orc-rust` exposes a synchronous writer. Drain completed stripes into
+/// Paimon's async FileWrite so a file does not retain every input batch.
 pub(crate) struct OrcFormatWriter {
     schema: SchemaRef,
-    batches: Vec<RecordBatch>,
+    worker: mpsc::UnboundedSender<WriterCommand>,
+    writer_id: u64,
     output: Box<dyn FileWrite>,
     pending_bytes: usize,
+    pending_rows: usize,
+    bytes_written: usize,
+}
+
+enum WriterCommand {
+    Create(u64, SchemaRef, oneshot::Sender<crate::Result<()>>),
+    Write(u64, RecordBatch, oneshot::Sender<crate::Result<()>>),
+    Flush(u64, oneshot::Sender<crate::Result<Vec<u8>>>),
+    Close(u64, oneshot::Sender<crate::Result<Vec<u8>>>),
+    Drop(u64),
+}
+
+struct WorkerWriter {
+    writer: orc_rust::ArrowWriter<SharedBuffer>,
+    encoded: Arc<Mutex<Vec<u8>>>,
 }
 
 #[derive(Clone)]
@@ -87,12 +111,155 @@ impl OrcFormatWriter {
                 });
             }
         }
+        let output = output.writer().await?;
+        let writer_id = NEXT_ORC_WRITER_ID.fetch_add(1, Ordering::Relaxed);
+        let worker = orc_worker(writer_id)?;
+        let (ready_tx, ready_rx) = oneshot::channel();
+        worker
+            .send(WriterCommand::Create(writer_id, schema.clone(), ready_tx))
+            .map_err(|_| worker_stopped())?;
+        ready_rx.await.map_err(|_| worker_stopped())??;
         Ok(Self {
             schema,
-            batches: Vec::new(),
-            output: output.writer().await?,
+            worker,
+            writer_id,
+            output,
             pending_bytes: 0,
+            pending_rows: 0,
+            bytes_written: 0,
         })
+    }
+
+    async fn publish_encoded(&mut self, encoded: Vec<u8>) -> crate::Result<()> {
+        if !encoded.is_empty() {
+            self.bytes_written += encoded.len();
+            self.output.write(Bytes::from(encoded)).await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OrcFormatWriter {
+    fn drop(&mut self) {
+        let _ = self.worker.send(WriterCommand::Drop(self.writer_id));
+    }
+}
+
+fn orc_worker(writer_id: u64) -> crate::Result<mpsc::UnboundedSender<WriterCommand>> {
+    let mut pool = ORC_WORKER_POOL.lock().map_err(|_| worker_stopped())?;
+    if pool.is_none() {
+        let count = std::thread::available_parallelism()
+            .map(|count| count.get().min(ORC_WORKER_COUNT))
+            .unwrap_or(1);
+        let mut workers = Vec::with_capacity(count);
+        for index in 0..count {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            std::thread::Builder::new()
+                .name(format!("paimon-orc-writer-{index}"))
+                .spawn(move || run_orc_worker(receiver))
+                .map_err(|error| Error::UnexpectedError {
+                    message: format!("Failed to start ORC writer worker: {error}"),
+                    source: Some(Box::new(error)),
+                })?;
+            workers.push(sender);
+        }
+        *pool = Some(workers);
+    }
+    let workers = pool.as_mut().unwrap();
+    let index = (writer_id as usize) % workers.len();
+    if workers[index].is_closed() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name(format!("paimon-orc-writer-{index}"))
+            .spawn(move || run_orc_worker(receiver))
+            .map_err(|error| Error::UnexpectedError {
+                message: format!("Failed to restart ORC writer worker: {error}"),
+                source: Some(Box::new(error)),
+            })?;
+        workers[index] = sender;
+    }
+    Ok(workers[index].clone())
+}
+
+fn run_orc_worker(mut commands: mpsc::UnboundedReceiver<WriterCommand>) {
+    let mut writers: HashMap<u64, WorkerWriter> = HashMap::new();
+    while let Some(command) = commands.blocking_recv() {
+        match command {
+            WriterCommand::Create(id, schema, done) => {
+                let encoded = Arc::new(Mutex::new(Vec::new()));
+                let result =
+                    orc_rust::ArrowWriterBuilder::new(SharedBuffer(encoded.clone()), schema)
+                        .with_stripe_byte_size(usize::MAX)
+                        .try_build()
+                        .map_err(|error| Error::DataInvalid {
+                            message: format!("Failed to create ORC writer: {error}"),
+                            source: Some(Box::new(error)),
+                        });
+                if done
+                    .send(result.map(|writer| {
+                        writers.insert(id, WorkerWriter { writer, encoded });
+                    }))
+                    .is_err()
+                {
+                    writers.remove(&id);
+                }
+            }
+            WriterCommand::Write(id, batch, done) => {
+                let result = writers
+                    .get_mut(&id)
+                    .ok_or_else(worker_stopped)
+                    .and_then(|state| {
+                        state
+                            .writer
+                            .write(&batch)
+                            .map_err(|error| Error::DataInvalid {
+                                message: format!("Failed to write ORC batch: {error}"),
+                                source: Some(Box::new(error)),
+                            })
+                    });
+                let _ = done.send(result);
+            }
+            WriterCommand::Flush(id, done) => {
+                let result = writers
+                    .get_mut(&id)
+                    .ok_or_else(worker_stopped)
+                    .and_then(|state| {
+                        state
+                            .writer
+                            .flush_stripe()
+                            .map_err(|error| Error::DataInvalid {
+                                message: format!("Failed to flush ORC stripe: {error}"),
+                                source: Some(Box::new(error)),
+                            })?;
+                        Ok(std::mem::take(&mut *state.encoded.lock().unwrap()))
+                    });
+                let _ = done.send(result);
+            }
+            WriterCommand::Close(id, done) => {
+                let result = writers
+                    .remove(&id)
+                    .ok_or_else(worker_stopped)
+                    .and_then(|state| {
+                        state.writer.close().map_err(|error| Error::DataInvalid {
+                            message: format!("Failed to close ORC writer: {error}"),
+                            source: Some(Box::new(error)),
+                        })?;
+                        let encoded = std::mem::take(&mut *state.encoded.lock().unwrap());
+                        Ok(encoded)
+                    });
+                let _ = done.send(result);
+            }
+            WriterCommand::Drop(id) => {
+                writers.remove(&id);
+            }
+        }
+    }
+}
+
+fn worker_stopped() -> Error {
+    Error::UnexpectedError {
+        message: "ORC writer worker stopped unexpectedly".into(),
+        source: None,
     }
 }
 
@@ -105,48 +272,52 @@ impl FormatFileWriter for OrcFormatWriter {
                 source: None,
             });
         }
-        self.pending_bytes += batch.get_array_memory_size();
-        self.batches.push(batch.clone());
+        let (done, result) = oneshot::channel();
+        self.worker
+            .send(WriterCommand::Write(self.writer_id, batch.clone(), done))
+            .map_err(|_| worker_stopped())?;
+        result.await.map_err(|_| worker_stopped())??;
+        self.pending_bytes = self
+            .pending_bytes
+            .saturating_add(batch.get_array_memory_size());
+        self.pending_rows = self.pending_rows.saturating_add(batch.num_rows());
+        if self.pending_bytes >= ORC_STRIPE_SIZE {
+            self.flush().await?;
+        }
         Ok(())
     }
 
     fn num_bytes(&self) -> usize {
-        self.pending_bytes
+        self.bytes_written.saturating_add(self.pending_bytes)
     }
     fn in_progress_size(&self) -> usize {
         self.pending_bytes
     }
+    fn pending_rows(&self) -> Option<usize> {
+        Some(self.pending_rows)
+    }
     async fn flush(&mut self) -> crate::Result<()> {
+        if self.pending_rows > 0 {
+            let (done, result) = oneshot::channel();
+            self.worker
+                .send(WriterCommand::Flush(self.writer_id, done))
+                .map_err(|_| worker_stopped())?;
+            let encoded = result.await.map_err(|_| worker_stopped())??;
+            self.pending_bytes = 0;
+            self.pending_rows = 0;
+            self.publish_encoded(encoded).await?;
+        }
         Ok(())
     }
     async fn close(mut self: Box<Self>) -> crate::Result<FormatWriteResult> {
-        let encoded = {
-            let bytes = Arc::new(Mutex::new(Vec::new()));
-            let mut writer =
-                orc_rust::ArrowWriterBuilder::new(SharedBuffer(bytes.clone()), self.schema.clone())
-                    .try_build()
-                    .map_err(|e| Error::DataInvalid {
-                        message: format!("Failed to create ORC writer: {e}"),
-                        source: Some(Box::new(e)),
-                    })?;
-            for batch in &self.batches {
-                writer.write(batch).map_err(|e| Error::DataInvalid {
-                    message: format!("Failed to write ORC batch: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-            }
-            writer.close().map_err(|e| Error::DataInvalid {
-                message: format!("Failed to close ORC writer: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-            let encoded = std::mem::take(&mut *bytes.lock().unwrap());
-            encoded
-        };
-        self.batches.clear();
-        let size = encoded.len() as u64;
-        self.output.write(Bytes::from(encoded)).await?;
+        let (done, result) = oneshot::channel();
+        self.worker
+            .send(WriterCommand::Close(self.writer_id, done))
+            .map_err(|_| worker_stopped())?;
+        let encoded = result.await.map_err(|_| worker_stopped())??;
+        self.publish_encoded(encoded).await?;
         self.output.close().await?;
-        Ok(FormatWriteResult::new(size))
+        Ok(FormatWriteResult::new(self.bytes_written as u64))
     }
 }
 
@@ -866,6 +1037,112 @@ mod tests {
         writer.write(batch).unwrap();
         writer.close().unwrap();
         buf
+    }
+
+    #[tokio::test]
+    async fn orc_writer_flushes_stripes_and_accepts_more_rows() {
+        use crate::io::FileIOBuilder;
+        use crate::spec::IntType;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/test_orc_writer_flush.orc";
+        let mut writer = OrcFormatWriter::new(&file_io.new_output(path).unwrap(), schema.clone())
+            .await
+            .unwrap();
+        for ids in [vec![1, 2], vec![3, 4]] {
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(ids))])
+                .unwrap();
+            writer.write(&batch).await.unwrap();
+            assert_eq!(writer.pending_rows(), Some(2));
+            writer.flush().await.unwrap();
+            assert_eq!(writer.pending_rows(), Some(0));
+            assert!(writer.num_bytes() > 0);
+        }
+        Box::new(writer).close().await.unwrap();
+
+        let input = file_io.new_input(path).unwrap();
+        let size = input.metadata().await.unwrap().size;
+        let read_fields = [field(0, "id", DataType::Int(IntType::new()))];
+        let mut stream = OrcFormatReader
+            .read_batch_stream(
+                Box::new(input.reader().await.unwrap()),
+                size,
+                &read_fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            actual.extend(values.values().iter().copied());
+        }
+        assert_eq!(actual, [1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn orc_workers_keep_multiple_open_files_independent() {
+        use crate::io::FileIOBuilder;
+        use crate::spec::IntType;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let mut open = Vec::new();
+        for id in 0..(ORC_WORKER_COUNT * 2) {
+            let path = format!("memory:/test_orc_worker_{id}.orc");
+            let mut writer =
+                OrcFormatWriter::new(&file_io.new_output(&path).unwrap(), schema.clone())
+                    .await
+                    .unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![id as i32]))],
+            )
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            open.push((id, path, writer));
+        }
+        for (id, path, writer) in open {
+            Box::new(writer).close().await.unwrap();
+            let input = file_io.new_input(&path).unwrap();
+            let size = input.metadata().await.unwrap().size;
+            let fields = [field(0, "id", DataType::Int(IntType::new()))];
+            let mut stream = OrcFormatReader
+                .read_batch_stream(
+                    Box::new(input.reader().await.unwrap()),
+                    size,
+                    &fields,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let batch = stream.next().await.unwrap().unwrap();
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(values.value(0), id as i32);
+            assert!(stream.next().await.is_none());
+        }
     }
 
     #[tokio::test]

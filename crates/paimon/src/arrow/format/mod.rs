@@ -501,6 +501,16 @@ pub(crate) async fn create_format_writer(
             blob::BlobFormatWriter::new(output, file_io).await?,
         ))
     } else if lower.ends_with(".orc") {
+        if !matches!(
+            compression.to_ascii_lowercase().as_str(),
+            "" | "none" | "uncompressed"
+        ) {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "ORC compression '{compression}' is not supported by the current writer"
+                ),
+            });
+        }
         Ok(Box::new(orc::OrcFormatWriter::new(output, schema).await?))
     } else if let Some((kind, path_compression)) = text::TextKind::from_path(path) {
         let compression = text::TextCompression::from_name(compression)?;

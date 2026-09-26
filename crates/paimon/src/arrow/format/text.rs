@@ -33,7 +33,7 @@ use base64::Engine;
 use bytes::Bytes;
 use futures::{stream, StreamExt};
 use std::collections::HashMap;
-use std::io::{BufReader, Cursor, Read, Write};
+use std::io::{self, BufReader, Cursor, Read, Write};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,31 +92,6 @@ impl TextCompression {
             "zst" => Some(Self::Zstd),
             _ => None,
         }
-    }
-
-    fn decode(self, input: &[u8]) -> crate::Result<Vec<u8>> {
-        let mut output = Vec::new();
-        match self {
-            Self::None => output.extend_from_slice(input),
-            Self::Gzip => {
-                flate2::read::MultiGzDecoder::new(input)
-                    .read_to_end(&mut output)
-                    .map_err(compression_error)?;
-            }
-            Self::Bzip2 => {
-                bzip2::read::MultiBzDecoder::new(input)
-                    .read_to_end(&mut output)
-                    .map_err(compression_error)?;
-            }
-            Self::Deflate => {
-                flate2::read::ZlibDecoder::new(input)
-                    .read_to_end(&mut output)
-                    .map_err(compression_error)?;
-            }
-            Self::Snappy | Self::Lz4 => return decode_hadoop_blocks(input, self),
-            Self::Zstd => output = zstd::stream::decode_all(input).map_err(compression_error)?,
-        };
-        Ok(output)
     }
 }
 
@@ -257,72 +232,134 @@ fn encode_hadoop_blocks(input: &[u8], codec: TextCompression) -> crate::Result<V
     Ok(output)
 }
 
-fn decode_hadoop_blocks(input: &[u8], codec: TextCompression) -> crate::Result<Vec<u8>> {
-    let mut position = 0;
-    let mut output = Vec::new();
-    while position < input.len() {
-        let original_size = read_block_length(input, &mut position)?;
-        if original_size == 0 {
-            if position != input.len() {
-                return Err(invalid_block("bytes after final block"));
-            }
-            return Ok(output);
-        }
-        let block_end = output
-            .len()
-            .checked_add(original_size)
-            .ok_or_else(|| invalid_block("block size overflow"))?;
-        while output.len() < block_end {
-            let compressed_size = read_block_length(input, &mut position)?;
-            if compressed_size == 0 || compressed_size > input.len() - position {
-                return Err(invalid_block("invalid compressed chunk length"));
-            }
-            let chunk = &input[position..position + compressed_size];
-            position += compressed_size;
-            let decoded = match codec {
-                TextCompression::Snappy => snap::raw::Decoder::new()
-                    .decompress_vec(chunk)
-                    .map_err(|error| Error::DataInvalid {
-                        message: format!("Invalid Snappy block: {error}"),
-                        source: Some(Box::new(error)),
-                    })?,
-                TextCompression::Lz4 => {
-                    lz4_flex::block::decompress(chunk, block_end - output.len()).map_err(
-                        |error| Error::DataInvalid {
-                            message: format!("Invalid LZ4 block: {error}"),
-                            source: Some(Box::new(error)),
-                        },
-                    )?
-                }
-                _ => unreachable!(),
-            };
-            if decoded.is_empty() || decoded.len() > block_end - output.len() {
-                return Err(invalid_block("decompressed chunk exceeds block length"));
-            }
-            output.extend_from_slice(&decoded);
+/// Decode one Hadoop block at a time. A malformed length must not allocate an
+/// attacker-controlled amount of memory before the file can be rejected.
+struct HadoopBlockReader<R> {
+    reader: R,
+    codec: TextCompression,
+    block: Vec<u8>,
+    position: usize,
+    finished: bool,
+}
+
+impl<R: Read> HadoopBlockReader<R> {
+    fn new(reader: R, codec: TextCompression) -> Self {
+        Self {
+            reader,
+            codec,
+            block: Vec::new(),
+            position: 0,
+            finished: false,
         }
     }
-    Ok(output)
+
+    fn load_block(&mut self) -> io::Result<()> {
+        const MAX_BLOCK_SIZE: usize = 64 * 1024 * 1024;
+        let mut length = [0; 4];
+        if self.reader.read(&mut length[..1])? == 0 {
+            self.finished = true;
+            return Ok(());
+        }
+        self.reader.read_exact(&mut length[1..])?;
+        let original_size = u32::from_be_bytes(length) as usize;
+        if original_size == 0 {
+            if self.reader.read(&mut length[..1])? != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bytes after final block",
+                ));
+            }
+            self.finished = true;
+            return Ok(());
+        }
+        if original_size > MAX_BLOCK_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Hadoop block is too large",
+            ));
+        }
+        self.block.clear();
+        while self.block.len() < original_size {
+            self.reader.read_exact(&mut length)?;
+            let compressed_size = u32::from_be_bytes(length) as usize;
+            if compressed_size == 0 || compressed_size > MAX_BLOCK_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid compressed chunk length",
+                ));
+            }
+            let mut compressed = vec![0; compressed_size];
+            self.reader.read_exact(&mut compressed)?;
+            let remaining = original_size - self.block.len();
+            let decoded = match self.codec {
+                TextCompression::Snappy => {
+                    let decoded_len = snap::raw::decompress_len(&compressed)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    if decoded_len > remaining {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Snappy chunk exceeds block length",
+                        ));
+                    }
+                    snap::raw::Decoder::new()
+                        .decompress_vec(&compressed)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                }
+                TextCompression::Lz4 => lz4_flex::block::decompress(&compressed, remaining)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                _ => unreachable!(),
+            };
+            if decoded.is_empty() || decoded.len() > remaining {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "decoded chunk exceeds block length",
+                ));
+            }
+            self.block.extend_from_slice(&decoded);
+        }
+        self.position = 0;
+        Ok(())
+    }
 }
 
-fn read_block_length(input: &[u8], position: &mut usize) -> crate::Result<usize> {
-    let bytes = input
-        .get(*position..*position + 4)
-        .ok_or_else(|| invalid_block("truncated length"))?;
-    *position += 4;
-    Ok(u32::from_be_bytes(bytes.try_into().unwrap()) as usize)
-}
-
-fn invalid_block(message: &str) -> Error {
-    Error::DataInvalid {
-        message: format!("Invalid Hadoop compressed text block: {message}"),
-        source: None,
+impl<R: Read> Read for HadoopBlockReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.position == self.block.len() && !self.finished {
+            self.load_block()?;
+        }
+        if self.finished {
+            return Ok(0);
+        }
+        let size = output.len().min(self.block.len() - self.position);
+        output[..size].copy_from_slice(&self.block[self.position..self.position + size]);
+        self.position += size;
+        Ok(size)
     }
 }
 
 #[cfg(test)]
 mod compression_tests {
     use super::*;
+    use crate::spec::{DataType as PaimonDataType, VarCharType};
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountedReader {
+        bytes: Bytes,
+        read_bytes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl FileRead for CountedReader {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            self.read_bytes
+                .fetch_add((range.end - range.start) as usize, Ordering::SeqCst);
+            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+    }
 
     #[test]
     fn hadoop_block_codecs_read_multiple_blocks_and_reject_truncation() {
@@ -332,10 +369,80 @@ mod compression_tests {
         for codec in [TextCompression::Snappy, TextCompression::Lz4] {
             let mut encoded = encode_hadoop_blocks(&input, codec).unwrap();
             encoded.extend_from_slice(&0_u32.to_be_bytes());
-            assert_eq!(codec.decode(&encoded).unwrap(), input);
+            let mut streamed = Vec::new();
+            HadoopBlockReader::new(Cursor::new(&encoded), codec)
+                .read_to_end(&mut streamed)
+                .unwrap();
+            assert_eq!(streamed, input);
             encoded.truncate(encoded.len() - 2);
-            assert!(codec.decode(&encoded).is_err());
+            assert!(HadoopBlockReader::new(Cursor::new(&encoded), codec)
+                .read_to_end(&mut Vec::new())
+                .is_err());
         }
+    }
+
+    #[test]
+    fn reads_hadoop_342_java_codec_outputs() {
+        // Produced by Hadoop 3.4.2 SnappyCodec and Lz4Codec from the same input.
+        // Hadoop does not add an explicit terminal block in these files.
+        let expected = [b"hello,payload\n".repeat(20), (0..16).collect::<Vec<_>>()].concat();
+        for (codec, encoded) in [
+            (
+                TextCompression::Snappy,
+                "0000012800000030a8023468656c6c6f2c7061796c6f61640afe0e00fe0e00fe0e00fe0e00190e3c000102030405060708090a0b0c0d0e0f",
+            ),
+            (
+                TextCompression::Lz4,
+                "0000012800000024ef68656c6c6f2c7061796c6f61640a0e00f7f001000102030405060708090a0b0c0d0e0f",
+            ),
+        ] {
+            let encoded = hex::decode(encoded).unwrap();
+            let mut actual = Vec::new();
+            HadoopBlockReader::new(Cursor::new(encoded), codec)
+                .read_to_end(&mut actual)
+                .unwrap();
+            assert_eq!(actual, expected, "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn line_delimiter_crosses_read_chunk_boundary() {
+        let mut input = vec![b'a'; 64 * 1024 - 1];
+        input.extend_from_slice(b"||tail||");
+        let mut lines = DelimitedLines::new(Cursor::new(input), "||");
+        assert_eq!(lines.next_line().unwrap().unwrap().len(), 64 * 1024 - 1);
+        assert_eq!(lines.next_line().unwrap().unwrap(), b"tail");
+        assert!(lines.next_line().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn text_reader_emits_first_batch_before_reading_whole_file() {
+        let bytes = Bytes::from("row\n".repeat(250_000));
+        let size = bytes.len();
+        let read_bytes = Arc::new(AtomicUsize::new(0));
+        let reader =
+            TextFormatReader::new(TextKind::Text, TextCompression::None, &HashMap::new()).unwrap();
+        let fields = [DataField::new(
+            0,
+            "line".to_string(),
+            PaimonDataType::VarChar(VarCharType::string_type()),
+        )];
+        let mut stream = reader
+            .read_batch_stream(
+                Box::new(CountedReader {
+                    bytes,
+                    read_bytes: read_bytes.clone(),
+                }),
+                size as u64,
+                &fields,
+                None,
+                Some(1024),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), 1024);
+        assert!(read_bytes.load(Ordering::SeqCst) < size / 2);
     }
 }
 
@@ -438,127 +545,249 @@ impl FormatFileReader for TextFormatReader {
                 message: "Row selection is not supported for line-oriented formats".into(),
             });
         }
-        let bytes = self.compression.decode(&reader.read(0..file_size).await?)?;
         let fields = crate::arrow::residual::widen_scan_fields(read_fields, predicates);
         let schema = build_target_arrow_schema(&fields)?;
-        if matches!(self.kind, TextKind::Csv) {
-            validate_csv_schema(&schema)?;
+        match self.kind {
+            TextKind::Csv => validate_csv_schema(&schema)?,
+            TextKind::Text => validate_text_schema(&schema)?,
+            TextKind::Json => {}
         }
-        let normalized =
-            if self.options.line_delimiter == "\n" || !matches!(self.kind, TextKind::Json) {
-                bytes.to_vec()
-            } else {
-                String::from_utf8(bytes.to_vec())
-                    .map_err(|e| Error::DataInvalid {
-                        message: format!("Invalid UTF-8 in text file: {e}"),
-                        source: Some(Box::new(e)),
-                    })?
-                    .replace(&self.options.line_delimiter, "\n")
-                    .into_bytes()
-            };
-        let normalized = if matches!(self.kind, TextKind::Json) {
-            transform_json_lines(&normalized, &schema, false)?
-        } else {
-            normalized
-        };
+        let kind = self.kind;
+        let compression = self.compression;
+        let options = self.options.clone();
         let size = batch_size.unwrap_or(1024).max(1);
-        let batches = match self.kind {
-            TextKind::Csv => {
-                let content = String::from_utf8(normalized).map_err(|e| Error::DataInvalid {
-                    message: format!("Invalid UTF-8 in CSV file: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-                let lines = content.split_terminator(&self.options.line_delimiter);
-                let rows = lines
-                    .skip(usize::from(self.options.header))
-                    .map(|line| {
-                        let line = if self.options.line_delimiter == "\n" {
-                            line.strip_suffix('\r').unwrap_or(line)
-                        } else {
-                            line
-                        };
-                        let row = parse_csv_line(line, &self.options)?;
-                        if row.len() != schema.fields().len() {
-                            return Err(Error::DataInvalid {
-                                message: format!(
-                                    "CSV row has {} fields, expected {}",
-                                    row.len(),
-                                    schema.fields().len()
-                                ),
-                                source: None,
-                            });
-                        }
-                        Ok(row)
-                    })
-                    .collect::<crate::Result<Vec<_>>>()?;
-                rows.chunks(size)
-                    .map(|chunk| {
-                        let columns = schema
-                            .fields()
-                            .iter()
-                            .enumerate()
-                            .map(|(index, field)| {
-                                let strings: ArrayRef = Arc::new(StringArray::from_iter(
-                                    chunk
-                                        .iter()
-                                        .map(|row: &Vec<Option<String>>| row[index].as_deref()),
-                                ));
-                                csv_cast_column(&strings, field.data_type())
-                            })
-                            .collect::<crate::Result<Vec<_>>>()?;
-                        RecordBatch::try_new(schema.clone(), columns).map_err(arrow_error)
-                    })
-                    .collect::<crate::Result<Vec<_>>>()?
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let chunks = stream::try_unfold((reader, 0_u64), move |(reader, start)| async move {
+            if start >= file_size {
+                return Ok::<_, io::Error>(None);
             }
-            TextKind::Json => arrow_json::ReaderBuilder::new(schema)
-                .with_batch_size(size)
-                .build(BufReader::new(Cursor::new(normalized)))
-                .map_err(arrow_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(arrow_error)?,
-            TextKind::Text => {
-                validate_text_schema(&schema)?;
-                let lines = String::from_utf8(normalized).map_err(|e| Error::DataInvalid {
-                    message: format!("Invalid UTF-8 in text file: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
-                lines
-                    .split_terminator(&self.options.line_delimiter)
-                    .map(|line| {
-                        if self.options.line_delimiter == "\n" {
-                            line.strip_suffix('\r').unwrap_or(line)
-                        } else {
-                            line
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .chunks(size)
-                    .map(|chunk| {
-                        RecordBatch::try_new(
-                            schema.clone(),
-                            vec![Arc::new(StringArray::from(chunk.to_vec()))],
-                        )
-                        .map_err(arrow_error)
-                    })
-                    .collect::<crate::Result<Vec<_>>>()?
+            let end = start.saturating_add(64 * 1024).min(file_size);
+            let bytes = reader.read(start..end).await.map_err(io::Error::other)?;
+            if bytes.len() != (end - start) as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "text file changed while reading",
+                ));
             }
-        };
+            Ok(Some((bytes, (reader, end))))
+        });
+        let source =
+            tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(Box::pin(chunks)));
+        tokio::task::spawn_blocking(move || {
+            let source: Box<dyn Read> = match compression {
+                TextCompression::None => Box::new(source),
+                TextCompression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(source)),
+                TextCompression::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(source)),
+                TextCompression::Deflate => Box::new(flate2::read::ZlibDecoder::new(source)),
+                TextCompression::Snappy | TextCompression::Lz4 => {
+                    Box::new(HadoopBlockReader::new(source, compression))
+                }
+                TextCompression::Zstd => match zstd::stream::read::Decoder::new(source) {
+                    Ok(decoder) => Box::new(decoder),
+                    Err(error) => {
+                        let _ = sender.blocking_send(Err(compression_error(error)));
+                        return;
+                    }
+                },
+            };
+            if let Err(error) = decode_text_batches(source, kind, options, schema, size, &sender) {
+                let _ = sender.blocking_send(Err(error));
+            }
+        });
         let predicates = predicates.map(|fp| FilePredicates {
             predicates: fp.predicates.clone(),
             row_filter_factory: None,
             file_fields: fp.file_fields.clone(),
         });
-        Ok(stream::iter(
-            batches
-                .into_iter()
-                .map(move |batch| match predicates.as_ref() {
-                    Some(fp) => crate::arrow::residual::filter_record_batch_by_predicates(
-                        batch, fp, &fields,
-                    ),
-                    None => Ok(batch),
-                }),
-        )
+        Ok(stream::unfold(receiver, |mut receiver| async {
+            receiver.recv().await.map(|batch| (batch, receiver))
+        })
+        .map(move |batch| {
+            let batch = batch?;
+            match predicates.as_ref() {
+                Some(fp) => {
+                    crate::arrow::residual::filter_record_batch_by_predicates(batch, fp, &fields)
+                }
+                None => Ok(batch),
+            }
+        })
         .boxed())
+    }
+}
+
+struct DelimitedLines<R> {
+    reader: BufReader<R>,
+    delimiter: Vec<u8>,
+    pending: Vec<u8>,
+    search_from: usize,
+    eof: bool,
+}
+
+impl<R: Read> DelimitedLines<R> {
+    fn new(reader: R, delimiter: &str) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            delimiter: delimiter.as_bytes().to_vec(),
+            pending: Vec::new(),
+            search_from: 0,
+            eof: false,
+        }
+    }
+
+    fn next_line(&mut self) -> io::Result<Option<Vec<u8>>> {
+        loop {
+            if let Some(relative) = self.pending[self.search_from..]
+                .windows(self.delimiter.len())
+                .position(|window| window == self.delimiter)
+            {
+                let position = self.search_from + relative;
+                let rest = self.pending.split_off(position + self.delimiter.len());
+                let mut line = std::mem::replace(&mut self.pending, rest);
+                line.truncate(position);
+                self.search_from = 0;
+                return Ok(Some(line));
+            }
+            if self.eof {
+                return Ok((!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending)));
+            }
+            self.search_from = self
+                .pending
+                .len()
+                .saturating_sub(self.delimiter.len().saturating_sub(1));
+            let mut buffer = [0; 64 * 1024];
+            let read = self.reader.read(&mut buffer)?;
+            if read == 0 {
+                self.eof = true;
+            } else {
+                self.pending.extend_from_slice(&buffer[..read]);
+            }
+        }
+    }
+}
+
+fn decode_text_batches(
+    source: Box<dyn Read>,
+    kind: TextKind,
+    options: TextOptions,
+    schema: SchemaRef,
+    size: usize,
+    sender: &tokio::sync::mpsc::Sender<crate::Result<RecordBatch>>,
+) -> crate::Result<()> {
+    let mut lines = DelimitedLines::new(source, &options.line_delimiter);
+    let mut first_line = true;
+    loop {
+        let mut chunk = Vec::new();
+        while chunk.len() < size {
+            let Some(mut line) = lines.next_line().map_err(text_read_error)? else {
+                break;
+            };
+            if first_line && kind == TextKind::Csv && options.header {
+                first_line = false;
+                continue;
+            }
+            first_line = false;
+            if options.line_delimiter == "\n" && line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            chunk.push(line);
+        }
+        if chunk.is_empty() {
+            break;
+        }
+        for batch in decode_text_chunk(&chunk, kind, &options, &schema)? {
+            if sender.blocking_send(Ok(batch)).is_err() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_text_chunk(
+    lines: &[Vec<u8>],
+    kind: TextKind,
+    options: &TextOptions,
+    schema: &SchemaRef,
+) -> crate::Result<Vec<RecordBatch>> {
+    match kind {
+        TextKind::Csv => {
+            let rows = lines
+                .iter()
+                .map(|line| {
+                    let line = std::str::from_utf8(line).map_err(|e| Error::DataInvalid {
+                        message: format!("Invalid UTF-8 in CSV file: {e}"),
+                        source: Some(Box::new(e)),
+                    })?;
+                    let row = if line.trim().is_empty() {
+                        vec![None; schema.fields().len()]
+                    } else {
+                        parse_csv_line(line, options)?
+                    };
+                    if row.len() != schema.fields().len() {
+                        return Err(Error::DataInvalid {
+                            message: format!(
+                                "CSV row has {} fields, expected {}",
+                                row.len(),
+                                schema.fields().len()
+                            ),
+                            source: None,
+                        });
+                    }
+                    Ok(row)
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            let columns = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let strings: ArrayRef = Arc::new(StringArray::from_iter(
+                        rows.iter().map(|row| row[index].as_deref()),
+                    ));
+                    csv_cast_column(&strings, field.data_type())
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(vec![
+                RecordBatch::try_new(schema.clone(), columns).map_err(arrow_error)?
+            ])
+        }
+        TextKind::Json => {
+            let mut input = Vec::new();
+            for line in lines {
+                input.extend_from_slice(line);
+                input.push(b'\n');
+            }
+            let normalized = transform_json_lines(&input, schema, false)?;
+            arrow_json::ReaderBuilder::new(schema.clone())
+                .with_batch_size(lines.len())
+                .build(BufReader::new(Cursor::new(normalized)))
+                .map_err(arrow_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(arrow_error)
+        }
+        TextKind::Text => {
+            let strings = lines
+                .iter()
+                .map(|line| {
+                    std::str::from_utf8(line).map_err(|e| Error::DataInvalid {
+                        message: format!("Invalid UTF-8 in text file: {e}"),
+                        source: Some(Box::new(e)),
+                    })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(vec![RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(strings))],
+            )
+            .map_err(arrow_error)?])
+        }
+    }
+}
+
+fn text_read_error(error: io::Error) -> Error {
+    Error::DataInvalid {
+        message: format!("Failed to read line-oriented format: {error}"),
+        source: Some(Box::new(error)),
     }
 }
 

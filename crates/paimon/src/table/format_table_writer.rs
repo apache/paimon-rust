@@ -145,6 +145,18 @@ impl FormatTableWriter {
             });
         }
         let compression = format_table_compression(schema.options(), &format);
+        if format == "orc"
+            && !matches!(
+                compression.to_ascii_lowercase().as_str(),
+                "" | "none" | "uncompressed"
+            )
+        {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "ORC compression '{compression}' is not supported by the current writer"
+                ),
+            });
+        }
         let extension = if matches!(format.as_str(), "csv" | "json" | "text") {
             match TextCompression::from_name(&compression)?.extension() {
                 Some(codec_extension) => format!("{extension}.{codec_extension}"),
@@ -465,9 +477,12 @@ fn format_table_compression(options: &HashMap<String, String>, format: &str) -> 
         .or_else(|| options.get("compression"))
         .cloned()
         .unwrap_or_else(|| {
+            // Java defaults ORC to zstd, but orc-rust 0.8 writes only
+            // uncompressed ORC. Keep the Rust default truthful until the
+            // writer supports that codec; explicit codecs are rejected above.
             match format {
                 "parquet" => "snappy",
-                "orc" | "avro" | "mosaic" => "zstd",
+                "avro" | "mosaic" => "zstd",
                 _ => "none",
             }
             .to_string()
