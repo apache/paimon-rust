@@ -1078,12 +1078,6 @@ fn prune_data_type(
                         nested_field_enabled,
                     )? {
                         fields.push(data_field_with_type(data_field, pruned_type));
-                    } else {
-                        // This direct sub-ROW exists in the file, but all of
-                        // its requested descendants were added later. Read an
-                        // older sibling under it to retain every ancestor's
-                        // row-level NULL buffer.
-                        fields.push(data_field.clone());
                     }
                 }
             }
@@ -1549,14 +1543,14 @@ mod row_tests {
 
     #[test]
     fn projected_added_leaf_reads_older_siblings_for_each_row_null_buffer() {
+        let existing = field(3, "existing", DataType::Int(IntType::new()));
         let old_sub = field(
             2,
             "sub",
-            DataType::Row(RowType::new(vec![field(
-                3,
-                "existing",
-                DataType::Int(IntType::new()),
-            )])),
+            DataType::Row(RowType::new(vec![
+                existing.clone(),
+                field(6, "unneeded", DataType::Int(IntType::new())),
+            ])),
         );
         let file_profile = field(
             1,
@@ -1584,7 +1578,44 @@ mod row_tests {
         let DataType::Row(profile) = pruned[0].data_type() else {
             panic!("profile should remain a ROW")
         };
-        assert_eq!(profile.fields(), &[old_sub]);
+        assert_eq!(
+            profile.fields(),
+            &[field(2, "sub", DataType::Row(RowType::new(vec![existing])))]
+        );
+    }
+
+    #[test]
+    fn disabled_nested_mode_does_not_preserve_deep_hidden_anchor() {
+        let file_profile = field(
+            1,
+            "profile",
+            DataType::Row(RowType::new(vec![field(
+                2,
+                "sub",
+                DataType::Row(RowType::new(vec![field(
+                    3,
+                    "old",
+                    DataType::Int(IntType::new()),
+                )])),
+            )])),
+        );
+        let read_profile = field(
+            1,
+            "profile",
+            DataType::Row(RowType::new(vec![field(
+                2,
+                "sub",
+                DataType::Row(RowType::new(vec![field(
+                    4,
+                    "added",
+                    DataType::Int(IntType::new()),
+                )])),
+            )])),
+        );
+
+        assert!(read_data_fields(&[file_profile], &[read_profile], false)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

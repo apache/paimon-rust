@@ -86,7 +86,11 @@ pub(super) fn project_by_paths(fields: &[DataField], paths: &[String]) -> Result
 /// Java `collectLeafPaths` only emits a top-level field or one direct child
 /// of a ROW. A deeper partial ROW could be decoded but cannot be assembled
 /// from independently written files, so reject it before creating data files.
-pub(super) fn validate_write_paths(fields: &[DataField], paths: &[String]) -> Result<()> {
+pub(super) fn validate_write_paths(
+    fields: &[DataField],
+    paths: &[String],
+    nested_field_enabled: bool,
+) -> Result<()> {
     let mut seen = HashSet::new();
     let whole = paths
         .iter()
@@ -101,6 +105,16 @@ pub(super) fn validate_write_paths(fields: &[DataField], paths: &[String]) -> Re
             });
         }
         if whole.contains(path.as_str()) {
+            // `project_by_paths` must prefer an exact top-level name when
+            // decoding existing files. A string-only write API cannot tell
+            // that name apart from an equally named nested SET target.
+            if nested_field_enabled && ambiguous_nested_write_path(fields, path) {
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "Ambiguous data-evolution write path '{path}': it names both a top-level column and a nested field"
+                    ),
+                });
+            }
             continue;
         }
         let Some((head, child)) = path.split_once('.') else {
@@ -134,6 +148,23 @@ pub(super) fn validate_write_paths(fields: &[DataField], paths: &[String]) -> Re
         }
     }
     Ok(())
+}
+
+fn ambiguous_nested_write_path(fields: &[DataField], path: &str) -> bool {
+    let Some((head, child)) = path.split_once('.') else {
+        return false;
+    };
+    if child.contains('.') {
+        return false;
+    }
+    fields
+        .iter()
+        .find(|field| field.name() == head)
+        .and_then(|field| match field.data_type() {
+            DataType::Row(row) => Some(row),
+            _ => None,
+        })
+        .is_some_and(|row| row.fields().iter().any(|field| field.name() == child))
 }
 
 pub(super) fn field_with_type(field: &DataField, data_type: DataType) -> DataField {
@@ -265,9 +296,9 @@ mod tests {
                 )])),
             )])),
         )];
-        validate_write_paths(&nested, &["profile.address".into()]).unwrap();
+        validate_write_paths(&nested, &["profile.address".into()], true).unwrap();
         assert!(matches!(
-            validate_write_paths(&nested, &["profile.address.zip".into()]),
+            validate_write_paths(&nested, &["profile.address.zip".into()], true),
             Err(Error::Unsupported { .. })
         ));
     }
@@ -280,8 +311,28 @@ mod tests {
             vec!["profile".into(), "profile.age".into()],
             vec!["profile.age".into(), "profile".into()],
         ] {
-            assert!(validate_write_paths(&fields, &paths).is_err());
+            assert!(validate_write_paths(&fields, &paths, true).is_err());
         }
-        validate_write_paths(&fields, &["profile.age".into(), "profile.name".into()]).unwrap();
+        validate_write_paths(
+            &fields,
+            &["profile.age".into(), "profile.name".into()],
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn write_paths_reject_top_level_and_nested_name_collision_only_when_enabled() {
+        let fields = fields();
+        let path = ["profile.name".to_string()];
+        assert!(matches!(
+            validate_write_paths(&fields, &path, true),
+            Err(Error::Unsupported { .. })
+        ));
+        validate_write_paths(&fields, &path, false).unwrap();
+
+        // Physical file decoding keeps Java's exact top-level name precedence.
+        let selected = project_by_paths(&fields, &path).unwrap();
+        assert_eq!(selected[0].id(), 5);
     }
 }

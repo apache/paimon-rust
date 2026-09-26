@@ -111,7 +111,11 @@ impl DataEvolutionWriter {
             });
         }
 
-        super::data_evolution_fields::validate_write_paths(schema.fields(), &update_columns)?;
+        super::data_evolution_fields::validate_write_paths(
+            schema.fields(),
+            &update_columns,
+            core_options.data_evolution_nested_field_enabled(),
+        )?;
         let write_fields =
             super::data_evolution_fields::project_by_paths(schema.fields(), &update_columns)?;
         if !core_options.data_evolution_nested_field_enabled()
@@ -1170,7 +1174,11 @@ impl DataEvolutionPartialWriter {
                 source: None,
             });
         }
-        super::data_evolution_fields::validate_write_paths(fields, write_columns)?;
+        super::data_evolution_fields::validate_write_paths(
+            fields,
+            write_columns,
+            core_options.data_evolution_nested_field_enabled(),
+        )?;
         let projected = super::data_evolution_fields::project_by_paths(fields, write_columns)?;
         let mut normal_fields = Vec::new();
         let mut normal_indices = Vec::new();
@@ -1475,6 +1483,38 @@ mod tests {
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
+    }
+
+    #[test]
+    fn nested_update_rejects_ambiguous_top_level_name() {
+        let profile = DataType::Row(RowType::new(vec![DataField::new(
+            0,
+            "age".to_string(),
+            DataType::Int(IntType::new()),
+        )]));
+        let schema = Schema::builder()
+            .column("profile", profile)
+            .column("profile.age", DataType::Int(IntType::new()))
+            .option("bucket", "-1")
+            .option("data-evolution.enabled", "true")
+            .option("data-evolution.nested-field.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "ambiguous_nested_update"),
+            "memory:/ambiguous_nested_update".to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        let error = DataEvolutionWriter::new(&table, vec!["profile.age".into()])
+            .err()
+            .expect("ambiguous write path must fail before writing");
+        assert!(error
+            .to_string()
+            .contains("Ambiguous data-evolution write path"));
     }
 
     fn nested_profile_batch(
