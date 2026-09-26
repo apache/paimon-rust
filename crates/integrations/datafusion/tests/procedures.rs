@@ -947,6 +947,16 @@ async fn test_expire_snapshots_procedure() {
     );
     assert_eq!(snapshot_ids(&sql_context, "exp").await, vec![3, 4]);
 
+    // older_than as a local timestamp string; nothing is below retain_min.
+    assert_eq!(
+        expire_count(
+            &sql_context,
+            "CALL sys.expire_snapshots(table => 'test_db.exp', older_than => '2999-01-01 00:00:00', retain_min => 2)",
+        )
+        .await,
+        0
+    );
+
     // Dynamic table options apply to this call.
     assert_eq!(
         expire_count(
