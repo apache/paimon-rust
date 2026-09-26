@@ -3344,7 +3344,8 @@ mod tests {
     #[test]
     fn test_aggregation_schema_validation_rejects_unsupported_options() {
         for (key, value) in [
-            ("ignore-delete", "true"),
+            ("aggregation.ignore-delete", "true"),
+            ("fields.value.ignore-delete", "true"),
             ("fields.value.sequence-group", "g1"),
         ] {
             let err = Schema::builder()
