@@ -26,6 +26,7 @@ struct Entry<V> {
     value: OnceCell<Arc<V>>,
     base_weight: usize,
     weight: AtomicUsize,
+    users: AtomicUsize,
 }
 
 struct State<K, V> {
@@ -39,42 +40,30 @@ pub(super) struct FileMetadataCache<K, V> {
     state: Mutex<State<K, V>>,
 }
 
-struct LoadGuard<'a, K, V>
+struct EntryGuard<'a, K, V>
 where
     K: Clone + Eq + Hash,
 {
     cache: &'a FileMetadataCache<K, V>,
     key: K,
     entry: Arc<Entry<V>>,
-    armed: bool,
 }
 
-impl<'a, K, V> LoadGuard<'a, K, V>
+impl<'a, K, V> EntryGuard<'a, K, V>
 where
     K: Clone + Eq + Hash,
 {
     fn new(cache: &'a FileMetadataCache<K, V>, key: K, entry: Arc<Entry<V>>) -> Self {
-        Self {
-            cache,
-            key,
-            entry,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
+        Self { cache, key, entry }
     }
 }
 
-impl<K, V> Drop for LoadGuard<'_, K, V>
+impl<K, V> Drop for EntryGuard<'_, K, V>
 where
     K: Clone + Eq + Hash,
 {
     fn drop(&mut self) {
-        if self.armed {
-            self.cache.remove_if_same(&self.key, &self.entry);
-        }
+        self.cache.release(&self.key, &self.entry);
     }
 }
 
@@ -122,34 +111,25 @@ where
 
         let entry = {
             let mut state = self.state.lock().unwrap();
-            if let Some(entry) = state.entries.get(&key) {
+            let entry = if let Some(entry) = state.entries.get(&key) {
                 Arc::clone(entry)
             } else {
                 let entry = Arc::new(Entry {
                     value: OnceCell::new(),
                     base_weight,
                     weight: AtomicUsize::new(base_weight),
+                    users: AtomicUsize::new(0),
                 });
                 state.weight = state.weight.saturating_add(base_weight);
                 state.entries.put(key.clone(), Arc::clone(&entry));
                 entry
-            }
+            };
+            entry.users.fetch_add(1, Ordering::Relaxed);
+            entry
         };
+        let _guard = EntryGuard::new(self, key.clone(), Arc::clone(&entry));
 
-        let value = entry
-            .value
-            .get_or_try_init(|| {
-                let mut guard = LoadGuard::new(self, key.clone(), Arc::clone(&entry));
-                async move {
-                    let result = load().await;
-                    if result.is_ok() {
-                        guard.disarm();
-                    }
-                    result
-                }
-            })
-            .await
-            .map(Arc::clone)?;
+        let value = entry.value.get_or_try_init(load).await.map(Arc::clone)?;
         let loaded_weight = entry
             .base_weight
             .saturating_add(value_weight(value.as_ref()).max(1));
@@ -176,12 +156,16 @@ where
         Ok(value)
     }
 
-    fn remove_if_same(&self, key: &K, entry: &Arc<Entry<V>>) {
+    fn release(&self, key: &K, entry: &Arc<Entry<V>>) {
         let mut state = self.state.lock().unwrap();
-        if state
-            .entries
-            .peek(key)
-            .is_some_and(|cached| Arc::ptr_eq(cached, entry))
+        let users = entry.users.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(users > 0);
+        if users == 1
+            && entry.value.get().is_none()
+            && state
+                .entries
+                .peek(key)
+                .is_some_and(|cached| Arc::ptr_eq(cached, entry))
         {
             state.entries.pop(key);
             state.weight = state
@@ -218,6 +202,7 @@ mod tests {
     use super::*;
     use std::convert::Infallible;
     use std::future::pending;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn evicts_least_recently_used_entry_by_count() {
@@ -268,6 +253,92 @@ mod tests {
         let state = cache.state.lock().unwrap();
         assert!(state.entries.is_empty());
         assert_eq!(state.weight, 0);
+    }
+
+    #[tokio::test]
+    async fn waiter_caches_value_after_initializer_is_cancelled() {
+        let cache = Arc::new(FileMetadataCache::<String, usize>::new(1024, 2));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let first_cache = Arc::clone(&cache);
+        let first_loads = Arc::clone(&loads);
+        let first = tokio::spawn(async move {
+            first_cache
+                .get_or_try_insert_with(
+                    Some("shared".to_string()),
+                    6,
+                    || async move {
+                        first_loads.fetch_add(1, Ordering::Relaxed);
+                        started_tx.send(()).unwrap();
+                        pending::<Result<Arc<usize>, Infallible>>().await
+                    },
+                    |_| 1,
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+
+        let second_cache = Arc::clone(&cache);
+        let second_loads = Arc::clone(&loads);
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(async move {
+            waiting_tx.send(()).unwrap();
+            second_cache
+                .get_or_try_insert_with(
+                    Some("shared".to_string()),
+                    6,
+                    || async move {
+                        second_loads.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(Arc::new(7))
+                    },
+                    |_| 1,
+                )
+                .await
+        });
+        waiting_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let users = cache
+                    .state
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .1
+                    .users
+                    .load(Ordering::Relaxed);
+                if users == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(*second.await.unwrap().unwrap(), 7);
+
+        let third_loads = Arc::clone(&loads);
+        let value = cache
+            .get_or_try_insert_with(
+                Some("shared".to_string()),
+                6,
+                || async move {
+                    third_loads.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, Infallible>(Arc::new(8))
+                },
+                |_| 1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*value, 7);
+        assert_eq!(loads.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
