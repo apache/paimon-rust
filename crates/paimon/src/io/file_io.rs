@@ -976,12 +976,12 @@ impl InputFile {
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
-        let blob_cache_key = format!("{}\0{cache_path}", self.context_id);
+        let metadata_cache_key = format!("{}\0{cache_path}", self.context_id);
         let reader = op.reader(&relative_path).await?;
         let Some(cache) = &self.cache else {
             return Ok(InputFileReader::Direct {
                 reader,
-                cache_key: blob_cache_key,
+                cache_key: metadata_cache_key,
                 file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
             });
         };
@@ -1001,7 +1001,7 @@ impl InputFile {
                 cache.clone(),
                 read_token,
             ),
-            cache_key: blob_cache_key,
+            cache_key: metadata_cache_key,
             file_format_metadata_cache_max_bytes: self.file_format_metadata_cache_max_bytes,
         })
     }
@@ -1800,7 +1800,7 @@ mod input_output_test {
 
     #[tokio::test]
     async fn test_file_read_cache_key_is_scoped_to_file_io_context() {
-        let path = "memory:/cache-key.blob";
+        let path = "memory:/cache-key.parquet";
         let first = setup_memory_file_io();
         first
             .new_output(path)
