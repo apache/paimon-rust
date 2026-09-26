@@ -76,6 +76,8 @@ use crate::error::to_datafusion_error;
 /// Default `index_type` for the global index procedures when the argument is
 /// omitted, matching Java's `CreateGlobalIndexProcedure`.
 const DEFAULT_GLOBAL_INDEX_TYPE: &str = "btree";
+/// Java `NativeFullTextGlobalIndexerFactory.IDENTIFIER`.
+const FULL_TEXT_GLOBAL_INDEX_TYPE: &str = "full-text";
 
 /// Resolve a snapshot by id: try live snapshot file first, then fall back to tag metadata.
 async fn resolve_snapshot_by_id(
@@ -706,11 +708,26 @@ async fn proc_create_global_index(
             builder.with_options(parse_key_value_options(options)?);
         }
         builder.execute().await.map_err(to_datafusion_error)?;
+    } else if index_type == FULL_TEXT_GLOBAL_INDEX_TYPE {
+        #[cfg(feature = "fulltext")]
+        {
+            let mut builder = table.new_full_text_index_build_builder();
+            builder.with_index_column(index_column);
+            if let Some(options) = args.get("options") {
+                builder.with_options(parse_key_value_options(options)?);
+            }
+            builder.execute().await.map_err(to_datafusion_error)?;
+        }
+        #[cfg(not(feature = "fulltext"))]
+        return Err(DataFusionError::NotImplemented(
+            "create_global_index with index_type => 'full-text' requires the 'fulltext' feature"
+                .to_string(),
+        ));
     } else {
         // Echo the raw argument, not the normalized one, so a typo stays visible.
         return Err(DataFusionError::NotImplemented(format!(
-            "create_global_index only supports index_type => 'btree', 'bitmap', 'multivalue', 'fm', or vindex types \
-             ('ivf-flat', 'ivf-pq', 'ivf-sq', 'ivf-rq', 'diskann'), got '{index_type_arg}'"
+            "create_global_index only supports index_type => 'btree', 'bitmap', 'multivalue', 'fm', 'full-text', \
+             or vindex types ('ivf-flat', 'ivf-pq', 'ivf-sq', 'ivf-rq', 'diskann'), got '{index_type_arg}'"
         )));
     }
     ok_result(ctx)
