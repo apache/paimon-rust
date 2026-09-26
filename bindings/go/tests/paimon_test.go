@@ -287,6 +287,64 @@ func openTestTable(t *testing.T) *paimon.Table {
 	return openTableAt(t, warehouse, "simple_log_table")
 }
 
+func TestReadBuilderWithLimitPrunesPlanSplits(t *testing.T) {
+	table := openTestTable(t)
+
+	planSplitCount := func(setLimit func(*paimon.ReadBuilder) error) int {
+		rb, err := table.NewReadBuilder()
+		if err != nil {
+			t.Fatalf("Failed to create read builder: %v", err)
+		}
+		defer rb.Close()
+		if setLimit != nil {
+			if err := setLimit(rb); err != nil {
+				t.Fatalf("Failed to set limit: %v", err)
+			}
+		}
+		scan, err := rb.NewScan()
+		if err != nil {
+			t.Fatalf("Failed to create scan: %v", err)
+		}
+		defer scan.Close()
+		plan, err := scan.Plan()
+		if err != nil {
+			t.Fatalf("Failed to plan: %v", err)
+		}
+		defer plan.Close()
+		return len(plan.Splits())
+	}
+
+	baseline := planSplitCount(nil)
+	if baseline < 1 {
+		t.Fatalf("expected >= 1 split without a limit, got %d", baseline)
+	}
+	// A zero limit prunes every split at plan time, proving the hint reaches
+	// planning through the FFI (mirrors core apply_limit_pushdown semantics).
+	if got := planSplitCount(func(rb *paimon.ReadBuilder) error { return rb.WithLimit(0) }); got != 0 {
+		t.Fatalf("expected 0 splits with WithLimit(0), got %d", got)
+	}
+	// A limit far above the row count must not prune any split.
+	if got := planSplitCount(func(rb *paimon.ReadBuilder) error { return rb.WithLimit(1 << 30) }); got != baseline {
+		t.Fatalf("expected %d splits with a large limit, got %d", baseline, got)
+	}
+}
+
+// A negative limit must be rejected before it reaches the unsigned C boundary,
+// where it would wrap to a huge value and make planning stop after the first
+// split. The check runs ahead of the closed-builder guard, so it needs no
+// warehouse: the distinct ErrNegativeLimit (not ErrClosed) proves the reject
+// arm ran rather than the nil-inner arm.
+func TestReadBuilderWithLimitRejectsNegative(t *testing.T) {
+	rb := &paimon.ReadBuilder{}
+	err := rb.WithLimit(-1)
+	if !errors.Is(err, paimon.ErrNegativeLimit) {
+		t.Fatalf("expected ErrNegativeLimit for a negative limit, got %v", err)
+	}
+	if errors.Is(err, paimon.ErrClosed) {
+		t.Fatalf("negative limit must be rejected as invalid input, not as a closed builder")
+	}
+}
+
 func TestWriteCommitReadRoundTrip(t *testing.T) {
 	table := openCopiedTestTable(t)
 

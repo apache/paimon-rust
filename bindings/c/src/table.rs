@@ -432,6 +432,7 @@ unsafe fn new_read_builder_state(
         projected_columns: None,
         filter: None,
         case_sensitive: true,
+        limit: None,
     })
 }
 
@@ -643,6 +644,29 @@ pub unsafe extern "C" fn paimon_read_builder_with_case_sensitive(
     std::ptr::null_mut()
 }
 
+/// Set a row-count limit hint for scan planning.
+///
+/// This lets planning stop selecting splits once the retained splits already
+/// cover `limit` rows, cutting the plan-time I/O of listing every split's
+/// stats when only the first N rows are wanted. It is a hint only: it does not
+/// guarantee exactly `limit` rows are returned, so the caller still enforces
+/// the final row limit when reading.
+///
+/// # Safety
+/// `rb` must be a valid pointer from `paimon_table_new_read_builder`, or null (returns error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_read_builder_with_limit(
+    rb: *mut paimon_read_builder,
+    limit: usize,
+) -> *mut paimon_error {
+    if let Err(e) = check_non_null(rb, "rb") {
+        return e;
+    }
+    let state = &mut *((*rb).inner as *mut ReadBuilderState);
+    state.limit = Some(limit);
+    std::ptr::null_mut()
+}
+
 /// Set a filter predicate for scan planning.
 ///
 /// The predicate is consumed (ownership transferred to the read builder).
@@ -691,6 +715,7 @@ pub unsafe extern "C" fn paimon_read_builder_new_scan(
     let scan_state = TableScanState {
         table: state.table.clone(),
         filter: state.filter.clone(),
+        limit: state.limit,
     };
     let inner = Box::into_raw(Box::new(scan_state)) as *mut c_void;
     paimon_result_table_scan {
@@ -731,6 +756,11 @@ pub unsafe extern "C" fn paimon_read_builder_new_read(
     // Apply filter if set
     if let Some(ref filter) = state.filter {
         rb_rust.with_filter(filter.clone());
+    }
+
+    // Apply limit hint if set
+    if let Some(limit) = state.limit {
+        rb_rust.with_limit(limit);
     }
 
     match rb_rust.new_read() {
@@ -787,6 +817,9 @@ pub unsafe extern "C" fn paimon_table_scan_plan(
     let mut rb = scan_state.table.new_read_builder();
     if let Some(ref filter) = scan_state.filter {
         rb.with_filter(filter.clone());
+    }
+    if let Some(limit) = scan_state.limit {
+        rb.with_limit(limit);
     }
     let table_scan = rb.new_scan();
 
