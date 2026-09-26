@@ -55,7 +55,7 @@ use parquet::file::statistics::Statistics as ParquetStatistics;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) struct ParquetFormatReader {
@@ -2460,9 +2460,6 @@ fn build_row_ranges_selection(
 const PARQUET_METADATA_CACHE_MAX_ENTRIES: usize = 4096;
 const PARQUET_METADATA_CACHE_MIN_ENTRY_BYTES: usize = 8 * 1024;
 
-static PARQUET_METADATA_CACHE: LazyLock<ParquetMetadataCache> =
-    LazyLock::new(ParquetMetadataCache::new);
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ParquetMetadataCacheKey {
     file: String,
@@ -2476,12 +2473,9 @@ struct ParquetMetadataCache {
 }
 
 impl ParquetMetadataCache {
-    fn new() -> Self {
+    fn new(max_bytes: usize) -> Self {
         Self {
-            inner: FileMetadataCache::new(
-                crate::io::DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES,
-                PARQUET_METADATA_CACHE_MAX_ENTRIES,
-            ),
+            inner: FileMetadataCache::new(max_bytes, PARQUET_METADATA_CACHE_MAX_ENTRIES),
         }
     }
 
@@ -2489,16 +2483,7 @@ impl ParquetMetadataCache {
         &self,
         reader: &mut ArrowFileReader,
         options: Option<&ArrowReaderOptions>,
-        enabled: bool,
     ) -> parquet::errors::Result<Arc<ParquetMetaData>> {
-        let max_bytes = reader.r.file_format_metadata_cache_max_bytes();
-        if !enabled || max_bytes == 0 {
-            if max_bytes == 0 {
-                self.inner.resize(0);
-            }
-            return reader.load_metadata(options).await;
-        }
-        self.inner.resize(max_bytes);
         let column_index = options.map_or(PageIndexPolicy::Skip, |o| o.column_index_policy());
         let offset_index = options.map_or(PageIndexPolicy::Skip, |o| o.offset_index_policy());
         let key = reader
@@ -2753,8 +2738,20 @@ impl AsyncFileReader for ArrowFileReader {
         let options = options.cloned();
         let metadata_cache_enabled = self.metadata_cache_enabled;
         Box::pin(async move {
-            PARQUET_METADATA_CACHE
-                .load(self, options.as_ref(), metadata_cache_enabled)
+            if !metadata_cache_enabled {
+                return self.load_metadata(options.as_ref()).await;
+            }
+            let Some(context) = self.r.file_format_metadata_cache().and_then(|cache| {
+                cache.downcast_ref::<crate::io::FileFormatMetadataCacheContext>()
+            }) else {
+                return self.load_metadata(options.as_ref()).await;
+            };
+            if context.max_bytes() == 0 {
+                return self.load_metadata(options.as_ref()).await;
+            }
+            context
+                .get_or_init(ParquetMetadataCache::new)
+                .load(self, options.as_ref())
                 .await
         })
     }
@@ -2896,6 +2893,7 @@ mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::{StreamExt, TryStreamExt};
+    use parquet::arrow::async_reader::AsyncFileReader;
     use parquet::basic::{Compression, GzipLevel, ZstdLevel};
     use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::file::statistics::Statistics as ParquetStatistics;
@@ -4702,8 +4700,7 @@ mod tests {
         resident_bytes: Arc<AtomicUsize>,
         peak_resident_bytes: Arc<AtomicUsize>,
         cache_key: Option<Arc<str>>,
-        metadata_cache_max_bytes: usize,
-        resize_cache_on_key: Option<Arc<super::ParquetMetadataCache>>,
+        metadata_cache: Option<Arc<crate::io::FileFormatMetadataCacheContext>>,
     }
 
     struct TrackedReadBuffer {
@@ -4732,23 +4729,36 @@ mod tests {
                 resident_bytes: Arc::new(AtomicUsize::new(0)),
                 peak_resident_bytes: Arc::new(AtomicUsize::new(0)),
                 cache_key: None,
-                metadata_cache_max_bytes: crate::io::DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES,
-                resize_cache_on_key: None,
+                metadata_cache: None,
             }
         }
 
         fn with_cache_key(mut self, cache_key: &str) -> Self {
             self.cache_key = Some(Arc::from(cache_key));
+            if self.metadata_cache.is_none() {
+                self.metadata_cache = Some(
+                    crate::io::FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap(),
+                );
+            }
             self
         }
 
         fn with_metadata_cache_max_bytes(mut self, max_bytes: usize) -> Self {
-            self.metadata_cache_max_bytes = max_bytes;
+            self.metadata_cache = Some(
+                crate::io::FileFormatMetadataCacheContext::from_props(&HashMap::from([(
+                    crate::common::CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE.to_string(),
+                    max_bytes.to_string(),
+                )]))
+                .unwrap(),
+            );
             self
         }
 
-        fn with_cache_resize_on_key(mut self, cache: Arc<super::ParquetMetadataCache>) -> Self {
-            self.resize_cache_on_key = Some(cache);
+        fn with_metadata_cache(
+            mut self,
+            cache: Arc<crate::io::FileFormatMetadataCacheContext>,
+        ) -> Self {
+            self.metadata_cache = Some(cache);
             self
         }
 
@@ -4791,16 +4801,13 @@ mod tests {
         }
 
         fn cache_key(&self) -> Option<&str> {
-            if let Some(cache) = &self.resize_cache_on_key {
-                cache
-                    .inner
-                    .resize(crate::io::DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES);
-            }
             self.cache_key.as_deref()
         }
 
-        fn file_format_metadata_cache_max_bytes(&self) -> usize {
-            self.metadata_cache_max_bytes
+        fn file_format_metadata_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+            self.metadata_cache
+                .as_ref()
+                .map(|cache| cache.as_ref() as &(dyn std::any::Any + Send + Sync))
         }
     }
 
@@ -4810,15 +4817,51 @@ mod tests {
             write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
         );
         let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
-        let cache = super::ParquetMetadataCache::new();
 
         for _ in 0..10 {
             let mut reader =
                 super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
-            cache.load(&mut reader, None, true).await.unwrap();
+            reader.get_metadata(None).await.unwrap();
         }
 
         assert_eq!(tracker.read_count(), 1);
+    }
+
+    #[cfg(feature = "storage-fs")]
+    #[tokio::test]
+    async fn parquet_metadata_cache_reuses_metadata_across_file_io_instances() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data.parquet");
+        std::fs::write(&path, &data).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let context =
+            crate::io::FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
+        let first = crate::io::FileIO::from_path(&path)
+            .unwrap()
+            .with_file_format_metadata_cache(context.clone())
+            .build()
+            .unwrap();
+        let second = crate::io::FileIO::from_path(&path)
+            .unwrap()
+            .with_file_format_metadata_cache(context)
+            .build()
+            .unwrap();
+
+        let mut first_reader = super::ArrowFileReader::new(
+            data.len() as u64,
+            Arc::new(first.new_input(&path).unwrap().reader().await.unwrap()),
+        );
+        let first_metadata = first_reader.get_metadata(None).await.unwrap();
+        let mut second_reader = super::ArrowFileReader::new(
+            data.len() as u64,
+            Arc::new(second.new_input(&path).unwrap().reader().await.unwrap()),
+        );
+        let second_metadata = second_reader.get_metadata(None).await.unwrap();
+
+        assert!(Arc::ptr_eq(&first_metadata, &second_metadata));
     }
 
     #[tokio::test]
@@ -4828,15 +4871,15 @@ mod tests {
         );
         let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
         let unidentified = TrackingFileRead::new(data.clone());
-        let cache = super::ParquetMetadataCache::new();
 
         for _ in 0..2 {
             let mut reader =
-                super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
-            cache.load(&mut reader, None, false).await.unwrap();
+                super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()))
+                    .with_metadata_cache_enabled(false);
+            reader.get_metadata(None).await.unwrap();
             let mut reader =
                 super::ArrowFileReader::new(data.len() as u64, Arc::new(unidentified.clone()));
-            cache.load(&mut reader, None, true).await.unwrap();
+            reader.get_metadata(None).await.unwrap();
         }
 
         assert_eq!(tracker.read_count(), 2);
@@ -4849,7 +4892,6 @@ mod tests {
             write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
         );
         let tracker = TrackingFileRead::new(data.clone()).with_cache_key("format-table.parquet");
-        let cache = super::ParquetMetadataCache::new();
         let reader = super::ParquetFormatReader::with_options(
             &HashMap::from([("type".to_string(), "format-table".to_string())]),
             None,
@@ -4859,10 +4901,8 @@ mod tests {
         for _ in 0..2 {
             let mut file_reader =
                 super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
-            cache
-                .load(&mut file_reader, None, reader.metadata_cache_enabled)
-                .await
-                .unwrap();
+            file_reader.metadata_cache_enabled = reader.metadata_cache_enabled;
+            file_reader.get_metadata(None).await.unwrap();
         }
 
         assert_eq!(tracker.read_count(), 2);
@@ -4885,27 +4925,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parquet_metadata_cache_zero_disables_and_clears_cache() {
+    async fn parquet_metadata_cache_zero_does_not_affect_other_contexts() {
         let data = Bytes::from(
             write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
         );
         let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
-        let cache = Arc::new(super::ParquetMetadataCache::new());
 
         let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
-        cache.load(&mut reader, None, true).await.unwrap();
+        reader.get_metadata(None).await.unwrap();
 
-        let disabled = tracker
-            .clone()
-            .with_metadata_cache_max_bytes(0)
-            .with_cache_resize_on_key(Arc::clone(&cache));
+        let disabled = tracker.clone().with_metadata_cache_max_bytes(0);
         let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(disabled));
-        cache.load(&mut reader, None, true).await.unwrap();
+        reader.get_metadata(None).await.unwrap();
 
         let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
-        cache.load(&mut reader, None, true).await.unwrap();
+        reader.get_metadata(None).await.unwrap();
 
-        assert_eq!(tracker.read_count(), 3);
+        assert_eq!(tracker.read_count(), 2);
     }
 
     #[tokio::test]
@@ -4914,14 +4950,12 @@ mod tests {
             write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
         );
         let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
-        let cache = super::ParquetMetadataCache::new();
         let loads = (0..10).map(|_| {
             let tracker = tracker.clone();
             let data = data.clone();
-            let cache = &cache;
             async move {
                 let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker));
-                cache.load(&mut reader, None, true).await
+                reader.get_metadata(None).await
             }
         });
 
@@ -4935,18 +4969,22 @@ mod tests {
         let data = Bytes::from(
             write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
         );
-        let first = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
-        let second = TrackingFileRead::new(data.clone()).with_cache_key("storage-b\0data.parquet");
-        let cache = super::ParquetMetadataCache::new();
+        let cache = crate::io::FileFormatMetadataCacheContext::from_props(&HashMap::new()).unwrap();
+        let first = TrackingFileRead::new(data.clone())
+            .with_cache_key("storage-a\0data.parquet")
+            .with_metadata_cache(cache.clone());
+        let second = TrackingFileRead::new(data.clone())
+            .with_cache_key("storage-b\0data.parquet")
+            .with_metadata_cache(cache);
 
         let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(first.clone()));
-        cache.load(&mut reader, None, true).await.unwrap();
+        reader.get_metadata(None).await.unwrap();
         let options =
             super::ArrowReaderOptions::new().with_offset_index_policy(PageIndexPolicy::Optional);
         let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(first.clone()));
-        cache.load(&mut reader, Some(&options), true).await.unwrap();
+        reader.get_metadata(Some(&options)).await.unwrap();
         let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(second.clone()));
-        cache.load(&mut reader, None, true).await.unwrap();
+        reader.get_metadata(None).await.unwrap();
 
         assert_eq!(first.read_count(), 2);
         assert_eq!(second.read_count(), 1);

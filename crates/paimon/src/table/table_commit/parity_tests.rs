@@ -614,8 +614,17 @@ async fn rest_commit_uses_catalog_snapshot_schema_and_retry_identity() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
     let identifier = Identifier::new("database", "table");
-    let env =
-        crate::table::RESTEnv::new(identifier.clone(), "uuid".into(), api, options, false, None);
+    let metadata_cache =
+        crate::io::FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
+    let env = crate::table::RESTEnv::new(
+        identifier.clone(),
+        "uuid".into(),
+        api,
+        options,
+        false,
+        None,
+        metadata_cache,
+    );
     let table = Table::new(
         io.clone(),
         identifier,
