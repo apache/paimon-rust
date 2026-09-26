@@ -63,7 +63,7 @@ const MANIFEST_DIR: &str = "manifest";
 /// Usage:
 /// 1. Create via [`DataEvolutionWriter::new`] (validates preconditions).
 /// 2. Feed matched rows via [`add_matched_batch`](Self::add_matched_batch).
-///    Each batch must contain a non-null `_ROW_ID` (Int64) column plus the update columns.
+///    Each batch must contain a non-null integer `_ROW_ID` column plus the update columns.
 /// 3. Call [`prepare_commit`](Self::prepare_commit) to produce `CommitMessage`s.
 /// 4. Commit via [`TableCommit`](super::TableCommit) (caller's responsibility).
 ///
@@ -167,15 +167,14 @@ impl DataEvolutionWriter {
     /// Add a batch of matched rows.
     ///
     /// The batch must contain:
-    /// - A non-null `_ROW_ID` column (Int64) identifying which rows to update
+    /// - A non-null integer `_ROW_ID` identifying rows, safely normalized to Int64
     /// - One column for each entry in `update_columns` with the new values
     pub fn add_matched_batch(&mut self, batch: RecordBatch) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
 
-        let row_id_col = row_id_column(&batch)?;
-        validate_row_id_not_null(row_id_col)?;
+        let batch = super::update_input::normalize_row_ids(batch)?;
         validate_update_columns(&batch, &self.update_columns)?;
 
         self.matched_batches.push(batch);
@@ -191,6 +190,11 @@ impl DataEvolutionWriter {
         assignments: Vec<(String, super::UpdateAssignment)>,
     ) -> Result<()> {
         let schema = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
+        let matched = matched
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .map(super::update_input::normalize_row_ids)
+            .collect::<Result<Vec<_>>>()?;
         let batches = super::update_assignment::assigned_batches(&matched, assignments, schema)?;
         // Validate the entire assignment before mutating the staged batches.
         for batch in &batches {
@@ -207,15 +211,17 @@ impl DataEvolutionWriter {
     /// Separate groups cannot update the same file's columns, matching the
     /// batch-table update contract; batches within a group may share a file.
     pub fn add_matched_group(&mut self, batches: Vec<RecordBatch>) -> Result<()> {
+        let batches = batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .map(super::update_input::normalize_row_ids)
+            .collect::<Result<Vec<_>>>()?;
         for batch in &batches {
-            if batch.num_rows() > 0 {
-                validate_row_id_not_null(row_id_column(batch)?)?;
-                validate_update_columns(batch, &self.update_columns)?;
-            }
+            validate_update_columns(batch, &self.update_columns)?;
         }
         let group_id = self.next_group_id;
         self.next_group_id += 1;
-        for batch in batches.into_iter().filter(|batch| batch.num_rows() > 0) {
+        for batch in batches {
             self.matched_batches.push(batch);
             self.matched_batch_groups.push(group_id);
         }
@@ -1045,22 +1051,11 @@ fn interleave_updated_leaf(
             *index
         } else {
             let value = matched_column(&matched_batches[batch_idx], path)?;
-            let value = if value.data_type() == original.data_type() {
-                value
-            } else {
-                arrow_cast::cast_with_options(
-                    value.as_ref(),
-                    original.data_type(),
-                    &arrow_cast::CastOptions {
-                        safe: false,
-                        ..Default::default()
-                    },
-                )
-                .map_err(|error| crate::Error::DataInvalid {
-                    message: format!("Failed to cast column {path}: {error}"),
-                    source: None,
-                })?
-            };
+            let value = super::update_input::cast_update_value(
+                &value,
+                original.data_type(),
+                super::update_input::CastMode::RowUpdate,
+            )?;
             let index = batch_arrays.len();
             batch_arrays.push(value);
             batch_id_map.insert(batch_idx, index);

@@ -38,7 +38,7 @@ pub struct TableUpdateByRowId {
     table: Table,
     commit_user: String,
     index: RowIdFileIndex,
-    updated: HashMap<String, HashSet<i64>>,
+    updated: HashMap<i32, HashSet<i64>>,
     messages: Vec<CommitMessage>,
 }
 
@@ -78,29 +78,31 @@ impl TableUpdateByRowId {
             .filter(|name| seen.insert(name.clone()))
             .collect::<Vec<_>>();
         let mut writer = DataEvolutionWriter::new(&self.table, columns.clone())?;
-        for batch in &batches {
-            if batch.column_by_name("_ROW_ID").is_none() {
-                return Err(invalid("Input data must contain _ROW_ID column"));
-            }
-        }
+        let batches = batches
+            .into_iter()
+            .map(super::update_input::normalize_row_ids)
+            .collect::<crate::Result<Vec<_>>>()?;
         writer.add_matched_group(batches.clone())?;
         let first_row_ids = self.index.matched_first_row_ids(&batches)?;
-        for column in &columns {
-            if let Some(previous) = self.updated.get(column) {
+        // Use the same leaf identities as commit-time conflict detection.
+        // Whole ROW and child paths must not produce two versions of one leaf.
+        let leaf_ids = super::data_evolution_fields::write_leaf_ids(
+            self.table.schema().fields(),
+            Some(&columns),
+        )?;
+        for id in &leaf_ids {
+            if let Some(previous) = self.updated.get(id) {
                 let overlap: Vec<_> = first_row_ids.intersection(previous).copied().collect();
                 if !overlap.is_empty() {
                     return Err(invalid(format!(
-                        "Input batches contain overlapping first_row_ids by column {column}: {overlap:?}"
+                        "Input batches contain overlapping first_row_ids by column {columns:?} (field ID {id}): {overlap:?}"
                     )));
                 }
             }
         }
         let messages = writer.prepare_commit_with_index(&self.index).await?;
-        for column in columns {
-            self.updated
-                .entry(column)
-                .or_default()
-                .extend(&first_row_ids);
+        for id in leaf_ids {
+            self.updated.entry(id).or_default().extend(&first_row_ids);
         }
         self.messages.extend(messages);
         Ok(self.messages.clone())

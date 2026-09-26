@@ -908,3 +908,183 @@ async fn predicate_assignments_keep_row_id_order_when_later_groups_have_deltas()
         );
     }
 }
+
+#[tokio::test]
+async fn row_id_integer_widths_work_for_direct_grouped_and_incremental_updates() {
+    use arrow_array::UInt64Array;
+    let table = evolution_table().await;
+    seed(&table).await;
+    let update = table.new_write_builder().new_update().unwrap();
+    let input = |row_ids: ArrayRef, value: i32| {
+        RecordBatch::try_from_iter([
+            ("_ROW_ID", row_ids),
+            ("value", Arc::new(Int32Array::from(vec![value])) as ArrayRef),
+        ])
+        .unwrap()
+    };
+    commit(
+        &table,
+        update
+            .update_by_arrow_with_row_id(vec![input(Arc::new(Int32Array::from(vec![0])), 11)])
+            .await
+            .unwrap(),
+    )
+    .await;
+    commit(
+        &table,
+        update
+            .update_by_arrow_batches_with_row_id(vec![Ok(vec![input(
+                Arc::new(UInt64Array::from(vec![1])),
+                22,
+            )])])
+            .await
+            .unwrap(),
+    )
+    .await;
+    let mut writer = table
+        .new_write_builder()
+        .new_data_evolution_writer(vec!["value".into()])
+        .unwrap();
+    writer
+        .add_matched_batch(input(Arc::new(Int32Array::from(vec![2])), 33))
+        .unwrap();
+    commit(&table, writer.prepare_commit().await.unwrap()).await;
+    assert_eq!(
+        read_rows(&table).await,
+        vec![vec![1, 11, 100], vec![2, 22, 200], vec![3, 33, 300]]
+    );
+    let before = parquet_files(&table).await;
+    assert!(update
+        .update_by_arrow_with_row_id(vec![
+            input(Arc::new(UInt64Array::from(vec![u64::MAX])), 99,)
+        ])
+        .await
+        .is_err());
+    assert_eq!(parquet_files(&table).await, before);
+}
+
+#[tokio::test]
+async fn row_id_nested_overlap_uses_leaf_identity_across_calls() {
+    use arrow_array::StructArray;
+    use paimon::spec::{DataField, RowType};
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column(
+            "profile",
+            DataType::Row(RowType::new(vec![
+                DataField::new(2, "a".into(), DataType::Int(IntType::new())),
+                DataField::new(3, "b".into(), DataType::Int(IntType::new())),
+            ])),
+        )
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .option("data-evolution.nested-field.enabled", "true")
+        .build()
+        .unwrap();
+    let path = "memory:/nested_overlap";
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    let arrow_schema = paimon::arrow::build_target_arrow_schema(table.schema().fields()).unwrap();
+    let arrow_schema::DataType::Struct(fields) = arrow_schema.field(1).data_type() else {
+        panic!("ROW")
+    };
+    let profile = |a: Vec<i32>, b: Vec<i32>| {
+        Arc::new(StructArray::new(
+            fields.clone(),
+            vec![Arc::new(Int32Array::from(a)), Arc::new(Int32Array::from(b))],
+            None,
+        )) as ArrayRef
+    };
+    write_batch(
+        &table,
+        &RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                profile(vec![10, 20], vec![100, 200]),
+            ],
+        )
+        .unwrap(),
+    )
+    .await;
+    let whole = RecordBatch::try_from_iter([
+        ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+        ("profile", profile(vec![11], vec![101])),
+    ])
+    .unwrap();
+    let child = matched(vec![1], &[("profile.a", vec![22])]);
+    let update = table.new_write_builder().new_update().unwrap();
+    let original_files = parquet_files(&table).await;
+    for reverse in [false, true] {
+        let mut updater = update.new_update_by_row_id().await.unwrap();
+        let calls = if reverse {
+            [(&child, "profile.a"), (&whole, "profile")]
+        } else {
+            [(&whole, "profile"), (&child, "profile.a")]
+        };
+        updater
+            .update_columns(vec![calls[0].0.clone()], vec![calls[0].1.into()])
+            .await
+            .unwrap();
+        let staged_files = parquet_files(&table).await;
+        let messages = updater.commit_messages().len();
+        let error = updater
+            .update_columns(vec![calls[1].0.clone()], vec![calls[1].1.into()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("overlapping first_row_ids"));
+        assert_eq!(updater.commit_messages().len(), messages);
+        assert_eq!(parquet_files(&table).await, staged_files);
+        updater.abort().await.unwrap();
+        assert_eq!(parquet_files(&table).await, original_files);
+    }
+    // Disjoint sibling leaves of the same file group remain valid.
+    let mut updater = update.new_update_by_row_id().await.unwrap();
+    updater
+        .update_columns(vec![child], vec!["profile.a".into()])
+        .await
+        .unwrap();
+    let messages = updater
+        .update_columns(
+            vec![matched(vec![0], &[("profile.b", vec![101])])],
+            vec!["profile.b".into()],
+        )
+        .await
+        .unwrap();
+    commit(&table, messages).await;
+    let read = table.new_read_builder();
+    let plan = read.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = read
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut actual = Vec::new();
+    for batch in batches {
+        let profile = batch
+            .column_by_name("profile")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let a = profile
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let b = profile
+            .column_by_name("b")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        actual.extend((0..batch.num_rows()).map(|row| (a.value(row), b.value(row))));
+    }
+    actual.sort();
+    assert_eq!(actual, vec![(10, 101), (22, 200)]);
+}

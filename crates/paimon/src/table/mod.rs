@@ -135,6 +135,7 @@ pub(crate) mod table_write;
 mod tag_manager;
 pub(crate) mod time_travel;
 mod update_assignment;
+mod update_input;
 mod upsert_key_matcher;
 mod vector_read;
 mod vector_scan;
