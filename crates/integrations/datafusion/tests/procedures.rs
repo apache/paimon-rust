@@ -860,6 +860,264 @@ async fn test_delete_multiple_tags() {
     assert_eq!(count, 0);
 }
 
+async fn expire_count(sql_context: &paimon_datafusion::SQLContext, sql: &str) -> i32 {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    batches[0]
+        .column_by_name("deleted_snapshots_count")
+        .expect("deleted_snapshots_count column")
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap()
+        .value(0)
+}
+
+async fn snapshot_ids(sql_context: &paimon_datafusion::SQLContext, table: &str) -> Vec<i64> {
+    let batches = sql_context
+        .sql(&format!(
+            "SELECT snapshot_id FROM paimon.test_db.`{table}$snapshots` ORDER BY snapshot_id"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_expire_snapshots_procedure() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.exp (id INT, name VARCHAR(100))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.exp VALUES (1, 'a')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT OVERWRITE paimon.test_db.exp VALUES (2, 'b')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.exp VALUES (3, 'c')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.exp VALUES (4, 'd')",
+    )
+    .await;
+    assert_eq!(snapshot_ids(&sql_context, "exp").await, vec![1, 2, 3, 4]);
+
+    // retain_max caps the history even though every snapshot is recent.
+    assert_eq!(
+        expire_count(
+            &sql_context,
+            "CALL sys.expire_snapshots(table => 'test_db.exp', retain_max => 3, retain_min => 1)",
+        )
+        .await,
+        1
+    );
+    assert_eq!(snapshot_ids(&sql_context, "exp").await, vec![2, 3, 4]);
+
+    // older_than (epoch millis) with retain_min as the floor.
+    assert_eq!(
+        expire_count(
+            &sql_context,
+            "CALL sys.expire_snapshots(table => 'test_db.exp', older_than => '9999999999999', retain_min => 2, max_deletes => 5)",
+        )
+        .await,
+        1
+    );
+    assert_eq!(snapshot_ids(&sql_context, "exp").await, vec![3, 4]);
+
+    // older_than as a local timestamp string; nothing is below retain_min.
+    assert_eq!(
+        expire_count(
+            &sql_context,
+            "CALL sys.expire_snapshots(table => 'test_db.exp', older_than => '2999-01-01 00:00:00', retain_min => 2)",
+        )
+        .await,
+        0
+    );
+
+    // Dynamic table options apply to this call.
+    assert_eq!(
+        expire_count(
+            &sql_context,
+            "CALL sys.expire_snapshots(table => 'test_db.exp', options => 'snapshot.num-retained.min=1,snapshot.num-retained.max=1')",
+        )
+        .await,
+        1
+    );
+    assert_eq!(snapshot_ids(&sql_context, "exp").await, vec![4]);
+    assert_eq!(
+        collect_id_name(&sql_context, "SELECT id, name FROM paimon.test_db.exp").await,
+        vec![
+            (2, "b".to_string()),
+            (3, "c".to_string()),
+            (4, "d".to_string())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_expire_snapshots_procedure_rejects_bad_arguments() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.expire_snapshots(table => 'test_db.t1', retain_maxx => 1)",
+        "retain_maxx",
+    )
+    .await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.expire_snapshots(table => 'test_db.t1', retain_max => 'x')",
+        "Invalid integer for 'retain_max'",
+    )
+    .await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.expire_snapshots(table => 'test_db.t1', retain_max => 1, retain_min => 2)",
+        "must not be less than",
+    )
+    .await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.expire_snapshots(table => 'test_db.t1', older_than => 'yesterday')",
+        "Invalid older_than timestamp",
+    )
+    .await;
+}
+
+async fn orphan_result(sql_context: &paimon_datafusion::SQLContext, sql: &str) -> (i64, i64) {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let column = |name: &str| {
+        batches[0]
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("{name} column"))
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    (
+        column("deletedFileCount"),
+        column("deletedFileTotalLenInBytes"),
+    )
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[tokio::test]
+async fn test_remove_orphan_files_procedure() {
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.orph (id INT, name VARCHAR(100))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.orph VALUES (1, 'a')",
+    )
+    .await;
+    let bucket = tmp.path().join("test_db.db/orph/bucket-0");
+    assert!(bucket.is_dir(), "{bucket:?}");
+    let orphan = bucket.join("data-orphan.parquet");
+    std::fs::write(&orphan, b"orphan").unwrap();
+
+    // The default cut-off (one day ago) protects the fresh file.
+    assert_eq!(
+        orphan_result(
+            &sql_context,
+            "CALL sys.remove_orphan_files(table => 'test_db.orph')",
+        )
+        .await,
+        (0, 0)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let older_than = now_millis() - 200;
+    assert_eq!(
+        orphan_result(
+            &sql_context,
+            &format!(
+                "CALL sys.remove_orphan_files(table => 'test_db.orph', older_than => '{older_than}', dry_run => true)"
+            ),
+        )
+        .await,
+        (1, 6)
+    );
+    assert!(orphan.exists(), "a dry run keeps the file");
+
+    assert_eq!(
+        orphan_result(
+            &sql_context,
+            &format!(
+                "CALL sys.remove_orphan_files(table => 'test_db.orph', older_than => '{older_than}', parallelism => 2, mode => 'local')"
+            ),
+        )
+        .await,
+        (1, 6)
+    );
+    assert!(!orphan.exists());
+    assert_eq!(
+        collect_id_name(&sql_context, "SELECT id, name FROM paimon.test_db.orph").await,
+        vec![(1, "a".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn test_remove_orphan_files_procedure_rejects_bad_arguments() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+    for (sql, expected) in [
+        (
+            "CALL sys.remove_orphan_files(table => 'test_db.*')",
+            "not supported yet",
+        ),
+        (
+            "CALL sys.remove_orphan_files(table => 'test_db.t1', mode => 'distributed')",
+            "only supports mode => 'local'",
+        ),
+        (
+            "CALL sys.remove_orphan_files(table => 'test_db.t1', older_than => '9999999999999')",
+            "earlier than now",
+        ),
+        (
+            "CALL sys.remove_orphan_files(table => 'test_db.t1', dry_run => 'maybe')",
+            "Invalid boolean for 'dry_run'",
+        ),
+        (
+            "CALL sys.remove_orphan_files(table => 'test_db.t1', parallelism => 0)",
+            "parallelism must be at least 1",
+        ),
+    ] {
+        assert_sql_error(&sql_context, sql, expected).await;
+    }
+}
+
 #[tokio::test]
 async fn test_rollback_to_snapshot() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
