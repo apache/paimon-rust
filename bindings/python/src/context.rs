@@ -123,25 +123,36 @@ fn pyjindo_library_in(directory: &std::path::Path) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn build_paimon_catalog(
-    mut catalog_options: HashMap<String, String>,
-) -> PyResult<Arc<dyn Catalog>> {
-    let use_jindo = catalog_options
+fn complete_jindo_options_with(
+    mut options: HashMap<String, String>,
+    library_path: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    discover: impl FnOnce() -> Option<PathBuf>,
+) -> HashMap<String, String> {
+    let use_jindo = options
         .get(OSS_IMPL)
         .is_some_and(|value| value.eq_ignore_ascii_case("jindo"));
-    let library_path = std::env::var_os(JINDOSDK_LIBRARY_PATH);
-    let home = std::env::var_os(JINDOSDK_HOME);
-    if use_jindo
-        && should_discover_pyjindo_library(
-            &catalog_options,
-            library_path.as_deref(),
-            home.as_deref(),
-        )
-    {
-        if let Some(path) = discover_pyjindo_library() {
-            catalog_options.insert(JINDO_LIBRARY_PATH.to_string(), path.display().to_string());
+    if use_jindo && should_discover_pyjindo_library(&options, library_path, home) {
+        if let Some(path) = discover() {
+            options.insert(JINDO_LIBRARY_PATH.to_string(), path.display().to_string());
         }
     }
+    options
+}
+
+pub(crate) fn complete_jindo_options(options: HashMap<String, String>) -> HashMap<String, String> {
+    let library_path = std::env::var_os(JINDOSDK_LIBRARY_PATH);
+    let home = std::env::var_os(JINDOSDK_HOME);
+    complete_jindo_options_with(
+        options,
+        library_path.as_deref(),
+        home.as_deref(),
+        discover_pyjindo_library,
+    )
+}
+
+fn build_paimon_catalog(catalog_options: HashMap<String, String>) -> PyResult<Arc<dyn Catalog>> {
+    let catalog_options = complete_jindo_options(catalog_options);
     let rt = runtime();
     rt.block_on(async {
         let options = Options::from_map(catalog_options);
@@ -190,6 +201,19 @@ mod tests {
             path.to_string_lossy().into(),
         );
         assert!(!should_discover_pyjindo_library(&options, None, None));
+    }
+
+    #[test]
+    fn test_complete_jindo_options() {
+        let options = HashMap::from([(OSS_IMPL.to_string(), "jindo".to_string())]);
+        let discovered = PathBuf::from("/pyjindo/libjindosdk_python.so");
+        let completed =
+            complete_jindo_options_with(options, None, None, || Some(discovered.clone()));
+
+        assert_eq!(
+            completed.get(JINDO_LIBRARY_PATH).map(String::as_str),
+            Some(discovered.to_string_lossy().as_ref())
+        );
     }
 }
 

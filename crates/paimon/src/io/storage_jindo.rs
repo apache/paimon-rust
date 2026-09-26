@@ -348,7 +348,16 @@ impl oio::List for JindoLister {
             let path = self.path.clone();
             let recursive = self.recursive;
             let marker = self.marker.clone();
-            let page = run_blocking(move || client.list_page(&path, recursive, marker)).await?;
+            let first_page = marker.is_none();
+            let page = match run_blocking(move || client.list_page(&path, recursive, marker)).await
+            {
+                Ok(page) => page,
+                Err(error) if first_page && error.kind() == ErrorKind::NotFound => {
+                    self.finished = true;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             self.finished = page.next_marker.is_none();
             self.marker = page.next_marker;
             self.entries = page.entries.into_iter();
@@ -1184,7 +1193,35 @@ mod tests {
                 .into_owned()
                 .collect::<HashMap<_, _>>();
             let prefix = parameters.get("prefix").cloned().unwrap_or_default();
-            if prefix.contains("missing.bin") {
+            let marker = parameters.get("marker").cloned();
+            if prefix.starts_with("forbidden/") {
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "application/xml")
+                    .header("x-oss-request-id", "jindo-test-forbidden")
+                    .body(Body::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>denied</Message>
+<RequestId>jindo-test-forbidden</RequestId></Error>"#,
+                    ))
+                    .unwrap();
+            }
+            if prefix.starts_with("broken-page/") && marker.is_some() {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("content-type", "application/xml")
+                    .header("x-oss-request-id", "jindo-test-page-not-found")
+                    .body(Body::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchKey</Code><Message>missing page</Message>
+<RequestId>jindo-test-page-not-found</RequestId></Error>"#,
+                    ))
+                    .unwrap();
+            }
+            if prefix.contains("missing.bin")
+                || prefix.starts_with("empty/")
+                || prefix.starts_with("empty-table/")
+            {
                 let body = format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com">
@@ -1202,10 +1239,16 @@ mod tests {
                     .body(Body::from(body))
                     .unwrap();
             }
-            let marker = parameters.get("marker").cloned();
             let probe = parameters.get("max-keys").map(String::as_str) == Some("1");
             let (key, truncated, next_marker) = if probe {
-                ("objects/a.bin", "false", "")
+                let key = if prefix.starts_with("broken-page/") {
+                    "broken-page/a.bin"
+                } else {
+                    "objects/a.bin"
+                };
+                (key, "false", "")
+            } else if prefix.starts_with("broken-page/") {
+                ("broken-page/a.bin", "true", "broken-page/a.bin")
             } else if marker.as_deref() == Some("objects/a.bin") {
                 ("objects/b.bin", "false", "")
             } else {
@@ -1218,7 +1261,7 @@ mod tests {
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com">
   <Name>jindo-test-bucket</Name>
-  <Prefix>objects/</Prefix>
+  <Prefix>{prefix}</Prefix>
   <Marker>{}</Marker>
   <MaxKeys>1</MaxKeys>
   <IsTruncated>{truncated}</IsTruncated>
@@ -1261,7 +1304,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let config = jindo_config_parse(HashMap::from([
+        let properties = HashMap::from([
             (OSS_IMPL.to_string(), JINDO_IMPL.to_string()),
             (JINDO_LIBRARY_PATH.to_string(), library_path),
             (OSS_ENDPOINT.to_string(), format!("http://{address}")),
@@ -1278,8 +1321,8 @@ mod tests {
                 "true".to_string(),
             ),
             ("fs.oss.retry.count".to_string(), "0".to_string()),
-        ]))
-        .unwrap();
+        ]);
+        let config = jindo_config_parse(properties.clone()).unwrap();
         let operator = jindo_config_build(&config, "jindo-test-bucket").unwrap();
 
         let metadata = operator.stat("objects/data.bin").await.unwrap();
@@ -1290,6 +1333,30 @@ mod tests {
             entries.iter().map(|entry| entry.path()).collect::<Vec<_>>(),
             ["objects/a.bin", "objects/b.bin"]
         );
+        assert!(operator.list("empty/").await.unwrap().is_empty());
+
+        let later_not_found = operator.list("broken-page/").await.unwrap_err();
+        assert_eq!(later_not_found.kind(), ErrorKind::NotFound);
+
+        let forbidden = operator.list("forbidden/").await.unwrap_err();
+        assert_eq!(forbidden.kind(), ErrorKind::PermissionDenied);
+
+        let file_io = crate::io::FileIOBuilder::new("oss")
+            .with_props(properties)
+            .build()
+            .unwrap();
+        let snapshots = crate::table::SnapshotManager::new(
+            file_io,
+            "oss://jindo-test-bucket/empty-table".to_string(),
+        );
+        assert_eq!(snapshots.get_latest_snapshot_id().await.unwrap(), None);
+        assert_eq!(snapshots.earliest_snapshot_id().await.unwrap(), None);
+        let branch_snapshots = snapshots.with_branch("dev");
+        assert_eq!(
+            branch_snapshots.get_latest_snapshot_id().await.unwrap(),
+            None
+        );
+        assert_eq!(branch_snapshots.earliest_snapshot_id().await.unwrap(), None);
 
         let reader = operator.reader("objects/data.bin").await.unwrap();
         assert_eq!(reader.read(2..6).await.unwrap().to_bytes(), &b"2345"[..]);
@@ -1309,7 +1376,7 @@ mod tests {
             .contains("Jindo list failed with a C++ exception"));
 
         assert_eq!(state.stat_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(state.list_page_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(state.list_page_requests.load(Ordering::SeqCst), 3);
         assert_eq!(state.range_requests.load(Ordering::SeqCst), 1);
         assert_eq!(state.unavailable_requests.load(Ordering::SeqCst), 1);
         server.abort();
