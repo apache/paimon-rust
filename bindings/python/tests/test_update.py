@@ -74,12 +74,12 @@ def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
         pa.array([101, 30], type=pa.int32()),
     ], names=['id', 'name', 'score'])
     update = builder.new_update().with_update_type(update_cols=['name', 'score'])
+    assert not hasattr(update, 'add_matched_batch')
+    assert not hasattr(update, 'prepare_commit')
+    assert not hasattr(update, 'close')
     messages = update.upsert_by_arrow_with_key(
         table=pa.Table.from_batches([first, second]), upsert_keys=['id'])
     assert messages and all(message.serialize() for message in messages)
-    update.close()
-    with pytest.raises(RuntimeError, match='closed'):
-        update.upsert_by_arrow_with_key(pa.Table.from_batches([first]), ['id'])
     builder.new_commit().commit(messages)
 
     actual = pa.Table.from_batches(context.sql(
@@ -99,6 +99,8 @@ def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
     ], names=['id', 'name', 'score'])
     stream_update = stream.new_update().with_update_type(
         update_cols=['name', 'score'])
+    assert not hasattr(stream_update, 'close')
+    assert not hasattr(stream_update, 'add_matched_batch')
     messages = stream_update.upsert_by_arrow_with_key(
         table=pa.Table.from_batches([next_rows]), upsert_keys=['id'],
         commit_identifier=42)
@@ -150,7 +152,7 @@ def test_batch_update_row_ids_commits_through_write_builder(tmp_path):
 
     table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('updates.t')
     builder = table.new_batch_write_builder()
-    update = builder.new_update(['name'])
+    update = builder._new_matched_update(['name'])
     update.add_matched_batch(pa.record_batch([
         pa.array([0, 2], type=pa.int64()),
         pa.array(['A', 'C']),
@@ -180,7 +182,7 @@ def test_grouped_batch_update_checks_input_table_file_overlap(tmp_path):
     table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table(
         'grouped_updates.t')
 
-    overlap = table.new_batch_write_builder().new_update(['name'])
+    overlap = table.new_batch_write_builder()._new_matched_update(['name'])
     overlap.add_matched_group([pa.record_batch([
         pa.array([0], type=pa.int64()), pa.array(['A']),
     ], names=['_ROW_ID', 'name'])])
@@ -191,7 +193,7 @@ def test_grouped_batch_update_checks_input_table_file_overlap(tmp_path):
         overlap.prepare_commit()
 
     builder = table.new_batch_write_builder()
-    update = builder.new_update(['name'])
+    update = builder._new_matched_update(['name'])
     update.add_matched_group([
         pa.record_batch([
             pa.array([0], type=pa.int64()), pa.array(['A']),
@@ -225,9 +227,6 @@ def test_batch_delete_row_ids_commits_deletion_vectors(tmp_path):
     update = builder.new_update()
     messages = update.delete_by_row_id([0, 2, 2])
     assert messages and messages[0].serialize()
-    update.close()
-    with pytest.raises(RuntimeError, match='closed'):
-        update.delete_by_row_id([1])
     builder.new_commit().commit(messages)
 
     actual = pa.Table.from_batches(context.sql(
