@@ -164,8 +164,14 @@ pub(crate) enum BlobReadValue {
 const BLOB_FOOTER_SIZE: u64 = 5;
 const BLOB_FORMAT_VERSION: u8 = 1;
 const BLOB_INDEX_CACHE_CAPACITY: usize = 16;
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct BlobIndexCacheKey {
+    namespace: usize,
+    file_path: String,
+}
+
 static BLOB_INDEX_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<LruCache<String, Arc<BlobFileIndex>>>,
+    std::sync::Mutex<LruCache<BlobIndexCacheKey, Arc<BlobFileIndex>>>,
 > = std::sync::LazyLock::new(|| {
     std::sync::Mutex::new(LruCache::new(
         std::num::NonZeroUsize::new(BLOB_INDEX_CACHE_CAPACITY).unwrap(),
@@ -1672,21 +1678,28 @@ impl BlobFileIndex {
         file_size: u64,
         file_path: &str,
     ) -> crate::Result<Arc<Self>> {
-        if !file_path.is_empty() {
+        let cache_key = reader
+            .cache_namespace()
+            .filter(|_| !file_path.is_empty())
+            .map(|namespace| BlobIndexCacheKey {
+                namespace,
+                file_path: file_path.to_string(),
+            });
+        if let Some(cache_key) = &cache_key {
             let mut cache = BLOB_INDEX_CACHE
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if let Some(index) = cache.get(file_path) {
+            if let Some(index) = cache.get(cache_key) {
                 return Ok(index.clone());
             }
         }
 
         let index = Arc::new(Self::load(reader, file_size).await?);
-        if !file_path.is_empty() {
+        if let Some(cache_key) = cache_key {
             BLOB_INDEX_CACHE
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .put(file_path.to_string(), index.clone());
+                .put(cache_key, index.clone());
         }
         Ok(index)
     }
@@ -2262,6 +2275,7 @@ fn encode_varint(value: i64, out: &mut Vec<u8>) {
 mod tests {
     use super::*;
     use crate::btree::test_util::BytesFileRead;
+    use crate::io::{FileIO, FileIOBuilder};
     use crate::spec::{ArrayType, BlobType, MapType, VarCharType};
     use arrow_array::Array;
     use bytes::Bytes;
@@ -2335,8 +2349,10 @@ mod tests {
     async fn test_blob_reader_reuses_cached_index() {
         let file_path = "file:///blob-index-cache-test/data.blob";
         let file_bytes = load_blob_fixture("blob-basic.blob");
-        let first = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
-        let second = TrackingFileRead::new(Bytes::from(file_bytes.clone()));
+        let first =
+            TrackingFileRead::new(Bytes::from(file_bytes.clone())).with_cache_namespace(usize::MAX);
+        let second =
+            TrackingFileRead::new(Bytes::from(file_bytes.clone())).with_cache_namespace(usize::MAX);
 
         let first_reader = IndexedBlobReader::open(
             Box::new(first.clone()),
@@ -2358,6 +2374,39 @@ mod tests {
         assert_eq!(first_reader.num_rows(), second_reader.num_rows());
         assert_eq!(first.ranges().len(), 2);
         assert!(second.ranges().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_isolated_by_file_io() {
+        let path = "memory:///blob-index-cache-namespace/data.blob";
+        let value = b"value";
+        let first_bytes = blob_test_utils::build_blob_file_bytes(&[None, Some(value.as_slice())]);
+        let second_bytes = blob_test_utils::build_blob_file_bytes(&[Some(value.as_slice()), None]);
+        assert_eq!(first_bytes.len(), second_bytes.len());
+
+        let first_io = FileIOBuilder::new("memory").build().unwrap();
+        let second_io = FileIOBuilder::new("memory").build().unwrap();
+        first_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(first_bytes))
+            .await
+            .unwrap();
+        second_io
+            .new_output(path)
+            .unwrap()
+            .write(Bytes::from(second_bytes))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_scalar_blob_file(&first_io, path).await,
+            vec![None, Some(value.to_vec())]
+        );
+        assert_eq!(
+            read_scalar_blob_file(&second_io, path).await,
+            vec![Some(value.to_vec()), None]
+        );
     }
 
     #[tokio::test]
@@ -3558,6 +3607,30 @@ mod tests {
         Ok(batches.iter().flat_map(collect_binary_values).collect())
     }
 
+    async fn read_scalar_blob_file(file_io: &FileIO, path: &str) -> Vec<Option<Vec<u8>>> {
+        let input = file_io.new_input(path).unwrap();
+        let file_size = input.metadata().await.unwrap().size;
+        let batches = BlobFormatReader::new(path.to_string(), false)
+            .read_batch_stream(
+                Box::new(input.reader().await.unwrap()),
+                file_size,
+                &[DataField::new(
+                    0,
+                    "payload".to_string(),
+                    DataType::Blob(BlobType::new()),
+                )],
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        batches.iter().flat_map(collect_binary_values).collect()
+    }
+
     fn rewrite_first_blob_entry_crc(file_bytes: &mut [u8], payload_length: usize) {
         let crc_offset = BLOB_INLINE_HEADER_SIZE as usize + payload_length + size_of::<i64>();
         let mut hasher = crc32fast::Hasher::new();
@@ -3650,6 +3723,7 @@ mod tests {
     #[derive(Clone)]
     struct TrackingFileRead {
         bytes: Bytes,
+        cache_namespace: Option<usize>,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
         ranges: Arc<Mutex<Vec<Range<u64>>>>,
@@ -3659,10 +3733,16 @@ mod tests {
         fn new(bytes: Bytes) -> Self {
             Self {
                 bytes,
+                cache_namespace: None,
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
                 ranges: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn with_cache_namespace(mut self, cache_namespace: usize) -> Self {
+            self.cache_namespace = Some(cache_namespace);
+            self
         }
 
         fn max_in_flight(&self) -> usize {
@@ -3683,6 +3763,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+
+        fn cache_namespace(&self) -> Option<usize> {
+            self.cache_namespace
         }
     }
 
