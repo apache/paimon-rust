@@ -24,7 +24,6 @@
 use std::collections::HashSet;
 
 use arrow_array::RecordBatch;
-use indexmap::IndexMap;
 
 use crate::table::{CommitMessage, Table, TableUpdateByRowId};
 
@@ -124,18 +123,12 @@ impl TableUpdate {
         Ok(Some(columns))
     }
 
-    /// Create the low-level writer for callers that already have matched rows.
-    pub fn new_update_by_row_id(&self) -> crate::Result<TableUpdateByRowId> {
-        TableUpdateByRowId::new(
-            &self.table,
-            self.update_cols
-                .clone()
-                .unwrap_or_else(|| self.all_fields()),
-        )
+    /// Create a row-ID updater sharing one snapshot across per-call columns.
+    pub async fn new_update_by_row_id(&self) -> crate::Result<TableUpdateByRowId> {
+        TableUpdateByRowId::new(&self.table, self.commit_user.clone()).await
     }
 
-    /// Update existing rows from Arrow batches containing `_ROW_ID`. When no
-    /// update type was selected, the input's non-`_ROW_ID` columns are used.
+    /// Update existing rows from chunks of one Arrow table containing `_ROW_ID`.
     pub async fn update_by_arrow_with_row_id(
         &self,
         batches: Vec<RecordBatch>,
@@ -143,103 +136,48 @@ impl TableUpdate {
         let Some(columns) = self.columns_for_input(&batches)? else {
             return Ok(Vec::new());
         };
-        let mut writer = TableUpdateByRowId::new(&self.table, columns)?;
-        for batch in batches {
-            writer.add_matched_batch(batch)?;
-        }
-        writer.prepare_commit().await
+        self.new_update_by_row_id()
+            .await?
+            .update_columns(batches, columns)
+            .await
     }
 
-    /// Apply multiple logical input tables while preserving group boundaries.
-    /// Groups updating the same target file group and any common column conflict.
-    /// Without an explicit update type, each input table selects its own columns.
-    pub async fn update_by_arrow_batches_with_row_id(
+    /// Update logical Arrow tables from a fallible iterator. Create the shared
+    /// snapshot/file index after receiving the first table, as in PyPaimon.
+    /// Abort staged files on an input, conversion, or update failure.
+    pub async fn update_by_arrow_batches_with_row_id<I>(
         &self,
-        groups: Vec<Vec<RecordBatch>>,
-    ) -> crate::Result<Vec<CommitMessage>> {
-        let mut inputs = Vec::new();
-        for group in groups {
-            if let Some(columns) = self.columns_for_input(&group)? {
-                inputs.push((columns, group));
-            }
-        }
-        let Some((first_columns, _)) = inputs.first() else {
-            return Ok(Vec::new());
-        };
-        if inputs
-            .iter()
-            .all(|(columns, _)| same_columns(first_columns, columns))
-        {
-            let mut writer = TableUpdateByRowId::new(&self.table, first_columns.clone())?;
-            for (_, group) in inputs {
-                writer.add_matched_group(group)?;
-            }
-            return writer.prepare_commit().await;
-        }
-        self.update_mixed_column_groups(inputs).await
-    }
-
-    async fn update_mixed_column_groups(
-        &self,
-        inputs: Vec<(Vec<String>, Vec<RecordBatch>)>,
-    ) -> crate::Result<Vec<CommitMessage>> {
-        let has_rows = inputs
-            .iter()
-            .any(|(_, group)| group.iter().any(|batch| batch.num_rows() > 0));
-        // A writer per column preserves the per-column overlap rule even when
-        // two input tables select intersecting but different column sets.
-        let mut writers = IndexMap::<String, TableUpdateByRowId>::new();
-        for (columns, group) in inputs {
-            for column in columns {
-                let batches = group
-                    .iter()
-                    .map(|batch| {
-                        let schema = batch.schema();
-                        let indices = [schema.index_of(ROW_ID), schema.index_of(&column)]
-                            .into_iter()
-                            .collect::<Result<Vec<_>, _>>()
-                            .map_err(|error| invalid(error.to_string()))?;
-                        batch
-                            .project(&indices)
-                            .map_err(|error| invalid(error.to_string()))
-                    })
-                    .collect::<crate::Result<Vec<_>>>()?;
-                if !writers.contains_key(&column) {
-                    writers.insert(
-                        column.clone(),
-                        TableUpdateByRowId::new(&self.table, vec![column.clone()])?,
-                    );
-                }
-                writers
-                    .get_mut(&column)
-                    .unwrap()
-                    .add_matched_group(batches)?;
-            }
-        }
-
-        // Every column must read the same base snapshot. Results prepared by
-        // earlier column writers are aborted if a later column fails.
-        crate::spec::CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        let snapshot = super::time_travel::resolve_snapshot(&self.table).await?;
-        if snapshot.is_none() && has_rows {
-            return Err(invalid("No files with row tracking found in target table"));
-        }
-        let mut messages = Vec::new();
-        for (_, mut writer) in writers {
-            if let Some(snapshot) = &snapshot {
-                writer.pin_read_snapshot(snapshot.id());
-            }
-            match writer.prepare_commit().await {
-                Ok(prepared) => messages.extend(prepared),
-                Err(error) => {
-                    let commit =
-                        super::TableCommit::new(self.table.clone(), self.commit_user.clone());
-                    let _ = commit.abort(&messages).await;
-                    return Err(error);
+        groups: I,
+    ) -> crate::Result<Vec<CommitMessage>>
+    where
+        I: IntoIterator<Item = crate::Result<Vec<RecordBatch>>>,
+    {
+        let mut writer = None;
+        let result = async {
+            for group in groups {
+                let group = group?;
+                if let Some(columns) = self.columns_for_input(&group)? {
+                    if writer.is_none() {
+                        writer = Some(self.new_update_by_row_id().await?);
+                    }
+                    writer
+                        .as_mut()
+                        .unwrap()
+                        .update_columns(group, columns)
+                        .await?;
                 }
             }
+            Ok(writer
+                .as_ref()
+                .map_or_else(Vec::new, |writer| writer.commit_messages().to_vec()))
         }
-        Ok(messages)
+        .await;
+        if result.is_err() {
+            if let Some(writer) = &mut writer {
+                let _ = writer.abort().await;
+            }
+        }
+        result
     }
 
     /// Upsert complete Arrow rows by composite key through the core upsert
@@ -257,6 +195,7 @@ impl TableUpdate {
                 upsert_keys,
                 self.update_cols
                     .clone()
+                    .filter(|columns| !columns.is_empty())
                     .unwrap_or_else(|| self.all_fields()),
             )?;
         for batch in batches {

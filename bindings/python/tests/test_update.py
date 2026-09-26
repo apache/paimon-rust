@@ -139,14 +139,20 @@ def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
         'score': [101, 101, 21, 31, 41],
     }
 
-    # Empty selection remains empty in core, rather than updating all fields.
-    # Invalid configuration must not overwrite the previously selected fields.
+    # Empty selection means all columns for upsert, as in PyPaimon.
+    # Invalid configuration must not overwrite the previous selection.
     all_columns.with_update_type([])
     with pytest.raises(ValueError, match='not in table schema'):
         all_columns.with_update_type(['missing'])
-    with pytest.raises(ValueError, match='update columns must not be empty'):
-        all_columns.upsert_by_arrow_with_key(
-            pa.Table.from_batches([first]), ['id'])
+    messages = all_columns.upsert_by_arrow_with_key(
+        pa.Table.from_batches([first]), ['id'])
+    builder.new_commit().commit(messages)
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, name, score FROM paimon.table_upsert.t WHERE id = 1'))
+    assert actual.to_pydict() == {'id': [1, 1], 'name': ['x', 'x'], 'score': [100, 100]}
+    with pytest.raises(ValueError, match='column_names cannot be empty'):
+        all_columns.update_by_arrow_with_row_id(
+            pa.table({'_ROW_ID': [0], 'score': [2]}))
 
 
 def test_batch_update_row_ids_commits_through_write_builder(tmp_path):
@@ -161,15 +167,15 @@ def test_batch_update_row_ids_commits_through_write_builder(tmp_path):
 
     table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('updates.t')
     builder = table.new_batch_write_builder()
-    update = builder._new_matched_update(['name'])
-    update.add_matched_batch(pa.record_batch([
-        pa.array([0, 2], type=pa.int64()),
-        pa.array(['A', 'C']),
-    ], names=['_ROW_ID', 'name']))
-    messages = update.prepare_commit()
+    update = builder.new_update().with_update_type(['id'])
+    row_ids = update.new_update_by_row_id()
+    messages = row_ids.update_columns(pa.table({
+        '_ROW_ID': [0, 2], 'name': ['A', 'C'],
+    }), ['name'])
     assert messages and messages[0].serialize()
-    with pytest.raises(RuntimeError, match='closed'):
-        update.prepare_commit()
+    assert [m.serialize() for m in row_ids.commit_messages] == [m.serialize() for m in messages]
+    with pytest.raises(ValueError, match='overlapping first_row_ids'):
+        row_ids.update_columns(pa.table({'_ROW_ID': [1], 'name': ['B']}), ['name'])
     builder.new_commit().commit(messages)
 
     actual = pa.Table.from_batches(context.sql(
@@ -191,33 +197,54 @@ def test_grouped_batch_update_checks_input_table_file_overlap(tmp_path):
     table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table(
         'grouped_updates.t')
 
-    overlap = table.new_batch_write_builder()._new_matched_update(['name'])
-    overlap.add_matched_group([pa.record_batch([
-        pa.array([0], type=pa.int64()), pa.array(['A']),
-    ], names=['_ROW_ID', 'name'])])
-    overlap.add_matched_group([pa.record_batch([
-        pa.array([1], type=pa.int64()), pa.array(['B']),
-    ], names=['_ROW_ID', 'name'])])
+    before = set(tmp_path.rglob('*.parquet'))
+    overlap = table.new_batch_write_builder().new_update()
     with pytest.raises(ValueError, match='overlapping first_row_ids.*0'):
-        overlap.prepare_commit()
+        overlap.update_by_arrow_batches_with_row_id(iter([
+            pa.table({'_ROW_ID': [0], 'name': ['A']}),
+            pa.table({'_ROW_ID': [1], 'name': ['B']}),
+        ]))
+    assert set(tmp_path.rglob('*.parquet')) == before
+
+    def failing_tables():
+        yield pa.table({'_ROW_ID': [0], 'name': ['A']})
+        raise RuntimeError('input failed')
+
+    with pytest.raises(RuntimeError, match='input failed'):
+        overlap.update_by_arrow_batches_with_row_id(failing_tables())
+    assert set(tmp_path.rglob('*.parquet')) == before
 
     builder = table.new_batch_write_builder()
-    update = builder._new_matched_update(['name'])
-    update.add_matched_group([
-        pa.record_batch([
-            pa.array([0], type=pa.int64()), pa.array(['A']),
-        ], names=['_ROW_ID', 'name']),
-        pa.record_batch([
-            pa.array([1], type=pa.int64()), pa.array(['B']),
-        ], names=['_ROW_ID', 'name']),
-    ])
-    update.add_matched_group([pa.record_batch([
-        pa.array([2], type=pa.int64()), pa.array(['C']),
-    ], names=['_ROW_ID', 'name'])])
-    builder.new_commit().commit(update.prepare_commit())
+    messages = builder.new_update().update_by_arrow_batches_with_row_id(iter([
+        pa.Table.from_batches([
+            pa.record_batch([pa.array([0], type=pa.int64()), pa.array(['A'])],
+                            names=['_ROW_ID', 'name']),
+            pa.record_batch([pa.array([1], type=pa.int64()), pa.array(['B'])],
+                            names=['_ROW_ID', 'name']),
+        ]),
+        pa.table({'_ROW_ID': [2], 'name': ['C']}),
+    ]))
+    builder.new_commit().commit(messages)
     actual = pa.Table.from_batches(context.sql(
         'SELECT id, name FROM paimon.grouped_updates.t')).sort_by('id').to_pydict()
     assert actual == {'id': [1, 2, 3, 4], 'name': ['A', 'B', 'C', 'd']}
+
+    def creates_rows_before_first_yield():
+        context.sql("INSERT INTO paimon.grouped_updates.t (id, name) VALUES (5, 'e')")
+        yield pa.table({'_ROW_ID': [4], 'name': ['E']})
+
+    builder = table.new_batch_write_builder()
+    messages = builder.new_update().update_by_arrow_batches_with_row_id(
+        creates_rows_before_first_yield())
+    builder.new_commit().commit(messages)
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, name FROM paimon.grouped_updates.t')).sort_by('id').to_pydict()
+    assert actual == {'id': [1, 2, 3, 4, 5], 'name': ['A', 'B', 'C', 'd', 'E']}
+
+    context.sql('CREATE TABLE paimon.grouped_updates.plain (id INT)')
+    plain = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('grouped_updates.plain')
+    assert plain.new_batch_write_builder().new_update().update_by_arrow_batches_with_row_id(
+        iter([])) == []
 
 
 def test_batch_delete_row_ids_commits_deletion_vectors(tmp_path):
@@ -246,3 +273,23 @@ def test_batch_delete_row_ids_commits_deletion_vectors(tmp_path):
     stream_update = stream.new_update()
     stream.new_commit().commit(42, stream_update.delete_by_row_id([1], 42))
     assert list(context.sql('SELECT id, name FROM paimon.deletes.t')) == []
+
+
+def test_stream_row_id_update_and_factory(tmp_path):
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.stream_updates')
+    context.sql("""CREATE TABLE paimon.stream_updates.t (id INT, value INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')""")
+    context.sql('INSERT INTO paimon.stream_updates.t (id, value) VALUES (1, 10), (2, 20)')
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('stream_updates.t')
+    stream = table.new_stream_write_builder()
+    update = stream.new_update()
+    messages = update.update_by_arrow_with_row_id(pa.table({'_ROW_ID': [0], 'value': [11]}), 10)
+    stream.new_commit().commit(10, messages)
+    low = update.new_update_by_row_id(11)
+    messages = low.update_columns(pa.table({'_ROW_ID': [1], 'value': [22]}), ['value'])
+    stream.new_commit().commit(11, messages)
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, value FROM paimon.stream_updates.t')).sort_by('id').to_pydict()
+    assert actual == {'id': [1, 2], 'value': [11, 22]}

@@ -19,7 +19,7 @@
 
 use super::write_builder::validate_commit_user;
 use super::{
-    DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableUpdateByRowId, TableWrite,
+    DataEvolutionDeleteWriter, DataEvolutionWriter, Table, TableCommit, TableUpdate, TableWrite,
 };
 use crate::resource::ResourceContext;
 use uuid::Uuid;
@@ -89,10 +89,10 @@ impl<'a> FormatWriteBuilder<'a> {
         })
     }
 
-    pub(crate) fn new_update_by_row_id(
+    pub(crate) fn new_data_evolution_writer(
         &self,
         _update_columns: Vec<String>,
-    ) -> crate::Result<TableUpdateByRowId> {
+    ) -> crate::Result<DataEvolutionWriter> {
         Err(crate::Error::Unsupported {
             message: "Updating format tables is not supported by the Rust client yet".to_string(),
         })

@@ -20,7 +20,7 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch};
+use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 use paimon::spec::{DataType, IntType, Schema, TableSchema};
 use paimon::table::{CommitMessage, Table};
@@ -153,16 +153,15 @@ async fn row_id_update_infers_columns_and_reuses_configuration() {
     assert!(update
         .with_update_type(vec!["value".into(), "missing".into()])
         .is_err());
-    // Invalid configuration must leave the previous selection intact. The
-    // low-level factory inherits that selection, ignoring the extra column.
-    let mut writer = update.new_update_by_row_id().unwrap();
-    writer
-        .add_matched_batch(matched(
+    // Invalid configuration must leave the previous selection intact.
+    let messages = update
+        .update_by_arrow_with_row_id(vec![matched(
             vec![0],
             &[("value", vec![999]), ("score", vec![101])],
-        ))
+        )])
+        .await
         .unwrap();
-    commit(&table, writer.prepare_commit().await.unwrap()).await;
+    commit(&table, messages).await;
 
     // Selecting the full schema restores per-input inference, like Python.
     update
@@ -188,13 +187,17 @@ async fn grouped_updates_allow_disjoint_columns_on_the_same_file() {
     seed(&table).await;
     let update = table.new_write_builder().new_update().unwrap();
     let messages = update
-        .update_by_arrow_batches_with_row_id(vec![
+        .update_by_arrow_batches_with_row_id(
             vec![
-                matched(vec![0], &[("value", vec![11])]),
-                matched(vec![1], &[("value", vec![22])]),
-            ],
-            vec![matched(vec![0, 2], &[("score", vec![101, 303])])],
-        ])
+                vec![
+                    matched(vec![0], &[("value", vec![11])]),
+                    matched(vec![1], &[("value", vec![22])]),
+                ],
+                vec![matched(vec![0, 2], &[("score", vec![101, 303])])],
+            ]
+            .into_iter()
+            .map(Ok),
+        )
         .await
         .unwrap();
     commit(&table, messages).await;
@@ -213,13 +216,17 @@ async fn overlapping_groups_abort_previously_prepared_columns() {
     // The score writer succeeds before the value writer encounters different
     // logical inputs touching the same file, even though their row IDs differ.
     let error = update
-        .update_by_arrow_batches_with_row_id(vec![
-            vec![matched(
-                vec![0],
-                &[("score", vec![101]), ("value", vec![11])],
-            )],
-            vec![matched(vec![2], &[("value", vec![33])])],
-        ])
+        .update_by_arrow_batches_with_row_id(
+            vec![
+                vec![matched(
+                    vec![0],
+                    &[("score", vec![101]), ("value", vec![11])],
+                )],
+                vec![matched(vec![2], &[("value", vec![33])])],
+            ]
+            .into_iter()
+            .map(Ok),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -261,7 +268,7 @@ async fn row_id_update_rejects_inconsistent_chunks_and_empty_selection() {
         .unwrap_err();
     assert!(error.to_string().contains("column_names cannot be empty"));
     assert!(update
-        .update_by_arrow_batches_with_row_id(vec![])
+        .update_by_arrow_batches_with_row_id(vec![].into_iter().map(Ok))
         .await
         .unwrap()
         .is_empty());
@@ -273,18 +280,26 @@ async fn grouped_updates_on_an_empty_table_preserve_empty_input_semantics() {
     let table = evolution_table().await;
     let update = table.new_write_builder().new_update().unwrap();
     assert!(update
-        .update_by_arrow_batches_with_row_id(vec![
-            vec![matched(vec![], &[("value", vec![])])],
-            vec![matched(vec![], &[("score", vec![])])],
-        ])
+        .update_by_arrow_batches_with_row_id(
+            vec![
+                vec![matched(vec![], &[("value", vec![])])],
+                vec![matched(vec![], &[("score", vec![])])],
+            ]
+            .into_iter()
+            .map(Ok)
+        )
         .await
         .unwrap()
         .is_empty());
     let error = update
-        .update_by_arrow_batches_with_row_id(vec![
-            vec![matched(vec![0], &[("value", vec![11])])],
-            vec![matched(vec![0], &[("score", vec![101])])],
-        ])
+        .update_by_arrow_batches_with_row_id(
+            vec![
+                vec![matched(vec![0], &[("value", vec![11])])],
+                vec![matched(vec![0], &[("score", vec![101])])],
+            ]
+            .into_iter()
+            .map(Ok),
+        )
         .await
         .unwrap_err();
     assert!(error.to_string().contains("No files with row tracking"));
@@ -348,6 +363,74 @@ async fn configured_upsert_and_delete_are_core_operations() {
 }
 
 #[tokio::test]
+async fn row_id_update_rejects_invalid_casts_without_writing_nulls() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let before = parquet_files(&table).await;
+    let update = table.new_write_builder().new_update().unwrap();
+    for values in [
+        Arc::new(StringArray::from(vec!["bad"])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![i64::from(i32::MAX) + 1])),
+    ] {
+        let input = RecordBatch::try_from_iter([
+            ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+            ("value", values),
+        ])
+        .unwrap();
+        assert!(update
+            .update_by_arrow_with_row_id(vec![input])
+            .await
+            .is_err());
+        assert_eq!(parquet_files(&table).await, before);
+    }
+    let input = RecordBatch::try_from_iter([
+        ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+        ("value", Arc::new(Int64Array::from(vec![42])) as ArrayRef),
+    ])
+    .unwrap();
+    commit(
+        &table,
+        update
+            .update_by_arrow_with_row_id(vec![input])
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        read_rows(&table).await,
+        vec![vec![1, 42, 100], vec![2, 20, 200], vec![3, 30, 300]]
+    );
+}
+
+#[tokio::test]
+async fn empty_update_type_means_all_columns_for_upsert_only() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec![]).unwrap();
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![batch(&[
+                ("id", vec![1]),
+                ("value", vec![11]),
+                ("score", vec![101]),
+            ])],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    commit(&table, messages).await;
+    assert_eq!(
+        read_rows(&table).await,
+        vec![vec![1, 11, 101], vec![2, 20, 200], vec![3, 30, 300]]
+    );
+    assert!(update
+        .update_by_arrow_with_row_id(vec![matched(vec![0], &[("value", vec![12])])])
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn update_builder_rejects_overwrite_and_time_travel() {
     let table = evolution_table().await;
     assert!(table
@@ -358,4 +441,146 @@ async fn update_builder_rejects_overwrite_and_time_travel() {
     let historical =
         table.copy_with_options(HashMap::from([("scan.snapshot-id".into(), "1".into())]));
     assert!(historical.new_write_builder().new_update().is_err());
+}
+
+#[tokio::test]
+async fn row_id_factory_shares_snapshot_and_selects_columns_per_call() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["id".into()]).unwrap();
+    let mut updater = update.new_update_by_row_id().await.unwrap();
+    // The factory does not inherit the high-level selected columns. It pins
+    // the original file index even if new rows arrive before the first call.
+    seed(&table).await;
+    assert!(updater
+        .update_columns(
+            vec![matched(vec![3], &[("value", vec![99])])],
+            vec!["value".into()]
+        )
+        .await
+        .is_err());
+    let first = updater
+        .update_columns(
+            vec![matched(vec![0], &[("value", vec![11])])],
+            vec!["value".into()],
+        )
+        .await
+        .unwrap();
+    let both = updater
+        .update_columns(
+            vec![matched(vec![1], &[("score", vec![222])])],
+            vec!["score".into()],
+        )
+        .await
+        .unwrap();
+    assert!(both.len() > first.len());
+    assert_eq!(both.len(), updater.commit_messages().len());
+    assert!(both
+        .iter()
+        .all(|message| message.check_from_snapshot == Some(1)));
+    assert!(updater
+        .update_columns(
+            vec![matched(vec![2], &[("value", vec![33])])],
+            vec!["value".into()]
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("overlapping first_row_ids"));
+    // A validation error leaves earlier messages available to commit.
+    commit(&table, updater.commit_messages().to_vec()).await;
+    assert_eq!(
+        read_rows(&table).await,
+        vec![
+            vec![1, 10, 100],
+            vec![1, 11, 100],
+            vec![2, 20, 200],
+            vec![2, 20, 222],
+            vec![3, 30, 300],
+            vec![3, 30, 300],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn grouped_input_failure_aborts_files_and_preserves_the_cause() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let before = parquet_files(&table).await;
+    let update = table.new_write_builder().new_update().unwrap();
+    let error = update
+        .update_by_arrow_batches_with_row_id(vec![
+            Ok(vec![matched(vec![0], &[("value", vec![11])])]),
+            Err(paimon::Error::DataInvalid {
+                message: "input generator failed".into(),
+                source: None,
+            }),
+        ])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("input generator failed"));
+    assert_eq!(parquet_files(&table).await, before);
+    assert_eq!(
+        read_rows(&table).await,
+        vec![vec![1, 10, 100], vec![2, 20, 200], vec![3, 30, 300]]
+    );
+}
+
+#[tokio::test]
+async fn core_assignments_validate_before_staging_and_preserve_chunk_alignment() {
+    use paimon::table::UpdateAssignment;
+    let table = evolution_table().await;
+    seed(&table).await;
+    let mut writer = table
+        .new_write_builder()
+        .new_data_evolution_writer(vec!["value".into(), "score".into()])
+        .unwrap();
+    let matched = vec![
+        matched(vec![2, 0], &[("id", vec![3, 1])]),
+        matched(vec![1], &[("id", vec![2])]),
+    ];
+    for invalid in [
+        Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(StringArray::from(vec!["1", "bad", "3"])),
+        Arc::new(arrow_array::Float64Array::from(vec![1.0, 2.5, 3.0])),
+        Arc::new(Int64Array::from(vec![1, i64::MAX, 3])),
+    ] {
+        assert!(writer
+            .add_assigned_batches(
+                matched.clone(),
+                vec![
+                    ("value".into(), UpdateAssignment::Array(vec![invalid])),
+                    (
+                        "score".into(),
+                        UpdateAssignment::Scalar(Arc::new(Int32Array::from(vec![9])))
+                    ),
+                ]
+            )
+            .is_err());
+    }
+    writer
+        .add_assigned_batches(
+            matched,
+            vec![
+                (
+                    "value".into(),
+                    UpdateAssignment::Array(vec![
+                        Arc::new(Int64Array::from(Vec::<i64>::new())),
+                        Arc::new(Int64Array::from(vec![33])),
+                        Arc::new(Int64Array::from(vec![11, 22])),
+                    ]),
+                ),
+                (
+                    "score".into(),
+                    UpdateAssignment::Scalar(Arc::new(Int32Array::from(vec![999]))),
+                ),
+            ],
+        )
+        .unwrap();
+    commit(&table, writer.prepare_commit().await.unwrap()).await;
+    assert_eq!(
+        read_rows(&table).await,
+        vec![vec![1, 11, 999], vec![2, 22, 999], vec![3, 33, 999]]
+    );
 }

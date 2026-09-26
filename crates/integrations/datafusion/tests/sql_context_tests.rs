@@ -529,7 +529,7 @@ async fn test_select_branch_table_reads_branch_snapshot() {
     let write_builder = branch_table.new_write_builder();
     assert!(write_builder.new_write().is_err());
     assert!(write_builder
-        .new_update_by_row_id(vec!["name".to_string()])
+        .new_data_evolution_writer(vec!["name".to_string()])
         .is_err());
     assert!(write_builder.new_delete().is_err());
     assert!(write_builder.try_new_commit().is_err());

@@ -18,7 +18,7 @@
 //! UPDATE execution for Paimon tables.
 //!
 //! Supports two execution paths:
-//! - **Data evolution tables**: partial-column writes via [`paimon::table::TableUpdateByRowId`].
+//! - **Data evolution tables**: partial-column writes via [`paimon::table::DataEvolutionWriter`].
 //! - **Append-only tables** (no PK, no deletion vectors): copy-on-write file rewriting
 //!   via [`paimon::table::CopyOnWriteMergeWriter`].
 
@@ -100,7 +100,7 @@ async fn execute_update_once(
     // 2. Create the row-ID writer through the table write builder (validates preconditions)
     let wb = table.new_write_builder();
     let mut table_update = wb
-        .new_update_by_row_id(columns.clone())
+        .new_data_evolution_writer(columns.clone())
         .map_err(to_datafusion_error)?;
 
     // 3. Query the target table directly with WHERE filter.
