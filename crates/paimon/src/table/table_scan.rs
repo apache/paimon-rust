@@ -940,11 +940,6 @@ async fn resolve_data_file_field_ids(
         schema.fields()
     };
 
-    let field_id_by_name = fields
-        .iter()
-        .map(|field| (field.name(), field.id()))
-        .collect::<HashMap<_, _>>();
-
     let mut field_ids = HashSet::new();
     match file.write_cols.as_ref() {
         None => {
@@ -960,17 +955,14 @@ async fn resolve_data_file_field_ids(
                 if is_system_field_name(col) {
                     continue;
                 }
-                let Some(field_id) = field_id_by_name.get(col.as_str()) else {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "Cannot find write column '{}' in schema {}.",
-                            col, file.schema_id
-                        ),
-                        source: None,
-                    });
-                };
-                if !is_system_field_id(*field_id) {
-                    field_ids.insert(*field_id);
+                let projected = super::data_evolution_fields::project_by_paths(
+                    fields,
+                    std::slice::from_ref(col),
+                )?;
+                for field in projected {
+                    if !is_system_field_id(field.id()) {
+                        field_ids.insert(field.id());
+                    }
                 }
             }
         }

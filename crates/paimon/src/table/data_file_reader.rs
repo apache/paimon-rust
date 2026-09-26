@@ -125,6 +125,7 @@ pub(crate) struct DataFileReader {
     batch_size: Option<usize>,
     parquet_read_budget: Option<Arc<ReadBudget>>,
     table_options: Arc<HashMap<String, String>>,
+    nested_field_enabled: bool,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
 }
@@ -152,6 +153,7 @@ impl DataFileReader {
             batch_size: None,
             parquet_read_budget: None,
             table_options: Arc::new(HashMap::new()),
+            nested_field_enabled: false,
             mosaic_prefetch: MosaicPrefetchOptions::default(),
             read_timing: None,
         }
@@ -191,6 +193,13 @@ impl DataFileReader {
         options: impl Into<Arc<HashMap<String, String>>>,
     ) -> Self {
         self.table_options = options.into();
+        self.nested_field_enabled = crate::spec::CoreOptions::new(&self.table_options)
+            .data_evolution_nested_field_enabled();
+        self
+    }
+
+    pub(crate) fn with_nested_field_enabled(mut self, enabled: bool) -> Self {
+        self.nested_field_enabled = enabled;
         self
     }
 
@@ -528,21 +537,22 @@ impl DataFileReader {
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
-        // What the reader is asked for.
-        let projected_read_fields: Vec<DataField> = if let Some(ref df) = data_fields {
-            read_data_fields(df, &read_type)?
-        } else {
-            read_type
-                .iter()
-                .filter(|field| field.name() != ROW_ID_FIELD_NAME)
-                .cloned()
-                .collect()
-        };
         let data_schema_fields = data_schema_fields_for_file(
             &file_fields,
             file_meta.write_cols.as_deref(),
             data_schema_fields.as_deref(),
         )?;
+        // What the reader is asked for.
+        let projected_read_fields: Vec<DataField> =
+            if data_fields.is_some() || file_meta.write_cols.is_some() {
+                read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?
+            } else {
+                read_type
+                    .iter()
+                    .filter(|field| field.name() != ROW_ID_FIELD_NAME)
+                    .cloned()
+                    .collect()
+            };
         let path_to_read = split.data_file_path(&file_meta);
         let configured_reader = create_format_reader_with_budget(
             &path_to_read,
@@ -561,14 +571,15 @@ impl DataFileReader {
         // The decoded batch is described by `format_read_fields`, so map
         // `read_type` onto *that* list: its entries carry the types the columns
         // actually come back as, which is what reconciling them needs.
-        let (index_mapping, source_fields) = if data_fields.is_some() {
-            (
-                create_index_mapping(&read_type, &format_read_fields),
-                Some(format_read_fields.clone()),
-            )
-        } else {
-            (None, None)
-        };
+        let (index_mapping, source_fields) =
+            if data_fields.is_some() || file_meta.write_cols.is_some() {
+                (
+                    create_index_mapping(&read_type, &format_read_fields),
+                    Some(format_read_fields.clone()),
+                )
+            } else {
+                (None, None)
+            };
 
         // Remap predicates from table-level to file-level indices.
         let file_predicates = if row_id_residual {
@@ -824,18 +835,19 @@ impl DataFileReader {
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
-        // What the reader is asked for.
-        let projected_read_fields: Vec<DataField> = if let Some(ref df) = data_fields {
-            read_data_fields(df, &read_type)?
-        } else {
-            read_type
-                .iter()
-                .filter(|field| field.name() != ROW_ID_FIELD_NAME)
-                .cloned()
-                .collect()
-        };
         let data_schema_fields =
             data_schema_fields_for_file(&file_fields, file_meta.write_cols.as_deref(), None)?;
+        // What the reader is asked for.
+        let projected_read_fields: Vec<DataField> =
+            if data_fields.is_some() || file_meta.write_cols.is_some() {
+                read_data_fields(&data_schema_fields, &read_type, self.nested_field_enabled)?
+            } else {
+                read_type
+                    .iter()
+                    .filter(|field| field.name() != ROW_ID_FIELD_NAME)
+                    .cloned()
+                    .collect()
+            };
         let path_to_read = split.data_file_path(&file_meta);
         let configured_reader = create_format_reader_with_budget(
             &path_to_read,
@@ -854,14 +866,15 @@ impl DataFileReader {
         // The decoded batch is described by `format_read_fields`, so map
         // `read_type` onto *that* list: its entries carry the types the columns
         // actually come back as, which is what reconciling them needs.
-        let (index_mapping, source_fields) = if data_fields.is_some() {
-            (
-                create_index_mapping(&read_type, &format_read_fields),
-                Some(format_read_fields.clone()),
-            )
-        } else {
-            (None, None)
-        };
+        let (index_mapping, source_fields) =
+            if data_fields.is_some() || file_meta.write_cols.is_some() {
+                (
+                    create_index_mapping(&read_type, &format_read_fields),
+                    Some(format_read_fields.clone()),
+                )
+            } else {
+                (None, None)
+            };
 
         // Remap predicates from table-level to file-level indices.
         let file_predicates = {
@@ -1019,6 +1032,7 @@ fn project_file_batch(
 fn read_data_fields(
     all_data_fields: &[DataField],
     expected_fields: &[DataField],
+    nested_field_enabled: bool,
 ) -> crate::Result<Vec<DataField>> {
     let mut read_fields = Vec::new();
     for data_field in all_data_fields {
@@ -1026,9 +1040,11 @@ fn read_data_fields(
             .iter()
             .find(|field| field.id() == data_field.id())
         {
-            if let Some(pruned_type) =
-                prune_data_type(expected.data_type(), data_field.data_type())?
-            {
+            if let Some(pruned_type) = prune_data_type(
+                expected.data_type(),
+                data_field.data_type(),
+                nested_field_enabled,
+            )? {
                 read_fields.push(data_field_with_type(data_field, pruned_type));
             }
         }
@@ -1036,7 +1052,11 @@ fn read_data_fields(
     Ok(read_fields)
 }
 
-fn prune_data_type(read_type: &DataType, data_type: &DataType) -> crate::Result<Option<DataType>> {
+fn prune_data_type(
+    read_type: &DataType,
+    data_type: &DataType,
+    nested_field_enabled: bool,
+) -> crate::Result<Option<DataType>> {
     match read_type {
         DataType::Row(read_row) if is_variant_extraction_row_type(read_type) => {
             Ok(Some(DataType::Row(read_row.clone())))
@@ -1052,21 +1072,29 @@ fn prune_data_type(read_type: &DataType, data_type: &DataType) -> crate::Result<
                     .iter()
                     .find(|field| field.id() == read_field.id())
                 {
-                    if let Some(pruned_type) =
-                        prune_data_type(read_field.data_type(), data_field.data_type())?
-                    {
+                    if let Some(pruned_type) = prune_data_type(
+                        read_field.data_type(),
+                        data_field.data_type(),
+                        nested_field_enabled,
+                    )? {
                         fields.push(data_field_with_type(data_field, pruned_type));
                     }
                 }
             }
             if fields.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(DataType::Row(crate::spec::RowType::with_nullable(
-                    read_type.is_nullable(),
-                    fields,
-                ))))
+                if !nested_field_enabled {
+                    return Ok(None);
+                }
+                if let Some(anchor) = data_row.fields().first().cloned() {
+                    fields.push(anchor);
+                } else {
+                    return Ok(None);
+                }
             }
+            Ok(Some(DataType::Row(crate::spec::RowType::with_nullable(
+                read_type.is_nullable(),
+                fields,
+            ))))
         }
         // ARRAY and MAP are deliberately NOT descended, even though Java's
         // `pruneDataType` does: the pruned type is also what the Vortex reader is
@@ -1090,19 +1118,7 @@ fn data_schema_fields_for_file(
     data_schema_fields: Option<&[DataField]>,
 ) -> crate::Result<Vec<DataField>> {
     if let Some(write_cols) = write_cols {
-        return write_cols
-            .iter()
-            .map(|name| {
-                file_fields
-                    .iter()
-                    .find(|field| field.name() == name)
-                    .cloned()
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: format!("write column '{name}' is absent from the file schema"),
-                        source: None,
-                    })
-            })
-            .collect();
+        return super::data_evolution_fields::project_by_paths(file_fields, write_cols);
     }
     Ok(data_schema_fields.unwrap_or(file_fields).to_vec())
 }
@@ -1507,7 +1523,7 @@ mod row_tests {
         ));
         let expected_field = field(1, "v", extraction_type.clone());
 
-        let read_fields = read_data_fields(&[data_field], &[expected_field]).unwrap();
+        let read_fields = read_data_fields(&[data_field], &[expected_field], false).unwrap();
 
         assert_eq!(read_fields.len(), 1);
         assert!(is_variant_extraction_row_type(read_fields[0].data_type()));
@@ -1519,10 +1535,143 @@ mod row_tests {
         let data_field = field(1, "n", DataType::Int(IntType::new()));
         let expected_field = field(1, "n", DataType::BigInt(BigIntType::new()));
 
-        let read_fields = read_data_fields(&[data_field], &[expected_field]).unwrap();
+        let read_fields = read_data_fields(&[data_field], &[expected_field], false).unwrap();
 
         assert_eq!(read_fields.len(), 1);
         assert_eq!(read_fields[0].data_type(), &DataType::Int(IntType::new()));
+    }
+
+    #[test]
+    fn projected_added_leaf_reads_older_siblings_for_each_row_null_buffer() {
+        let existing = field(3, "existing", DataType::Int(IntType::new()));
+        let old_sub = field(
+            2,
+            "sub",
+            DataType::Row(RowType::new(vec![
+                existing.clone(),
+                field(6, "unneeded", DataType::Int(IntType::new())),
+            ])),
+        );
+        let file_profile = field(
+            1,
+            "profile",
+            DataType::Row(RowType::new(vec![
+                old_sub.clone(),
+                field(4, "other", DataType::Int(IntType::new())),
+            ])),
+        );
+        let read_profile = field(
+            1,
+            "profile",
+            DataType::Row(RowType::new(vec![field(
+                2,
+                "sub",
+                DataType::Row(RowType::new(vec![field(
+                    5,
+                    "added",
+                    DataType::Int(IntType::new()),
+                )])),
+            )])),
+        );
+
+        let pruned = read_data_fields(&[file_profile], &[read_profile], true).unwrap();
+        let DataType::Row(profile) = pruned[0].data_type() else {
+            panic!("profile should remain a ROW")
+        };
+        assert_eq!(
+            profile.fields(),
+            &[field(2, "sub", DataType::Row(RowType::new(vec![existing])))]
+        );
+    }
+
+    #[test]
+    fn disabled_nested_mode_does_not_preserve_deep_hidden_anchor() {
+        let file_profile = field(
+            1,
+            "profile",
+            DataType::Row(RowType::new(vec![field(
+                2,
+                "sub",
+                DataType::Row(RowType::new(vec![field(
+                    3,
+                    "old",
+                    DataType::Int(IntType::new()),
+                )])),
+            )])),
+        );
+        let read_profile = field(
+            1,
+            "profile",
+            DataType::Row(RowType::new(vec![field(
+                2,
+                "sub",
+                DataType::Row(RowType::new(vec![field(
+                    4,
+                    "added",
+                    DataType::Int(IntType::new()),
+                )])),
+            )])),
+        );
+
+        assert!(read_data_fields(&[file_profile], &[read_profile], false)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn projected_missing_direct_child_reads_a_physical_sibling_as_anchor() {
+        let age = field(3, "age", DataType::Int(IntType::new()));
+        let file_profile = field(1, "profile", DataType::Row(RowType::new(vec![age.clone()])));
+        let read_profile = field(
+            1,
+            "profile",
+            DataType::Row(RowType::new(vec![field(
+                2,
+                "name",
+                DataType::VarChar(VarCharType::string_type()),
+            )])),
+        );
+
+        let pruned = read_data_fields(&[file_profile], &[read_profile], true).unwrap();
+        let DataType::Row(profile) = pruned[0].data_type() else {
+            panic!("profile should remain a ROW")
+        };
+        assert_eq!(profile.fields(), &[age]);
+    }
+
+    #[test]
+    fn disabled_nested_mode_does_not_read_hidden_sibling_anchor() {
+        let file_profile = field(
+            1,
+            "profile",
+            DataType::Row(RowType::new(vec![field(
+                2,
+                "old",
+                DataType::Int(IntType::new()),
+            )])),
+        );
+        let projected = field(
+            1,
+            "profile",
+            DataType::Row(RowType::new(vec![field(
+                3,
+                "added",
+                DataType::Int(IntType::new()),
+            )])),
+        );
+        assert!(read_data_fields(
+            std::slice::from_ref(&file_profile),
+            std::slice::from_ref(&projected),
+            false,
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            read_data_fields(&[file_profile], &[projected], true)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -3673,7 +3822,7 @@ mod prune_container_tests {
         ])));
         let read = DataType::Array(ArrayType::new(row(vec![f(3, "lang", str_t())])));
 
-        assert_eq!(prune_data_type(&read, &data).unwrap().unwrap(), data);
+        assert_eq!(prune_data_type(&read, &data, false).unwrap().unwrap(), data);
     }
 
     #[test]
@@ -3684,6 +3833,6 @@ mod prune_container_tests {
         ));
         let read = DataType::Map(MapType::new(str_t(), row(vec![f(5, "v", str_t())])));
 
-        assert_eq!(prune_data_type(&read, &data).unwrap().unwrap(), data);
+        assert_eq!(prune_data_type(&read, &data, false).unwrap().unwrap(), data);
     }
 }

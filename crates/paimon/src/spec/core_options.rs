@@ -23,6 +23,7 @@ const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
 pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
+const DATA_EVOLUTION_NESTED_FIELD_ENABLED_OPTION: &str = "data-evolution.nested-field.enabled";
 const FILE_INDEX_READ_ENABLED_OPTION: &str = "file-index.read.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
@@ -724,6 +725,13 @@ impl<'a> CoreOptions<'a> {
     pub fn data_evolution_enabled(&self) -> bool {
         self.options
             .get(DATA_EVOLUTION_ENABLED_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    pub fn data_evolution_nested_field_enabled(&self) -> bool {
+        self.options
+            .get(DATA_EVOLUTION_NESTED_FIELD_ENABLED_OPTION)
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     }

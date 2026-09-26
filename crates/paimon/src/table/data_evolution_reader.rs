@@ -524,7 +524,7 @@ impl DataEvolutionReader {
                                 &file_meta,
                             )
                             .await?;
-                            let data_fields = raw_file_physical_fields(
+                            let (data_fields, file_schema_nested_enabled) = raw_file_physical_fields(
                                 &self.schema_manager,
                                 self.table_schema_id,
                                 &self.table_fields,
@@ -609,7 +609,13 @@ impl DataEvolutionReader {
                             let mut row_id_cursor = file_base_row_id;
                             let mut row_id_offset: usize = 0;
 
-                            let mut stream = raw_file_reader.read_single_file_stream(
+                            let mut stream = raw_file_reader.clone()
+                                .with_nested_field_enabled(
+                                    CoreOptions::new(&self.table_options)
+                                        .data_evolution_nested_field_enabled()
+                                        || file_schema_nested_enabled,
+                                )
+                                .read_single_file_stream(
                                 &split,
                                 file_meta,
                                 data_fields,
@@ -973,19 +979,24 @@ impl DataEvolutionReader {
         let target_schema = build_target_arrow_schema(&read_type)?;
 
         Ok(try_stream! {
-            let file_infos = load_file_infos(
+            let (file_infos, file_schema_nested_enabled) = load_file_infos(
                 &schema_manager,
                 table_schema_id,
                 &table_fields,
                 &prepared_group.files,
             )
             .await?;
+            let nested_enabled = CoreOptions::new(&table_options)
+                .data_evolution_nested_field_enabled()
+                || file_schema_nested_enabled;
             let source_plan = build_source_plan_with_row_id_pushdown(
                 &prepared_group,
                 &file_infos,
                 &read_type,
+                &table_fields,
                 &blob_descriptor_fields,
                 row_ranges.is_some(),
+                nested_enabled,
             )?;
 
             let active_source_indices: Vec<usize> = source_plan
@@ -1057,6 +1068,7 @@ impl DataEvolutionReader {
                             blob_parallelism,
                             source_parquet_read_budget.clone(),
                             Arc::clone(&table_options),
+                            nested_enabled,
                             mosaic_prefetch,
                             read_timing.clone(),
                             anchor_deletion_vector.as_ref(),
@@ -1137,6 +1149,15 @@ impl DataEvolutionReader {
 
                 for (idx, provider) in source_plan.column_plan.iter().enumerate() {
                     let target_field = &target_schema.fields()[idx];
+                    if let Some(nested) = &source_plan.nested_plan[idx] {
+                        columns.push(super::data_evolution_nested::assemble_nested_row(
+                            nested,
+                            target_field.data_type(),
+                            &source_cursors,
+                            rows_to_emit,
+                        )?);
+                        continue;
+                    }
                     let array = provider
                         .and_then(|(source_idx, field_offset)| {
                             source_cursors[source_idx].as_ref().map(|(batch, offset)| {
@@ -1180,40 +1201,23 @@ async fn raw_file_physical_fields(
     table_schema_id: i64,
     table_fields: &[DataField],
     file: &DataFileMeta,
-) -> crate::Result<Option<Vec<DataField>>> {
-    let schema_fields = if file.schema_id == table_schema_id {
-        None
+) -> crate::Result<(Option<Vec<DataField>>, bool)> {
+    let (schema_fields, file_schema_nested_enabled) = if file.schema_id == table_schema_id {
+        (None, false)
     } else {
-        Some(
-            schema_manager
-                .schema(file.schema_id)
-                .await?
-                .fields()
-                .to_vec(),
+        let schema = schema_manager.schema(file.schema_id).await?;
+        (
+            Some(schema.fields().to_vec()),
+            schema.core_options().data_evolution_nested_field_enabled(),
         )
     };
 
     let Some(write_cols) = file.write_cols.as_ref() else {
-        return Ok(schema_fields);
+        return Ok((schema_fields, file_schema_nested_enabled));
     };
     let fields = schema_fields.as_deref().unwrap_or(table_fields);
-    let written_fields = write_cols
-        .iter()
-        .map(|name| {
-            fields
-                .iter()
-                .find(|field| field.name() == name)
-                .cloned()
-                .ok_or_else(|| Error::DataInvalid {
-                    message: format!(
-                        "Failed to resolve write column '{}' in raw-convertible file '{}'",
-                        name, file.file_name
-                    ),
-                    source: None,
-                })
-        })
-        .collect::<crate::Result<Vec<_>>>()?;
-    Ok(Some(written_fields))
+    let written_fields = super::data_evolution_fields::project_by_paths(fields, write_cols)?;
+    Ok((Some(written_fields), file_schema_nested_enabled))
 }
 
 async fn resolve_descriptor_columns(
@@ -1615,6 +1619,7 @@ fn open_source_stream(
     blob_parallelism: usize,
     parquet_read_budget: Option<Arc<ReadBudget>>,
     table_options: Arc<HashMap<String, String>>,
+    nested_field_enabled: bool,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
@@ -1686,6 +1691,7 @@ fn open_source_stream(
     .with_blob_parallelism(blob_parallelism)
     .with_parquet_read_budget(parquet_read_budget)
     .with_table_options(table_options)
+    .with_nested_field_enabled(nested_field_enabled)
     .with_mosaic_prefetch(mosaic_prefetch)
     .with_read_timing(read_timing);
 
@@ -2173,8 +2179,9 @@ async fn load_file_infos(
     table_schema_id: i64,
     table_fields: &[DataField],
     files: &[DataFileMeta],
-) -> crate::Result<Vec<ResolvedFileInfo>> {
+) -> crate::Result<(Vec<ResolvedFileInfo>, bool)> {
     let mut infos = Vec::with_capacity(files.len());
+    let mut nested_enabled = false;
 
     for file in files {
         let (field_ids, data_fields, effective_fields_owned);
@@ -2184,6 +2191,8 @@ async fn load_file_infos(
             effective_fields_owned = None;
         } else {
             let data_schema = schema_manager.schema(file.schema_id).await?;
+            nested_enabled |=
+                CoreOptions::new(data_schema.options()).data_evolution_nested_field_enabled();
             let fields = data_schema.fields().to_vec();
             field_ids = resolve_field_ids(file, &fields)?;
             data_fields = Some(fields.clone());
@@ -2207,27 +2216,17 @@ async fn load_file_infos(
         });
     }
 
-    Ok(infos)
+    Ok((infos, nested_enabled))
 }
 
 fn resolve_field_ids(file: &DataFileMeta, fields: &[DataField]) -> crate::Result<Vec<i32>> {
     match &file.write_cols {
-        Some(write_cols) => write_cols
-            .iter()
-            .map(|name| {
-                fields
-                    .iter()
-                    .find(|field| field.name() == name)
-                    .map(|field| field.id())
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: format!(
-                            "Failed to resolve write column '{}' in file '{}'",
-                            name, file.file_name
-                        ),
-                        source: None,
-                    })
-            })
-            .collect(),
+        Some(write_cols) => Ok(
+            super::data_evolution_fields::project_by_paths(fields, write_cols)?
+                .iter()
+                .map(DataField::id)
+                .collect(),
+        ),
         None => Ok(fields.iter().map(|field| field.id()).collect()),
     }
 }
@@ -2280,6 +2279,7 @@ fn normalize_vector_write_cols(
 struct SourcePlan {
     sources: Vec<FieldSource>,
     column_plan: Vec<Option<(usize, usize)>>,
+    nested_plan: Vec<Option<super::data_evolution_nested::NestedFieldPlan>>,
 }
 
 #[cfg(test)]
@@ -2293,7 +2293,9 @@ fn build_source_plan(
         prepared_group,
         file_infos,
         read_type,
+        read_type,
         blob_descriptor_fields,
+        false,
         false,
     )
 }
@@ -2302,8 +2304,10 @@ fn build_source_plan_with_row_id_pushdown(
     prepared_group: &PreparedMergeGroup,
     file_infos: &[ResolvedFileInfo],
     read_type: &[DataField],
+    table_fields: &[DataField],
     blob_descriptor_fields: &HashSet<String>,
     row_id_pushdown: bool,
+    nested_enabled: bool,
 ) -> crate::Result<SourcePlan> {
     let mut sources = Vec::new();
     let mut normal_providers: HashMap<i32, usize> = HashMap::new(); // field_id -> source_idx
@@ -2311,6 +2315,7 @@ fn build_source_plan_with_row_id_pushdown(
     let mut vector_bunch_indices: HashMap<(i64, String, Vec<String>), usize> = HashMap::new();
     let mut blob_source_indices: HashMap<i32, usize> = HashMap::new();
     let mut expected_blob_row_count: Option<i64> = None;
+    let mut normal_sources: Vec<(usize, Vec<DataField>)> = Vec::new();
 
     for (file_idx, file) in prepared_group.files.iter().enumerate() {
         let info = &file_infos[file_idx];
@@ -2403,6 +2408,17 @@ fn build_source_plan_with_row_id_pushdown(
         } else {
             expected_blob_row_count = Some(file.row_count);
             let source_idx = sources.len();
+            if nested_enabled {
+                let effective_fields = info.data_fields.as_deref().unwrap_or(table_fields);
+                let physical_fields = match file.write_cols.as_deref() {
+                    Some(write_cols) => super::data_evolution_fields::project_by_paths(
+                        effective_fields,
+                        write_cols,
+                    )?,
+                    None => effective_fields.to_vec(),
+                };
+                normal_sources.push((source_idx, physical_fields));
+            }
             sources.push(FieldSource::DataFile {
                 file: Box::new(file.clone()),
                 data_fields: info.data_fields.clone(),
@@ -2416,7 +2432,65 @@ fn build_source_plan_with_row_id_pushdown(
     }
 
     let mut column_plan = Vec::with_capacity(read_type.len());
+    let mut nested_plan = Vec::with_capacity(read_type.len());
     for field in read_type {
+        if nested_enabled && matches!(field.data_type(), DataType::Row(_)) {
+            let physical_sources = normal_sources
+                .iter()
+                .map(
+                    |(source_index, fields)| super::data_evolution_nested::PhysicalRowSource {
+                        source_index: *source_index,
+                        fields,
+                    },
+                )
+                .collect::<Vec<_>>();
+            if let Some(selection) =
+                super::data_evolution_nested::select_nested_row(field, &physical_sources)?
+            {
+                if selection.whole_source.is_none() {
+                    let current_field = table_fields
+                        .iter()
+                        .find(|candidate| candidate.id() == field.id())
+                        .unwrap_or(field);
+                    let mut offsets = HashMap::new();
+                    for source in &selection.anchors {
+                        let physical_fields = normal_sources
+                            .iter()
+                            .find(|(index, _)| index == source)
+                            .map(|(_, fields)| fields.as_slice())
+                            .ok_or_else(|| Error::DataInvalid {
+                                message: format!(
+                                    "Missing physical nested source {source} for '{}'",
+                                    field.name()
+                                ),
+                                source: None,
+                            })?;
+                        let source_field = super::data_evolution_nested::source_read_field(
+                            field,
+                            current_field,
+                            *source,
+                            physical_fields,
+                            &selection,
+                        )?;
+                        offsets.insert(*source, sources[*source].add_read_field(source_field));
+                    }
+                    nested_plan.push(Some(super::data_evolution_nested::NestedFieldPlan {
+                        anchors: selection
+                            .anchors
+                            .iter()
+                            .map(|source| (*source, offsets[source]))
+                            .collect(),
+                        children: selection
+                            .children
+                            .iter()
+                            .map(|source| source.map(|source| (source, offsets[&source])))
+                            .collect(),
+                    }));
+                    column_plan.push(None);
+                    continue;
+                }
+            }
+        }
         let source_idx = if field.data_type().is_blob_file_field()
             && !blob_descriptor_fields.contains(field.name())
         {
@@ -2436,6 +2510,7 @@ fn build_source_plan_with_row_id_pushdown(
         if let Some(source_idx) = source_idx {
             let field_offset = sources[source_idx].add_read_field(field.clone());
             column_plan.push(Some((source_idx, field_offset)));
+            nested_plan.push(None);
         } else if !field.data_type().is_nullable() {
             return Err(Error::DataInvalid {
                 message: format!(
@@ -2446,6 +2521,7 @@ fn build_source_plan_with_row_id_pushdown(
             });
         } else {
             column_plan.push(None);
+            nested_plan.push(None);
         }
     }
 
@@ -2485,6 +2561,7 @@ fn build_source_plan_with_row_id_pushdown(
     Ok(SourcePlan {
         sources,
         column_plan,
+        nested_plan,
     })
 }
 
@@ -3986,8 +4063,10 @@ mod tests {
             &prepared_group,
             &file_infos,
             &read_type,
+            &read_type,
             &HashSet::new(),
             true,
+            false,
         )
         .unwrap_err();
 
