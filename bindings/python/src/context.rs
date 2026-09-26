@@ -552,6 +552,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::write::PyStreamWriteBuilder>()?;
     this.add_class::<crate::write::PyBatchTableWrite>()?;
     this.add_class::<crate::write::PyBatchTableUpdate>()?;
+    this.add_class::<crate::write::PyTableUpsert>()?;
     this.add_class::<crate::update_match::PyUpsertKeyMatcher>()?;
     this.add_class::<crate::write::PyBatchTableDelete>()?;
     this.add_class::<crate::write::PyStreamTableWrite>()?;

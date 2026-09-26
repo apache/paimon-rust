@@ -25,8 +25,8 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{CoreOptions, DataType, Datum};
 use paimon::table::{
-    CommitMessage, DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite,
-    COMMIT_MESSAGE_SERIALIZER_VERSION,
+    CommitMessage, DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableUpsert,
+    TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -99,6 +99,25 @@ impl WriteContext {
             inner: Some(builder.new_write().map_err(to_py_err)?),
             target_schema: paimon::arrow::build_target_arrow_schema(self.table.schema().fields())
                 .map_err(to_py_err)?,
+            table_location: self.table.location().to_string(),
+            commit_user: self.commit_user.clone(),
+        })
+    }
+
+    fn new_upsert(
+        &self,
+        keys: Vec<String>,
+        update_columns: Vec<String>,
+    ) -> PyResult<PyTableUpsert> {
+        let inner = self
+            .table
+            .new_write_builder()
+            .with_commit_user(self.commit_user.clone())
+            .map_err(to_py_err)?
+            .new_upsert(keys, update_columns)
+            .map_err(to_py_err)?;
+        Ok(PyTableUpsert {
+            inner: Some(inner),
             table_location: self.table.location().to_string(),
             commit_user: self.commit_user.clone(),
         })
@@ -249,6 +268,19 @@ impl PyBatchWriteBuilder {
         })
     }
 
+    fn new_upsert(
+        &self,
+        keys: Vec<String>,
+        update_columns: Vec<String>,
+    ) -> PyResult<PyTableUpsert> {
+        if self.static_partition.is_some() {
+            return Err(PyValueError::new_err(
+                "TableUpsert does not support overwrite",
+            ));
+        }
+        self.context.new_upsert(keys, update_columns)
+    }
+
     /// Create a deletion-vector writer for data-evolution row-ID deletes.
     fn new_delete(&self) -> PyResult<PyBatchTableDelete> {
         if self.static_partition.is_some() {
@@ -324,6 +356,14 @@ impl PyStreamWriteBuilder {
         Ok(PyStreamTableWrite {
             state: self.context.new_write(false)?,
         })
+    }
+
+    fn new_upsert(
+        &self,
+        keys: Vec<String>,
+        update_columns: Vec<String>,
+    ) -> PyResult<PyTableUpsert> {
+        self.context.new_upsert(keys, update_columns)
     }
 
     fn new_commit(&self) -> PyResult<PyStreamTableCommit> {
@@ -404,6 +444,44 @@ pub struct PyBatchTableUpdate {
     inner: Option<TableUpdate>,
     table_location: String,
     commit_user: String,
+}
+
+#[pyclass(name = "TableUpsert", module = "pypaimon_rust.datafusion", unsendable)]
+pub struct PyTableUpsert {
+    inner: Option<TableUpsert>,
+    table_location: String,
+    commit_user: String,
+}
+
+#[pymethods]
+impl PyTableUpsert {
+    fn close(&mut self) {
+        self.inner.take();
+    }
+
+    fn add_batch(&mut self, batch: &Bound<'_, PyAny>) -> PyResult<()> {
+        let batch = RecordBatch::from_pyarrow_bound(batch)?;
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("TableUpsert is closed"))?
+            .add_batch(batch)
+            .map_err(to_py_err)
+    }
+
+    fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("TableUpsert is closed"))?;
+        let messages = py
+            .detach(|| runtime().block_on(inner.prepare_commit()))
+            .map_err(to_py_err)?;
+        Ok(wrap_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
 }
 
 #[pymethods]

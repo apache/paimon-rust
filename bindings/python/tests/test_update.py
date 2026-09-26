@@ -47,6 +47,62 @@ def test_upsert_key_matcher_rejects_different_key_types():
         ], names=['id', '_ROW_ID']))
 
 
+def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.table_upsert')
+    context.sql("""CREATE TABLE paimon.table_upsert.t (
+        id INT, name STRING, score INT) WITH (
+        'row-tracking.enabled' = 'true',
+        'data-evolution.enabled' = 'true')""")
+    context.sql("""INSERT INTO paimon.table_upsert.t (id, name, score)
+        VALUES (1, 'a', 10), (1, 'b', 11), (2, 'c', 20)""")
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('table_upsert.t')
+    builder = table.new_batch_write_builder()
+    upsert = builder.new_upsert(['id'], ['name', 'score'])
+    upsert.add_batch(pa.record_batch([
+        pa.array([1], type=pa.int32()),
+        pa.array(['x']),
+        pa.array([100], type=pa.int32()),
+    ], names=['id', 'name', 'score']))
+    upsert.add_batch(pa.record_batch([
+        pa.array([1, 3], type=pa.int32()),
+        pa.array(['y', 'd']),
+        pa.array([101, 30], type=pa.int32()),
+    ], names=['id', 'name', 'score']))
+    messages = upsert.prepare_commit()
+    assert messages and all(message.serialize() for message in messages)
+    with pytest.raises(RuntimeError, match='closed'):
+        upsert.prepare_commit()
+    builder.new_commit().commit(messages)
+
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, name, score FROM paimon.table_upsert.t'))
+    actual = actual.sort_by([('id', 'ascending'), ('name', 'ascending')]).to_pydict()
+    assert actual == {
+        'id': [1, 1, 2, 3],
+        'name': ['y', 'y', 'c', 'd'],
+        'score': [101, 101, 20, 30],
+    }
+
+    stream = table.new_stream_write_builder()
+    next_upsert = stream.new_upsert(['id'], ['name', 'score'])
+    next_upsert.add_batch(pa.record_batch([
+        pa.array([2, 4], type=pa.int32()),
+        pa.array(['C', 'e']),
+        pa.array([21, 40], type=pa.int32()),
+    ], names=['id', 'name', 'score']))
+    stream.new_commit().commit(42, next_upsert.prepare_commit())
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, name, score FROM paimon.table_upsert.t'))
+    actual = actual.sort_by([('id', 'ascending'), ('name', 'ascending')]).to_pydict()
+    assert actual == {
+        'id': [1, 1, 2, 3, 4],
+        'name': ['y', 'y', 'C', 'd', 'e'],
+        'score': [101, 101, 21, 30, 40],
+    }
+
+
 def test_batch_update_row_ids_commits_through_write_builder(tmp_path):
     context = SQLContext()
     context.register_catalog('paimon', {'warehouse': str(tmp_path)})
