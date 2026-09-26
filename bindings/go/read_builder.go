@@ -76,11 +76,19 @@ func (rb *ReadBuilder) WithCaseSensitive(caseSensitive bool) error {
 }
 
 // WithLimit sets a row-count limit hint for scan planning. Planning stops
-// selecting splits once the retained ones already cover the limit, so a preview
-// or sample of the first N rows avoids listing every split's statistics. It is a
-// hint only: it does not guarantee exactly limit rows are returned, so callers
-// still enforce the final row limit when reading.
+// retaining splits once the ones already kept cover the limit, so reading a
+// preview or sample of the first N rows keeps fewer splits. Planning still reads
+// the manifest entries to learn each split's row count, so this bounds how many
+// splits are retained rather than avoiding all planning I/O. It is a hint only:
+// it does not guarantee exactly limit rows are returned, so callers still enforce
+// the final row limit when reading.
+//
+// A negative limit is rejected with ErrNegativeLimit: it would wrap to a huge
+// value through the unsigned C boundary and stop planning after the first split.
 func (rb *ReadBuilder) WithLimit(limit int) error {
+	if limit < 0 {
+		return ErrNegativeLimit
+	}
 	if rb.inner == nil {
 		return ErrClosed
 	}

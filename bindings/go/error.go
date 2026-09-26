@@ -31,6 +31,12 @@ import (
 // ErrClosed is returned when an operation is attempted on a closed resource.
 var ErrClosed = errors.New("paimon: use of closed resource")
 
+// ErrNegativeLimit is returned by ReadBuilder.WithLimit when the limit is
+// negative. A negative Go int would wrap to a huge value through the unsigned
+// C boundary and make scan planning stop after the first split, silently
+// dropping rows, so it is rejected up front.
+var ErrNegativeLimit = errors.New("paimon: read-builder limit must not be negative")
+
 // ErrorCode represents categories of errors from paimon.
 type ErrorCode int32
 
