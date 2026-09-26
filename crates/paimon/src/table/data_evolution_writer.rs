@@ -2420,7 +2420,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("Column value not found"))
+            matches!(err, crate::Error::DataInvalid { message, .. } if message == "Input data must contain value column")
         );
     }
 

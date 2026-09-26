@@ -826,6 +826,125 @@ fn constructor_accepts(source: &DataType, target: &DataType) -> bool {
     )
 }
 
+// Arrow C++ converts the binary mantissa using half-to-even rounding. Scaling
+// in f64 first (Arrow Rust's generic cast) introduces a second rounding step,
+// changing values such as 2.675 -> DECIMAL(10, 2) from 2.67 to 2.68.
+fn float_to_decimal(value: f64, single: bool, precision: u8, scale: i8) -> crate::Result<i128> {
+    let overflow = || invalid("Floating update value exceeds decimal precision");
+    if !value.is_finite() {
+        return Err(overflow());
+    }
+    let absolute = value.abs();
+    let limit = 10_f64.powi(i32::from(precision) - i32::from(scale));
+    let limit = if single {
+        f64::from(limit as f32)
+    } else {
+        limit
+    };
+    if absolute > limit {
+        return Err(overflow());
+    }
+    let round_shift = |value: u128, bits: u32| -> u128 {
+        if bits == 0 {
+            return value;
+        }
+        if bits >= 128 {
+            return 0; // The intermediate values are bounded by 10^38.
+        }
+        let whole = value >> bits;
+        let remainder = value & ((1_u128 << bits) - 1);
+        let half = 1_u128 << (bits - 1);
+        whole + u128::from(remainder > half || (remainder == half && whole & 1 != 0))
+    };
+    let unscaled = if scale < 0 {
+        // C++ uses nearbyint in the floating domain for negative scales.
+        (absolute * 10_f64.powi(i32::from(scale))).round_ties_even() as u128
+    } else if absolute == 0.0 {
+        0
+    } else {
+        let bits = absolute.to_bits();
+        let raw_exponent = ((bits >> 52) & 0x7ff) as i32;
+        let mut mantissa = u128::from(bits & ((1_u64 << 52) - 1));
+        let mut exponent = if raw_exponent == 0 {
+            -1074
+        } else {
+            mantissa |= 1_u128 << 52;
+            raw_exponent - 1023 - 52
+        };
+        // Normalize subnormals just like frexp; float32 mantissas use 24 bits.
+        let shift = 52 - mantissa.ilog2();
+        mantissa <<= shift;
+        exponent -= shift as i32;
+        if single {
+            mantissa >>= 29;
+            exponent += 29;
+        }
+        let scale = scale as u32;
+        if exponent >= 0 {
+            let value = mantissa
+                .checked_mul(10_u128.pow(scale))
+                .ok_or_else(overflow)?;
+            let factor = 1_u128.checked_shl(exponent as u32).ok_or_else(overflow)?;
+            value.checked_mul(factor).ok_or_else(overflow)?
+        } else {
+            let mut right = (-exponent) as u32;
+            // Match C++'s bounded decimal arithmetic and its rounding order
+            // when the target scale is too large for a single multiplication.
+            let safe_scale = if single { 30 } else { 22 };
+            let first = scale.min(safe_scale);
+            let mut value = mantissa * 10_u128.pow(first);
+            let mut remaining = scale - first;
+            let step = (38 - u32::from(precision)).max(1);
+            let mut total_exp = 0;
+            let mut total_shift = 0;
+            while remaining > 0 && right > 0 {
+                let exp = remaining.min(step);
+                total_exp += exp;
+                let bits = right.min(10_u128.pow(total_exp).ilog2() + 1 - total_shift);
+                total_shift += bits;
+                value = round_shift(value, bits);
+                right -= bits;
+                value = value.checked_mul(10_u128.pow(exp)).ok_or_else(overflow)?;
+                remaining -= exp;
+            }
+            value = value
+                .checked_mul(10_u128.pow(remaining))
+                .ok_or_else(overflow)?;
+            round_shift(value, right)
+        }
+    };
+    if unscaled >= 10_u128.pow(u32::from(precision)) {
+        return Err(overflow());
+    }
+    Ok(if value.is_sign_negative() {
+        -(unscaled as i128)
+    } else {
+        unscaled as i128
+    })
+}
+
+fn cast_float_decimal(array: &ArrayRef, precision: u8, scale: i8) -> crate::Result<ArrayRef> {
+    let single = *array.data_type() == DataType::Float32;
+    let values = arrow_cast::cast(array.as_ref(), &DataType::Float64)
+        .map_err(|error| invalid(error.to_string()))?;
+    let values = values
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .iter()
+        .map(|value| {
+            value
+                .map(|v| float_to_decimal(v, single, precision, scale))
+                .transpose()
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(Arc::new(
+        arrow_array::Decimal128Array::from(values)
+            .with_precision_and_scale(precision, scale)
+            .map_err(|error| invalid(error.to_string()))?,
+    ))
+}
+
 fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Result<ArrayRef> {
     let source = array.data_type();
     if source == target {
@@ -976,6 +1095,11 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
                     .with_precision_and_scale(*precision, *scale)
                     .map_err(|error| invalid(error.to_string()))?,
             ));
+        }
+    }
+    if matches!(source, DataType::Float32 | DataType::Float64) {
+        if let DataType::Decimal128(precision, scale) = target {
+            return cast_float_decimal(array, *precision, *scale);
         }
     }
     if mode == CastMode::Constructor {
@@ -1911,6 +2035,55 @@ mod tests {
                 _ => unreachable!(),
             };
             assert_eq!(child.to_data(), Int32Array::from(vec![7]).to_data());
+        }
+    }
+    #[test]
+    fn floating_decimal_values_use_binary_mantissa_and_half_even_rounding() {
+        let input: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(2.25),
+            Some(2.75),
+            Some(-2.25),
+            None,
+        ]));
+        let actual = cast_assignment(&input, &DataType::Decimal128(10, 1)).unwrap();
+        let expected = Decimal128Array::from(vec![Some(22), Some(28), Some(-22), None])
+            .with_precision_and_scale(10, 1)
+            .unwrap();
+        assert_eq!(actual.to_data(), expected.to_data());
+        for (value, precision, scale, expected) in [
+            (2.675, 10, 2, 267),
+            (-2.675, 10, 2, -267),
+            (0.1, 38, 20, 10_000_000_000_000_000_555),
+            (
+                0.1,
+                38,
+                38,
+                10_000_000_000_000_000_555_111_512_312_578_270_210,
+            ),
+            (1.005, 38, 20, 100_499_999_999_999_989_342),
+            (250.0, 4, -2, 2),
+            (350.0, 4, -2, 4),
+            (f64::from_bits(1), 38, 38, 0),
+            (-0.0, 10, 2, 0),
+        ] {
+            assert_eq!(
+                float_to_decimal(value, false, precision, scale).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            float_to_decimal(f64::from(0.1_f32), true, 38, 20).unwrap(),
+            10_000_000_149_011_611_938
+        );
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1000.0,
+            -1000.0,
+            999.999,
+        ] {
+            assert!(float_to_decimal(value, false, 5, 2).is_err());
         }
     }
 }
