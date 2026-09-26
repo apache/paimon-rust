@@ -236,6 +236,10 @@ jobs:
             needs_docker: true
             needs_lumina: false
             needs_uv: false
+          - suite: jindo
+            needs_docker: false
+            needs_lumina: false
+            needs_uv: false
     env:
       RUST_LOG: DEBUG
       RUST_BACKTRACE: full
@@ -312,6 +316,24 @@ jobs:
         if: matrix.suite == 'go'
         working-directory: bindings/go
         run: make test
+
+      - uses: actions/setup-python@v6
+        if: matrix.suite == 'jindo'
+        with:
+          python-version: "3.11"
+
+      - name: Install Jindo SDK
+        if: matrix.suite == 'jindo'
+        run: |
+          python -m pip install --only-binary=:all: --no-deps pyjindosdk==6.10.4
+          echo "PAIMON_JINDO_SDK_LIBRARY=$(python -c 'import pathlib, pyjindo; print(pathlib.Path(pyjindo.__path__[0]) / "libjindosdk_python.so")')" >> "$GITHUB_ENV"
+
+      - name: Jindo SDK Integration Test
+        if: matrix.suite == 'jindo'
+        run: >
+          cargo test --locked -p paimon --features storage-jindo --lib
+          io::storage_jindo::tests::test_real_sdk_io_and_failure_mapping
+          -- --ignored --exact
 
       - name: Stop Docker containers
         if: ${{ always() && matrix.needs_docker }}
