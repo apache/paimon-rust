@@ -48,20 +48,23 @@ async fn check_binary_partition(primary_key: bool) {
     let bin: ArrayRef = Arc::new(BinaryArray::from_iter_values([
         b"a/b".as_slice(),
         b"a=b".as_slice(),
+        "\u{00A0}".as_bytes(),
+        b"\x1c".as_slice(),
+        b"\xED\xA0\x80".as_slice(),
     ]));
     let batch = RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
             ArrowField::new("bin", ArrowDataType::Binary, true),
             ArrowField::new("id", ArrowDataType::Int32, true),
         ])),
-        vec![bin, Arc::new(Int32Array::from(vec![1, 2]))],
+        vec![bin, Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
     )
     .unwrap();
     let builder = table.new_write_builder();
     let mut writer = builder.new_write().unwrap();
     writer.write_arrow_batch(&batch).await.unwrap();
     let messages = writer.prepare_commit().await.unwrap();
-    assert_eq!(messages.len(), 2);
+    assert_eq!(messages.len(), 5);
     builder.new_commit().commit(messages).await.unwrap();
 
     let plan = table.new_read_builder().new_scan().plan().await.unwrap();
@@ -78,6 +81,17 @@ async fn check_binary_partition(primary_key: bool) {
         paths.iter().any(|path| path.contains("bin=a%3Db/")),
         "{paths:?}"
     );
+    // These directory names match Java's Character.isWhitespace and UTF-8 decoder.
+    for expected in [
+        "bin=\u{00A0}/",
+        "bin=__DEFAULT_PARTITION__/",
+        "bin=\u{FFFD}/",
+    ] {
+        assert!(
+            paths.iter().any(|path| path.contains(expected)),
+            "missing {expected} in {paths:?}"
+        );
+    }
     let batches: Vec<RecordBatch> = table
         .new_read_builder()
         .new_read()
@@ -100,7 +114,7 @@ async fn check_binary_partition(primary_key: bool) {
         })
         .collect::<Vec<_>>();
     ids.sort_unstable();
-    assert_eq!(ids, vec![1, 2]);
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
 }
 
 #[tokio::test]
