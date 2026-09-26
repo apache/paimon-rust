@@ -23,7 +23,7 @@ use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{CoreOptions, DataType, Datum};
 use paimon::table::{
-    CommitMessage, Table, TableCommit, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
+    CommitMessage, Table, TableCommit, TableUpdate, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -223,6 +223,29 @@ impl PyBatchWriteBuilder {
         })
     }
 
+    /// Create a row-ID data-evolution update writer. The Python caller supplies
+    /// matched Arrow batches and commits the returned messages separately.
+    fn new_update(&self, update_columns: Vec<String>) -> PyResult<PyBatchTableUpdate> {
+        if self.static_partition.is_some() {
+            return Err(PyValueError::new_err(
+                "BatchTableUpdate does not support overwrite",
+            ));
+        }
+        let inner = self
+            .context
+            .table
+            .new_write_builder()
+            .with_commit_user(self.context.commit_user.clone())
+            .map_err(to_py_err)?
+            .new_update(update_columns)
+            .map_err(to_py_err)?;
+        Ok(PyBatchTableUpdate {
+            inner: Some(inner),
+            table_location: self.context.table.location().to_string(),
+            commit_user: self.context.commit_user.clone(),
+        })
+    }
+
     fn new_commit(&self) -> PyResult<PyBatchTableCommit> {
         let table = &self.context.table;
         let ignore_empty = boolean_option(table, "snapshot.ignore-empty-commit", true)?;
@@ -335,6 +358,53 @@ impl WriteState {
 pub struct PyBatchTableWrite {
     state: WriteState,
     prepared: bool,
+}
+
+#[pyclass(
+    name = "BatchTableUpdate",
+    module = "pypaimon_rust.datafusion",
+    unsendable
+)]
+pub struct PyBatchTableUpdate {
+    inner: Option<TableUpdate>,
+    table_location: String,
+    commit_user: String,
+}
+
+#[pymethods]
+impl PyBatchTableUpdate {
+    fn close(&mut self) {
+        self.inner.take();
+    }
+
+    fn add_matched_batch(&mut self, batch: &Bound<'_, PyAny>) -> PyResult<()> {
+        let batch = RecordBatch::from_pyarrow_bound(batch)?;
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("BatchTableUpdate is closed"))?
+            .add_matched_batch(batch)
+            .map_err(to_py_err)
+    }
+
+    fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("BatchTableUpdate is closed"))?;
+        let messages = py
+            .detach(|| runtime().block_on(inner.prepare_commit()))
+            .map_err(to_py_err)?;
+        Ok(messages
+            .into_iter()
+            .map(|inner| PyCommitMessage {
+                inner,
+                origin: Some(MessageOrigin {
+                    table_location: self.table_location.clone(),
+                    commit_user: self.commit_user.clone(),
+                }),
+            })
+            .collect())
+    }
 }
 
 #[pymethods]
