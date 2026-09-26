@@ -178,6 +178,12 @@ const SNAPSHOT_NUM_RETAINED_MIN_OPTION: &str = "snapshot.num-retained.min";
 const SNAPSHOT_NUM_RETAINED_MAX_OPTION: &str = "snapshot.num-retained.max";
 const SNAPSHOT_TIME_RETAINED_OPTION: &str = "snapshot.time-retained";
 const SNAPSHOT_EXPIRE_LIMIT_OPTION: &str = "snapshot.expire.limit";
+const CHANGELOG_NUM_RETAINED_MIN_OPTION: &str = "changelog.num-retained.min";
+const CHANGELOG_NUM_RETAINED_MAX_OPTION: &str = "changelog.num-retained.max";
+const CHANGELOG_TIME_RETAINED_OPTION: &str = "changelog.time-retained";
+const WRITE_ONLY_OPTION: &str = "write-only";
+/// Java `CoreOptions.WRITE_ONLY` fallback key.
+const WRITE_COMPACTION_SKIP_OPTION: &str = "write.compaction-skip";
 const DEFAULT_SNAPSHOT_NUM_RETAINED_MIN: i32 = 10;
 const DEFAULT_SNAPSHOT_NUM_RETAINED_MAX: i32 = i32::MAX;
 const DEFAULT_SNAPSHOT_TIME_RETAINED_MS: u64 = 60 * 60 * 1000;
@@ -1266,6 +1272,43 @@ impl<'a> CoreOptions<'a> {
         self.positive_i32_option(SNAPSHOT_EXPIRE_LIMIT_OPTION, DEFAULT_SNAPSHOT_EXPIRE_LIMIT)
     }
 
+    /// Whether changelogs outlive snapshots: `changelog.num-retained.min/max` or
+    /// `changelog.time-retained` exceed the snapshot counterparts they default
+    /// to. Java `CoreOptions#changelogLifecycleDecoupled`.
+    pub fn changelog_lifecycle_decoupled(&self) -> crate::Result<bool> {
+        let snapshot_max = self.snapshot_num_retained_max()?;
+        let snapshot_min = self.snapshot_num_retained_min()?;
+        let snapshot_time = self.snapshot_time_retained_ms()?;
+        let changelog_max =
+            self.positive_i32_option(CHANGELOG_NUM_RETAINED_MAX_OPTION, snapshot_max)?;
+        let changelog_min =
+            self.positive_i32_option(CHANGELOG_NUM_RETAINED_MIN_OPTION, snapshot_min)?;
+        let changelog_time = match self.options.get(CHANGELOG_TIME_RETAINED_OPTION) {
+            None => snapshot_time,
+            Some(value) => {
+                parse_duration_millis(value).ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "Invalid value for {CHANGELOG_TIME_RETAINED_OPTION}: '{value}'"
+                    ),
+                    source: None,
+                })?
+            }
+        };
+        Ok(changelog_max > snapshot_max
+            || changelog_min > snapshot_min
+            || changelog_time > snapshot_time)
+    }
+
+    /// Whether writers skip compaction and snapshot expiration (`write-only`,
+    /// fallback `write.compaction-skip`, default false).
+    pub fn write_only(&self) -> bool {
+        self.options
+            .get(WRITE_ONLY_OPTION)
+            .or_else(|| self.options.get(WRITE_COMPACTION_SKIP_OPTION))
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
     fn positive_i32_option(&self, option_name: &'static str, default: i32) -> crate::Result<i32> {
         let Some(value) = self.options.get(option_name) else {
             return Ok(default);
@@ -1947,6 +1990,53 @@ mod tests {
             };
             assert!(result.is_err(), "{key}={value} must be rejected");
         }
+    }
+
+    #[test]
+    fn test_changelog_lifecycle_and_write_only() {
+        let core = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>()
+        };
+        let options = core(&[]);
+        assert!(!CoreOptions::new(&options)
+            .changelog_lifecycle_decoupled()
+            .unwrap());
+        assert!(!CoreOptions::new(&options).write_only());
+
+        for pairs in [
+            [
+                ("changelog.num-retained.max", "20"),
+                ("snapshot.num-retained.max", "10"),
+            ],
+            [
+                ("changelog.num-retained.min", "20"),
+                ("snapshot.num-retained.min", "10"),
+            ],
+            [
+                ("changelog.time-retained", "2 h"),
+                ("snapshot.time-retained", "1 h"),
+            ],
+        ] {
+            let options = core(&pairs);
+            assert!(
+                CoreOptions::new(&options)
+                    .changelog_lifecycle_decoupled()
+                    .unwrap(),
+                "{pairs:?}"
+            );
+        }
+        let options = core(&[("changelog.time-retained", "30 min")]);
+        assert!(!CoreOptions::new(&options)
+            .changelog_lifecycle_decoupled()
+            .unwrap());
+
+        let options = core(&[("write-only", "true")]);
+        assert!(CoreOptions::new(&options).write_only());
+        let options = core(&[("write.compaction-skip", "true")]);
+        assert!(CoreOptions::new(&options).write_only());
     }
 
     #[test]

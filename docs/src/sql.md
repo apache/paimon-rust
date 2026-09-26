@@ -1136,6 +1136,15 @@ This follows Java's `expire_snapshots` procedure; changelog files are expired
 together with their snapshots (`changelog.num-retained.*` and
 `changelog.time-retained` are not applied).
 
+As in Java, every commit also expires snapshots with the table options
+afterwards. Set `write-only` to `true` to skip this, for example when a separate
+job runs `expire_snapshots`. Automatic expiration is also skipped while
+changelogs are configured to outlive snapshots (`changelog.num-retained.*` or
+`changelog.time-retained` above the `snapshot.*` settings), because
+paimon-rust cannot keep changelogs past their snapshots yet. A failed automatic
+expiration does not fail the commit; it is logged and retried by the next
+commit.
+
 ### create_global_index
 
 Build and commit a global index for a table column:

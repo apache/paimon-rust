@@ -404,6 +404,8 @@ async fn test_retention_rules() {
         &[
             ("snapshot.num-retained.min", "2"),
             ("snapshot.num-retained.max", "3"),
+            // Commits must not expire on their own here.
+            ("write-only", "true"),
         ],
         false,
     );
@@ -625,7 +627,7 @@ async fn test_missing_end_snapshot_keeps_manifests() {
 
 #[tokio::test]
 async fn test_writes_earliest_hint_when_nothing_expires() {
-    let table = test_table("memory:/expire_hint", &[], false);
+    let table = test_table("memory:/expire_hint", &[("write-only", "true")], false);
     setup_dirs(&table).await;
     append(&table, &[1]).await;
     let sm = table.snapshot_manager();
@@ -1006,4 +1008,74 @@ async fn test_slowest_consumer_limits_expiration() {
     }
     assert_eq!(expire_keeping(&table, 1).await, 2);
     assert_eq!(snapshot_ids(&table).await, vec![3, 4, 5]);
+}
+
+#[tokio::test]
+async fn test_commit_expires_snapshots() {
+    let table = test_table(
+        "memory:/expire_after_commit",
+        &[
+            ("snapshot.num-retained.min", "1"),
+            ("snapshot.num-retained.max", "2"),
+        ],
+        false,
+    );
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    for id in 2..=4 {
+        overwrite(&table, &[id]).await;
+    }
+    assert_eq!(snapshot_ids(&table).await, vec![3, 4]);
+    assert_files_match_references(&table).await;
+    assert_eq!(read_ids(&table).await, vec![4]);
+}
+
+#[tokio::test]
+async fn test_commit_keeps_recent_snapshots_by_default() {
+    let table = test_table("memory:/expire_after_commit_default", &[], false);
+    setup_dirs(&table).await;
+    // More than `snapshot.num-retained.min` (10), but all younger than
+    // `snapshot.time-retained` (1 h).
+    for id in 1..=12 {
+        overwrite(&table, &[id]).await;
+    }
+    assert_eq!(snapshot_ids(&table).await, (1..=12).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn test_commit_skips_expiration() {
+    let retention = [
+        ("snapshot.num-retained.min", "1"),
+        ("snapshot.num-retained.max", "1"),
+    ];
+    for (name, extra) in [
+        ("write_only", ("write-only", "true")),
+        ("compaction_skip", ("write.compaction-skip", "true")),
+        // Changelogs are configured to outlive snapshots.
+        ("decoupled", ("changelog.num-retained.max", "10")),
+    ] {
+        let mut options = retention.to_vec();
+        options.push(extra);
+        let table = test_table(&format!("memory:/expire_skip_{name}"), &options, false);
+        setup_dirs(&table).await;
+        for id in 1..=3 {
+            overwrite(&table, &[id]).await;
+        }
+        assert_eq!(snapshot_ids(&table).await, vec![1, 2, 3], "{name}");
+    }
+}
+
+#[tokio::test]
+async fn test_failed_expiration_does_not_fail_the_commit() {
+    let table = test_table(
+        "memory:/expire_after_commit_invalid",
+        &[("snapshot.num-retained.min", "0")],
+        false,
+    );
+    setup_dirs(&table).await;
+    for id in 1..=3 {
+        overwrite(&table, &[id]).await;
+    }
+    assert_eq!(snapshot_ids(&table).await, vec![1, 2, 3]);
+    assert_eq!(read_ids(&table).await, vec![3]);
 }
