@@ -39,6 +39,45 @@ pub(super) struct FileMetadataCache<K, V> {
     state: Mutex<State<K, V>>,
 }
 
+struct LoadGuard<'a, K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    cache: &'a FileMetadataCache<K, V>,
+    key: K,
+    entry: Arc<Entry<V>>,
+    armed: bool,
+}
+
+impl<'a, K, V> LoadGuard<'a, K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    fn new(cache: &'a FileMetadataCache<K, V>, key: K, entry: Arc<Entry<V>>) -> Self {
+        Self {
+            cache,
+            key,
+            entry,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl<K, V> Drop for LoadGuard<'_, K, V>
+where
+    K: Clone + Eq + Hash,
+{
+    fn drop(&mut self) {
+        if self.armed {
+            self.cache.remove_if_same(&self.key, &self.entry);
+        }
+    }
+}
+
 impl<K, V> FileMetadataCache<K, V>
 where
     K: Clone + Eq + Hash,
@@ -97,22 +136,20 @@ where
             }
         };
 
-        let value = match entry.value.get_or_try_init(load).await {
-            Ok(value) => Arc::clone(value),
-            Err(error) => {
-                let mut state = self.state.lock().unwrap();
-                if state
-                    .entries
-                    .peek(&key)
-                    .is_some_and(|cached| Arc::ptr_eq(cached, &entry))
-                {
-                    state.entries.pop(&key);
-                    state.weight = state.weight.saturating_sub(entry.base_weight);
-                    self.evict(&mut state);
+        let value = entry
+            .value
+            .get_or_try_init(|| {
+                let mut guard = LoadGuard::new(self, key.clone(), Arc::clone(&entry));
+                async move {
+                    let result = load().await;
+                    if result.is_ok() {
+                        guard.disarm();
+                    }
+                    result
                 }
-                return Err(error);
-            }
-        };
+            })
+            .await
+            .map(Arc::clone)?;
         let loaded_weight = entry
             .base_weight
             .saturating_add(value_weight(value.as_ref()).max(1));
@@ -123,6 +160,11 @@ where
             .is_some_and(|cached| Arc::ptr_eq(cached, &entry))
             && entry.weight.load(Ordering::Relaxed) == entry.base_weight
         {
+            if loaded_weight > self.max_bytes {
+                state.entries.pop(&key);
+                state.weight = state.weight.saturating_sub(entry.base_weight);
+                return Ok(value);
+            }
             entry.weight.store(loaded_weight, Ordering::Relaxed);
             state.weight = state
                 .weight
@@ -132,6 +174,20 @@ where
             self.evict(&mut state);
         }
         Ok(value)
+    }
+
+    fn remove_if_same(&self, key: &K, entry: &Arc<Entry<V>>) {
+        let mut state = self.state.lock().unwrap();
+        if state
+            .entries
+            .peek(key)
+            .is_some_and(|cached| Arc::ptr_eq(cached, entry))
+        {
+            state.entries.pop(key);
+            state.weight = state
+                .weight
+                .saturating_sub(entry.weight.load(Ordering::Relaxed));
+        }
     }
 
     fn evict(&self, state: &mut State<K, V>) {
@@ -161,6 +217,7 @@ where
 mod tests {
     use super::*;
     use std::convert::Infallible;
+    use std::future::pending;
 
     #[tokio::test]
     async fn evicts_least_recently_used_entry_by_count() {
@@ -183,5 +240,71 @@ mod tests {
         }
 
         assert_eq!(loads.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn removes_cancelled_load() {
+        let cache = Arc::new(FileMetadataCache::<String, usize>::new(1024, 2));
+        let task_cache = Arc::clone(&cache);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            task_cache
+                .get_or_try_insert_with(
+                    Some("cancelled".to_string()),
+                    9,
+                    || async move {
+                        started_tx.send(()).unwrap();
+                        pending::<Result<Arc<usize>, Infallible>>().await
+                    },
+                    |_| 1,
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let state = cache.state.lock().unwrap();
+        assert!(state.entries.is_empty());
+        assert_eq!(state.weight, 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_load_does_not_evict_cached_entries() {
+        let cache = FileMetadataCache::<String, usize>::new(512, 2);
+        let small_loads = AtomicUsize::new(0);
+        let oversized_loads = AtomicUsize::new(0);
+
+        for _ in 0..2 {
+            cache
+                .get_or_try_insert_with(
+                    Some("small".to_string()),
+                    5,
+                    || async {
+                        small_loads.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(Arc::new(1))
+                    },
+                    |value| *value,
+                )
+                .await
+                .unwrap();
+
+            cache
+                .get_or_try_insert_with(
+                    Some("oversized".to_string()),
+                    9,
+                    || async {
+                        oversized_loads.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(Arc::new(1024))
+                    },
+                    |value| *value,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(small_loads.load(Ordering::Relaxed), 1);
+        assert_eq!(oversized_loads.load(Ordering::Relaxed), 2);
     }
 }
