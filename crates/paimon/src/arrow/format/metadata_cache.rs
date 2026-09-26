@@ -34,7 +34,7 @@ struct State<K, V> {
 }
 
 pub(super) struct FileMetadataCache<K, V> {
-    max_bytes: AtomicUsize,
+    max_bytes: usize,
     max_entries: usize,
     state: Mutex<State<K, V>>,
 }
@@ -45,7 +45,7 @@ where
 {
     pub(super) fn new(max_bytes: usize, max_entries: usize) -> Self {
         Self {
-            max_bytes: AtomicUsize::new(max_bytes),
+            max_bytes,
             max_entries,
             state: Mutex::new(State {
                 entries: LruCache::unbounded(),
@@ -59,11 +59,6 @@ where
             .saturating_add(std::mem::size_of::<Entry<V>>())
             .saturating_add(key_heap_bytes)
             .saturating_add(value_weight)
-    }
-
-    pub(super) fn resize(&self, max_bytes: usize) {
-        self.max_bytes.store(max_bytes, Ordering::Relaxed);
-        self.evict(&mut self.state.lock().unwrap());
     }
 
     pub(super) async fn get_or_try_insert_with<E, F, Fut, W>(
@@ -82,8 +77,7 @@ where
             return load().await;
         };
         let base_weight = Self::entry_weight(key_heap_bytes, 0);
-        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
-        if max_bytes == 0 || base_weight > max_bytes {
+        if self.max_bytes == 0 || base_weight > self.max_bytes {
             return load().await;
         }
 
@@ -141,8 +135,7 @@ where
     }
 
     fn evict(&self, state: &mut State<K, V>) {
-        let max_bytes = self.max_bytes.load(Ordering::Relaxed);
-        while state.weight > max_bytes || state.entries.len() > self.max_entries {
+        while state.weight > self.max_bytes || state.entries.len() > self.max_entries {
             let Some(key) = state
                 .entries
                 .iter()

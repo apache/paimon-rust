@@ -23,7 +23,7 @@ use crate::catalog::{Identifier, RESTTokenFileIO};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
-use crate::io::FileIO;
+use crate::io::{FileFormatMetadataCacheContext, FileIO};
 use crate::spec::{CoreOptions, TableSchema, PATH_OPTION};
 use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
 use crate::table::{ObjectTable, Table};
@@ -53,6 +53,8 @@ impl Table {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let local_cache = create_local_cache_with_namespace(&rest_options, api.options())?;
+        let file_format_metadata_cache =
+            FileFormatMetadataCacheContext::from_props(api.options().to_map())?;
         RESTEnv::build_table(
             &identifier,
             response,
@@ -60,6 +62,7 @@ impl Table {
             rest_options,
             data_token_enabled,
             local_cache,
+            file_format_metadata_cache,
         )
         .await
     }
@@ -75,6 +78,7 @@ pub struct RESTEnv {
     options: Options,
     data_token_enabled: bool,
     local_cache: Option<Arc<LocalCache>>,
+    file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
 }
 
 impl std::fmt::Debug for RESTEnv {
@@ -95,6 +99,7 @@ impl RESTEnv {
         options: Options,
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
+        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
     ) -> Self {
         Self {
             identifier,
@@ -103,6 +108,7 @@ impl RESTEnv {
             options,
             data_token_enabled,
             local_cache,
+            file_format_metadata_cache,
         }
     }
 
@@ -134,6 +140,7 @@ impl RESTEnv {
             self.options.clone(),
             self.data_token_enabled,
             self.local_cache.clone(),
+            self.file_format_metadata_cache.clone(),
         )
         .await
     }
@@ -145,6 +152,7 @@ impl RESTEnv {
         options: Options,
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
+        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
     ) -> Result<Table> {
         let response = Self::fetch_table_response(identifier, &api).await?;
         Self::build_table(
@@ -154,6 +162,7 @@ impl RESTEnv {
             options,
             data_token_enabled,
             local_cache,
+            file_format_metadata_cache,
         )
         .await
     }
@@ -177,6 +186,7 @@ impl RESTEnv {
         options: Options,
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
+        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
     ) -> Result<Table> {
         let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
@@ -240,9 +250,9 @@ impl RESTEnv {
             &table_path,
             api.clone(),
             &options,
-            data_token_enabled,
-            is_external,
+            data_token_enabled && !is_external,
             local_cache.clone(),
+            file_format_metadata_cache.clone(),
         )
         .await?;
 
@@ -253,6 +263,7 @@ impl RESTEnv {
             options,
             data_token_enabled,
             local_cache,
+            file_format_metadata_cache,
         );
         let parsed_identifier = identifier.parsed_object_name()?;
         let branch = parsed_identifier.branch_or_default().to_string();
@@ -277,6 +288,7 @@ impl RESTEnv {
         options: Options,
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
+        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
     ) -> Result<ObjectTable> {
         let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
@@ -318,9 +330,9 @@ impl RESTEnv {
             &object_path,
             api,
             &options,
-            data_token_enabled,
-            is_external,
+            data_token_enabled && !is_external,
             local_cache,
+            file_format_metadata_cache,
         )
         .await?;
 
@@ -332,23 +344,25 @@ impl RESTEnv {
         path: &str,
         api: Arc<RESTApi>,
         options: &Options,
-        data_token_enabled: bool,
-        is_external: bool,
+        use_data_token: bool,
         local_cache: Option<Arc<LocalCache>>,
+        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
     ) -> Result<FileIO> {
-        if data_token_enabled && !is_external {
+        if use_data_token {
             return Arc::new(RESTTokenFileIO::new(
                 identifier.clone(),
                 path.to_string(),
                 options.clone(),
                 api,
                 local_cache,
+                file_format_metadata_cache,
             ))
             .build_file_io()
             .await;
         }
 
         let mut builder = FileIO::from_path(path)?.with_props(options.to_map());
+        builder = builder.with_file_format_metadata_cache(file_format_metadata_cache);
         if let Some(local_cache) = local_cache {
             builder = builder.with_local_cache(local_cache);
         }
@@ -488,6 +502,7 @@ mod tests {
         );
         let local_cache = create_local_cache(&options).unwrap();
         let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+        let metadata_cache = FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
 
         let rest_env = RESTEnv::new(
             Identifier::new("database", "table"),
@@ -496,9 +511,50 @@ mod tests {
             options,
             false,
             local_cache,
+            metadata_cache,
         );
 
         assert!(rest_env.has_local_cache());
         assert!(rest_env.clone().has_local_cache());
+    }
+
+    #[tokio::test]
+    async fn test_rest_table_loads_share_catalog_metadata_cache() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::URI, "http://localhost:1");
+        options.set(CatalogOptions::WAREHOUSE, "test-warehouse");
+        options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+        options.set(CatalogOptions::TOKEN, "test-token");
+        let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+        let metadata_cache = FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
+        let identifier = Identifier::new("database", "table");
+
+        let first = RESTEnv::build_file_io(
+            &identifier,
+            "memory:/table",
+            api.clone(),
+            &options,
+            false,
+            None,
+            metadata_cache.clone(),
+        )
+        .await
+        .unwrap();
+        let second = RESTEnv::build_file_io(
+            &identifier,
+            "memory:/table",
+            api,
+            &options,
+            false,
+            None,
+            metadata_cache,
+        )
+        .await
+        .unwrap();
+
+        assert!(Arc::ptr_eq(
+            &first.file_format_metadata_cache(),
+            &second.file_format_metadata_cache()
+        ));
     }
 }
