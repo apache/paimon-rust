@@ -329,6 +329,22 @@ func TestReadBuilderWithLimitPrunesPlanSplits(t *testing.T) {
 	}
 }
 
+// A negative limit must be rejected before it reaches the unsigned C boundary,
+// where it would wrap to a huge value and make planning stop after the first
+// split. The check runs ahead of the closed-builder guard, so it needs no
+// warehouse: the distinct ErrNegativeLimit (not ErrClosed) proves the reject
+// arm ran rather than the nil-inner arm.
+func TestReadBuilderWithLimitRejectsNegative(t *testing.T) {
+	rb := &paimon.ReadBuilder{}
+	err := rb.WithLimit(-1)
+	if !errors.Is(err, paimon.ErrNegativeLimit) {
+		t.Fatalf("expected ErrNegativeLimit for a negative limit, got %v", err)
+	}
+	if errors.Is(err, paimon.ErrClosed) {
+		t.Fatalf("negative limit must be rejected as invalid input, not as a closed builder")
+	}
+}
+
 func TestWriteCommitReadRoundTrip(t *testing.T) {
 	table := openCopiedTestTable(t)
 
