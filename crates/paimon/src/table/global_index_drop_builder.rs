@@ -401,6 +401,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_drop_full_text_global_index_only_removes_target_entries() {
+        let table = test_table("memory:/test_drop_full_text_global_index");
+        setup_dirs(&table).await;
+
+        let mut message = CommitMessage::new(
+            BinaryRow::new(0).to_serialized_bytes(),
+            0,
+            vec![data_file("data-0.parquet")],
+        );
+        message.new_index_files = vec![
+            global_index_file("full-text", "full-text-name-0.index", 1, 0, 9),
+            global_index_file("full-text", "full-text-name-1.index", 1, 10, 19),
+            global_index_file("full-text", "full-text-id.index", 0, 0, 9),
+            global_index_file(BTREE_GLOBAL_INDEX_TYPE, "btree-name.index", 1, 0, 9),
+        ];
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(vec![message])
+            .await
+            .unwrap();
+
+        let dropped = table
+            .new_global_index_drop_builder()
+            .with_index_column("name")
+            .with_index_type("Full-Text")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dropped, 2);
+
+        let mut remaining = latest_index_entries(&table)
+            .await
+            .into_iter()
+            .map(|entry| entry.index_file.file_name)
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec![
+                "btree-name.index".to_string(),
+                "full-text-id.index".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_drop_btree_global_index_is_idempotent_without_match() {
         let table = test_table("memory:/test_drop_btree_global_index_idempotent");
         setup_dirs(&table).await;
@@ -524,7 +569,7 @@ mod tests {
         let err = table
             .new_global_index_drop_builder()
             .with_index_column("id")
-            .with_index_type("full-text")
+            .with_index_type("hash")
             .execute()
             .await
             .expect_err("unsupported type must error");

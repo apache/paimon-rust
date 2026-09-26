@@ -63,6 +63,8 @@ mod format_write_builder;
 #[cfg(feature = "fulltext")]
 mod full_text_index_adapter;
 #[cfg(feature = "fulltext")]
+mod full_text_index_build_builder;
+#[cfg(feature = "fulltext")]
 mod full_text_search_builder;
 pub(crate) mod global_index_build_common;
 mod global_index_drop_builder;
@@ -158,6 +160,8 @@ pub use format_partition::{
 };
 pub use format_partition_stats::FormatTablePartitionStatsCollector;
 pub use format_partition_truncate::FormatTableTruncator;
+#[cfg(feature = "fulltext")]
+pub use full_text_index_build_builder::FullTextIndexBuildBuilder;
 #[cfg(feature = "fulltext")]
 pub use full_text_search_builder::FullTextSearchBuilder;
 use futures::stream::BoxStream;
@@ -423,6 +427,14 @@ impl Table {
 
     pub fn new_batch_vector_search_builder(&self) -> BatchVectorSearchBuilder<'_> {
         BatchVectorSearchBuilder::new(self)
+    }
+
+    /// Create a builder for `full-text` global index files.
+    ///
+    /// Reference: [NativeFullTextGlobalIndexWriter](https://github.com/apache/paimon/blob/master/paimon-full-text/src/main/java/org/apache/paimon/fulltext/index/NativeFullTextGlobalIndexWriter.java)
+    #[cfg(feature = "fulltext")]
+    pub fn new_full_text_index_build_builder(&self) -> FullTextIndexBuildBuilder<'_> {
+        FullTextIndexBuildBuilder::new(self)
     }
 
     pub fn new_lumina_index_build_builder(&self) -> LuminaIndexBuildBuilder<'_> {

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared helpers for the global-index build builders (btree, lumina, vindex).
+//! Shared helpers for the global-index build builders (btree, full-text,
+//! lumina, vindex).
 //!
 //! Mirrors Java `GlobalIndexBuilderUtils`, which exposes a single
 //! `indexedRowRanges` used by both the sorted and vector index builders. The
@@ -24,11 +25,50 @@
 //! `index_type` string, so it lives here once rather than being copied into
 //! each builder.
 
+use crate::io::OutputFile;
 use crate::spec::{FileKind, IndexManifest};
 use crate::table::{merge_row_ranges, RowRange, Table};
 use crate::{Error, Result};
+use bytes::Bytes;
+use std::path::Path;
+use tokio::io::AsyncReadExt;
 
 pub(crate) mod vector;
+
+const COPY_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Stream a locally built index file to its table location. Native index
+/// builders (Lumina, full-text) serialize to a local temporary file first
+/// because their writers need synchronous I/O.
+pub(crate) async fn copy_local_file_to_output(
+    source_path: &Path,
+    output: OutputFile,
+) -> Result<()> {
+    let mut source =
+        tokio::fs::File::open(source_path)
+            .await
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to open temporary index file: {e}"),
+                source: None,
+            })?;
+    let mut writer = output.writer().await?;
+    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+
+    loop {
+        let len = source
+            .read(&mut buffer)
+            .await
+            .map_err(|e| Error::UnexpectedError {
+                message: format!("Failed to read temporary index file: {e}"),
+                source: None,
+            })?;
+        if len == 0 {
+            break;
+        }
+        writer.write(Bytes::copy_from_slice(&buffer[..len])).await?;
+    }
+    writer.close().await
+}
 
 /// Java `sameExtraFieldIds`: null/empty are equal; otherwise exact ordered equality.
 pub(crate) fn same_extra_field_ids(a: Option<&[i32]>, b: Option<&[i32]>) -> bool {

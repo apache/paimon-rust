@@ -1128,6 +1128,13 @@ CALL sys.create_global_index(
   index_type => 'fm',
   options => 'fm-index.partition-size=16mb,fm-index.sa-sample-rate=32,fm-index.compression=lz4'
 );
+
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'content',
+  index_type => 'full-text',
+  options => 'full-text.tokenizer=jieba,full-text.remove-stop-words=false'
+);
 ```
 
 `index_type` defaults to `btree`. It is case-insensitive and surrounding
@@ -1176,6 +1183,18 @@ Build options are
 `fm-index.locate-cost-ratio`. When locating a dense result would cost more than
 the configured ratio, the FM index safely declines evaluation and the normal
 source scan applies the predicate.
+
+Full-text global indexes support character-string columns and serve the
+[`full_text_search`](#full-text-search) function. They require the `fulltext`
+feature. The build splits the table's row IDs into
+`global-index.row-count-per-shard` shards and writes one Java-compatible
+`full-text` index file per shard, so Java readers can use the files as well.
+Every `full-text.*` option is passed to the native index writer with the prefix
+removed, as in Java; examples are `full-text.tokenizer`, `full-text.lower-case`,
+`full-text.stem`, `full-text.language`, and `full-text.remove-stop-words`.
+Invalid options are rejected before any data is read. NULL values are counted
+in a shard's row count but are not indexed. A later call indexes only rows
+that no `full-text` index on the column covers yet.
 
 The current global-index builders require a row-tracking data-evolution table
 with global indexes enabled. They do not support primary-key tables or tables
@@ -1325,7 +1344,7 @@ CALL sys.drop_global_index(
 ```
 
 `index_type` accepts every type the create procedures build: `btree`, `bitmap`,
-`multivalue`, `fm`, `lumina` (or `lumina-vector-ann`), and the vindex types
+`multivalue`, `fm`, `full-text`, `lumina` (or `lumina-vector-ann`), and the vindex types
 `ivf-flat`, `ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
 case-insensitive and surrounding whitespace is ignored.
 
@@ -1989,6 +2008,8 @@ SELECT * FROM full_text_search('paimon.my_db.docs', 'content', 'paimon search', 
 ```
 
 The function searches across all Tantivy full-text index files for the target column, merges results by relevance score, and returns the top-k matching rows. If no matching index is found, an empty result is returned.
+
+Build the index files with `CALL sys.create_global_index(..., index_type => 'full-text')` (see [create_global_index](#create_global_index)), or with Java Paimon; both write the same format.
 
 
 ## Time Travel
