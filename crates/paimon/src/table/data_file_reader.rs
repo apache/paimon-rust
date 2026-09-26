@@ -105,6 +105,10 @@ impl FileRead for TimedFileRead {
         self.timing.add_file_read(start.elapsed());
         result
     }
+
+    fn cache_namespace(&self) -> Option<usize> {
+        self.inner.cache_namespace()
+    }
 }
 
 /// Reads data from Parquet files.
@@ -1746,6 +1750,21 @@ mod tests {
                 Duration::from_millis(20),
             )
         );
+    }
+
+    #[tokio::test]
+    async fn timed_file_read_preserves_cache_namespace() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let input = file_io.new_input("memory:/timed-file").unwrap();
+        let reader = input.reader().await.unwrap();
+        let cache_namespace = reader.cache_namespace();
+        let timed = TimedFileRead {
+            inner: Box::new(reader),
+            timing: Arc::new(DataFileReadTiming::default()),
+        };
+
+        assert!(cache_namespace.is_some());
+        assert_eq!(timed.cache_namespace(), cache_namespace);
     }
 
     #[test]
