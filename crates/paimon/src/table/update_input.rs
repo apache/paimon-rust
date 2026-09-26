@@ -270,12 +270,11 @@ fn cast_list<O: OffsetSizeTrait>(
 }
 
 /// PyPaimon rebuilds temporal row values after a lossy safe cast fails.
-/// Its constructors floor timestamp/duration values instead of rounding a
+/// Its constructors floor duration values instead of rounding a
 /// negative fraction toward zero. Exact conversions still use Arrow directly.
 fn coerce_temporal(array: &ArrayRef, target: &DataType) -> crate::Result<Option<ArrayRef>> {
     let (from, to, time_of_day) = match (array.data_type(), target) {
-        (DataType::Timestamp(from, _), DataType::Timestamp(to, _))
-        | (DataType::Duration(from), DataType::Duration(to)) => {
+        (DataType::Duration(from), DataType::Duration(to)) => {
             (units_per_second(from), units_per_second(to), false)
         }
         (
@@ -406,7 +405,8 @@ fn cast_to_string(array: &ArrayRef, target: &DataType) -> crate::Result<ArrayRef
     options.format_options = arrow_cast::display::FormatOptions::new()
         .with_timestamp_format(Some(&timestamp_format))
         .with_timestamp_tz_format(Some(&zoned_format))
-        .with_time_format(Some(&time_format));
+        .with_time_format(Some(&time_format))
+        .with_datetime_format(Some("%Y-%m-%d"));
     let duration;
     let input = if matches!(array.data_type(), DataType::Duration(_)) {
         duration = arrow_cast::cast(array.as_ref(), &DataType::Int64)
@@ -462,6 +462,211 @@ fn parse_decimal_text(value: &str, precision: u8, scale: i8) -> crate::Result<i1
     Ok(if negative { -unscaled } else { unscaled })
 }
 
+// Match Arrow C++'s ParseTimestampISO8601 grammar and fractional precision.
+// Parsing at the requested unit must reject extra digits, even trailing zeros.
+fn parse_timestamp_text(value: &str, unit: &TimeUnit, zoned: bool) -> Option<i64> {
+    fn digits(value: &str) -> Option<u32> {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        value.parse().ok()
+    }
+    if !value.is_ascii() || value.len() < 10 || &value[4..5] != "-" || &value[7..8] != "-" {
+        return None;
+    }
+    let date = chrono::NaiveDate::from_ymd_opt(
+        digits(&value[..4])? as i32,
+        digits(&value[5..7])?,
+        digits(&value[8..10])?,
+    )?;
+    let midnight = date.and_hms_opt(0, 0, 0)?.and_utc().timestamp();
+    let units = units_per_second(unit);
+    if value.len() == 10 {
+        return (!zoned).then(|| midnight.checked_mul(units)).flatten();
+    }
+    if !matches!(value.as_bytes()[10], b' ' | b'T') {
+        return None;
+    }
+    let mut time = &value[11..];
+    let mut offset = 0_i64;
+    let has_offset = if let Some(local) = time.strip_suffix('Z') {
+        time = local;
+        true
+    } else if let Some(index) = time.find(['+', '-']) {
+        let zone = &time[index + 1..];
+        let (hours, minutes) = match zone.len() {
+            2 => (digits(zone)?, 0),
+            4 => (digits(&zone[..2])?, digits(&zone[2..])?),
+            5 if &zone[2..3] == ":" => (digits(&zone[..2])?, digits(&zone[3..])?),
+            _ => return None,
+        };
+        if hours >= 24 || minutes >= 60 {
+            return None;
+        }
+        offset = i64::from(hours * 3600 + minutes * 60);
+        if time.as_bytes()[index] == b'-' {
+            offset = -offset;
+        }
+        time = &time[..index];
+        true
+    } else {
+        false
+    };
+    if has_offset != zoned {
+        return None;
+    }
+    let (clock, fraction) = match time.split_once('.') {
+        Some((clock, fraction)) if clock.len() == 8 => {
+            let precision = units.ilog10() as usize;
+            if fraction.is_empty() || fraction.len() > precision {
+                return None;
+            }
+            let fraction =
+                i64::from(digits(fraction)?) * 10_i64.pow((precision - fraction.len()) as u32);
+            (clock, fraction)
+        }
+        Some(_) => return None,
+        None => (time, 0),
+    };
+    let (hour, minute, second) = match clock.len() {
+        2 => (digits(clock)?, 0, 0),
+        5 if &clock[2..3] == ":" => (digits(&clock[..2])?, digits(&clock[3..])?, 0),
+        8 if &clock[2..3] == ":" && &clock[5..6] == ":" => (
+            digits(&clock[..2])?,
+            digits(&clock[3..5])?,
+            digits(&clock[6..])?,
+        ),
+        _ => return None,
+    };
+    if hour >= 24 || minute >= 60 || second >= 60 {
+        return None;
+    }
+    let seconds = midnight + i64::from(hour * 3600 + minute * 60 + second) - offset;
+    // Use a wider intermediate so valid negative boundary values do not fail
+    // before their positive fractional component is added.
+    i64::try_from(i128::from(seconds) * i128::from(units) + i128::from(fraction)).ok()
+}
+
+fn timestamp_array(values: Int64Array, target: &DataType) -> crate::Result<ArrayRef> {
+    let data = values
+        .to_data()
+        .into_builder()
+        .data_type(target.clone())
+        .build()
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(arrow_array::make_array(data))
+}
+
+/// Timestamp timezones are metadata for Arrow casts. Change physical units
+/// without interpreting a timezone-free epoch count as local wall time.
+fn cast_timestamp(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Result<ArrayRef> {
+    let DataType::Timestamp(from, _) = array.data_type() else {
+        unreachable!()
+    };
+    let DataType::Timestamp(to, _) = target else {
+        unreachable!()
+    };
+    let raw = arrow_cast::cast(array.as_ref(), &DataType::Int64)
+        .map_err(|error| invalid(error.to_string()))?;
+    let raw = raw.as_any().downcast_ref::<Int64Array>().unwrap();
+    let from = units_per_second(from);
+    let to = units_per_second(to);
+    let values = raw
+        .iter()
+        .map(|value| {
+            value
+                .map(|value| {
+                    if to >= from {
+                        value
+                            .checked_mul(to / from)
+                            .ok_or_else(|| invalid("Timestamp assignment overflow"))
+                    } else {
+                        let divisor = from / to;
+                        if mode == CastMode::Assignment && value % divisor != 0 {
+                            return Err(invalid("Timestamp assignment would lose precision"));
+                        }
+                        // PyPaimon's row-ID constructor fallback rounds negative epochs down.
+                        Ok(value.div_euclid(divisor))
+                    }
+                })
+                .transpose()
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    timestamp_array(Int64Array::from(values), target)
+}
+
+// Arrow C++ accepts decimal with an optional minus, or unsigned hexadecimal
+// interpreted in the target width (including two's complement for signed types).
+fn parse_integer_text(value: &str, target: &DataType) -> Option<i128> {
+    let bits = match target {
+        DataType::Int8 | DataType::UInt8 => 8,
+        DataType::Int16 | DataType::UInt16 => 16,
+        DataType::Int32 | DataType::UInt32 => 32,
+        DataType::Int64 | DataType::UInt64 => 64,
+        _ => unreachable!(),
+    };
+    let signed = target.is_signed_integer();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        if hex.is_empty() || hex.len() > bits / 4 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let value = i128::from_str_radix(hex, 16).ok()?;
+        return Some(if signed && value >= 1_i128 << (bits - 1) {
+            value - (1_i128 << bits)
+        } else {
+            value
+        });
+    }
+    let digits = if signed {
+        value.strip_prefix('-').unwrap_or(value)
+    } else {
+        value
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value = value.parse::<i128>().ok()?;
+    let (min, max) = if signed {
+        (-(1_i128 << (bits - 1)), (1_i128 << (bits - 1)) - 1)
+    } else {
+        (0, (1_i128 << bits) - 1)
+    };
+    (min..=max).contains(&value).then_some(value)
+}
+
+fn cast_integer_text(array: &ArrayRef, target: &DataType) -> crate::Result<ArrayRef> {
+    let text = arrow_cast::cast(array.as_ref(), &DataType::Utf8)
+        .map_err(|error| invalid(error.to_string()))?;
+    let values = text
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|value| {
+            value
+                .map(|value| {
+                    parse_integer_text(value, target)
+                        .ok_or_else(|| invalid(format!("Invalid integer assignment: {value}")))
+                })
+                .transpose()
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    // Range was checked in the requested width, before narrowing the storage.
+    let integers: ArrayRef = if target.is_signed_integer() {
+        Arc::new(Int64Array::from_iter(
+            values.into_iter().map(|v| v.map(|v| v as i64)),
+        ))
+    } else {
+        Arc::new(arrow_array::UInt64Array::from_iter(
+            values.into_iter().map(|v| v.map(|v| v as u64)),
+        ))
+    };
+    arrow_cast::cast(integers.as_ref(), target).map_err(|error| invalid(error.to_string()))
+}
+
 fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Result<ArrayRef> {
     let source = array.data_type();
     if source == target {
@@ -474,6 +679,68 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
         safe: false,
         ..Default::default()
     };
+    if matches!(
+        target,
+        DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    ) && !matches!(
+        source,
+        DataType::Null
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    ) && !source.is_string()
+    {
+        // A row-ID constructor can rebuild an all-null column in any scalar
+        // type even when the safe cast between the declared types is absent.
+        if mode == CastMode::RowUpdate && array.null_count() == array.len() {
+            return Ok(new_null_array(target, array.len()));
+        }
+        return Err(invalid(format!(
+            "Unsupported assignment cast from {source:?} to {target:?}"
+        )));
+    }
+    if matches!(
+        source,
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+    ) && (target.is_numeric() || *target == DataType::Boolean)
+    {
+        // Binary numeric inputs contain text, never native-endian numeric bytes.
+        let text = arrow_cast::cast_with_options(array.as_ref(), &DataType::Utf8, &options)
+            .map_err(|error| invalid(error.to_string()))?;
+        return cast_primitive(&text, target, mode);
+    }
+    if matches!(source, DataType::Timestamp(..)) && matches!(target, DataType::Timestamp(..)) {
+        return cast_timestamp(array, target, mode);
+    }
+    if source.is_string() {
+        if let DataType::Timestamp(unit, timezone) = target {
+            let text = arrow_cast::cast_with_options(array.as_ref(), &DataType::Utf8, &options)
+                .map_err(|error| invalid(error.to_string()))?;
+            let values = text
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|value| {
+                    value
+                        .map(|value| {
+                            parse_timestamp_text(value, unit, timezone.is_some()).ok_or_else(|| {
+                                invalid(format!("Invalid timestamp assignment: {value}"))
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            return timestamp_array(Int64Array::from(values), target);
+        }
+    }
+    if source.is_string() && target.is_integer() {
+        return cast_integer_text(array, target);
+    }
     if source.is_string() && *target == DataType::Boolean {
         let text = arrow_cast::cast_with_options(array.as_ref(), &DataType::Utf8, &options)
             .map_err(|error| invalid(error.to_string()))?;
@@ -578,10 +845,8 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
     let exact_numeric = (source.is_numeric() && target.is_integer())
         || (source.is_integer() && target.is_numeric())
         || (source.is_decimal() && target.is_decimal());
-    let exact_temporal = (matches!(source, DataType::Timestamp(..))
-        && matches!(target, DataType::Timestamp(..)))
-        || (matches!(source, DataType::Time32(_) | DataType::Time64(_))
-            && matches!(target, DataType::Time32(_) | DataType::Time64(_)))
+    let exact_temporal = (matches!(source, DataType::Time32(_) | DataType::Time64(_))
+        && matches!(target, DataType::Time32(_) | DataType::Time64(_)))
         || (matches!(source, DataType::Duration(_)) && matches!(target, DataType::Duration(_)))
         || (matches!(source, DataType::Date32 | DataType::Date64)
             && matches!(target, DataType::Date32 | DataType::Date64));
@@ -1056,6 +1321,239 @@ mod tests {
             } else {
                 assert!(result.is_err());
             }
+        }
+    }
+
+    #[test]
+    fn timestamp_text_preserves_pyarrow_precision_and_offset_rules() {
+        for mode in [CastMode::Assignment, CastMode::RowUpdate] {
+            for (unit, fraction) in [
+                (TimeUnit::Second, ""),
+                (TimeUnit::Millisecond, ".123"),
+                (TimeUnit::Microsecond, ".123456"),
+                (TimeUnit::Nanosecond, ".123456789"),
+            ] {
+                let text = format!("1970-01-01 00:00:00{fraction}");
+                let input: ArrayRef = Arc::new(StringArray::from(vec![Some(text.as_str()), None]));
+                let target = DataType::Timestamp(unit, None);
+                let result = cast_update_value(&input, &target, mode).unwrap();
+                let raw = arrow_cast::cast(result.as_ref(), &DataType::Int64).unwrap();
+                assert_eq!(
+                    raw.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+                    match unit {
+                        TimeUnit::Second => 0,
+                        TimeUnit::Millisecond => 123,
+                        TimeUnit::Microsecond => 123456,
+                        TimeUnit::Nanosecond => 123456789,
+                    }
+                );
+                assert!(result.is_null(1));
+                let extra = format!(
+                    "1970-01-01 00:00:00{}0",
+                    if fraction.is_empty() { "." } else { fraction }
+                );
+                let input: ArrayRef = Arc::new(StringArray::from(vec![extra]));
+                assert!(cast_update_value(&input, &target, mode).is_err());
+            }
+        }
+        for (text, expected) in [
+            ("1970-01-01", 0),
+            ("1970-01-01T01", 3_600_000),
+            ("1970-01-01 00:01", 60_000),
+            ("1969-12-31 23:59:59.999", -1),
+        ] {
+            assert_eq!(
+                parse_timestamp_text(text, &TimeUnit::Millisecond, false),
+                Some(expected)
+            );
+        }
+        for text in [
+            "1970-01-01 00:00:00.123456",
+            "1970-01-01 00:00:00.0000",
+            "1970-01-01 00:00:00.",
+            "1970-01-01t00:00:00",
+            "1970-02-30",
+            "1970-01-01 24:00:00",
+            "1970-01-01 23:59:60",
+            "1970-01-01T00:00:00Z",
+            "1970-01-01T00:00:00+08:00",
+            "不是时间",
+            "1970-01-01 00:00:00.1234567890",
+        ] {
+            assert!(
+                parse_timestamp_text(text, &TimeUnit::Millisecond, false).is_none(),
+                "{text}"
+            );
+        }
+        for text in [
+            "1970-01-01T08+08",
+            "1970-01-01 08:00+0800",
+            "1970-01-01 08:00:00+08:00",
+            "1970-01-01T00:00:00Z",
+        ] {
+            assert_eq!(
+                parse_timestamp_text(text, &TimeUnit::Millisecond, true),
+                Some(0)
+            );
+        }
+        assert!(
+            parse_timestamp_text("1970-01-01 00:00:00", &TimeUnit::Millisecond, true).is_none()
+        );
+    }
+
+    #[test]
+    fn timestamp_cast_changes_timezone_metadata_without_changing_epoch() {
+        for source_zone in [None, Some("Asia/Shanghai"), Some("America/New_York")] {
+            let values = TimestampMicrosecondArray::from(vec![Some(-1000), None, Some(1000)])
+                .with_timezone_opt(source_zone);
+            let input: ArrayRef = Arc::new(values);
+            for target_zone in [None, Some("UTC"), Some("Asia/Shanghai")] {
+                for mode in [CastMode::Assignment, CastMode::RowUpdate] {
+                    let target =
+                        DataType::Timestamp(TimeUnit::Millisecond, target_zone.map(Into::into));
+                    let output = cast_update_value(&input, &target, mode).unwrap();
+                    let raw = arrow_cast::cast(output.as_ref(), &DataType::Int64).unwrap();
+                    assert_eq!(
+                        raw.to_data(),
+                        Int64Array::from(vec![Some(-1), None, Some(1)]).to_data()
+                    );
+                    assert_eq!(output.data_type(), &target);
+                }
+            }
+        }
+        let input: ArrayRef =
+            Arc::new(TimestampMicrosecondArray::from(vec![-1001]).with_timezone("Asia/Shanghai"));
+        let target = DataType::Timestamp(TimeUnit::Millisecond, None);
+        assert!(cast_assignment(&input, &target).is_err());
+        let output = cast_update_value(&input, &target, CastMode::RowUpdate).unwrap();
+        assert_eq!(
+            arrow_cast::cast(output.as_ref(), &DataType::Int64)
+                .unwrap()
+                .to_data(),
+            Int64Array::from(vec![-2]).to_data()
+        );
+        let input: ArrayRef = Arc::new(arrow_array::TimestampSecondArray::from(vec![i64::MAX]));
+        assert!(cast_assignment(&input, &target).is_err());
+    }
+
+    #[test]
+    fn binary_assignments_parse_text_and_never_reinterpret_numeric_bytes() {
+        let binary: ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![
+            Some(b"1.25".as_slice()),
+            None,
+        ]));
+        for mode in [CastMode::Assignment, CastMode::RowUpdate] {
+            for input_type in [
+                DataType::Binary,
+                DataType::LargeBinary,
+                DataType::BinaryView,
+            ] {
+                let input = arrow_cast::cast(binary.as_ref(), &input_type).unwrap();
+                let output = cast_update_value(&input, &DataType::Float64, mode).unwrap();
+                assert_eq!(
+                    output.to_data(),
+                    Float64Array::from(vec![Some(1.25), None]).to_data()
+                );
+            }
+            let input: ArrayRef = Arc::new(Int64Array::from(vec![42]));
+            for target in [
+                DataType::Binary,
+                DataType::LargeBinary,
+                DataType::BinaryView,
+                DataType::FixedSizeBinary(8),
+            ] {
+                assert!(cast_update_value(&input, &target, mode).is_err());
+            }
+            let input: ArrayRef =
+                Arc::new(arrow_array::BinaryArray::from(vec![b"true".as_slice()]));
+            assert_eq!(
+                cast_update_value(&input, &DataType::Boolean, mode)
+                    .unwrap()
+                    .to_data(),
+                arrow_array::BooleanArray::from(vec![true]).to_data()
+            );
+            for invalid_text in [b"yes".as_slice(), b"\xff"] {
+                let input: ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![invalid_text]));
+                assert!(cast_update_value(&input, &DataType::Boolean, mode).is_err());
+            }
+            let input: ArrayRef =
+                Arc::new(arrow_array::BinaryArray::from(vec![b"1.234".as_slice()]));
+            assert!(cast_update_value(&input, &DataType::Decimal128(10, 2), mode).is_err());
+        }
+    }
+
+    #[test]
+    fn date64_strings_use_dates_without_time_components() {
+        let input: ArrayRef = Arc::new(arrow_array::Date64Array::from(vec![
+            Some(0),
+            None,
+            Some(-86_400_000),
+        ]));
+        for mode in [CastMode::Assignment, CastMode::RowUpdate] {
+            let output = cast_update_value(&input, &DataType::Utf8, mode).unwrap();
+            assert_eq!(
+                output.to_data(),
+                StringArray::from(vec![Some("1970-01-01"), None, Some("1969-12-31")]).to_data()
+            );
+        }
+    }
+
+    #[test]
+    fn integer_text_checks_syntax_width_and_signed_hex_values() {
+        for (target, bits) in [
+            (DataType::Int8, 8),
+            (DataType::Int16, 16),
+            (DataType::Int32, 32),
+            (DataType::Int64, 64),
+            (DataType::UInt8, 8),
+            (DataType::UInt16, 16),
+            (DataType::UInt32, 32),
+            (DataType::UInt64, 64),
+        ] {
+            let hex = format!("0x{}", "f".repeat(bits / 4));
+            let expected = if target.is_signed_integer() {
+                -1
+            } else {
+                (1_i128 << bits) - 1
+            };
+            assert_eq!(parse_integer_text(&hex, &target), Some(expected));
+            assert_eq!(parse_integer_text("0X2a", &target), Some(42));
+            assert_eq!(parse_integer_text("00042", &target), Some(42));
+            for invalid in ["+42", " 42", "42 ", "42.0", "", "-", "0x", "-0x2a"] {
+                assert!(
+                    parse_integer_text(invalid, &target).is_none(),
+                    "{invalid} -> {target:?}"
+                );
+            }
+            assert!(parse_integer_text(&format!("{hex}0"), &target).is_none());
+            let upper = (1_i128 << (bits - usize::from(target.is_signed_integer()))) - 1;
+            assert_eq!(parse_integer_text(&upper.to_string(), &target), Some(upper));
+            assert!(parse_integer_text(&(upper + 1).to_string(), &target).is_none());
+            if target.is_signed_integer() {
+                assert_eq!(
+                    parse_integer_text(&(-upper - 1).to_string(), &target),
+                    Some(-upper - 1)
+                );
+                assert!(parse_integer_text(&(-upper - 2).to_string(), &target).is_none());
+            } else {
+                assert!(parse_integer_text("-0", &target).is_none());
+            }
+            let input: ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![
+                Some(hex.as_bytes()),
+                None,
+            ]));
+            let output = cast_assignment(&input, &target).unwrap();
+            assert_eq!(output.data_type(), &target);
+            assert!(output.is_null(1));
+            let output = cast_to_string(&output, &DataType::Utf8).unwrap();
+            assert_eq!(
+                output
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                expected.to_string()
+            );
         }
     }
 }

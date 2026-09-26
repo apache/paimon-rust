@@ -81,7 +81,12 @@ impl TableUpdateByRowId {
         let batches = batches
             .into_iter()
             .map(super::update_input::normalize_row_ids)
-            .collect::<crate::Result<Vec<_>>>()?;
+            .collect::<crate::Result<Vec<_>>>()?
+            .into_iter()
+            // Keep schema validation for empty inputs, then let both the
+            // writer and file index consume the same logical rows.
+            .filter(|batch| batch.num_rows() > 0)
+            .collect::<Vec<_>>();
         writer.add_matched_group(batches.clone())?;
         let first_row_ids = self.index.matched_first_row_ids(&batches)?;
         // Use the same leaf identities as commit-time conflict detection.

@@ -133,20 +133,6 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
-    /// Create an append-table upsert writer using user-specified match keys.
-    pub fn new_upsert(
-        &self,
-        keys: Vec<String>,
-        update_columns: Vec<String>,
-    ) -> crate::Result<super::TableUpsert> {
-        match &self.0 {
-            WriteBuilderKind::Paimon(builder) => builder.new_upsert(keys, update_columns),
-            WriteBuilderKind::Format(_) => Err(crate::Error::Unsupported {
-                message: "native upsert is not supported for format tables".to_string(),
-            }),
-        }
-    }
-
     /// Create a new writer for data-evolution row-id deletes.
     pub fn new_delete(&self) -> crate::Result<DataEvolutionDeleteWriter> {
         match &self.0 {
@@ -255,15 +241,6 @@ impl<'a> PaimonWriteBuilder<'a> {
     ) -> crate::Result<DataEvolutionWriter> {
         self.ensure_main_branch_write()?;
         DataEvolutionWriter::new(self.table, update_columns)
-    }
-
-    pub fn new_upsert(
-        &self,
-        keys: Vec<String>,
-        update_columns: Vec<String>,
-    ) -> crate::Result<super::TableUpsert> {
-        self.ensure_main_branch_write()?;
-        super::TableUpsert::new(self.table, self.commit_user.clone(), keys, update_columns)
     }
 
     /// Create a new writer for data-evolution row-id deletes.

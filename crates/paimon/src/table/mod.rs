@@ -204,7 +204,6 @@ pub use table_read::{AuditLogRead, TableRead};
 pub use table_scan::{AuditLogScan, TableScan};
 pub use table_update::TableUpdate;
 pub use table_update_by_row_id::TableUpdateByRowId;
-pub use table_upsert::TableUpsert;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
 pub use update_assignment::UpdateAssignment;

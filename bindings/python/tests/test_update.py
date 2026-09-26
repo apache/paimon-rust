@@ -262,6 +262,8 @@ def test_stream_row_id_update_and_factory(tmp_path):
     messages = update.update_by_arrow_with_row_id(pa.table({'_ROW_ID': [0], 'value': [11]}), 10)
     stream.new_commit().commit(10, messages)
     low = update.new_update_by_row_id(11)
+    with pytest.raises(ValueError, match='must contain _ROW_ID'):
+        low.update_columns(pa.table({'value': pa.array([], type=pa.int32())}), ['value'])
     messages = low.update_columns(pa.table({'_ROW_ID': [1], 'value': [22]}), ['value'])
     stream.new_commit().commit(11, messages)
     actual = pa.Table.from_batches(context.sql(

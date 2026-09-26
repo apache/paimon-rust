@@ -56,10 +56,10 @@ fn selected_rows(batch: &RecordBatch, rows: &[usize]) -> crate::Result<RecordBat
 }
 
 /// Upsert full Arrow rows into a data-evolution table without primary keys.
-/// Existing keys are updated by row ID; new keys are appended. The caller
-/// commits the returned messages through the same write builder's committer.
+/// Internal executor for `TableUpdate::upsert_by_arrow_with_key`. Existing
+/// keys are updated by row ID; new keys are appended.
 #[must_use = "upsert must be used to call prepare_commit()"]
-pub struct TableUpsert {
+pub(super) struct TableUpsert {
     table: Table,
     commit_user: String,
     keys: Vec<String>,
@@ -68,7 +68,7 @@ pub struct TableUpsert {
 }
 
 impl TableUpsert {
-    pub(crate) fn new(
+    pub(super) fn new(
         table: &Table,
         commit_user: String,
         keys: Vec<String>,
@@ -117,7 +117,7 @@ impl TableUpsert {
 
     /// Add full rows. Column order may differ from the table schema; names and
     /// Arrow types must agree. Multiple batches form one logical upsert input.
-    pub fn add_batch(&mut self, batch: RecordBatch) -> crate::Result<()> {
+    pub(super) fn add_batch(&mut self, batch: RecordBatch) -> crate::Result<()> {
         let target = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
         if batch.num_columns() != target.fields().len() {
             return Err(invalid("native upsert requires all table columns"));
@@ -146,7 +146,7 @@ impl TableUpsert {
     /// Match source keys against the target snapshot, stage row-ID updates and
     /// new rows, then return both sets of commit messages as one operation.
     #[must_use = "commit messages must be passed to TableCommit"]
-    pub async fn prepare_commit(self) -> crate::Result<Vec<CommitMessage>> {
+    pub(super) async fn prepare_commit(self) -> crate::Result<Vec<CommitMessage>> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         let Some(first) = self.source.first() else {
             return Err(invalid("Input data is empty"));

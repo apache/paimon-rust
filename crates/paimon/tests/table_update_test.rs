@@ -1088,3 +1088,55 @@ async fn row_id_nested_overlap_uses_leaf_identity_across_calls() {
     actual.sort();
     assert_eq!(actual, vec![(10, 101), (22, 200)]);
 }
+
+#[tokio::test]
+async fn row_id_update_ignores_empty_chunks_before_integer_normalization() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let mut by_row_id = table
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .new_update_by_row_id()
+        .await
+        .unwrap();
+    let error = by_row_id
+        .update_columns(vec![batch(&[("value", vec![])])], vec!["value".into()])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("must contain _ROW_ID"));
+    assert!(by_row_id.commit_messages().is_empty());
+    for unsigned in [false, true] {
+        let table = evolution_table().await;
+        seed(&table).await;
+        let ids: ArrayRef = if unsigned {
+            Arc::new(arrow_array::UInt32Array::from(vec![0, 2]))
+        } else {
+            Arc::new(Int32Array::from(vec![0, 2]))
+        };
+        let input = RecordBatch::try_from_iter([
+            ("_ROW_ID", ids),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![99, 77])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let update = table.new_write_builder().new_update().unwrap();
+        let messages = update
+            .update_by_arrow_with_row_id(vec![
+                input.slice(0, 0),
+                input.slice(0, 1),
+                input.slice(1, 0),
+                input.slice(1, 1),
+                input.slice(2, 0),
+            ])
+            .await
+            .unwrap();
+        commit(&table, messages).await;
+        assert_eq!(
+            read_rows(&table).await,
+            vec![vec![1, 99, 100], vec![2, 20, 200], vec![3, 77, 300]]
+        );
+    }
+}

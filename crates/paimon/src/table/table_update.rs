@@ -206,17 +206,15 @@ impl TableUpdate {
         batches: Vec<RecordBatch>,
         upsert_keys: Vec<String>,
     ) -> crate::Result<Vec<CommitMessage>> {
-        let mut writer = self
-            .table
-            .new_write_builder()
-            .with_commit_user(self.commit_user.clone())?
-            .new_upsert(
-                upsert_keys,
-                self.update_cols
-                    .clone()
-                    .filter(|columns| !columns.is_empty())
-                    .unwrap_or_else(|| self.all_fields()),
-            )?;
+        let mut writer = super::table_upsert::TableUpsert::new(
+            &self.table,
+            self.commit_user.clone(),
+            upsert_keys,
+            self.update_cols
+                .clone()
+                .filter(|columns| !columns.is_empty())
+                .unwrap_or_else(|| self.all_fields()),
+        )?;
         for batch in batches {
             writer.add_batch(batch)?;
         }
