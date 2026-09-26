@@ -47,3 +47,29 @@ def test_batch_update_row_ids_commits_through_write_builder(tmp_path):
     actual = pa.Table.from_batches(context.sql(
         'SELECT id, name FROM paimon.updates.t')).sort_by('id').to_pydict()
     assert actual == {'id': [1, 2, 3], 'name': ['A', 'b', 'C']}
+
+
+def test_batch_delete_row_ids_commits_deletion_vectors(tmp_path):
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.deletes')
+    context.sql("""CREATE TABLE paimon.deletes.t (id INT, name STRING) WITH (
+        'row-tracking.enabled' = 'true',
+        'data-evolution.enabled' = 'true',
+        'deletion-vectors.enabled' = 'true')""")
+    context.sql("""INSERT INTO paimon.deletes.t (id, name)
+        VALUES (1, 'a'), (2, 'b'), (3, 'c')""")
+
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('deletes.t')
+    builder = table.new_batch_write_builder()
+    delete = builder.new_delete()
+    delete.add_row_ids([0, 2, 2])
+    messages = delete.prepare_commit()
+    assert messages and messages[0].serialize()
+    with pytest.raises(RuntimeError, match='closed'):
+        delete.add_row_ids([1])
+    builder.new_commit().commit(messages)
+
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, name FROM paimon.deletes.t')).to_pydict()
+    assert actual == {'id': [2], 'name': ['b']}
