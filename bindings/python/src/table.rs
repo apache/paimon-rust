@@ -201,6 +201,38 @@ impl PyTable {
             .collect())
     }
 
+    // ---------------- maintenance ----------------
+    /// Expire old snapshots and delete the files only they reference. Unset
+    /// arguments fall back to the table options, as in `CALL
+    /// sys.expire_snapshots`. Returns the number of expired snapshots.
+    #[pyo3(signature = (retain_max=None, retain_min=None, older_than_ms=None, max_deletes=None))]
+    fn expire_snapshots(
+        &self,
+        py: Python<'_>,
+        retain_max: Option<i32>,
+        retain_min: Option<i32>,
+        older_than_ms: Option<i64>,
+        max_deletes: Option<i32>,
+    ) -> PyResult<usize> {
+        let table = Arc::clone(&self.inner);
+        py.detach(move || {
+            let mut expire = table.new_expire_snapshots();
+            if let Some(value) = retain_max {
+                expire.with_retain_max(value);
+            }
+            if let Some(value) = retain_min {
+                expire.with_retain_min(value);
+            }
+            if let Some(value) = older_than_ms {
+                expire.with_older_than_millis(value);
+            }
+            if let Some(value) = max_deletes {
+                expire.with_max_deletes(value);
+            }
+            runtime().block_on(expire.execute()).map_err(to_py_err)
+        })
+    }
+
     fn list_partitions(&self) -> PyResult<Vec<HashMap<String, String>>> {
         let stats = runtime()
             .block_on(self.inner.partition_stats())
