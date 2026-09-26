@@ -21,7 +21,9 @@
 
 use super::format_write_builder::FormatWriteBuilder;
 use crate::resource::ResourceContext;
-use crate::table::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
+use crate::table::{
+    DataEvolutionDeleteWriter, DataEvolutionWriter, Table, TableCommit, TableUpdate, TableWrite,
+};
 use uuid::Uuid;
 
 /// Builder for creating table writers and committers.
@@ -112,11 +114,22 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
-    /// Create a new TableUpdate for data-evolution row-id updates.
-    pub fn new_update(&self, update_columns: Vec<String>) -> crate::Result<TableUpdate> {
+    /// Create a configured table update object, as in PyPaimon.
+    pub fn new_update(&self) -> crate::Result<TableUpdate> {
         match &self.0 {
-            WriteBuilderKind::Paimon(builder) => builder.new_update(update_columns),
-            WriteBuilderKind::Format(builder) => builder.new_update(update_columns),
+            WriteBuilderKind::Paimon(builder) => builder.new_update(),
+            WriteBuilderKind::Format(builder) => builder.new_update(),
+        }
+    }
+
+    /// Create a low-level writer for already matched row IDs.
+    pub fn new_data_evolution_writer(
+        &self,
+        update_columns: Vec<String>,
+    ) -> crate::Result<DataEvolutionWriter> {
+        match &self.0 {
+            WriteBuilderKind::Paimon(builder) => builder.new_data_evolution_writer(update_columns),
+            WriteBuilderKind::Format(builder) => builder.new_data_evolution_writer(update_columns),
         }
     }
 
@@ -210,10 +223,24 @@ impl<'a> PaimonWriteBuilder<'a> {
         })
     }
 
-    /// Create a new TableUpdate for data-evolution row-id updates.
-    pub fn new_update(&self, update_columns: Vec<String>) -> crate::Result<TableUpdate> {
+    /// Create a configured table update object.
+    pub fn new_update(&self) -> crate::Result<TableUpdate> {
+        ensure_table_write_allowed(self.table)?;
+        if self.overwrite {
+            return Err(crate::Error::Unsupported {
+                message: "TableUpdate does not support overwrite".to_string(),
+            });
+        }
+        Ok(TableUpdate::new(self.table, self.commit_user.clone()))
+    }
+
+    /// Create a writer for already matched row IDs.
+    pub fn new_data_evolution_writer(
+        &self,
+        update_columns: Vec<String>,
+    ) -> crate::Result<DataEvolutionWriter> {
         self.ensure_main_branch_write()?;
-        TableUpdate::new(self.table, update_columns)
+        DataEvolutionWriter::new(self.table, update_columns)
     }
 
     /// Create a new writer for data-evolution row-id deletes.
@@ -549,11 +576,11 @@ mod tests {
     }
 
     #[test]
-    fn test_new_update_rejects_non_data_evolution_table() {
+    fn test_new_update_by_row_id_rejects_non_data_evolution_table() {
         let table = test_postpone_pk_table(&test_file_io(), "memory:/test_new_update_invalid");
         let err = table
             .new_write_builder()
-            .new_update(vec!["value".to_string()])
+            .new_data_evolution_writer(vec!["value".to_string()])
             .err()
             .unwrap();
 
@@ -565,12 +592,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_update_prepares_empty_commit_for_empty_batch() {
+    async fn test_new_update_by_row_id_prepares_empty_commit_for_empty_batch() {
         let file_io = test_file_io();
         let table = test_data_evolution_table(&file_io, "memory:/test_new_update_empty");
         let mut update = table
             .new_write_builder()
-            .new_update(vec!["name".to_string()])
+            .new_data_evolution_writer(vec!["name".to_string()])
             .unwrap();
 
         update

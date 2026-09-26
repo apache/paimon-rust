@@ -16,14 +16,15 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{CoreOptions, DataType, Datum};
 use paimon::table::{
-    CommitMessage, Table, TableCommit, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
+    CommitMessage, Table, TableCommit, TableUpdate, TableUpdateByRowId, TableWrite,
+    COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -31,7 +32,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 
 use crate::error::to_py_err;
-use crate::predicate::py_to_datum;
+use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
 /// Validate an incoming batch schema against the table's target Arrow schema:
 /// field count, order, and names must match, and types must match exactly. The
@@ -223,6 +224,17 @@ impl PyBatchWriteBuilder {
         })
     }
 
+    fn new_update(&self) -> PyResult<PyBatchTableUpdate> {
+        if self.static_partition.is_some() {
+            return Err(PyValueError::new_err(
+                "BatchTableUpdate does not support overwrite",
+            ));
+        }
+        Ok(PyBatchTableUpdate {
+            context: UpdateContext::new(&self.context)?,
+        })
+    }
+
     fn new_commit(&self) -> PyResult<PyBatchTableCommit> {
         let table = &self.context.table;
         let ignore_empty = boolean_option(table, "snapshot.ignore-empty-commit", true)?;
@@ -280,6 +292,12 @@ impl PyStreamWriteBuilder {
         })
     }
 
+    fn new_update(&self) -> PyResult<PyStreamTableUpdate> {
+        Ok(PyStreamTableUpdate {
+            context: UpdateContext::new(&self.context)?,
+        })
+    }
+
     fn new_commit(&self) -> PyResult<PyStreamTableCommit> {
         Ok(PyStreamTableCommit {
             context: CommitContext::new(&self.context.table, &self.context.commit_user, false)?,
@@ -292,6 +310,194 @@ struct WriteState {
     target_schema: Arc<ArrowSchema>,
     table_location: String,
     commit_user: String,
+}
+
+fn wrap_messages(
+    messages: Vec<CommitMessage>,
+    table_location: &str,
+    commit_user: &str,
+) -> Vec<PyCommitMessage> {
+    messages
+        .into_iter()
+        .map(|inner| PyCommitMessage {
+            inner,
+            origin: Some(MessageOrigin {
+                table_location: table_location.to_string(),
+                commit_user: commit_user.to_string(),
+            }),
+        })
+        .collect()
+}
+
+fn arrow_table_batches(table: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    let mut batches = table
+        .call_method0("to_batches")?
+        .try_iter()?
+        .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
+        .collect::<PyResult<Vec<_>>>()?;
+    // Preserve empty input schema so core validates columns even with no rows.
+    if batches.is_empty() {
+        batches.push(RecordBatch::new_empty(Arc::new(
+            ArrowSchema::from_pyarrow_bound(&table.getattr("schema")?)?,
+        )));
+    }
+    Ok(batches)
+}
+
+struct UpdateContext {
+    inner: TableUpdate,
+    table: Arc<Table>,
+    table_location: String,
+    commit_user: String,
+}
+
+impl UpdateContext {
+    fn new(context: &WriteContext) -> PyResult<Self> {
+        Ok(Self {
+            inner: context
+                .table
+                .new_write_builder()
+                .with_commit_user(context.commit_user.clone())
+                .map_err(to_py_err)?
+                .new_update()
+                .map_err(to_py_err)?,
+            table: context.table.clone(),
+            table_location: context.table.location().to_string(),
+            commit_user: context.commit_user.clone(),
+        })
+    }
+
+    fn update_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+        assignments: &Bound<'_, PyDict>,
+        read_columns: Option<Vec<String>>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let predicate = predicate
+            .map(|predicate| dict_to_table_predicate(predicate, self.table.schema().fields(), true))
+            .transpose()?;
+        let callback_error = Arc::new(Mutex::new(None));
+        let assignments = crate::update_assignment::from_python(
+            py,
+            assignments,
+            self.table.schema().fields(),
+            callback_error.clone(),
+        )?;
+        let result = py.detach(|| {
+            runtime().block_on(self.inner.update_by_predicate(
+                predicate,
+                assignments,
+                read_columns.unwrap_or_default(),
+            ))
+        });
+        if let Some(error) = callback_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        Ok(wrap_messages(
+            result.map_err(to_py_err)?,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
+
+    fn update_by_arrow_with_row_id(
+        &self,
+        py: Python<'_>,
+        table: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let batches = arrow_table_batches(table)?;
+        let messages = py
+            .detach(|| runtime().block_on(self.inner.update_by_arrow_with_row_id(batches)))
+            .map_err(to_py_err)?;
+        Ok(wrap_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
+
+    fn update_by_arrow_batches_with_row_id(
+        &self,
+        py: Python<'_>,
+        tables: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let input_error = Mutex::new(None);
+        let iterator = tables.try_iter()?.unbind();
+        let groups = std::iter::from_fn(|| {
+            // The generator may itself invoke a native operation. Leave the
+            // async execution context while calling Python so nested block_on
+            // calls are supported. The outer operation releases the GIL for I/O.
+            tokio::task::block_in_place(|| {
+                Python::attach(|py| {
+                    iterator.bind(py).clone().next().map(|table| {
+                        table
+                            .and_then(|table| arrow_table_batches(&table))
+                            .map_err(|error| {
+                                *input_error.lock().unwrap() = Some(error);
+                                paimon::Error::DataInvalid {
+                                    message: "Failed to read an input Arrow table".into(),
+                                    source: None,
+                                }
+                            })
+                    })
+                })
+            })
+        });
+        let result = py
+            .detach(|| runtime().block_on(self.inner.update_by_arrow_batches_with_row_id(groups)));
+        if let Some(error) = input_error.into_inner().unwrap() {
+            return Err(error);
+        }
+        Ok(wrap_messages(
+            result.map_err(to_py_err)?,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
+
+    fn new_update_by_row_id(&self, py: Python<'_>) -> PyResult<PyTableUpdateByRowId> {
+        let inner = py
+            .detach(|| runtime().block_on(self.inner.new_update_by_row_id()))
+            .map_err(to_py_err)?;
+        Ok(PyTableUpdateByRowId {
+            inner,
+            table_location: self.table_location.clone(),
+            commit_user: self.commit_user.clone(),
+        })
+    }
+
+    fn upsert_by_arrow_with_key(
+        &self,
+        py: Python<'_>,
+        input: &Bound<'_, PyAny>,
+        keys: Vec<String>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let batches = arrow_table_batches(input)?;
+        let messages = py
+            .detach(|| runtime().block_on(self.inner.upsert_by_arrow_with_key(batches, keys)))
+            .map_err(to_py_err)?;
+        Ok(wrap_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
+
+    fn delete_by_row_id(
+        &self,
+        py: Python<'_>,
+        row_ids: Vec<i64>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let messages = py
+            .detach(|| runtime().block_on(self.inner.delete_by_row_id(row_ids)))
+            .map_err(to_py_err)?;
+        Ok(wrap_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
 }
 
 impl WriteState {
@@ -314,16 +520,11 @@ impl WriteState {
         let messages = py
             .detach(|| runtime().block_on(inner.prepare_commit()))
             .map_err(to_py_err)?;
-        Ok(messages
-            .into_iter()
-            .map(|inner| PyCommitMessage {
-                inner,
-                origin: Some(MessageOrigin {
-                    table_location: self.table_location.clone(),
-                    commit_user: self.commit_user.clone(),
-                }),
-            })
-            .collect())
+        Ok(wrap_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+        ))
     }
 }
 
@@ -335,6 +536,192 @@ impl WriteState {
 pub struct PyBatchTableWrite {
     state: WriteState,
     prepared: bool,
+}
+
+#[pyclass(name = "BatchTableUpdate", module = "pypaimon_rust.datafusion")]
+pub struct PyBatchTableUpdate {
+    context: UpdateContext,
+}
+
+#[pyclass(name = "TableUpdateByRowId", module = "pypaimon_rust.datafusion")]
+pub struct PyTableUpdateByRowId {
+    inner: TableUpdateByRowId,
+    table_location: String,
+    commit_user: String,
+}
+
+#[pymethods]
+impl PyTableUpdateByRowId {
+    fn update_columns(
+        &mut self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        column_names: Vec<String>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let batches = arrow_table_batches(data)?;
+        let messages = py
+            .detach(|| runtime().block_on(self.inner.update_columns(batches, column_names)))
+            .map_err(to_py_err)?;
+        Ok(wrap_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
+
+    #[getter]
+    fn commit_messages(&self) -> Vec<PyCommitMessage> {
+        wrap_messages(
+            self.inner.commit_messages().to_vec(),
+            &self.table_location,
+            &self.commit_user,
+        )
+    }
+
+    fn _abort(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| runtime().block_on(self.inner.abort()))
+            .map_err(to_py_err)
+    }
+}
+
+#[pyclass(name = "StreamTableUpdate", module = "pypaimon_rust.datafusion")]
+pub struct PyStreamTableUpdate {
+    context: UpdateContext,
+}
+
+#[pymethods]
+impl PyStreamTableUpdate {
+    #[pyo3(signature = (predicate, assignments, commit_identifier, read_columns=None))]
+    fn update_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+        assignments: &Bound<'_, PyDict>,
+        commit_identifier: i64,
+        read_columns: Option<Vec<String>>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let _ = commit_identifier;
+        self.context
+            .update_by_predicate(py, predicate, assignments, read_columns)
+    }
+
+    fn update_by_arrow_with_row_id(
+        &self,
+        py: Python<'_>,
+        table: &Bound<'_, PyAny>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let _ = commit_identifier;
+        self.context.update_by_arrow_with_row_id(py, table)
+    }
+
+    fn new_update_by_row_id(
+        &self,
+        py: Python<'_>,
+        commit_identifier: i64,
+    ) -> PyResult<PyTableUpdateByRowId> {
+        let _ = commit_identifier;
+        self.context.new_update_by_row_id(py)
+    }
+
+    fn with_update_type<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        update_cols: Vec<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.context
+            .inner
+            .with_update_type(update_cols)
+            .map_err(to_py_err)?;
+        Ok(slf)
+    }
+
+    fn upsert_by_arrow_with_key(
+        &self,
+        py: Python<'_>,
+        table: &Bound<'_, PyAny>,
+        upsert_keys: Vec<String>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        // The stream committer applies the identifier to the returned messages.
+        let _ = commit_identifier;
+        self.context
+            .upsert_by_arrow_with_key(py, table, upsert_keys)
+    }
+
+    fn delete_by_row_id(
+        &self,
+        py: Python<'_>,
+        row_ids: Vec<i64>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        // The stream committer applies the identifier to the returned messages.
+        let _ = commit_identifier;
+        self.context.delete_by_row_id(py, row_ids)
+    }
+}
+
+#[pymethods]
+impl PyBatchTableUpdate {
+    #[pyo3(signature = (predicate, assignments, read_columns=None))]
+    fn update_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+        assignments: &Bound<'_, PyDict>,
+        read_columns: Option<Vec<String>>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        self.context
+            .update_by_predicate(py, predicate, assignments, read_columns)
+    }
+
+    fn update_by_arrow_with_row_id(
+        &self,
+        py: Python<'_>,
+        table: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        self.context.update_by_arrow_with_row_id(py, table)
+    }
+
+    fn update_by_arrow_batches_with_row_id(
+        &self,
+        py: Python<'_>,
+        tables: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        self.context.update_by_arrow_batches_with_row_id(py, tables)
+    }
+
+    fn new_update_by_row_id(&self, py: Python<'_>) -> PyResult<PyTableUpdateByRowId> {
+        self.context.new_update_by_row_id(py)
+    }
+
+    fn with_update_type<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        update_cols: Vec<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.context
+            .inner
+            .with_update_type(update_cols)
+            .map_err(to_py_err)?;
+        Ok(slf)
+    }
+
+    fn upsert_by_arrow_with_key(
+        &self,
+        py: Python<'_>,
+        table: &Bound<'_, PyAny>,
+        upsert_keys: Vec<String>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        self.context
+            .upsert_by_arrow_with_key(py, table, upsert_keys)
+    }
+
+    fn delete_by_row_id(
+        &self,
+        py: Python<'_>,
+        row_ids: Vec<i64>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        self.context.delete_by_row_id(py, row_ids)
+    }
 }
 
 #[pymethods]

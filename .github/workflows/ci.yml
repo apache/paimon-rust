@@ -287,6 +287,9 @@ jobs:
 
       - name: DataFusion Integration Test
         if: matrix.suite == 'datafusion'
+        env:
+          # The partition-count DV fixture exceeds Rust's default 2 MiB test-thread stack.
+          RUST_MIN_STACK: 16777216
         run: cargo test --locked -p paimon-datafusion --all-targets
 
       - name: DataFusion Vortex Integration Test

@@ -55,7 +55,8 @@ pub use table::{
     IncrementalScanMode, IncrementalSplit, PartitionBucket, Plan, PostponeBucketPlan,
     PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite, RESTEnv, RESTSnapshotCommit,
     ReadBuilder, RenamingSnapshotCommit, RowRange, ScanTrace, SnapshotCommit, SnapshotManager,
-    Table, TableCommit, TableRead, TableScan, TableUpdate, TableWrite, TagManager, WriteBuilder,
+    Table, TableCommit, TableRead, TableScan, TableUpdate, TableUpdateByRowId, TableWrite,
+    TagManager, WriteBuilder,
 };
 
 pub use table::{

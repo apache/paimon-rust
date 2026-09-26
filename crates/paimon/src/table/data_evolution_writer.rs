@@ -38,8 +38,8 @@ use crate::table::data_file_writer::DataFileWriter;
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::source::data_evolution_anchor_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
-use crate::table::DataSplitBuilder;
 use crate::table::Table;
+use crate::table::{DataSplit, DataSplitBuilder};
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StructArray};
 use arrow_buffer::NullBuffer;
@@ -63,7 +63,7 @@ const MANIFEST_DIR: &str = "manifest";
 /// Usage:
 /// 1. Create via [`DataEvolutionWriter::new`] (validates preconditions).
 /// 2. Feed matched rows via [`add_matched_batch`](Self::add_matched_batch).
-///    Each batch must contain a non-null `_ROW_ID` (Int64) column plus the update columns.
+///    Each batch must contain a non-null integer `_ROW_ID` column plus the update columns.
 /// 3. Call [`prepare_commit`](Self::prepare_commit) to produce `CommitMessage`s.
 /// 4. Commit via [`TableCommit`](super::TableCommit) (caller's responsibility).
 ///
@@ -75,9 +75,12 @@ const MANIFEST_DIR: &str = "manifest";
 #[must_use = "writer must be used to call prepare_commit()"]
 pub struct DataEvolutionWriter {
     table: Table,
+    read_snapshot_id: Option<i64>,
     update_columns: Vec<String>,
     write_fields: Vec<DataField>,
     matched_batches: Vec<RecordBatch>,
+    matched_batch_groups: Vec<usize>,
+    next_group_id: usize,
 }
 
 impl DataEvolutionWriter {
@@ -152,28 +155,83 @@ impl DataEvolutionWriter {
 
         Ok(Self {
             table: table.clone(),
+            read_snapshot_id: None,
             update_columns,
             write_fields,
             matched_batches: Vec::new(),
+            matched_batch_groups: Vec::new(),
+            next_group_id: 1,
         })
     }
 
     /// Add a batch of matched rows.
     ///
     /// The batch must contain:
-    /// - A non-null `_ROW_ID` column (Int64) identifying which rows to update
+    /// - A non-null integer `_ROW_ID` identifying rows, safely normalized to Int64
     /// - One column for each entry in `update_columns` with the new values
     pub fn add_matched_batch(&mut self, batch: RecordBatch) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
 
-        let row_id_col = row_id_column(&batch)?;
-        validate_row_id_not_null(row_id_col)?;
+        let batch = super::update_input::normalize_row_ids(batch)?;
         validate_update_columns(&batch, &self.update_columns)?;
 
         self.matched_batches.push(batch);
+        self.matched_batch_groups.push(0);
         Ok(())
+    }
+
+    /// Normalize and broadcast evaluated assignments in core. Language bindings
+    /// supply Arrow values; they do not choose cast or row-count semantics.
+    pub fn add_assigned_batches(
+        &mut self,
+        matched: Vec<RecordBatch>,
+        assignments: Vec<(String, super::UpdateAssignment)>,
+    ) -> Result<()> {
+        let schema = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
+        let matched = matched
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .map(super::update_input::normalize_row_ids)
+            .collect::<Result<Vec<_>>>()?;
+        let batches = super::update_assignment::assigned_batches(&matched, assignments, schema)?;
+        // Validate the entire assignment before mutating the staged batches.
+        for batch in &batches {
+            validate_row_id_not_null(row_id_column(batch)?)?;
+            validate_update_columns(batch, &self.update_columns)?;
+        }
+        for batch in batches {
+            self.add_matched_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Add one logical input table, which may contain multiple Arrow batches.
+    /// Separate groups cannot update the same file's columns, matching the
+    /// batch-table update contract; batches within a group may share a file.
+    pub fn add_matched_group(&mut self, batches: Vec<RecordBatch>) -> Result<()> {
+        let batches = batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .map(super::update_input::normalize_row_ids)
+            .collect::<Result<Vec<_>>>()?;
+        for batch in &batches {
+            validate_update_columns(batch, &self.update_columns)?;
+        }
+        let group_id = self.next_group_id;
+        self.next_group_id += 1;
+        for batch in batches {
+            self.matched_batches.push(batch);
+            self.matched_batch_groups.push(group_id);
+        }
+        Ok(())
+    }
+
+    /// Pin the target scan to the same snapshot used to match source rows.
+    /// A concurrent update to those rows must be detected by the committer.
+    pub fn pin_read_snapshot(&mut self, snapshot_id: i64) {
+        self.read_snapshot_id = Some(snapshot_id);
     }
 
     /// Scan file metadata, group matched rows by file, read originals,
@@ -190,56 +248,19 @@ impl DataEvolutionWriter {
             return Ok(Vec::new());
         }
 
-        // 1. Scan file metadata and build row_id -> file group index.
-        //    In data-evolution tables, multiple files can share the same first_row_id
-        //    (base file + partial-column files). We must group them so the reader
-        //    can merge columns correctly.
-        let scan = self.table.new_read_builder().new_scan();
-        let plan = scan.plan().await?;
+        let index = RowIdFileIndex::load(&self.table, self.read_snapshot_id).await?;
+        self.prepare_commit_with_index(&index).await
+    }
 
-        let mut file_index: Vec<FileRowRange> = Vec::new();
-        for split in plan.splits() {
-            let partition_bytes = split.partition().to_serialized_bytes();
-            let bucket = split.bucket();
-            let bucket_path = split.bucket_path().to_string();
-            let snapshot_id = split.snapshot_id();
-            let total_buckets = split.total_buckets();
-
-            let all_files: Vec<DataFileMeta> = split
-                .data_files()
-                .iter()
-                .filter(|f| f.first_row_id.is_some())
-                .cloned()
-                .collect();
-
-            let groups = group_by_overlapping_row_id(all_files);
-            for group in groups {
-                // Compute the overall row_id range for this group.
-                // The base file has the widest range; partial-column files share it.
-                let first_row_id = group.iter().filter_map(|f| f.first_row_id).min().unwrap();
-                let last_row_id = group
-                    .iter()
-                    .filter_map(|f| f.row_id_range().map(|(_, end)| end))
-                    .max()
-                    .unwrap();
-                // The actual row count is the max among the group (base file's count).
-                let row_count = group.iter().map(|f| f.row_count).max().unwrap();
-
-                file_index.push(FileRowRange {
-                    first_row_id,
-                    last_row_id,
-                    row_count,
-                    partition: partition_bytes.clone(),
-                    bucket,
-                    bucket_path: bucket_path.clone(),
-                    snapshot_id,
-                    total_buckets,
-                    files: group,
-                });
-            }
+    pub(super) async fn prepare_commit_with_index(
+        self,
+        index: &RowIdFileIndex,
+    ) -> Result<Vec<CommitMessage>> {
+        if self.matched_batches.is_empty() {
+            return Ok(Vec::new());
         }
-        file_index.sort_by_key(|f| f.first_row_id);
-
+        let read_table = &index.read_table;
+        let file_index = &index.files;
         if file_index.is_empty() {
             return Err(crate::Error::DataInvalid {
                 message: "No files with row tracking found in target table".to_string(),
@@ -247,111 +268,126 @@ impl DataEvolutionWriter {
             });
         }
 
-        // 2. Group matched rows by their owning file
-        let file_matches = group_matched_rows_by_file(&self.matched_batches, &file_index)?;
+        // 2. Reject overlapping input tables before checking individual row IDs.
+        // Python's batch update uses the same order of validation.
+        validate_matched_group_disjointness(
+            &self.matched_batches,
+            &self.matched_batch_groups,
+            file_index,
+            &self.update_columns,
+        )?;
+        let file_matches = group_matched_rows_by_file(&self.matched_batches, file_index)?;
 
         // 3. For each affected file: read original columns, apply updates, write partial files
         let mut writer = DataEvolutionPartialWriter::new(&self.table, self.update_columns.clone())?;
 
-        for (&file_pos, matched_rows) in &file_matches {
-            let file_range = &file_index[file_pos];
-            let first_row_id = file_range.first_row_id;
-            let row_count = file_range.row_count as usize;
+        let result = async {
+            for (&file_pos, matched_rows) in &file_matches {
+                let file_range = &file_index[file_pos];
+                let first_row_id = file_range.first_row_id;
+                let row_count = file_range.row_count as usize;
 
-            // Read original columns from the entire file group (base + partial-column files).
-            let col_refs: Vec<&str> = self.write_fields.iter().map(DataField::name).collect();
-            let mut rb = self.table.new_read_builder();
-            rb.with_projection(&col_refs)?;
-            let read = rb.new_read()?;
+                // Read original columns from the entire file group (base + partial-column files).
+                let col_refs: Vec<&str> = self.write_fields.iter().map(DataField::name).collect();
+                let mut rb = read_table.new_read_builder();
+                rb.with_projection(&col_refs)?;
+                let read = rb.new_read()?;
 
-            // Base + partial-column files share row-id ranges, so physical
-            // row counts overcount the group's logical rows.
-            let split = DataSplitBuilder::new()
-                .with_snapshot(file_range.snapshot_id)
-                .with_partition(BinaryRow::from_serialized_bytes(&file_range.partition)?)
-                .with_bucket(file_range.bucket)
-                .with_bucket_path(file_range.bucket_path.clone())
-                .with_total_buckets(file_range.total_buckets)
-                .with_data_files(file_range.files.clone())
-                .with_raw_convertible(file_range.files.len() == 1)
-                .build()?;
+                // Base + partial-column files share row-id ranges, so physical
+                // row counts overcount the group's logical rows.
+                let split = DataSplitBuilder::new()
+                    .with_snapshot(file_range.snapshot_id)
+                    .with_partition(BinaryRow::from_serialized_bytes(&file_range.partition)?)
+                    .with_bucket(file_range.bucket)
+                    .with_bucket_path(file_range.bucket_path.clone())
+                    .with_total_buckets(file_range.total_buckets)
+                    .with_data_files(file_range.files.clone())
+                    .with_raw_convertible(file_range.files.len() == 1)
+                    .build()?;
 
-            let stream = read.to_arrow(&[split])?;
-            let original_batches: Vec<RecordBatch> = stream.try_collect().await?;
+                let stream = read.to_arrow(&[split])?;
+                let original_batches: Vec<RecordBatch> = stream.try_collect().await?;
 
-            let original_batch = if original_batches.is_empty() {
-                continue;
-            } else if original_batches.len() == 1 {
-                original_batches.into_iter().next().unwrap()
-            } else {
-                concat_batches(&original_batches[0].schema(), &original_batches).map_err(|e| {
-                    crate::Error::DataInvalid {
-                        message: format!("Failed to concat batches: {e}"),
+                let original_batch = if original_batches.is_empty() {
+                    continue;
+                } else if original_batches.len() == 1 {
+                    original_batches.into_iter().next().unwrap()
+                } else {
+                    concat_batches(&original_batches[0].schema(), &original_batches).map_err(
+                        |e| crate::Error::DataInvalid {
+                            message: format!("Failed to concat batches: {e}"),
+                            source: None,
+                        },
+                    )?
+                };
+
+                if original_batch.num_rows() != row_count {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Expected {} rows from file, got {}",
+                            row_count,
+                            original_batch.num_rows()
+                        ),
                         source: None,
-                    }
-                })?
-            };
-
-            if original_batch.num_rows() != row_count {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "Expected {} rows from file, got {}",
-                        row_count,
-                        original_batch.num_rows()
-                    ),
-                    source: None,
-                });
-            }
-
-            // Keep one physical ROW column per top-level field, even when the
-            // update names identify several nested leaves of that ROW.
-            let mut sorted_matches: Vec<(usize, usize, usize)> = matched_rows
-                .iter()
-                .map(|m| (m.offset, m.batch_idx, m.row_idx))
-                .collect();
-            sorted_matches.sort_by_key(|(offset, _, _)| *offset);
-            if sorted_matches.windows(2).any(|rows| rows[0].0 == rows[1].0) {
-                return Err(crate::Error::DataInvalid {
-                    message: "Multiple updates target the same row ID".to_string(),
-                    source: None,
-                });
-            }
-            let new_columns = self
-                .write_fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    apply_field_updates(
-                        field,
-                        field.name(),
-                        original_batch.column(index),
-                        &self.update_columns,
-                        &self.matched_batches,
-                        &sorted_matches,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let write_schema = crate::arrow::build_target_arrow_schema(&self.write_fields)?;
-            let updated_batch = RecordBatch::try_new(write_schema, new_columns).map_err(|e| {
-                crate::Error::DataInvalid {
-                    message: format!("Failed to create updated batch: {e}"),
-                    source: None,
+                    });
                 }
-            })?;
 
-            writer
-                .write_partial_batch(
-                    file_range.partition.clone(),
-                    file_range.bucket,
-                    first_row_id,
-                    file_range.snapshot_id,
-                    updated_batch,
-                )
-                .await?;
+                // Keep one physical ROW column per top-level field, even when the
+                // update names identify several nested leaves of that ROW.
+                let mut sorted_matches: Vec<(usize, usize, usize)> = matched_rows
+                    .iter()
+                    .map(|m| (m.offset, m.batch_idx, m.row_idx))
+                    .collect();
+                sorted_matches.sort_by_key(|(offset, _, _)| *offset);
+                if sorted_matches.windows(2).any(|rows| rows[0].0 == rows[1].0) {
+                    return Err(crate::Error::DataInvalid {
+                        message: "Multiple updates target the same row ID".to_string(),
+                        source: None,
+                    });
+                }
+                let new_columns = self
+                    .write_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        apply_field_updates(
+                            field,
+                            field.name(),
+                            original_batch.column(index),
+                            &self.update_columns,
+                            &self.matched_batches,
+                            &sorted_matches,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let write_schema = crate::arrow::build_target_arrow_schema(&self.write_fields)?;
+                let updated_batch =
+                    RecordBatch::try_new(write_schema, new_columns).map_err(|e| {
+                        crate::Error::DataInvalid {
+                            message: format!("Failed to create updated batch: {e}"),
+                            source: None,
+                        }
+                    })?;
+
+                writer
+                    .write_partial_batch(
+                        file_range.partition.clone(),
+                        file_range.bucket,
+                        first_row_id,
+                        file_range.snapshot_id,
+                        updated_batch,
+                    )
+                    .await?;
+            }
+
+            // 4. Collect commit messages (caller is responsible for committing)
+            writer.prepare_commit().await
         }
-
-        // 4. Collect commit messages (caller is responsible for committing)
-        writer.prepare_commit().await
+        .await;
+        if result.is_err() {
+            writer.abort().await;
+        }
+        result
     }
 }
 
@@ -842,6 +878,39 @@ fn group_matched_rows_by_file(
     Ok(file_matches)
 }
 
+fn validate_matched_group_disjointness(
+    batches: &[RecordBatch],
+    batch_groups: &[usize],
+    file_index: &[FileRowRange],
+    update_columns: &[String],
+) -> Result<()> {
+    let mut first_group_by_file = HashMap::new();
+    for (batch, group) in batches.iter().zip(batch_groups) {
+        let row_ids = row_id_column(batch)?;
+        for row_id in row_ids.values() {
+            let Some((file_pos, file)) = find_owning_file(file_index, *row_id) else {
+                continue;
+            };
+            if let Some(previous) = first_group_by_file.insert(file_pos, *group) {
+                if previous != *group {
+                    let overlapping = update_columns
+                        .iter()
+                        .map(|column| format!("'{column}': [{}]", file.first_row_id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Input batches contain overlapping first_row_ids by column: {{{overlapping}}}"
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn row_id_column(batch: &RecordBatch) -> Result<&Int64Array> {
     batch
         .column_by_name("_ROW_ID")
@@ -883,13 +952,7 @@ fn validate_update_columns(batch: &RecordBatch, update_columns: &[String]) -> Re
 }
 
 fn matched_column_index(batch: &RecordBatch, col: &str) -> Result<usize> {
-    batch
-        .schema()
-        .index_of(col)
-        .map_err(|e| crate::Error::DataInvalid {
-            message: format!("Column {col} not found in matched batch: {e}"),
-            source: None,
-        })
+    super::update_input::unique_column_index(batch.schema().as_ref(), col)
 }
 
 fn matched_column(batch: &RecordBatch, col: &str) -> Result<ArrayRef> {
@@ -982,16 +1045,11 @@ fn interleave_updated_leaf(
             *index
         } else {
             let value = matched_column(&matched_batches[batch_idx], path)?;
-            let value = if value.data_type() == original.data_type() {
-                value
-            } else {
-                arrow_cast::cast(value.as_ref(), original.data_type()).map_err(|error| {
-                    crate::Error::DataInvalid {
-                        message: format!("Failed to cast column {path}: {error}"),
-                        source: None,
-                    }
-                })?
-            };
+            let value = super::update_input::cast_update_value(
+                &value,
+                original.data_type(),
+                super::update_input::CastMode::RowUpdate,
+            )?;
             let index = batch_arrays.len();
             batch_arrays.push(value);
             batch_id_map.insert(batch_idx, index);
@@ -1027,6 +1085,99 @@ fn interleave_updated_leaf(
             source: None,
         }
     })
+}
+
+/// Snapshot metadata shared by all column updates in one operation.
+pub(super) struct RowIdFileIndex {
+    read_table: Table,
+    files: Vec<FileRowRange>,
+}
+
+impl RowIdFileIndex {
+    pub(super) async fn load(table: &Table, snapshot_id: Option<i64>) -> Result<Self> {
+        CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
+        let snapshot = if let Some(id) = snapshot_id {
+            Some(table.snapshot_manager().get_snapshot(id).await?)
+        } else {
+            super::time_travel::resolve_snapshot(table).await?
+        };
+        let Some(snapshot) = snapshot else {
+            return Ok(Self {
+                read_table: table.clone(),
+                files: Vec::new(),
+            });
+        };
+        let read_table = table.copy_with_pinned_snapshot(&snapshot);
+        let plan = read_table.new_read_builder().new_scan().plan().await?;
+        Self::from_splits(read_table, plan.splits())
+    }
+
+    pub(super) fn from_splits(read_table: Table, splits: &[DataSplit]) -> Result<Self> {
+        let mut file_index: Vec<FileRowRange> = Vec::new();
+        for split in splits {
+            let partition_bytes = split.partition().to_serialized_bytes();
+            let bucket = split.bucket();
+            let bucket_path = split.bucket_path().to_string();
+            let snapshot_id = split.snapshot_id();
+            let total_buckets = split.total_buckets();
+
+            let all_files: Vec<DataFileMeta> = split
+                .data_files()
+                .iter()
+                .filter(|f| f.first_row_id.is_some())
+                .cloned()
+                .collect();
+
+            let groups = group_by_overlapping_row_id(all_files);
+            for group in groups {
+                // Compute the overall row_id range for this group.
+                // The base file has the widest range; partial-column files share it.
+                let first_row_id = group.iter().filter_map(|f| f.first_row_id).min().unwrap();
+                let last_row_id = group
+                    .iter()
+                    .filter_map(|f| f.row_id_range().map(|(_, end)| end))
+                    .max()
+                    .unwrap();
+                // The actual row count is the max among the group (base file's count).
+                let row_count = group.iter().map(|f| f.row_count).max().unwrap();
+
+                file_index.push(FileRowRange {
+                    first_row_id,
+                    last_row_id,
+                    row_count,
+                    partition: partition_bytes.clone(),
+                    bucket,
+                    bucket_path: bucket_path.clone(),
+                    snapshot_id,
+                    total_buckets,
+                    files: group,
+                });
+            }
+        }
+        file_index.sort_by_key(|f| f.first_row_id);
+
+        Ok(Self {
+            read_table,
+            files: file_index,
+        })
+    }
+
+    pub(super) fn matched_first_row_ids(&self, batches: &[RecordBatch]) -> Result<HashSet<i64>> {
+        if batches.iter().all(|batch| batch.num_rows() == 0) {
+            return Ok(HashSet::new());
+        }
+        if self.files.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "No files with row tracking found in target table".into(),
+                source: None,
+            });
+        }
+        let matches = group_matched_rows_by_file(batches, &self.files)?;
+        Ok(matches
+            .keys()
+            .map(|&index| self.files[index].first_row_id)
+            .collect())
+    }
 }
 
 struct FileRowRange {
@@ -1338,29 +1489,26 @@ impl DataEvolutionPartialWriter {
         })
     }
 
+    async fn abort(&mut self) {
+        for writer in self.writers.values_mut() {
+            writer.abort().await;
+        }
+        self.writers.clear();
+        self.check_from_snapshots.clear();
+    }
+
     /// Close all writers and collect CommitMessages for use with TableCommit.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         let writers: Vec<(WriterKey, DataFileWriter)> = self.writers.drain().collect();
         let check_from_snapshots = std::mem::take(&mut self.check_from_snapshots);
 
-        let futures: Vec<_> = writers
-            .into_iter()
-            .map(|(key, mut writer)| {
-                let base_key = (key.0.clone(), key.1, key.2);
-                let check_from_snapshot = check_from_snapshots.get(&base_key).copied();
-                async move {
-                    let files = writer.prepare_commit().await?;
-                    let (partition_bytes, bucket, _first_row_id, _kind) = key;
-                    Ok::<_, crate::Error>((partition_bytes, bucket, check_from_snapshot, files))
-                }
-            })
-            .collect();
-
-        let results = futures::future::try_join_all(futures).await?;
+        let results = DataFileWriter::prepare_all(writers).await?;
 
         // Group files by (partition, bucket) since multiple first_row_ids may share the same partition/bucket
         let mut grouped: HashMap<(Vec<u8>, i32), PartialCommitGroup> = HashMap::new();
-        for (partition_bytes, bucket, check_from_snapshot, files) in results {
+        for ((partition_bytes, bucket, first_row_id, _kind), files) in results {
+            let base_key = (partition_bytes.clone(), bucket, first_row_id);
+            let check_from_snapshot = check_from_snapshots.get(&base_key).copied();
             let entry = grouped
                 .entry((partition_bytes, bucket))
                 .or_insert_with(|| (None, Vec::new()));
@@ -2272,7 +2420,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            matches!(err, crate::Error::DataInvalid { message, .. } if message.contains("Column value not found"))
+            matches!(err, crate::Error::DataInvalid { message, .. } if message == "Input data must contain value column")
         );
     }
 

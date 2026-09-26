@@ -311,6 +311,44 @@ impl DataFileWriter {
         result
     }
 
+    /// Prepare a group of writers atomically with respect to file ownership.
+    /// Wait for every close before cleanup; dropping close futures can leave
+    /// outputs appearing after an abort has already removed their paths.
+    pub(super) async fn prepare_all<K>(
+        writers: impl IntoIterator<Item = (K, Self)>,
+    ) -> Result<Vec<(K, Vec<DataFileMeta>)>> {
+        let results =
+            futures::future::join_all(writers.into_iter().map(|(key, mut writer)| async {
+                let result = writer.prepare_commit().await;
+                (key, writer, result)
+            }))
+            .await;
+        if results.iter().any(|(_, _, result)| result.is_err()) {
+            let mut first_error = None;
+            for (_, mut writer, result) in results {
+                match result {
+                    Ok(files) => {
+                        // Successful prepare transferred these paths to us.
+                        for file in files {
+                            for path in file.collect_files(&writer.bucket_dir()) {
+                                let _ = writer.file_io.delete_file(&path).await;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                writer.abort().await;
+            }
+            return Err(first_error.unwrap());
+        }
+        results
+            .into_iter()
+            .map(|(key, _, files)| files.map(|files| (key, files)))
+            .collect()
+    }
+
     async fn finish(&mut self) -> Result<Vec<DataFileMeta>> {
         self.close_current_file().await?;
         while let Some(result) = self.in_flight_closes.join_next().await {
@@ -501,5 +539,59 @@ mod tests {
             files.iter().map(|file| file.row_count).collect::<Vec<_>>(),
             vec![2, 3, 1]
         );
+    }
+
+    #[tokio::test]
+    async fn grouped_prepare_failure_removes_successful_and_failed_outputs() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let mut writers = Vec::new();
+        for first_row_id in [0, 1] {
+            let mut writer = DataFileWriter::new(
+                file_io.clone(),
+                "memory:///prepare-failure".into(),
+                String::new(),
+                0,
+                0,
+                i64::MAX,
+                "none".into(),
+                0,
+                i64::MAX,
+                "parquet".into(),
+                vec![DataField::new(
+                    0,
+                    "id".into(),
+                    DataType::Int(IntType::new()),
+                )],
+                HashMap::new(),
+                Some(first_row_id),
+                None,
+                None,
+            );
+            let batch = RecordBatch::try_from_iter([(
+                "id",
+                Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
+            )])
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            if first_row_id == 1 {
+                // Simulate a background file close failing after another file
+                // in the operation has already finished successfully.
+                writer.in_flight_closes.spawn(async {
+                    Err(crate::Error::DataInvalid {
+                        message: "injected close failure".into(),
+                        source: None,
+                    })
+                });
+            }
+            writers.push((first_row_id, writer));
+        }
+        let error = DataFileWriter::prepare_all(writers).await.unwrap_err();
+        assert!(error.to_string().contains("injected close failure"));
+        assert!(file_io
+            .list_status_recursive("memory:///prepare-failure")
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| !entry.path.ends_with(".parquet")));
     }
 }
