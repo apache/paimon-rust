@@ -21,14 +21,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Int32Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, BinaryArray, BooleanArray, Decimal128Array, Int32Array, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
+use bytes::Bytes;
 use futures::TryStreamExt;
 
 use super::Table;
 use crate::catalog::Identifier;
 use crate::io::{FileIO, FileIOBuilder};
-use crate::spec::{DataType, IntType, Schema, TableSchema, VarCharType};
+use crate::spec::{
+    BooleanType, DataType, DecimalType, IntType, Schema, TableSchema, VarBinaryType, VarCharType,
+};
 
 fn table(io: FileIO, location: &str, partitioned: bool, options: &[(&str, &str)]) -> Table {
     let mut builder = Schema::builder();
@@ -156,6 +161,23 @@ async fn ids(table: &Table) -> Vec<i32> {
     }
     ids.sort_unstable();
     ids
+}
+
+async fn count_with_empty_projection(table: &Table) -> usize {
+    let mut builder = table.new_read_builder();
+    builder.with_projection(&[]).unwrap();
+    let plan = builder.new_scan().plan().await.unwrap();
+    builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum()
 }
 
 async fn visible_files(table: &Table, partition: &str) -> Vec<String> {
@@ -652,6 +674,11 @@ async fn row_format_round_trips_through_native_read() {
         append(&table, &batch(&[("a", 1), ("b", 2), ("a", 3)])).await;
         assert_eq!(ids(&table).await, [1, 2, 3], "format={format}");
         assert_eq!(
+            count_with_empty_projection(&table).await,
+            3,
+            "format={format}"
+        );
+        assert_eq!(
             visible_files(&table, "dt=a")
                 .await
                 .iter()
@@ -705,28 +732,719 @@ fn unsupported_format_is_rejected_before_a_writer_is_opened() {
     let table = memory_table(
         "format_unsupported_write",
         false,
-        &[("file.format", "json")],
+        &[("file.format", "unknown")],
     );
     let error = table.new_write_builder().new_write().err().unwrap();
     assert!(error.to_string().contains("not supported"));
 }
 
-#[test]
-fn readable_but_unwritable_formats_are_rejected_before_staging() {
-    for format in ["orc", "mosaic"] {
+#[tokio::test]
+async fn java_format_table_formats_round_trip() {
+    for format in ["parquet", "orc", "csv", "json", "mosaic"] {
         let table = memory_table(
-            &format!("format_no_{format}_writer"),
-            false,
+            &format!("format_{format}_round_trip"),
+            true,
             &[("file.format", format)],
         );
-        let error = table.new_write_builder().new_write().err().unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains("can be read but cannot be written"),
-            "format={format}, error={error}"
+        append(&table, &batch(&[("a", 1), ("a", 2), ("b", 3)])).await;
+        assert_eq!(ids(&table).await, [1, 2, 3], "format={format}");
+        assert_eq!(
+            visible_files(&table, "dt=a").await.len(),
+            1,
+            "format={format}"
+        );
+        assert_eq!(
+            visible_files(&table, "dt=b").await.len(),
+            1,
+            "format={format}"
         );
     }
+}
+
+#[tokio::test]
+async fn csv_and_json_format_tables_read_unterminated_final_rows() {
+    for format in ["csv", "json"] {
+        for rows in [1, 2050] {
+            let table = memory_table(
+                &format!("format_{format}_unterminated_{rows}"),
+                false,
+                &[("file.format", format)],
+            );
+            let contents = (0..rows)
+                .map(|id| match format {
+                    "csv" => id.to_string(),
+                    "json" => format!("{{\"id\":{id}}}"),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            table
+                .file_io()
+                .new_output(&format!("{}/part-0.{format}", table.location()))
+                .unwrap()
+                .write(Bytes::from(contents))
+                .await
+                .unwrap();
+            assert_eq!(ids(&table).await, (0..rows).collect::<Vec<_>>());
+            assert_eq!(count_with_empty_projection(&table).await, rows as usize);
+        }
+    }
+}
+
+#[test]
+fn orc_rejects_compression_it_cannot_write() {
+    let table = memory_table(
+        "format_orc_unsupported_compression",
+        false,
+        &[("file.format", "orc"), ("file.compression", "zstd")],
+    );
+    let error = table.new_write_builder().new_write().err().unwrap();
+    assert!(error.to_string().contains("ORC compression"), "{error}");
+}
+
+#[tokio::test]
+async fn csv_header_round_trips_and_java_json_string_numbers_are_readable() {
+    let csv = memory_table(
+        "format_csv_header",
+        false,
+        &[("file.format", "csv"), ("csv.include-header", "true")],
+    );
+    append(&csv, &unpartitioned_batch(&[7, 8])).await;
+    let path = visible_files(&csv, "").await.remove(0);
+    let contents = csv
+        .file_io()
+        .new_input(&path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert_eq!(&contents[..], b"id\n7\n8\n");
+    assert_eq!(ids(&csv).await, [7, 8]);
+
+    let json = memory_table("format_java_json", false, &[("file.format", "json")]);
+    json.file_io()
+        .new_output(&format!("{}/part-0.json", json.location()))
+        .unwrap()
+        .write(Bytes::from_static(b"{\"id\":\"7\"}\n{\"id\":\"8\"}\n"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&json).await, [7, 8]);
+}
+
+#[tokio::test]
+async fn csv_and_json_binary_fields_use_java_base64_encoding() {
+    for format in ["csv", "json"] {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "payload",
+                DataType::VarBinary(VarBinaryType::new(32).unwrap()),
+            )
+            .option("type", "format-table")
+            .option("file.format", format)
+            .build()
+            .unwrap();
+        let location = format!("memory:/format_{format}_binary");
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", "format_binary"),
+            location,
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let input = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", ArrowType::Int32, true),
+                Field::new("payload", ArrowType::Binary, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(BinaryArray::from(vec![Some(&b"Hi"[..])])),
+            ],
+        )
+        .unwrap();
+        append(&table, &input).await;
+        let path = visible_files(&table, "").await.remove(0);
+        let contents = table
+            .file_io()
+            .new_input(&path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&contents).contains("SGk="),
+            "format={format}"
+        );
+        let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = table
+            .new_read_builder()
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let payload = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(payload.value(0), b"Hi", "format={format}");
+    }
+}
+
+#[tokio::test]
+async fn json_binary_conversion_preserves_decimal_precision() {
+    let schema = Schema::builder()
+        .column(
+            "amount",
+            DataType::Decimal(DecimalType::new(38, 4).unwrap()),
+        )
+        .column(
+            "payload",
+            DataType::VarBinary(VarBinaryType::new(32).unwrap()),
+        )
+        .option("type", "format-table")
+        .option("file.format", "json")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_json_decimal_binary"),
+        "memory:/format_json_decimal_binary".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let unscaled: i128 = "12345678901234567890123456789012345678".parse().unwrap();
+    let input = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("amount", ArrowType::Decimal128(38, 4), true),
+            Field::new("payload", ArrowType::Binary, true),
+        ])),
+        vec![
+            Arc::new(
+                Decimal128Array::from(vec![Some(unscaled)])
+                    .with_precision_and_scale(38, 4)
+                    .unwrap(),
+            ),
+            Arc::new(BinaryArray::from(vec![Some(&b"Hi"[..])])),
+        ],
+    )
+    .unwrap();
+    append(&table, &input).await;
+    let path = visible_files(&table, "").await.remove(0);
+    let written = table
+        .file_io()
+        .new_input(&path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&written).contains("1234567890123456789012345678901234.5678"));
+    table
+        .file_io()
+        .new_output(&format!("{}/external.json", table.location()))
+        .unwrap()
+        .write(Bytes::from_static(
+            b"{\"amount\":1234567890123456789012345678901234.5678,\"payload\":\"SGk=\"}\n",
+        ))
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, [unscaled, unscaled]);
+}
+
+#[tokio::test]
+async fn java_json_boolean_strings_are_readable() {
+    let schema = Schema::builder()
+        .column("flag", DataType::Boolean(BooleanType::new()))
+        .option("type", "format-table")
+        .option("file.format", "json")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_java_json_boolean"),
+        "memory:/format_java_json_boolean".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    table
+        .file_io()
+        .new_output(&format!("{}/java.json", table.location()))
+        .unwrap()
+        .write(Bytes::from_static(
+            b"{\"flag\":\"true\"}\n{\"flag\":\"false\"}\n",
+        ))
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let flags = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert_eq!(flags.iter().collect::<Vec<_>>(), [Some(true), Some(false)]);
+
+    let input = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "flag",
+            ArrowType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![Some(true)]))],
+    )
+    .unwrap();
+    append(&table, &input).await;
+    let path = visible_files(&table, "")
+        .await
+        .into_iter()
+        .find(|path| !path.ends_with("/java.json"))
+        .unwrap();
+    let written = table
+        .file_io()
+        .new_input(&path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&written).contains("\"flag\":\"true\""));
+}
+
+#[tokio::test]
+async fn csv_reads_java_doubled_and_backslash_quoted_fields() {
+    let schema = Schema::builder()
+        .column("value", DataType::VarChar(VarCharType::string_type()))
+        .option("type", "format-table")
+        .option("file.format", "csv")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_java_csv_quotes"),
+        "memory:/format_java_csv_quotes".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    table
+        .file_io()
+        .new_output(&format!("{}/java.csv", table.location()))
+        .unwrap()
+        .write(Bytes::from_static(b"\"a\"\"b\"\n\"c\\\"d\"\n"))
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        [Some("a\"b"), Some("c\"d")]
+    );
+}
+
+#[tokio::test]
+async fn csv_blank_lines_have_null_fields_like_java() {
+    let schema = Schema::builder()
+        .column("left", DataType::VarChar(VarCharType::string_type()))
+        .column("right", DataType::VarChar(VarCharType::string_type()))
+        .option("type", "format-table")
+        .option("file.format", "csv")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_java_csv_blank"),
+        "memory:/format_java_csv_blank".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    table
+        .file_io()
+        .new_output(&format!("{}/java.csv", table.location()))
+        .unwrap()
+        .write(Bytes::from_static(b"\n  \na,b\n"))
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    for column in batches[0].columns() {
+        assert!(column.is_null(0));
+        assert!(column.is_null(1));
+    }
+}
+
+#[tokio::test]
+async fn csv_preserves_quoted_empty_string_separately_from_null() {
+    let schema = Schema::builder()
+        .column("value", DataType::VarChar(VarCharType::string_type()))
+        .option("type", "format-table")
+        .option("file.format", "csv")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_csv_empty"),
+        "memory:/format_csv_empty".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let input = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "value",
+            ArrowType::Utf8,
+            true,
+        )])),
+        vec![Arc::new(StringArray::from(vec![Some(""), None]))],
+    )
+    .unwrap();
+    append(&table, &input).await;
+    let path = visible_files(&table, "").await.remove(0);
+    let bytes = table
+        .file_io()
+        .new_input(&path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"\"\"\n\n");
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.value(0), "");
+    assert!(!values.is_null(0));
+    assert!(values.is_null(1));
+}
+
+#[tokio::test]
+async fn csv_custom_delimiters_keep_line_breaks_and_partial_row_separator() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::VarChar(VarCharType::string_type()))
+        .option("type", "format-table")
+        .option("file.format", "csv")
+        .option("csv.field-delimiter", ";")
+        .option("csv.line-delimiter", "||")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_csv_custom"),
+        "memory:/format_csv_custom".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let input = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", ArrowType::Int32, true),
+            Field::new("value", ArrowType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["a|", "line\nbreak"])),
+        ],
+    )
+    .unwrap();
+    append(&table, &input).await;
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let values = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.value(0), "a|");
+    assert_eq!(values.value(1), "line\nbreak");
+}
+
+#[tokio::test]
+async fn text_format_table_round_trip() {
+    let schema = Schema::builder()
+        .column("line", DataType::VarChar(VarCharType::string_type()))
+        .option("type", "format-table")
+        .option("file.format", "text")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_text_round_trip"),
+        "memory:/format_text_round_trip".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let input = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "line",
+            ArrowType::Utf8,
+            true,
+        )])),
+        vec![Arc::new(StringArray::from(vec!["first", "second"]))],
+    )
+    .unwrap();
+    append(&table, &input).await;
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..array.len())
+                .map(|index| array.value(index).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["first", "second"]);
+    assert_eq!(count_with_empty_projection(&table).await, 2);
+}
+
+#[tokio::test]
+async fn compressed_text_format_tables_round_trip_with_java_file_suffixes() {
+    let codecs = [
+        ("gzip", "gz"),
+        ("bzip2", "bz2"),
+        ("deflate", "deflate"),
+        ("snappy", "snappy"),
+        ("lz4", "lz4"),
+        ("zstd", "zst"),
+    ];
+    for format in ["csv", "json", "text"] {
+        for (codec, suffix) in codecs {
+            let mut builder = Schema::builder()
+                .column(
+                    if format == "text" { "line" } else { "id" },
+                    if format == "text" {
+                        DataType::VarChar(VarCharType::string_type())
+                    } else {
+                        DataType::Int(IntType::new())
+                    },
+                )
+                .option("type", "format-table")
+                .option("file.format", format)
+                .option("file.compression", codec);
+            if format == "csv" && codec == "gzip" {
+                builder = builder
+                    .option("file.suffix.include.compression", "true")
+                    .option("csv.include-header", "true");
+            }
+            let schema = builder.build().unwrap();
+            let location = format!("memory:/format_{format}_{codec}_compressed");
+            let table = Table::new(
+                FileIOBuilder::new("memory").build().unwrap(),
+                Identifier::new("default", "format_compressed_text"),
+                location,
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let input = if format == "text" {
+                RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![Field::new(
+                        "line",
+                        ArrowType::Utf8,
+                        true,
+                    )])),
+                    vec![Arc::new(StringArray::from(vec!["first", "second"]))],
+                )
+                .unwrap()
+            } else {
+                unpartitioned_batch(&[7, 8])
+            };
+            let builder = table.new_write_builder();
+            let mut write = builder.new_write().unwrap();
+            write.write_arrow_batch(&input.slice(0, 1)).await.unwrap();
+            write.write_arrow_batch(&input.slice(1, 1)).await.unwrap();
+            let messages = write.prepare_commit().await.unwrap();
+            builder.new_commit().commit(messages).await.unwrap();
+            let files = visible_files(&table, "").await;
+            assert_eq!(files.len(), 1, "{format}/{codec}");
+            assert!(
+                files[0].ends_with(&format!(".{format}.{suffix}")),
+                "{}",
+                files[0]
+            );
+            let content = table
+                .file_io()
+                .new_input(&files[0])
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            assert!(!content.is_empty(), "{format}/{codec}");
+            if codec == "gzip" {
+                assert!(content.starts_with(&[0x1f, 0x8b]));
+            } else if codec == "bzip2" {
+                assert!(content.starts_with(b"BZh"));
+            } else if codec == "zstd" {
+                assert!(content.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]));
+            } else if matches!(codec, "snappy" | "lz4") {
+                let block_len = u32::from_be_bytes(content[..4].try_into().unwrap()) as usize;
+                if format == "text" {
+                    assert_eq!(block_len, b"first\n".len());
+                } else if format == "csv" {
+                    assert_eq!(block_len, b"7\n".len());
+                } else {
+                    assert!(block_len > 0);
+                }
+            }
+            if format == "text" {
+                let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+                let batches: Vec<RecordBatch> = table
+                    .new_read_builder()
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(plan.splits())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                let values = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .iter()
+                            .flatten()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(values, ["first", "second"], "{codec}");
+            } else {
+                assert_eq!(ids(&table).await, [7, 8], "{format}/{codec}");
+            }
+            assert_eq!(
+                count_with_empty_projection(&table).await,
+                2,
+                "{format}/{codec}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn compressed_csv_is_detected_from_path_even_without_table_compression_option() {
+    use std::io::Write;
+
+    let table = memory_table("format_external_gzip_csv", false, &[("file.format", "csv")]);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(b"7\n8\n").unwrap();
+    let compressed = encoder.finish().unwrap();
+    table
+        .file_io()
+        .new_output(&format!("{}/external.csv.gz", table.location()))
+        .unwrap()
+        .write(Bytes::from(compressed))
+        .await
+        .unwrap();
+    assert_eq!(ids(&table).await, [7, 8]);
+}
+
+#[tokio::test]
+async fn bzip2_csv_is_detected_from_path_even_without_table_compression_option() {
+    use std::io::Write;
+
+    let table = memory_table(
+        "format_external_bzip2_csv",
+        false,
+        &[("file.format", "csv")],
+    );
+    let mut encoder = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+    encoder.write_all(b"7\n8\n").unwrap();
+    let compressed = encoder.finish().unwrap();
+    table
+        .file_io()
+        .new_output(&format!("{}/external.csv.bz2", table.location()))
+        .unwrap()
+        .write(Bytes::from(compressed))
+        .await
+        .unwrap();
+    assert_eq!(ids(&table).await, [7, 8]);
 }
 
 #[tokio::test]

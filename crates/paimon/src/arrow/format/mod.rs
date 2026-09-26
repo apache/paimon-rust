@@ -24,6 +24,7 @@ mod orc;
 pub(crate) mod parquet;
 mod row;
 mod shredding;
+pub(crate) mod text;
 #[cfg(feature = "vortex")]
 mod vortex;
 
@@ -82,7 +83,7 @@ pub(crate) trait FormatFileReader: Send + Sync {
     /// requested output by name, so extra columns are harmless.
     ///
     /// Predicate exactness is per-format, NOT a blanket guarantee:
-    /// - Parquet, ORC, Avro, Row, Mosaic, and Vortex apply the predicate **exactly** —
+    /// - Parquet, ORC, Avro, Row, Mosaic, Vortex, CSV, JSON, and TEXT apply the predicate **exactly** —
     ///   each emitted batch contains only rows matching the pushed-down predicate
     ///   (native pushdown for pruning + a row-level residual pass for the rest).
     /// - Blob does not evaluate predicates at all. Non-matching rows may survive,
@@ -395,6 +396,12 @@ pub(crate) fn create_format_reader_with_budget(
         )
     } else if lower.ends_with(".orc") {
         Box::new(orc::OrcFormatReader)
+    } else if let Some((kind, compression)) = text::TextKind::from_path(path) {
+        Box::new(text::TextFormatReader::new(
+            kind,
+            compression,
+            table_options,
+        )?)
     } else if lower.ends_with(".avro") {
         Box::new(avro::AvroFormatReader)
     } else if lower.ends_with(".row") {
@@ -435,6 +442,9 @@ fn supported_read_formats() -> Vec<&'static str> {
         ".parquet",
         ".blob",
         ".orc",
+        ".csv",
+        ".json",
+        ".text",
         ".avro",
         ".row",
         ".mosaic",
@@ -447,6 +457,10 @@ fn supported_write_formats() -> Vec<&'static str> {
     vec![
         ".parquet",
         ".blob",
+        ".orc",
+        ".csv",
+        ".json",
+        ".text",
         ".avro",
         ".row",
         ".mosaic",
@@ -485,6 +499,31 @@ pub(crate) async fn create_format_writer(
     } else if lower.ends_with(".blob") {
         Ok(Box::new(
             blob::BlobFormatWriter::new(output, file_io).await?,
+        ))
+    } else if lower.ends_with(".orc") {
+        if !matches!(
+            compression.to_ascii_lowercase().as_str(),
+            "" | "none" | "uncompressed"
+        ) {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "ORC compression '{compression}' is not supported by the current writer"
+                ),
+            });
+        }
+        Ok(Box::new(orc::OrcFormatWriter::new(output, schema).await?))
+    } else if let Some((kind, path_compression)) = text::TextKind::from_path(path) {
+        let compression = text::TextCompression::from_name(compression)?;
+        if compression != path_compression {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "Text file compression {:?} does not match file suffix of {path}",
+                    compression
+                ),
+            });
+        }
+        Ok(Box::new(
+            text::TextFormatWriter::new(output, schema, kind, compression, format_options).await?,
         ))
     } else if lower.ends_with(".avro") {
         let fields = match write_fields {
@@ -624,11 +663,13 @@ mod tests {
     #[tokio::test]
     async fn create_format_writer_error_lists_every_supported_format() {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let output = file_io.new_output("memory:/unsupported/data.csv").unwrap();
+        let output = file_io
+            .new_output("memory:/unsupported/data.unknown")
+            .unwrap();
         let schema = Arc::new(arrow_schema::Schema::empty());
 
         let err = match create_format_writer(&output, schema, "zstd", 1, None, None, None).await {
-            Ok(_) => panic!("csv is not a writable format"),
+            Ok(_) => panic!("unknown is not a writable format"),
             Err(err) => err,
         };
 
@@ -641,6 +682,6 @@ mod tests {
                 "{format} missing from write-format error: {message}"
             );
         }
-        assert!(message.contains("data.csv"), "message: {message}");
+        assert!(message.contains("data.unknown"), "message: {message}");
     }
 }
