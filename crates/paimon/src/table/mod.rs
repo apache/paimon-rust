@@ -47,6 +47,7 @@ mod data_file_writer;
 mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
+mod expire_snapshots;
 mod format_partition;
 mod format_partition_location;
 mod format_partition_stats;
@@ -118,6 +119,7 @@ mod row_position_selection;
 mod scan_trace;
 pub(crate) mod schema_manager;
 pub(crate) mod snapshot_commit;
+mod snapshot_deletion;
 mod snapshot_manager;
 mod sort_merge;
 mod sorted_global_index_build_builder;
@@ -153,6 +155,7 @@ pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 pub use de_vector_scan::PreparedVectorSearchFilter;
+pub use expire_snapshots::ExpireSnapshots;
 pub use format_partition::{
     format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
 };
@@ -435,6 +438,13 @@ impl Table {
 
     pub fn new_btree_global_index_build_builder(&self) -> BTreeGlobalIndexBuildBuilder<'_> {
         self.new_sorted_global_index_build_builder()
+    }
+
+    /// Create a snapshot expiration for this table.
+    ///
+    /// Reference: [ExpireSnapshotsImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/ExpireSnapshotsImpl.java)
+    pub fn new_expire_snapshots(&self) -> ExpireSnapshots<'_> {
+        ExpireSnapshots::new(self)
     }
 
     pub fn new_global_index_drop_builder(&self) -> GlobalIndexDropBuilder<'_> {

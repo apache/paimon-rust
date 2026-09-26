@@ -49,7 +49,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, StringArray};
+use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
+use datafusion::arrow::array::{ArrayRef, Int32Array, StringArray};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -181,6 +182,14 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
             "dry_run",
         ],
         "create_lumina_index" => &["table", "index_column", "index_type", "options"],
+        "expire_snapshots" => &[
+            "table",
+            "retain_max",
+            "retain_min",
+            "older_than",
+            "max_deletes",
+            "options",
+        ],
         "grant_permission" => &[
             "resource_type",
             "access",
@@ -286,6 +295,7 @@ pub async fn execute_call(
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
         "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
+        "expire_snapshots" => proc_expire_snapshots(ctx, catalog, catalog_name, &args).await,
         "grant_permission" => proc_grant_permission(ctx, catalog, catalog_name, &args).await,
         "revoke_permission" => proc_revoke_permission(ctx, catalog, catalog_name, &args).await,
         "list_permissions" => proc_list_permissions(ctx, catalog, catalog_name, &args).await,
@@ -1214,6 +1224,82 @@ async fn proc_list_policies(
     )
 }
 
+/// `CALL sys.expire_snapshots`, with the arguments of Java's Flink and Spark
+/// `ExpireSnapshotsProcedure`. `options` are dynamic table options applied for
+/// this call only (for example `snapshot.time-retained`).
+async fn proc_expire_snapshots(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let mut table = get_table(catalog, catalog_name, args).await?;
+    if let Some(options) = args.get("options") {
+        table = table.copy_with_options(parse_key_value_options(options)?);
+    }
+    let mut expire = table.new_expire_snapshots();
+    if let Some(value) = optional_i32_arg(args, "retain_max")? {
+        expire.with_retain_max(value);
+    }
+    if let Some(value) = optional_i32_arg(args, "retain_min")? {
+        expire.with_retain_min(value);
+    }
+    if let Some(value) = optional_i32_arg(args, "max_deletes")? {
+        expire.with_max_deletes(value);
+    }
+    if let Some(older_than) = args.get("older_than").filter(|v| !v.trim().is_empty()) {
+        expire.with_older_than_millis(parse_older_than(older_than)?);
+    }
+    let deleted = expire.execute().await.map_err(to_datafusion_error)?;
+    let deleted = i32::try_from(deleted).unwrap_or(i32::MAX);
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "deleted_snapshots_count",
+        ArrowDataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![deleted]))])?;
+    ctx.read_batch(batch)
+}
+
+fn optional_i32_arg(args: &HashMap<String, String>, name: &str) -> DFResult<Option<i32>> {
+    args.get(name)
+        .map(|value| {
+            value.trim().parse::<i32>().map_err(|_| {
+                DataFusionError::Plan(format!("Invalid integer for '{name}': '{value}'"))
+            })
+        })
+        .transpose()
+}
+
+/// `older_than` as epoch milliseconds, or as a timestamp such as
+/// `2024-01-01 12:00:00` in the session's local time zone, which is how Java
+/// (`DateTimeUtils.parseTimestampData` with the default time zone) reads it.
+fn parse_older_than(value: &str) -> DFResult<i64> {
+    let value = value.trim();
+    if let Ok(millis) = value.parse::<i64>() {
+        return Ok(millis);
+    }
+    let naive = ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"]
+        .iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+        .or_else(|| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+        })
+        .ok_or_else(|| DataFusionError::Plan(format!("Invalid older_than timestamp: '{value}'")))?;
+    Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|timestamp| timestamp.timestamp_millis())
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "older_than '{value}' does not exist in the local time zone"
+            ))
+        })
+}
+
 fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "result",
@@ -1231,6 +1317,41 @@ fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
 mod tests {
     use super::*;
     use paimon::io::FileIOBuilder;
+
+    #[test]
+    fn test_parse_older_than() {
+        assert_eq!(
+            parse_older_than("1700000000000").unwrap(),
+            1_700_000_000_000
+        );
+        let expected = Local
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2024, 1, 2)
+                    .unwrap()
+                    .and_hms_milli_opt(3, 4, 5, 600)
+                    .unwrap(),
+            )
+            .earliest()
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(parse_older_than("2024-01-02 03:04:05.6").unwrap(), expected);
+        assert_eq!(
+            parse_older_than(" 2024-01-02T03:04:05.600 ").unwrap(),
+            expected
+        );
+        let midnight = Local
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2024, 1, 2)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap(),
+            )
+            .earliest()
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(parse_older_than("2024-01-02").unwrap(), midnight);
+        assert!(parse_older_than("2024-13-01").is_err());
+    }
     use paimon::spec::CommitKind;
 
     fn test_file_io() -> paimon::io::FileIO {
