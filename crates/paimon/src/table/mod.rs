@@ -129,6 +129,7 @@ mod table_read;
 mod table_scan;
 mod table_update;
 mod table_update_by_row_id;
+mod table_update_predicate;
 mod table_upsert;
 pub(crate) mod table_write;
 mod tag_manager;

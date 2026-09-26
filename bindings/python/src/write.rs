@@ -18,22 +18,21 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{make_array, ArrayData};
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{CoreOptions, DataType, Datum};
 use paimon::table::{
-    CommitMessage, DataEvolutionWriter, Table, TableCommit, TableUpdate, TableUpdateByRowId,
-    TableWrite, UpdateAssignment, COMMIT_MESSAGE_SERIALIZER_VERSION,
+    CommitMessage, Table, TableCommit, TableUpdate, TableUpdateByRowId, TableWrite,
+    COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyString};
+use pyo3::types::{PyBytes, PyDict, PyString};
 
 use crate::error::to_py_err;
-use crate::predicate::py_to_datum;
+use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
 /// Validate an incoming batch schema against the table's target Arrow schema:
 /// field count, order, and names must match, and types must match exactly. The
@@ -236,27 +235,6 @@ impl PyBatchWriteBuilder {
         })
     }
 
-    /// Internal PyPaimon bridge for predicate assignments.
-    fn _new_matched_update(&self, update_cols: Vec<String>) -> PyResult<PyMatchedBatchUpdate> {
-        if self.static_partition.is_some() {
-            return Err(PyValueError::new_err(
-                "_MatchedBatchUpdateWriter does not support overwrite",
-            ));
-        }
-        let inner = self
-            .context
-            .table
-            .new_write_builder()
-            .new_data_evolution_writer(update_cols)
-            .map_err(to_py_err)?;
-        Ok(PyMatchedBatchUpdate {
-            inner: Some(inner),
-            table_location: self.context.table.location().to_string(),
-            commit_user: self.context.commit_user.clone(),
-            closed: false,
-        })
-    }
-
     fn new_commit(&self) -> PyResult<PyBatchTableCommit> {
         let table = &self.context.table;
         let ignore_empty = boolean_option(table, "snapshot.ignore-empty-commit", true)?;
@@ -368,6 +346,7 @@ fn arrow_table_batches(table: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
 
 struct UpdateContext {
     inner: TableUpdate,
+    table: Arc<Table>,
     table_location: String,
     commit_user: String,
 }
@@ -382,9 +361,44 @@ impl UpdateContext {
                 .map_err(to_py_err)?
                 .new_update()
                 .map_err(to_py_err)?,
+            table: context.table.clone(),
             table_location: context.table.location().to_string(),
             commit_user: context.commit_user.clone(),
         })
+    }
+
+    fn update_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+        assignments: &Bound<'_, PyDict>,
+        read_columns: Option<Vec<String>>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let predicate = predicate
+            .map(|predicate| dict_to_table_predicate(predicate, self.table.schema().fields(), true))
+            .transpose()?;
+        let callback_error = Arc::new(Mutex::new(None));
+        let assignments = crate::update_assignment::from_python(
+            py,
+            assignments,
+            self.table.schema().fields(),
+            callback_error.clone(),
+        )?;
+        let result = py.detach(|| {
+            runtime().block_on(self.inner.update_by_predicate(
+                predicate,
+                assignments,
+                read_columns.unwrap_or_default(),
+            ))
+        });
+        if let Some(error) = callback_error.lock().unwrap().take() {
+            return Err(error);
+        }
+        Ok(wrap_messages(
+            result.map_err(to_py_err)?,
+            &self.table_location,
+            &self.commit_user,
+        ))
     }
 
     fn update_by_arrow_with_row_id(
@@ -534,31 +548,6 @@ pub struct PyBatchTableUpdate {
 }
 
 #[pyclass(
-    name = "_MatchedBatchUpdateWriter",
-    module = "pypaimon_rust.datafusion",
-    unsendable
-)]
-pub struct PyMatchedBatchUpdate {
-    inner: Option<DataEvolutionWriter>,
-    table_location: String,
-    commit_user: String,
-    closed: bool,
-}
-
-impl PyMatchedBatchUpdate {
-    fn ensure_inner(&mut self) -> PyResult<&mut DataEvolutionWriter> {
-        if self.closed {
-            return Err(PyRuntimeError::new_err(
-                "_MatchedBatchUpdateWriter is closed",
-            ));
-        }
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("_MatchedBatchUpdateWriter is closed"))
-    }
-}
-
-#[pyclass(
     name = "TableUpdateByRowId",
     module = "pypaimon_rust.datafusion",
     unsendable
@@ -619,6 +608,20 @@ pub struct PyStreamTableUpdate {
 
 #[pymethods]
 impl PyStreamTableUpdate {
+    #[pyo3(signature = (predicate, assignments, commit_identifier, read_columns=None))]
+    fn update_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+        assignments: &Bound<'_, PyDict>,
+        commit_identifier: i64,
+        read_columns: Option<Vec<String>>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let _ = commit_identifier;
+        self.context
+            .update_by_predicate(py, predicate, assignments, read_columns)
+    }
+
     fn update_by_arrow_with_row_id(
         &self,
         py: Python<'_>,
@@ -676,6 +679,18 @@ impl PyStreamTableUpdate {
 
 #[pymethods]
 impl PyBatchTableUpdate {
+    #[pyo3(signature = (predicate, assignments, read_columns=None))]
+    fn update_by_predicate(
+        &self,
+        py: Python<'_>,
+        predicate: Option<&Bound<'_, PyDict>>,
+        assignments: &Bound<'_, PyDict>,
+        read_columns: Option<Vec<String>>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        self.context
+            .update_by_predicate(py, predicate, assignments, read_columns)
+    }
+
     fn update_by_arrow_with_row_id(
         &self,
         py: Python<'_>,
@@ -723,97 +738,6 @@ impl PyBatchTableUpdate {
         row_ids: Vec<i64>,
     ) -> PyResult<Vec<PyCommitMessage>> {
         self.context.delete_by_row_id(py, row_ids)
-    }
-}
-
-#[pymethods]
-impl PyMatchedBatchUpdate {
-    fn close(&mut self) {
-        self.closed = true;
-        self.inner.take();
-    }
-
-    fn pin_read_snapshot(&mut self, snapshot_id: i64) -> PyResult<()> {
-        self.ensure_inner()?.pin_read_snapshot(snapshot_id);
-        Ok(())
-    }
-
-    /// Evaluate assignments for one matched logical file group. Python
-    /// callables run with the GIL and receive the original Arrow table; batch
-    /// casts, broadcasting, validation and batch construction belong to core.
-    fn add_assigned_table(
-        &mut self,
-        py: Python<'_>,
-        matched: &Bound<'_, PyAny>,
-        assignments: &Bound<'_, PyDict>,
-        schema: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
-        if matched.getattr("num_rows")?.extract::<usize>()? == 0 {
-            return Ok(());
-        }
-        let pa = py.import("pyarrow")?;
-        let array_type = pa.getattr("Array")?;
-        let chunked_type = pa.getattr("ChunkedArray")?;
-        let scalar_type = pa.getattr("Scalar")?;
-        let mut converted = Vec::new();
-        for (name, original) in assignments.iter() {
-            let name: String = name.extract()?;
-            let value = if original.is_callable() {
-                let result = original.call1((matched,))?;
-                if !result.is_instance(&array_type)? && !result.is_instance(&chunked_type)? {
-                    return Err(PyValueError::new_err(format!("Callable assignment for {name} must return a pyarrow.Array or pyarrow.ChunkedArray.")));
-                }
-                result
-            } else {
-                original
-            };
-            let assignment = if value.is_instance(&array_type)? {
-                UpdateAssignment::Array(vec![make_array(ArrayData::from_pyarrow_bound(&value)?)])
-            } else if value.is_instance(&chunked_type)? {
-                let chunks = value
-                    .getattr("chunks")?
-                    .try_iter()?
-                    .map(|chunk| Ok(make_array(ArrayData::from_pyarrow_bound(&chunk?)?)))
-                    .collect::<PyResult<Vec<_>>>()?;
-                UpdateAssignment::Array(chunks)
-            } else {
-                // A Python object has no Arrow type. Convert that one value
-                // through PyArrow; core owns all array casts and broadcasting.
-                let scalar = if value.is_instance(&scalar_type)? {
-                    value.call_method0("as_py")?
-                } else {
-                    value
-                };
-                let kwargs = PyDict::new(py);
-                kwargs.set_item(
-                    "type",
-                    schema.call_method1("field", (&name,))?.getattr("type")?,
-                )?;
-                let one = pa.call_method("array", (PyList::new(py, [scalar])?,), Some(&kwargs))?;
-                UpdateAssignment::Scalar(make_array(ArrayData::from_pyarrow_bound(&one)?))
-            };
-            converted.push((name, assignment));
-        }
-        self.ensure_inner()?
-            .add_assigned_batches(arrow_table_batches(matched)?, converted)
-            .map_err(to_py_err)
-    }
-
-    fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
-        self.ensure_inner()?;
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("_MatchedBatchUpdateWriter is closed"))?;
-        self.closed = true;
-        let messages = py
-            .detach(|| runtime().block_on(inner.prepare_commit()))
-            .map_err(to_py_err)?;
-        Ok(wrap_messages(
-            messages,
-            &self.table_location,
-            &self.commit_user,
-        ))
     }
 }
 

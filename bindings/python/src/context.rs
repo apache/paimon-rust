@@ -552,7 +552,6 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<crate::write::PyStreamWriteBuilder>()?;
     this.add_class::<crate::write::PyBatchTableWrite>()?;
     this.add_class::<crate::write::PyBatchTableUpdate>()?;
-    this.add_class::<crate::write::PyMatchedBatchUpdate>()?;
     this.add_class::<crate::write::PyTableUpdateByRowId>()?;
     this.add_class::<crate::write::PyStreamTableUpdate>()?;
     this.add_function(wrap_pyfunction!(

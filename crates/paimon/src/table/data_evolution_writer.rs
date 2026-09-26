@@ -38,8 +38,8 @@ use crate::table::data_file_writer::DataFileWriter;
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::source::data_evolution_anchor_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
-use crate::table::DataSplitBuilder;
 use crate::table::Table;
+use crate::table::{DataSplit, DataSplitBuilder};
 use crate::Result;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StructArray};
 use arrow_buffer::NullBuffer;
@@ -1120,8 +1120,12 @@ impl RowIdFileIndex {
         };
         let read_table = table.copy_with_pinned_snapshot(&snapshot);
         let plan = read_table.new_read_builder().new_scan().plan().await?;
+        Self::from_splits(read_table, plan.splits())
+    }
+
+    pub(super) fn from_splits(read_table: Table, splits: &[DataSplit]) -> Result<Self> {
         let mut file_index: Vec<FileRowRange> = Vec::new();
-        for split in plan.splits() {
+        for split in splits {
             let partition_bytes = split.partition().to_serialized_bytes();
             let bucket = split.bucket();
             let bucket_path = split.bucket_path().to_string();

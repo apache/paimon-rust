@@ -22,10 +22,18 @@ use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use arrow_select::take::take;
 use std::sync::Arc;
 
-/// A literal (one value) or an Arrow array, retaining its original chunks.
+type AssignmentFunction = dyn Fn(&[RecordBatch]) -> crate::Result<Vec<ArrayRef>> + Send + Sync;
+type ScalarFunction = dyn Fn() -> crate::Result<ArrayRef> + Send + Sync;
+
+/// A literal, an Arrow array, or a function evaluated per matched file group.
+#[derive(Clone)]
 pub enum UpdateAssignment {
     Scalar(ArrayRef),
     Array(Vec<ArrayRef>),
+    /// Receives the projected matched rows of one logical file group.
+    Function(Arc<AssignmentFunction>),
+    /// Convert a foreign-language scalar only when matching rows exist.
+    DeferredScalar(Arc<ScalarFunction>),
 }
 
 fn invalid(message: impl Into<String>) -> crate::Error {
@@ -332,6 +340,8 @@ pub(super) fn assigned_batches(
         let (scalar, chunks) = match assignment {
             UpdateAssignment::Scalar(value) => (true, vec![value]),
             UpdateAssignment::Array(chunks) => (false, chunks),
+            UpdateAssignment::Function(function) => (false, function(matched)?),
+            UpdateAssignment::DeferredScalar(function) => (true, vec![function()?]),
         };
         let length: usize = chunks.iter().map(|array| array.len()).sum();
         if length != if scalar { 1 } else { row_count } {

@@ -44,12 +44,20 @@ pub struct TableUpdateByRowId {
 
 impl TableUpdateByRowId {
     pub(crate) async fn new(table: &Table, commit_user: String) -> crate::Result<Self> {
+        Self::with_index(table, commit_user, RowIdFileIndex::load(table, None).await?)
+    }
+
+    pub(super) fn with_index(
+        table: &Table,
+        commit_user: String,
+        index: RowIdFileIndex,
+    ) -> crate::Result<Self> {
         // Validate table layout without fixing any update columns.
         let _ = DataEvolutionWriter::new(table, Vec::new())?;
         Ok(Self {
             table: table.clone(),
             commit_user,
-            index: RowIdFileIndex::load(table, None).await?,
+            index,
             updated: HashMap::new(),
             messages: Vec::new(),
         })

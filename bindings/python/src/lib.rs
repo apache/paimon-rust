@@ -25,6 +25,7 @@ mod read;
 mod schema;
 mod table;
 mod udf;
+mod update_assignment;
 mod update_match;
 mod write;
 // ---- #285: observability ----

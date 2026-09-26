@@ -584,3 +584,327 @@ async fn core_assignments_validate_before_staging_and_preserve_chunk_alignment()
         vec![vec![1, 11, 999], vec![2, 22, 999], vec![3, 33, 999]]
     );
 }
+
+#[tokio::test]
+async fn predicate_update_filters_exactly_and_calls_functions_per_file_group() {
+    use paimon::spec::{Datum, PredicateBuilder};
+    use paimon::table::UpdateAssignment;
+    use std::sync::Mutex;
+    let table = evolution_table().await;
+    seed(&table).await;
+    seed(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    commit(&table, update.delete_by_row_id(vec![1]).await.unwrap()).await;
+    // Predicate updates choose assignment columns, independently of the
+    // row-ID/upsert column selection on the reusable high-level updater.
+    update.with_update_type(vec!["id".into()]).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let calls = seen.clone();
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .greater_or_equal("id", Datum::Int(2))
+        .unwrap();
+    let messages = update
+        .update_by_predicate(
+            Some(predicate),
+            vec![
+                (
+                    "value".into(),
+                    UpdateAssignment::Function(Arc::new(move |batches| {
+                        calls
+                            .lock()
+                            .unwrap()
+                            .push(batches.iter().map(RecordBatch::num_rows).sum::<usize>());
+                        batches
+                            .iter()
+                            .map(|batch| {
+                                assert_eq!(
+                                    batch
+                                        .schema()
+                                        .fields()
+                                        .iter()
+                                        .map(|f| f.name().as_str())
+                                        .collect::<Vec<_>>(),
+                                    vec!["value", "_ROW_ID"]
+                                );
+                                let values = batch
+                                    .column(0)
+                                    .as_any()
+                                    .downcast_ref::<Int32Array>()
+                                    .unwrap();
+                                Ok(Arc::new(Int32Array::from_iter(
+                                    values.iter().map(|v| v.map(|v| v + 1)),
+                                )) as ArrayRef)
+                            })
+                            .collect()
+                    })),
+                ),
+                (
+                    "score".into(),
+                    UpdateAssignment::Scalar(Arc::new(Int32Array::from(vec![999]))),
+                ),
+            ],
+            vec!["value".into(), "value".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+    assert!(messages
+        .iter()
+        .all(|message| message.check_from_snapshot == Some(3)));
+    commit(&table, messages).await;
+    assert_eq!(
+        read_rows(&table).await,
+        vec![
+            vec![1, 10, 100],
+            vec![1, 10, 100],
+            vec![2, 21, 999],
+            vec![3, 31, 999],
+            vec![3, 31, 999],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn predicate_array_assignments_span_file_groups() {
+    use paimon::table::UpdateAssignment;
+    let table = evolution_table().await;
+    seed(&table).await;
+    seed(&table).await;
+    let update = table.new_write_builder().new_update().unwrap();
+    let messages = update
+        .update_by_predicate(
+            None,
+            vec![(
+                "score".into(),
+                UpdateAssignment::Array(vec![
+                    Arc::new(Int64Array::from(vec![11, 12])),
+                    Arc::new(Int64Array::from(vec![13, 14, 15, 16])),
+                ]),
+            )],
+            vec![],
+        )
+        .await
+        .unwrap();
+    commit(&table, messages).await;
+    assert_eq!(
+        read_rows(&table).await,
+        vec![
+            vec![1, 10, 11],
+            vec![1, 10, 14],
+            vec![2, 20, 12],
+            vec![2, 20, 15],
+            vec![3, 30, 13],
+            vec![3, 30, 16],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn predicate_callback_failure_aborts_earlier_group_files() {
+    use paimon::table::UpdateAssignment;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let table = evolution_table().await;
+    seed(&table).await;
+    seed(&table).await;
+    let before = parquet_files(&table).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let error = table
+        .new_write_builder()
+        .new_update()
+        .unwrap()
+        .update_by_predicate(
+            None,
+            vec![(
+                "value".into(),
+                UpdateAssignment::Function(Arc::new(move |batches| {
+                    if seen.fetch_add(1, Ordering::SeqCst) == 1 {
+                        return Err(paimon::Error::DataInvalid {
+                            message: "second callback failed".into(),
+                            source: None,
+                        });
+                    }
+                    Ok(batches
+                        .iter()
+                        .map(|batch| batch.column_by_name("value").unwrap().clone())
+                        .collect())
+                })),
+            )],
+            vec!["value".into()],
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("second callback failed"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(parquet_files(&table).await, before);
+}
+
+#[tokio::test]
+async fn predicate_validation_and_no_matches_do_not_evaluate_assignments() {
+    use paimon::spec::{Datum, PredicateBuilder};
+    use paimon::table::UpdateAssignment;
+    let table = evolution_table().await;
+    seed(&table).await;
+    let update = table.new_write_builder().new_update().unwrap();
+    let panic_function = UpdateAssignment::Function(Arc::new(|_| panic!("must not evaluate")));
+    for (assignments, columns, error) in [
+        (vec![], vec![], "assignments must not be empty"),
+        (
+            vec![("value".into(), panic_function.clone())],
+            vec![],
+            "require read_columns",
+        ),
+        (
+            vec![("value".into(), panic_function.clone())],
+            vec!["missing".into()],
+            "Read column missing",
+        ),
+        (
+            vec![("missing".into(), panic_function.clone())],
+            vec!["value".into()],
+            "Column missing",
+        ),
+        (
+            vec![
+                ("value".into(), panic_function.clone()),
+                ("score".into(), UpdateAssignment::Array(vec![])),
+            ],
+            vec!["value".into()],
+            "cannot be combined",
+        ),
+    ] {
+        assert!(update
+            .update_by_predicate(None, assignments, columns)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains(error));
+    }
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("id", Datum::Int(99))
+        .unwrap();
+    assert!(update
+        .update_by_predicate(
+            Some(predicate),
+            vec![
+                ("value".into(), panic_function),
+                (
+                    "score".into(),
+                    UpdateAssignment::DeferredScalar(Arc::new(|| panic!("unused scalar")))
+                ),
+            ],
+            vec!["value".into()]
+        )
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn predicate_update_preserves_previous_partial_values_outside_matches() {
+    use paimon::spec::{Datum, PredicateBuilder};
+    use paimon::table::UpdateAssignment;
+    let table = evolution_table().await;
+    seed(&table).await;
+    let update = table.new_write_builder().new_update().unwrap();
+    let messages = update
+        .update_by_arrow_with_row_id(vec![matched(vec![0], &[("value", vec![11])])])
+        .await
+        .unwrap();
+    commit(&table, messages).await;
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("id", Datum::Int(2))
+        .unwrap();
+    let messages = update
+        .update_by_predicate(
+            Some(predicate),
+            vec![(
+                "value".into(),
+                UpdateAssignment::Scalar(Arc::new(Int32Array::from(vec![22]))),
+            )],
+            vec![],
+        )
+        .await
+        .unwrap();
+    commit(&table, messages).await;
+    assert_eq!(
+        read_rows(&table).await,
+        vec![vec![1, 11, 100], vec![2, 22, 200], vec![3, 30, 300]]
+    );
+}
+
+#[tokio::test]
+async fn predicate_assignments_keep_row_id_order_when_later_groups_have_deltas() {
+    use paimon::table::UpdateAssignment;
+    use std::sync::Mutex;
+    for callable in [false, true] {
+        let table = evolution_table().await;
+        seed(&table).await;
+        write_batch(
+            &table,
+            &batch(&[
+                ("id", vec![4, 5, 6]),
+                ("value", vec![40, 50, 60]),
+                ("score", vec![400, 500, 600]),
+            ]),
+        )
+        .await;
+        let update = table.new_write_builder().new_update().unwrap();
+        let messages = update
+            .update_by_arrow_with_row_id(vec![matched(vec![3], &[("value", vec![44])])])
+            .await
+            .unwrap();
+        commit(&table, messages).await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let calls = seen.clone();
+        let (assignment, read_columns) = if callable {
+            (
+                UpdateAssignment::Function(Arc::new(move |batches| {
+                    batches
+                        .iter()
+                        .map(|batch| {
+                            let ids = batch
+                                .column_by_name("_ROW_ID")
+                                .unwrap()
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap();
+                            calls.lock().unwrap().extend(ids.values().iter().copied());
+                            Ok(Arc::new(Int32Array::from_iter_values(
+                                ids.values().iter().map(|id| *id as i32 + 11),
+                            )) as ArrayRef)
+                        })
+                        .collect()
+                })),
+                vec!["id".into()],
+            )
+        } else {
+            (
+                UpdateAssignment::Array(vec![
+                    Arc::new(Int32Array::from(vec![11, 12])),
+                    Arc::new(Int32Array::from(vec![13, 14, 15, 16])),
+                ]),
+                vec![],
+            )
+        };
+        let messages = update
+            .update_by_predicate(None, vec![("score".into(), assignment)], read_columns)
+            .await
+            .unwrap();
+        if callable {
+            assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2, 3, 4, 5]);
+        }
+        commit(&table, messages).await;
+        assert_eq!(
+            read_rows(&table).await,
+            vec![
+                vec![1, 10, 11],
+                vec![2, 20, 12],
+                vec![3, 30, 13],
+                vec![4, 44, 14],
+                vec![5, 50, 15],
+                vec![6, 60, 16],
+            ]
+        );
+    }
+}

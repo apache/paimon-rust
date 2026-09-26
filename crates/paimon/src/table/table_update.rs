@@ -180,6 +180,25 @@ impl TableUpdate {
         result
     }
 
+    /// Update rows matching a predicate. Scalar assignments and functions run
+    /// per logical file group; Arrow arrays span all matched rows in scan order.
+    /// Functions receive only `read_columns` followed by `_ROW_ID`.
+    pub async fn update_by_predicate(
+        &self,
+        predicate: Option<crate::spec::Predicate>,
+        assignments: Vec<(String, super::UpdateAssignment)>,
+        read_columns: Vec<String>,
+    ) -> crate::Result<Vec<CommitMessage>> {
+        super::table_update_predicate::update(
+            &self.table,
+            &self.commit_user,
+            predicate,
+            assignments,
+            read_columns,
+        )
+        .await
+    }
+
     /// Upsert complete Arrow rows by composite key through the core upsert
     /// writer. Existing keys update every matching row ID; new keys append.
     pub async fn upsert_by_arrow_with_key(

@@ -293,3 +293,64 @@ def test_stream_row_id_update_and_factory(tmp_path):
     actual = pa.Table.from_batches(context.sql(
         'SELECT id, value FROM paimon.stream_updates.t')).sort_by('id').to_pydict()
     assert actual == {'id': [1, 2], 'value': [11, 22]}
+
+
+def test_predicate_update_owns_scan_callbacks_and_rollback(tmp_path):
+    assert not hasattr(datafusion, '_MatchedBatchUpdateWriter')
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.pred_updates')
+    context.sql("""CREATE TABLE paimon.pred_updates.t (id INT, value INT, score INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true',
+        'deletion-vectors.enabled' = 'true')""")
+    for values in ('(1, 10, 100), (2, 20, 200)', '(3, 30, 300), (4, 40, 400)'):
+        context.sql('INSERT INTO paimon.pred_updates.t (id, value, score) VALUES ' + values)
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('pred_updates.t')
+    builder = table.new_batch_write_builder()
+    assert not hasattr(builder, '_new_matched_update')
+    update = builder.new_update().with_update_type(['id'])
+    seen = []
+
+    def increment(rows):
+        assert rows.column_names == ['value', '_ROW_ID']
+        seen.append(rows.num_rows)
+        return pa.compute.add(rows['value'], 1)
+
+    messages = update.update_by_predicate(
+        {'method': 'greaterOrEqual', 'field': 'id', 'literals': [2]},
+        {'value': increment, 'score': 999}, read_columns=['value'])
+    assert sorted(seen) == [1, 2]
+    builder.new_commit().commit(messages)
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, value, score FROM paimon.pred_updates.t')).sort_by('id').to_pydict()
+    assert actual == {'id': [1, 2, 3, 4], 'value': [10, 21, 31, 41],
+                      'score': [100, 999, 999, 999]}
+
+    before = set(tmp_path.rglob('*.parquet'))
+    seen.clear()
+
+    def fail_second(rows):
+        seen.append(rows.num_rows)
+        if len(seen) == 2:
+            raise RuntimeError('callback failure')
+        return rows['value']
+
+    with pytest.raises(RuntimeError, match='callback failure'):
+        update.update_by_predicate(None, {'value': fail_second}, read_columns=['value'])
+    assert len(seen) == 2
+    assert set(tmp_path.rglob('*.parquet')) == before
+    assert update.update_by_predicate(
+        {'method': 'equal', 'field': 'id', 'literals': [99]},
+        {'value': 'bad-int'}) == []
+    assert update.update_by_predicate(
+        {'method': 'equal', 'field': 'id', 'literals': [99]},
+        {'value': fail_second}, read_columns=['value']) == []
+    assert len(seen) == 2
+
+    stream = table.new_stream_write_builder()
+    messages = stream.new_update().update_by_predicate(
+        None, {'score': pa.chunked_array([[11], [22, 33, 44]])}, 42)
+    stream.new_commit().commit(42, messages)
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, score FROM paimon.pred_updates.t')).sort_by('id').to_pydict()
+    assert actual == {'id': [1, 2, 3, 4], 'score': [11, 22, 33, 44]}
