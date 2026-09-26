@@ -207,7 +207,7 @@ async fn test_create_global_index_requires_index_column() {
 async fn test_create_global_index_rejects_unsupported_index_types() {
     let (_tmp, sql_context) = setup_btree_global_index_table("global_index_bad_type").await;
 
-    for index_type in ["full-text", "ivf-hnsw-flat", "ivf-hnsw-sq"] {
+    for index_type in ["hash", "ivf-hnsw-flat", "ivf-hnsw-sq"] {
         assert_sql_error(
             &sql_context,
             &format!(
@@ -217,7 +217,7 @@ async fn test_create_global_index_rejects_unsupported_index_types() {
                     index_type => '{index_type}'\
                 )"
             ),
-            "only supports index_type => 'btree', 'bitmap', 'multivalue', 'fm', or vindex types",
+            "only supports index_type => 'btree', 'bitmap', 'multivalue', 'fm', 'full-text', or vindex types",
         )
         .await;
     }
@@ -347,14 +347,14 @@ async fn test_global_index_procedures_echo_raw_unsupported_type() {
 
     assert_sql_error(
         &sql_context,
-        "CALL sys.create_global_index(table => 'test_db.btree_echo', index_column => 'id', index_type => 'Full-Text')",
-        "got 'Full-Text'",
+        "CALL sys.create_global_index(table => 'test_db.btree_echo', index_column => 'id', index_type => 'Ivf-Hnsw-Flat')",
+        "got 'Ivf-Hnsw-Flat'",
     )
     .await;
     assert_sql_error(
         &sql_context,
-        "CALL sys.drop_global_index(table => 'test_db.btree_echo', index_column => 'id', index_type => 'Full-Text')",
-        "unsupported global index type 'Full-Text'",
+        "CALL sys.drop_global_index(table => 'test_db.btree_echo', index_column => 'id', index_type => 'Ivf-Hnsw-Flat')",
+        "unsupported global index type 'Ivf-Hnsw-Flat'",
     )
     .await;
 }
@@ -580,6 +580,110 @@ async fn test_create_and_drop_fm_global_index() {
     drop(tmp);
 }
 
+#[cfg(feature = "fulltext")]
+#[tokio::test]
+async fn test_create_and_drop_full_text_global_index() {
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.ft_build (id INT, name VARCHAR(100)) WITH (\
+            'row-tracking.enabled' = 'true',\
+            'data-evolution.enabled' = 'true',\
+            'global-index.enabled' = 'true',\
+            'global-index.row-count-per-shard' = '2'\
+        )",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.ft_build (id, name) VALUES \
+         (1, 'apache paimon lake'), (2, 'rust engine'), (3, NULL), \
+         (4, 'paimon rust reader'), (5, 'streaming lake')",
+    )
+    .await;
+    let search =
+        "SELECT id, name FROM full_text_search('paimon.test_db.ft_build', 'name', 'paimon', 10)";
+
+    // Without an index, the default `fast` search mode finds nothing.
+    assert!(collect_id_name(&sql_context, search).await.is_empty());
+
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(\
+            table => 'test_db.ft_build', \
+            index_column => 'name', \
+            index_type => 'Full-Text'\
+        )",
+    )
+    .await;
+    // Five rows at two rows per shard: [0, 1], [2, 3], [4, 4].
+    assert_eq!(
+        row_count(
+            &sql_context,
+            "SELECT * FROM paimon.test_db.`ft_build$table_indexes` \
+             WHERE index_type = 'full-text' AND index_field_name = 'name'",
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        collect_id_name(&sql_context, search).await,
+        vec![
+            (1, "apache paimon lake".to_string()),
+            (4, "paimon rust reader".to_string())
+        ]
+    );
+
+    // Rebuilding with no new rows is a no-op.
+    exec(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.ft_build', index_column => 'name', index_type => 'full-text')",
+    )
+    .await;
+    assert_eq!(
+        row_count(
+            &sql_context,
+            "SELECT * FROM paimon.test_db.`ft_build$table_indexes` WHERE index_type = 'full-text'",
+        )
+        .await,
+        3
+    );
+
+    exec(
+        &sql_context,
+        "CALL sys.drop_global_index(table => 'test_db.ft_build', index_column => 'name', index_type => 'full-text')",
+    )
+    .await;
+    assert_eq!(
+        row_count(
+            &sql_context,
+            "SELECT * FROM paimon.test_db.`ft_build$table_indexes` WHERE index_type = 'full-text'",
+        )
+        .await,
+        0
+    );
+    assert!(collect_id_name(&sql_context, search).await.is_empty());
+    drop(tmp);
+}
+
+#[cfg(feature = "fulltext")]
+#[tokio::test]
+async fn test_create_full_text_global_index_rejects_non_string_column() {
+    let (_tmp, sql_context) = setup_btree_global_index_table("ft_bad_column").await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.ft_bad_column (id, name) VALUES (1, 'alice')",
+    )
+    .await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_global_index(table => 'test_db.ft_bad_column', index_column => 'id', index_type => 'full-text')",
+        "Full-text index requires a character string column",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn test_drop_global_index_removes_btree_and_reads_fallback() {
     let (_tmp, sql_context) = setup_btree_global_index_table("btree_drop").await;
@@ -675,7 +779,7 @@ async fn test_drop_global_index_rejects_unsupported_index_type() {
 
     assert_sql_error(
         &sql_context,
-        "CALL sys.drop_global_index(table => 'test_db.global_index_drop_bad_type', index_column => 'id', index_type => 'full-text')",
+        "CALL sys.drop_global_index(table => 'test_db.global_index_drop_bad_type', index_column => 'id', index_type => 'hash')",
         "unsupported global index type",
     )
     .await;
