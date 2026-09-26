@@ -1043,6 +1043,29 @@ async fn test_commit_keeps_recent_snapshots_by_default() {
 }
 
 #[tokio::test]
+async fn test_commit_does_not_look_for_expirable_snapshots_in_a_young_table() {
+    let table = test_table("memory:/expire_after_commit_young", &[], false);
+    setup_dirs(&table).await;
+    // No more snapshots than `snapshot.num-retained.min` (10): expiration is
+    // not even attempted, so it never writes the EARLIEST hint.
+    for id in 1..=10 {
+        append(&table, &[id]).await;
+    }
+    assert!(!table
+        .snapshot_manager()
+        .earliest_hint_exists()
+        .await
+        .unwrap());
+    append(&table, &[11]).await;
+    assert!(table
+        .snapshot_manager()
+        .earliest_hint_exists()
+        .await
+        .unwrap());
+    assert_eq!(snapshot_ids(&table).await, (1..=11).collect::<Vec<_>>());
+}
+
+#[tokio::test]
 async fn test_commit_skips_expiration() {
     let retention = [
         ("snapshot.num-retained.min", "1"),

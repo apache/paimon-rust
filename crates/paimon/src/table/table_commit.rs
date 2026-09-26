@@ -974,6 +974,17 @@ impl TableCommit {
                 return;
             }
         }
+        // While the table has no more than `snapshot.num-retained.min` snapshots,
+        // nothing can expire. Checking that from the LATEST hint spares every
+        // commit to a young table the consumer listing and EARLIEST lookup.
+        let latest = self.table.snapshot_manager().get_latest_snapshot_id().await;
+        if let (Ok(Some(latest)), Ok(retain_min)) =
+            (latest, core_options.snapshot_num_retained_min())
+        {
+            if latest <= i64::from(retain_min) {
+                return;
+            }
+        }
         if let Err(error) = self.table.new_expire_snapshots().execute().await {
             log::warn!("Failed to expire snapshots after commit: {error}");
         }
