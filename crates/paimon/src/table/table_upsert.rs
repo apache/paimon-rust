@@ -104,7 +104,7 @@ impl TableUpsert {
             return Err(invalid("upsert update columns must not be empty"));
         }
         // Reuse the row-ID writer's precondition and column-path checks.
-        let _validated_update = super::TableUpdate::new(table, update_columns.clone())?;
+        let _validated_update = super::TableUpdateByRowId::new(table, update_columns.clone())?;
         Ok(Self {
             table: table.clone(),
             commit_user,
@@ -185,7 +185,7 @@ impl TableUpsert {
                     .table
                     .new_write_builder()
                     .with_commit_user(self.commit_user.clone())?
-                    .new_update(self.update_columns)?;
+                    .new_update_by_row_id(self.update_columns)?;
                 if let Some(snapshot_id) = plan.snapshot_id() {
                     update.pin_read_snapshot(snapshot_id);
                 }

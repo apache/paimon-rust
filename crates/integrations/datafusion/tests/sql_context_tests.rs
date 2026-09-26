@@ -528,7 +528,9 @@ async fn test_select_branch_table_reads_branch_snapshot() {
     let branch_table = table.copy_with_branch("b1").await.unwrap();
     let write_builder = branch_table.new_write_builder();
     assert!(write_builder.new_write().is_err());
-    assert!(write_builder.new_update(vec!["name".to_string()]).is_err());
+    assert!(write_builder
+        .new_update_by_row_id(vec!["name".to_string()])
+        .is_err());
     assert!(write_builder.new_delete().is_err());
     assert!(write_builder.try_new_commit().is_err());
 

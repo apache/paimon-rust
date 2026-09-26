@@ -422,7 +422,7 @@ async fn projection_and_column_updates_do_not_multiply_positions_or_reorder_grou
     append_ids(&table, 0, 4).await;
     append_ids(&table, 4, 8).await;
     let write = table.new_write_builder();
-    let mut update = write.new_update(vec!["value".into()]).unwrap();
+    let mut update = write.new_update_by_row_id(vec!["value".into()]).unwrap();
     update
         .add_matched_batch(
             RecordBatch::try_from_iter(vec![

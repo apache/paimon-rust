@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{make_array, ArrayData, UInt32Array};
@@ -25,7 +25,8 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{CoreOptions, DataType, Datum};
 use paimon::table::{
-    CommitMessage, Table, TableCommit, TableUpdate, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
+    CommitMessage, Table, TableCommit, TableUpdate, TableUpdateByRowId, TableWrite,
+    COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -102,32 +103,6 @@ impl WriteContext {
             commit_user: self.commit_user.clone(),
         })
     }
-}
-
-fn table_field_names(table: &Table) -> Vec<String> {
-    table
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| field.name().to_string())
-        .collect()
-}
-
-fn normalize_update_columns(table: &Table, requested: Vec<String>) -> PyResult<Vec<String>> {
-    let fields = table_field_names(table);
-    let mut seen = HashSet::new();
-    let mut columns = Vec::new();
-    for column in requested {
-        if !fields.contains(&column) {
-            return Err(PyValueError::new_err(format!(
-                "Column {column} is not in table schema."
-            )));
-        }
-        if seen.insert(column.clone()) {
-            columns.push(column);
-        }
-    }
-    Ok(if columns.is_empty() { fields } else { columns })
 }
 
 fn boolean_option(table: &Table, key: &str, default: bool) -> PyResult<bool> {
@@ -258,9 +233,7 @@ impl PyBatchWriteBuilder {
             ));
         }
         Ok(PyBatchTableUpdate {
-            table: Arc::clone(&self.context.table),
-            commit_user: self.context.commit_user.clone(),
-            update_columns: table_field_names(&self.context.table),
+            context: UpdateContext::new(&self.context)?,
         })
     }
 
@@ -271,15 +244,12 @@ impl PyBatchWriteBuilder {
                 "_MatchedBatchUpdateWriter does not support overwrite",
             ));
         }
-        let update_columns = normalize_update_columns(&self.context.table, update_cols)?;
-        let inner = self
-            .context
-            .table
-            .new_write_builder()
-            .with_commit_user(self.context.commit_user.clone())
-            .map_err(to_py_err)?
-            .new_update(update_columns)
+        let mut context = UpdateContext::new(&self.context)?;
+        context
+            .inner
+            .with_update_type(update_cols)
             .map_err(to_py_err)?;
+        let inner = context.inner.new_update_by_row_id().map_err(to_py_err)?;
         Ok(PyMatchedBatchUpdate {
             inner: Some(inner),
             table_location: self.context.table.location().to_string(),
@@ -345,12 +315,10 @@ impl PyStreamWriteBuilder {
         })
     }
 
-    fn new_update(&self) -> PyStreamTableUpdate {
-        PyStreamTableUpdate {
-            table: Arc::clone(&self.context.table),
-            commit_user: self.context.commit_user.clone(),
-            update_columns: table_field_names(&self.context.table),
-        }
+    fn new_update(&self) -> PyResult<PyStreamTableUpdate> {
+        Ok(PyStreamTableUpdate {
+            context: UpdateContext::new(&self.context)?,
+        })
     }
 
     fn new_commit(&self) -> PyResult<PyStreamTableCommit> {
@@ -384,48 +352,62 @@ fn wrap_messages(
         .collect()
 }
 
-fn upsert_by_arrow_with_key(
-    py: Python<'_>,
-    table: &Table,
-    commit_user: &str,
-    input: &Bound<'_, PyAny>,
-    keys: Vec<String>,
-    update_columns: Vec<String>,
-) -> PyResult<Vec<PyCommitMessage>> {
-    let mut upsert = table
-        .new_write_builder()
-        .with_commit_user(commit_user)
-        .map_err(to_py_err)?
-        .new_upsert(keys, update_columns)
-        .map_err(to_py_err)?;
-    for batch in input.call_method0("to_batches")?.try_iter()? {
-        upsert
-            .add_batch(RecordBatch::from_pyarrow_bound(&batch?)?)
-            .map_err(to_py_err)?;
-    }
-    let messages = py
-        .detach(|| runtime().block_on(upsert.prepare_commit()))
-        .map_err(to_py_err)?;
-    Ok(wrap_messages(messages, table.location(), commit_user))
+struct UpdateContext {
+    inner: TableUpdate,
+    table_location: String,
+    commit_user: String,
 }
 
-fn delete_by_row_id(
-    py: Python<'_>,
-    table: &Table,
-    commit_user: &str,
-    row_ids: Vec<i64>,
-) -> PyResult<Vec<PyCommitMessage>> {
-    let mut delete = table
-        .new_write_builder()
-        .with_commit_user(commit_user)
-        .map_err(to_py_err)?
-        .new_delete()
-        .map_err(to_py_err)?;
-    delete.add_row_ids(row_ids).map_err(to_py_err)?;
-    let messages = py
-        .detach(|| runtime().block_on(delete.prepare_commit()))
-        .map_err(to_py_err)?;
-    Ok(wrap_messages(messages, table.location(), commit_user))
+impl UpdateContext {
+    fn new(context: &WriteContext) -> PyResult<Self> {
+        Ok(Self {
+            inner: context
+                .table
+                .new_write_builder()
+                .with_commit_user(context.commit_user.clone())
+                .map_err(to_py_err)?
+                .new_update()
+                .map_err(to_py_err)?,
+            table_location: context.table.location().to_string(),
+            commit_user: context.commit_user.clone(),
+        })
+    }
+
+    fn upsert_by_arrow_with_key(
+        &self,
+        py: Python<'_>,
+        input: &Bound<'_, PyAny>,
+        keys: Vec<String>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let batches = input
+            .call_method0("to_batches")?
+            .try_iter()?
+            .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
+            .collect::<PyResult<Vec<_>>>()?;
+        let messages = py
+            .detach(|| runtime().block_on(self.inner.upsert_by_arrow_with_key(batches, keys)))
+            .map_err(to_py_err)?;
+        Ok(wrap_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
+
+    fn delete_by_row_id(
+        &self,
+        py: Python<'_>,
+        row_ids: Vec<i64>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let messages = py
+            .detach(|| runtime().block_on(self.inner.delete_by_row_id(row_ids)))
+            .map_err(to_py_err)?;
+        Ok(wrap_messages(
+            messages,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
 }
 
 impl WriteState {
@@ -472,9 +454,7 @@ pub struct PyBatchTableWrite {
     unsendable
 )]
 pub struct PyBatchTableUpdate {
-    table: Arc<Table>,
-    commit_user: String,
-    update_columns: Vec<String>,
+    context: UpdateContext,
 }
 
 #[pyclass(
@@ -483,14 +463,14 @@ pub struct PyBatchTableUpdate {
     unsendable
 )]
 pub struct PyMatchedBatchUpdate {
-    inner: Option<TableUpdate>,
+    inner: Option<TableUpdateByRowId>,
     table_location: String,
     commit_user: String,
     closed: bool,
 }
 
 impl PyMatchedBatchUpdate {
-    fn ensure_inner(&mut self) -> PyResult<&mut TableUpdate> {
+    fn ensure_inner(&mut self) -> PyResult<&mut TableUpdateByRowId> {
         if self.closed {
             return Err(PyRuntimeError::new_err(
                 "_MatchedBatchUpdateWriter is closed",
@@ -508,9 +488,7 @@ impl PyMatchedBatchUpdate {
     unsendable
 )]
 pub struct PyStreamTableUpdate {
-    table: Arc<Table>,
-    commit_user: String,
-    update_columns: Vec<String>,
+    context: UpdateContext,
 }
 
 #[pymethods]
@@ -519,7 +497,10 @@ impl PyStreamTableUpdate {
         mut slf: PyRefMut<'py, Self>,
         update_cols: Vec<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.update_columns = normalize_update_columns(&slf.table, update_cols)?;
+        slf.context
+            .inner
+            .with_update_type(update_cols)
+            .map_err(to_py_err)?;
         Ok(slf)
     }
 
@@ -532,14 +513,8 @@ impl PyStreamTableUpdate {
     ) -> PyResult<Vec<PyCommitMessage>> {
         // The stream committer applies the identifier to the returned messages.
         let _ = commit_identifier;
-        upsert_by_arrow_with_key(
-            py,
-            &self.table,
-            &self.commit_user,
-            table,
-            upsert_keys,
-            self.update_columns.clone(),
-        )
+        self.context
+            .upsert_by_arrow_with_key(py, table, upsert_keys)
     }
 
     fn delete_by_row_id(
@@ -550,7 +525,7 @@ impl PyStreamTableUpdate {
     ) -> PyResult<Vec<PyCommitMessage>> {
         // The stream committer applies the identifier to the returned messages.
         let _ = commit_identifier;
-        delete_by_row_id(py, &self.table, &self.commit_user, row_ids)
+        self.context.delete_by_row_id(py, row_ids)
     }
 }
 
@@ -560,7 +535,10 @@ impl PyBatchTableUpdate {
         mut slf: PyRefMut<'py, Self>,
         update_cols: Vec<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        slf.update_columns = normalize_update_columns(&slf.table, update_cols)?;
+        slf.context
+            .inner
+            .with_update_type(update_cols)
+            .map_err(to_py_err)?;
         Ok(slf)
     }
 
@@ -570,14 +548,8 @@ impl PyBatchTableUpdate {
         table: &Bound<'_, PyAny>,
         upsert_keys: Vec<String>,
     ) -> PyResult<Vec<PyCommitMessage>> {
-        upsert_by_arrow_with_key(
-            py,
-            &self.table,
-            &self.commit_user,
-            table,
-            upsert_keys,
-            self.update_columns.clone(),
-        )
+        self.context
+            .upsert_by_arrow_with_key(py, table, upsert_keys)
     }
 
     fn delete_by_row_id(
@@ -585,7 +557,7 @@ impl PyBatchTableUpdate {
         py: Python<'_>,
         row_ids: Vec<i64>,
     ) -> PyResult<Vec<PyCommitMessage>> {
-        delete_by_row_id(py, &self.table, &self.commit_user, row_ids)
+        self.context.delete_by_row_id(py, row_ids)
     }
 }
 

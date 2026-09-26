@@ -139,6 +139,15 @@ def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
         'score': [101, 101, 21, 31, 41],
     }
 
+    # Empty selection remains empty in core, rather than updating all fields.
+    # Invalid configuration must not overwrite the previously selected fields.
+    all_columns.with_update_type([])
+    with pytest.raises(ValueError, match='not in table schema'):
+        all_columns.with_update_type(['missing'])
+    with pytest.raises(ValueError, match='update columns must not be empty'):
+        all_columns.upsert_by_arrow_with_key(
+            pa.Table.from_batches([first]), ['id'])
+
 
 def test_batch_update_row_ids_commits_through_write_builder(tmp_path):
     context = SQLContext()

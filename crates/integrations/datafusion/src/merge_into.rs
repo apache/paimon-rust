@@ -18,7 +18,7 @@
 //! MERGE INTO execution for Paimon tables.
 //!
 //! Supports two execution paths:
-//! - **Data evolution tables**: partial-column writes via [`paimon::table::TableUpdate`].
+//! - **Data evolution tables**: partial-column writes via [`paimon::table::TableUpdateByRowId`].
 //! - **Append-only tables** (no PK, no deletion vectors): copy-on-write file rewriting
 //!   via [`paimon::table::CopyOnWriteMergeWriter`].
 
@@ -122,7 +122,7 @@ where
 /// Execute a MERGE INTO statement on a Paimon table.
 ///
 /// Dispatches to the appropriate execution path based on table type:
-/// - Data evolution tables → partial-column writes via `TableUpdate`
+/// - Data evolution tables → partial-column writes via `TableUpdateByRowId`
 /// - Append-only tables (no PK) → copy-on-write file rewriting via `CopyOnWriteMergeWriter`
 pub(crate) async fn execute_merge_into(
     ctx: &SQLContext,
@@ -646,7 +646,7 @@ async fn execute_merge_into_once(
     let wb = table.new_write_builder();
     let update_writer = if let Some(ref upd) = parsed.update {
         Some(
-            wb.new_update(upd.columns.clone())
+            wb.new_update_by_row_id(upd.columns.clone())
                 .map_err(to_datafusion_error)?,
         )
     } else {

@@ -18,7 +18,9 @@
 //! Write builder for Java-compatible `type=format-table` metadata.
 
 use super::write_builder::validate_commit_user;
-use super::{DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite};
+use super::{
+    DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableUpdateByRowId, TableWrite,
+};
 use crate::resource::ResourceContext;
 use uuid::Uuid;
 
@@ -81,7 +83,16 @@ impl<'a> FormatWriteBuilder<'a> {
         )
     }
 
-    pub(crate) fn new_update(&self, _update_columns: Vec<String>) -> crate::Result<TableUpdate> {
+    pub(crate) fn new_update(&self) -> crate::Result<TableUpdate> {
+        Err(crate::Error::Unsupported {
+            message: "Updating format tables is not supported by the Rust client yet".to_string(),
+        })
+    }
+
+    pub(crate) fn new_update_by_row_id(
+        &self,
+        _update_columns: Vec<String>,
+    ) -> crate::Result<TableUpdateByRowId> {
         Err(crate::Error::Unsupported {
             message: "Updating format tables is not supported by the Rust client yet".to_string(),
         })
