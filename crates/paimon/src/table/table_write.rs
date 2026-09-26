@@ -45,9 +45,10 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
+use crate::table::write_batch_normalize::normalize_write_array;
 use crate::table::{Snapshot, SnapshotManager, Table, TableScan};
 use crate::Result;
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -133,6 +134,7 @@ pub struct TableWrite {
     partition_keys: Vec<String>,
     schema_id: i64,
     target_file_size: i64,
+    target_file_row_num: i64,
     blob_target_file_size: i64,
     vector_target_file_size: i64,
     file_compression: String,
@@ -201,6 +203,7 @@ impl TableWrite {
             partition_keys: schema.partition_keys().to_vec(),
             schema_id: schema.id(),
             target_file_size: 0,
+            target_file_row_num: i64::MAX,
             blob_target_file_size: 0,
             vector_target_file_size: 0,
             file_compression: String::new(),
@@ -315,6 +318,7 @@ impl TableWrite {
             });
         }
         let target_file_size = core_options.target_file_size();
+        let target_file_row_num = core_options.target_file_row_num()?;
         let blob_target_file_size = core_options.blob_target_file_size();
         let vector_target_file_size = core_options.vector_target_file_size();
         let file_compression = core_options.file_compression().to_string();
@@ -465,6 +469,7 @@ impl TableWrite {
             partition_keys,
             schema_id: schema.id(),
             target_file_size,
+            target_file_row_num,
             blob_target_file_size,
             vector_target_file_size,
             file_compression,
@@ -602,11 +607,11 @@ impl TableWrite {
     }
 
     pub(super) fn normalize_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
-        self.validate_write_batch_schema(batch)?;
+        let batch = self.validate_write_batch_schema(batch)?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }
-        let batch = self.enrich_rowkind_batch(batch)?;
+        let batch = self.enrich_rowkind_batch(&batch)?;
         Ok((batch.num_rows() != 0).then_some(batch))
     }
 
@@ -619,7 +624,7 @@ impl TableWrite {
         self.write_bucket(partition, bucket, batch).await
     }
 
-    fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<()> {
+    fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let expected_schema = &self.write_schema;
         let actual_schema = batch.schema();
         let table_field_count = expected_schema.fields().len();
@@ -689,19 +694,20 @@ impl TableWrite {
             }
         }
 
+        let mut normalized_columns: Vec<ArrayRef> = Vec::with_capacity(actual_field_count);
         for (index, expected_field) in expected_schema.fields().iter().enumerate() {
             let actual_field = actual_schema.field(index);
-            if actual_field.data_type() != expected_field.data_type() {
-                return Err(crate::Error::DataInvalid {
+            let column = normalize_write_array(batch.column(index), expected_field.data_type())
+                .map_err(|error| crate::Error::DataInvalid {
                     message: format!(
-                        "write batch schema data type mismatch for field '{}' at index {index}: expected {:?}, actual {:?}",
+                        "write batch schema data type mismatch for field '{}' at index {index}: expected {:?}, actual {:?}: {error}",
                         expected_field.name(),
                         expected_field.data_type(),
                         actual_field.data_type()
                     ),
-                    source: None,
-                });
-            }
+                    source: Some(Box::new(error)),
+                })?;
+            normalized_columns.push(column);
         }
         if includes_value_kind {
             let actual_field = actual_schema.field(table_field_count);
@@ -715,9 +721,25 @@ impl TableWrite {
                     source: None,
                 });
             }
+            normalized_columns.push(batch.column(table_field_count).clone());
         }
 
-        Ok(())
+        let schema = if includes_value_kind {
+            let mut fields = expected_schema.fields().iter().cloned().collect::<Vec<_>>();
+            fields.push(actual_schema.fields()[table_field_count].clone());
+            Arc::new(arrow_schema::Schema::new_with_metadata(
+                fields,
+                expected_schema.metadata().clone(),
+            ))
+        } else {
+            expected_schema.clone()
+        };
+        RecordBatch::try_new(schema, normalized_columns).map_err(|error| {
+            crate::Error::DataInvalid {
+                message: format!("Failed to normalize write batch schema: {error}"),
+                source: Some(Box::new(error)),
+            }
+        })
     }
 
     /// Group rows by (partition_bytes, bucket) and return sub-batches.
@@ -1114,6 +1136,7 @@ impl TableWrite {
                     bucket,
                     self.schema_id,
                     self.target_file_size,
+                    self.target_file_row_num,
                     self.blob_target_file_size,
                     self.file_compression.clone(),
                     self.file_compression_zstd_level,
@@ -1149,6 +1172,7 @@ impl TableWrite {
                     None,
                 )
                 .with_file_index(self.file_index_options.clone())
+                .with_target_file_row_num(self.target_file_row_num)
                 .with_resources(self.resources.clone()),
             ))
         }

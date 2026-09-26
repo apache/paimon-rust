@@ -137,6 +137,7 @@ pub(crate) mod vector_search_result;
 #[cfg(test)]
 mod vector_search_test_utils;
 mod vindex_index_build_builder;
+mod write_batch_normalize;
 mod write_builder;
 
 use crate::Result;
