@@ -75,6 +75,7 @@ const MANIFEST_DIR: &str = "manifest";
 #[must_use = "writer must be used to call prepare_commit()"]
 pub struct DataEvolutionWriter {
     table: Table,
+    read_snapshot_id: Option<i64>,
     update_columns: Vec<String>,
     write_fields: Vec<DataField>,
     matched_batches: Vec<RecordBatch>,
@@ -152,6 +153,7 @@ impl DataEvolutionWriter {
 
         Ok(Self {
             table: table.clone(),
+            read_snapshot_id: None,
             update_columns,
             write_fields,
             matched_batches: Vec::new(),
@@ -176,6 +178,12 @@ impl DataEvolutionWriter {
         Ok(())
     }
 
+    /// Pin the target scan to the same snapshot used to match source rows.
+    /// A concurrent update to those rows must be detected by the committer.
+    pub fn pin_read_snapshot(&mut self, snapshot_id: i64) {
+        self.read_snapshot_id = Some(snapshot_id);
+    }
+
     /// Scan file metadata, group matched rows by file, read originals,
     /// apply updates, and write partial-column files.
     ///
@@ -194,7 +202,17 @@ impl DataEvolutionWriter {
         //    In data-evolution tables, multiple files can share the same first_row_id
         //    (base file + partial-column files). We must group them so the reader
         //    can merge columns correctly.
-        let scan = self.table.new_read_builder().new_scan();
+        let read_table = if let Some(snapshot_id) = self.read_snapshot_id {
+            let snapshot = self
+                .table
+                .snapshot_manager()
+                .get_snapshot(snapshot_id)
+                .await?;
+            self.table.copy_with_pinned_snapshot(&snapshot)
+        } else {
+            self.table.clone()
+        };
+        let scan = read_table.new_read_builder().new_scan();
         let plan = scan.plan().await?;
 
         let mut file_index: Vec<FileRowRange> = Vec::new();
@@ -260,7 +278,7 @@ impl DataEvolutionWriter {
 
             // Read original columns from the entire file group (base + partial-column files).
             let col_refs: Vec<&str> = self.write_fields.iter().map(DataField::name).collect();
-            let mut rb = self.table.new_read_builder();
+            let mut rb = read_table.new_read_builder();
             rb.with_projection(&col_refs)?;
             let read = rb.new_read()?;
 

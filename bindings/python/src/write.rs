@@ -18,8 +18,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::array::{make_array, ArrayData, UInt32Array};
+use arrow::compute::take;
 use arrow::datatypes::Schema as ArrowSchema;
-use arrow::pyarrow::FromPyArrow;
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{CoreOptions, DataType, Datum};
 use paimon::table::{
@@ -29,7 +31,7 @@ use paimon::table::{
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyString};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 
 use crate::error::to_py_err;
 use crate::predicate::py_to_datum;
@@ -410,6 +412,14 @@ impl PyBatchTableUpdate {
         self.inner.take();
     }
 
+    fn pin_read_snapshot(&mut self, snapshot_id: i64) -> PyResult<()> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("BatchTableUpdate is closed"))?
+            .pin_read_snapshot(snapshot_id);
+        Ok(())
+    }
+
     fn add_matched_batch(&mut self, batch: &Bound<'_, PyAny>) -> PyResult<()> {
         let batch = RecordBatch::from_pyarrow_bound(batch)?;
         self.inner
@@ -417,6 +427,92 @@ impl PyBatchTableUpdate {
             .ok_or_else(|| PyRuntimeError::new_err("BatchTableUpdate is closed"))?
             .add_matched_batch(batch)
             .map_err(to_py_err)
+    }
+
+    /// Evaluate assignments for one matched logical file group. Python
+    /// callables run with the GIL and receive the original Arrow table; batch
+    /// construction and submission stay inside the native update bridge.
+    fn add_assigned_table(
+        &mut self,
+        py: Python<'_>,
+        matched: &Bound<'_, PyAny>,
+        assignments: &Bound<'_, PyDict>,
+        schema: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let row_count: usize = matched.getattr("num_rows")?.extract()?;
+        if row_count == 0 {
+            return Ok(());
+        }
+        let pa = py.import("pyarrow")?;
+        let array_type = pa.getattr("Array")?;
+        let chunked_type = pa.getattr("ChunkedArray")?;
+        let scalar_type = pa.getattr("Scalar")?;
+        let mut arrays = vec![matched.get_item("_ROW_ID")?.unbind()];
+        let mut fields = vec![pa
+            .call_method1("field", ("_ROW_ID", pa.call_method0("int64")?))?
+            .unbind()];
+        for (name, original) in assignments.iter() {
+            let name: String = name.extract()?;
+            let field = schema.call_method1("field", (&name,))?;
+            let target_type = field.getattr("type")?;
+            let value = if original.is_callable() {
+                let result = original.call1((matched,))?;
+                if !result.is_instance(&array_type)? && !result.is_instance(&chunked_type)? {
+                    return Err(PyValueError::new_err(format!(
+                        "Callable assignment for {name} must return a pyarrow.Array or pyarrow.ChunkedArray."
+                    )));
+                }
+                result
+            } else {
+                original
+            };
+            let array = if value.is_instance(&array_type)? || value.is_instance(&chunked_type)? {
+                let length: usize = value.len()?;
+                if length != row_count {
+                    return Err(PyValueError::new_err(format!(
+                        "Assignment array length must match matched row count: {length} != {row_count}."
+                    )));
+                }
+                if value.getattr("type")?.eq(&target_type)? {
+                    value
+                } else {
+                    value.call_method1("cast", (&target_type,))?
+                }
+            } else {
+                let scalar = if value.is_instance(&scalar_type)? {
+                    value.call_method0("as_py")?
+                } else {
+                    value
+                };
+                // Convert a single scalar through PyArrow's existing type
+                // semantics, then broadcast it with Arrow in Rust. Avoid a
+                // Python object for every matched row.
+                let values = PyList::new(py, [scalar])?;
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("type", &target_type)?;
+                let one = pa.call_method("array", (values,), Some(&kwargs))?;
+                let one = make_array(ArrayData::from_pyarrow_bound(&one)?);
+                let indices = UInt32Array::from(vec![0; row_count]);
+                take(one.as_ref(), &indices, None)
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?
+                    .to_data()
+                    .to_pyarrow(py)?
+            };
+            arrays.push(array.unbind());
+            fields.push(field.unbind());
+        }
+        let table_schema = pa.call_method1("schema", (PyList::new(py, fields)?,))?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("schema", table_schema)?;
+        let table = pa.getattr("Table")?.call_method(
+            "from_arrays",
+            (PyList::new(py, arrays)?,),
+            Some(&kwargs),
+        )?;
+        for batch in table.call_method0("to_batches")?.try_iter()? {
+            self.add_matched_batch(&batch?)?;
+        }
+        Ok(())
     }
 
     fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {

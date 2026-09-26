@@ -45,6 +45,12 @@ impl TableUpdate {
         self.writer.add_matched_batch(batch)
     }
 
+    /// Use the snapshot that produced the matched rows for target reads and
+    /// conflict detection.
+    pub fn pin_read_snapshot(&mut self, snapshot_id: i64) {
+        self.writer.pin_read_snapshot(snapshot_id);
+    }
+
     /// Prepare commit messages for the caller to commit via [`TableCommit`](super::TableCommit).
     #[must_use = "commit messages must be passed to TableCommit"]
     pub async fn prepare_commit(self) -> crate::Result<Vec<CommitMessage>> {

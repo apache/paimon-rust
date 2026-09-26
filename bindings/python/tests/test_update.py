@@ -18,7 +18,33 @@
 import pyarrow as pa
 import pytest
 
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
+from pypaimon_rust.datafusion import PaimonCatalog, SQLContext, UpsertKeyMatcher
+
+
+def test_upsert_key_matcher_deduplicates_and_fans_out():
+    source = pa.record_batch([
+        pa.array([1, 1, 2, None, 3], type=pa.int32()),
+        pa.array(['a', 'a', 'b', 'n', 'c']),
+    ], names=['id', 'part'])
+    matcher = UpsertKeyMatcher(source, ['id', 'part'])
+    assert matcher.deduplicated_indices() == [1, 2, 3, 4]
+    matcher.add_existing_batch(pa.record_batch([
+        pa.array([1, 2, 1, None, 9], type=pa.int32()),
+        pa.array(['a', 'b', 'a', 'n', 'other']),
+        pa.array([10, 20, 11, 30, 40], type=pa.int64()),
+    ], names=['id', 'part', '_ROW_ID']))
+    assert matcher.finish() == ([1, 1, 2, 3], [10, 11, 20, 30], [4])
+
+
+def test_upsert_key_matcher_rejects_different_key_types():
+    matcher = UpsertKeyMatcher(pa.record_batch([
+        pa.array([1], type=pa.int32()),
+    ], names=['id']), ['id'])
+    with pytest.raises(ValueError, match='upsert key type differs'):
+        matcher.add_existing_batch(pa.record_batch([
+            pa.array([1], type=pa.int64()),
+            pa.array([0], type=pa.int64()),
+        ], names=['id', '_ROW_ID']))
 
 
 def test_batch_update_row_ids_commits_through_write_builder(tmp_path):
