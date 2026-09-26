@@ -2399,6 +2399,22 @@ mod tests {
             .await
             .unwrap();
 
+        let first_namespace = first_io
+            .new_input(path)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap()
+            .cache_namespace();
+        let second_namespace = second_io
+            .new_input(path)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap()
+            .cache_namespace();
+        assert_ne!(first_namespace, second_namespace);
+
         assert_eq!(
             read_scalar_blob_file(&first_io, path).await,
             vec![None, Some(value.to_vec())]
