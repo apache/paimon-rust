@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{make_array, ArrayData, UInt32Array};
@@ -25,8 +25,8 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{CoreOptions, DataType, Datum};
 use paimon::table::{
-    CommitMessage, DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableUpsert,
-    TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
+    CommitMessage, DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite,
+    COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -103,25 +103,32 @@ impl WriteContext {
             commit_user: self.commit_user.clone(),
         })
     }
+}
 
-    fn new_upsert(
-        &self,
-        keys: Vec<String>,
-        update_columns: Vec<String>,
-    ) -> PyResult<PyTableUpsert> {
-        let inner = self
-            .table
-            .new_write_builder()
-            .with_commit_user(self.commit_user.clone())
-            .map_err(to_py_err)?
-            .new_upsert(keys, update_columns)
-            .map_err(to_py_err)?;
-        Ok(PyTableUpsert {
-            inner: Some(inner),
-            table_location: self.table.location().to_string(),
-            commit_user: self.commit_user.clone(),
-        })
+fn table_field_names(table: &Table) -> Vec<String> {
+    table
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect()
+}
+
+fn normalize_update_columns(table: &Table, requested: Vec<String>) -> PyResult<Vec<String>> {
+    let fields = table_field_names(table);
+    let mut seen = HashSet::new();
+    let mut columns = Vec::new();
+    for column in requested {
+        if !fields.contains(&column) {
+            return Err(PyValueError::new_err(format!(
+                "Column {column} is not in table schema."
+            )));
+        }
+        if seen.insert(column.clone()) {
+            columns.push(column);
+        }
     }
+    Ok(if columns.is_empty() { fields } else { columns })
 }
 
 fn boolean_option(table: &Table, key: &str, default: bool) -> PyResult<bool> {
@@ -247,38 +254,36 @@ impl PyBatchWriteBuilder {
 
     /// Create a row-ID data-evolution update writer. The Python caller supplies
     /// matched Arrow batches and commits the returned messages separately.
-    fn new_update(&self, update_columns: Vec<String>) -> PyResult<PyBatchTableUpdate> {
+    #[pyo3(signature = (update_columns=None))]
+    fn new_update(&self, update_columns: Option<Vec<String>>) -> PyResult<PyBatchTableUpdate> {
         if self.static_partition.is_some() {
             return Err(PyValueError::new_err(
                 "BatchTableUpdate does not support overwrite",
             ));
         }
-        let inner = self
-            .context
-            .table
-            .new_write_builder()
-            .with_commit_user(self.context.commit_user.clone())
-            .map_err(to_py_err)?
-            .new_update(update_columns)
-            .map_err(to_py_err)?;
+        let inner = update_columns
+            .as_ref()
+            .map(|columns| {
+                self.context
+                    .table
+                    .new_write_builder()
+                    .with_commit_user(self.context.commit_user.clone())
+                    .map_err(to_py_err)?
+                    .new_update(columns.clone())
+                    .map_err(to_py_err)
+            })
+            .transpose()?;
+        let update_columns =
+            update_columns.unwrap_or_else(|| table_field_names(&self.context.table));
         Ok(PyBatchTableUpdate {
-            inner: Some(inner),
+            inner,
+            table: Arc::clone(&self.context.table),
             table_location: self.context.table.location().to_string(),
             commit_user: self.context.commit_user.clone(),
+            update_columns,
+            started: false,
+            closed: false,
         })
-    }
-
-    fn new_upsert(
-        &self,
-        keys: Vec<String>,
-        update_columns: Vec<String>,
-    ) -> PyResult<PyTableUpsert> {
-        if self.static_partition.is_some() {
-            return Err(PyValueError::new_err(
-                "TableUpsert does not support overwrite",
-            ));
-        }
-        self.context.new_upsert(keys, update_columns)
     }
 
     /// Create a deletion-vector writer for data-evolution row-ID deletes.
@@ -358,12 +363,13 @@ impl PyStreamWriteBuilder {
         })
     }
 
-    fn new_upsert(
-        &self,
-        keys: Vec<String>,
-        update_columns: Vec<String>,
-    ) -> PyResult<PyTableUpsert> {
-        self.context.new_upsert(keys, update_columns)
+    fn new_update(&self) -> PyStreamTableUpdate {
+        PyStreamTableUpdate {
+            table: Arc::clone(&self.context.table),
+            commit_user: self.context.commit_user.clone(),
+            update_columns: table_field_names(&self.context.table),
+            closed: false,
+        }
     }
 
     fn new_commit(&self) -> PyResult<PyStreamTableCommit> {
@@ -395,6 +401,31 @@ fn wrap_messages(
             }),
         })
         .collect()
+}
+
+fn upsert_by_arrow_with_key(
+    py: Python<'_>,
+    table: &Table,
+    commit_user: &str,
+    input: &Bound<'_, PyAny>,
+    keys: Vec<String>,
+    update_columns: Vec<String>,
+) -> PyResult<Vec<PyCommitMessage>> {
+    let mut upsert = table
+        .new_write_builder()
+        .with_commit_user(commit_user)
+        .map_err(to_py_err)?
+        .new_upsert(keys, update_columns)
+        .map_err(to_py_err)?;
+    for batch in input.call_method0("to_batches")?.try_iter()? {
+        upsert
+            .add_batch(RecordBatch::from_pyarrow_bound(&batch?)?)
+            .map_err(to_py_err)?;
+    }
+    let messages = py
+        .detach(|| runtime().block_on(upsert.prepare_commit()))
+        .map_err(to_py_err)?;
+    Ok(wrap_messages(messages, table.location(), commit_user))
 }
 
 impl WriteState {
@@ -442,69 +473,149 @@ pub struct PyBatchTableWrite {
 )]
 pub struct PyBatchTableUpdate {
     inner: Option<TableUpdate>,
+    table: Arc<Table>,
     table_location: String,
     commit_user: String,
+    update_columns: Vec<String>,
+    started: bool,
+    closed: bool,
 }
 
-#[pyclass(name = "TableUpsert", module = "pypaimon_rust.datafusion", unsendable)]
-pub struct PyTableUpsert {
-    inner: Option<TableUpsert>,
-    table_location: String,
+impl PyBatchTableUpdate {
+    fn ensure_inner(&mut self) -> PyResult<&mut TableUpdate> {
+        if self.closed {
+            return Err(PyRuntimeError::new_err("BatchTableUpdate is closed"));
+        }
+        if self.inner.is_none() {
+            self.inner = Some(
+                self.table
+                    .new_write_builder()
+                    .with_commit_user(self.commit_user.clone())
+                    .map_err(to_py_err)?
+                    .new_update(self.update_columns.clone())
+                    .map_err(to_py_err)?,
+            );
+        }
+        Ok(self.inner.as_mut().expect("update writer initialized"))
+    }
+}
+
+#[pyclass(
+    name = "StreamTableUpdate",
+    module = "pypaimon_rust.datafusion",
+    unsendable
+)]
+pub struct PyStreamTableUpdate {
+    table: Arc<Table>,
     commit_user: String,
+    update_columns: Vec<String>,
+    closed: bool,
 }
 
 #[pymethods]
-impl PyTableUpsert {
+impl PyStreamTableUpdate {
     fn close(&mut self) {
-        self.inner.take();
+        self.closed = true;
     }
 
-    fn add_batch(&mut self, batch: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batch = RecordBatch::from_pyarrow_bound(batch)?;
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("TableUpsert is closed"))?
-            .add_batch(batch)
-            .map_err(to_py_err)
+    fn with_update_type<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        update_columns: Vec<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        if slf.closed {
+            return Err(PyRuntimeError::new_err("StreamTableUpdate is closed"));
+        }
+        slf.update_columns = normalize_update_columns(&slf.table, update_columns)?;
+        Ok(slf)
     }
 
-    fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("TableUpsert is closed"))?;
-        let messages = py
-            .detach(|| runtime().block_on(inner.prepare_commit()))
-            .map_err(to_py_err)?;
-        Ok(wrap_messages(
-            messages,
-            &self.table_location,
+    fn upsert_by_arrow_with_key(
+        &self,
+        py: Python<'_>,
+        input: &Bound<'_, PyAny>,
+        keys: Vec<String>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        if self.closed {
+            return Err(PyRuntimeError::new_err("StreamTableUpdate is closed"));
+        }
+        // The stream committer applies the identifier to the returned messages.
+        let _ = commit_identifier;
+        upsert_by_arrow_with_key(
+            py,
+            &self.table,
             &self.commit_user,
-        ))
+            input,
+            keys,
+            self.update_columns.clone(),
+        )
     }
 }
 
 #[pymethods]
 impl PyBatchTableUpdate {
     fn close(&mut self) {
+        self.closed = true;
         self.inner.take();
     }
 
+    fn with_update_type<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        update_columns: Vec<String>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        if slf.started {
+            return Err(PyRuntimeError::new_err(
+                "Cannot change update columns after adding matched rows",
+            ));
+        }
+        if slf.closed {
+            return Err(PyRuntimeError::new_err("BatchTableUpdate is closed"));
+        }
+        let update_columns = normalize_update_columns(&slf.table, update_columns)?;
+        let inner = slf
+            .table
+            .new_write_builder()
+            .with_commit_user(slf.commit_user.clone())
+            .map_err(to_py_err)?
+            .new_update(update_columns.clone())
+            .map_err(to_py_err)?;
+        slf.inner = Some(inner);
+        slf.update_columns = update_columns;
+        Ok(slf)
+    }
+
+    fn upsert_by_arrow_with_key(
+        &self,
+        py: Python<'_>,
+        input: &Bound<'_, PyAny>,
+        keys: Vec<String>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        if self.closed {
+            return Err(PyRuntimeError::new_err("BatchTableUpdate is closed"));
+        }
+        upsert_by_arrow_with_key(
+            py,
+            &self.table,
+            &self.commit_user,
+            input,
+            keys,
+            self.update_columns.clone(),
+        )
+    }
+
     fn pin_read_snapshot(&mut self, snapshot_id: i64) -> PyResult<()> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("BatchTableUpdate is closed"))?
-            .pin_read_snapshot(snapshot_id);
+        self.ensure_inner()?.pin_read_snapshot(snapshot_id);
+        self.started = true;
         Ok(())
     }
 
     fn add_matched_batch(&mut self, batch: &Bound<'_, PyAny>) -> PyResult<()> {
         let batch = RecordBatch::from_pyarrow_bound(batch)?;
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("BatchTableUpdate is closed"))?
+        self.ensure_inner()?
             .add_matched_batch(batch)
-            .map_err(to_py_err)
+            .map_err(to_py_err)?;
+        self.started = true;
+        Ok(())
     }
 
     /// Preserve one Python Arrow table's boundary across its record batches.
@@ -513,11 +624,11 @@ impl PyBatchTableUpdate {
             .try_iter()?
             .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
             .collect::<PyResult<Vec<_>>>()?;
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("BatchTableUpdate is closed"))?
+        self.ensure_inner()?
             .add_matched_group(batches)
-            .map_err(to_py_err)
+            .map_err(to_py_err)?;
+        self.started = true;
+        Ok(())
     }
 
     /// Evaluate assignments for one matched logical file group. Python
@@ -607,10 +718,12 @@ impl PyBatchTableUpdate {
     }
 
     fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
+        self.ensure_inner()?;
         let inner = self
             .inner
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("BatchTableUpdate is closed"))?;
+        self.closed = true;
         let messages = py
             .detach(|| runtime().block_on(inner.prepare_commit()))
             .map_err(to_py_err)?;

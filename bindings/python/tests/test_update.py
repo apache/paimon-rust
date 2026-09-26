@@ -59,21 +59,23 @@ def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
         VALUES (1, 'a', 10), (1, 'b', 11), (2, 'c', 20)""")
     table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('table_upsert.t')
     builder = table.new_batch_write_builder()
-    upsert = builder.new_upsert(['id'], ['name', 'score'])
-    upsert.add_batch(pa.record_batch([
+    first = pa.record_batch([
         pa.array([1], type=pa.int32()),
         pa.array(['x']),
         pa.array([100], type=pa.int32()),
-    ], names=['id', 'name', 'score']))
-    upsert.add_batch(pa.record_batch([
+    ], names=['id', 'name', 'score'])
+    second = pa.record_batch([
         pa.array([1, 3], type=pa.int32()),
         pa.array(['y', 'd']),
         pa.array([101, 30], type=pa.int32()),
-    ], names=['id', 'name', 'score']))
-    messages = upsert.prepare_commit()
+    ], names=['id', 'name', 'score'])
+    update = builder.new_update().with_update_type(['name', 'score'])
+    messages = update.upsert_by_arrow_with_key(
+        pa.Table.from_batches([first, second]), ['id'])
     assert messages and all(message.serialize() for message in messages)
+    update.close()
     with pytest.raises(RuntimeError, match='closed'):
-        upsert.prepare_commit()
+        update.upsert_by_arrow_with_key(pa.Table.from_batches([first]), ['id'])
     builder.new_commit().commit(messages)
 
     actual = pa.Table.from_batches(context.sql(
@@ -86,20 +88,47 @@ def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
     }
 
     stream = table.new_stream_write_builder()
-    next_upsert = stream.new_upsert(['id'], ['name', 'score'])
-    next_upsert.add_batch(pa.record_batch([
+    next_rows = pa.record_batch([
         pa.array([2, 4], type=pa.int32()),
         pa.array(['C', 'e']),
         pa.array([21, 40], type=pa.int32()),
-    ], names=['id', 'name', 'score']))
-    stream.new_commit().commit(42, next_upsert.prepare_commit())
+    ], names=['id', 'name', 'score'])
+    stream_update = stream.new_update().with_update_type(['name', 'score'])
+    messages = stream_update.upsert_by_arrow_with_key(
+        pa.Table.from_batches([next_rows]), ['id'], 42)
+    stream.new_commit().commit(42, messages)
+    next_round = pa.record_batch([
+        pa.array([4], type=pa.int32()),
+        pa.array(['E']),
+        pa.array([41], type=pa.int32()),
+    ], names=['id', 'name', 'score'])
+    messages = stream_update.upsert_by_arrow_with_key(
+        pa.Table.from_batches([next_round]), ['id'], 43)
+    stream.new_commit().commit(43, messages)
     actual = pa.Table.from_batches(context.sql(
         'SELECT id, name, score FROM paimon.table_upsert.t'))
     actual = actual.sort_by([('id', 'ascending'), ('name', 'ascending')]).to_pydict()
     assert actual == {
         'id': [1, 1, 2, 3, 4],
-        'name': ['y', 'y', 'C', 'd', 'e'],
-        'score': [101, 101, 21, 30, 40],
+        'name': ['y', 'y', 'C', 'd', 'E'],
+        'score': [101, 101, 21, 30, 41],
+    }
+
+    builder = table.new_batch_write_builder()
+    all_columns = builder.new_update()
+    messages = all_columns.upsert_by_arrow_with_key(pa.Table.from_pydict({
+        'id': [3], 'name': ['D'], 'score': [31],
+    }, schema=pa.schema([
+        ('id', pa.int32()), ('name', pa.string()), ('score', pa.int32()),
+    ])), ['id'])
+    builder.new_commit().commit(messages)
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, name, score FROM paimon.table_upsert.t'))
+    actual = actual.sort_by([('id', 'ascending'), ('name', 'ascending')]).to_pydict()
+    assert actual == {
+        'id': [1, 1, 2, 3, 4],
+        'name': ['y', 'y', 'C', 'D', 'E'],
+        'score': [101, 101, 21, 31, 41],
     }
 
 
