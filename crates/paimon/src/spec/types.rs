@@ -664,6 +664,11 @@ impl FromStr for BinaryType {
             .fail();
         }
 
+        // Java permits omitted lengths and uses the type's default length.
+        if s == "BINARY" || s == "BINARY NOT NULL" {
+            return Self::with_nullable(s == "BINARY", Self::DEFAULT_LENGTH);
+        }
+
         let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "BinaryType")?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
@@ -1691,6 +1696,11 @@ impl FromStr for VarBinaryType {
             .fail();
         }
 
+        // Java permits omitted lengths and uses the type's default length.
+        if s == "VARBINARY" || s == "VARBINARY NOT NULL" {
+            return Self::try_new(s == "VARBINARY", Self::DEFAULT_LENGTH);
+        }
+
         let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "VarBinaryType")?;
         let length_str = &s[open_bracket + 1..close_bracket];
         let length = length_str
@@ -1789,6 +1799,11 @@ impl FromStr for VarCharType {
                     "Invalid VARCHAR type. Expected string to start with 'VARCHAR' or 'STRING'.",
             }
             .fail();
+        }
+
+        // Java permits omitted lengths and uses the type's default length.
+        if s == "VARCHAR" || s == "VARCHAR NOT NULL" {
+            return Self::with_nullable(s == "VARCHAR", Self::DEFAULT_LENGTH);
         }
 
         let (open_bracket, close_bracket) = serde_utils::extract_brackets_pos(s, "VarCharType")?;
@@ -2879,6 +2894,28 @@ mod tests {
     }
 
     #[test]
+    fn test_default_length_string_types_match_java() {
+        // Java DataTypeJsonParser uses each type's DEFAULT_LENGTH when omitted.
+        let cases = [
+            ("VARCHAR", DataType::VarChar(VarCharType::default())),
+            ("BINARY", DataType::Binary(BinaryType::default())),
+            ("VARBINARY", DataType::VarBinary(VarBinaryType::default())),
+        ];
+        for (name, expected) in cases {
+            for nullable in [true, false] {
+                let suffix = if nullable { "" } else { " NOT NULL" };
+                let expected = expected.copy_with_nullable(nullable).unwrap();
+                for input in [format!("{name}{suffix}"), format!("{name}(1){suffix}")] {
+                    let parsed: DataType =
+                        serde_json::from_value(serde_json::json!(input)).unwrap();
+                    assert_eq!(parsed, expected, "{input}");
+                    assert_eq!(parsed.to_string(), format!("{name}(1){suffix}"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_string_type_serializes_like_java() {
         let nullable = DataType::VarChar(VarCharType::string_type());
         assert_eq!(serde_json::to_string(&nullable).unwrap(), r#""STRING""#);
@@ -3299,7 +3336,9 @@ mod tests {
     fn test_datatype_deserialize_rejects_unknown_shapes() {
         assert!(serde_json::from_str::<DataType>("\"TUPLE\"").is_err());
         assert!(serde_json::from_str::<DataType>("\"INT NULLABLE\"").is_err());
-        assert!(serde_json::from_str::<DataType>("\"VARCHAR\"").is_err());
+        for malformed in ["VARCHAR(", "BINARY(", "VARBINARY("] {
+            assert!(serde_json::from_value::<DataType>(serde_json::json!(malformed)).is_err());
+        }
         assert!(serde_json::from_str::<DataType>(r#"{"type":"TUPLE","element":"INT"}"#).is_err());
         assert!(serde_json::from_str::<DataType>(r#"{"element":"INT"}"#).is_err());
         assert!(serde_json::from_str::<DataType>("7").is_err());

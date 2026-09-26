@@ -17,11 +17,11 @@
 
 use std::collections::HashMap;
 
+use crate::spec::core_options::IGNORE_DELETE_FALLBACK_KEYS;
 use crate::spec::{CoreOptions, DataField, DataType, VarCharType};
 
 const MERGE_ENGINE_OPTION: &str = "merge-engine";
 const AGGREGATION_ENGINE: &str = "aggregation";
-const IGNORE_DELETE_OPTION: &str = "ignore-delete";
 const IGNORE_DELETE_SUFFIX: &str = ".ignore-delete";
 const AGGREGATION_REMOVE_RECORD_ON_DELETE_OPTION: &str = "aggregation.remove-record-on-delete";
 const FIELDS_DEFAULT_AGG_FUNCTION_OPTION: &str = "fields.default-aggregate-function";
@@ -547,8 +547,9 @@ pub(crate) fn validate_no_aggregation_on_sequence_field(
 }
 
 fn is_unsupported_aggregation_option(key: &str) -> bool {
-    key == IGNORE_DELETE_OPTION
-        || key.ends_with(IGNORE_DELETE_SUFFIX)
+    // Global ignore-delete and its Java aliases filter rows before aggregation.
+    // Field-level aggregation uses ignore-retract instead.
+    (key.ends_with(IGNORE_DELETE_SUFFIX) && !IGNORE_DELETE_FALLBACK_KEYS.contains(&key))
         || is_fields_option_with_suffix(key, SEQUENCE_GROUP_SUFFIX)
 }
 
@@ -622,6 +623,30 @@ mod tests {
     }
 
     #[test]
+    fn test_aggregation_accepts_global_ignore_delete_and_java_aliases() {
+        for key in
+            std::iter::once("ignore-delete").chain(IGNORE_DELETE_FALLBACK_KEYS.iter().copied())
+        {
+            for value in ["true", "false"] {
+                let options = aggregation_options(&[(key, value)]);
+                let config = AggregationConfig::new(&options);
+                assert_eq!(
+                    config
+                        .validate_create_mode(&pk(), &sample_fields())
+                        .unwrap(),
+                    Some(AggregationMode::Basic),
+                    "{key}={value}"
+                );
+                assert_eq!(
+                    config.validate_runtime_mode(true, "default.t").unwrap(),
+                    Some(AggregationMode::Basic),
+                    "{key}={value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_validate_create_mode_ignores_non_pk_tables() {
         let options = aggregation_options(&[("fields.x.ignore-retract", "true")]);
         let config = AggregationConfig::new(&options);
@@ -648,7 +673,7 @@ mod tests {
     #[test]
     fn test_validate_create_mode_rejects_unsupported_options() {
         for key in [
-            IGNORE_DELETE_OPTION,
+            "aggregation.ignore-delete",
             "fields.price.ignore-delete",
             "fields.price.sequence-group",
         ] {

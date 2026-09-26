@@ -340,3 +340,76 @@ def test_ltz_schema_alias_write_roundtrip(tmp_path, precision, unit, micros, fra
     assert sum(split.row_count() for split in table.new_read_builder().new_scan().plan().splits()) == 1
     rows = pa.Table.from_batches(ctx.sql("SELECT id, ts FROM paimon.wdb.t"))
     assert rows.to_pydict() == {"id": [1], "ts": [value]}
+
+
+@pytest.mark.parametrize("primary_key", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_write_normalizes_nested_and_fixed_binary(tmp_path, primary_key, stream):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.wdb")
+    key = ", PRIMARY KEY (id)" if primary_key else ""
+    options = " WITH ('bucket' = '1')" if primary_key else ""
+    ctx.sql("CREATE TABLE paimon.wdb.t (id INT, data BINARY, items INT[]{}){}".format(
+        key, options))
+    table = _get_table(str(tmp_path))
+    builder = table.new_stream_write_builder() if stream else table.new_batch_write_builder()
+    writer = builder.new_write()
+    schema = pa.schema([("id", pa.int32()), ("data", pa.binary(2)),
+                        ("items", pa.list_(pa.int32()))])
+    data = pa.record_batch([[0, 1, 2, 3], [b"00", b"ab", None, b"cd"],
+                           [[], [1, None], None, []]], schema=schema)
+    # Rejected batches must not poison the writer or cause partial writes.
+    wrong = data.rename_columns(["items", "data", "id"])
+    with pytest.raises(ValueError):
+        writer.write_arrow(wrong)
+    writer.write_arrow(data.slice(1))
+    messages = writer.prepare_commit(True, 1) if stream else writer.prepare_commit()
+    commit = builder.new_commit()
+    if stream:
+        commit.commit(1, messages)
+    else:
+        commit.commit(messages)
+    result = pa.Table.from_batches(ctx.sql("SELECT * FROM paimon.wdb.t ORDER BY id"))
+    assert result.to_pylist() == data.slice(1).to_pylist()
+    writer.close()
+
+
+def test_format_write_schema_error_preserves_accepted_rows(tmp_path):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.wdb")
+    ctx.sql("CREATE TABLE paimon.wdb.t (id INT, name STRING) "
+            "WITH ('type' = 'format-table', 'file.format' = 'parquet')")
+    builder = _get_table(str(tmp_path)).new_batch_write_builder()
+    writer = builder.new_write()
+    try:
+        writer.write_arrow(_batch([1], ["first"]))
+        with pytest.raises(ValueError):
+            writer.write_arrow(_batch([9], ["invalid"]).rename_columns(["wrong", "name"]))
+        writer.write_arrow(_batch([2], ["second"]))
+        builder.new_commit().commit(writer.prepare_commit())
+        result = pa.Table.from_batches(ctx.sql("SELECT * FROM paimon.wdb.t ORDER BY id"))
+        assert result.to_pydict() == {"id": [1, 2], "name": ["first", "second"]}
+    finally:
+        writer.close()
+
+
+def test_write_explicit_row_kinds_use_core_ignore_delete_filter(tmp_path):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.wdb")
+    ctx.sql("CREATE TABLE paimon.wdb.t (id INT, value INT, PRIMARY KEY (id)) "
+            "WITH ('bucket' = '1', 'merge-engine' = 'aggregation', "
+            "'fields.value.aggregate-function' = 'sum', 'ignore-delete' = 'true')")
+    builder = _get_table(str(tmp_path)).new_batch_write_builder()
+    writer = builder.new_write()
+    try:
+        schema = pa.schema([("id", pa.int32()), ("value", pa.int32()),
+                            ("_VALUE_KIND", pa.int8())])
+        writer.write_arrow(pa.record_batch([[1, 1, 2], [10, 3, 7], [0, 3, 1]], schema=schema))
+        builder.new_commit().commit(writer.prepare_commit())
+        result = pa.Table.from_batches(ctx.sql("SELECT * FROM paimon.wdb.t"))
+        assert result.to_pydict() == {"id": [1], "value": [10]}
+    finally:
+        writer.close()

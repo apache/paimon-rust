@@ -95,6 +95,7 @@ const MANIFEST_SORT_ENABLED_OPTION: &str = "manifest-sort.enabled";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_FILTER_COLUMN_INDEX_ENABLED_OPTION: &str = "parquet.filter.columnindex.enabled";
+const PARQUET_WRITE_PAGE_INDEX_ENABLED_OPTION: &str = "parquet.write-page-index.enabled";
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
 pub(crate) const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
     "read.parquet.row-group.max-inflight-bytes";
@@ -112,7 +113,7 @@ pub(crate) const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
 const ROWKIND_FIELD_OPTION: &str = "rowkind.field";
 const IGNORE_DELETE_OPTION: &str = "ignore-delete";
 const IGNORE_UPDATE_BEFORE_OPTION: &str = "ignore-update-before";
-const IGNORE_DELETE_FALLBACK_KEYS: &[&str] = &[
+pub(super) const IGNORE_DELETE_FALLBACK_KEYS: &[&str] = &[
     "first-row.ignore-delete",
     "deduplicate.ignore-delete",
     "partial-update.ignore-delete",
@@ -765,6 +766,22 @@ impl<'a> CoreOptions<'a> {
             _ => Err(crate::Error::ConfigInvalid {
                 message: format!(
                     "Option '{PARQUET_FILTER_COLUMN_INDEX_ENABLED_OPTION}' must be true or false, got: {raw}"
+                ),
+            }),
+        }
+    }
+
+    /// Whether newly written Parquet files include page indexes. Default is true.
+    pub fn parquet_write_page_index_enabled(&self) -> crate::Result<bool> {
+        let Some(raw) = self.options.get(PARQUET_WRITE_PAGE_INDEX_ENABLED_OPTION) else {
+            return Ok(true);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Option '{PARQUET_WRITE_PAGE_INDEX_ENABLED_OPTION}' must be true or false, got: {raw}"
                 ),
             }),
         }
