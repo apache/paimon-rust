@@ -24,6 +24,12 @@ use crate::catalog::DEFAULT_MAIN_BRANCH;
 use crate::io::FileIO;
 use crate::table::{SchemaManager, SnapshotManager, TagManager};
 use opendal::raw::get_basename;
+use std::collections::HashMap;
+
+/// Table option a reader falls back to when the primary branch has no data.
+const SCAN_FALLBACK_BRANCH: &str = "scan.fallback-branch";
+/// Table option naming the branch a reader treats as primary.
+const SCAN_PRIMARY_BRANCH: &str = "scan.primary-branch";
 
 const BRANCH_DIR: &str = "branch";
 const BRANCH_PREFIX: &str = "branch-";
@@ -200,6 +206,33 @@ impl BranchManager {
         }
         let path = self.branch_path(branch_name);
         self.file_io.delete_dir(&path).await?;
+        Ok(())
+    }
+
+    /// Reject deleting a branch a reader is configured to consult.
+    ///
+    /// A branch named by `scan.primary-branch` or `scan.fallback-branch` is part
+    /// of a table's read path; dropping it would break reads that fall back to
+    /// it. Mirrors Java `AbstractFileStoreTable.deleteBranch`, which refuses the
+    /// deletion and asks the caller to unset the option first. Callers pass the
+    /// table options because these keys live on the schema, not the manager.
+    pub fn ensure_branch_deletable(
+        options: &HashMap<String, String>,
+        branch_name: &str,
+    ) -> crate::Result<()> {
+        for key in [SCAN_PRIMARY_BRANCH, SCAN_FALLBACK_BRANCH] {
+            if options
+                .get(key)
+                .is_some_and(|configured| configured == branch_name)
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Cannot delete branch '{branch_name}' because it is configured as '{key}'. Unset '{key}' first."
+                    ),
+                    source: None,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -499,6 +532,30 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("doesn't exist"));
+    }
+
+    #[test]
+    fn test_ensure_branch_deletable_rejects_scan_branches() {
+        for key in ["scan.primary-branch", "scan.fallback-branch"] {
+            let mut options = HashMap::new();
+            options.insert(key.to_string(), "prod".to_string());
+
+            // The branch the option points at is part of a read path.
+            let err = BranchManager::ensure_branch_deletable(&options, "prod").unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("prod"), "{msg}");
+            assert!(msg.contains(key), "{msg}");
+
+            // A different branch is unaffected even while the option is set,
+            // so the guard keys on the configured value, not its mere presence.
+            BranchManager::ensure_branch_deletable(&options, "feature").unwrap();
+        }
+    }
+
+    #[test]
+    fn test_ensure_branch_deletable_without_scan_options() {
+        let options = HashMap::new();
+        BranchManager::ensure_branch_deletable(&options, "any").unwrap();
     }
 
     #[tokio::test]
