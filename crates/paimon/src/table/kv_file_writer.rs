@@ -44,8 +44,8 @@ use crate::table::managed_blob_reference::ManagedBlobReferences;
 use crate::table::managed_blob_writer::ManagedBlobWriteState;
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::sort_merge::{
-    AggregateMergeFunction, BufferedBatch, MergeFunction, MergeResult, MergeRow,
-    PartialUpdateMergeFunction,
+    AggregateMergeFunction, BufferedBatch, FirstRowMergeFunction, MergeFunction, MergeResult,
+    MergeRow, PartialUpdateMergeFunction,
 };
 use crate::Result;
 use arrow_array::{Array, BooleanArray, Int64Array, Int8Array, RecordBatch, UInt32Array};
@@ -1089,40 +1089,80 @@ impl KeyValueFileWriter {
         batch: &RecordBatch,
         sorted_indices: &arrow_array::UInt32Array,
     ) -> Result<Vec<u32>> {
-        let n = sorted_indices.len();
-        if n == 0 {
-            return Ok(vec![]);
+        if sorted_indices.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let rows = self.convert_key_rows(batch)?;
-
-        let mut result: Vec<u32> = Vec::with_capacity(n);
-        // Track the start of the current key group and the candidate winner.
-        let mut group_winner = sorted_indices.value(0);
-
-        for i in 1..n {
-            let cur = sorted_indices.value(i);
-            if rows.row(group_winner as usize) == rows.row(cur as usize) {
-                // Same key group — update winner based on merge engine.
-                match self.config.merge_engine {
-                    // Deduplicate: keep last (highest seq), which is the current row
-                    // since we sorted ascending.
-                    MergeEngine::Deduplicate => group_winner = cur,
-                    // FirstRow: keep first (lowest seq), so don't update.
-                    MergeEngine::FirstRow => {}
-                    MergeEngine::PartialUpdate | MergeEngine::Aggregation => unreachable!(
-                        "{:?} should use select_flush_indices and skip dedup",
-                        self.config.merge_engine
-                    ),
-                }
-            } else {
-                // New key group — emit the winner of the previous group.
-                result.push(group_winner);
-                group_winner = cur;
+        let schema = batch.schema();
+        let value_kinds = if self.config.merge_engine == MergeEngine::FirstRow {
+            batch
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .map(|column| {
+                    column.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                        crate::Error::DataInvalid {
+                            message: "_VALUE_KIND column must be Int8".into(),
+                            source: None,
+                        }
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let first_row_merge = FirstRowMergeFunction {
+            ignore_delete: CoreOptions::new(&self.config.table_options).ignore_delete(),
+        };
+        let key_rows = self.convert_key_rows(batch)?;
+        let mut result = Vec::with_capacity(sorted_indices.len());
+        let mut start = 0;
+        while start < sorted_indices.len() {
+            let first = sorted_indices.value(start);
+            let mut end = start + 1;
+            while end < sorted_indices.len()
+                && key_rows.row(first as usize) == key_rows.row(sorted_indices.value(end) as usize)
+            {
+                end += 1;
             }
+            match self.config.merge_engine {
+                MergeEngine::Deduplicate => result.push(sorted_indices.value(end - 1)),
+                // Java's ReducerMergeFunctionWrapper bypasses the merge function
+                // for singleton groups. Insert-only batches need no kind validation.
+                MergeEngine::FirstRow if end - start == 1 || value_kinds.is_none() => {
+                    result.push(first);
+                }
+                MergeEngine::FirstRow => {
+                    let kinds = value_kinds.unwrap();
+                    let rows = sorted_indices.values()[start..end]
+                        .iter()
+                        .map(|&idx| MergeRow {
+                            batch_idx: 0,
+                            row_idx: idx as usize,
+                            // Keep the established user-sequence and arrival order.
+                            sequence_number: 0,
+                            user_sequence: None,
+                            value_kind: if kinds.is_null(idx as usize) {
+                                RowKind::Insert as i8
+                            } else {
+                                kinds.value(idx as usize)
+                            },
+                        })
+                        .collect::<Vec<_>>();
+                    // First-row returns a source index without reading/materializing values.
+                    match first_row_merge.merge(&rows, &[], &[], &schema)? {
+                        MergeResult::SourceRow { row_idx, .. } => result.push(row_idx as u32),
+                        MergeResult::Omit => {}
+                        MergeResult::MaterializedRow(_) | MergeResult::MaterializedDeleteRow(_) => {
+                            unreachable!("first-row merge must return an input row")
+                        }
+                    }
+                }
+                MergeEngine::PartialUpdate | MergeEngine::Aggregation => unreachable!(
+                    "{:?} should use select_flush_indices and skip dedup",
+                    self.config.merge_engine
+                ),
+            }
+            start = end;
         }
-        // Emit the last group's winner.
-        result.push(group_winner);
         Ok(result)
     }
 
@@ -1570,6 +1610,115 @@ mod tests {
             .unwrap();
 
         assert_eq!(deduped, vec![0, 2]);
+    }
+
+    fn first_row_kind_batch(ids: Vec<i32>, kinds: Vec<i8>) -> RecordBatch {
+        let len = ids.len();
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("seq", ArrowDataType::Int64, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int64Array::from_iter_values(0..len as i64)),
+                Arc::new(Int32Array::from_iter_values(10..10 + len as i32)),
+                Arc::new(Int8Array::from(kinds)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_first_row_flush_rejects_every_retract_in_a_multi_row_group() {
+        for retract in [RowKind::Delete, RowKind::UpdateBefore] {
+            for position in 1..=3 {
+                let mut kinds = vec![RowKind::Insert as i8; 5];
+                kinds[position] = retract as i8;
+                let batch = first_row_kind_batch(vec![0, 1, 1, 1, 2], kinds);
+                let mut config = test_write_config(MergeEngine::FirstRow);
+                config.write_buffer_size = i64::MAX;
+                config.input_changelog = true;
+                let mut writer = KeyValueFileWriter::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    config,
+                    0,
+                )
+                .unwrap();
+                // The invalid group spans batches and follows a valid key group.
+                writer.write(&batch.slice(0, 3)).await.unwrap();
+                writer.write(&batch.slice(3, 2)).await.unwrap();
+                let error = writer
+                    .prepare_commit()
+                    .await
+                    .err()
+                    .expect("retract must be rejected");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("does not support DELETE or UPDATE_BEFORE"),
+                    "{retract:?} at {position}: {error}"
+                );
+                assert!(writer.written_files.is_empty());
+                assert!(writer.written_changelog_files.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_first_row_flush_preserves_singleton_retracts_like_java_reducer() {
+        let batch = first_row_kind_batch(vec![1, 2, 3], vec![1, 3, 2]);
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let mut writer =
+            KeyValueFileWriter::new(io.clone(), test_write_config(MergeEngine::FirstRow), 0)
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+        let stored = read_kv_file(&io, &prepared.data_files[0]).await;
+        assert_eq!(prepared.data_files[0].delete_row_count, Some(2));
+        assert_eq!(
+            stored
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_ref(),
+            batch
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_ref()
+        );
+        assert_eq!(
+            stored.column_by_name("value").unwrap().as_ref(),
+            batch.column_by_name("value").unwrap().as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_row_flush_ignore_delete_uses_first_add_and_omits_retract_group() {
+        let batch = first_row_kind_batch(vec![1, 1, 1, 1, 2, 2], vec![3, 2, 0, 1, 1, 3]);
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let mut config = test_write_config(MergeEngine::FirstRow);
+        config
+            .table_options
+            .insert("ignore-delete".into(), "true".into());
+        let mut writer = KeyValueFileWriter::new(io.clone(), config, 0).unwrap();
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+        assert_eq!(prepared.data_files[0].row_count, 1);
+        assert_eq!(prepared.data_files[0].delete_row_count, Some(0));
+        let stored = read_kv_file(&io, &prepared.data_files[0]).await;
+        assert_eq!(
+            stored.column_by_name("value").unwrap().as_ref(),
+            &Int32Array::from(vec![11]) as &dyn Array
+        );
+        assert_eq!(
+            stored
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_ref(),
+            &Int8Array::from(vec![RowKind::UpdateAfter as i8]) as &dyn Array
+        );
     }
 
     fn partial_update_writer() -> KeyValueFileWriter {

@@ -1823,15 +1823,6 @@ impl Schema {
             });
         }
 
-        let merge_engine = core
-            .merge_engine()
-            .map_err(Self::options_error_to_config_invalid)?;
-        if merge_engine != MergeEngine::Deduplicate {
-            return Err(crate::Error::ConfigInvalid {
-                message: "rowkind.field only supports merge-engine=deduplicate".to_string(),
-            });
-        }
-
         let producer = core
             .try_changelog_producer()
             .map_err(Self::options_error_to_config_invalid)?;
@@ -3353,7 +3344,8 @@ mod tests {
     #[test]
     fn test_aggregation_schema_validation_rejects_unsupported_options() {
         for (key, value) in [
-            ("ignore-delete", "true"),
+            ("aggregation.ignore-delete", "true"),
+            ("fields.value.ignore-delete", "true"),
             ("fields.value.sequence-group", "g1"),
         ] {
             let err = Schema::builder()
@@ -5812,20 +5804,17 @@ mod tests {
     }
 
     #[test]
-    fn rowkind_field_rejects_non_deduplicate_merge_engine() {
-        let err = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("op", DataType::VarChar(VarCharType::string_type()))
-            .primary_key(["id"])
-            .option("merge-engine", "partial-update")
-            .option("rowkind.field", "op")
-            .build()
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::ConfigInvalid { ref message }
-                if message.contains("deduplicate")),
-            "got {err:?}"
-        );
+    fn rowkind_field_accepts_supported_merge_engines() {
+        for engine in ["deduplicate", "first-row", "partial-update", "aggregation"] {
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("op", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("merge-engine", engine)
+                .option("rowkind.field", "op")
+                .build()
+                .unwrap();
+        }
     }
 
     #[test]
