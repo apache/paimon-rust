@@ -1136,6 +1136,40 @@ This follows Java's `expire_snapshots` procedure; changelog files are expired
 together with their snapshots (`changelog.num-retained.*` and
 `changelog.time-retained` are not applied).
 
+### remove_orphan_files
+
+Delete files that no snapshot, tag, branch or long-lived changelog references,
+such as files left by failed or interrupted writes:
+
+```sql
+CALL sys.remove_orphan_files(table => 'paimon.my_db.my_table');
+
+-- Report what would be deleted, without deleting it.
+CALL sys.remove_orphan_files(
+  table => 'paimon.my_db.my_table',
+  older_than => '2024-01-01 12:00:00',
+  dry_run => true
+);
+```
+
+It returns `deletedFileCount` and `deletedFileTotalLenInBytes`, like Java.
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `older_than` | one day ago | Only files last modified before this time are candidates (epoch milliseconds, or `yyyy-MM-dd HH:mm:ss[.SSS]` in the local time zone). It must be in the past, so files of writes still in progress are never deleted. |
+| `dry_run` | `false` | List the orphan files without deleting them. |
+| `parallelism` | `16` | Maximum concurrent manifest reads and deletions. |
+| `mode` | `local` | Only `local` is supported. |
+
+Candidates are files in the `manifest`, `index` and `statistics` directories,
+in bucket directories (including `data-file.external-paths`), and non-snapshot
+files in snapshot and changelog directories. Files are matched by name against
+everything the snapshots, tags and changelogs of every branch reference. The
+cleanup aborts without deleting anything when a branch has no schema, or when
+a live snapshot references a missing metadata file. Managed BLOB files
+(`*.managed.blob`) are never removed, and empty directories are left in place.
+`table => 'db.*'` (every table of a database) is not supported yet.
+
 ### create_global_index
 
 Build and commit a global index for a table column:

@@ -84,6 +84,7 @@ pub(crate) mod merge_tree_split_generator;
 #[cfg(test)]
 mod mosaic_table_write_tests;
 mod object_table;
+mod orphan_files_clean;
 mod partition_filter;
 mod partition_row_count;
 mod partition_stat;
@@ -176,6 +177,7 @@ pub use incremental_scan::{
 };
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use object_table::{ObjectEntry, ObjectTable};
+pub use orphan_files_clean::{OrphanFilesCleanResult, RemoveOrphanFiles};
 pub use partition_row_count::PartitionRowCount;
 pub use partition_stat::PartitionStat;
 pub use pk_vector_bucket_split::{BucketVectorPayload, BucketVectorSearchSplit};
@@ -445,6 +447,13 @@ impl Table {
     /// Reference: [ExpireSnapshotsImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/ExpireSnapshotsImpl.java)
     pub fn new_expire_snapshots(&self) -> ExpireSnapshots<'_> {
         ExpireSnapshots::new(self)
+    }
+
+    /// Create an orphan file cleanup for this table.
+    ///
+    /// Reference: [LocalOrphanFilesClean](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/operation/LocalOrphanFilesClean.java)
+    pub fn new_remove_orphan_files(&self) -> RemoveOrphanFiles<'_> {
+        RemoveOrphanFiles::new(self)
     }
 
     pub fn new_global_index_drop_builder(&self) -> GlobalIndexDropBuilder<'_> {

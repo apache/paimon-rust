@@ -426,7 +426,7 @@ fn data_file_key(entry: &ManifestEntry) -> DataFileKey {
 
 /// Java `SerializationAssignment.planFile`: the plan file of a row-id
 /// reassignment, owned by the snapshot that performed it.
-fn reassign_plan_file(snapshot: &Snapshot) -> Option<&str> {
+pub(crate) fn reassign_plan_file(snapshot: &Snapshot) -> Option<&str> {
     let properties = snapshot.properties()?;
     if properties.get(REASSIGN_SNAPSHOT_ID_PROPERTY)? != &snapshot.id().to_string() {
         return None;

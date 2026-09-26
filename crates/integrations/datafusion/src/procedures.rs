@@ -50,7 +50,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
-use datafusion::arrow::array::{ArrayRef, Int32Array, StringArray};
+use datafusion::arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -182,6 +182,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
             "dry_run",
         ],
         "create_lumina_index" => &["table", "index_column", "index_type", "options"],
+        "remove_orphan_files" => &["table", "older_than", "dry_run", "parallelism", "mode"],
         "expire_snapshots" => &[
             "table",
             "retain_max",
@@ -296,6 +297,7 @@ pub async fn execute_call(
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
         "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
         "expire_snapshots" => proc_expire_snapshots(ctx, catalog, catalog_name, &args).await,
+        "remove_orphan_files" => proc_remove_orphan_files(ctx, catalog, catalog_name, &args).await,
         "grant_permission" => proc_grant_permission(ctx, catalog, catalog_name, &args).await,
         "revoke_permission" => proc_revoke_permission(ctx, catalog, catalog_name, &args).await,
         "list_permissions" => proc_list_permissions(ctx, catalog, catalog_name, &args).await,
@@ -1259,6 +1261,65 @@ async fn proc_expire_snapshots(
         false,
     )]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![deleted]))])?;
+    ctx.read_batch(batch)
+}
+
+/// `CALL sys.remove_orphan_files`, with the arguments of Java's Flink and
+/// Spark `RemoveOrphanFilesProcedure`. Only one table per call and the local
+/// mode are supported.
+async fn proc_remove_orphan_files(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    if require_arg(args, "table")?.trim().ends_with(".*") {
+        return Err(DataFusionError::NotImplemented(
+            "remove_orphan_files on all tables of a database ('db.*') is not supported yet"
+                .to_string(),
+        ));
+    }
+    if let Some(mode) = args.get("mode") {
+        if !mode.trim().eq_ignore_ascii_case("local") {
+            return Err(DataFusionError::NotImplemented(format!(
+                "remove_orphan_files only supports mode => 'local', got '{mode}'"
+            )));
+        }
+    }
+    let table = get_table(catalog, catalog_name, args).await?;
+    let mut clean = table.new_remove_orphan_files();
+    if let Some(older_than) = args.get("older_than").filter(|v| !v.trim().is_empty()) {
+        clean.with_older_than_millis(parse_older_than(older_than)?);
+    }
+    if let Some(dry_run) = args.get("dry_run") {
+        let dry_run = dry_run.trim().parse::<bool>().map_err(|_| {
+            DataFusionError::Plan(format!("Invalid boolean for 'dry_run': '{dry_run}'"))
+        })?;
+        clean.with_dry_run(dry_run);
+    }
+    if let Some(parallelism) = optional_i32_arg(args, "parallelism")? {
+        if parallelism < 1 {
+            return Err(DataFusionError::Plan(format!(
+                "parallelism must be at least 1, got {parallelism}"
+            )));
+        }
+        clean.with_parallelism(parallelism as usize);
+    }
+    let result = clean.execute().await.map_err(to_datafusion_error)?;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("deletedFileCount", ArrowDataType::Int64, false),
+        Field::new("deletedFileTotalLenInBytes", ArrowDataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![result.deleted_file_count as i64])),
+            Arc::new(Int64Array::from(vec![
+                result.deleted_file_total_bytes as i64,
+            ])),
+        ],
+    )?;
     ctx.read_batch(batch)
 }
 

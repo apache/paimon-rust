@@ -1006,6 +1006,118 @@ async fn test_expire_snapshots_procedure_rejects_bad_arguments() {
     .await;
 }
 
+async fn orphan_result(sql_context: &paimon_datafusion::SQLContext, sql: &str) -> (i64, i64) {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    let column = |name: &str| {
+        batches[0]
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("{name} column"))
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    (
+        column("deletedFileCount"),
+        column("deletedFileTotalLenInBytes"),
+    )
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[tokio::test]
+async fn test_remove_orphan_files_procedure() {
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.orph (id INT, name VARCHAR(100))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.orph VALUES (1, 'a')",
+    )
+    .await;
+    let bucket = tmp.path().join("test_db.db/orph/bucket-0");
+    assert!(bucket.is_dir(), "{bucket:?}");
+    let orphan = bucket.join("data-orphan.parquet");
+    std::fs::write(&orphan, b"orphan").unwrap();
+
+    // The default cut-off (one day ago) protects the fresh file.
+    assert_eq!(
+        orphan_result(
+            &sql_context,
+            "CALL sys.remove_orphan_files(table => 'test_db.orph')",
+        )
+        .await,
+        (0, 0)
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let older_than = now_millis() - 200;
+    assert_eq!(
+        orphan_result(
+            &sql_context,
+            &format!(
+                "CALL sys.remove_orphan_files(table => 'test_db.orph', older_than => '{older_than}', dry_run => true)"
+            ),
+        )
+        .await,
+        (1, 6)
+    );
+    assert!(orphan.exists(), "a dry run keeps the file");
+
+    assert_eq!(
+        orphan_result(
+            &sql_context,
+            &format!(
+                "CALL sys.remove_orphan_files(table => 'test_db.orph', older_than => '{older_than}', parallelism => 2, mode => 'local')"
+            ),
+        )
+        .await,
+        (1, 6)
+    );
+    assert!(!orphan.exists());
+    assert_eq!(
+        collect_id_name(&sql_context, "SELECT id, name FROM paimon.test_db.orph").await,
+        vec![(1, "a".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn test_remove_orphan_files_procedure_rejects_bad_arguments() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+    for (sql, expected) in [
+        (
+            "CALL sys.remove_orphan_files(table => 'test_db.*')",
+            "not supported yet",
+        ),
+        (
+            "CALL sys.remove_orphan_files(table => 'test_db.t1', mode => 'distributed')",
+            "only supports mode => 'local'",
+        ),
+        (
+            "CALL sys.remove_orphan_files(table => 'test_db.t1', older_than => '9999999999999')",
+            "earlier than now",
+        ),
+        (
+            "CALL sys.remove_orphan_files(table => 'test_db.t1', dry_run => 'maybe')",
+            "Invalid boolean for 'dry_run'",
+        ),
+        (
+            "CALL sys.remove_orphan_files(table => 'test_db.t1', parallelism => 0)",
+            "parallelism must be at least 1",
+        ),
+    ] {
+        assert_sql_error(&sql_context, sql, expected).await;
+    }
+}
+
 #[tokio::test]
 async fn test_rollback_to_snapshot() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
