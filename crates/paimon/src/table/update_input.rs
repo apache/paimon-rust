@@ -34,6 +34,8 @@ use arrow_schema::{DataType, Schema, TimeUnit};
 pub(super) enum CastMode {
     Assignment,
     RowUpdate,
+    // Internal whole-column fallback; never retries safe casts on children.
+    Constructor,
 }
 
 fn invalid(message: impl Into<String>) -> crate::Error {
@@ -43,13 +45,30 @@ fn invalid(message: impl Into<String>) -> crate::Error {
     }
 }
 
+/// Resolve a referenced input field without silently selecting a duplicate.
+pub(super) fn unique_column_index(schema: &Schema, name: &str) -> crate::Result<usize> {
+    let mut matches = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.name() == name);
+    let index = matches
+        .next()
+        .map(|(index, _)| index)
+        .ok_or_else(|| invalid(format!("Input data must contain {name} column")))?;
+    if matches.next().is_some() {
+        return Err(invalid(format!(
+            "Input field {name} is ambiguous: duplicate column names"
+        )));
+    }
+    Ok(index)
+}
+
 /// Normalize row IDs before matching, overlap detection or writing. No caller
 /// may interpret a different integer representation as different row identity.
 pub(super) fn normalize_row_ids(batch: RecordBatch) -> crate::Result<RecordBatch> {
     let schema = batch.schema();
-    let index = schema
-        .index_of("_ROW_ID")
-        .map_err(|_| invalid("Input data must contain _ROW_ID column"))?;
+    let index = unique_column_index(&schema, "_ROW_ID")?;
     // Empty logical inputs do not participate in matching or writing.
     if batch.num_rows() == 0 {
         return Ok(batch);
@@ -103,18 +122,32 @@ fn units_per_second(unit: &TimeUnit) -> i64 {
     }
 }
 
-/// Cast logical values recursively, so dictionary encoding and nesting cannot
-/// bypass primitive validation. The final outer cast only converts the layout.
+/// Row-ID coercion retries the entire column through Python constructor
+/// semantics. A failed child cannot independently opt into a lossy conversion.
 pub(super) fn cast_update_value(
     array: &ArrayRef,
     target: &DataType,
     mode: CastMode,
 ) -> crate::Result<ArrayRef> {
+    if mode == CastMode::RowUpdate {
+        cast_values(array, target, CastMode::Assignment)
+            .or_else(|_| cast_values(array, target, CastMode::Constructor))
+    } else {
+        cast_values(array, target, mode)
+    }
+}
+
+/// Cast logical values recursively, so dictionary encoding and nesting cannot
+/// bypass primitive validation. The final outer cast only converts the layout.
+fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Result<ArrayRef> {
+    if mode == CastMode::Constructor && array.null_count() == array.len() {
+        return Ok(new_null_array(target, array.len()));
+    }
     if array.data_type() == target {
         return Ok(array.clone());
     }
     if matches!(array.data_type(), DataType::Dictionary(..)) {
-        return cast_update_value(&decode_dictionary(array)?, target, mode);
+        return cast_values(&decode_dictionary(array)?, target, mode);
     }
     if let DataType::ListView(field) | DataType::LargeListView(field) = array.data_type() {
         // Convert only the offsets/layout first. Casting children here would
@@ -129,7 +162,7 @@ pub(super) fn cast_update_value(
             },
         )
         .map_err(|error| invalid(error.to_string()))?;
-        return cast_update_value(&materialized, target, mode);
+        return cast_values(&materialized, target, mode);
     }
     if matches!(array.data_type(), DataType::RunEndEncoded(..)) {
         return Err(invalid(
@@ -142,7 +175,10 @@ pub(super) fn cast_update_value(
             let columns = fields
                 .iter()
                 .map(|field| match input.column_by_name(field.name()) {
-                    Some(column) => cast_update_value(column, field.data_type(), mode),
+                    Some(column) => {
+                        let column = constructor_child(column, input.nulls(), 1, mode)?;
+                        cast_values(&column, field.data_type(), mode)
+                    }
                     None => Ok(new_null_array(field.data_type(), input.len())),
                 })
                 .collect::<crate::Result<Vec<_>>>()?;
@@ -172,7 +208,9 @@ pub(super) fn cast_update_value(
             )?),
             DataType::FixedSizeList(_, size) => {
                 let input = array.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
-                let values = cast_update_value(input.values(), field.data_type(), mode)?;
+                let values =
+                    constructor_child(input.values(), input.nulls(), *size as usize, mode)?;
+                let values = cast_values(&values, field.data_type(), mode)?;
                 Some(Arc::new(
                     FixedSizeListArray::try_new_with_length(
                         field.clone(),
@@ -191,6 +229,8 @@ pub(super) fn cast_update_value(
             let offsets = input.value_offsets();
             let start = offsets[0];
             let length = offsets[offsets.len() - 1] - start;
+            let (offsets, indices) = constructor_offsets(offsets, input.nulls(), mode);
+            let length = indices.as_ref().map_or(length as usize, |i| i.len());
             let DataType::Struct(fields) = field.data_type() else {
                 return Err(invalid("Map entries must have a struct type"));
             };
@@ -200,23 +240,17 @@ pub(super) fn cast_update_value(
                 .into_iter()
                 .zip(fields)
                 .map(|(values, field)| {
-                    cast_update_value(
-                        &values.slice(start as usize, length as usize),
-                        field.data_type(),
-                        mode,
-                    )
+                    let values = match &indices {
+                        Some(indices) => arrow_select::take::take(values.as_ref(), indices, None)
+                            .map_err(|error| invalid(error.to_string()))?,
+                        None => values.slice(start as usize, length),
+                    };
+                    cast_values(&values, field.data_type(), mode)
                 })
                 .collect::<crate::Result<Vec<_>>>()?;
-            let entries =
-                StructArray::try_new_with_length(fields.clone(), columns, None, length as usize)
-                    .map_err(|error| invalid(error.to_string()))?;
-            let offsets = OffsetBuffer::new(
-                offsets
-                    .iter()
-                    .map(|offset| offset - start)
-                    .collect::<Vec<_>>()
-                    .into(),
-            );
+            let entries = StructArray::try_new_with_length(fields.clone(), columns, None, length)
+                .map_err(|error| invalid(error.to_string()))?;
+            let offsets = OffsetBuffer::new(offsets.into());
             Some(Arc::new(
                 MapArray::try_new(
                     field.clone(),
@@ -239,7 +273,20 @@ pub(super) fn cast_update_value(
             array.data_type()
         )));
     }
-    cast_primitive(nested.as_ref().unwrap_or(array), target, mode)
+    if let Some(nested) = nested {
+        // Child values already follow the selected contract; only change the
+        // container layout here (for example List to LargeList).
+        return arrow_cast::cast_with_options(
+            nested.as_ref(),
+            target,
+            &arrow_cast::CastOptions {
+                safe: false,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| invalid(error.to_string()));
+    }
+    cast_primitive(array, target, mode)
 }
 
 fn cast_list<O: OffsetSizeTrait>(
@@ -252,21 +299,59 @@ fn cast_list<O: OffsetSizeTrait>(
     let end = offsets[offsets.len() - 1];
     // A sliced list can retain unused values before and after its visible rows.
     // Only the visible child range participates in casting and validation.
-    let values = input
-        .values()
-        .slice(start.as_usize(), (end - start).as_usize());
-    let values = cast_update_value(&values, field.data_type(), mode)?;
-    let offsets = OffsetBuffer::new(
-        offsets
-            .iter()
-            .map(|offset| *offset - start)
-            .collect::<Vec<_>>()
-            .into(),
-    );
+    let (offsets, indices) = constructor_offsets(offsets, input.nulls(), mode);
+    let values = match indices {
+        Some(indices) => arrow_select::take::take(input.values().as_ref(), &indices, None)
+            .map_err(|error| invalid(error.to_string()))?,
+        None => input
+            .values()
+            .slice(start.as_usize(), (end - start).as_usize()),
+    };
+    let values = cast_values(&values, field.data_type(), mode)?;
+    let offsets = OffsetBuffer::new(offsets.into());
     Ok(Arc::new(
         GenericListArray::<O>::try_new(field.clone(), offsets, values, input.nulls().cloned())
             .map_err(|error| invalid(error.to_string()))?,
     ))
+}
+
+// Rebuilding Python values discards children hidden by a null parent. Safe
+// casts deliberately retain them, since Arrow C++ validates their values too.
+fn constructor_child(
+    array: &ArrayRef,
+    nulls: Option<&arrow_buffer::NullBuffer>,
+    width: usize,
+    mode: CastMode,
+) -> crate::Result<ArrayRef> {
+    if mode != CastMode::Constructor || nulls.is_none_or(|n| n.null_count() == 0) {
+        return Ok(array.clone());
+    }
+    let nulls = nulls.unwrap();
+    let indices = arrow_array::UInt64Array::from_iter(
+        (0..array.len()).map(|i| nulls.is_valid(i / width).then_some(i as u64)),
+    );
+    arrow_select::take::take(array.as_ref(), &indices, None)
+        .map_err(|error| invalid(error.to_string()))
+}
+
+fn constructor_offsets<O: OffsetSizeTrait>(
+    offsets: &[O],
+    nulls: Option<&arrow_buffer::NullBuffer>,
+    mode: CastMode,
+) -> (Vec<O>, Option<arrow_array::UInt64Array>) {
+    if mode != CastMode::Constructor || nulls.is_none_or(|n| n.null_count() == 0) {
+        return (offsets.iter().map(|o| *o - offsets[0]).collect(), None);
+    }
+    let nulls = nulls.unwrap();
+    let mut indices = Vec::new();
+    let mut rebased = vec![O::usize_as(0)];
+    for (i, range) in offsets.windows(2).enumerate() {
+        if nulls.is_valid(i) {
+            indices.extend((range[0].as_usize()..range[1].as_usize()).map(|i| i as u64));
+        }
+        rebased.push(O::usize_as(indices.len()));
+    }
+    (rebased, Some(arrow_array::UInt64Array::from(indices)))
 }
 
 /// PyPaimon rebuilds temporal row values after a lossy safe cast fails.
@@ -667,10 +752,105 @@ fn cast_integer_text(array: &ArrayRef, target: &DataType) -> crate::Result<Array
     arrow_cast::cast(integers.as_ref(), target).map_err(|error| invalid(error.to_string()))
 }
 
+fn temporal_storage(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::Date32 | DataType::Time32(_) => Some(DataType::Int32),
+        DataType::Date64
+        | DataType::Time64(_)
+        | DataType::Timestamp(..)
+        | DataType::Duration(_) => Some(DataType::Int64),
+        _ => None,
+    }
+}
+
+// Arrow C++ exposes temporal/physical-integer casts only at the exact storage
+// width. Arrow Rust additionally accepts other numeric pairs and string times.
+fn temporal_cast_supported(source: &DataType, target: &DataType) -> bool {
+    use DataType::*;
+    if *source == Null || (!source.is_temporal() && !target.is_temporal()) {
+        return true;
+    }
+    if target.is_string()
+        || temporal_storage(source).as_ref() == Some(target)
+        || temporal_storage(target).as_ref() == Some(source)
+    {
+        return true;
+    }
+    if source.is_string() {
+        return matches!(target, Date32 | Date64 | Timestamp(..));
+    }
+    matches!(
+        (source, target),
+        (Date32 | Date64, Date32 | Date64 | Timestamp(..))
+            | (
+                Timestamp(..),
+                Timestamp(..) | Date32 | Date64 | Time32(_) | Time64(_)
+            )
+            | (Time32(_) | Time64(_), Time32(_) | Time64(_))
+            | (Duration(_), Duration(_))
+    )
+}
+
+// These are Python value categories accepted by pa.array(..., type=target),
+// after the safe cast of the whole column has failed. Never parse text or
+// stringify numeric/temporal children during this fallback.
+fn constructor_accepts(source: &DataType, target: &DataType) -> bool {
+    use DataType::*;
+    let bytes = |t: &DataType| {
+        t.is_string() || matches!(t, Binary | LargeBinary | BinaryView | FixedSizeBinary(_))
+    };
+    if *source == Null || source == target {
+        return true;
+    }
+    if bytes(target) {
+        return bytes(source);
+    }
+    if target.is_integer() {
+        return source.is_numeric();
+    }
+    if target.is_floating() {
+        return source.is_integer() || source.is_floating() || *source == Boolean;
+    }
+    if target.is_decimal() {
+        return source.is_integer() || source.is_decimal();
+    }
+    if temporal_storage(target).is_some() && source.is_numeric() {
+        return true;
+    }
+    matches!(
+        (source, target),
+        (Date32 | Date64 | Timestamp(..), Date32 | Date64)
+            | (Timestamp(..), Timestamp(..))
+            | (Time32(_) | Time64(_), Time32(_) | Time64(_))
+            | (Duration(_), Duration(_))
+    )
+}
+
 fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Result<ArrayRef> {
     let source = array.data_type();
     if source == target {
         return Ok(array.clone());
+    }
+    if mode == CastMode::Constructor && !constructor_accepts(source, target) {
+        return Err(invalid(format!(
+            "Cannot reconstruct {source:?} values as {target:?}"
+        )));
+    }
+    if mode == CastMode::Assignment && !temporal_cast_supported(source, target) {
+        return Err(invalid(format!(
+            "Unsupported assignment cast from {source:?} to {target:?}"
+        )));
+    }
+    if mode == CastMode::Constructor && source.is_numeric() && temporal_storage(target).is_some() {
+        let storage = temporal_storage(target).unwrap();
+        let raw = cast_primitive(array, &storage, mode)?;
+        return Ok(arrow_array::make_array(
+            raw.to_data()
+                .into_builder()
+                .data_type(target.clone())
+                .build()
+                .map_err(|e| invalid(e.to_string()))?,
+        ));
     }
     if target.is_string() {
         return cast_to_string(array, target);
@@ -694,11 +874,6 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
             | DataType::FixedSizeBinary(_)
     ) && !source.is_string()
     {
-        // A row-ID constructor can rebuild an all-null column in any scalar
-        // type even when the safe cast between the declared types is absent.
-        if mode == CastMode::RowUpdate && array.null_count() == array.len() {
-            return Ok(new_null_array(target, array.len()));
-        }
         return Err(invalid(format!(
             "Unsupported assignment cast from {source:?} to {target:?}"
         )));
@@ -736,6 +911,22 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
                 })
                 .collect::<crate::Result<Vec<_>>>()?;
             return timestamp_array(Int64Array::from(values), target);
+        }
+    }
+    if source.is_string() && matches!(target, DataType::Date32 | DataType::Date64) {
+        let text = arrow_cast::cast(array.as_ref(), &DataType::Utf8)
+            .map_err(|e| invalid(e.to_string()))?;
+        for value in text
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .flatten()
+        {
+            if value.len() != 10 || parse_timestamp_text(value, &TimeUnit::Second, false).is_none()
+            {
+                return Err(invalid(format!("Invalid date assignment: {value}")));
+            }
         }
     }
     if source.is_string() && target.is_integer() {
@@ -787,7 +978,7 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
             ));
         }
     }
-    if mode == CastMode::RowUpdate {
+    if mode == CastMode::Constructor {
         if let Some(converted) = coerce_temporal(array, target)? {
             return Ok(converted);
         }
@@ -853,7 +1044,7 @@ fn cast_primitive(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate:
     // PyPaimon's row-ID constructor fallback permits float/decimal-to-int
     // truncation and temporal unit coercion, but still rejects integer-to-float
     // range loss and decimal rescaling loss. Keep that distinction explicit.
-    let coerce_integer = mode == CastMode::RowUpdate
+    let coerce_integer = mode == CastMode::Constructor
         && (source.is_floating() || source.is_decimal())
         && target.is_integer();
     let exact =
@@ -1554,6 +1745,172 @@ mod tests {
                     .value(0),
                 expected.to_string()
             );
+        }
+    }
+    #[test]
+    fn referenced_input_names_must_be_unambiguous() {
+        use arrow_schema::Field;
+        let schema = Schema::new(vec![
+            Field::new("_ROW_ID", DataType::Int64, false),
+            Field::new("value", DataType::Int32, true),
+            Field::new("value", DataType::Int32, true),
+        ]);
+        assert_eq!(unique_column_index(&schema, "_ROW_ID").unwrap(), 0);
+        assert!(unique_column_index(&schema, "value").is_err());
+        assert!(unique_column_index(&schema, "missing").is_err());
+        let batch = RecordBatch::try_from_iter([
+            ("_ROW_ID", Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+            ("_ROW_ID", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+        ])
+        .unwrap();
+        assert!(normalize_row_ids(batch.clone()).is_err());
+        assert!(normalize_row_ids(batch.slice(0, 0)).is_err());
+    }
+
+    #[test]
+    fn temporal_casts_enforce_cpp_pairs_and_constructor_numeric_units() {
+        let inputs: Vec<ArrayRef> = vec![
+            Arc::new(Float64Array::from(vec![1.5, -1.5])),
+            Arc::new(
+                Decimal128Array::from(vec![15, -15])
+                    .with_precision_and_scale(8, 1)
+                    .unwrap(),
+            ),
+        ];
+        for input in inputs {
+            for target in [
+                DataType::Date32,
+                DataType::Date64,
+                DataType::Time32(TimeUnit::Millisecond),
+                DataType::Time64(TimeUnit::Microsecond),
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Duration(TimeUnit::Millisecond),
+            ] {
+                assert!(cast_assignment(&input, &target).is_err(), "{target:?}");
+                let output = cast_update_value(&input, &target, CastMode::RowUpdate).unwrap();
+                let raw =
+                    arrow_cast::cast(output.as_ref(), &temporal_storage(&target).unwrap()).unwrap();
+                let raw = arrow_cast::cast(raw.as_ref(), &DataType::Int64).unwrap();
+                assert_eq!(raw.to_data(), Int64Array::from(vec![1, -1]).to_data());
+            }
+        }
+        let input: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![1_000_000]));
+        for target in [DataType::Float64, DataType::Int32, DataType::Date32] {
+            for mode in [CastMode::Assignment, CastMode::RowUpdate] {
+                assert_eq!(
+                    cast_update_value(&input, &target, mode).is_ok(),
+                    target == DataType::Date32
+                );
+            }
+        }
+        for (text, target, succeeds) in [
+            (
+                "00:00:01.234567",
+                DataType::Time32(TimeUnit::Millisecond),
+                false,
+            ),
+            ("2024-01-02 12:34:56", DataType::Date32, false),
+            ("2024-01-02", DataType::Date32, true),
+        ] {
+            let input: ArrayRef = Arc::new(StringArray::from(vec![text]));
+            for mode in [CastMode::Assignment, CastMode::RowUpdate] {
+                assert_eq!(cast_update_value(&input, &target, mode).is_ok(), succeeds);
+            }
+        }
+        // The physical integer width is part of Arrow C++'s safe cast contract.
+        let input: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+        let target = DataType::Timestamp(TimeUnit::Millisecond, None);
+        assert!(cast_assignment(&input, &target).is_err());
+        assert!(cast_update_value(&input, &target, CastMode::RowUpdate).is_ok());
+    }
+
+    #[test]
+    fn nested_row_fallback_reconstructs_every_child_in_the_column() {
+        use arrow_schema::Field;
+        let input: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("b", DataType::Float64, true)),
+                Arc::new(Float64Array::from(vec![1.5])) as ArrayRef,
+            ),
+        ]));
+        let target = DataType::Struct(
+            vec![
+                Field::new("a", DataType::Utf8, true),
+                Field::new("b", DataType::Int32, true),
+            ]
+            .into(),
+        );
+        assert!(cast_update_value(&input, &target, CastMode::RowUpdate).is_err());
+        // Safe conversion remains available when no child needs reconstruction.
+        let target = DataType::Struct(
+            vec![
+                Field::new("a", DataType::Utf8, true),
+                Field::new("b", DataType::Float64, true),
+            ]
+            .into(),
+        );
+        assert!(cast_update_value(&input, &target, CastMode::RowUpdate).is_ok());
+    }
+
+    #[test]
+    fn row_fallback_discards_values_under_null_parents_only_after_safe_failure() {
+        use arrow_schema::Field;
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, 7]));
+        let nulls = Some(arrow_buffer::NullBuffer::from(vec![false, true]));
+        let from_field = Arc::new(Field::new("a", DataType::Int64, true));
+        let to_field = Arc::new(Field::new("a", DataType::Int32, true));
+        let inputs: Vec<(ArrayRef, DataType)> = vec![
+            (
+                Arc::new(StructArray::new(
+                    vec![from_field.clone()].into(),
+                    vec![values.clone()],
+                    nulls.clone(),
+                )),
+                DataType::Struct(vec![to_field.clone()].into()),
+            ),
+            (
+                Arc::new(ListArray::new(
+                    from_field.clone(),
+                    OffsetBuffer::from_lengths([1, 1]),
+                    values.clone(),
+                    nulls.clone(),
+                )),
+                DataType::LargeList(to_field.clone()),
+            ),
+            (
+                Arc::new(FixedSizeListArray::new(from_field, 1, values, nulls)),
+                DataType::FixedSizeList(to_field, 1),
+            ),
+        ];
+        for (input, target) in inputs {
+            assert!(cast_assignment(&input, &target).is_err());
+            let output = cast_update_value(&input, &target, CastMode::RowUpdate).unwrap();
+            assert!(output.is_null(0));
+            assert!(output.is_valid(1));
+            let child: ArrayRef = match &target {
+                DataType::Struct(_) => output
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap()
+                    .column(0)
+                    .slice(1, 1),
+                DataType::LargeList(_) => output
+                    .as_any()
+                    .downcast_ref::<LargeListArray>()
+                    .unwrap()
+                    .value(1),
+                DataType::FixedSizeList(..) => output
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .unwrap()
+                    .value(1),
+                _ => unreachable!(),
+            };
+            assert_eq!(child.to_data(), Int32Array::from(vec![7]).to_data());
         }
     }
 }

@@ -330,3 +330,47 @@ def test_predicate_update_owns_scan_callbacks_and_rollback(tmp_path):
     actual = pa.Table.from_batches(context.sql(
         'SELECT id, score FROM paimon.pred_updates.t')).sort_by('id').to_pydict()
     assert actual == {'id': [1, 2, 3, 4], 'score': [11, 22, 33, 44]}
+
+
+@pytest.mark.parametrize('kind', ['batch', 'stream', 'row_id'])
+def test_update_can_transfer_and_be_collected_on_another_thread(tmp_path, kind, monkeypatch):
+    import gc
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.threaded_updates')
+    context.sql("""CREATE TABLE paimon.threaded_updates.t (id INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')""")
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('threaded_updates.t')
+    builder = table.new_stream_write_builder() if kind == 'stream' else table.new_batch_write_builder()
+    update = builder.new_update()
+    if kind == 'row_id':
+        update = update.new_update_by_row_id()
+
+    def access(value):
+        if kind == 'row_id':
+            return value.commit_messages
+        value.with_update_type(['id'])
+        rows = value.new_update_by_row_id(42) if kind == 'stream' else value.new_update_by_row_id()
+        return rows.commit_messages
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(access, update).result() == []
+        # Exception tracebacks and wrapper cycles can defer destruction to GC
+        # on a different thread, even if operations stay on the creator thread.
+        gc.collect()
+        errors = []
+        monkeypatch.setattr(sys, 'unraisablehook', errors.append)
+        enabled = gc.isenabled()
+        gc.disable()
+        try:
+            cycle = [update]
+            cycle.append(cycle)
+            del update, cycle
+            pool.submit(gc.collect).result()
+            assert errors == []
+        finally:
+            if enabled:
+                gc.enable()

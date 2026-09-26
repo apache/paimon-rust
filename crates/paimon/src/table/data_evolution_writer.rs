@@ -952,13 +952,7 @@ fn validate_update_columns(batch: &RecordBatch, update_columns: &[String]) -> Re
 }
 
 fn matched_column_index(batch: &RecordBatch, col: &str) -> Result<usize> {
-    batch
-        .schema()
-        .index_of(col)
-        .map_err(|e| crate::Error::DataInvalid {
-            message: format!("Column {col} not found in matched batch: {e}"),
-            source: None,
-        })
+    super::update_input::unique_column_index(batch.schema().as_ref(), col)
 }
 
 fn matched_column(batch: &RecordBatch, col: &str) -> Result<ArrayRef> {

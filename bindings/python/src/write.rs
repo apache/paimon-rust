@@ -538,20 +538,12 @@ pub struct PyBatchTableWrite {
     prepared: bool,
 }
 
-#[pyclass(
-    name = "BatchTableUpdate",
-    module = "pypaimon_rust.datafusion",
-    unsendable
-)]
+#[pyclass(name = "BatchTableUpdate", module = "pypaimon_rust.datafusion")]
 pub struct PyBatchTableUpdate {
     context: UpdateContext,
 }
 
-#[pyclass(
-    name = "TableUpdateByRowId",
-    module = "pypaimon_rust.datafusion",
-    unsendable
-)]
+#[pyclass(name = "TableUpdateByRowId", module = "pypaimon_rust.datafusion")]
 pub struct PyTableUpdateByRowId {
     inner: TableUpdateByRowId,
     table_location: String,
@@ -592,11 +584,7 @@ impl PyTableUpdateByRowId {
     }
 }
 
-#[pyclass(
-    name = "StreamTableUpdate",
-    module = "pypaimon_rust.datafusion",
-    unsendable
-)]
+#[pyclass(name = "StreamTableUpdate", module = "pypaimon_rust.datafusion")]
 pub struct PyStreamTableUpdate {
     context: UpdateContext,
 }
