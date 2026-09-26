@@ -32,6 +32,7 @@ use super::format_table_scan::supported_format_table_extension;
 use super::table_write::take_rows;
 use super::Table;
 use crate::arrow::build_target_arrow_schema;
+use crate::arrow::format::text::TextCompression;
 use crate::arrow::format::{create_format_writer, with_write_resources, FormatFileWriter};
 use crate::resource::ResourceContext;
 use crate::spec::{BinaryRow, CoreOptions, DataField};
@@ -93,7 +94,7 @@ impl FormatTableWriter {
         // unsupported formats before staging any files, rather than failing
         // after the first RecordBatch has been routed.
         match format.as_str() {
-            "parquet" | "row" | "avro" => {}
+            "parquet" | "row" | "avro" | "orc" | "csv" | "text" | "json" | "mosaic" => {}
             #[cfg(feature = "vortex")]
             "vortex" => {}
             _ => {
@@ -144,7 +145,12 @@ impl FormatTableWriter {
             });
         }
         let compression = format_table_compression(schema.options(), &format);
-        let extension = if schema
+        let extension = if matches!(format.as_str(), "csv" | "json" | "text") {
+            match TextCompression::from_name(&compression)?.extension() {
+                Some(codec_extension) => format!("{extension}.{codec_extension}"),
+                None => extension,
+            }
+        } else if schema
             .options()
             .get("file.suffix.include.compression")
             .is_some_and(|value| value.eq_ignore_ascii_case("true"))

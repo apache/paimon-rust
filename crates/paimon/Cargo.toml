@@ -108,11 +108,14 @@ crc32fast = "1"
 zstd = "0.13"
 snap = "1"
 lz4_flex = "0.13"
+flate2 = "1"
+bzip2 = "0.6"
 lzokay-native = { version = "0.1", default-features = false, features = ["decompress"] }
 arrow-array = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-cast = { workspace = true }
+arrow-json = "58.0"
 arrow-ord = { workspace = true }
 arrow-row = { workspace = true }
 arrow-schema = { workspace = true }

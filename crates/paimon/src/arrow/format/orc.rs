@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilePredicates, FormatFileReader};
-use crate::io::FileRead;
+use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
+use crate::io::{FileRead, FileWrite, OutputFile};
 use crate::spec::{is_row_id_column, DataField, DataType, Datum, Predicate, PredicateOperator};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{future::BoxFuture, StreamExt};
@@ -27,10 +29,126 @@ use orc_rust::predicate::PredicateValue;
 use orc_rust::projection::ProjectionMask;
 use orc_rust::reader::AsyncChunkReader;
 use orc_rust::ArrowReaderBuilder;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 const ORC_IN_PREDICATE_MAX_LITERALS: usize = 20;
 
 pub(crate) struct OrcFormatReader;
+
+/// `orc-rust` currently exposes a synchronous writer. Keep its encoded output
+/// in a shared buffer and publish it through Paimon's async FileWrite on close.
+pub(crate) struct OrcFormatWriter {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    output: Box<dyn FileWrite>,
+    pending_bytes: usize,
+}
+
+#[derive(Clone)]
+struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl OrcFormatWriter {
+    pub(crate) async fn new(output: &OutputFile, schema: SchemaRef) -> crate::Result<Self> {
+        // orc-rust 0.8 uses `unimplemented!` for other Arrow types. Report a
+        // normal error before it can panic or leave a partial staged file.
+        for field in schema.fields() {
+            if !matches!(
+                field.data_type(),
+                ArrowDataType::Float32
+                    | ArrowDataType::Float64
+                    | ArrowDataType::Int8
+                    | ArrowDataType::Int16
+                    | ArrowDataType::Int32
+                    | ArrowDataType::Int64
+                    | ArrowDataType::Utf8
+                    | ArrowDataType::LargeUtf8
+                    | ArrowDataType::Binary
+                    | ArrowDataType::LargeBinary
+                    | ArrowDataType::Boolean
+            ) {
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "ORC writer does not support column '{}' ({:?})",
+                        field.name(),
+                        field.data_type()
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            schema,
+            batches: Vec::new(),
+            output: output.writer().await?,
+            pending_bytes: 0,
+        })
+    }
+}
+
+#[async_trait]
+impl FormatFileWriter for OrcFormatWriter {
+    async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
+        if batch.schema() != self.schema {
+            return Err(Error::DataInvalid {
+                message: "ORC batch schema differs from file schema".into(),
+                source: None,
+            });
+        }
+        self.pending_bytes += batch.get_array_memory_size();
+        self.batches.push(batch.clone());
+        Ok(())
+    }
+
+    fn num_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+    fn in_progress_size(&self) -> usize {
+        self.pending_bytes
+    }
+    async fn flush(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+    async fn close(mut self: Box<Self>) -> crate::Result<FormatWriteResult> {
+        let encoded = {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let mut writer =
+                orc_rust::ArrowWriterBuilder::new(SharedBuffer(bytes.clone()), self.schema.clone())
+                    .try_build()
+                    .map_err(|e| Error::DataInvalid {
+                        message: format!("Failed to create ORC writer: {e}"),
+                        source: Some(Box::new(e)),
+                    })?;
+            for batch in &self.batches {
+                writer.write(batch).map_err(|e| Error::DataInvalid {
+                    message: format!("Failed to write ORC batch: {e}"),
+                    source: Some(Box::new(e)),
+                })?;
+            }
+            writer.close().map_err(|e| Error::DataInvalid {
+                message: format!("Failed to close ORC writer: {e}"),
+                source: Some(Box::new(e)),
+            })?;
+            let encoded = std::mem::take(&mut *bytes.lock().unwrap());
+            encoded
+        };
+        self.batches.clear();
+        let size = encoded.len() as u64;
+        self.output.write(Bytes::from(encoded)).await?;
+        self.output.close().await?;
+        Ok(FormatWriteResult::new(size))
+    }
+}
 
 #[async_trait]
 impl FormatFileReader for OrcFormatReader {
