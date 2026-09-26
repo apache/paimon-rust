@@ -75,6 +75,49 @@ def test_batch_update_row_ids_commits_through_write_builder(tmp_path):
     assert actual == {'id': [1, 2, 3], 'name': ['A', 'b', 'C']}
 
 
+def test_grouped_batch_update_checks_input_table_file_overlap(tmp_path):
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.grouped_updates')
+    context.sql("""CREATE TABLE paimon.grouped_updates.t (id INT, name STRING) WITH (
+        'row-tracking.enabled' = 'true',
+        'data-evolution.enabled' = 'true')""")
+    context.sql("""INSERT INTO paimon.grouped_updates.t (id, name)
+        VALUES (1, 'a'), (2, 'b')""")
+    context.sql("""INSERT INTO paimon.grouped_updates.t (id, name)
+        VALUES (3, 'c'), (4, 'd')""")
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table(
+        'grouped_updates.t')
+
+    overlap = table.new_batch_write_builder().new_update(['name'])
+    overlap.add_matched_group([pa.record_batch([
+        pa.array([0], type=pa.int64()), pa.array(['A']),
+    ], names=['_ROW_ID', 'name'])])
+    overlap.add_matched_group([pa.record_batch([
+        pa.array([1], type=pa.int64()), pa.array(['B']),
+    ], names=['_ROW_ID', 'name'])])
+    with pytest.raises(ValueError, match='overlapping first_row_ids.*0'):
+        overlap.prepare_commit()
+
+    builder = table.new_batch_write_builder()
+    update = builder.new_update(['name'])
+    update.add_matched_group([
+        pa.record_batch([
+            pa.array([0], type=pa.int64()), pa.array(['A']),
+        ], names=['_ROW_ID', 'name']),
+        pa.record_batch([
+            pa.array([1], type=pa.int64()), pa.array(['B']),
+        ], names=['_ROW_ID', 'name']),
+    ])
+    update.add_matched_group([pa.record_batch([
+        pa.array([2], type=pa.int64()), pa.array(['C']),
+    ], names=['_ROW_ID', 'name'])])
+    builder.new_commit().commit(update.prepare_commit())
+    actual = pa.Table.from_batches(context.sql(
+        'SELECT id, name FROM paimon.grouped_updates.t')).sort_by('id').to_pydict()
+    assert actual == {'id': [1, 2, 3, 4], 'name': ['A', 'B', 'C', 'd']}
+
+
 def test_batch_delete_row_ids_commits_deletion_vectors(tmp_path):
     context = SQLContext()
     context.register_catalog('paimon', {'warehouse': str(tmp_path)})

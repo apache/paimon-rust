@@ -429,6 +429,19 @@ impl PyBatchTableUpdate {
             .map_err(to_py_err)
     }
 
+    /// Preserve one Python Arrow table's boundary across its record batches.
+    fn add_matched_group(&mut self, batches: &Bound<'_, PyAny>) -> PyResult<()> {
+        let batches = batches
+            .try_iter()?
+            .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
+            .collect::<PyResult<Vec<_>>>()?;
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("BatchTableUpdate is closed"))?
+            .add_matched_group(batches)
+            .map_err(to_py_err)
+    }
+
     /// Evaluate assignments for one matched logical file group. Python
     /// callables run with the GIL and receive the original Arrow table; batch
     /// construction and submission stay inside the native update bridge.

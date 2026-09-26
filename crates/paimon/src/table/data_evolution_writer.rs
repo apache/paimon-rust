@@ -79,6 +79,8 @@ pub struct DataEvolutionWriter {
     update_columns: Vec<String>,
     write_fields: Vec<DataField>,
     matched_batches: Vec<RecordBatch>,
+    matched_batch_groups: Vec<usize>,
+    next_group_id: usize,
 }
 
 impl DataEvolutionWriter {
@@ -157,6 +159,8 @@ impl DataEvolutionWriter {
             update_columns,
             write_fields,
             matched_batches: Vec::new(),
+            matched_batch_groups: Vec::new(),
+            next_group_id: 1,
         })
     }
 
@@ -175,6 +179,26 @@ impl DataEvolutionWriter {
         validate_update_columns(&batch, &self.update_columns)?;
 
         self.matched_batches.push(batch);
+        self.matched_batch_groups.push(0);
+        Ok(())
+    }
+
+    /// Add one logical input table, which may contain multiple Arrow batches.
+    /// Separate groups cannot update the same file's columns, matching the
+    /// batch-table update contract; batches within a group may share a file.
+    pub fn add_matched_group(&mut self, batches: Vec<RecordBatch>) -> Result<()> {
+        for batch in &batches {
+            if batch.num_rows() > 0 {
+                validate_row_id_not_null(row_id_column(batch)?)?;
+                validate_update_columns(batch, &self.update_columns)?;
+            }
+        }
+        let group_id = self.next_group_id;
+        self.next_group_id += 1;
+        for batch in batches.into_iter().filter(|batch| batch.num_rows() > 0) {
+            self.matched_batches.push(batch);
+            self.matched_batch_groups.push(group_id);
+        }
         Ok(())
     }
 
@@ -265,7 +289,14 @@ impl DataEvolutionWriter {
             });
         }
 
-        // 2. Group matched rows by their owning file
+        // 2. Reject overlapping input tables before checking individual row IDs.
+        // Python's batch update uses the same order of validation.
+        validate_matched_group_disjointness(
+            &self.matched_batches,
+            &self.matched_batch_groups,
+            &file_index,
+            &self.update_columns,
+        )?;
         let file_matches = group_matched_rows_by_file(&self.matched_batches, &file_index)?;
 
         // 3. For each affected file: read original columns, apply updates, write partial files
@@ -858,6 +889,39 @@ fn group_matched_rows_by_file(
     }
 
     Ok(file_matches)
+}
+
+fn validate_matched_group_disjointness(
+    batches: &[RecordBatch],
+    batch_groups: &[usize],
+    file_index: &[FileRowRange],
+    update_columns: &[String],
+) -> Result<()> {
+    let mut first_group_by_file = HashMap::new();
+    for (batch, group) in batches.iter().zip(batch_groups) {
+        let row_ids = row_id_column(batch)?;
+        for row_id in row_ids.values() {
+            let Some((file_pos, file)) = find_owning_file(file_index, *row_id) else {
+                continue;
+            };
+            if let Some(previous) = first_group_by_file.insert(file_pos, *group) {
+                if previous != *group {
+                    let overlapping = update_columns
+                        .iter()
+                        .map(|column| format!("'{column}': [{}]", file.first_row_id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(crate::Error::DataInvalid {
+                        message: format!(
+                            "Input batches contain overlapping first_row_ids by column: {{{overlapping}}}"
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn row_id_column(batch: &RecordBatch) -> Result<&Int64Array> {

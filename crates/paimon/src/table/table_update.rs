@@ -45,6 +45,12 @@ impl TableUpdate {
         self.writer.add_matched_batch(batch)
     }
 
+    /// Add batches belonging to one logical input table. Distinct input
+    /// tables may not update the same file group for these columns.
+    pub fn add_matched_group(&mut self, batches: Vec<RecordBatch>) -> crate::Result<()> {
+        self.writer.add_matched_group(batches)
+    }
+
     /// Use the snapshot that produced the matched rows for target reads and
     /// conflict detection.
     pub fn pin_read_snapshot(&mut self, snapshot_id: i64) {
