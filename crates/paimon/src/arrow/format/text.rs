@@ -344,6 +344,7 @@ impl<R: Read> Read for HadoopBlockReader<R> {
 mod compression_tests {
     use super::*;
     use crate::spec::{DataType as PaimonDataType, VarCharType};
+    use futures::TryStreamExt;
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -358,6 +359,15 @@ mod compression_tests {
             self.read_bytes
                 .fetch_add((range.end - range.start) as usize, Ordering::SeqCst);
             Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    struct PanickingReader;
+
+    #[async_trait]
+    impl FileRead for PanickingReader {
+        async fn read(&self, _range: Range<u64>) -> crate::Result<Bytes> {
+            panic!("simulated text read panic");
         }
     }
 
@@ -443,6 +453,101 @@ mod compression_tests {
             .unwrap();
         assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), 1024);
         assert!(read_bytes.load(Ordering::SeqCst) < size / 2);
+    }
+
+    #[tokio::test]
+    async fn unterminated_final_line_is_returned_across_batches() {
+        let fields = [DataField::new(
+            0,
+            "line".to_string(),
+            PaimonDataType::VarChar(VarCharType::string_type()),
+        )];
+        for kind in [TextKind::Text, TextKind::Csv, TextKind::Json] {
+            for rows in [1, 2050] {
+                let line = if kind == TextKind::Json {
+                    b"{\"line\":\"value\"}".as_slice()
+                } else {
+                    b"value".as_slice()
+                };
+                let mut input = Vec::new();
+                for index in 0..rows {
+                    if index > 0 {
+                        input.push(b'\n');
+                    }
+                    input.extend_from_slice(line);
+                }
+                for compression in [
+                    TextCompression::None,
+                    TextCompression::Gzip,
+                    TextCompression::Bzip2,
+                    TextCompression::Deflate,
+                    TextCompression::Snappy,
+                    TextCompression::Lz4,
+                    TextCompression::Zstd,
+                ] {
+                    let mut encoder = TextEncoder::new(compression).unwrap();
+                    let mut encoded = encoder.write(input.clone()).unwrap();
+                    encoded.extend_from_slice(&encoder.finish().unwrap());
+                    let size = encoded.len();
+                    let reader = TextFormatReader::new(kind, compression, &HashMap::new()).unwrap();
+                    let batches: Vec<RecordBatch> = reader
+                        .read_batch_stream(
+                            Box::new(CountedReader {
+                                bytes: Bytes::from(encoded),
+                                read_bytes: Arc::new(AtomicUsize::new(0)),
+                            }),
+                            size as u64,
+                            &fields,
+                            None,
+                            Some(1024),
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                        .try_collect()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                        rows,
+                        "kind={kind:?}, compression={compression:?}"
+                    );
+                    assert_eq!(
+                        batches
+                            .iter()
+                            .map(RecordBatch::num_rows)
+                            .collect::<Vec<_>>(),
+                        if rows == 1 {
+                            vec![1]
+                        } else {
+                            vec![1024, 1024, 2]
+                        },
+                        "kind={kind:?}, compression={compression:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn text_reader_reports_worker_panic() {
+        let fields = [DataField::new(
+            0,
+            "line".to_string(),
+            PaimonDataType::VarChar(VarCharType::string_type()),
+        )];
+        let reader =
+            TextFormatReader::new(TextKind::Text, TextCompression::None, &HashMap::new()).unwrap();
+        let result: crate::Result<Vec<RecordBatch>> = reader
+            .read_batch_stream(Box::new(PanickingReader), 1, &fields, None, None, None)
+            .await
+            .unwrap()
+            .try_collect()
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("text decoding task failed"));
     }
 }
 
@@ -573,7 +678,7 @@ impl FormatFileReader for TextFormatReader {
         });
         let source =
             tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(Box::pin(chunks)));
-        tokio::task::spawn_blocking(move || {
+        let worker = tokio::task::spawn_blocking(move || {
             let source: Box<dyn Read> = match compression {
                 TextCompression::None => Box::new(source),
                 TextCompression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(source)),
@@ -599,9 +704,26 @@ impl FormatFileReader for TextFormatReader {
             row_filter_factory: None,
             file_fields: fp.file_fields.clone(),
         });
-        Ok(stream::unfold(receiver, |mut receiver| async {
-            receiver.recv().await.map(|batch| (batch, receiver))
-        })
+        Ok(stream::unfold(
+            (receiver, Some(worker)),
+            |(mut receiver, mut worker)| async move {
+                match receiver.recv().await {
+                    Some(batch) => Some((batch, (receiver, worker))),
+                    None => {
+                        let worker = worker.take()?;
+                        worker.await.err().map(|error| {
+                            (
+                                Err(Error::UnexpectedError {
+                                    message: "text decoding task failed".to_string(),
+                                    source: Some(Box::new(error)),
+                                }),
+                                (receiver, None),
+                            )
+                        })
+                    }
+                }
+            },
+        )
         .map(move |batch| {
             let batch = batch?;
             match predicates.as_ref() {
@@ -648,6 +770,7 @@ impl<R: Read> DelimitedLines<R> {
                 return Ok(Some(line));
             }
             if self.eof {
+                self.search_from = 0;
                 return Ok((!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending)));
             }
             self.search_from = self

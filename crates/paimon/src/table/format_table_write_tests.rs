@@ -761,6 +761,36 @@ async fn java_format_table_formats_round_trip() {
     }
 }
 
+#[tokio::test]
+async fn csv_and_json_format_tables_read_unterminated_final_rows() {
+    for format in ["csv", "json"] {
+        for rows in [1, 2050] {
+            let table = memory_table(
+                &format!("format_{format}_unterminated_{rows}"),
+                false,
+                &[("file.format", format)],
+            );
+            let contents = (0..rows)
+                .map(|id| match format {
+                    "csv" => id.to_string(),
+                    "json" => format!("{{\"id\":{id}}}"),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            table
+                .file_io()
+                .new_output(&format!("{}/part-0.{format}", table.location()))
+                .unwrap()
+                .write(Bytes::from(contents))
+                .await
+                .unwrap();
+            assert_eq!(ids(&table).await, (0..rows).collect::<Vec<_>>());
+            assert_eq!(count_with_empty_projection(&table).await, rows as usize);
+        }
+    }
+}
+
 #[test]
 fn orc_rejects_compression_it_cannot_write() {
     let table = memory_table(
