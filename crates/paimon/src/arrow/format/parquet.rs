@@ -61,6 +61,7 @@ use tokio::sync::{mpsc, oneshot};
 pub(crate) struct ParquetFormatReader {
     read_budget: Option<Arc<ReadBudget>>,
     page_index_enabled: bool,
+    metadata_cache_enabled: bool,
 }
 
 impl Default for ParquetFormatReader {
@@ -68,6 +69,7 @@ impl Default for ParquetFormatReader {
         Self {
             read_budget: None,
             page_index_enabled: true,
+            metadata_cache_enabled: true,
         }
     }
 }
@@ -77,10 +79,12 @@ impl ParquetFormatReader {
         options: &HashMap<String, String>,
         read_budget: Option<Arc<ReadBudget>>,
     ) -> crate::Result<Self> {
+        let core_options = CoreOptions::new(options);
         Ok(Self {
             read_budget,
-            page_index_enabled: crate::spec::CoreOptions::new(options)
-                .parquet_filter_column_index_enabled()?,
+            page_index_enabled: core_options.parquet_filter_column_index_enabled()?,
+            // Format-table files may be replaced in place.
+            metadata_cache_enabled: !core_options.is_format_table(),
         })
     }
 
@@ -597,7 +601,8 @@ impl FormatFileReader for ParquetFormatReader {
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
         let shared_reader: Arc<dyn FileRead> = reader.into();
-        let arrow_file_reader = ArrowFileReader::new(file_size, Arc::clone(&shared_reader));
+        let arrow_file_reader = ArrowFileReader::new(file_size, Arc::clone(&shared_reader))
+            .with_metadata_cache_enabled(self.metadata_cache_enabled);
 
         let empty_predicates = Vec::new();
         let (preds, file_fields): (&[Predicate], &[DataField]) = match predicates {
@@ -2486,13 +2491,19 @@ impl ParquetMetadataCache {
         options: Option<&ArrowReaderOptions>,
         enabled: bool,
     ) -> parquet::errors::Result<Arc<ParquetMetaData>> {
-        self.inner
-            .resize(reader.r.file_format_metadata_cache_max_bytes());
+        let max_bytes = reader.r.file_format_metadata_cache_max_bytes();
+        if !enabled || max_bytes == 0 {
+            if max_bytes == 0 {
+                self.inner.resize(0);
+            }
+            return reader.load_metadata(options).await;
+        }
+        self.inner.resize(max_bytes);
         let column_index = options.map_or(PageIndexPolicy::Skip, |o| o.column_index_policy());
         let offset_index = options.map_or(PageIndexPolicy::Skip, |o| o.offset_index_policy());
-        let key = enabled
-            .then(|| reader.r.cache_key())
-            .flatten()
+        let key = reader
+            .r
+            .cache_key()
             .filter(|key| !key.is_empty())
             .map(|file| ParquetMetadataCacheKey {
                 file: file.to_string(),
@@ -2538,6 +2549,7 @@ fn page_index_policy_tag(policy: PageIndexPolicy) -> u8 {
 struct ArrowFileReader {
     file_size: u64,
     r: Arc<dyn FileRead>,
+    metadata_cache_enabled: bool,
 }
 
 /// coalesce threshold: 1 MiB.
@@ -2557,7 +2569,8 @@ pub(crate) async fn read_row_count(
     reader: Box<dyn FileRead>,
     file_size: u64,
 ) -> crate::Result<i64> {
-    let mut reader = ArrowFileReader::new(file_size, Arc::from(reader));
+    let mut reader =
+        ArrowFileReader::new(file_size, Arc::from(reader)).with_metadata_cache_enabled(false);
     let metadata = reader
         .get_metadata(None)
         .await
@@ -2570,7 +2583,16 @@ pub(crate) async fn read_row_count(
 
 impl ArrowFileReader {
     fn new(file_size: u64, r: Arc<dyn FileRead>) -> Self {
-        Self { file_size, r }
+        Self {
+            file_size,
+            r,
+            metadata_cache_enabled: true,
+        }
+    }
+
+    fn with_metadata_cache_enabled(mut self, enabled: bool) -> Self {
+        self.metadata_cache_enabled = enabled;
+        self
     }
 
     fn read_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
@@ -2729,9 +2751,10 @@ impl AsyncFileReader for ArrowFileReader {
         options: Option<&ArrowReaderOptions>,
     ) -> BoxFuture<'_, parquet::errors::Result<Arc<ParquetMetaData>>> {
         let options = options.cloned();
+        let metadata_cache_enabled = self.metadata_cache_enabled;
         Box::pin(async move {
             PARQUET_METADATA_CACHE
-                .load(self, options.as_ref(), true)
+                .load(self, options.as_ref(), metadata_cache_enabled)
                 .await
         })
     }
@@ -4680,6 +4703,7 @@ mod tests {
         peak_resident_bytes: Arc<AtomicUsize>,
         cache_key: Option<Arc<str>>,
         metadata_cache_max_bytes: usize,
+        resize_cache_on_key: Option<Arc<super::ParquetMetadataCache>>,
     }
 
     struct TrackedReadBuffer {
@@ -4709,6 +4733,7 @@ mod tests {
                 peak_resident_bytes: Arc::new(AtomicUsize::new(0)),
                 cache_key: None,
                 metadata_cache_max_bytes: crate::io::DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES,
+                resize_cache_on_key: None,
             }
         }
 
@@ -4719,6 +4744,11 @@ mod tests {
 
         fn with_metadata_cache_max_bytes(mut self, max_bytes: usize) -> Self {
             self.metadata_cache_max_bytes = max_bytes;
+            self
+        }
+
+        fn with_cache_resize_on_key(mut self, cache: Arc<super::ParquetMetadataCache>) -> Self {
+            self.resize_cache_on_key = Some(cache);
             self
         }
 
@@ -4761,6 +4791,11 @@ mod tests {
         }
 
         fn cache_key(&self) -> Option<&str> {
+            if let Some(cache) = &self.resize_cache_on_key {
+                cache
+                    .inner
+                    .resize(crate::io::DEFAULT_FILE_FORMAT_METADATA_CACHE_MAX_BYTES);
+            }
             self.cache_key.as_deref()
         }
 
@@ -4809,17 +4844,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn format_table_parquet_metadata_bypasses_cache() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let tracker = TrackingFileRead::new(data.clone()).with_cache_key("format-table.parquet");
+        let cache = super::ParquetMetadataCache::new();
+        let reader = super::ParquetFormatReader::with_options(
+            &HashMap::from([("type".to_string(), "format-table".to_string())]),
+            None,
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let mut file_reader =
+                super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+            cache
+                .load(&mut file_reader, None, reader.metadata_cache_enabled)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(tracker.read_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn parquet_row_count_bypasses_metadata_cache() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
+        );
+        let tracker = TrackingFileRead::new(data.clone()).with_cache_key("row-count.parquet");
+
+        for _ in 0..2 {
+            super::read_row_count(Box::new(tracker.clone()), data.len() as u64)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(tracker.read_count(), 2);
+    }
+
+    #[tokio::test]
     async fn parquet_metadata_cache_zero_disables_and_clears_cache() {
         let data = Bytes::from(
             write_multi_row_group_parquet(8, 64, EnabledStatistics::Chunk, false).await,
         );
         let tracker = TrackingFileRead::new(data.clone()).with_cache_key("storage-a\0data.parquet");
-        let cache = super::ParquetMetadataCache::new();
+        let cache = Arc::new(super::ParquetMetadataCache::new());
 
         let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
         cache.load(&mut reader, None, true).await.unwrap();
 
-        let disabled = tracker.clone().with_metadata_cache_max_bytes(0);
+        let disabled = tracker
+            .clone()
+            .with_metadata_cache_max_bytes(0)
+            .with_cache_resize_on_key(Arc::clone(&cache));
         let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(disabled));
         cache.load(&mut reader, None, true).await.unwrap();
 
