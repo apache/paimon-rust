@@ -71,6 +71,15 @@ type ListDirResultSize = unsafe extern "C" fn(JdoPtr) -> i64;
 type IsListDirResultTruncated = unsafe extern "C" fn(JdoPtr) -> bool;
 type ListDirResultNextMarker = unsafe extern "C" fn(JdoPtr) -> *const c_char;
 type ListDirFileStatus = unsafe extern "C" fn(JdoPtr, usize) -> JdoPtr;
+type ListObjects = unsafe extern "C" fn(
+    JdoPtr,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    i32,
+    JdoPtr,
+) -> JdoPtr;
+type FreeListObjectsResult = unsafe extern "C" fn(JdoPtr);
 type GetObject = unsafe extern "C" fn(JdoPtr, *const c_char, *mut c_char, i64, i64, JdoPtr) -> i64;
 
 unsafe extern "C" {
@@ -79,6 +88,18 @@ unsafe extern "C" {
         handle: JdoPtr,
         path: *const c_char,
         recursive: bool,
+        options: JdoPtr,
+        result: *mut JdoPtr,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
+    fn paimon_jindo_list_objects(
+        list_objects: ListObjects,
+        handle: JdoPtr,
+        path: *const c_char,
+        delimiter: *const c_char,
+        marker: *const c_char,
+        max_keys: i32,
         options: JdoPtr,
         result: *mut JdoPtr,
         error: *mut c_char,
@@ -348,16 +369,7 @@ impl oio::List for JindoLister {
             let path = self.path.clone();
             let recursive = self.recursive;
             let marker = self.marker.clone();
-            let first_page = marker.is_none();
-            let page = match run_blocking(move || client.list_page(&path, recursive, marker)).await
-            {
-                Ok(page) => page,
-                Err(error) if first_page && error.kind() == ErrorKind::NotFound => {
-                    self.finished = true;
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            };
+            let page = run_blocking(move || client.list_page(&path, recursive, marker)).await?;
             self.finished = page.next_marker.is_none();
             self.marker = page.next_marker;
             self.entries = page.entries.into_iter();
@@ -441,6 +453,8 @@ struct JindoApi {
     is_list_dir_result_truncated: IsListDirResultTruncated,
     list_dir_result_next_marker: ListDirResultNextMarker,
     list_dir_file_status: ListDirFileStatus,
+    list_objects: ListObjects,
+    free_list_objects_result: FreeListObjectsResult,
     get_object: GetObject,
     _library: Library,
 }
@@ -530,6 +544,8 @@ impl JindoApi {
                 ListDirResultNextMarker
             ),
             list_dir_file_status: load!("jdo_getListDirFileStatus", ListDirFileStatus),
+            list_objects: load!("jdo_listObjects", ListObjects),
+            free_list_objects_result: load!("jdo_freeListObjectsResult", FreeListObjectsResult),
             get_object: load!("jdo_getObject", GetObject),
             _library: library,
         };
@@ -662,7 +678,15 @@ impl JindoClient {
         marker: Option<String>,
     ) -> OpendalResult<JindoListPage> {
         let path = to_cstring(&self.full_path(path), "Jindo path")?;
-        self.with_handle(|handle| {
+        let first_page = marker.is_none();
+        let handle = unsafe { (self.api.create_handle)(self.store) };
+        if handle.is_null() {
+            return Err(OpendalError::new(
+                ErrorKind::Unexpected,
+                "Jindo failed to create an operation context",
+            ));
+        }
+        let value = (|| {
             let options = unsafe { (self.api.create_options)() };
             if options.is_null() {
                 return Err(OpendalError::new(
@@ -723,6 +747,57 @@ impl JindoClient {
                 entries,
                 next_marker,
             })
+        })();
+        let code = unsafe { (self.api.handle_error_code)(handle) };
+        let error = self.handle_error(handle);
+        unsafe { (self.api.free_handle)(handle) };
+        if first_page && code == JDO_FILE_NOT_FOUND_ERROR {
+            self.verify_list_prefix(&path)?;
+            return Ok(JindoListPage {
+                entries: Vec::new(),
+                next_marker: None,
+            });
+        }
+        error?;
+        value
+    }
+
+    fn verify_list_prefix(&self, path: &CStr) -> OpendalResult<()> {
+        self.with_handle(|handle| {
+            let mut result = std::ptr::null_mut();
+            let mut error = [0 as c_char; JINDO_EXCEPTION_BUFFER_SIZE];
+            let status = unsafe {
+                paimon_jindo_list_objects(
+                    self.api.list_objects,
+                    handle,
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    std::ptr::null_mut(),
+                    &mut result,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            };
+            if status != 0 {
+                let message = unsafe { CStr::from_ptr(error.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                return Err(OpendalError::new(
+                    ErrorKind::Unexpected,
+                    "Jindo list failed with a C++ exception",
+                )
+                .with_context("message", message));
+            }
+            if result.is_null() {
+                return Err(OpendalError::new(
+                    ErrorKind::Unexpected,
+                    "Jindo returned an empty list result",
+                ));
+            }
+            unsafe { (self.api.free_list_objects_result)(result) };
+            Ok(())
         })
     }
 
@@ -1162,6 +1237,18 @@ mod tests {
         }
 
         if method == Method::GET {
+            if uri.path().starts_with("/missing-bucket/") {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("content-type", "application/xml")
+                    .header("x-oss-request-id", "jindo-test-bucket-not-found")
+                    .body(Body::from(
+                        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchBucket</Code><Message>missing bucket</Message>
+<RequestId>jindo-test-bucket-not-found</RequestId></Error>"#,
+                    ))
+                    .unwrap();
+            }
             if let Some(range) = headers.get("range") {
                 if uri.path().contains("unavailable.bin") {
                     state.unavailable_requests.fetch_add(1, Ordering::SeqCst);
@@ -1334,6 +1421,10 @@ mod tests {
             ["objects/a.bin", "objects/b.bin"]
         );
         assert!(operator.list("empty/").await.unwrap().is_empty());
+
+        let missing_bucket_operator = jindo_config_build(&config, "missing-bucket").unwrap();
+        let missing_bucket = missing_bucket_operator.list("empty/").await.unwrap_err();
+        assert_eq!(missing_bucket.kind(), ErrorKind::NotFound);
 
         let later_not_found = operator.list("broken-page/").await.unwrap_err();
         assert_eq!(later_not_found.kind(), ErrorKind::NotFound);

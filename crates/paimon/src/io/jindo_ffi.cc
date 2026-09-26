@@ -19,6 +19,8 @@
 #include <exception>
 
 using ListDir = void* (*)(void*, const char*, bool, void*);
+using ListObjects = void* (*)(
+        void*, const char*, const char*, const char*, int, void*);
 
 namespace {
 
@@ -54,6 +56,33 @@ extern "C" int paimon_jindo_list_dir(
     *result = nullptr;
     try {
         *result = list_dir(handle, path, recursive, options);
+        return 0;
+    } catch (const std::exception& exception) {
+        copy_error(error, error_capacity, exception.what());
+    } catch (...) {
+        copy_error(error, error_capacity, "unknown C++ exception");
+    }
+    return 1;
+}
+
+extern "C" int paimon_jindo_list_objects(
+        ListObjects list_objects,
+        void* handle,
+        const char* path,
+        const char* delimiter,
+        const char* marker,
+        int max_keys,
+        void* options,
+        void** result,
+        char* error,
+        std::size_t error_capacity) noexcept {
+    if (list_objects == nullptr || result == nullptr) {
+        copy_error(error, error_capacity, "invalid Jindo list call");
+        return 1;
+    }
+    *result = nullptr;
+    try {
+        *result = list_objects(handle, path, delimiter, marker, max_keys, options);
         return 0;
     } catch (const std::exception& exception) {
         copy_error(error, error_capacity, exception.what());
