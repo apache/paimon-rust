@@ -19,8 +19,8 @@ use super::{find_skipping_tags, previous_tag};
 use crate::catalog::Identifier;
 use crate::io::FileIOBuilder;
 use crate::spec::{
-    DataType, FileKind, IndexManifest, IntType, ManifestList, Schema, Snapshot, TableSchema,
-    VarCharType, SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION,
+    DataType, FileKind, IndexManifest, IntType, Manifest, ManifestList, Schema, Snapshot,
+    TableSchema, VarCharType, SCAN_SNAPSHOT_ID_OPTION, SCAN_TAG_NAME_OPTION,
 };
 use crate::table::{CommitMessage, Table, TableCommit, TableWrite};
 use crate::Error;
@@ -197,6 +197,8 @@ async fn live_snapshots(table: &Table) -> Vec<Snapshot> {
 /// reader needs is gone, and nothing only expired snapshots used is left.
 ///
 /// Live data files come from the scan planner, not from the deletion code.
+/// Data, changelog and index files are compared together, because index files
+/// (deletion vectors) may live in bucket directories beside the data.
 async fn assert_files_match_references(table: &Table) {
     let mut data_files = BTreeSet::new();
     let mut manifest_files = BTreeSet::new();
@@ -220,7 +222,20 @@ async fn assert_files_match_references(table: &Table) {
             snapshot.base_manifest_list().to_string(),
             snapshot.delta_manifest_list().to_string(),
         ];
-        lists.extend(snapshot.changelog_manifest_list().map(str::to_string));
+        if let Some(changelog) = snapshot.changelog_manifest_list() {
+            for manifest in ManifestList::read(file_io, &manifest_path(changelog))
+                .await
+                .unwrap()
+            {
+                for entry in Manifest::read(file_io, &manifest_path(manifest.file_name()))
+                    .await
+                    .unwrap()
+                {
+                    data_files.insert(entry.file().file_name.clone());
+                }
+            }
+            lists.push(changelog.to_string());
+        }
         for list in lists {
             for manifest in ManifestList::read(file_io, &manifest_path(&list))
                 .await
@@ -240,16 +255,14 @@ async fn assert_files_match_references(table: &Table) {
             manifest_files.insert(index_manifest.to_string());
         }
     }
-    assert_eq!(physical_data_files(table).await, data_files, "data files");
+    let mut physical = physical_data_files(table).await;
+    physical.extend(file_names_under(table, "index").await);
+    data_files.extend(index_files);
+    assert_eq!(physical, data_files, "data, changelog and index files");
     assert_eq!(
         file_names_under(table, "manifest").await,
         manifest_files,
         "manifest files"
-    );
-    assert_eq!(
-        file_names_under(table, "index").await,
-        index_files,
-        "index files"
     );
 }
 
@@ -656,4 +669,341 @@ fn test_previous_tag_and_skipping_tags() {
     assert_eq!(ids(1, 2), Vec::<i64>::new());
     assert_eq!(ids(1, 3), vec![2]);
     assert_eq!(ids(10, 20), vec![9]);
+}
+
+fn table_with_schema(table_path: &str, schema: Schema) -> Table {
+    Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "expire_table"),
+        table_path.to_string(),
+        TableSchema::new(0, &schema),
+        None,
+    )
+}
+
+async fn delete_row(table: &Table, row_id: i64) {
+    let mut deletion = table.new_write_builder().new_delete().unwrap();
+    deletion.add_row_ids([row_id]).unwrap();
+    let messages = deletion.prepare_commit().await.unwrap();
+    TableCommit::new(table.clone(), "u".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+}
+
+async fn index_file_names(table: &Table, snapshot: &Snapshot) -> BTreeSet<String> {
+    let Some(index_manifest) = snapshot.index_manifest() else {
+        return BTreeSet::new();
+    };
+    IndexManifest::read(
+        table.file_io(),
+        &format!("{}/manifest/{index_manifest}", table.location()),
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|entry| entry.index_file.file_name)
+    .collect()
+}
+
+#[tokio::test]
+async fn test_deletion_vector_files_follow_their_snapshots() {
+    for in_data_dir in ["false", "true"] {
+        let table = test_table(
+            &format!("memory:/expire_dv_{in_data_dir}"),
+            &[
+                ("row-tracking.enabled", "true"),
+                ("data-evolution.enabled", "true"),
+                ("deletion-vectors.enabled", "true"),
+                ("index-file-in-data-file-dir", in_data_dir),
+            ],
+            false,
+        );
+        setup_dirs(&table).await;
+        append(&table, &[1, 2, 3]).await;
+        delete_row(&table, 0).await;
+        let sm = table.snapshot_manager();
+        let first_dv = index_file_names(&table, &sm.get_snapshot(2).await.unwrap()).await;
+        assert_eq!(
+            first_dv.len(),
+            1,
+            "one deletion vector after the first delete"
+        );
+        delete_row(&table, 1).await;
+        append(&table, &[4]).await;
+        let latest = sm.get_latest_snapshot().await.unwrap().unwrap();
+        let live_dv = index_file_names(&table, &latest).await;
+        assert!(
+            live_dv.is_disjoint(&first_dv),
+            "the second delete rewrote the vector"
+        );
+
+        assert_eq!(expire_keeping(&table, 1).await, 3);
+        assert_files_match_references(&table).await;
+        assert_eq!(
+            read_ids(&table).await,
+            vec![3, 4],
+            "index-file-in-data-file-dir={in_data_dir}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_changelog_and_hash_index_files_are_expired() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("dt", DataType::VarChar(VarCharType::string_type()))
+        .primary_key(["id"])
+        .option("changelog-producer", "input")
+        .option("index-file-in-data-file-dir", "true")
+        .build()
+        .unwrap();
+    let table = table_with_schema("memory:/expire_changelog", schema);
+    setup_dirs(&table).await;
+    for id in 1..=3 {
+        append(&table, &[id]).await;
+    }
+    let sm = table.snapshot_manager();
+    let changelog_of = |snapshot: Snapshot| snapshot.changelog_manifest_list().map(str::to_string);
+    assert!(changelog_of(sm.get_snapshot(1).await.unwrap()).is_some());
+    let physical_before = physical_data_files(&table).await;
+    assert!(
+        physical_before
+            .iter()
+            .any(|name| name.starts_with("changelog-")),
+        "{physical_before:?}"
+    );
+
+    assert_eq!(expire_keeping(&table, 1).await, 2);
+    let physical_after = physical_data_files(&table).await;
+    let changelogs_after = physical_after
+        .iter()
+        .filter(|name| name.starts_with("changelog-"))
+        .count();
+    assert_eq!(
+        changelogs_after, 1,
+        "only the retained snapshot's changelog stays"
+    );
+    assert_files_match_references(&table).await;
+    assert_eq!(read_ids(&table).await, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn test_external_data_files_are_deleted_at_their_path() {
+    let table = test_table("memory:/expire_external", &[], false);
+    setup_dirs(&table).await;
+    let file_io = table.file_io().clone();
+    // Move each written file to an external location, as a table with
+    // `data-file.external-paths` stores it.
+    let externalize = |mut messages: Vec<CommitMessage>, name: &'static str| {
+        let file_io = file_io.clone();
+        async move {
+            for message in &mut messages {
+                for file in &mut message.new_files {
+                    let bucket_path =
+                        format!("{}/bucket-{}", "memory:/expire_external", message.bucket);
+                    let local = file.data_file_path(&bucket_path);
+                    let external = format!("memory:/external_store/{name}/{}", file.file_name);
+                    let bytes = file_io.new_input(&local).unwrap().read().await.unwrap();
+                    file_io
+                        .new_output(&external)
+                        .unwrap()
+                        .write(bytes)
+                        .await
+                        .unwrap();
+                    file_io.delete_file(&local).await.unwrap();
+                    file.external_path = Some(external);
+                }
+            }
+            messages
+        }
+    };
+    let first = externalize(write(&table, &[1], "a").await, "first").await;
+    let first_path = first[0].new_files[0].external_path.clone().unwrap();
+    TableCommit::new(table.clone(), "u".to_string())
+        .commit(first)
+        .await
+        .unwrap();
+    let second = externalize(write(&table, &[2], "a").await, "second").await;
+    let second_path = second[0].new_files[0].external_path.clone().unwrap();
+    TableCommit::new(table.clone(), "u".to_string())
+        .overwrite(second, None)
+        .await
+        .unwrap();
+    append(&table, &[3]).await;
+    assert_eq!(read_ids(&table).await, vec![2, 3]);
+
+    assert_eq!(expire_keeping(&table, 1).await, 2);
+    assert!(
+        !file_io.exists(&first_path).await.unwrap(),
+        "overwritten external file"
+    );
+    assert!(
+        file_io.exists(&second_path).await.unwrap(),
+        "live external file"
+    );
+    assert_eq!(read_ids(&table).await, vec![2, 3]);
+}
+
+/// Replace a manifest list with bytes that do not parse.
+async fn corrupt_manifest(table: &Table, name: &str) {
+    table
+        .file_io()
+        .new_output(&format!("{}/manifest/{name}", table.location()))
+        .unwrap()
+        .write(bytes::Bytes::from_static(b"not an avro file"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_unreadable_delta_keeps_its_data_files() {
+    let table = test_table("memory:/expire_bad_delta", &[], false);
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    let files_of_1 = physical_data_files(&table).await;
+    overwrite(&table, &[2]).await;
+    overwrite(&table, &[3]).await;
+    let sm = table.snapshot_manager();
+    // Snapshot 2's delta, which deletes the file of snapshot 1, is unreadable.
+    corrupt_manifest(
+        &table,
+        sm.get_snapshot(2).await.unwrap().delta_manifest_list(),
+    )
+    .await;
+
+    assert_eq!(expire_keeping(&table, 1).await, 2);
+    let remaining = physical_data_files(&table).await;
+    assert!(
+        files_of_1.is_subset(&remaining),
+        "a plan that cannot be read deletes nothing"
+    );
+    // Snapshot 3's readable delta still removed the file of snapshot 2.
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(read_ids(&table).await, vec![3]);
+}
+
+#[tokio::test]
+async fn test_unreadable_tag_keeps_files_it_may_protect() {
+    let table = test_table("memory:/expire_bad_tag", &[], false);
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    let sm = table.snapshot_manager();
+    table
+        .tag_manager()
+        .create("t1", &sm.get_snapshot(1).await.unwrap())
+        .await
+        .unwrap();
+    overwrite(&table, &[2]).await;
+    overwrite(&table, &[3]).await;
+    let data_before = physical_data_files(&table).await;
+    corrupt_manifest(
+        &table,
+        sm.get_snapshot(1).await.unwrap().delta_manifest_list(),
+    )
+    .await;
+
+    expire_keeping(&table, 1).await;
+    // Every deletion after the tag depends on reading it, so nothing goes.
+    assert_eq!(physical_data_files(&table).await, data_before);
+    assert_eq!(read_ids(&table).await, vec![3]);
+}
+
+#[tokio::test]
+async fn test_unbuildable_skipping_set_keeps_manifests() {
+    let table = test_table("memory:/expire_bad_skipping", &[], false);
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    overwrite(&table, &[2]).await;
+    let sm = table.snapshot_manager();
+    // A tag inside the expired range whose manifests cannot be read.
+    table
+        .tag_manager()
+        .create("t2", &sm.get_snapshot(2).await.unwrap())
+        .await
+        .unwrap();
+    overwrite(&table, &[3]).await;
+    let snapshot_1 = sm.get_snapshot(1).await.unwrap();
+    corrupt_manifest(
+        &table,
+        sm.get_snapshot(2).await.unwrap().base_manifest_list(),
+    )
+    .await;
+
+    assert_eq!(expire_keeping(&table, 1).await, 2);
+    let manifests = file_names_under(&table, "manifest").await;
+    assert!(manifests.contains(snapshot_1.base_manifest_list()));
+    assert!(manifests.contains(snapshot_1.delta_manifest_list()));
+    assert_eq!(snapshot_ids(&table).await, vec![3]);
+    assert_eq!(read_ids(&table).await, vec![3]);
+}
+
+#[tokio::test]
+async fn test_each_snapshot_is_protected_by_its_closest_earlier_tag() {
+    let table = test_table("memory:/expire_two_tags", &[], false);
+    setup_dirs(&table).await;
+    let sm = table.snapshot_manager();
+    append(&table, &[1]).await;
+    overwrite(&table, &[2]).await;
+    for (tag, id) in [("t1", 1), ("t2", 2)] {
+        table
+            .tag_manager()
+            .create(tag, &sm.get_snapshot(id).await.unwrap())
+            .await
+            .unwrap();
+    }
+    overwrite(&table, &[3]).await;
+    overwrite(&table, &[4]).await;
+
+    assert_eq!(expire_keeping(&table, 1).await, 3);
+    // Files of 1 and 2 stay for their tags; the file of 3 goes.
+    assert_eq!(physical_data_files(&table).await.len(), 3);
+    assert_files_match_references(&table).await;
+    assert_eq!(
+        read_ids_at(&table, SCAN_TAG_NAME_OPTION, "t1").await,
+        vec![1]
+    );
+    assert_eq!(
+        read_ids_at(&table, SCAN_TAG_NAME_OPTION, "t2").await,
+        vec![2]
+    );
+}
+
+#[tokio::test]
+async fn test_missing_snapshot_in_range_is_skipped() {
+    let table = test_table("memory:/expire_gap", &[], false);
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    for id in 2..=4 {
+        overwrite(&table, &[id]).await;
+    }
+    // Snapshot 2 was removed by someone else.
+    table.snapshot_manager().delete_snapshot(2).await.unwrap();
+
+    assert_eq!(expire_keeping(&table, 1).await, 2);
+    assert_eq!(snapshot_ids(&table).await, vec![4]);
+    assert_eq!(read_ids(&table).await, vec![4]);
+}
+
+#[tokio::test]
+async fn test_slowest_consumer_limits_expiration() {
+    let table = test_table("memory:/expire_consumers", &[], false);
+    setup_dirs(&table).await;
+    for id in 1..=5 {
+        append(&table, &[id]).await;
+    }
+    for (consumer, next) in [("fast", 5), ("slow", 3)] {
+        table
+            .file_io()
+            .new_output(&format!(
+                "{}/consumer/consumer-{consumer}",
+                table.location()
+            ))
+            .unwrap()
+            .write(bytes::Bytes::from(format!(r#"{{"nextSnapshot":{next}}}"#)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(expire_keeping(&table, 1).await, 2);
+    assert_eq!(snapshot_ids(&table).await, vec![3, 4, 5]);
 }
