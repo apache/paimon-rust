@@ -457,7 +457,7 @@ impl FormatFileReader for TextFormatReader {
                     .into_bytes()
             };
         let normalized = if matches!(self.kind, TextKind::Json) {
-            transform_json_binary_lines(&normalized, &schema, false)?
+            transform_json_lines(&normalized, &schema, false)?
         } else {
             normalized
         };
@@ -646,6 +646,11 @@ fn parse_csv_line(line: &str, options: &TextOptions) -> crate::Result<Vec<Option
                 })?;
                 position += 1;
                 if byte == options.quote {
+                    if bytes.get(position) == Some(&options.quote) {
+                        value.push(options.quote);
+                        position += 1;
+                        continue;
+                    }
                     break;
                 }
                 if byte == options.escape
@@ -727,17 +732,13 @@ fn csv_cast_column(column: &ArrayRef, target: &DataType) -> crate::Result<ArrayR
     arrow_cast::cast(column, target).map_err(arrow_error)
 }
 
-/// Java's JSON format uses Base64 for binary values. Arrow JSON uses hex, so
-/// translate at the JSON boundary while keeping its typed nested decoder.
-fn transform_json_binary_lines(
-    bytes: &[u8],
-    schema: &SchemaRef,
-    to_java: bool,
-) -> crate::Result<Vec<u8>> {
+/// Normalize Java's Base64 binary and string boolean values for Arrow JSON,
+/// while retaining the exact tokens of unrelated numeric fields.
+fn transform_json_lines(bytes: &[u8], schema: &SchemaRef, to_java: bool) -> crate::Result<Vec<u8>> {
     if !schema
         .fields()
         .iter()
-        .any(|f| contains_binary(f.data_type()))
+        .any(|f| contains_json_conversion(f.data_type()))
     {
         return Ok(bytes.to_vec());
     }
@@ -753,7 +754,7 @@ fn transform_json_binary_lines(
             })?;
         for field in schema.fields() {
             if let Some(child) = value.get_mut(field.name()) {
-                transform_json_binary(child, field.data_type(), to_java)?;
+                transform_json_value(child, field.data_type(), to_java)?;
             }
         }
         serde_json::to_writer(&mut output, &value).map_err(|e| Error::DataInvalid {
@@ -765,21 +766,24 @@ fn transform_json_binary_lines(
     Ok(output)
 }
 
-fn contains_binary(data_type: &DataType) -> bool {
+fn contains_json_conversion(data_type: &DataType) -> bool {
     match data_type {
-        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => true,
+        DataType::Boolean
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::FixedSizeBinary(_) => true,
         DataType::Struct(fields) => fields
             .iter()
-            .any(|field| contains_binary(field.data_type())),
+            .any(|field| contains_json_conversion(field.data_type())),
         DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
-            contains_binary(field.data_type())
+            contains_json_conversion(field.data_type())
         }
-        DataType::Map(field, _) => contains_binary(field.data_type()),
+        DataType::Map(field, _) => contains_json_conversion(field.data_type()),
         _ => false,
     }
 }
 
-fn transform_json_binary(
+fn transform_json_value(
     value: &mut serde_json::Value,
     data_type: &DataType,
     to_java: bool,
@@ -788,6 +792,19 @@ fn transform_json_binary(
         return Ok(());
     }
     match data_type {
+        DataType::Boolean => {
+            if to_java {
+                if let Some(boolean) = value.as_bool() {
+                    *value = serde_json::Value::String(boolean.to_string());
+                }
+            } else if let Some(boolean) = value.as_str() {
+                if boolean.eq_ignore_ascii_case("true") {
+                    *value = serde_json::Value::Bool(true);
+                } else if boolean.eq_ignore_ascii_case("false") {
+                    *value = serde_json::Value::Bool(false);
+                }
+            }
+        }
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
             let encoded = value.as_str().ok_or_else(|| Error::DataInvalid {
                 message: "JSON binary value must be a string".into(),
@@ -815,14 +832,14 @@ fn transform_json_binary(
         DataType::Struct(fields) => {
             for field in fields {
                 if let Some(child) = value.get_mut(field.name()) {
-                    transform_json_binary(child, field.data_type(), to_java)?;
+                    transform_json_value(child, field.data_type(), to_java)?;
                 }
             }
         }
         DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
             if let Some(items) = value.as_array_mut() {
                 for item in items {
-                    transform_json_binary(item, field.data_type(), to_java)?;
+                    transform_json_value(item, field.data_type(), to_java)?;
                 }
             }
         }
@@ -830,7 +847,7 @@ fn transform_json_binary(
             if let DataType::Struct(fields) = field.data_type() {
                 if let Some(values) = value.as_object_mut() {
                     for item in values.values_mut() {
-                        transform_json_binary(item, fields[1].data_type(), to_java)?;
+                        transform_json_value(item, fields[1].data_type(), to_java)?;
                     }
                 }
             }
@@ -921,7 +938,7 @@ impl FormatFileWriter for TextFormatWriter {
                 writer.write(batch).map_err(arrow_error)?;
                 writer.finish().map_err(arrow_error)?;
                 drop(writer);
-                bytes = transform_json_binary_lines(&bytes, &self.schema, true)?;
+                bytes = transform_json_lines(&bytes, &self.schema, true)?;
                 if self.options.line_delimiter != "\n" {
                     bytes = String::from_utf8(bytes)
                         .map_err(|e| Error::DataInvalid {
@@ -1020,4 +1037,45 @@ fn append_csv_row<'a>(
     }
     out.extend_from_slice(options.line_delimiter.as_bytes());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{Field, Schema};
+
+    #[test]
+    fn nested_java_json_boolean_strings_are_normalized() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "outer",
+            DataType::Struct(
+                vec![
+                    Field::new("flag", DataType::Boolean, true),
+                    Field::new(
+                        "flags",
+                        DataType::List(Arc::new(Field::new("item", DataType::Boolean, true))),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            true,
+        )]));
+        let input = b"{\"outer\":{\"flag\":\"true\",\"flags\":[\"false\",null,\"true\"]}}\n";
+        let normalized = transform_json_lines(input, &schema, false).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
+        assert_eq!(value["outer"]["flag"], true);
+        assert_eq!(
+            value["outer"]["flags"],
+            serde_json::json!([false, null, true])
+        );
+
+        let java = transform_json_lines(&normalized, &schema, true).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&java).unwrap();
+        assert_eq!(value["outer"]["flag"], "true");
+        assert_eq!(
+            value["outer"]["flags"],
+            serde_json::json!(["false", null, "true"])
+        );
+    }
 }

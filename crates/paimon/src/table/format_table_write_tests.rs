@@ -21,7 +21,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, BinaryArray, Int32Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, BinaryArray, BooleanArray, Decimal128Array, Int32Array, RecordBatch, StringArray,
+};
 use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -29,7 +31,9 @@ use futures::TryStreamExt;
 use super::Table;
 use crate::catalog::Identifier;
 use crate::io::{FileIO, FileIOBuilder};
-use crate::spec::{DataType, IntType, Schema, TableSchema, VarBinaryType, VarCharType};
+use crate::spec::{
+    BooleanType, DataType, DecimalType, IntType, Schema, TableSchema, VarBinaryType, VarCharType,
+};
 
 fn table(io: FileIO, location: &str, partitioned: bool, options: &[(&str, &str)]) -> Table {
     let mut builder = Schema::builder();
@@ -848,6 +852,197 @@ async fn csv_and_json_binary_fields_use_java_base64_encoding() {
             .unwrap();
         assert_eq!(payload.value(0), b"Hi", "format={format}");
     }
+}
+
+#[tokio::test]
+async fn json_binary_conversion_preserves_decimal_precision() {
+    let schema = Schema::builder()
+        .column(
+            "amount",
+            DataType::Decimal(DecimalType::new(38, 4).unwrap()),
+        )
+        .column(
+            "payload",
+            DataType::VarBinary(VarBinaryType::new(32).unwrap()),
+        )
+        .option("type", "format-table")
+        .option("file.format", "json")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_json_decimal_binary"),
+        "memory:/format_json_decimal_binary".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    let unscaled: i128 = "12345678901234567890123456789012345678".parse().unwrap();
+    let input = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("amount", ArrowType::Decimal128(38, 4), true),
+            Field::new("payload", ArrowType::Binary, true),
+        ])),
+        vec![
+            Arc::new(
+                Decimal128Array::from(vec![Some(unscaled)])
+                    .with_precision_and_scale(38, 4)
+                    .unwrap(),
+            ),
+            Arc::new(BinaryArray::from(vec![Some(&b"Hi"[..])])),
+        ],
+    )
+    .unwrap();
+    append(&table, &input).await;
+    let path = visible_files(&table, "").await.remove(0);
+    let written = table
+        .file_io()
+        .new_input(&path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&written).contains("1234567890123456789012345678901234.5678"));
+    table
+        .file_io()
+        .new_output(&format!("{}/external.json", table.location()))
+        .unwrap()
+        .write(Bytes::from_static(
+            b"{\"amount\":1234567890123456789012345678901234.5678,\"payload\":\"SGk=\"}\n",
+        ))
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, [unscaled, unscaled]);
+}
+
+#[tokio::test]
+async fn java_json_boolean_strings_are_readable() {
+    let schema = Schema::builder()
+        .column("flag", DataType::Boolean(BooleanType::new()))
+        .option("type", "format-table")
+        .option("file.format", "json")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_java_json_boolean"),
+        "memory:/format_java_json_boolean".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    table
+        .file_io()
+        .new_output(&format!("{}/java.json", table.location()))
+        .unwrap()
+        .write(Bytes::from_static(
+            b"{\"flag\":\"true\"}\n{\"flag\":\"false\"}\n",
+        ))
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let flags = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
+    assert_eq!(flags.iter().collect::<Vec<_>>(), [Some(true), Some(false)]);
+
+    let input = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "flag",
+            ArrowType::Boolean,
+            true,
+        )])),
+        vec![Arc::new(BooleanArray::from(vec![Some(true)]))],
+    )
+    .unwrap();
+    append(&table, &input).await;
+    let path = visible_files(&table, "")
+        .await
+        .into_iter()
+        .find(|path| !path.ends_with("/java.json"))
+        .unwrap();
+    let written = table
+        .file_io()
+        .new_input(&path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&written).contains("\"flag\":\"true\""));
+}
+
+#[tokio::test]
+async fn csv_reads_java_doubled_and_backslash_quoted_fields() {
+    let schema = Schema::builder()
+        .column("value", DataType::VarChar(VarCharType::string_type()))
+        .option("type", "format-table")
+        .option("file.format", "csv")
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "format_java_csv_quotes"),
+        "memory:/format_java_csv_quotes".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    table
+        .file_io()
+        .new_output(&format!("{}/java.csv", table.location()))
+        .unwrap()
+        .write(Bytes::from_static(b"\"a\"\"b\"\n\"c\\\"d\"\n"))
+        .await
+        .unwrap();
+    let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = table
+        .new_read_builder()
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        [Some("a\"b"), Some("c\"d")]
+    );
 }
 
 #[tokio::test]
