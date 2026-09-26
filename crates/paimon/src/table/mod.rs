@@ -47,6 +47,7 @@ mod data_file_writer;
 mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
+mod external_path;
 mod format_partition;
 mod format_partition_location;
 mod format_partition_stats;
