@@ -37,6 +37,8 @@ mod chunk_shuffle;
 mod commit_message;
 mod consumer_manager;
 pub(crate) mod cow_writer;
+mod data_evolution_fields;
+mod data_evolution_nested;
 mod data_evolution_reader;
 pub mod data_evolution_writer;
 mod data_file_index_writer;

@@ -2888,40 +2888,46 @@ impl TableCommit {
                 .fields()
                 .to_vec()
         };
-        let field_id_by_name = fields
-            .iter()
-            .map(|field| (field.name().to_string(), field.id()))
-            .collect::<HashMap<_, _>>();
-
-        let mut field_ids = HashSet::new();
-        match file.write_cols.as_ref() {
-            None => {
-                field_ids.extend(
-                    fields
-                        .iter()
-                        .filter(|field| !is_system_field(field.name()))
-                        .map(|field| field.id()),
-                );
-            }
-            Some(write_cols) => {
-                for col in write_cols {
-                    if is_system_field(col) {
-                        continue;
-                    }
-                    let Some(field_id) = field_id_by_name.get(col) else {
-                        return Err(crate::Error::DataInvalid {
-                            message: format!(
-                                "Cannot find write column '{}' in schema {}.",
-                                col, file.schema_id
-                            ),
-                            source: None,
-                        });
-                    };
-                    field_ids.insert(*field_id);
-                }
-            }
+        let data_fields = fields
+            .into_iter()
+            .filter(|field| !is_system_field(field.name()))
+            .collect::<Vec<_>>();
+        let write_cols = file.write_cols.as_ref().map(|cols| {
+            cols.iter()
+                .filter(|col| !is_system_field(col))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        if self
+            .table
+            .schema()
+            .core_options()
+            .data_evolution_nested_field_enabled()
+        {
+            return super::data_evolution_fields::write_leaf_ids(
+                &data_fields,
+                write_cols.as_deref(),
+            );
         }
-        Ok(field_ids)
+        let mut ids = HashSet::new();
+        if let Some(write_cols) = write_cols {
+            for col in write_cols {
+                let field = data_fields
+                    .iter()
+                    .find(|field| field.name() == col)
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!(
+                            "Cannot find write column '{}' in schema {}.",
+                            col, file.schema_id
+                        ),
+                        source: None,
+                    })?;
+                ids.insert(field.id());
+            }
+        } else {
+            ids.extend(data_fields.iter().map(|field| field.id()));
+        }
+        Ok(ids)
     }
 
     /// Assign row tracking metadata: snapshot ID as sequence number, and
@@ -3788,6 +3794,93 @@ mod tests {
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
+    }
+
+    #[tokio::test]
+    async fn nested_row_id_conflicts_follow_java_leaf_identity() {
+        use crate::spec::{IntType, RowType, Schema};
+
+        let profile = DataType::Row(RowType::new(vec![
+            crate::spec::DataField::new(0, "name".into(), DataType::Int(IntType::new())),
+            crate::spec::DataField::new(0, "age".into(), DataType::Int(IntType::new())),
+        ]));
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("profile", profile)
+            .option("bucket", "-1")
+            .option("data-evolution.enabled", "true")
+            .option("data-evolution.nested-field.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "nested_conflict"),
+            "memory:/nested_conflict".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let commit = table.new_write_builder().new_commit();
+        let ids_for = |path: Option<&str>| {
+            let mut file = test_data_file("f.parquet", 10);
+            file.write_cols = path.map(|path| vec![path.to_string()]);
+            file
+        };
+        let name = commit
+            .write_field_ids(&ids_for(Some("profile.name")))
+            .await
+            .unwrap();
+        let age = commit
+            .write_field_ids(&ids_for(Some("profile.age")))
+            .await
+            .unwrap();
+        let whole = commit
+            .write_field_ids(&ids_for(Some("profile")))
+            .await
+            .unwrap();
+        let full = commit.write_field_ids(&ids_for(None)).await.unwrap();
+        assert!(name.is_disjoint(&age));
+        assert!(!name.is_disjoint(&whole));
+        assert!(!age.is_disjoint(&whole));
+        assert!(whole.is_subset(&full));
+    }
+
+    #[tokio::test]
+    async fn disabled_nested_mode_rejects_dotted_row_id_write_path() {
+        use crate::spec::{IntType, RowType, Schema};
+
+        let schema = Schema::builder()
+            .column(
+                "profile",
+                DataType::Row(RowType::new(vec![crate::spec::DataField::new(
+                    0,
+                    "age".into(),
+                    DataType::Int(IntType::new()),
+                )])),
+            )
+            .option("bucket", "-1")
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            test_file_io(),
+            Identifier::new("default", "nested_disabled"),
+            "memory:/nested_disabled".into(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let mut file = test_data_file("f.parquet", 10);
+        file.write_cols = Some(vec!["profile.age".into()]);
+        let err = table
+            .new_write_builder()
+            .new_commit()
+            .write_field_ids(&file)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Cannot find write column 'profile.age'"));
     }
 
     fn test_partitioned_schema() -> TableSchema {

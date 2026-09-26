@@ -41,7 +41,9 @@ use crate::table::stats_filter::group_by_overlapping_row_id;
 use crate::table::DataSplitBuilder;
 use crate::table::Table;
 use crate::Result;
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StructArray};
+use arrow_buffer::NullBuffer;
+use arrow_schema::DataType as ArrowDataType;
 use arrow_select::concat::concat_batches;
 use arrow_select::interleave::interleave;
 use bytes::Bytes;
@@ -74,6 +76,7 @@ const MANIFEST_DIR: &str = "manifest";
 pub struct DataEvolutionWriter {
     table: Table,
     update_columns: Vec<String>,
+    write_fields: Vec<DataField>,
     matched_batches: Vec<RecordBatch>,
 }
 
@@ -108,16 +111,31 @@ impl DataEvolutionWriter {
             });
         }
 
+        super::data_evolution_fields::validate_write_paths(schema.fields(), &update_columns)?;
+        let write_fields =
+            super::data_evolution_fields::project_by_paths(schema.fields(), &update_columns)?;
+        if !core_options.data_evolution_nested_field_enabled()
+            && update_columns
+                .iter()
+                .any(|column| !schema.fields().iter().any(|field| field.name() == column))
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Nested data-evolution write paths require data-evolution.nested-field.enabled=true"
+                    .to_string(),
+                source: None,
+            });
+        }
         let partition_keys = schema.partition_keys();
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
         for col in &update_columns {
-            if partition_keys.contains(col) {
+            let top_level = DataEvolutionPartialWriter::top_level_write_name(col, schema.fields());
+            if partition_keys.iter().any(|key| key == top_level) {
                 return Err(crate::Error::Unsupported {
                     message: format!("Cannot update partition column '{col}' in MERGE INTO"),
                 });
             }
-            if let Some(field) = schema.fields().iter().find(|f| f.name() == col) {
-                if field.data_type().is_blob_type() && !blob_descriptor_fields.contains(col) {
+            if let Some(field) = schema.fields().iter().find(|f| f.name() == top_level) {
+                if field.data_type().is_blob_type() && !blob_descriptor_fields.contains(top_level) {
                     return Err(crate::Error::Unsupported {
                         message: format!(
                             "Cannot update raw-data BLOB column '{col}' in MERGE INTO. \
@@ -131,6 +149,7 @@ impl DataEvolutionWriter {
         Ok(Self {
             table: table.clone(),
             update_columns,
+            write_fields,
             matched_batches: Vec::new(),
         })
     }
@@ -236,7 +255,7 @@ impl DataEvolutionWriter {
             let row_count = file_range.row_count as usize;
 
             // Read original columns from the entire file group (base + partial-column files).
-            let col_refs: Vec<&str> = self.update_columns.iter().map(|s| s.as_str()).collect();
+            let col_refs: Vec<&str> = self.write_fields.iter().map(DataField::name).collect();
             let mut rb = self.table.new_read_builder();
             rb.with_projection(&col_refs)?;
             let read = rb.new_read()?;
@@ -280,97 +299,41 @@ impl DataEvolutionWriter {
                 });
             }
 
-            // Apply updates using 2-array interleave: [original_col, updates_col].
-            // Matched rows are gathered into a single contiguous update array first,
-            // avoiding O(N) array clones for every row in the file.
-            let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(self.update_columns.len());
-
-            // Sort matched rows by offset for contiguous iteration
+            // Keep one physical ROW column per top-level field, even when the
+            // update names identify several nested leaves of that ROW.
             let mut sorted_matches: Vec<(usize, usize, usize)> = matched_rows
                 .iter()
                 .map(|m| (m.offset, m.batch_idx, m.row_idx))
                 .collect();
             sorted_matches.sort_by_key(|(offset, _, _)| *offset);
-
-            for (col_idx, col_name) in self.update_columns.iter().enumerate() {
-                let original_col = original_batch.column(col_idx);
-                let original_dtype = original_col.data_type();
-
-                // Gather update values into a single array (one entry per matched row, in offset order)
-                let update_indices: Vec<(usize, usize)> = sorted_matches
-                    .iter()
-                    .map(|&(_, batch_idx, row_idx)| (batch_idx, row_idx))
-                    .collect();
-
-                // Collect unique batch arrays, cast if needed
-                let mut batch_arrays: Vec<ArrayRef> = Vec::new();
-                let mut batch_id_map: HashMap<usize, usize> = HashMap::new();
-                let mut interleave_src: Vec<(usize, usize)> =
-                    Vec::with_capacity(update_indices.len());
-
-                for &(batch_idx, row_idx) in &update_indices {
-                    let arr_idx = match batch_id_map.get(&batch_idx) {
-                        Some(&idx) => idx,
-                        None => {
-                            let src_col =
-                                matched_column(&self.matched_batches[batch_idx], col_name)?;
-                            let casted = if src_col.data_type() != original_dtype {
-                                arrow_cast::cast(src_col.as_ref(), original_dtype).map_err(|e| {
-                                    crate::Error::DataInvalid {
-                                        message: format!("Failed to cast column {col_name}: {e}"),
-                                        source: None,
-                                    }
-                                })?
-                            } else {
-                                src_col
-                            };
-                            let idx = batch_arrays.len();
-                            batch_arrays.push(casted);
-                            batch_id_map.insert(batch_idx, idx);
-                            idx
-                        }
-                    };
-                    interleave_src.push((arr_idx, row_idx));
-                }
-
-                let update_col = if batch_arrays.len() == 1 && interleave_src.len() == 1 {
-                    // Single update value — just slice
-                    let (_, row_idx) = interleave_src[0];
-                    batch_arrays[0].slice(row_idx, 1)
-                } else {
-                    let refs: Vec<&dyn Array> = batch_arrays.iter().map(|a| a.as_ref()).collect();
-                    interleave(&refs, &interleave_src).map_err(|e| crate::Error::DataInvalid {
-                        message: format!("Failed to gather update values for {col_name}: {e}"),
-                        source: None,
-                    })?
-                };
-
-                // Build final indices: 2 sources — [0] = original, [1] = update_col
-                let mut indices: Vec<(usize, usize)> = Vec::with_capacity(row_count);
-                let mut match_pos = 0;
-                for row in 0..row_count {
-                    if match_pos < sorted_matches.len() && sorted_matches[match_pos].0 == row {
-                        indices.push((1, match_pos));
-                        match_pos += 1;
-                    } else {
-                        indices.push((0, row));
-                    }
-                }
-
-                let sources: [&dyn Array; 2] = [original_col.as_ref(), update_col.as_ref()];
-                let new_col =
-                    interleave(&sources, &indices).map_err(|e| crate::Error::DataInvalid {
-                        message: format!("Failed to interleave column {col_name}: {e}"),
-                        source: None,
-                    })?;
-                new_columns.push(new_col);
+            if sorted_matches.windows(2).any(|rows| rows[0].0 == rows[1].0) {
+                return Err(crate::Error::DataInvalid {
+                    message: "Multiple updates target the same row ID".to_string(),
+                    source: None,
+                });
             }
-
-            let updated_batch = RecordBatch::try_new(original_batch.schema(), new_columns)
-                .map_err(|e| crate::Error::DataInvalid {
+            let new_columns = self
+                .write_fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    apply_field_updates(
+                        field,
+                        field.name(),
+                        original_batch.column(index),
+                        &self.update_columns,
+                        &self.matched_batches,
+                        &sorted_matches,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let write_schema = crate::arrow::build_target_arrow_schema(&self.write_fields)?;
+            let updated_batch = RecordBatch::try_new(write_schema, new_columns).map_err(|e| {
+                crate::Error::DataInvalid {
                     message: format!("Failed to create updated batch: {e}"),
                     source: None,
-                })?;
+                }
+            })?;
 
             writer
                 .write_partial_batch(
@@ -930,6 +893,138 @@ fn matched_column(batch: &RecordBatch, col: &str) -> Result<ArrayRef> {
     Ok(batch.column(idx).clone())
 }
 
+/// Apply matched values to one projected field. The projection may be a ROW
+/// containing only the leaves named in `update_columns`; its untouched sibling
+/// leaves remain available from the read batch but are absent from this file.
+fn apply_field_updates(
+    write_field: &DataField,
+    path: &str,
+    original: &ArrayRef,
+    update_columns: &[String],
+    matched_batches: &[RecordBatch],
+    matches: &[(usize, usize, usize)],
+) -> Result<ArrayRef> {
+    if update_columns.iter().any(|column| column == path) {
+        return interleave_updated_leaf(path, original, matched_batches, matches);
+    }
+
+    let DataType::Row(row) = write_field.data_type() else {
+        return Err(crate::Error::DataInvalid {
+            message: format!("No update value was supplied for '{path}'"),
+            source: None,
+        });
+    };
+    let source = original
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: format!("Expected ROW values for nested update '{path}'"),
+            source: None,
+        })?;
+    let children =
+        row.fields()
+            .iter()
+            .map(|child| {
+                let child_path = format!("{path}.{}", child.name());
+                let source_child = source.column_by_name(child.name()).ok_or_else(|| {
+                    crate::Error::DataInvalid {
+                        message: format!("Nested update source is missing '{child_path}'"),
+                        source: None,
+                    }
+                })?;
+                apply_field_updates(
+                    child,
+                    &child_path,
+                    source_child,
+                    update_columns,
+                    matched_batches,
+                    matches,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+    let ArrowDataType::Struct(fields) =
+        crate::arrow::paimon_type_to_arrow(write_field.data_type())?
+    else {
+        unreachable!("ROW type must map to Arrow Struct")
+    };
+    let mut valid = (0..original.len())
+        .map(|row| source.is_valid(row))
+        .collect::<Vec<_>>();
+    for &(offset, _, _) in matches {
+        valid[offset] = true;
+    }
+    let struct_array = StructArray::try_new(fields, children, Some(NullBuffer::from(valid)))
+        .map_err(|error| crate::Error::DataInvalid {
+            message: format!("Failed to build nested update '{path}': {error}"),
+            source: None,
+        })?;
+    Ok(Arc::new(struct_array))
+}
+
+/// Gather matched rows into one array, then use a two-array interleave over
+/// the file's physical row positions. Casts follow the existing top-level
+/// MERGE update behavior.
+fn interleave_updated_leaf(
+    path: &str,
+    original: &ArrayRef,
+    matched_batches: &[RecordBatch],
+    matches: &[(usize, usize, usize)],
+) -> Result<ArrayRef> {
+    let mut batch_arrays = Vec::<ArrayRef>::new();
+    let mut batch_id_map = HashMap::<usize, usize>::new();
+    let mut gather = Vec::with_capacity(matches.len());
+    for &(_, batch_idx, row_idx) in matches {
+        let array_idx = if let Some(index) = batch_id_map.get(&batch_idx) {
+            *index
+        } else {
+            let value = matched_column(&matched_batches[batch_idx], path)?;
+            let value = if value.data_type() == original.data_type() {
+                value
+            } else {
+                arrow_cast::cast(value.as_ref(), original.data_type()).map_err(|error| {
+                    crate::Error::DataInvalid {
+                        message: format!("Failed to cast column {path}: {error}"),
+                        source: None,
+                    }
+                })?
+            };
+            let index = batch_arrays.len();
+            batch_arrays.push(value);
+            batch_id_map.insert(batch_idx, index);
+            index
+        };
+        gather.push((array_idx, row_idx));
+    }
+    let updates = if gather.len() == 1 {
+        batch_arrays[gather[0].0].slice(gather[0].1, 1)
+    } else {
+        let arrays = batch_arrays
+            .iter()
+            .map(|array| array.as_ref())
+            .collect::<Vec<_>>();
+        interleave(&arrays, &gather).map_err(|error| crate::Error::DataInvalid {
+            message: format!("Failed to gather update values for {path}: {error}"),
+            source: None,
+        })?
+    };
+    let mut indices = Vec::with_capacity(original.len());
+    let mut matched = 0;
+    for row in 0..original.len() {
+        if matched < matches.len() && matches[matched].0 == row {
+            indices.push((1, matched));
+            matched += 1;
+        } else {
+            indices.push((0, row));
+        }
+    }
+    interleave(&[original.as_ref(), updates.as_ref()], &indices).map_err(|error| {
+        crate::Error::DataInvalid {
+            message: format!("Failed to interleave column {path}: {error}"),
+            source: None,
+        }
+    })
+}
+
 struct FileRowRange {
     first_row_id: i64,
     last_row_id: i64,
@@ -1064,33 +1159,52 @@ impl DataEvolutionPartialWriter {
         core_options: &CoreOptions<'_>,
     ) -> Result<Vec<PartialWriteSet>> {
         let vector_file_format = core_options.vector_file_format();
+        if !core_options.data_evolution_nested_field_enabled()
+            && write_columns
+                .iter()
+                .any(|column| !fields.iter().any(|field| field.name() == column))
+        {
+            return Err(crate::Error::DataInvalid {
+                message: "Nested data-evolution write paths require data-evolution.nested-field.enabled=true"
+                    .to_string(),
+                source: None,
+            });
+        }
+        super::data_evolution_fields::validate_write_paths(fields, write_columns)?;
+        let projected = super::data_evolution_fields::project_by_paths(fields, write_columns)?;
         let mut normal_fields = Vec::new();
-        let mut normal_columns = Vec::new();
         let mut normal_indices = Vec::new();
         let mut vector_fields = Vec::new();
-        let mut vector_columns = Vec::new();
         let mut vector_indices = Vec::new();
 
-        for (idx, column) in write_columns.iter().enumerate() {
-            let field = fields
-                .iter()
-                .find(|field| field.name() == column)
-                .cloned()
-                .ok_or_else(|| crate::Error::DataInvalid {
-                    message: format!("Unknown data-evolution write column '{column}'"),
-                    source: None,
-                })?;
-
+        for (idx, field) in projected.into_iter().enumerate() {
             if vector_file_format.is_some() && matches!(field.data_type(), DataType::Vector(_)) {
                 vector_fields.push(field);
-                vector_columns.push(column.clone());
                 vector_indices.push(idx);
             } else {
                 normal_fields.push(field);
-                normal_columns.push(column.clone());
                 normal_indices.push(idx);
             }
         }
+
+        let normal_columns = write_columns
+            .iter()
+            .filter(|path| {
+                normal_fields
+                    .iter()
+                    .any(|field| field.name() == Self::top_level_write_name(path, fields))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let vector_columns = write_columns
+            .iter()
+            .filter(|path| {
+                vector_fields
+                    .iter()
+                    .any(|field| field.name() == Self::top_level_write_name(path, fields))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
 
         let mut write_sets = Vec::new();
         if !normal_fields.is_empty() {
@@ -1123,6 +1237,14 @@ impl DataEvolutionPartialWriter {
         }
 
         Ok(write_sets)
+    }
+
+    fn top_level_write_name<'a>(path: &'a str, fields: &[DataField]) -> &'a str {
+        if fields.iter().any(|field| field.name() == path) {
+            path
+        } else {
+            path.split_once('.').map_or(path, |(head, _)| head)
+        }
     }
 
     /// Write a partial-column batch for a specific partition, bucket, and row ID range.
@@ -1259,8 +1381,12 @@ mod tests {
     use super::*;
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
-    use crate::spec::{DataType, FloatType, IntType, Schema, TableSchema, VarCharType, VectorType};
-    use arrow_array::StringArray;
+    use crate::spec::{
+        DataField, DataType, FloatType, IntType, RowType, Schema, TableSchema, VarCharType,
+        VectorType,
+    };
+    use arrow_array::{Int32Array, StringArray, StructArray};
+    use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use std::sync::Arc;
 
@@ -1328,6 +1454,543 @@ mod tests {
             .build()
             .unwrap();
         TableSchema::new(0, &schema)
+    }
+
+    fn test_nested_data_evolution_schema() -> TableSchema {
+        let profile = DataType::Row(RowType::new(vec![
+            DataField::new(
+                1,
+                "name".to_string(),
+                DataType::VarChar(VarCharType::string_type()),
+            ),
+            DataField::new(2, "age".to_string(), DataType::Int(IntType::new())),
+        ]));
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("profile", profile)
+            .option("bucket", "-1")
+            .option("data-evolution.enabled", "true")
+            .option("data-evolution.nested-field.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        TableSchema::new(0, &schema)
+    }
+
+    fn nested_profile_batch(
+        fields: &[DataField],
+        columns: Vec<ArrayRef>,
+        valid: Vec<bool>,
+    ) -> RecordBatch {
+        let schema = crate::arrow::build_target_arrow_schema(fields).unwrap();
+        let ArrowDataType::Struct(children) = schema.field(0).data_type() else {
+            panic!("expected profile ROW")
+        };
+        let profile =
+            StructArray::try_new(children.clone(), columns, Some(NullBuffer::from(valid))).unwrap();
+        RecordBatch::try_new(schema, vec![Arc::new(profile)]).unwrap()
+    }
+
+    fn full_nested_batch(table: &Table) -> RecordBatch {
+        let profile = nested_profile_batch(
+            &table.schema().fields()[1..2],
+            vec![
+                Arc::new(StringArray::from(vec![Some("alice"), Some("bob"), None])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), None])),
+            ],
+            vec![true, true, false],
+        );
+        let schema = crate::arrow::build_target_arrow_schema(table.schema().fields()).unwrap();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                profile.column(0).clone(),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn commit_full_nested_batch(table: &Table) {
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&full_nested_batch(table))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        builder.new_commit().commit(messages).await.unwrap();
+    }
+
+    async fn commit_partial_nested_batch(
+        table: &Table,
+        path: &str,
+        values: ArrayRef,
+        valid: Vec<bool>,
+        check_from_snapshot: i64,
+    ) -> DataFileMeta {
+        let fields = super::super::data_evolution_fields::project_by_paths(
+            table.schema().fields(),
+            &[path.to_string()],
+        )
+        .unwrap();
+        let batch = nested_profile_batch(&fields, vec![values], valid);
+        let mut writer = DataEvolutionPartialWriter::new(table, vec![path.to_string()]).unwrap();
+        writer
+            .write_partial_batch(
+                crate::spec::EMPTY_SERIALIZED_ROW.clone(),
+                0,
+                0,
+                check_from_snapshot,
+                batch,
+            )
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let file = messages[0].new_files[0].clone();
+        assert_eq!(file.write_cols, Some(vec![path.to_string()]));
+        table
+            .new_write_builder()
+            .new_commit()
+            .commit(messages)
+            .await
+            .unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn nested_partial_parquet_files_merge_latest_children() {
+        let file_io = test_file_io();
+        let path = "memory:/test_de_nested_partial";
+        setup_dirs(&file_io, path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_de_nested_partial"),
+            path.to_string(),
+            test_nested_data_evolution_schema(),
+            None,
+        );
+        commit_full_nested_batch(&table).await;
+        let age_file = commit_partial_nested_batch(
+            &table,
+            "profile.age",
+            Arc::new(Int32Array::from(vec![Some(11), Some(21), None])),
+            vec![true, true, false],
+            1,
+        )
+        .await;
+        assert_eq!(age_file.first_row_id, Some(0));
+        commit_partial_nested_batch(
+            &table,
+            "profile.name",
+            Arc::new(StringArray::from(vec![Some("ALICE"), Some("BOB"), None])),
+            vec![true, true, false],
+            2,
+        )
+        .await;
+
+        let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+        let batches = table
+            .new_read_builder()
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let profiles = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let names = profiles
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ages = profiles
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                actual.push((
+                    ids.value(row),
+                    profiles.is_valid(row).then(|| names.value(row).to_string()),
+                    profiles.is_valid(row).then(|| ages.value(row)),
+                ));
+            }
+        }
+        actual.sort_by_key(|row| row.0);
+        assert_eq!(
+            actual,
+            vec![
+                (1, Some("ALICE".to_string()), Some(11)),
+                (2, Some("BOB".to_string()), Some(21)),
+                (3, None, None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn row_id_update_writes_two_nested_leaves_and_revives_null_parent() {
+        let file_io = test_file_io();
+        let path = "memory:/test_de_nested_row_id_update";
+        setup_dirs(&file_io, path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_de_nested_row_id_update"),
+            path.to_string(),
+            test_nested_data_evolution_schema(),
+            None,
+        );
+        commit_full_nested_batch(&table).await;
+
+        let matched = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("_ROW_ID", ArrowDataType::Int64, false),
+                ArrowField::new("profile.age", ArrowDataType::Int32, true),
+                ArrowField::new("profile.name", ArrowDataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 2])),
+                Arc::new(Int32Array::from(vec![Some(99), Some(33)])),
+                Arc::new(StringArray::from(vec![Some("ALICE"), Some("new")])),
+            ],
+        )
+        .unwrap();
+        let mut writer =
+            DataEvolutionWriter::new(&table, vec!["profile.age".into(), "profile.name".into()])
+                .unwrap();
+        writer.add_matched_batch(matched).unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(
+            messages[0].new_files[0].write_cols,
+            Some(vec!["profile.age".into(), "profile.name".into()])
+        );
+        table
+            .new_write_builder()
+            .new_commit()
+            .commit(messages)
+            .await
+            .unwrap();
+
+        let plan = table.new_read_builder().new_scan().plan().await.unwrap();
+        let batches = table
+            .new_read_builder()
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let profiles = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let names = profiles
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ages = profiles
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                actual.push((
+                    ids.value(row),
+                    names.value(row).to_string(),
+                    ages.value(row),
+                ));
+                assert!(profiles.is_valid(row));
+            }
+        }
+        actual.sort_by_key(|row| row.0);
+        assert_eq!(
+            actual,
+            vec![
+                (1, "ALICE".into(), 99),
+                (2, "bob".into(), 20),
+                (3, "new".into(), 33),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_projection_uses_sibling_nullness_and_masks_null_source_parent() {
+        let file_io = test_file_io();
+        let path = "memory:/test_de_nested_projected_nullness";
+        setup_dirs(&file_io, path).await;
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_de_nested_projected_nullness"),
+            path.to_string(),
+            test_nested_data_evolution_schema(),
+            None,
+        );
+        commit_full_nested_batch(&table).await;
+        // Row 0's newest age file has a NULL parent. Its older age must not
+        // reappear, although the older name keeps the composed parent valid.
+        // Row 2 has the inverse: only the new age parent is valid.
+        commit_partial_nested_batch(
+            &table,
+            "profile.age",
+            Arc::new(Int32Array::from(vec![Some(99), Some(21), Some(30)])),
+            vec![false, true, true],
+            1,
+        )
+        .await;
+
+        for (path, expected_parent, expected_values) in [
+            (
+                "profile.name",
+                vec![true, true, true],
+                vec![Some("alice"), Some("bob"), None],
+            ),
+            (
+                "profile.age",
+                vec![true, true, true],
+                vec![None, Some("21"), Some("30")],
+            ),
+        ] {
+            let projection = super::super::data_evolution_fields::project_by_paths(
+                table.schema().fields(),
+                &[path.to_string()],
+            )
+            .unwrap();
+            let mut builder = table.new_read_builder();
+            builder.with_read_type(projection);
+            let plan = builder.new_scan().plan().await.unwrap();
+            let batches = builder
+                .new_read()
+                .unwrap()
+                .to_arrow(plan.splits())
+                .unwrap()
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .unwrap();
+            let mut actual = Vec::new();
+            for batch in batches {
+                let parent = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    let value = if parent.column(0).is_null(row) {
+                        None
+                    } else if path.ends_with("name") {
+                        Some(
+                            parent
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap()
+                                .value(row)
+                                .to_string(),
+                        )
+                    } else {
+                        Some(
+                            parent
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int32Array>()
+                                .unwrap()
+                                .value(row)
+                                .to_string(),
+                        )
+                    };
+                    actual.push((parent.is_valid(row), value));
+                }
+            }
+            assert_eq!(
+                actual,
+                expected_parent
+                    .into_iter()
+                    .zip(
+                        expected_values
+                            .into_iter()
+                            .map(|value| value.map(str::to_string))
+                    )
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn projected_new_deep_leaf_preserves_both_parent_null_buffers() {
+        let file_io = test_file_io();
+        let path = "memory:/test_de_new_deep_leaf";
+        setup_dirs(&file_io, path).await;
+        let old_schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "profile",
+                DataType::Row(RowType::new(vec![
+                    DataField::new(
+                        0,
+                        "sub".into(),
+                        DataType::Row(RowType::new(vec![DataField::new(
+                            0,
+                            "existing".into(),
+                            DataType::Int(IntType::new()),
+                        )])),
+                    ),
+                    DataField::new(
+                        0,
+                        "other".into(),
+                        DataType::VarChar(VarCharType::string_type()),
+                    ),
+                ])),
+            )
+            .option("bucket", "-1")
+            .option("data-evolution.enabled", "true")
+            .option("data-evolution.nested-field.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let old_table_schema = TableSchema::new(0, &old_schema);
+        let old_table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_de_new_deep_leaf"),
+            path.to_string(),
+            old_table_schema.clone(),
+            None,
+        );
+        let arrow_schema =
+            crate::arrow::build_target_arrow_schema(old_table.schema().fields()).unwrap();
+        let ArrowDataType::Struct(profile_fields) = arrow_schema.field(1).data_type() else {
+            panic!("profile must be ROW")
+        };
+        let ArrowDataType::Struct(sub_fields) = profile_fields[0].data_type() else {
+            panic!("sub must be ROW")
+        };
+        let sub = StructArray::try_new(
+            sub_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(10), None]))],
+            Some(NullBuffer::from(vec![true, false])),
+        )
+        .unwrap();
+        let profile = StructArray::try_new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(sub),
+                Arc::new(StringArray::from(vec![Some("one"), Some("two")])),
+            ],
+            Some(NullBuffer::from(vec![true, true])),
+        )
+        .unwrap();
+        let old_batch = RecordBatch::try_new(
+            arrow_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(profile)],
+        )
+        .unwrap();
+        let builder = old_table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&old_batch).await.unwrap();
+        builder
+            .new_commit()
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        let schema_path = old_table.schema_manager().schema_path(0);
+        file_io
+            .mkdirs(schema_path.rsplit_once('/').unwrap().0)
+            .await
+            .unwrap();
+        file_io
+            .new_output(&schema_path)
+            .unwrap()
+            .write(Bytes::from(serde_json::to_vec(&old_table_schema).unwrap()))
+            .await
+            .unwrap();
+
+        let mut new_fields = old_schema.fields().to_vec();
+        let DataType::Row(profile_type) = new_fields[1].data_type() else {
+            panic!("profile must be ROW")
+        };
+        let mut profile_children = profile_type.fields().to_vec();
+        let DataType::Row(sub_type) = profile_children[0].data_type() else {
+            panic!("sub must be ROW")
+        };
+        let mut sub_children = sub_type.fields().to_vec();
+        sub_children.push(DataField::new(
+            old_table_schema.highest_field_id() + 1,
+            "added".into(),
+            DataType::Int(IntType::new()),
+        ));
+        profile_children[0] = super::super::data_evolution_fields::field_with_type(
+            &profile_children[0],
+            DataType::Row(RowType::with_nullable(true, sub_children)),
+        );
+        new_fields[1] = super::super::data_evolution_fields::field_with_type(
+            &new_fields[1],
+            DataType::Row(RowType::with_nullable(true, profile_children)),
+        );
+        let new_schema = old_schema
+            .copy(RowType::with_nullable(false, new_fields))
+            .unwrap();
+        let current = Table::new(
+            file_io,
+            Identifier::new("default", "test_de_new_deep_leaf"),
+            path.to_string(),
+            TableSchema::new(1, &new_schema),
+            None,
+        );
+        let projection = super::super::data_evolution_fields::project_by_paths(
+            current.schema().fields(),
+            &["profile.sub.added".to_string()],
+        )
+        .unwrap();
+        let mut read_builder = current.new_read_builder();
+        read_builder.with_read_type(projection);
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        let batches = read_builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        let profile = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let sub = profile
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let added = sub.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert!(profile.is_valid(0));
+        assert!(profile.is_valid(1));
+        assert!(sub.is_valid(0));
+        assert!(sub.is_null(1));
+        assert!(added.is_null(0));
+        assert!(added.is_null(1));
     }
 
     fn test_table(file_io: &FileIO, table_path: &str) -> Table {
