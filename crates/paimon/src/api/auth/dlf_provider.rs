@@ -47,8 +47,8 @@ pub struct DLFToken {
     /// Security token for temporary credentials (optional).
     #[serde(rename = "SecurityToken")]
     pub security_token: Option<String>,
-    /// Expiration timestamp in milliseconds (PyPaimon compatibility).
-    #[serde(rename = "ExpirationAt", default, skip_serializing)]
+    /// Expiration timestamp in milliseconds used internally for refresh decisions.
+    #[serde(skip)]
     pub expiration_at_millis: Option<i64>,
     /// Expiration time string (ISO 8601 format).
     #[serde(
@@ -591,7 +591,7 @@ mod tests {
         .unwrap();
         let token = loader.read_token(1).await.unwrap();
         assert_eq!(token.security_token, None);
-        assert_eq!(token.expiration_at_millis, Some(123));
+        assert_eq!(token.expiration_at_millis, None);
 
         tokio::fs::write(
             &path,
