@@ -379,7 +379,9 @@ impl TableCommit {
             commit_identifier,
             filter_committed,
         )
-        .await
+        .await?;
+        self.maintain().await;
+        Ok(())
     }
 
     pub(crate) async fn commit_if_latest_snapshot(
@@ -437,6 +439,7 @@ impl TableCommit {
             }
             return Err(error);
         }
+        self.maintain().await;
         Ok(())
     }
 
@@ -551,7 +554,9 @@ impl TableCommit {
             commit_identifier,
             filter_committed,
         )
-        .await
+        .await?;
+        self.maintain().await;
+        Ok(())
     }
 
     /// Build a predicate-based partition filter from a partial static partition spec.
@@ -783,7 +788,9 @@ impl TableCommit {
             commit_identifier,
             filter_committed,
         )
-        .await
+        .await?;
+        self.maintain().await;
+        Ok(())
     }
 
     /// Python-compatible alias for dropping partitions.
@@ -859,7 +866,9 @@ impl TableCommit {
             commit_identifier,
             filter_committed,
         )
-        .await
+        .await?;
+        self.maintain().await;
+        Ok(())
     }
 
     /// A Format Table has no snapshots, so an overwrite commit would find nothing to delete and
@@ -935,6 +944,50 @@ impl TableCommit {
             }
         }
         Ok(())
+    }
+
+    /// Table maintenance after a commit, like Java `TableCommitImpl#maintain`:
+    /// expire snapshots unless the table is `write-only`.
+    ///
+    /// When changelogs outlive snapshots (`changelog.num-retained.*` or
+    /// `changelog.time-retained` above the snapshot settings), Java also moves
+    /// expired snapshots into long-lived changelogs. Without that, expiring
+    /// here would drop changelog the table is configured to keep, so it is
+    /// skipped. The commit has already succeeded, so a failed expiration is
+    /// logged rather than reported as a commit failure; the next commit or
+    /// `expire_snapshots` call retries it.
+    async fn maintain(&self) {
+        let core_options = CoreOptions::new(self.table.schema().options());
+        if core_options.write_only() {
+            return;
+        }
+        match core_options.changelog_lifecycle_decoupled() {
+            Ok(false) => {}
+            Ok(true) => {
+                log::debug!(
+                    "Skip expiring snapshots after commit: the changelog lifecycle is decoupled"
+                );
+                return;
+            }
+            Err(error) => {
+                log::warn!("Skip expiring snapshots after commit: {error}");
+                return;
+            }
+        }
+        // While the table has no more than `snapshot.num-retained.min` snapshots,
+        // nothing can expire. Checking that from the LATEST hint spares every
+        // commit to a young table the consumer listing and EARLIEST lookup.
+        let latest = self.table.snapshot_manager().get_latest_snapshot_id().await;
+        if let (Ok(Some(latest)), Ok(retain_min)) =
+            (latest, core_options.snapshot_num_retained_min())
+        {
+            if latest <= i64::from(retain_min) {
+                return;
+            }
+        }
+        if let Err(error) = self.table.new_expire_snapshots().execute().await {
+            log::warn!("Failed to expire snapshots after commit: {error}");
+        }
     }
 
     fn bucket_path(&self, partition: &[u8], bucket: i32) -> Result<String> {

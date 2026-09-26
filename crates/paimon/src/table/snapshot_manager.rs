@@ -331,6 +331,30 @@ impl SnapshotManager {
         self.file_io.delete_file(&path).await
     }
 
+    /// Whether the EARLIEST hint file exists.
+    pub(crate) async fn earliest_hint_exists(&self) -> crate::Result<bool> {
+        self.file_io.exists(&self.earliest_hint_path()).await
+    }
+
+    /// Read a snapshot that may have been removed concurrently; `None` when
+    /// its file does not exist. Mirrors Java `SnapshotManager#tryGetSnapshot`.
+    pub(crate) async fn try_get_snapshot(
+        &self,
+        snapshot_id: i64,
+    ) -> crate::Result<Option<Snapshot>> {
+        match self.get_snapshot(snapshot_id).await {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(crate::Error::SnapshotNotExist { .. }) => Ok(None),
+            // Deleted between the existence check and the read.
+            Err(crate::Error::IoUnexpected { ref source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Update the EARLIEST hint file.
     pub async fn write_earliest_hint(&self, snapshot_id: i64) -> crate::Result<()> {
         let hint_path = self.earliest_hint_path();

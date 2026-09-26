@@ -860,6 +860,152 @@ async fn test_delete_multiple_tags() {
     assert_eq!(count, 0);
 }
 
+async fn expire_count(sql_context: &paimon_datafusion::SQLContext, sql: &str) -> i32 {
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    batches[0]
+        .column_by_name("deleted_snapshots_count")
+        .expect("deleted_snapshots_count column")
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int32Array>()
+        .unwrap()
+        .value(0)
+}
+
+async fn snapshot_ids(sql_context: &paimon_datafusion::SQLContext, table: &str) -> Vec<i64> {
+    let batches = sql_context
+        .sql(&format!(
+            "SELECT snapshot_id FROM paimon.test_db.`{table}$snapshots` ORDER BY snapshot_id"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_expire_snapshots_procedure() {
+    let (_tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.exp (id INT, name VARCHAR(100))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.exp VALUES (1, 'a')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT OVERWRITE paimon.test_db.exp VALUES (2, 'b')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.exp VALUES (3, 'c')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.exp VALUES (4, 'd')",
+    )
+    .await;
+    assert_eq!(snapshot_ids(&sql_context, "exp").await, vec![1, 2, 3, 4]);
+
+    // retain_max caps the history even though every snapshot is recent.
+    assert_eq!(
+        expire_count(
+            &sql_context,
+            "CALL sys.expire_snapshots(table => 'test_db.exp', retain_max => 3, retain_min => 1)",
+        )
+        .await,
+        1
+    );
+    assert_eq!(snapshot_ids(&sql_context, "exp").await, vec![2, 3, 4]);
+
+    // older_than (epoch millis) with retain_min as the floor.
+    assert_eq!(
+        expire_count(
+            &sql_context,
+            "CALL sys.expire_snapshots(table => 'test_db.exp', older_than => '9999999999999', retain_min => 2, max_deletes => 5)",
+        )
+        .await,
+        1
+    );
+    assert_eq!(snapshot_ids(&sql_context, "exp").await, vec![3, 4]);
+
+    // older_than as a local timestamp string; nothing is below retain_min.
+    assert_eq!(
+        expire_count(
+            &sql_context,
+            "CALL sys.expire_snapshots(table => 'test_db.exp', older_than => '2999-01-01 00:00:00', retain_min => 2)",
+        )
+        .await,
+        0
+    );
+
+    // Dynamic table options apply to this call.
+    assert_eq!(
+        expire_count(
+            &sql_context,
+            "CALL sys.expire_snapshots(table => 'test_db.exp', options => 'snapshot.num-retained.min=1,snapshot.num-retained.max=1')",
+        )
+        .await,
+        1
+    );
+    assert_eq!(snapshot_ids(&sql_context, "exp").await, vec![4]);
+    assert_eq!(
+        collect_id_name(&sql_context, "SELECT id, name FROM paimon.test_db.exp").await,
+        vec![
+            (2, "b".to_string()),
+            (3, "c".to_string()),
+            (4, "d".to_string())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_expire_snapshots_procedure_rejects_bad_arguments() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.expire_snapshots(table => 'test_db.t1', retain_maxx => 1)",
+        "retain_maxx",
+    )
+    .await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.expire_snapshots(table => 'test_db.t1', retain_max => 'x')",
+        "Invalid integer for 'retain_max'",
+    )
+    .await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.expire_snapshots(table => 'test_db.t1', retain_max => 1, retain_min => 2)",
+        "must not be less than",
+    )
+    .await;
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.expire_snapshots(table => 'test_db.t1', older_than => 'yesterday')",
+        "Invalid older_than timestamp",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn test_rollback_to_snapshot() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;

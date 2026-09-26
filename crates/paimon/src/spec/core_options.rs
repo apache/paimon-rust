@@ -174,6 +174,20 @@ pub(crate) const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
 pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
 const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
 const PK_FULL_TEXT_INDEX_COLUMNS_OPTION: &str = "pk-full-text.index.columns";
+const SNAPSHOT_NUM_RETAINED_MIN_OPTION: &str = "snapshot.num-retained.min";
+const SNAPSHOT_NUM_RETAINED_MAX_OPTION: &str = "snapshot.num-retained.max";
+const SNAPSHOT_TIME_RETAINED_OPTION: &str = "snapshot.time-retained";
+const SNAPSHOT_EXPIRE_LIMIT_OPTION: &str = "snapshot.expire.limit";
+const CHANGELOG_NUM_RETAINED_MIN_OPTION: &str = "changelog.num-retained.min";
+const CHANGELOG_NUM_RETAINED_MAX_OPTION: &str = "changelog.num-retained.max";
+const CHANGELOG_TIME_RETAINED_OPTION: &str = "changelog.time-retained";
+const WRITE_ONLY_OPTION: &str = "write-only";
+/// Java `CoreOptions.WRITE_ONLY` fallback key.
+const WRITE_COMPACTION_SKIP_OPTION: &str = "write.compaction-skip";
+const DEFAULT_SNAPSHOT_NUM_RETAINED_MIN: i32 = 10;
+const DEFAULT_SNAPSHOT_NUM_RETAINED_MAX: i32 = i32::MAX;
+const DEFAULT_SNAPSHOT_TIME_RETAINED_MS: u64 = 60 * 60 * 1000;
+const DEFAULT_SNAPSHOT_EXPIRE_LIMIT: i32 = 50;
 
 /// Merge engine for primary-key tables.
 ///
@@ -1222,6 +1236,96 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_COMMIT_MAX_RETRY_WAIT_MS)
     }
 
+    /// Minimum number of completed snapshots to retain
+    /// (`snapshot.num-retained.min`, default 10). Must be at least 1.
+    pub fn snapshot_num_retained_min(&self) -> crate::Result<i32> {
+        self.positive_i32_option(
+            SNAPSHOT_NUM_RETAINED_MIN_OPTION,
+            DEFAULT_SNAPSHOT_NUM_RETAINED_MIN,
+        )
+    }
+
+    /// Maximum number of completed snapshots to retain
+    /// (`snapshot.num-retained.max`, default unbounded). Must be at least 1.
+    pub fn snapshot_num_retained_max(&self) -> crate::Result<i32> {
+        self.positive_i32_option(
+            SNAPSHOT_NUM_RETAINED_MAX_OPTION,
+            DEFAULT_SNAPSHOT_NUM_RETAINED_MAX,
+        )
+    }
+
+    /// How long a completed snapshot is retained (`snapshot.time-retained`,
+    /// default 1 h), in milliseconds.
+    pub fn snapshot_time_retained_ms(&self) -> crate::Result<u64> {
+        match self.options.get(SNAPSHOT_TIME_RETAINED_OPTION) {
+            None => Ok(DEFAULT_SNAPSHOT_TIME_RETAINED_MS),
+            Some(value) => parse_duration_millis(value).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("Invalid value for {SNAPSHOT_TIME_RETAINED_OPTION}: '{value}'"),
+                source: None,
+            }),
+        }
+    }
+
+    /// Maximum number of snapshots expired in one run (`snapshot.expire.limit`,
+    /// default 50). Must be at least 1.
+    pub fn snapshot_expire_limit(&self) -> crate::Result<i32> {
+        self.positive_i32_option(SNAPSHOT_EXPIRE_LIMIT_OPTION, DEFAULT_SNAPSHOT_EXPIRE_LIMIT)
+    }
+
+    /// Whether changelogs outlive snapshots: `changelog.num-retained.min/max` or
+    /// `changelog.time-retained` exceed the snapshot counterparts they default
+    /// to. Java `CoreOptions#changelogLifecycleDecoupled`.
+    pub fn changelog_lifecycle_decoupled(&self) -> crate::Result<bool> {
+        let snapshot_max = self.snapshot_num_retained_max()?;
+        let snapshot_min = self.snapshot_num_retained_min()?;
+        let snapshot_time = self.snapshot_time_retained_ms()?;
+        let changelog_max =
+            self.positive_i32_option(CHANGELOG_NUM_RETAINED_MAX_OPTION, snapshot_max)?;
+        let changelog_min =
+            self.positive_i32_option(CHANGELOG_NUM_RETAINED_MIN_OPTION, snapshot_min)?;
+        let changelog_time = match self.options.get(CHANGELOG_TIME_RETAINED_OPTION) {
+            None => snapshot_time,
+            Some(value) => {
+                parse_duration_millis(value).ok_or_else(|| crate::Error::DataInvalid {
+                    message: format!(
+                        "Invalid value for {CHANGELOG_TIME_RETAINED_OPTION}: '{value}'"
+                    ),
+                    source: None,
+                })?
+            }
+        };
+        Ok(changelog_max > snapshot_max
+            || changelog_min > snapshot_min
+            || changelog_time > snapshot_time)
+    }
+
+    /// Whether writers skip compaction and snapshot expiration (`write-only`,
+    /// fallback `write.compaction-skip`, default false).
+    pub fn write_only(&self) -> bool {
+        self.options
+            .get(WRITE_ONLY_OPTION)
+            .or_else(|| self.options.get(WRITE_COMPACTION_SKIP_OPTION))
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    fn positive_i32_option(&self, option_name: &'static str, default: i32) -> crate::Result<i32> {
+        let Some(value) = self.options.get(option_name) else {
+            return Ok(default);
+        };
+        match value.trim().parse::<i32>() {
+            Ok(parsed) if parsed >= 1 => Ok(parsed),
+            Ok(_) => Err(crate::Error::DataInvalid {
+                message: format!("{option_name} must be at least 1, got '{value}'"),
+                source: None,
+            }),
+            Err(e) => Err(crate::Error::DataInvalid {
+                message: format!("Invalid value for {option_name}: '{value}'"),
+                source: Some(Box::new(e)),
+            }),
+        }
+    }
+
     pub fn row_tracking_enabled(&self) -> bool {
         self.options
             .get(ROW_TRACKING_ENABLED_OPTION)
@@ -1848,6 +1952,92 @@ fn parse_duration_millis(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_snapshot_expire_options() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.snapshot_num_retained_min().unwrap(), 10);
+        assert_eq!(core.snapshot_num_retained_max().unwrap(), i32::MAX);
+        assert_eq!(core.snapshot_time_retained_ms().unwrap(), 3_600_000);
+        assert_eq!(core.snapshot_expire_limit().unwrap(), 50);
+
+        let options = HashMap::from([
+            ("snapshot.num-retained.min".to_string(), "2".to_string()),
+            ("snapshot.num-retained.max".to_string(), "5".to_string()),
+            ("snapshot.time-retained".to_string(), "10 min".to_string()),
+            ("snapshot.expire.limit".to_string(), "3".to_string()),
+        ]);
+        let core = CoreOptions::new(&options);
+        assert_eq!(core.snapshot_num_retained_min().unwrap(), 2);
+        assert_eq!(core.snapshot_num_retained_max().unwrap(), 5);
+        assert_eq!(core.snapshot_time_retained_ms().unwrap(), 600_000);
+        assert_eq!(core.snapshot_expire_limit().unwrap(), 3);
+
+        for (key, value) in [
+            ("snapshot.num-retained.min", "0"),
+            ("snapshot.num-retained.max", "abc"),
+            ("snapshot.expire.limit", "-1"),
+            ("snapshot.time-retained", "1 fortnight"),
+        ] {
+            let options = HashMap::from([(key.to_string(), value.to_string())]);
+            let core = CoreOptions::new(&options);
+            let result = match key {
+                "snapshot.time-retained" => core.snapshot_time_retained_ms().map(|_| ()),
+                "snapshot.num-retained.min" => core.snapshot_num_retained_min().map(|_| ()),
+                "snapshot.num-retained.max" => core.snapshot_num_retained_max().map(|_| ()),
+                _ => core.snapshot_expire_limit().map(|_| ()),
+            };
+            assert!(result.is_err(), "{key}={value} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_changelog_lifecycle_and_write_only() {
+        let core = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>()
+        };
+        let options = core(&[]);
+        assert!(!CoreOptions::new(&options)
+            .changelog_lifecycle_decoupled()
+            .unwrap());
+        assert!(!CoreOptions::new(&options).write_only());
+
+        for pairs in [
+            [
+                ("changelog.num-retained.max", "20"),
+                ("snapshot.num-retained.max", "10"),
+            ],
+            [
+                ("changelog.num-retained.min", "20"),
+                ("snapshot.num-retained.min", "10"),
+            ],
+            [
+                ("changelog.time-retained", "2 h"),
+                ("snapshot.time-retained", "1 h"),
+            ],
+        ] {
+            let options = core(&pairs);
+            assert!(
+                CoreOptions::new(&options)
+                    .changelog_lifecycle_decoupled()
+                    .unwrap(),
+                "{pairs:?}"
+            );
+        }
+        let options = core(&[("changelog.time-retained", "30 min")]);
+        assert!(!CoreOptions::new(&options)
+            .changelog_lifecycle_decoupled()
+            .unwrap());
+
+        let options = core(&[("write-only", "true")]);
+        assert!(CoreOptions::new(&options).write_only());
+        let options = core(&[("write.compaction-skip", "true")]);
+        assert!(CoreOptions::new(&options).write_only());
+    }
 
     #[test]
     fn test_read_batch_size() {
