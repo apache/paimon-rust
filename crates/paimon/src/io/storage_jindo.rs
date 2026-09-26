@@ -974,6 +974,18 @@ fn to_cstring(value: &str, name: &str) -> OpendalResult<CString> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(target_os = "linux")]
+    use axum::body::Body;
+    #[cfg(target_os = "linux")]
+    use axum::extract::State;
+    #[cfg(target_os = "linux")]
+    use axum::http::{HeaderMap, Method, Response, StatusCode, Uri};
+    #[cfg(target_os = "linux")]
+    use axum::Router;
+
     #[test]
     fn test_use_jindo() {
         assert!(!use_jindo(&HashMap::new()).unwrap());
@@ -1088,5 +1100,159 @@ mod tests {
             relative_list_path("oss://bucket/", "table/snapshot", true),
             "table/snapshot/"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Default)]
+    struct OssMockState {
+        stat_requests: Arc<AtomicUsize>,
+        list_page_requests: Arc<AtomicUsize>,
+        range_requests: Arc<AtomicUsize>,
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn oss_mock(
+        State(state): State<OssMockState>,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        const DATA: &[u8] = b"0123456789";
+
+        if method == Method::HEAD {
+            if !uri.path().contains("data.bin") {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("x-oss-request-id", "jindo-test-not-found")
+                    .body(Body::empty())
+                    .unwrap();
+            }
+            state.stat_requests.fetch_add(1, Ordering::SeqCst);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-length", DATA.len())
+                .header("etag", "\"jindo-test-etag\"")
+                .header("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT")
+                .header("x-oss-object-type", "Normal")
+                .header("x-oss-storage-class", "Standard")
+                .header("x-oss-request-id", "jindo-test-stat")
+                .body(Body::empty())
+                .unwrap();
+        }
+
+        if method == Method::GET {
+            if let Some(range) = headers.get("range") {
+                state.range_requests.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(range, "bytes=2-5");
+                return Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header("content-length", 4)
+                    .header("content-range", "bytes 2-5/10")
+                    .header("etag", "\"jindo-test-etag\"")
+                    .header("x-oss-request-id", "jindo-test-range")
+                    .body(Body::from(&DATA[2..6]))
+                    .unwrap();
+            }
+
+            let query = uri.query().unwrap_or_default();
+            let parameters = url::form_urlencoded::parse(query.as_bytes())
+                .into_owned()
+                .collect::<HashMap<_, _>>();
+            let marker = parameters.get("marker").cloned();
+            let probe = parameters.get("max-keys").map(String::as_str) == Some("1");
+            let (key, truncated, next_marker) = if probe {
+                ("objects/a.bin", "false", "")
+            } else if marker.as_deref() == Some("objects/a.bin") {
+                ("objects/b.bin", "false", "")
+            } else {
+                ("objects/a.bin", "true", "objects/a.bin")
+            };
+            if !probe {
+                state.list_page_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            let body = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://doc.oss-cn-hangzhou.aliyuncs.com">
+  <Name>jindo-test-bucket</Name>
+  <Prefix>objects/</Prefix>
+  <Marker>{}</Marker>
+  <MaxKeys>1</MaxKeys>
+  <IsTruncated>{truncated}</IsTruncated>
+  <NextMarker>{next_marker}</NextMarker>
+  <Contents>
+    <Key>{key}</Key>
+    <LastModified>2024-01-01T00:00:00.000Z</LastModified>
+    <ETag>&quot;jindo-test-etag&quot;</ETag>
+    <Type>Normal</Type>
+    <Size>10</Size>
+    <StorageClass>Standard</StorageClass>
+  </Contents>
+</ListBucketResult>"#,
+                marker.unwrap_or_default()
+            );
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/xml")
+                .header("content-length", body.len())
+                .header("x-oss-request-id", "jindo-test-list")
+                .body(Body::from(body))
+                .unwrap();
+        }
+
+        Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires pyjindosdk"]
+    async fn test_real_sdk_stat_paginated_list_and_range_read() {
+        let library_path = std::env::var("PAIMON_JINDO_SDK_LIBRARY")
+            .expect("PAIMON_JINDO_SDK_LIBRARY must point to the real Jindo SDK");
+        let state = OssMockState::default();
+        let app = Router::new().fallback(oss_mock).with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = jindo_config_parse(HashMap::from([
+            (OSS_IMPL.to_string(), JINDO_IMPL.to_string()),
+            (JINDO_LIBRARY_PATH.to_string(), library_path),
+            (OSS_ENDPOINT.to_string(), format!("http://{address}")),
+            (
+                "fs.oss.accessKeyId".to_string(),
+                "test-access-key".to_string(),
+            ),
+            (
+                "fs.oss.accessKeySecret".to_string(),
+                "test-access-secret".to_string(),
+            ),
+            (
+                "fs.oss.second.level.domain.enable".to_string(),
+                "true".to_string(),
+            ),
+            ("fs.oss.retry.count".to_string(), "0".to_string()),
+        ]))
+        .unwrap();
+        let operator = jindo_config_build(&config, "jindo-test-bucket").unwrap();
+
+        let metadata = operator.stat("objects/data.bin").await.unwrap();
+        assert!(metadata.is_file());
+
+        let entries = operator.list("objects/").await.unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.path()).collect::<Vec<_>>(),
+            ["objects/a.bin", "objects/b.bin"]
+        );
+
+        let reader = operator.reader("objects/data.bin").await.unwrap();
+        assert_eq!(reader.read(2..6).await.unwrap().to_bytes(), &b"2345"[..]);
+
+        assert_eq!(state.stat_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(state.list_page_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(state.range_requests.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }
