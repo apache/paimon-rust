@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Thin Python bridge for the core upsert key matcher.
+//! Internal Python bridge for the core upsert key matcher.
 
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
@@ -24,35 +24,19 @@ use pyo3::prelude::*;
 
 use crate::error::to_py_err;
 
-#[pyclass(
-    name = "UpsertKeyMatcher",
-    module = "pypaimon_rust.datafusion",
-    unsendable
-)]
-pub struct PyUpsertKeyMatcher {
-    inner: UpsertKeyMatcher,
-}
+type MatchResult = (Vec<usize>, Vec<i64>, Vec<usize>);
 
-#[pymethods]
-impl PyUpsertKeyMatcher {
-    #[new]
-    fn new(batch: &Bound<'_, PyAny>, keys: Vec<String>) -> PyResult<Self> {
-        let batch = RecordBatch::from_pyarrow_bound(batch)?;
-        Ok(Self {
-            inner: UpsertKeyMatcher::new(&batch, keys).map_err(to_py_err)?,
-        })
+#[pyfunction(name = "_match_upsert_keys")]
+pub fn match_upsert_keys(
+    source: &Bound<'_, PyAny>,
+    keys: Vec<String>,
+    existing_batches: &Bound<'_, PyAny>,
+) -> PyResult<MatchResult> {
+    let source = RecordBatch::from_pyarrow_bound(source)?;
+    let mut matcher = UpsertKeyMatcher::new(&source, keys).map_err(to_py_err)?;
+    for batch in existing_batches.try_iter()? {
+        let batch = RecordBatch::from_pyarrow_bound(&batch?)?;
+        matcher.add_existing_batch(&batch).map_err(to_py_err)?;
     }
-
-    fn deduplicated_indices(&self) -> Vec<usize> {
-        self.inner.deduplicated_indices()
-    }
-
-    fn add_existing_batch(&mut self, batch: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batch = RecordBatch::from_pyarrow_bound(batch)?;
-        self.inner.add_existing_batch(&batch).map_err(to_py_err)
-    }
-
-    fn finish(&self) -> (Vec<usize>, Vec<i64>, Vec<usize>) {
-        self.inner.finish()
-    }
+    Ok(matcher.finish())
 }

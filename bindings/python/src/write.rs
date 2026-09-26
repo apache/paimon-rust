@@ -25,8 +25,7 @@ use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{CoreOptions, DataType, Datum};
 use paimon::table::{
-    CommitMessage, DataEvolutionDeleteWriter, Table, TableCommit, TableUpdate, TableWrite,
-    COMMIT_MESSAGE_SERIALIZER_VERSION,
+    CommitMessage, Table, TableCommit, TableUpdate, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -286,26 +285,6 @@ impl PyBatchWriteBuilder {
         })
     }
 
-    /// Create a deletion-vector writer for data-evolution row-ID deletes.
-    fn new_delete(&self) -> PyResult<PyBatchTableDelete> {
-        if self.static_partition.is_some() {
-            return Err(PyValueError::new_err(
-                "BatchTableDelete does not support overwrite",
-            ));
-        }
-        let inner = self
-            .context
-            .table
-            .new_write_builder()
-            .new_delete()
-            .map_err(to_py_err)?;
-        Ok(PyBatchTableDelete {
-            inner: Some(inner),
-            table_location: self.context.table.location().to_string(),
-            commit_user: self.context.commit_user.clone(),
-        })
-    }
-
     fn new_commit(&self) -> PyResult<PyBatchTableCommit> {
         let table = &self.context.table;
         let ignore_empty = boolean_option(table, "snapshot.ignore-empty-commit", true)?;
@@ -424,6 +403,25 @@ fn upsert_by_arrow_with_key(
     }
     let messages = py
         .detach(|| runtime().block_on(upsert.prepare_commit()))
+        .map_err(to_py_err)?;
+    Ok(wrap_messages(messages, table.location(), commit_user))
+}
+
+fn delete_by_row_id(
+    py: Python<'_>,
+    table: &Table,
+    commit_user: &str,
+    row_ids: Vec<i64>,
+) -> PyResult<Vec<PyCommitMessage>> {
+    let mut delete = table
+        .new_write_builder()
+        .with_commit_user(commit_user)
+        .map_err(to_py_err)?
+        .new_delete()
+        .map_err(to_py_err)?;
+    delete.add_row_ids(row_ids).map_err(to_py_err)?;
+    let messages = py
+        .detach(|| runtime().block_on(delete.prepare_commit()))
         .map_err(to_py_err)?;
     Ok(wrap_messages(messages, table.location(), commit_user))
 }
@@ -550,6 +548,20 @@ impl PyStreamTableUpdate {
             self.update_columns.clone(),
         )
     }
+
+    fn delete_by_row_id(
+        &self,
+        py: Python<'_>,
+        row_ids: Vec<i64>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        if self.closed {
+            return Err(PyRuntimeError::new_err("StreamTableUpdate is closed"));
+        }
+        // The stream committer applies the identifier to the returned messages.
+        let _ = commit_identifier;
+        delete_by_row_id(py, &self.table, &self.commit_user, row_ids)
+    }
 }
 
 #[pymethods]
@@ -601,6 +613,17 @@ impl PyBatchTableUpdate {
             keys,
             self.update_columns.clone(),
         )
+    }
+
+    fn delete_by_row_id(
+        &self,
+        py: Python<'_>,
+        row_ids: Vec<i64>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        if self.closed {
+            return Err(PyRuntimeError::new_err("BatchTableUpdate is closed"));
+        }
+        delete_by_row_id(py, &self.table, &self.commit_user, row_ids)
     }
 
     fn pin_read_snapshot(&mut self, snapshot_id: i64) -> PyResult<()> {
@@ -724,47 +747,6 @@ impl PyBatchTableUpdate {
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("BatchTableUpdate is closed"))?;
         self.closed = true;
-        let messages = py
-            .detach(|| runtime().block_on(inner.prepare_commit()))
-            .map_err(to_py_err)?;
-        Ok(wrap_messages(
-            messages,
-            &self.table_location,
-            &self.commit_user,
-        ))
-    }
-}
-
-#[pyclass(
-    name = "BatchTableDelete",
-    module = "pypaimon_rust.datafusion",
-    unsendable
-)]
-pub struct PyBatchTableDelete {
-    inner: Option<DataEvolutionDeleteWriter>,
-    table_location: String,
-    commit_user: String,
-}
-
-#[pymethods]
-impl PyBatchTableDelete {
-    fn close(&mut self) {
-        self.inner.take();
-    }
-
-    fn add_row_ids(&mut self, row_ids: Vec<i64>) -> PyResult<()> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("BatchTableDelete is closed"))?
-            .add_row_ids(row_ids)
-            .map_err(to_py_err)
-    }
-
-    fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
-        let inner = self
-            .inner
-            .take()
-            .ok_or_else(|| PyRuntimeError::new_err("BatchTableDelete is closed"))?;
         let messages = py
             .detach(|| runtime().block_on(inner.prepare_commit()))
             .map_err(to_py_err)?;

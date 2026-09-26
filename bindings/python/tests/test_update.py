@@ -17,34 +17,38 @@
 
 import pyarrow as pa
 import pytest
+import pypaimon_rust.datafusion as datafusion
 
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext, UpsertKeyMatcher
+from pypaimon_rust.datafusion import PaimonCatalog, SQLContext, _match_upsert_keys
 
 
 def test_upsert_key_matcher_deduplicates_and_fans_out():
+    assert not hasattr(datafusion, 'UpsertKeyMatcher')
+    assert not hasattr(datafusion, 'BatchTableDelete')
     source = pa.record_batch([
         pa.array([1, 1, 2, None, 3], type=pa.int32()),
         pa.array(['a', 'a', 'b', 'n', 'c']),
     ], names=['id', 'part'])
-    matcher = UpsertKeyMatcher(source, ['id', 'part'])
-    assert matcher.deduplicated_indices() == [1, 2, 3, 4]
-    matcher.add_existing_batch(pa.record_batch([
+    existing = pa.record_batch([
         pa.array([1, 2, 1, None, 9], type=pa.int32()),
         pa.array(['a', 'b', 'a', 'n', 'other']),
         pa.array([10, 20, 11, 30, 40], type=pa.int64()),
-    ], names=['id', 'part', '_ROW_ID']))
-    assert matcher.finish() == ([1, 1, 2, 3], [10, 11, 20, 30], [4])
+    ], names=['id', 'part', '_ROW_ID'])
+    assert _match_upsert_keys(source, ['id', 'part'], iter([existing])) == (
+        [1, 1, 2, 3], [10, 11, 20, 30], [4]
+    )
 
 
 def test_upsert_key_matcher_rejects_different_key_types():
-    matcher = UpsertKeyMatcher(pa.record_batch([
+    source = pa.record_batch([
         pa.array([1], type=pa.int32()),
-    ], names=['id']), ['id'])
+    ], names=['id'])
+    existing = pa.record_batch([
+        pa.array([1], type=pa.int64()),
+        pa.array([0], type=pa.int64()),
+    ], names=['id', '_ROW_ID'])
     with pytest.raises(ValueError, match='upsert key type differs'):
-        matcher.add_existing_batch(pa.record_batch([
-            pa.array([1], type=pa.int64()),
-            pa.array([0], type=pa.int64()),
-        ], names=['id', '_ROW_ID']))
+        _match_upsert_keys(source, ['id'], [existing])
 
 
 def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
@@ -216,14 +220,19 @@ def test_batch_delete_row_ids_commits_deletion_vectors(tmp_path):
 
     table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('deletes.t')
     builder = table.new_batch_write_builder()
-    delete = builder.new_delete()
-    delete.add_row_ids([0, 2, 2])
-    messages = delete.prepare_commit()
+    update = builder.new_update()
+    messages = update.delete_by_row_id([0, 2, 2])
     assert messages and messages[0].serialize()
+    update.close()
     with pytest.raises(RuntimeError, match='closed'):
-        delete.add_row_ids([1])
+        update.delete_by_row_id([1])
     builder.new_commit().commit(messages)
 
     actual = pa.Table.from_batches(context.sql(
         'SELECT id, name FROM paimon.deletes.t')).to_pydict()
     assert actual == {'id': [2], 'name': ['b']}
+
+    stream = table.new_stream_write_builder()
+    stream_update = stream.new_update()
+    stream.new_commit().commit(42, stream_update.delete_by_row_id([1], 42))
+    assert list(context.sql('SELECT id, name FROM paimon.deletes.t')) == []
