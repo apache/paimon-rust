@@ -47,8 +47,8 @@ pub struct DLFToken {
     /// Security token for temporary credentials (optional).
     #[serde(rename = "SecurityToken")]
     pub security_token: Option<String>,
-    /// Expiration timestamp in milliseconds.
-    #[serde(rename = "ExpirationAt", default, skip_serializing)]
+    /// Expiration timestamp in milliseconds used internally for refresh decisions.
+    #[serde(skip)]
     pub expiration_at_millis: Option<i64>,
     /// Expiration time string (ISO 8601 format).
     #[serde(
@@ -122,6 +122,29 @@ impl DLFToken {
             .and_utc();
         Some(datetime.timestamp_millis())
     }
+
+    fn from_json(token_json: &str) -> Result<Self> {
+        let mut token: Self = serde_json::from_str(token_json).map_err(|_| Error::DataInvalid {
+            message: "Failed to parse token JSON".to_string(),
+            source: None,
+        })?;
+        if token.access_key_id.trim().is_empty() || token.access_key_secret.trim().is_empty() {
+            return Err(Error::DataInvalid {
+                message: "DLF token access key ID and secret must not be empty".to_string(),
+                source: None,
+            });
+        }
+        if let Some(expiration) = token.expiration.as_deref() {
+            token.expiration_at_millis =
+                Some(Self::parse_expiration_to_millis(expiration).ok_or_else(|| {
+                    Error::DataInvalid {
+                        message: "Failed to parse token Expiration".to_string(),
+                        source: None,
+                    }
+                })?);
+        }
+        Ok(token)
+    }
 }
 /// Trait for DLF token loaders.
 #[async_trait]
@@ -131,6 +154,58 @@ pub trait DLFTokenLoader: Send + Sync {
 
     /// Get a description of the loader.
     fn description(&self) -> &str;
+}
+
+/// Loads DLF credentials from a local JSON file.
+pub struct DLFLocalFileTokenLoader {
+    token_file_path: String,
+}
+
+impl DLFLocalFileTokenLoader {
+    const DEFAULT_MAX_RETRIES: u32 = 5;
+
+    /// Create a local-file token loader.
+    pub fn new(token_file_path: impl Into<String>) -> Result<Self> {
+        let token_file_path = token_file_path.into();
+        if token_file_path.trim().is_empty() {
+            return Err(Error::ConfigInvalid {
+                message: "dlf.token-path must not be empty".to_string(),
+            });
+        }
+        Ok(Self { token_file_path })
+    }
+
+    async fn read_token(&self, max_retries: u32) -> Result<DLFToken> {
+        let mut last_error = None;
+        for attempt in 0..max_retries.max(1) {
+            let result = match tokio::fs::read_to_string(&self.token_file_path).await {
+                Ok(token_json) => DLFToken::from_json(&token_json),
+                Err(error) => Err(Error::DataInvalid {
+                    message: format!("Failed to read DLF token file: {}", self.token_file_path),
+                    source: Some(Box::new(error)),
+                }),
+            };
+            match result {
+                Ok(token) => return Ok(token),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt + 1 < max_retries {
+                tokio::time::sleep(std::time::Duration::from_secs(u64::from(attempt + 1))).await;
+            }
+        }
+        Err(last_error.expect("at least one token load attempt"))
+    }
+}
+
+#[async_trait]
+impl DLFTokenLoader for DLFLocalFileTokenLoader {
+    async fn load_token(&self) -> Result<DLFToken> {
+        self.read_token(Self::DEFAULT_MAX_RETRIES).await
+    }
+
+    fn description(&self) -> &str {
+        &self.token_file_path
+    }
 }
 
 /// DLF ECS Token Loader.
@@ -167,24 +242,7 @@ impl DLFECSTokenLoader {
     /// Get the token from ECS metadata service.
     async fn get_token(&self, url: &str) -> Result<DLFToken> {
         let token_json = self.http_client.get(url).await?;
-        let mut token: DLFToken =
-            serde_json::from_str(&token_json).map_err(|e| Error::DataInvalid {
-                message: format!("Failed to parse token JSON: {e}"),
-                source: None,
-            })?;
-        if token.expiration_at_millis.is_none() {
-            if let Some(expiration) = token.expiration.as_deref() {
-                token.expiration_at_millis = Some(
-                    DLFToken::parse_expiration_to_millis(expiration).ok_or_else(|| {
-                        Error::DataInvalid {
-                            message: format!("Failed to parse token Expiration: {expiration}"),
-                            source: None,
-                        }
-                    })?,
-                );
-            }
-        }
-        Ok(token)
+        DLFToken::from_json(&token_json)
     }
 
     /// Build the token URL from base URL and role name.
@@ -221,26 +279,46 @@ pub struct DLFTokenLoaderFactory;
 
 impl DLFTokenLoaderFactory {
     /// Create a token loader based on options.
-    pub fn create_token_loader(options: &Options) -> Option<Arc<dyn DLFTokenLoader>> {
-        let loader = options.get(CatalogOptions::DLF_TOKEN_LOADER)?;
-
-        if loader == "ecs" {
-            let ecs_metadata_url = options
-                .get(CatalogOptions::DLF_TOKEN_ECS_METADATA_URL)
-                .cloned()
-                .unwrap_or_else(|| {
-                    "http://100.100.100.200/latest/meta-data/Ram/security-credentials/".to_string()
-                });
-            let role_name = options
-                .get(CatalogOptions::DLF_TOKEN_ECS_ROLE_NAME)
-                .cloned();
-            Some(
-                Arc::new(DLFECSTokenLoader::new(ecs_metadata_url, role_name))
-                    as Arc<dyn DLFTokenLoader>,
-            )
-        } else {
-            None
+    pub fn create_token_loader(options: &Options) -> Result<Option<Arc<dyn DLFTokenLoader>>> {
+        match options
+            .get(CatalogOptions::DLF_TOKEN_LOADER)
+            .map(String::as_str)
+        {
+            Some("ecs") => {
+                let ecs_metadata_url = options
+                    .get(CatalogOptions::DLF_TOKEN_ECS_METADATA_URL)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        "http://100.100.100.200/latest/meta-data/Ram/security-credentials/"
+                            .to_string()
+                    });
+                let role_name = options
+                    .get(CatalogOptions::DLF_TOKEN_ECS_ROLE_NAME)
+                    .cloned();
+                Ok(Some(Arc::new(DLFECSTokenLoader::new(
+                    ecs_metadata_url,
+                    role_name,
+                ))))
+            }
+            Some("local_file") => Self::create_local_file_loader(options).map(Some),
+            Some(loader) => Err(Error::ConfigInvalid {
+                message: format!("Unknown DLF token loader: {loader}"),
+            }),
+            None if options.get(CatalogOptions::DLF_TOKEN_PATH).is_some() => {
+                Self::create_local_file_loader(options).map(Some)
+            }
+            None => Ok(None),
         }
+    }
+
+    fn create_local_file_loader(options: &Options) -> Result<Arc<dyn DLFTokenLoader>> {
+        let token_path =
+            options
+                .get(CatalogOptions::DLF_TOKEN_PATH)
+                .ok_or_else(|| Error::ConfigInvalid {
+                    message: "dlf.token-path is required for local_file token loading".to_string(),
+                })?;
+        Ok(Arc::new(DLFLocalFileTokenLoader::new(token_path)?))
     }
 }
 // ============================================================================
@@ -486,6 +564,206 @@ mod tests {
         let expiration = "2024-12-31T23:59:59Z";
         let millis = DLFToken::parse_expiration_to_millis(expiration);
         assert!(millis.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_local_file_token_loader_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        let loader = DLFLocalFileTokenLoader::new(path.display().to_string()).unwrap();
+
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"ak-1","AccessKeySecret":"sk-1","SecurityToken":"sts-1"}"#,
+        )
+        .await
+        .unwrap();
+        let token = loader.read_token(1).await.unwrap();
+        assert_eq!(token.access_key_id, "ak-1");
+        assert_eq!(token.security_token.as_deref(), Some("sts-1"));
+        assert_eq!(token.expiration_at_millis, None);
+
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"ak-2","AccessKeySecret":"sk-2","ExpirationAt":123}"#,
+        )
+        .await
+        .unwrap();
+        let token = loader.read_token(1).await.unwrap();
+        assert_eq!(token.security_token, None);
+        assert_eq!(token.expiration_at_millis, None);
+
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"ak-3","AccessKeySecret":"sk-3","Expiration":"2099-01-01T00:00:00Z"}"#,
+        )
+        .await
+        .unwrap();
+        let token = loader.read_token(1).await.unwrap();
+        assert_eq!(
+            token.expiration_at_millis,
+            DLFToken::parse_expiration_to_millis("2099-01-01T00:00:00Z")
+        );
+
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"ak-4","AccessKeySecret":"sk-4","ExpirationAt":123,"Expiration":"2099-01-01T00:00:00Z"}"#,
+        )
+        .await
+        .unwrap();
+        let token = loader.read_token(1).await.unwrap();
+        assert_eq!(
+            token.expiration_at_millis,
+            DLFToken::parse_expiration_to_millis("2099-01-01T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_file_token_loader_errors_do_not_leak_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        let loader = DLFLocalFileTokenLoader::new(path.display().to_string()).unwrap();
+
+        let error = loader.read_token(1).await.unwrap_err();
+        assert!(error.to_string().contains("Failed to read DLF token file"));
+
+        let secret = "SECRET_MUST_NOT_LEAK";
+        tokio::fs::write(
+            &path,
+            format!(r#"{{"AccessKeyId":"ak","AccessKeySecret":"{secret}" invalid}}"#),
+        )
+        .await
+        .unwrap();
+        let error = loader.read_token(1).await.unwrap_err();
+        assert!(error.to_string().contains("Failed to parse token JSON"));
+        assert!(!error.to_string().contains(secret));
+
+        tokio::fs::write(&path, r#"{"AccessKeyId":"ak"}"#)
+            .await
+            .unwrap();
+        let error = loader.read_token(1).await.unwrap_err();
+        assert!(error.to_string().contains("Failed to parse token JSON"));
+
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"","AccessKeySecret":"sk","Expiration":"invalid"}"#,
+        )
+        .await
+        .unwrap();
+        let error = loader.read_token(1).await.unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
+
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"ak","AccessKeySecret":"sk","Expiration":"invalid"}"#,
+        )
+        .await
+        .unwrap();
+        let error = loader.read_token(1).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Failed to parse token Expiration"));
+
+        tokio::fs::write(
+            &path,
+            r#"{"AccessKeyId":"ak","AccessKeySecret":"sk","ExpirationAt":123,"Expiration":"invalid"}"#,
+        )
+        .await
+        .unwrap();
+        let error = loader.read_token(1).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Failed to parse token Expiration"));
+    }
+
+    #[test]
+    fn test_local_file_token_loader_factory_validation() {
+        let mut options = Options::new();
+        options.set(CatalogOptions::DLF_TOKEN_LOADER, "local_file");
+        assert!(DLFTokenLoaderFactory::create_token_loader(&options)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("dlf.token-path is required"));
+
+        options.set(CatalogOptions::DLF_TOKEN_PATH, " ");
+        assert!(DLFTokenLoaderFactory::create_token_loader(&options)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("must not be empty"));
+
+        options.set(CatalogOptions::DLF_TOKEN_LOADER, "unknown");
+        assert!(DLFTokenLoaderFactory::create_token_loader(&options)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Unknown DLF token loader"));
+
+        options.remove(CatalogOptions::DLF_TOKEN_LOADER);
+        options.set(CatalogOptions::DLF_TOKEN_PATH, "/tmp/token.json");
+        assert_eq!(
+            DLFTokenLoaderFactory::create_token_loader(&options)
+                .unwrap()
+                .unwrap()
+                .description(),
+            "/tmp/token.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_file_provider_refreshes_expiring_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token.json");
+        let expires_soon = (Utc::now()
+            + chrono::Duration::milliseconds(TOKEN_EXPIRATION_SAFE_TIME_MILLIS / 2))
+        .format(DLFToken::TOKEN_DATE_FORMAT);
+        tokio::fs::write(
+            &path,
+            format!(
+                r#"{{"AccessKeyId":"old-ak","AccessKeySecret":"old-sk","Expiration":"{expires_soon}"}}"#
+            ),
+        )
+        .await
+        .unwrap();
+        let loader = Arc::new(DLFLocalFileTokenLoader::new(path.display().to_string()).unwrap());
+        let provider = DLFAuthProvider::new(
+            "https://dlf.cn-hangzhou.aliyuncs.com",
+            "cn-hangzhou",
+            "default",
+            None,
+            Some(loader),
+        )
+        .unwrap();
+
+        let auth = RESTAuthParameter::new("GET", "/test", None, HashMap::new());
+        let headers = provider
+            .merge_auth_header(HashMap::new(), &auth)
+            .await
+            .unwrap();
+        assert!(headers[AUTHORIZATION_HEADER_KEY].contains("old-ak"));
+        let expires_later = (Utc::now()
+            + chrono::Duration::milliseconds(TOKEN_EXPIRATION_SAFE_TIME_MILLIS * 2))
+        .format(DLFToken::TOKEN_DATE_FORMAT);
+        tokio::fs::write(
+            &path,
+            format!(
+                r#"{{"AccessKeyId":"new-ak","AccessKeySecret":"new-sk","Expiration":"{expires_later}"}}"#
+            ),
+        )
+        .await
+        .unwrap();
+        let headers = provider
+            .merge_auth_header(HashMap::new(), &auth)
+            .await
+            .unwrap();
+        assert!(headers[AUTHORIZATION_HEADER_KEY].contains("new-ak"));
+        tokio::fs::remove_file(path).await.unwrap();
+        let headers = provider
+            .merge_auth_header(HashMap::new(), &auth)
+            .await
+            .unwrap();
+        assert!(headers[AUTHORIZATION_HEADER_KEY].contains("new-ak"));
     }
 
     struct RotatingTokenLoader {
