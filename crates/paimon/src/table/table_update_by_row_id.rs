@@ -64,6 +64,8 @@ impl TableUpdateByRowId {
     }
 
     /// Stage one logical Arrow table. Its chunks may share a file group.
+    /// Partition columns may carry their existing values. Changing them is
+    /// rejected before writing, because a move requires delete + insert.
     pub async fn update_columns(
         &mut self,
         batches: Vec<RecordBatch>,
@@ -77,7 +79,7 @@ impl TableUpdateByRowId {
             .into_iter()
             .filter(|name| seen.insert(name.clone()))
             .collect::<Vec<_>>();
-        let mut writer = DataEvolutionWriter::new(&self.table, columns.clone())?;
+        let mut writer = DataEvolutionWriter::for_row_id(&self.table, columns.clone())?;
         let batches = batches
             .into_iter()
             .map(super::update_input::normalize_row_ids)

@@ -50,7 +50,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use indexmap::IndexMap;
 use roaring::RoaringBitmap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -92,6 +92,21 @@ impl DataEvolutionWriter {
     /// - No primary keys
     /// - Update columns don't include partition keys
     pub fn new(table: &Table, update_columns: Vec<String>) -> Result<Self> {
+        Self::with_partition_columns(table, update_columns, false)
+    }
+
+    /// Row-ID inputs may carry unchanged partition values, as complete-row
+    /// upserts do. Validate their values against the pinned file index before
+    /// writing; changing a partition requires delete + insert.
+    pub(super) fn for_row_id(table: &Table, update_columns: Vec<String>) -> Result<Self> {
+        Self::with_partition_columns(table, update_columns, true)
+    }
+
+    fn with_partition_columns(
+        table: &Table,
+        update_columns: Vec<String>,
+        allow_partition_columns: bool,
+    ) -> Result<Self> {
         let schema = table.schema();
         let core_options = CoreOptions::new(schema.options());
 
@@ -136,7 +151,7 @@ impl DataEvolutionWriter {
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
         for col in &update_columns {
             let top_level = DataEvolutionPartialWriter::top_level_write_name(col, schema.fields());
-            if partition_keys.iter().any(|key| key == top_level) {
+            if !allow_partition_columns && partition_keys.iter().any(|key| key == top_level) {
                 return Err(crate::Error::Unsupported {
                     message: format!("Cannot update partition column '{col}' in MERGE INTO"),
                 });
@@ -162,6 +177,51 @@ impl DataEvolutionWriter {
             matched_batch_groups: Vec::new(),
             next_group_id: 1,
         })
+    }
+
+    fn validate_partition_values(
+        &self,
+        files: &[FileRowRange],
+        matches: &HashMap<usize, Vec<MatchedRow>>,
+    ) -> Result<()> {
+        for (partition_index, name) in self.table.schema().partition_keys().iter().enumerate() {
+            let Some(field) = self.write_fields.iter().find(|field| field.name() == name) else {
+                continue;
+            };
+            let target_type = crate::arrow::paimon_type_to_arrow(field.data_type())?;
+            let values = self
+                .matched_batches
+                .iter()
+                .map(|batch| {
+                    super::update_input::cast_update_value(
+                        &matched_column(batch, name)?,
+                        &target_type,
+                        super::update_input::CastMode::RowUpdate,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (&file_pos, rows) in matches {
+                let partition = BinaryRow::from_serialized_bytes(&files[file_pos].partition)?;
+                let expected = crate::arrow::partition::partition_array(
+                    &partition,
+                    partition_index,
+                    field.data_type(),
+                    1,
+                )?
+                .to_data();
+                for row in rows {
+                    if values[row.batch_idx].slice(row.row_idx, 1).to_data() != expected {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!(
+                                "Cannot change partition column '{name}' in a row-ID update"
+                            ),
+                            source: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Add a batch of matched rows.
@@ -277,6 +337,7 @@ impl DataEvolutionWriter {
             &self.update_columns,
         )?;
         let file_matches = group_matched_rows_by_file(&self.matched_batches, file_index)?;
+        self.validate_partition_values(file_index, &file_matches)?;
 
         // 3. For each affected file: read original columns, apply updates, write partial files
         let mut writer = DataEvolutionPartialWriter::new(&self.table, self.update_columns.clone())?;
@@ -545,7 +606,7 @@ impl DataEvolutionDeleteWriter {
             });
         }
 
-        let mut deletes_by_bucket: HashMap<(Vec<u8>, i32), BucketDeletePlan> = HashMap::new();
+        let mut deletes_by_bucket: BTreeMap<(Vec<u8>, i32), BucketDeletePlan> = BTreeMap::new();
         for row_id in &self.row_ids {
             let (file_pos, file_range) =
                 find_delete_owning_file(&file_index, *row_id).ok_or_else(|| {
@@ -580,11 +641,21 @@ impl DataEvolutionDeleteWriter {
 
         let mut messages = Vec::new();
         for ((partition, bucket), delete_plan) in deletes_by_bucket {
-            if let Some(message) = self
+            match self
                 .prepare_bucket_delete_message(partition, bucket, delete_plan, &snapshot)
-                .await?
+                .await
             {
-                messages.push(message);
+                Ok(Some(message)) => messages.push(message),
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = self
+                        .table
+                        .new_write_builder()
+                        .new_commit()
+                        .abort(&messages)
+                        .await;
+                    return Err(error);
+                }
             }
         }
 
@@ -683,7 +754,7 @@ impl DataEvolutionDeleteWriter {
         let mut bitmaps = IndexMap::new();
         let mut deleted_index_files = Vec::new();
 
-        for entry in index_entries {
+        for mut entry in index_entries {
             if entry.kind != FileKind::Add
                 || entry.bucket != bucket
                 || entry.partition != partition
@@ -692,6 +763,12 @@ impl DataEvolutionDeleteWriter {
                 continue;
             }
             deleted_index_files.push(entry.index_file.clone());
+            // Preserve the original manifest identity in deleted_index_files.
+            // Only the copy used for reading acquires the legacy physical path.
+            layout
+                .location()
+                .resolve_legacy_deletion_vector(self.table.file_io(), &mut entry.index_file)
+                .await?;
             let Some(ranges) = entry.index_file.deletion_vectors_ranges.as_ref() else {
                 continue;
             };
@@ -725,12 +802,21 @@ impl DataEvolutionDeleteWriter {
         bitmaps.sort_keys();
 
         let file_name = format!("index-{}-1", Uuid::new_v4());
-        // Write where the reader resolves it, so a deletion vector written here is
-        // found again on the next scan.
         let layout = self.deletion_vector_layout(partition, bucket)?;
-        let location = layout.location();
-        let path = location.resolve(&file_name, None);
-        self.table.file_io().mkdirs(&location.directory()).await?;
+        let external_path = super::external_path::new_index_external_path(
+            self.table.schema().options(),
+            layout.index_file_in_data_file_dir,
+            layout
+                .bucket_path
+                .strip_prefix(&format!("{}/", layout.table_path))
+                .expect("bucket path is under the table"),
+            &file_name,
+        )?;
+        let path = layout
+            .location()
+            .resolve(&file_name, external_path.as_deref());
+        let directory = path.rsplit_once('/').expect("index file has a parent").0;
+        self.table.file_io().mkdirs(directory).await?;
 
         let mut bytes = vec![DELETION_VECTORS_INDEX_VERSION_V1];
         let mut ranges = IndexMap::new();
@@ -768,11 +854,16 @@ impl DataEvolutionDeleteWriter {
             message: "Deletion-vector index file has too many entries".to_string(),
             source: None,
         })?;
-        self.table
+        if let Err(error) = self
+            .table
             .file_io()
             .new_output(&path)?
             .write(Bytes::from(bytes))
-            .await?;
+            .await
+        {
+            let _ = self.table.file_io().delete_file(&path).await;
+            return Err(error);
+        }
 
         Ok(IndexFileMeta {
             index_type: DELETION_VECTORS_INDEX_TYPE.to_string(),
@@ -780,7 +871,7 @@ impl DataEvolutionDeleteWriter {
             file_size,
             row_count: i64::from(row_count),
             deletion_vectors_ranges: Some(ranges),
-            external_path: None,
+            external_path,
             global_index_meta: None,
         })
     }

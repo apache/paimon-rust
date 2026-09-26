@@ -44,7 +44,7 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 ///
 /// Row-ID updates infer columns from the input unless configured with
 /// [`with_update_type`](Self::with_update_type). Key-based upserts currently
-/// require complete Arrow rows and an unpartitioned table.
+/// require complete Arrow rows and match keys within each partition.
 #[derive(Clone)]
 pub struct TableUpdate {
     table: Table,
@@ -200,7 +200,9 @@ impl TableUpdate {
     }
 
     /// Upsert complete Arrow rows by composite key through the core upsert
-    /// writer. Existing keys update every matching row ID; new keys append.
+    /// writer. Keys match within each partition, including when partition
+    /// columns are omitted from `upsert_keys`. Existing keys update every
+    /// matching row ID; new keys append.
     pub async fn upsert_by_arrow_with_key(
         &self,
         batches: Vec<RecordBatch>,

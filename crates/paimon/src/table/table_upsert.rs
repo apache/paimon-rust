@@ -71,16 +71,18 @@ impl TableUpsert {
     pub(super) fn new(
         table: &Table,
         commit_user: String,
-        keys: Vec<String>,
+        mut keys: Vec<String>,
         update_columns: Vec<String>,
     ) -> crate::Result<Self> {
         if keys.is_empty() {
             return Err(invalid("upsert keys must not be empty"));
         }
-        if !table.schema().partition_keys().is_empty() {
-            return Err(crate::Error::Unsupported {
-                message: "native upsert currently requires an unpartitioned table".to_string(),
-            });
+        // PyPaimon matches independently within each source partition, even
+        // when callers omit partition columns from their upsert keys.
+        for partition in table.schema().partition_keys() {
+            if !keys.contains(partition) {
+                keys.push(partition.clone());
+            }
         }
         let fields = table.schema().fields();
         for key in &keys {
@@ -105,7 +107,8 @@ impl TableUpsert {
             return Err(invalid("upsert update columns must not be empty"));
         }
         // Reuse the row-ID writer's precondition and column-path checks.
-        let _validated_update = super::DataEvolutionWriter::new(table, update_columns.clone())?;
+        let _validated_update =
+            super::DataEvolutionWriter::for_row_id(table, update_columns.clone())?;
         Ok(Self {
             table: table.clone(),
             commit_user,
@@ -182,11 +185,8 @@ impl TableUpsert {
                     .map_err(|error| {
                         invalid(format!("cannot build matched upsert rows: {error}"))
                     })?;
-                let mut update = self
-                    .table
-                    .new_write_builder()
-                    .with_commit_user(self.commit_user.clone())?
-                    .new_data_evolution_writer(self.update_columns)?;
+                let mut update =
+                    super::DataEvolutionWriter::for_row_id(&self.table, self.update_columns)?;
                 if let Some(snapshot_id) = plan.snapshot_id() {
                     update.pin_read_snapshot(snapshot_id);
                 }

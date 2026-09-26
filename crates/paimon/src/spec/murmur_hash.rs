@@ -86,6 +86,24 @@ pub(crate) fn hash_bytes(data: &[u8]) -> i32 {
     fmix(h1 ^ data.len() as u32) as i32
 }
 
+/// Guava's canonical Murmur3_32 with seed zero, used by Java's external
+/// entropy paths. Unlike Paimon row hashing, the tail forms a single word.
+pub(crate) fn hash_bytes_guava(data: &[u8]) -> i32 {
+    let (words, tail) = data.as_chunks::<4>();
+    let mut hash = 0;
+    for word in words {
+        hash = mix_h1(hash, mix_k1(u32::from_le_bytes(*word)));
+    }
+    let mut last = 0;
+    for (index, byte) in tail.iter().enumerate() {
+        last |= u32::from(*byte) << (8 * index);
+    }
+    if !tail.is_empty() {
+        hash ^= mix_k1(last);
+    }
+    fmix(hash ^ data.len() as u32) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
