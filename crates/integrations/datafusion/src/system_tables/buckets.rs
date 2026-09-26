@@ -32,7 +32,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use paimon::spec::{BinaryRow, DataField};
-use paimon::table::Table;
+use paimon::table::{DataSplit, Table};
 
 use super::row_string_cast::format_row_as_java_cast_string;
 use crate::error::to_datafusion_error;
@@ -120,12 +120,33 @@ async fn collect_bucket_rows(table: &Table) -> paimon::Result<Vec<BucketRow>> {
         .plan()
         .await?;
     let partition_fields = table.schema().partition_fields();
-    // BTreeMap keys sort by partition string then bucket, matching Java BucketsTable's
-    // `Comparator.comparing(partition).thenComparing(bucket)`.
-    let mut aggs: BTreeMap<(Option<String>, i32), BucketAgg> = BTreeMap::new();
-    for split in scan.splits() {
-        let partition = format_partition(split.partition(), &partition_fields)?;
-        let agg = aggs.entry((partition, split.bucket())).or_default();
+    aggregate_bucket_rows(scan.splits(), &partition_fields)
+}
+
+/// Aggregate splits into one row per (partition, bucket).
+///
+/// Group by the raw partition row, not its rendered string. The Java
+/// cast-to-string formatter is not injective — e.g. `(p1='a, b', p2='c')` and
+/// `(p1='a', p2='b, c')` both render `{a, b, c}` — so keying on the string would
+/// merge unrelated partitions and report combined counts. The serialized
+/// `BinaryRow` bytes are injective and form the grouping key; the string is
+/// carried only for output. Keys still sort by partition string then bucket to
+/// match Java BucketsTable's `Comparator.comparing(partition).thenComparing(bucket)`,
+/// with the raw bytes as a final tie-break so distinct look-alike partitions keep
+/// a deterministic order.
+fn aggregate_bucket_rows(
+    splits: &[DataSplit],
+    partition_fields: &[DataField],
+) -> paimon::Result<Vec<BucketRow>> {
+    let mut aggs: BTreeMap<(Option<String>, i32, Vec<u8>), BucketAgg> = BTreeMap::new();
+    for split in splits {
+        let partition = format_partition(split.partition(), partition_fields)?;
+        let key = (
+            partition,
+            split.bucket(),
+            split.partition().to_serialized_bytes(),
+        );
+        let agg = aggs.entry(key).or_default();
         for file in split.data_files() {
             agg.record_count = agg.record_count.saturating_add(file.row_count);
             agg.file_size_in_bytes = agg.file_size_in_bytes.saturating_add(file.file_size);
@@ -137,7 +158,7 @@ async fn collect_bucket_rows(table: &Table) -> paimon::Result<Vec<BucketRow>> {
     }
     Ok(aggs
         .into_iter()
-        .map(|((partition, bucket), agg)| BucketRow {
+        .map(|((partition, bucket, _), agg)| BucketRow {
             partition,
             bucket,
             agg,
@@ -184,4 +205,54 @@ fn format_partition(
         return Ok(Some("{}".to_string()));
     }
     format_row_as_java_cast_string(partition, partition_fields).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paimon::spec::{DataType, Datum, VarCharType};
+
+    fn string_type() -> DataType {
+        DataType::VarChar(VarCharType::new(64).unwrap())
+    }
+
+    fn partition_row(a: &str, b: &str) -> BinaryRow {
+        let t = string_type();
+        let da = Datum::String(a.to_string());
+        let db = Datum::String(b.to_string());
+        BinaryRow::from_datums(&[(Some(&da), &t), (Some(&db), &t)])
+    }
+
+    fn split(partition: BinaryRow, bucket: i32) -> DataSplit {
+        DataSplit::builder()
+            .with_snapshot(1)
+            .with_partition(partition)
+            .with_bucket(bucket)
+            .with_bucket_path("/warehouse/bucket".to_string())
+            .with_data_files(Vec::new())
+            .build()
+            .unwrap()
+    }
+
+    // Two distinct partitions whose Java cast-string renders identically must
+    // still aggregate into separate rows. Grouping on the rendered string (the
+    // pre-fix behavior) would merge them into one row with combined counts.
+    #[test]
+    fn look_alike_partitions_do_not_merge() {
+        let t = string_type();
+        let fields = vec![
+            DataField::new(0, "p1".to_string(), t.clone()),
+            DataField::new(1, "p2".to_string(), t),
+        ];
+        let a = partition_row("a, b", "c");
+        let b = partition_row("a", "b, c");
+        // Precondition: the rendered strings collide, so string keying would merge.
+        assert_eq!(
+            format_partition(&a, &fields).unwrap(),
+            format_partition(&b, &fields).unwrap(),
+        );
+
+        let rows = aggregate_bucket_rows(&[split(a, 0), split(b, 0)], &fields).unwrap();
+        assert_eq!(rows.len(), 2, "distinct partitions must not be merged");
+    }
 }
