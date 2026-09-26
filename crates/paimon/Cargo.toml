@@ -41,6 +41,7 @@ storage-all = [
     "storage-obs",
     "storage-gcs",
     "storage-hdfs",
+    "storage-jindo",
 ]
 fulltext = ["dep:paimon-ftindex-core"]
 vortex = ["dep:vortex"]
@@ -61,6 +62,7 @@ storage-azdls = [
 storage-obs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-obs"]
 storage-gcs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-gcs"]
 storage-hdfs = ["dep:opendal-service-hdfs-native"]
+storage-jindo = ["storage-oss"]
 
 [dependencies]
 url = "2.5.2"
@@ -148,6 +150,9 @@ log = "0.4"
 # Keep CI on the dependency set that passed before unicode-segmentation 1.13.3.
 # The 1.13.3 resolver update correlates with Linux Vortex tests hanging.
 unicode-segmentation = "=1.13.2"
+
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
