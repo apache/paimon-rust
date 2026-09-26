@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// These tests need a real local file system for modification times. On
+// Windows CI the temporary directory is an 8.3 short path, which opendal's
+// local lister cannot strip its canonical root from, so like the repository's
+// other local-listing tests they do not run there.
+#![cfg(not(windows))]
+
 use super::current_time_millis;
 use crate::catalog::Identifier;
 use crate::io::FileIOBuilder;
