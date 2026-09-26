@@ -465,11 +465,14 @@ async fn proc_delete_branch(
     let branch_str = require_arg(args, "branch")?;
 
     let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    let options = table.schema().options();
     for branch_name in branch_str.split(',') {
         let branch_name = branch_name.trim();
         if branch_name.is_empty() {
             continue;
         }
+        BranchManager::ensure_branch_deletable(options, branch_name)
+            .map_err(to_datafusion_error)?;
         if !bm
             .branch_exists(branch_name)
             .await
