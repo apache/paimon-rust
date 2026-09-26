@@ -24,8 +24,9 @@ use arrow_schema::{DataType, Field, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use futures::TryStreamExt;
 
+use super::upsert_key_matcher::UpsertKeyMatcher;
 use crate::spec::CoreOptions;
-use crate::table::{CommitMessage, Table, UpsertKeyMatcher};
+use crate::table::{CommitMessage, Table};
 
 const ROW_ID: &str = "_ROW_ID";
 

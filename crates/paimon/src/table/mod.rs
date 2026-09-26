@@ -207,7 +207,6 @@ pub use table_upsert::TableUpsert;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
 pub use update_assignment::UpdateAssignment;
-pub use upsert_key_matcher::UpsertKeyMatcher;
 pub use vector_read::{BatchVectorRead, VectorRead};
 pub use vector_scan::{VectorScan, VectorScanPlan};
 pub use vector_search_builder::VectorSearchBuilder;

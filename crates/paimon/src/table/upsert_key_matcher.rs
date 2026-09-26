@@ -44,7 +44,7 @@ fn key_columns(batch: &RecordBatch, keys: &[String]) -> crate::Result<Vec<ArrayR
         .collect()
 }
 
-pub(crate) fn supported_key_type(data_type: &DataType) -> bool {
+pub(super) fn supported_key_type(data_type: &DataType) -> bool {
     matches!(
         data_type,
         DataType::Boolean
@@ -70,7 +70,7 @@ pub(crate) fn supported_key_type(data_type: &DataType) -> bool {
 
 /// Match source keys against target row IDs using Arrow row encoding.
 /// Repeated source keys keep their last row; repeated target keys fan out.
-pub struct UpsertKeyMatcher {
+pub(super) struct UpsertKeyMatcher {
     keys: Vec<String>,
     types: Vec<DataType>,
     converter: RowConverter,
@@ -80,7 +80,7 @@ pub struct UpsertKeyMatcher {
 }
 
 impl UpsertKeyMatcher {
-    pub fn new(batch: &RecordBatch, keys: Vec<String>) -> crate::Result<Self> {
+    pub(super) fn new(batch: &RecordBatch, keys: Vec<String>) -> crate::Result<Self> {
         if keys.is_empty() {
             return Err(invalid("upsert keys must not be empty"));
         }
@@ -116,11 +116,7 @@ impl UpsertKeyMatcher {
         })
     }
 
-    pub fn deduplicated_indices(&self) -> Vec<usize> {
-        self.input.iter().map(|(index, _)| *index).collect()
-    }
-
-    pub fn add_existing_batch(&mut self, batch: &RecordBatch) -> crate::Result<()> {
+    pub(super) fn add_existing_batch(&mut self, batch: &RecordBatch) -> crate::Result<()> {
         let columns = key_columns(batch, &self.keys)?;
         for (column, expected) in columns.iter().zip(&self.types) {
             if column.data_type() != expected {
@@ -155,7 +151,7 @@ impl UpsertKeyMatcher {
 
     /// Source indices refer to the original input batch. Each matched source
     /// index is repeated once per matching target row ID.
-    pub fn finish(&self) -> (Vec<usize>, Vec<i64>, Vec<usize>) {
+    pub(super) fn finish(&self) -> (Vec<usize>, Vec<i64>, Vec<usize>) {
         let mut matched = Vec::new();
         let mut row_ids = Vec::new();
         let mut new = Vec::new();
@@ -170,5 +166,81 @@ impl UpsertKeyMatcher {
             }
         }
         (matched, row_ids, new)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int32Array, StringArray};
+    use std::sync::Arc;
+
+    #[test]
+    fn composite_keys_preserve_nulls_last_source_rows_and_duplicate_targets() {
+        let source = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    Some(2),
+                    None,
+                    Some(3),
+                ])) as ArrayRef,
+            ),
+            (
+                "part",
+                Arc::new(StringArray::from(vec!["a", "a", "b", "n", "c"])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let existing = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(1),
+                    None,
+                    Some(9),
+                ])) as ArrayRef,
+            ),
+            (
+                "part",
+                Arc::new(StringArray::from(vec!["a", "b", "a", "n", "other"])) as ArrayRef,
+            ),
+            (
+                ROW_ID,
+                Arc::new(Int64Array::from(vec![10, 20, 11, 30, 40])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut matcher = UpsertKeyMatcher::new(&source, vec!["id".into(), "part".into()]).unwrap();
+        matcher.add_existing_batch(&existing.slice(0, 2)).unwrap();
+        matcher.add_existing_batch(&existing.slice(2, 3)).unwrap();
+        assert_eq!(
+            matcher.finish(),
+            (vec![1, 1, 2, 3], vec![10, 11, 20, 30], vec![4])
+        );
+    }
+
+    #[test]
+    fn rejects_mismatched_key_types() {
+        let source = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+        )])
+        .unwrap();
+        let existing = RecordBatch::try_from_iter(vec![
+            ("id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+            (ROW_ID, Arc::new(Int64Array::from(vec![0])) as ArrayRef),
+        ])
+        .unwrap();
+        let mut matcher = UpsertKeyMatcher::new(&source, vec!["id".into()]).unwrap();
+        assert!(matcher
+            .add_existing_batch(&existing)
+            .unwrap_err()
+            .to_string()
+            .contains("upsert key type differs"));
     }
 }

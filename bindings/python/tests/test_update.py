@@ -19,39 +19,13 @@ import pyarrow as pa
 import pytest
 import pypaimon_rust.datafusion as datafusion
 
-from pypaimon_rust.datafusion import PaimonCatalog, SQLContext, _match_upsert_keys
-
-
-def test_upsert_key_matcher_deduplicates_and_fans_out():
-    assert not hasattr(datafusion, 'UpsertKeyMatcher')
-    assert not hasattr(datafusion, 'BatchTableDelete')
-    source = pa.record_batch([
-        pa.array([1, 1, 2, None, 3], type=pa.int32()),
-        pa.array(['a', 'a', 'b', 'n', 'c']),
-    ], names=['id', 'part'])
-    existing = pa.record_batch([
-        pa.array([1, 2, 1, None, 9], type=pa.int32()),
-        pa.array(['a', 'b', 'a', 'n', 'other']),
-        pa.array([10, 20, 11, 30, 40], type=pa.int64()),
-    ], names=['id', 'part', '_ROW_ID'])
-    assert _match_upsert_keys(source, ['id', 'part'], iter([existing])) == (
-        [1, 1, 2, 3], [10, 11, 20, 30], [4]
-    )
-
-
-def test_upsert_key_matcher_rejects_different_key_types():
-    source = pa.record_batch([
-        pa.array([1], type=pa.int32()),
-    ], names=['id'])
-    existing = pa.record_batch([
-        pa.array([1], type=pa.int64()),
-        pa.array([0], type=pa.int64()),
-    ], names=['id', '_ROW_ID'])
-    with pytest.raises(ValueError, match='upsert key type differs'):
-        _match_upsert_keys(source, ['id'], [existing])
+from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
 
 
 def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
+    assert not hasattr(datafusion, '_match_upsert_keys')
+    assert not hasattr(datafusion, 'UpsertKeyMatcher')
+    assert not hasattr(datafusion, 'BatchTableDelete')
     context = SQLContext()
     context.register_catalog('paimon', {'warehouse': str(tmp_path)})
     context.sql('CREATE SCHEMA paimon.table_upsert')

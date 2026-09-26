@@ -586,11 +586,6 @@ impl PyTableUpdateByRowId {
         )
     }
 
-    fn _pin_read_snapshot(&mut self, py: Python<'_>, snapshot_id: i64) -> PyResult<()> {
-        py.detach(|| runtime().block_on(self.inner.pin_read_snapshot(snapshot_id)))
-            .map_err(to_py_err)
-    }
-
     fn _abort(&mut self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| runtime().block_on(self.inner.abort()))
             .map_err(to_py_err)

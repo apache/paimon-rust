@@ -63,17 +63,6 @@ impl TableUpdateByRowId {
         })
     }
 
-    /// Pin an externally matched snapshot before staging the first update.
-    pub async fn pin_read_snapshot(&mut self, snapshot_id: i64) -> crate::Result<()> {
-        if !self.messages.is_empty() {
-            return Err(invalid(
-                "Cannot change snapshot after staging row-ID updates",
-            ));
-        }
-        self.index = RowIdFileIndex::load(&self.table, Some(snapshot_id)).await?;
-        Ok(())
-    }
-
     /// Stage one logical Arrow table. Its chunks may share a file group.
     pub async fn update_columns(
         &mut self,
