@@ -207,6 +207,25 @@ class Table:
         Calling this from an active asyncio event loop will result in a panic.
         """
         ...
+    def expire_snapshots(
+        self,
+        retain_max: Optional[int] = None,
+        retain_min: Optional[int] = None,
+        older_than_ms: Optional[int] = None,
+        max_deletes: Optional[int] = None,
+    ) -> int:
+        """
+        Expire old snapshots and delete the files that only they reference,
+        like ``CALL sys.expire_snapshots``. Unset arguments fall back to the
+        table options ``snapshot.num-retained.max``, ``snapshot.num-retained.min``,
+        ``snapshot.time-retained`` (as ``now - older_than_ms``) and
+        ``snapshot.expire.limit``. Tagged snapshots and snapshots a consumer
+        still reads are kept. Returns the number of expired snapshots.
+
+        Warning: This method blocks on a DataFusion runtime.
+        Calling this from an active asyncio event loop will result in a panic.
+        """
+        ...
     def list_partitions(self) -> List[Dict[str, str]]:
         """
         Warning: This method blocks on a DataFusion runtime.
