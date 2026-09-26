@@ -156,3 +156,36 @@ def test_invalid_identifier_types(tmp_path, identifier):
     catalog = PaimonCatalog({"warehouse": str(tmp_path)})
     with pytest.raises(TypeError):
         catalog.get_table(identifier)
+
+
+def test_expire_snapshots(tmp_path):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.edb")
+    ctx.sql("CREATE TABLE paimon.edb.t (id INT, name STRING)")
+    ctx.sql("INSERT INTO paimon.edb.t VALUES (1, 'a')")
+    for i in range(2, 6):
+        ctx.sql(f"INSERT OVERWRITE paimon.edb.t VALUES ({i}, 'v{i}')")
+    table = PaimonCatalog({"warehouse": str(tmp_path)}).get_table("edb.t")
+    ctx.sql("CALL sys.create_tag(table => 'edb.t', tag => 't2', snapshot_id => 2)")
+    assert [s.id() for s in table.list_snapshots()] == [5, 4, 3, 2, 1]
+
+    # Every snapshot is recent, so the default `snapshot.time-retained` keeps them.
+    assert table.expire_snapshots() == 0
+
+    assert table.expire_snapshots(retain_max=3, retain_min=1) == 2
+    assert [s.id() for s in table.list_snapshots()] == [5, 4, 3]
+
+    assert table.expire_snapshots(older_than_ms=2**62, retain_min=1, max_deletes=1) == 1
+    assert [s.id() for s in table.list_snapshots()] == [5, 4]
+
+    def ids(builder):
+        batches = builder.new_read().read(builder.new_scan().plan().splits())
+        return sorted(pa.Table.from_batches(batches).column("id").to_pylist())
+
+    assert ids(table.new_read_builder()) == [5]
+    # The tagged snapshot keeps its data files.
+    assert ids(table.new_read_builder({"scan.tag-name": "t2"})) == [2]
+
+    with pytest.raises(ValueError, match="must not be less than"):
+        table.expire_snapshots(retain_max=1, retain_min=2)
