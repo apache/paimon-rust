@@ -73,9 +73,9 @@ def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
         pa.array(['y', 'd']),
         pa.array([101, 30], type=pa.int32()),
     ], names=['id', 'name', 'score'])
-    update = builder.new_update().with_update_type(['name', 'score'])
+    update = builder.new_update().with_update_type(update_cols=['name', 'score'])
     messages = update.upsert_by_arrow_with_key(
-        pa.Table.from_batches([first, second]), ['id'])
+        table=pa.Table.from_batches([first, second]), upsert_keys=['id'])
     assert messages and all(message.serialize() for message in messages)
     update.close()
     with pytest.raises(RuntimeError, match='closed'):
@@ -97,9 +97,11 @@ def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
         pa.array(['C', 'e']),
         pa.array([21, 40], type=pa.int32()),
     ], names=['id', 'name', 'score'])
-    stream_update = stream.new_update().with_update_type(['name', 'score'])
+    stream_update = stream.new_update().with_update_type(
+        update_cols=['name', 'score'])
     messages = stream_update.upsert_by_arrow_with_key(
-        pa.Table.from_batches([next_rows]), ['id'], 42)
+        table=pa.Table.from_batches([next_rows]), upsert_keys=['id'],
+        commit_identifier=42)
     stream.new_commit().commit(42, messages)
     next_round = pa.record_batch([
         pa.array([4], type=pa.int32()),

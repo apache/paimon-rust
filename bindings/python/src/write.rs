@@ -518,20 +518,20 @@ impl PyStreamTableUpdate {
 
     fn with_update_type<'py>(
         mut slf: PyRefMut<'py, Self>,
-        update_columns: Vec<String>,
+        update_cols: Vec<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         if slf.closed {
             return Err(PyRuntimeError::new_err("StreamTableUpdate is closed"));
         }
-        slf.update_columns = normalize_update_columns(&slf.table, update_columns)?;
+        slf.update_columns = normalize_update_columns(&slf.table, update_cols)?;
         Ok(slf)
     }
 
     fn upsert_by_arrow_with_key(
         &self,
         py: Python<'_>,
-        input: &Bound<'_, PyAny>,
-        keys: Vec<String>,
+        table: &Bound<'_, PyAny>,
+        upsert_keys: Vec<String>,
         commit_identifier: i64,
     ) -> PyResult<Vec<PyCommitMessage>> {
         if self.closed {
@@ -543,8 +543,8 @@ impl PyStreamTableUpdate {
             py,
             &self.table,
             &self.commit_user,
-            input,
-            keys,
+            table,
+            upsert_keys,
             self.update_columns.clone(),
         )
     }
@@ -573,7 +573,7 @@ impl PyBatchTableUpdate {
 
     fn with_update_type<'py>(
         mut slf: PyRefMut<'py, Self>,
-        update_columns: Vec<String>,
+        update_cols: Vec<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         if slf.started {
             return Err(PyRuntimeError::new_err(
@@ -583,7 +583,7 @@ impl PyBatchTableUpdate {
         if slf.closed {
             return Err(PyRuntimeError::new_err("BatchTableUpdate is closed"));
         }
-        let update_columns = normalize_update_columns(&slf.table, update_columns)?;
+        let update_columns = normalize_update_columns(&slf.table, update_cols)?;
         let inner = slf
             .table
             .new_write_builder()
@@ -599,8 +599,8 @@ impl PyBatchTableUpdate {
     fn upsert_by_arrow_with_key(
         &self,
         py: Python<'_>,
-        input: &Bound<'_, PyAny>,
-        keys: Vec<String>,
+        table: &Bound<'_, PyAny>,
+        upsert_keys: Vec<String>,
     ) -> PyResult<Vec<PyCommitMessage>> {
         if self.closed {
             return Err(PyRuntimeError::new_err("BatchTableUpdate is closed"));
@@ -609,8 +609,8 @@ impl PyBatchTableUpdate {
             py,
             &self.table,
             &self.commit_user,
-            input,
-            keys,
+            table,
+            upsert_keys,
             self.update_columns.clone(),
         )
     }
