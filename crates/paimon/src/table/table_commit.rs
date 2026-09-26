@@ -441,6 +441,7 @@ impl TableCommit {
             }
             return Err(error);
         }
+        self.maintain().await;
         Ok(())
     }
 
