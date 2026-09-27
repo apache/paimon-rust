@@ -131,7 +131,11 @@ impl LocalCache {
         key
     }
 
-    fn can_cache_exact_range(&self, key: &BlockKey, payload_len: usize) -> bool {
+    async fn can_cache_exact_range(&self, key: &BlockKey, payload_len: usize) -> bool {
+        // Enforce a reduced disk budget even when this request bypasses the cache.
+        if let CacheBackend::Disk(disk) = &self.backend {
+            disk.ensure_recovered().await;
+        }
         if !key.exact_range || payload_len > MAX_EXACT_RANGE_CACHE_ENTRY_SIZE {
             return false;
         }
@@ -388,8 +392,8 @@ mod tests {
             .is_none());
     }
 
-    #[test]
-    fn test_exact_range_cache_entry_has_a_hard_limit() {
+    #[tokio::test]
+    async fn test_exact_range_cache_entry_has_a_hard_limit() {
         let cache = LocalCache::new(LocalCacheConfig {
             dir: None,
             namespace: "test".into(),
@@ -400,8 +404,16 @@ mod tests {
         .unwrap();
         let key = cache.range_key("data.blob", &(0..MAX_EXACT_RANGE_CACHE_ENTRY_SIZE as u64));
 
-        assert!(cache.can_cache_exact_range(&key, MAX_EXACT_RANGE_CACHE_ENTRY_SIZE));
-        assert!(!cache.can_cache_exact_range(&key, MAX_EXACT_RANGE_CACHE_ENTRY_SIZE + 1));
+        assert!(
+            cache
+                .can_cache_exact_range(&key, MAX_EXACT_RANGE_CACHE_ENTRY_SIZE)
+                .await
+        );
+        assert!(
+            !cache
+                .can_cache_exact_range(&key, MAX_EXACT_RANGE_CACHE_ENTRY_SIZE + 1)
+                .await
+        );
     }
 
     #[test]

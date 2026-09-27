@@ -221,7 +221,7 @@ impl FileRead for CachedFileReader {
                 message: "BLOB metadata range is too large".to_string(),
                 source: None,
             })?;
-        if !self.cache.can_cache_exact_range(&key, expected_len) {
+        if !self.cache.can_cache_exact_range(&key, expected_len).await {
             return self.delegate.read(range).await;
         }
         if let Some(payload) = self
@@ -370,6 +370,40 @@ mod tests {
             .into_iter()
             .all(|result| result.unwrap() == b"bc"[..]));
         assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_uncacheable_first_read_recovers_reduced_disk_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = |max_size| LocalCacheConfig {
+            dir: Some(directory.path().to_path_buf()),
+            namespace: "restart".into(),
+            max_size: Some(max_size),
+            block_size: 1024,
+            whitelist: std::collections::HashSet::from([FileType::BlobMeta]),
+        };
+        let cache = LocalCache::new(config(8192)).unwrap();
+        let key = cache.range_key("data.blob", &(0..2));
+        let token = cache.read_token("data.blob");
+        cache
+            .put_block(&key, Bytes::from_static(b"ab"), &token)
+            .await;
+        let cached_file = directory
+            .path()
+            .join(super::super::CACHE_DIRECTORY_NAME)
+            .join(key.cache_relative_path());
+        assert!(cached_file.exists());
+        drop(cache);
+
+        let cache = Arc::new(LocalCache::new(config(1)).unwrap());
+        let delegate = Arc::new(CountingReader {
+            data: Bytes::from_static(b"abcdefgh"),
+            reads: AtomicUsize::new(0),
+        });
+        let reader = CachedFileReader::new(delegate.clone(), "data.blob", 8, cache);
+        assert_eq!(reader.read_blob_metadata(2..4).await.unwrap(), b"cd"[..]);
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+        assert!(!cached_file.exists());
     }
 
     #[tokio::test]
