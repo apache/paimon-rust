@@ -60,6 +60,7 @@ impl std::fmt::Display for BlockDecodeError {
 pub(super) struct DiskCache {
     root: PathBuf,
     state: Mutex<CacheState>,
+    mutation: tokio::sync::Mutex<()>,
     recovered: tokio::sync::OnceCell<()>,
     coordinator: Arc<CacheCoordinator>,
 }
@@ -107,6 +108,7 @@ impl DiskCache {
                 max_size,
                 ..CacheState::default()
             }),
+            mutation: tokio::sync::Mutex::new(()),
             recovered: tokio::sync::OnceCell::new(),
             coordinator: Arc::new(CacheCoordinator::default()),
         }
@@ -299,15 +301,35 @@ impl DiskCache {
             }
         }
         drop(temporary_file);
-        if let Err(error) = tokio::fs::rename(&temporary, &path).await {
-            log::debug!(
-                "Failed to publish local cache block '{}': {error}",
-                path.display()
-            );
-            let _ = tokio::fs::remove_file(temporary).await;
-            return;
-        }
-        self.record_entry_and_evict(key.clone(), encoded_size).await;
+        let retired = {
+            let _mutation = self.mutation.lock().await;
+            if let Err(error) = tokio::fs::rename(&temporary, &path).await {
+                log::debug!(
+                    "Failed to publish local cache block '{}': {error}",
+                    path.display()
+                );
+                let _ = tokio::fs::remove_file(temporary).await;
+                return;
+            }
+
+            let to_evict = {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                if state
+                    .max_size
+                    .is_some_and(|max_size| encoded_size > max_size)
+                {
+                    remove_state_entry(&mut state, key);
+                    let mut to_evict = vec![key.clone()];
+                    to_evict.extend(collect_evictions(&mut state));
+                    to_evict
+                } else {
+                    insert_state_entry(&mut state, key.clone(), encoded_size);
+                    collect_evictions(&mut state)
+                }
+            };
+            self.retire_cache_files(to_evict).await
+        };
+        self.remove_cache_files(retired).await;
     }
 
     pub(super) async fn invalidate_path(&self, namespace: &str, path: &str) {
@@ -367,30 +389,50 @@ impl DiskCache {
         }
     }
 
-    async fn record_entry_and_evict(&self, key: BlockKey, encoded_size: u64) {
-        let to_evict = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            insert_state_entry(&mut state, key, encoded_size);
-            collect_evictions(&mut state)
-        };
-        self.remove_cache_files(to_evict).await;
-    }
-
     async fn evict_over_limit(&self) {
-        let to_evict = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            collect_evictions(&mut state)
+        let retired = {
+            let _mutation = self.mutation.lock().await;
+            let to_evict = {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                collect_evictions(&mut state)
+            };
+            self.retire_cache_files(to_evict).await
         };
-        self.remove_cache_files(to_evict).await;
+        self.remove_cache_files(retired).await;
     }
 
-    async fn remove_cache_files(&self, keys: Vec<BlockKey>) {
+    async fn retire_cache_files(&self, keys: Vec<BlockKey>) -> Vec<PathBuf> {
+        let mut retired = Vec::with_capacity(keys.len());
         for key in keys {
             let path = self.root.join(key.cache_relative_path());
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            let retired_path = parent.join(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
+            match tokio::fs::rename(&path, &retired_path).await {
+                Ok(()) => retired.push(retired_path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    log::debug!(
+                        "Failed to retire local cache block '{}': {error}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        retired
+    }
+
+    async fn remove_cache_files(&self, paths: Vec<PathBuf>) {
+        for path in paths {
             if let Err(error) = tokio::fs::remove_file(&path).await {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     log::debug!(
-                        "Failed to evict local cache block '{}': {error}",
+                        "Failed to remove retired local cache block '{}': {error}",
                         path.display()
                     );
                 }
@@ -1139,6 +1181,35 @@ mod tests {
 
         assert_eq!(cache.get_block(&first).await, None);
         assert_eq!(cache.get_block(&second).await, Some(payload));
+    }
+
+    #[tokio::test]
+    async fn test_disk_cache_eviction_does_not_delete_republished_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = BlockKey::new("s3://bucket/table/data/data.blob", 4, 0);
+        let cache = DiskCache::new(directory.path(), None).unwrap();
+        cache.put_block(&key, Bytes::from_static(b"old")).await;
+
+        let retired = {
+            let _mutation = cache.mutation.lock().await;
+            let to_evict = {
+                let mut state = cache
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                remove_state_entry(&mut state, &key);
+                vec![key.clone()]
+            };
+            cache.retire_cache_files(to_evict).await
+        };
+
+        cache.put_block(&key, Bytes::from_static(b"new")).await;
+        cache.remove_cache_files(retired).await;
+
+        assert_eq!(
+            cache.get_block(&key).await,
+            Some(Bytes::from_static(b"new"))
+        );
     }
 
     #[tokio::test]

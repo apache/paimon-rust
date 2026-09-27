@@ -909,13 +909,30 @@ impl InputFile {
     }
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
+        self.reader_with_known_size(None).await
+    }
+
+    pub(crate) async fn reader_with_file_size(
+        &self,
+        file_size: u64,
+    ) -> crate::Result<impl FileRead> {
+        self.reader_with_known_size(Some(file_size)).await
+    }
+
+    async fn reader_with_known_size(
+        &self,
+        known_size: Option<u64>,
+    ) -> crate::Result<InputFileReader> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let reader = op.reader(&relative_path).await?;
         let Some(cache) = &self.cache else {
             return Ok(InputFileReader::Direct(reader));
         };
         let read_token = cache.read_token(&cache_path);
-        let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
+        let size = if let Some(size) = known_size {
+            cache.put_file_size(&cache_path, size, &read_token).await;
+            size
+        } else if let Some(size) = cache.file_size(&cache_path, &read_token).await {
             size
         } else {
             let size = op.stat(&relative_path).await?.content_length();
@@ -1658,6 +1675,19 @@ mod input_output_test {
         assert_eq!(reader.read_blob_metadata(0..4).await.unwrap(), b"meta"[..]);
         assert!(reader.read(4..8).await.is_err());
         assert!(input.read().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_reader_with_file_size_skips_source_stat() {
+        let source = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let path = source.path().join("missing.blob");
+        let input = setup_cached_fs_file_io(cache_dir.path())
+            .new_input(path.to_str().unwrap())
+            .unwrap();
+
+        assert!(input.reader().await.is_err());
+        assert!(input.reader_with_file_size(42).await.is_ok());
     }
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
