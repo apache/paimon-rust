@@ -1757,8 +1757,10 @@ mod input_output_test {
         let source = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         let path = source.path().join("snapshot-1");
+        // Use a logical path so metadata classification is identical on Windows.
+        let location = path.to_string_lossy().replace('\\', "/");
         let input = setup_cached_fs_file_io(cache_dir.path())
-            .new_input(path.to_str().unwrap())
+            .new_input(&location)
             .unwrap();
 
         assert!(input.reader().await.is_err());
