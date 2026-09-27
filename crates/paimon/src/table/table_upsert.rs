@@ -17,6 +17,8 @@
 
 //! Table-level append-only upsert by user-specified keys.
 
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, UInt32Array};
@@ -26,7 +28,10 @@ use futures::TryStreamExt;
 
 use super::upsert_key_matcher::UpsertKeyMatcher;
 use super::write_batch_normalize::normalize_write_array;
-use crate::spec::CoreOptions;
+use crate::spec::{
+    batch_to_serialized_bytes, extract_datum, BinaryRow, BinaryRowBuilder, CoreOptions, DataField,
+};
+use crate::table::source::{DataSplit, Plan};
 use crate::table::{CommitMessage, Table};
 
 const ROW_ID: &str = "_ROW_ID";
@@ -54,6 +59,19 @@ fn selected_rows(batch: &RecordBatch, rows: &[usize]) -> crate::Result<RecordBat
         .collect::<crate::Result<Vec<_>>>()?;
     RecordBatch::try_new(batch.schema(), columns)
         .map_err(|error| invalid(format!("cannot build selected upsert rows: {error}")))
+}
+
+// Java may reserve variable-length storage for NULL timestamps/decimals.
+// Compare logical partitions using one encoding, independent of that padding.
+fn partition_key(row: &BinaryRow, fields: &[DataField]) -> crate::Result<Vec<u8>> {
+    let mut builder = BinaryRowBuilder::new(fields.len() as i32);
+    for (index, field) in fields.iter().enumerate() {
+        match extract_datum(row, index, field.data_type())? {
+            Some(value) => builder.write_datum(index, &value, field.data_type()),
+            None => builder.set_null_at(index),
+        }
+    }
+    Ok(builder.build().to_serialized_bytes())
 }
 
 /// Upsert full Arrow rows into a data-evolution table without primary keys.
@@ -144,6 +162,40 @@ impl TableUpsert {
         Ok(())
     }
 
+    /// Match only the source partitions, as PyPaimon does. Filter planned splits
+    /// after global row IDs have been assigned so pruning cannot renumber rows.
+    fn matching_splits<'a>(
+        &self,
+        source: &RecordBatch,
+        plan: &'a Plan,
+    ) -> crate::Result<Cow<'a, [DataSplit]>> {
+        let schema = self.table.schema();
+        if schema.partition_keys().is_empty() {
+            return Ok(Cow::Borrowed(plan.splits()));
+        }
+        let indices = schema
+            .partition_keys()
+            .iter()
+            .map(|name| {
+                source
+                    .schema()
+                    .index_of(name)
+                    .map_err(|error| invalid(error.to_string()))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let partitions: HashSet<_> = batch_to_serialized_bytes(source, &indices, schema.fields())?
+            .into_iter()
+            .collect();
+        let fields = schema.partition_fields();
+        let mut splits = Vec::new();
+        for split in plan.splits() {
+            if partitions.contains(&partition_key(split.partition(), &fields)?) {
+                splits.push(split.clone());
+            }
+        }
+        Ok(Cow::Owned(splits))
+    }
+
     /// Match source keys against the target snapshot, stage row-ID updates and
     /// new rows, then return both sets of commit messages as one operation.
     #[must_use = "commit messages must be passed to TableCommit"]
@@ -165,7 +217,8 @@ impl TableUpsert {
         read_builder.with_projection(&projection)?;
         let plan = read_builder.new_scan().plan().await?;
         let read = read_builder.new_read()?;
-        let mut stream = read.to_arrow(plan.splits())?;
+        let splits = self.matching_splits(&source, &plan)?;
+        let mut stream = read.to_arrow(splits.as_ref())?;
         while let Some(batch) = stream.try_next().await? {
             matcher.add_existing_batch(&batch)?;
         }
@@ -217,5 +270,52 @@ impl TableUpsert {
             }
         }
         result.map(|()| messages)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{DataType as PaimonType, DecimalType, TimestampType, VarCharType};
+
+    #[test]
+    fn partition_identity_ignores_java_null_variable_storage() {
+        let fields = vec![
+            DataField::new(
+                0,
+                "ts".into(),
+                PaimonType::Timestamp(TimestampType::new(6).unwrap()),
+            ),
+            DataField::new(
+                1,
+                "amount".into(),
+                PaimonType::Decimal(DecimalType::new(20, 2).unwrap()),
+            ),
+            DataField::new(
+                2,
+                "label".into(),
+                PaimonType::VarChar(VarCharType::new(100).unwrap()),
+            ),
+        ];
+        let mut builder = BinaryRowBuilder::new(3);
+        builder.set_null_at(0);
+        builder.set_null_at(1);
+        builder.write_string(2, "after-null-fields");
+        let canonical = builder.build();
+        let mut java = canonical.data()[..32].to_vec();
+        // BinaryWriter.writeTimestamp(NULL, 6) reserves 8 bytes;
+        // writeDecimal(NULL, 20) reserves another 16, even though both are NULL.
+        java.extend_from_slice(&[0; 24]);
+        java.extend_from_slice(&canonical.data()[32..]);
+        java[8..16].copy_from_slice(&(32_u64 << 32).to_le_bytes());
+        java[16..24].copy_from_slice(&(40_u64 << 32).to_le_bytes());
+        let offset_and_size = u64::from_le_bytes(canonical.data()[24..32].try_into().unwrap());
+        java[24..32].copy_from_slice(&(offset_and_size + (24_u64 << 32)).to_le_bytes());
+        let java = BinaryRow::from_bytes(3, java);
+        assert_ne!(java.to_serialized_bytes(), canonical.to_serialized_bytes());
+        assert_eq!(
+            partition_key(&java, &fields).unwrap(),
+            canonical.to_serialized_bytes()
+        );
     }
 }
