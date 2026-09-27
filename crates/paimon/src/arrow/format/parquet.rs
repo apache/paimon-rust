@@ -49,7 +49,7 @@ use parquet::file::metadata::{
     KeyValue, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -339,11 +339,13 @@ impl ParquetFormatWriter {
     ) -> crate::Result<Self> {
         // Reject a bad codec before allocating the writer.
         let codec = parse_compression(compression, zstd_level)?;
+        let core_options = CoreOptions::new(format_options);
+        let page_index_enabled = core_options.parquet_write_page_index_enabled()?;
         let async_write = output.async_writer().await?;
         let input_schema = schema;
         let schema = timestamp_millis_schema(&input_schema);
-        let inner = create_parquet_arrow_writer(async_write, schema.clone(), codec)?;
-        let core_options = CoreOptions::new(format_options);
+        let inner =
+            create_parquet_arrow_writer(async_write, schema.clone(), codec, page_index_enabled)?;
         let stats_modes = write_fields
             .map(|fields| core_options.metadata_stats_modes(fields.iter().map(DataField::name)))
             .transpose()?;
@@ -362,8 +364,17 @@ fn create_parquet_arrow_writer(
     async_write: Box<dyn crate::io::AsyncFileWrite>,
     schema: arrow_schema::SchemaRef,
     codec: Compression,
+    page_index_enabled: bool,
 ) -> crate::Result<AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>> {
-    let props = WriterProperties::builder().set_compression(codec).build();
+    let props = WriterProperties::builder()
+        .set_compression(codec)
+        .set_statistics_enabled(if page_index_enabled {
+            EnabledStatistics::Page
+        } else {
+            EnabledStatistics::Chunk
+        })
+        .set_offset_index_disabled(!page_index_enabled)
+        .build();
     AsyncArrowWriter::try_new(async_write, schema, Some(props)).map_err(|e| {
         crate::Error::DataInvalid {
             message: format!("Failed to create parquet writer: {e}"),
@@ -3798,6 +3809,25 @@ mod tests {
             parquet::arrow::arrow_reader::ParquetRecordBatchReader::try_new(bytes, 1024).unwrap();
         let total_rows: usize = reader.into_iter().map(|r| r.unwrap().num_rows()).sum();
         assert_eq!(total_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_invalid_page_index_option_creates_no_file() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/invalid_page_index_option.parquet";
+        let output = file_io.new_output(path).unwrap();
+        let options = HashMap::from([(
+            "parquet.write-page-index.enabled".to_string(),
+            "invalid".to_string(),
+        )]);
+        let result =
+            ParquetFormatWriter::new(&output, writer_arrow_schema(), "zstd", 1, None, &options)
+                .await;
+        assert!(
+            matches!(result, Err(crate::Error::ConfigInvalid { message })
+            if message.contains("parquet.write-page-index.enabled"))
+        );
+        assert!(!file_io.exists(path).await.unwrap());
     }
 
     #[tokio::test]

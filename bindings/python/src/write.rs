@@ -34,39 +34,6 @@ use pyo3::types::{PyBytes, PyDict, PyString};
 use crate::error::to_py_err;
 use crate::predicate::{dict_to_table_predicate, py_to_datum};
 
-/// Validate an incoming batch schema against the table's target Arrow schema:
-/// field count, order, and names must match, and types must match exactly. The
-/// nullable flag is intentionally NOT compared, since `build_target_arrow_schema`
-/// derives nullability from the Paimon field while pyarrow-constructed batches
-/// infer nullable=true. No cast — callers supply correctly-typed batches.
-///
-/// Type matching is strict (no binary-family interchange): the lower write path
-/// downcasts to the exact Arrow array for each Paimon type (e.g. a `Binary` /
-/// `VarBinary` field requires `arrow_array::BinaryArray`, not `LargeBinary` /
-/// `FixedSizeBinary`). Accepting a near-equivalent type here would pass
-/// validation but then fail deeper with a type-mismatch (or write files whose
-/// Arrow schema differs from the table), so it is rejected up front.
-fn validate_batch_schema(input: &ArrowSchema, target: &ArrowSchema) -> PyResult<()> {
-    let mismatch = || {
-        PyValueError::new_err(format!(
-            "Input schema is not consistent with the table schema. \
-             input: {input:?}, table: {target:?}"
-        ))
-    };
-    if input.fields().len() != target.fields().len() {
-        return Err(mismatch());
-    }
-    for (i, t) in input.fields().iter().zip(target.fields().iter()) {
-        if i.name() != t.name() {
-            return Err(mismatch());
-        }
-        if i.data_type() != t.data_type() {
-            return Err(mismatch());
-        }
-    }
-    Ok(())
-}
-
 type PartitionSpec = HashMap<String, Option<Datum>>;
 type PythonPartitionSpec = HashMap<String, Py<PyAny>>;
 
@@ -95,8 +62,6 @@ impl WriteContext {
         };
         Ok(WriteState {
             inner: Some(builder.new_write().map_err(to_py_err)?),
-            target_schema: paimon::arrow::build_target_arrow_schema(self.table.schema().fields())
-                .map_err(to_py_err)?,
             table_location: self.table.location().to_string(),
             commit_user: self.commit_user.clone(),
         })
@@ -307,7 +272,6 @@ impl PyStreamWriteBuilder {
 
 struct WriteState {
     inner: Option<TableWrite>,
-    target_schema: Arc<ArrowSchema>,
     table_location: String,
     commit_user: String,
 }
@@ -503,7 +467,6 @@ impl UpdateContext {
 impl WriteState {
     fn write_arrow(&mut self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
         let batch = RecordBatch::from_pyarrow_bound(batch)?;
-        validate_batch_schema(&batch.schema(), &self.target_schema)?;
         let inner = self
             .inner
             .as_mut()

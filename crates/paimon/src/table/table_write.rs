@@ -26,7 +26,7 @@ use crate::resource::ResourceContext;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
-    DataType, MergeEngine, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
+    DataType, MergeEngine, RowKind, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
@@ -882,7 +882,7 @@ impl TableWrite {
 
     fn enrich_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let Some(generator) = &self.row_kind_generator else {
-            return Ok(batch.clone());
+            return self.filter_rowkind_batch(batch);
         };
         if batch
             .schema()
@@ -896,23 +896,37 @@ impl TableWrite {
             });
         }
 
+        let kinds = (0..batch.num_rows())
+            .map(|row| generator.generate(batch, row).map(|kind| kind.to_value()))
+            .collect::<Result<Vec<_>>>()?;
+        let batch = Self::add_per_row_value_kind_column(batch, kinds)?;
+        self.filter_rowkind_batch(&batch)
+    }
+
+    /// Both generated row kinds and explicit caller-provided kinds use the
+    /// same Java RowKindFilter before bucket assignment and changelog writing.
+    fn filter_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let Some(filter) = &self.row_kind_filter else {
+            return Ok(batch.clone());
+        };
+        let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) else {
+            return Ok(batch.clone());
+        };
+        let kinds = column
+            .as_any()
+            .downcast_ref::<arrow_array::Int8Array>()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "_VALUE_KIND column must be Int8".to_string(),
+                source: None,
+            })?;
         let mut keep_rows = Vec::new();
-        let mut kinds = Vec::new();
-        for row in 0..batch.num_rows() {
-            let kind = generator.generate(batch, row)?;
-            if let Some(filter) = &self.row_kind_filter {
-                if !filter.test(kind) {
-                    continue;
-                }
+        for (row, kind) in kinds.iter().enumerate() {
+            let kind = RowKind::from_value(kind.unwrap_or(RowKind::Insert as i8))?;
+            if filter.test(kind) {
+                keep_rows.push(row);
             }
-            keep_rows.push(row);
-            kinds.push(kind.to_value());
         }
-        if keep_rows.is_empty() {
-            return Ok(RecordBatch::new_empty(batch.schema()));
-        }
-        let filtered = take_rows(batch, &keep_rows)?;
-        Self::add_per_row_value_kind_column(&filtered, kinds)
+        take_rows(batch, &keep_rows)
     }
 
     fn add_per_row_value_kind_column(

@@ -213,6 +213,8 @@ impl FormatTableWriter {
                 source: None,
             });
         }
+        // Reject schema mistakes before entering the mutation/failure path.
+        self.check_schema(batch)?;
         let result = self.write_inner(batch).await;
         if result.is_err() {
             self.failed = true;
@@ -222,7 +224,6 @@ impl FormatTableWriter {
     }
 
     async fn write_inner(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.check_schema(batch)?;
         if batch.num_rows() == 0 {
             return Ok(());
         }

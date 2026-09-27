@@ -393,8 +393,29 @@ async fn rejected_batch_does_not_stage_or_publish_a_file() {
     .unwrap();
     let error = write.write_arrow_batch(&wrong).await.err().unwrap();
     assert!(error.to_string().contains("expects"));
-    assert!(write.prepare_commit().await.is_err());
+    assert!(write.prepare_commit().await.unwrap().is_empty());
     assert!(visible_files(&table, "dt=a").await.is_empty());
+}
+
+#[tokio::test]
+async fn schema_error_preserves_accepted_rows_and_writer_recovery() {
+    let table = memory_table("format_schema_recovery", true, &[]);
+    let builder = table.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    write.write_arrow_batch(&batch(&[("a", 1)])).await.unwrap();
+    let error = write
+        .write_arrow_batch(&unpartitioned_batch(&[2]))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("expects 2 columns"));
+    write.write_arrow_batch(&batch(&[("a", 3)])).await.unwrap();
+    builder
+        .new_commit()
+        .commit(write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ids(&table).await, [1, 3]);
+    assert_eq!(visible_files(&table, "dt=a").await.len(), 1);
 }
 
 #[tokio::test]
