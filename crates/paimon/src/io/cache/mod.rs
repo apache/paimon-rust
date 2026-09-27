@@ -34,9 +34,7 @@ use std::sync::Arc;
 use disk::DiskCache;
 pub(super) use reader::CachedFileReader;
 
-const CACHE_DIRECTORY_NAME: &str = "paimon-local-cache-v3";
-const MAX_CACHE_ENTRIES: usize = 65_536;
-const MAX_EXACT_RANGE_CACHE_ENTRY_SIZE: usize = 64 * 1024 * 1024;
+const CACHE_DIRECTORY_NAME: &str = "paimon-local-cache-v2";
 const DEFAULT_FILE_SIZE_CAPACITY: usize = 65_536;
 
 #[derive(Debug)]
@@ -113,37 +111,10 @@ impl LocalCache {
     }
 
     pub(super) fn is_cacheable(&self, path: &str) -> bool {
-        !FileType::is_mutable(path) && (self.cache_blocks(path) || self.cache_blob_metadata(path))
-    }
-
-    pub(super) fn cache_blocks(&self, path: &str) -> bool {
-        self.whitelist.contains(&FileType::classify(path))
-    }
-
-    pub(super) fn cache_blob_metadata(&self, path: &str) -> bool {
-        path.ends_with(".blob") && self.whitelist.contains(&FileType::BlobMeta)
-    }
-
-    fn range_key(&self, path: &str, range: &std::ops::Range<u64>) -> BlockKey {
-        let mut key =
-            BlockKey::with_namespace(&self.namespace, path, range.end - range.start, range.start);
-        key.exact_range = true;
-        key
-    }
-
-    async fn can_cache_exact_range(&self, key: &BlockKey, payload_len: usize) -> bool {
-        // Enforce a reduced disk budget even when this request bypasses the cache.
-        if let CacheBackend::Disk(disk) = &self.backend {
-            disk.ensure_recovered().await;
-        }
-        if !key.exact_range || payload_len > MAX_EXACT_RANGE_CACHE_ENTRY_SIZE {
-            return false;
-        }
-        match &self.backend {
-            CacheBackend::Memory(memory) => memory.can_store(key, payload_len),
-            CacheBackend::Disk(disk) => disk.can_store(key, payload_len),
-            CacheBackend::External(_) => true,
-        }
+        let file_type = FileType::classify(path);
+        !FileType::is_mutable(path)
+            && (self.whitelist.contains(&file_type)
+                || (file_type == FileType::ParquetData && self.whitelist.contains(&FileType::Data)))
     }
 
     async fn get_block(
@@ -161,7 +132,7 @@ impl LocalCache {
             CacheBackend::Memory(memory) => memory.get_block(key),
             CacheBackend::Disk(disk) => disk.get_block(key).await,
             CacheBackend::External(cache) => {
-                let start = key.offset()?;
+                let start = key.block_index.checked_mul(key.block_size)?;
                 let length = u64::try_from(expected_len).ok()?;
                 let end = start.checked_add(length)?;
                 cache.get(&key.path, start..end).await
@@ -184,7 +155,7 @@ impl LocalCache {
             CacheBackend::Memory(memory) => memory.put_block(key, payload),
             CacheBackend::Disk(disk) => disk.put_block(key, payload).await,
             CacheBackend::External(cache) => {
-                if let Some(offset) = key.offset() {
+                if let Some(offset) = key.block_index.checked_mul(key.block_size) {
                     cache.put(&key.path, offset, payload).await;
                 }
             }
@@ -337,7 +308,7 @@ impl LocalCacheConfig {
         let whitelist = options
             .get(CatalogOptions::LOCAL_CACHE_WHITELIST)
             .map(String::as_str)
-            .unwrap_or("meta,global-index,blob-meta");
+            .unwrap_or("meta,global-index");
 
         Ok(Some(Self {
             dir,
@@ -392,30 +363,6 @@ mod tests {
             .is_none());
     }
 
-    #[tokio::test]
-    async fn test_exact_range_cache_entry_has_a_hard_limit() {
-        let cache = LocalCache::new(LocalCacheConfig {
-            dir: None,
-            namespace: "test".into(),
-            max_size: None,
-            block_size: 1024,
-            whitelist: HashSet::from([FileType::BlobMeta]),
-        })
-        .unwrap();
-        let key = cache.range_key("data.blob", &(0..MAX_EXACT_RANGE_CACHE_ENTRY_SIZE as u64));
-
-        assert!(
-            cache
-                .can_cache_exact_range(&key, MAX_EXACT_RANGE_CACHE_ENTRY_SIZE)
-                .await
-        );
-        assert!(
-            !cache
-                .can_cache_exact_range(&key, MAX_EXACT_RANGE_CACHE_ENTRY_SIZE + 1)
-                .await
-        );
-    }
-
     #[test]
     fn test_local_cache_config_uses_memory_when_enabled_without_directory() {
         let mut options = Options::new();
@@ -428,7 +375,7 @@ mod tests {
         assert_eq!(config.block_size, 1024 * 1024);
         assert_eq!(
             config.whitelist,
-            HashSet::from([FileType::Meta, FileType::GlobalIndex, FileType::BlobMeta])
+            HashSet::from([FileType::Meta, FileType::GlobalIndex])
         );
     }
 
@@ -447,11 +394,7 @@ mod tests {
         assert_eq!(config.block_size, 1024 * 1024);
         assert_eq!(
             config.whitelist,
-            std::collections::HashSet::from([
-                FileType::Meta,
-                FileType::GlobalIndex,
-                FileType::BlobMeta
-            ])
+            std::collections::HashSet::from([FileType::Meta, FileType::GlobalIndex])
         );
     }
 

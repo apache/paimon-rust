@@ -27,15 +27,15 @@ use tokio::io::AsyncWriteExt;
 use super::state::{BlockKey, CacheCoordinator, LogicalPath};
 
 const CACHE_MAGIC: &[u8; 8] = b"PAIMONLC";
-const CACHE_FORMAT_VERSION: u8 = 3;
-const FIXED_HEADER_LEN: usize = CACHE_MAGIC.len() + 2 + 4 + 4 + 8 + 8 + 8;
+const CACHE_FORMAT_VERSION: u8 = 2;
+const FIXED_HEADER_LEN: usize = CACHE_MAGIC.len() + 1 + 4 + 4 + 8 + 8 + 8;
 const CHECKSUM_LEN: usize = 4;
 const MAX_CACHE_KEY_HEADER_LEN: usize = 1024 * 1024;
 
 impl BlockKey {
     pub(super) fn cache_relative_path(&self) -> PathBuf {
         let mut digest = Sha256::new();
-        digest.update([CACHE_FORMAT_VERSION, u8::from(self.exact_range)]);
+        digest.update([CACHE_FORMAT_VERSION]);
         digest.update((self.namespace.len() as u64).to_le_bytes());
         digest.update(self.namespace.as_bytes());
         digest.update((self.path.len() as u64).to_le_bytes());
@@ -60,20 +60,13 @@ impl std::fmt::Display for BlockDecodeError {
 pub(super) struct DiskCache {
     root: PathBuf,
     state: Mutex<CacheState>,
-    mutation: tokio::sync::Mutex<()>,
     recovered: tokio::sync::OnceCell<()>,
     coordinator: Arc<CacheCoordinator>,
 }
 
-// Each publication gets a new identity, even when its key and size are unchanged.
-#[derive(Debug)]
-struct CacheEntry {
-    encoded_size: u64,
-}
-
 #[derive(Debug, Default)]
 struct CacheState {
-    entries: IndexMap<BlockKey, Arc<CacheEntry>>,
+    entries: IndexMap<BlockKey, u64>,
     paths: HashMap<LogicalPath, HashSet<BlockKey>>,
     current_size: u64,
     max_size: Option<u64>,
@@ -114,7 +107,6 @@ impl DiskCache {
                 max_size,
                 ..CacheState::default()
             }),
-            mutation: tokio::sync::Mutex::new(()),
             recovered: tokio::sync::OnceCell::new(),
             coordinator: Arc::new(CacheCoordinator::default()),
         }
@@ -149,8 +141,8 @@ impl DiskCache {
                             .state
                             .lock()
                             .unwrap_or_else(|error| error.into_inner());
-                        for (key, entry) in recovered.entries {
-                            insert_state_entry(&mut state, key, entry.encoded_size);
+                        for (key, encoded_size) in recovered.entries {
+                            insert_state_entry(&mut state, key, encoded_size);
                         }
                     }
                     Err(error) => {
@@ -169,36 +161,16 @@ impl DiskCache {
         self.coordinator.clone()
     }
 
-    pub(super) fn can_store(&self, key: &BlockKey, payload_len: usize) -> bool {
-        let Some(encoded_size) = encoded_block_disk_cost(key, payload_len) else {
-            return false;
-        };
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .max_size
-            .is_none_or(|max_size| encoded_size <= max_size)
-    }
-
     pub(super) async fn get_block(&self, key: &BlockKey) -> Option<Bytes> {
         self.ensure_recovered().await;
-        let entry = self.entry(key)?;
+        if !self.is_active(key) {
+            return None;
+        }
         let path = self.root.join(key.cache_relative_path());
-        self.complete_read(key, &entry, tokio::fs::read(&path).await)
-            .await
-    }
-
-    async fn complete_read(
-        &self,
-        key: &BlockKey,
-        entry: &Arc<CacheEntry>,
-        result: std::io::Result<Vec<u8>>,
-    ) -> Option<Bytes> {
-        let path = self.root.join(key.cache_relative_path());
-        let encoded = match result {
+        let encoded = match tokio::fs::read(&path).await {
             Ok(encoded) => encoded,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.discard_failed_read(key, entry).await;
+                self.forget_entry(key);
                 return None;
             }
             Err(error) => {
@@ -209,47 +181,25 @@ impl DiskCache {
                 return None;
             }
         };
-        match decode_owned_block(key, encoded) {
-            Ok(payload) if self.touch_entry(key, entry) => Some(payload),
+        match decode_block(key, &encoded) {
+            Ok(payload) if self.touch_entry(key) => Some(payload),
             Ok(_) => None,
             Err(error) => {
                 log::debug!(
                     "Discarding invalid local cache block '{}': {error}",
                     path.display()
                 );
-                self.discard_failed_read(key, entry).await;
+                self.forget_entry(key);
+                let _ = tokio::fs::remove_file(path).await;
                 None
             }
         }
     }
 
-    async fn discard_failed_read(&self, key: &BlockKey, observed: &Arc<CacheEntry>) {
-        let retired = {
-            let _mutation = self.mutation.lock().await;
-            {
-                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                if !state
-                    .entries
-                    .get(key)
-                    .is_some_and(|current| Arc::ptr_eq(current, observed))
-                {
-                    return;
-                }
-                remove_state_entry(&mut state, key);
-            }
-            self.retire_cache_files(vec![key.clone()]).await
-        };
-        self.remove_cache_files(retired).await;
-    }
-
     pub(super) async fn put_block(&self, key: &BlockKey, payload: Bytes) {
         self.ensure_recovered().await;
-        let Some(mut encoded_size) = encoded_block_disk_cost(key, payload.len()) else {
-            return;
-        };
-        if key.exact_range && payload.len() > super::MAX_EXACT_RANGE_CACHE_ENTRY_SIZE {
-            return;
-        }
+        let encoded = encode_block(key, &payload);
+        let encoded_size = encoded.len() as u64;
         if self
             .state
             .lock()
@@ -259,9 +209,6 @@ impl DiskCache {
         {
             return;
         }
-        let Some(header) = encode_block_header(key, payload.len()) else {
-            return;
-        };
 
         let path = self.root.join(key.cache_relative_path());
         let Some(parent) = path.parent() else {
@@ -296,14 +243,8 @@ impl DiskCache {
                 return;
             }
         };
-        let mut checksum = crc32fast::Hasher::new();
-        checksum.update(&header);
-        checksum.update(&payload);
-        let checksum = checksum.finalize().to_le_bytes();
         let write_result = async {
-            temporary_file.write_all(&header).await?;
-            temporary_file.write_all(&payload).await?;
-            temporary_file.write_all(&checksum).await?;
+            temporary_file.write_all(&encoded).await?;
             // Tokio may return from write_all before the blocking write completes.
             temporary_file.flush().await
         }
@@ -317,52 +258,16 @@ impl DiskCache {
             let _ = tokio::fs::remove_file(&temporary).await;
             return;
         }
-        if key.exact_range {
-            if let Ok(metadata) = temporary_file.metadata().await {
-                encoded_size = range_disk_cost(&metadata);
-            }
-            if self
-                .state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .max_size
-                .is_some_and(|limit| encoded_size > limit)
-            {
-                drop(temporary_file);
-                let _ = tokio::fs::remove_file(&temporary).await;
-                return;
-            }
-        }
         drop(temporary_file);
-        let retired = {
-            let _mutation = self.mutation.lock().await;
-            if let Err(error) = tokio::fs::rename(&temporary, &path).await {
-                log::debug!(
-                    "Failed to publish local cache block '{}': {error}",
-                    path.display()
-                );
-                let _ = tokio::fs::remove_file(temporary).await;
-                return;
-            }
-
-            let to_evict = {
-                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                if state
-                    .max_size
-                    .is_some_and(|max_size| encoded_size > max_size)
-                {
-                    remove_state_entry(&mut state, key);
-                    let mut to_evict = vec![key.clone()];
-                    to_evict.extend(collect_evictions(&mut state));
-                    to_evict
-                } else {
-                    insert_state_entry(&mut state, key.clone(), encoded_size);
-                    collect_evictions(&mut state)
-                }
-            };
-            self.retire_cache_files(to_evict).await
-        };
-        self.remove_cache_files(retired).await;
+        if let Err(error) = tokio::fs::rename(&temporary, &path).await {
+            log::debug!(
+                "Failed to publish local cache block '{}': {error}",
+                path.display()
+            );
+            let _ = tokio::fs::remove_file(temporary).await;
+            return;
+        }
+        self.record_entry_and_evict(key.clone(), encoded_size).await;
     }
 
     pub(super) async fn invalidate_path(&self, namespace: &str, path: &str) {
@@ -422,50 +327,30 @@ impl DiskCache {
         }
     }
 
-    async fn evict_over_limit(&self) {
-        let retired = {
-            let _mutation = self.mutation.lock().await;
-            let to_evict = {
-                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                collect_evictions(&mut state)
-            };
-            self.retire_cache_files(to_evict).await
+    async fn record_entry_and_evict(&self, key: BlockKey, encoded_size: u64) {
+        let to_evict = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            insert_state_entry(&mut state, key, encoded_size);
+            collect_evictions(&mut state)
         };
-        self.remove_cache_files(retired).await;
+        self.remove_cache_files(to_evict).await;
     }
 
-    async fn retire_cache_files(&self, keys: Vec<BlockKey>) -> Vec<PathBuf> {
-        let mut retired = Vec::with_capacity(keys.len());
+    async fn evict_over_limit(&self) {
+        let to_evict = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            collect_evictions(&mut state)
+        };
+        self.remove_cache_files(to_evict).await;
+    }
+
+    async fn remove_cache_files(&self, keys: Vec<BlockKey>) {
         for key in keys {
             let path = self.root.join(key.cache_relative_path());
-            let Some(parent) = path.parent() else {
-                continue;
-            };
-            let file_name = path
-                .file_name()
-                .map(|name| name.to_string_lossy())
-                .unwrap_or_default();
-            let retired_path = parent.join(format!(".{file_name}.tmp.{}", uuid::Uuid::new_v4()));
-            match tokio::fs::rename(&path, &retired_path).await {
-                Ok(()) => retired.push(retired_path),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    log::debug!(
-                        "Failed to retire local cache block '{}': {error}",
-                        path.display()
-                    );
-                }
-            }
-        }
-        retired
-    }
-
-    async fn remove_cache_files(&self, paths: Vec<PathBuf>) {
-        for path in paths {
             if let Err(error) = tokio::fs::remove_file(&path).await {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     log::debug!(
-                        "Failed to remove retired local cache block '{}': {error}",
+                        "Failed to evict local cache block '{}': {error}",
                         path.display()
                     );
                 }
@@ -473,31 +358,20 @@ impl DiskCache {
         }
     }
 
-    fn entry(&self, key: &BlockKey) -> Option<Arc<CacheEntry>> {
+    fn is_active(&self, key: &BlockKey) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .entries
-            .get(key)
-            .cloned()
+            .contains_key(key)
     }
 
-    #[cfg(test)]
-    fn is_active(&self, key: &BlockKey) -> bool {
-        self.entry(key).is_some()
-    }
-
-    fn touch_entry(&self, key: &BlockKey, observed: &Arc<CacheEntry>) -> bool {
+    fn touch_entry(&self, key: &BlockKey) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if !state
-            .entries
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, observed))
-        {
+        let Some(encoded_size) = state.entries.shift_remove(key) else {
             return false;
-        }
-        let entry = state.entries.shift_remove(key).unwrap();
-        state.entries.insert(key.clone(), entry);
+        };
+        state.entries.insert(key.clone(), encoded_size);
         true
     }
 
@@ -524,16 +398,12 @@ fn prepare_cache_root(root: &Path) -> crate::Result<PathBuf> {
 
 fn collect_evictions(state: &mut CacheState) -> Vec<BlockKey> {
     let mut to_evict = Vec::new();
-    {
-        while state.entries.len() > super::MAX_CACHE_ENTRIES
-            || state
-                .max_size
-                .is_some_and(|limit| state.current_size > limit)
-        {
+    if let Some(max_size) = state.max_size {
+        while state.current_size > max_size {
             let Some((eldest, size)) = state.entries.shift_remove_index(0) else {
                 break;
             };
-            state.current_size = state.current_size.saturating_sub(size.encoded_size);
+            state.current_size = state.current_size.saturating_sub(size);
             remove_path_index_entry(state, &eldest);
             to_evict.push(eldest);
         }
@@ -556,24 +426,20 @@ fn logical_path_matches_prefix(path: &LogicalPath, namespace: &str, prefix: &str
 
 fn insert_state_entry(state: &mut CacheState, key: BlockKey, encoded_size: u64) {
     if let Some(previous_size) = state.entries.shift_remove(&key) {
-        state.current_size = state
-            .current_size
-            .saturating_sub(previous_size.encoded_size);
+        state.current_size = state.current_size.saturating_sub(previous_size);
     }
     state
         .paths
         .entry(logical_path(&key))
         .or_default()
         .insert(key.clone());
-    state
-        .entries
-        .insert(key, Arc::new(CacheEntry { encoded_size }));
+    state.entries.insert(key, encoded_size);
     state.current_size = state.current_size.saturating_add(encoded_size);
 }
 
 fn remove_state_entry(state: &mut CacheState, key: &BlockKey) {
     if let Some(encoded_size) = state.entries.shift_remove(key) {
-        state.current_size = state.current_size.saturating_sub(encoded_size.encoded_size);
+        state.current_size = state.current_size.saturating_sub(encoded_size);
         remove_path_index_entry(state, key);
     }
 }
@@ -728,34 +594,14 @@ fn collect_cache_file(
             return;
         }
     };
-    let cost = if key.exact_range {
-        range_disk_cost(&metadata)
-    } else {
-        metadata.len()
-    };
     discovered.push((
         metadata
             .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
         path,
         key,
-        cost,
+        metadata.len(),
     ));
-}
-
-fn range_disk_cost(metadata: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata
-            .len()
-            .max(metadata.blocks().saturating_mul(512))
-            .max(4096)
-    }
-    #[cfg(not(unix))]
-    {
-        metadata.len().saturating_add(4095) / 4096 * 4096
-    }
 }
 
 fn read_block_key_header(path: &Path, encoded_len: u64) -> Result<BlockKey, BlockDecodeError> {
@@ -794,81 +640,37 @@ fn is_cache_temporary_name(name: &str, shard: &str) -> bool {
     is_cache_block_name(digest, shard) && uuid::Uuid::parse_str(suffix).is_ok()
 }
 
-fn encoded_block_len(key: &BlockKey, payload_len: usize) -> Option<usize> {
-    let key_len = key.namespace.len().checked_add(key.path.len())?;
-    if key_len > MAX_CACHE_KEY_HEADER_LEN
-        || u32::try_from(key.namespace.len()).is_err()
-        || u32::try_from(key.path.len()).is_err()
-    {
-        return None;
-    }
-    FIXED_HEADER_LEN
-        .checked_add(key_len)?
-        .checked_add(payload_len)?
-        .checked_add(CHECKSUM_LEN)
-}
-
-fn encoded_block_disk_cost(key: &BlockKey, payload_len: usize) -> Option<u64> {
-    let encoded_len = u64::try_from(encoded_block_len(key, payload_len)?).ok()?;
-    if key.exact_range {
-        encoded_len
-            .checked_add(4095)
-            .map(|length| length / 4096 * 4096)
-    } else {
-        Some(encoded_len)
-    }
-}
-
-fn encode_block_header(key: &BlockKey, payload_len: usize) -> Option<Vec<u8>> {
+fn encode_block(key: &BlockKey, payload: &Bytes) -> Vec<u8> {
     let namespace = key.namespace.as_bytes();
     let path = key.path.as_bytes();
-    let encoded_len = encoded_block_len(key, payload_len)?;
-    let header_len = FIXED_HEADER_LEN
-        .checked_add(namespace.len())?
-        .checked_add(path.len())?;
-    let mut header = Vec::with_capacity(header_len);
-    header.extend_from_slice(CACHE_MAGIC);
-    header.push(CACHE_FORMAT_VERSION);
-    header.push(u8::from(key.exact_range));
-    header.extend_from_slice(&u32::try_from(namespace.len()).ok()?.to_le_bytes());
-    header.extend_from_slice(&u32::try_from(path.len()).ok()?.to_le_bytes());
-    header.extend_from_slice(&key.block_size.to_le_bytes());
-    header.extend_from_slice(&key.block_index.to_le_bytes());
-    header.extend_from_slice(&u64::try_from(payload_len).ok()?.to_le_bytes());
-    header.extend_from_slice(namespace);
-    header.extend_from_slice(path);
-    debug_assert_eq!(encoded_len, header.len() + payload_len + CHECKSUM_LEN);
-    Some(header)
-}
-
-#[cfg(test)]
-fn encode_block(key: &BlockKey, payload: &Bytes) -> Vec<u8> {
-    let mut encoded = encode_block_header(key, payload.len()).unwrap();
+    let mut encoded = Vec::with_capacity(
+        FIXED_HEADER_LEN + namespace.len() + path.len() + payload.len() + CHECKSUM_LEN,
+    );
+    encoded.extend_from_slice(CACHE_MAGIC);
+    encoded.push(CACHE_FORMAT_VERSION);
+    encoded.extend_from_slice(&(namespace.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(&key.block_size.to_le_bytes());
+    encoded.extend_from_slice(&key.block_index.to_le_bytes());
+    encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(namespace);
+    encoded.extend_from_slice(path);
     encoded.extend_from_slice(payload);
     let checksum = crc32fast::hash(&encoded);
     encoded.extend_from_slice(&checksum.to_le_bytes());
     encoded
 }
 
-#[cfg(test)]
 fn decode_block(key: &BlockKey, encoded: &[u8]) -> Result<Bytes, BlockDecodeError> {
-    decode_bytes_block(key, Bytes::copy_from_slice(encoded))
-}
-
-fn decode_owned_block(key: &BlockKey, encoded: Vec<u8>) -> Result<Bytes, BlockDecodeError> {
-    decode_bytes_block(key, Bytes::from(encoded))
-}
-
-fn decode_bytes_block(key: &BlockKey, encoded: Bytes) -> Result<Bytes, BlockDecodeError> {
-    let (decoded_key, payload) = decode_bytes_block_any(encoded)?;
+    let (decoded_key, payload) = decode_block_any(encoded)?;
     if &decoded_key != key {
         return Err(BlockDecodeError("cache block key does not match"));
     }
     Ok(payload)
 }
 
-fn decode_bytes_block_any(encoded: Bytes) -> Result<(BlockKey, Bytes), BlockDecodeError> {
-    let (key, layout) = decode_block_header(&encoded, encoded.len() as u64)?;
+fn decode_block_any(encoded: &[u8]) -> Result<(BlockKey, Bytes), BlockDecodeError> {
+    let (key, layout) = decode_block_header(encoded, encoded.len() as u64)?;
     let payload_len = usize::try_from(layout.payload_len)
         .map_err(|_| BlockDecodeError("cache block payload is too large"))?;
     let payload_end = layout
@@ -884,12 +686,14 @@ fn decode_bytes_block_any(encoded: Bytes) -> Result<(BlockKey, Bytes), BlockDeco
         return Err(BlockDecodeError("cache block checksum does not match"));
     }
 
-    Ok((key, encoded.slice(layout.header_len..payload_end)))
+    Ok((
+        key,
+        Bytes::copy_from_slice(&encoded[layout.header_len..payload_end]),
+    ))
 }
 
 #[derive(Clone, Copy, Debug)]
 struct BlockLayout {
-    exact_range: bool,
     namespace_len: usize,
     path_len: usize,
     block_size: u64,
@@ -912,12 +716,7 @@ fn decode_block_layout(
         return Err(BlockDecodeError("cache block version is unsupported"));
     }
 
-    let exact_range = match fixed_header[CACHE_MAGIC.len() + 1] {
-        0 => false,
-        1 => true,
-        _ => return Err(BlockDecodeError("invalid cache range kind")),
-    };
-    let mut offset = CACHE_MAGIC.len() + 2;
+    let mut offset = CACHE_MAGIC.len() + 1;
     let namespace_len = read_u32(fixed_header, &mut offset)? as usize;
     let path_len = read_u32(fixed_header, &mut offset)? as usize;
     let block_size = read_u64(fixed_header, &mut offset)?;
@@ -946,7 +745,6 @@ fn decode_block_layout(
     }
 
     Ok(BlockLayout {
-        exact_range,
         namespace_len,
         path_len,
         block_size,
@@ -973,9 +771,10 @@ fn decode_block_header(
     let path = std::str::from_utf8(&header[namespace_end..path_end])
         .map_err(|_| BlockDecodeError("cache block path is not UTF-8"))?;
 
-    let mut key = BlockKey::with_namespace(namespace, path, layout.block_size, layout.block_index);
-    key.exact_range = layout.exact_range;
-    Ok((key, layout))
+    Ok((
+        BlockKey::with_namespace(namespace, path, layout.block_size, layout.block_index),
+        layout,
+    ))
 }
 
 fn read_u32(encoded: &[u8], offset: &mut usize) -> Result<u32, BlockDecodeError> {
@@ -1005,36 +804,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn test_metadata_ranges_charge_disk_allocation_and_recover() {
-        let directory = tempfile::tempdir().unwrap();
-        let cache = DiskCache::new(directory.path(), Some(8192)).unwrap();
-        let manifest = BlockKey::new("manifest", 8, 0);
-        cache
-            .put_block(&manifest, Bytes::from_static(b"manifest"))
-            .await;
-        let mut key = BlockKey::new("data.blob", 16384, 0);
-        key.exact_range = true;
-        cache.put_block(&key, Bytes::from(vec![0; 16384])).await;
-        assert!(cache.get_block(&manifest).await.is_some());
-        key.block_size = 1;
-        for offset in 0..100 {
-            key.block_index = offset;
-            cache.put_block(&key, Bytes::from_static(b"x")).await;
-        }
-        {
-            let state = cache.state.lock().unwrap();
-            assert!(state.current_size <= 8192);
-            assert!(state.entries.len() <= 2);
-        }
-        drop(cache);
-        let cache = DiskCache::new(directory.path(), Some(8192)).unwrap();
-        assert_eq!(cache.get_block(&key).await.unwrap(), b"x"[..]);
-        let state = cache.state.lock().unwrap();
-        assert!(state.current_size <= 8192);
-        assert!(state.entries.len() <= 2);
-    }
-
     #[test]
     fn test_disk_block_codec_round_trip() {
         let key = BlockKey::new("s3://bucket/table/snapshot/snapshot-1", 1024, 3);
@@ -1044,14 +813,6 @@ mod tests {
         let decoded = decode_block(&key, &encoded).unwrap();
 
         assert_eq!(decoded, payload);
-    }
-
-    #[test]
-    fn test_disk_block_size_preflight_rejects_overflow() {
-        let mut key = BlockKey::new("data.blob", 1, 0);
-        key.exact_range = true;
-
-        assert_eq!(encoded_block_disk_cost(&key, usize::MAX), None);
     }
 
     #[test]
@@ -1229,79 +990,6 @@ mod tests {
 
         assert_eq!(cache.get_block(&first).await, None);
         assert_eq!(cache.get_block(&second).await, Some(payload));
-    }
-
-    #[tokio::test]
-    async fn test_stale_failed_reads_preserve_republished_block() {
-        for corrupt in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let key = BlockKey::new("data.blob", 4, 0);
-            let cache = DiskCache::new(directory.path(), None).unwrap();
-            cache.put_block(&key, Bytes::from_static(b"old")).await;
-            let observed = cache.entry(&key).unwrap();
-            let path = directory.path().join(key.cache_relative_path());
-            // Pause A after the filesystem read but before failure cleanup.
-            if corrupt {
-                tokio::fs::write(&path, b"corrupt").await.unwrap();
-            } else {
-                let _mutation = cache.mutation.lock().await;
-                cache.forget_entry(&key);
-                let retired = cache.retire_cache_files(vec![key.clone()]).await;
-                cache.remove_cache_files(retired).await;
-            }
-            let old_result = tokio::fs::read(&path).await;
-            if corrupt {
-                assert!(decode_owned_block(&key, old_result.as_ref().unwrap().clone()).is_err());
-            } else {
-                assert_eq!(
-                    old_result.as_ref().unwrap_err().kind(),
-                    std::io::ErrorKind::NotFound
-                );
-            }
-            // B republishes the same key and same payload length before A resumes.
-            cache.put_block(&key, Bytes::from_static(b"new")).await;
-            assert!(cache
-                .complete_read(&key, &observed, old_result)
-                .await
-                .is_none());
-            assert_eq!(
-                cache.get_block(&key).await,
-                Some(Bytes::from_static(b"new"))
-            );
-            assert!(path.exists());
-            let state = cache.state.lock().unwrap();
-            assert_eq!(state.entries.len(), 1);
-            assert_eq!(state.current_size, state.entries[&key].encoded_size);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_disk_cache_eviction_does_not_delete_republished_block() {
-        let directory = tempfile::tempdir().unwrap();
-        let key = BlockKey::new("s3://bucket/table/data/data.blob", 4, 0);
-        let cache = DiskCache::new(directory.path(), None).unwrap();
-        cache.put_block(&key, Bytes::from_static(b"old")).await;
-
-        let retired = {
-            let _mutation = cache.mutation.lock().await;
-            let to_evict = {
-                let mut state = cache
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                remove_state_entry(&mut state, &key);
-                vec![key.clone()]
-            };
-            cache.retire_cache_files(to_evict).await
-        };
-
-        cache.put_block(&key, Bytes::from_static(b"new")).await;
-        cache.remove_cache_files(retired).await;
-
-        assert_eq!(
-            cache.get_block(&key).await,
-            Some(Bytes::from_static(b"new"))
-        );
     }
 
     #[tokio::test]

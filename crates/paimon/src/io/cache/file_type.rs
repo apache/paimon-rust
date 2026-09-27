@@ -21,10 +21,10 @@ use std::collections::HashSet;
 pub(super) enum FileType {
     Meta,
     Data,
+    ParquetData,
     BucketIndex,
     GlobalIndex,
     FileIndex,
-    BlobMeta,
 }
 
 impl FileType {
@@ -54,7 +54,11 @@ impl FileType {
             return Self::BucketIndex;
         }
 
-        Self::Data
+        if name.ends_with(".parquet") {
+            Self::ParquetData
+        } else {
+            Self::Data
+        }
     }
 
     pub(super) fn is_mutable(path: &str) -> bool {
@@ -76,13 +80,13 @@ impl FileType {
                 "global-index" => Some(Self::GlobalIndex),
                 "bucket-index" => Some(Self::BucketIndex),
                 "data" => Some(Self::Data),
+                "parquet-data" => Some(Self::ParquetData),
                 "file-index" => Some(Self::FileIndex),
-                "blob-meta" => Some(Self::BlobMeta),
                 "" => None,
                 unknown => {
                     log::warn!(
                         "Unknown local-cache.whitelist value '{}'; supported values are \
-                         meta, global-index, bucket-index, data, file-index, blob-meta",
+                         meta, global-index, bucket-index, data, parquet-data, file-index",
                         unknown
                     );
                     None
@@ -121,7 +125,7 @@ mod tests {
             ),
             (
                 "s3://bucket/table/bucket-0/data-abc.parquet",
-                FileType::Data,
+                FileType::ParquetData,
             ),
         ];
 

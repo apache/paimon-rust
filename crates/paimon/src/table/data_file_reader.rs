@@ -101,13 +101,6 @@ struct TimedFileRead {
 
 #[async_trait::async_trait]
 impl FileRead for TimedFileRead {
-    async fn read_blob_metadata(&self, range: Range<u64>) -> crate::Result<bytes::Bytes> {
-        let start = Instant::now();
-        let result = self.inner.read_blob_metadata(range).await;
-        self.timing.add_file_read(start.elapsed());
-        result
-    }
-
     async fn read(&self, range: Range<u64>) -> crate::Result<bytes::Bytes> {
         let start = Instant::now();
         let result = self.inner.read(range).await;
@@ -612,9 +605,7 @@ impl DataFileReader {
             let schema_open_start = read_timing.as_ref().map(|_| Instant::now());
             let input_file = file_io.new_input(&path_to_read)?;
             let open_start = read_timing.as_ref().map(|_| Instant::now());
-            let file_reader = input_file
-                .reader_with_file_size(file_meta.file_size as u64)
-                .await?;
+            let file_reader = input_file.reader().await?;
             if let (Some(timing), Some(start)) = (read_timing.as_ref(), open_start) {
                 timing.add_file_read(start.elapsed());
             }
@@ -912,9 +903,7 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let input_file = file_io.new_input(&path_to_read)?;
-            let file_reader = input_file
-                .reader_with_file_size(file_meta.file_size as u64)
-                .await?;
+            let file_reader = input_file.reader().await?;
 
             let mut batch_stream = format_reader
                 .read_batch_stream(

@@ -107,7 +107,7 @@ impl FileIO {
     /// `block_size` controls the aligned ranges presented to the cache.
     /// `whitelist` uses the same comma-separated values as
     /// `local-cache.whitelist`: `meta`, `global-index`, `bucket-index`, `data`,
-    /// `file-index`, and `blob-meta` (exact BLOB metadata ranges).
+    /// and `file-index`.
     pub fn with_file_block_cache(
         mut self,
         cache: Arc<dyn FileBlockCache>,
@@ -688,11 +688,6 @@ impl FileIOBuilder {
 
 #[async_trait::async_trait]
 pub trait FileRead: Send + Sync + Unpin + 'static {
-    /// Read BLOB metadata, allowing caches to retain only the requested range.
-    async fn read_blob_metadata(&self, range: Range<u64>) -> crate::Result<Bytes> {
-        self.read(range).await
-    }
-
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 }
 
@@ -710,13 +705,6 @@ enum InputFileReader {
 
 #[async_trait::async_trait]
 impl FileRead for InputFileReader {
-    async fn read_blob_metadata(&self, range: Range<u64>) -> crate::Result<Bytes> {
-        match self {
-            Self::Direct(reader) => reader.read_blob_metadata(range).await,
-            Self::Cached(reader) => reader.read_blob_metadata(range).await,
-        }
-    }
-
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         match self {
             Self::Direct(reader) => FileRead::read(reader, range).await,
@@ -891,9 +879,6 @@ impl InputFile {
         let Some(cache) = &self.cache else {
             return Ok(op.read(&relative_path).await?.to_bytes());
         };
-        if !cache.cache_blocks(&self.path) {
-            return Ok(op.read(&relative_path).await?.to_bytes());
-        }
         let read_token = cache.read_token(&cache_path);
         let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
             size
@@ -903,51 +888,24 @@ impl InputFile {
             size
         };
         let delegate = Arc::new(op.reader(&relative_path).await?);
-        CachedFileReader::new_with_token(
-            delegate,
-            &cache_path,
-            Some(size),
-            cache.clone(),
-            read_token,
-        )
-        .read_full()
-        .await
+        CachedFileReader::new_with_token(delegate, &cache_path, size, cache.clone(), read_token)
+            .read_full()
+            .await
     }
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
-        self.reader_with_known_size(None).await
-    }
-
-    pub(crate) async fn reader_with_file_size(
-        &self,
-        file_size: u64,
-    ) -> crate::Result<impl FileRead> {
-        self.reader_with_known_size(Some(file_size)).await
-    }
-
-    async fn reader_with_known_size(
-        &self,
-        known_size: Option<u64>,
-    ) -> crate::Result<InputFileReader> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let reader = op.reader(&relative_path).await?;
         let Some(cache) = &self.cache else {
             return Ok(InputFileReader::Direct(reader));
         };
         let read_token = cache.read_token(&cache_path);
-        // Classify the logical path, never the opaque cache identity. Exact metadata
-        // ranges do not need the file size; body reads must not trigger a stat.
-        let size = if !cache.cache_blocks(&self.path) {
-            None
-        } else if let Some(size) = known_size {
-            cache.put_file_size(&cache_path, size, &read_token).await;
-            Some(size)
-        } else if let Some(size) = cache.file_size(&cache_path, &read_token).await {
-            Some(size)
+        let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
+            size
         } else {
             let size = op.stat(&relative_path).await?.content_length();
             cache.put_file_size(&cache_path, size, &read_token).await;
-            Some(size)
+            size
         };
         Ok(InputFileReader::Cached(CachedFileReader::new_with_token(
             Arc::new(reader),
@@ -1668,103 +1626,64 @@ mod input_output_test {
     }
 
     #[tokio::test]
-    async fn test_blob_metadata_default_file_io_cache_does_not_cache_body() {
-        let source = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-        let path = source.path().join("data.blob");
-        std::fs::write(&path, b"metabody").unwrap();
-        let location = path.to_str().unwrap();
-        let file_io = setup_cached_fs_file_io(cache_dir.path());
-        let input = file_io.new_input(location).unwrap();
-        let reader = input.reader().await.unwrap();
-        assert_eq!(reader.read_blob_metadata(0..4).await.unwrap(), b"meta"[..]);
-        assert_eq!(reader.read(4..8).await.unwrap(), b"body"[..]);
-        drop(reader);
-        std::fs::remove_file(&path).unwrap();
-        let reader = input.reader().await.unwrap();
-        assert_eq!(reader.read_blob_metadata(0..4).await.unwrap(), b"meta"[..]);
-        assert!(reader.read(4..8).await.is_err());
-        assert!(input.read().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_blob_metadata_reader_needs_no_stat() {
-        let source = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-        let path = source.path().join("data.blob");
-        let input = setup_cached_fs_file_io(cache_dir.path())
-            .new_input(path.to_str().unwrap())
-            .unwrap();
-        // Opening the reader must succeed even when a source stat would fail.
-        assert!(input.metadata().await.is_err());
-        let reader = input.reader().await.unwrap();
-        std::fs::write(&path, b"metabody").unwrap();
-        assert_eq!(reader.read(4..8).await.unwrap(), b"body"[..]);
-        assert_eq!(reader.read_blob_metadata(0..4).await.unwrap(), b"meta"[..]);
-        drop(reader);
-        std::fs::remove_file(&path).unwrap();
-        let reader = input.reader().await.unwrap();
-        assert_eq!(reader.read_blob_metadata(0..4).await.unwrap(), b"meta"[..]);
-        assert!(reader.read(4..8).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_root_metadata_range_cache_uses_logical_path() {
+    async fn test_parquet_only_cache_and_data_compatibility() {
         for disk in [false, true] {
-            let directory = tempfile::tempdir().unwrap();
-            let mut options = Options::new();
-            options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
-            if disk {
-                options.set(
-                    CatalogOptions::LOCAL_CACHE_DIR,
-                    directory.path().to_string_lossy(),
+            for whitelist in ["meta,global-index", "parquet-data", "data"] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut options = Options::new();
+                options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+                options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, whitelist);
+                options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
+                if disk {
+                    options.set(
+                        CatalogOptions::LOCAL_CACHE_DIR,
+                        directory.path().to_string_lossy(),
+                    );
+                }
+                let cache = Arc::new(
+                    LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap())
+                        .unwrap(),
                 );
-            }
-            options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
-            let cache = Arc::new(
-                LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap())
-                    .unwrap(),
-            );
-            let file_io = FileIOBuilder::new("memory")
-                .with_local_cache(cache)
-                .build()
-                .unwrap();
-            for path in [
-                "memory:/snapshot-1",
-                "memory:/schema-1",
-                "memory:/snapshot/snapshot-1",
-            ] {
-                file_io
-                    .new_output(path)
-                    .unwrap()
-                    .write(Bytes::from_static(b"metadata"))
-                    .await
+                let file_io = FileIOBuilder::new("memory")
+                    .with_local_cache(cache)
+                    .build()
                     .unwrap();
-                let input = file_io.new_input(path).unwrap();
-                let reader = input.reader().await.unwrap();
-                assert_eq!(reader.read(1..7).await.unwrap(), b"etadat"[..]);
-                // Delete the source directly, without invalidating the cache.
-                let (op, relative_path, _) = input.source.resolve(path).await.unwrap();
-                op.delete(&relative_path).await.unwrap();
-                let reader = input.reader().await.unwrap();
-                assert_eq!(reader.read(1..7).await.unwrap(), b"etadat"[..], "{path}");
+                for name in [
+                    "data.parquet",
+                    "data.blob",
+                    "data.orc",
+                    "data.parquet.index",
+                    "snapshot-1",
+                ] {
+                    let path = format!("memory:/{name}");
+                    file_io
+                        .new_output(&path)
+                        .unwrap()
+                        .write(Bytes::from_static(b"abcdefgh"))
+                        .await
+                        .unwrap();
+                    let input = file_io.new_input(&path).unwrap();
+                    let reader = input.reader().await.unwrap();
+                    assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
+                    drop(reader);
+                    let (op, relative_path, _) = input.source.resolve(&path).await.unwrap();
+                    op.delete(&relative_path).await.unwrap();
+                    let cached = match whitelist {
+                        "parquet-data" => name.ends_with(".parquet"),
+                        "data" => name.starts_with("data.") && !name.ends_with(".index"),
+                        _ => name == "snapshot-1",
+                    };
+                    let result = input.read().await;
+                    if cached {
+                        assert_eq!(result.unwrap(), b"abcdefgh"[..], "{whitelist}: {name}");
+                        let reader = input.reader().await.unwrap();
+                        assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
+                    } else {
+                        assert!(result.is_err(), "{whitelist}: {name}");
+                    }
+                }
             }
         }
-    }
-
-    #[tokio::test]
-    async fn test_reader_with_file_size_skips_source_stat() {
-        let source = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
-        let path = source.path().join("snapshot-1");
-        // Use a logical path so metadata classification is identical on Windows.
-        let location = path.to_string_lossy().replace('\\', "/");
-        let input = setup_cached_fs_file_io(cache_dir.path())
-            .new_input(&location)
-            .unwrap();
-
-        assert!(input.reader().await.is_err());
-        assert!(input.reader_with_file_size(42).await.is_ok());
     }
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
