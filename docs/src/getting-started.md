@@ -330,7 +330,8 @@ let catalog = CatalogFactory::create(options).await?;
 without caching value bodies. Metadata ranges share the cache budget, with estimated memory
 overhead (at least 512 bytes) or disk allocation (at least 4 KiB) charged per entry. Built-in
 caches hold at most 65,536 entries and skip entries larger than the budget. `data` still enables
-ordinary block caching. This caches bytes used to build descriptors, not decoded descriptors.
+ordinary block caching. Exact metadata entries over 64 MiB bypass the cache. This caches bytes
+used to build descriptors, not decoded descriptors.
 
 Each catalog owns its in-memory cache for the catalog's lifetime. Disk caches
 are reused after process restarts. Cache keys include a catalog-configuration
