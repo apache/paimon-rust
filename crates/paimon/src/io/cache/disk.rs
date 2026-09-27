@@ -65,9 +65,15 @@ pub(super) struct DiskCache {
     coordinator: Arc<CacheCoordinator>,
 }
 
+// Each publication gets a new identity, even when its key and size are unchanged.
+#[derive(Debug)]
+struct CacheEntry {
+    encoded_size: u64,
+}
+
 #[derive(Debug, Default)]
 struct CacheState {
-    entries: IndexMap<BlockKey, u64>,
+    entries: IndexMap<BlockKey, Arc<CacheEntry>>,
     paths: HashMap<LogicalPath, HashSet<BlockKey>>,
     current_size: u64,
     max_size: Option<u64>,
@@ -143,8 +149,8 @@ impl DiskCache {
                             .state
                             .lock()
                             .unwrap_or_else(|error| error.into_inner());
-                        for (key, encoded_size) in recovered.entries {
-                            insert_state_entry(&mut state, key, encoded_size);
+                        for (key, entry) in recovered.entries {
+                            insert_state_entry(&mut state, key, entry.encoded_size);
                         }
                     }
                     Err(error) => {
@@ -176,14 +182,23 @@ impl DiskCache {
 
     pub(super) async fn get_block(&self, key: &BlockKey) -> Option<Bytes> {
         self.ensure_recovered().await;
-        if !self.is_active(key) {
-            return None;
-        }
+        let entry = self.entry(key)?;
         let path = self.root.join(key.cache_relative_path());
-        let encoded = match tokio::fs::read(&path).await {
+        self.complete_read(key, &entry, tokio::fs::read(&path).await)
+            .await
+    }
+
+    async fn complete_read(
+        &self,
+        key: &BlockKey,
+        entry: &Arc<CacheEntry>,
+        result: std::io::Result<Vec<u8>>,
+    ) -> Option<Bytes> {
+        let path = self.root.join(key.cache_relative_path());
+        let encoded = match result {
             Ok(encoded) => encoded,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.forget_entry(key);
+                self.discard_failed_read(key, entry).await;
                 return None;
             }
             Err(error) => {
@@ -195,18 +210,36 @@ impl DiskCache {
             }
         };
         match decode_owned_block(key, encoded) {
-            Ok(payload) if self.touch_entry(key) => Some(payload),
+            Ok(payload) if self.touch_entry(key, entry) => Some(payload),
             Ok(_) => None,
             Err(error) => {
                 log::debug!(
                     "Discarding invalid local cache block '{}': {error}",
                     path.display()
                 );
-                self.forget_entry(key);
-                let _ = tokio::fs::remove_file(path).await;
+                self.discard_failed_read(key, entry).await;
                 None
             }
         }
+    }
+
+    async fn discard_failed_read(&self, key: &BlockKey, observed: &Arc<CacheEntry>) {
+        let retired = {
+            let _mutation = self.mutation.lock().await;
+            {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                if !state
+                    .entries
+                    .get(key)
+                    .is_some_and(|current| Arc::ptr_eq(current, observed))
+                {
+                    return;
+                }
+                remove_state_entry(&mut state, key);
+            }
+            self.retire_cache_files(vec![key.clone()]).await
+        };
+        self.remove_cache_files(retired).await;
     }
 
     pub(super) async fn put_block(&self, key: &BlockKey, payload: Bytes) {
@@ -440,20 +473,31 @@ impl DiskCache {
         }
     }
 
-    fn is_active(&self, key: &BlockKey) -> bool {
+    fn entry(&self, key: &BlockKey) -> Option<Arc<CacheEntry>> {
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .entries
-            .contains_key(key)
+            .get(key)
+            .cloned()
     }
 
-    fn touch_entry(&self, key: &BlockKey) -> bool {
+    #[cfg(test)]
+    fn is_active(&self, key: &BlockKey) -> bool {
+        self.entry(key).is_some()
+    }
+
+    fn touch_entry(&self, key: &BlockKey, observed: &Arc<CacheEntry>) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let Some(encoded_size) = state.entries.shift_remove(key) else {
+        if !state
+            .entries
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, observed))
+        {
             return false;
-        };
-        state.entries.insert(key.clone(), encoded_size);
+        }
+        let entry = state.entries.shift_remove(key).unwrap();
+        state.entries.insert(key.clone(), entry);
         true
     }
 
@@ -489,7 +533,7 @@ fn collect_evictions(state: &mut CacheState) -> Vec<BlockKey> {
             let Some((eldest, size)) = state.entries.shift_remove_index(0) else {
                 break;
             };
-            state.current_size = state.current_size.saturating_sub(size);
+            state.current_size = state.current_size.saturating_sub(size.encoded_size);
             remove_path_index_entry(state, &eldest);
             to_evict.push(eldest);
         }
@@ -512,20 +556,24 @@ fn logical_path_matches_prefix(path: &LogicalPath, namespace: &str, prefix: &str
 
 fn insert_state_entry(state: &mut CacheState, key: BlockKey, encoded_size: u64) {
     if let Some(previous_size) = state.entries.shift_remove(&key) {
-        state.current_size = state.current_size.saturating_sub(previous_size);
+        state.current_size = state
+            .current_size
+            .saturating_sub(previous_size.encoded_size);
     }
     state
         .paths
         .entry(logical_path(&key))
         .or_default()
         .insert(key.clone());
-    state.entries.insert(key, encoded_size);
+    state
+        .entries
+        .insert(key, Arc::new(CacheEntry { encoded_size }));
     state.current_size = state.current_size.saturating_add(encoded_size);
 }
 
 fn remove_state_entry(state: &mut CacheState, key: &BlockKey) {
     if let Some(encoded_size) = state.entries.shift_remove(key) {
-        state.current_size = state.current_size.saturating_sub(encoded_size);
+        state.current_size = state.current_size.saturating_sub(encoded_size.encoded_size);
         remove_path_index_entry(state, key);
     }
 }
@@ -1181,6 +1229,50 @@ mod tests {
 
         assert_eq!(cache.get_block(&first).await, None);
         assert_eq!(cache.get_block(&second).await, Some(payload));
+    }
+
+    #[tokio::test]
+    async fn test_stale_failed_reads_preserve_republished_block() {
+        for corrupt in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let key = BlockKey::new("data.blob", 4, 0);
+            let cache = DiskCache::new(directory.path(), None).unwrap();
+            cache.put_block(&key, Bytes::from_static(b"old")).await;
+            let observed = cache.entry(&key).unwrap();
+            let path = directory.path().join(key.cache_relative_path());
+            // Pause A after the filesystem read but before failure cleanup.
+            if corrupt {
+                tokio::fs::write(&path, b"corrupt").await.unwrap();
+            } else {
+                let _mutation = cache.mutation.lock().await;
+                cache.forget_entry(&key);
+                let retired = cache.retire_cache_files(vec![key.clone()]).await;
+                cache.remove_cache_files(retired).await;
+            }
+            let old_result = tokio::fs::read(&path).await;
+            if corrupt {
+                assert!(decode_owned_block(&key, old_result.as_ref().unwrap().clone()).is_err());
+            } else {
+                assert_eq!(
+                    old_result.as_ref().unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            }
+            // B republishes the same key and same payload length before A resumes.
+            cache.put_block(&key, Bytes::from_static(b"new")).await;
+            assert!(cache
+                .complete_read(&key, &observed, old_result)
+                .await
+                .is_none());
+            assert_eq!(
+                cache.get_block(&key).await,
+                Some(Bytes::from_static(b"new"))
+            );
+            assert!(path.exists());
+            let state = cache.state.lock().unwrap();
+            assert_eq!(state.entries.len(), 1);
+            assert_eq!(state.current_size, state.entries[&key].encoded_size);
+        }
     }
 
     #[tokio::test]
