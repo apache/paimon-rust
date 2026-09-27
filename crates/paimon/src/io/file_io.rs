@@ -903,9 +903,15 @@ impl InputFile {
             size
         };
         let delegate = Arc::new(op.reader(&relative_path).await?);
-        CachedFileReader::new_with_token(delegate, &cache_path, size, cache.clone(), read_token)
-            .read_full()
-            .await
+        CachedFileReader::new_with_token(
+            delegate,
+            &cache_path,
+            Some(size),
+            cache.clone(),
+            read_token,
+        )
+        .read_full()
+        .await
     }
 
     pub async fn reader(&self) -> crate::Result<impl FileRead> {
@@ -929,15 +935,19 @@ impl InputFile {
             return Ok(InputFileReader::Direct(reader));
         };
         let read_token = cache.read_token(&cache_path);
-        let size = if let Some(size) = known_size {
+        // Classify the logical path, never the opaque cache identity. Exact metadata
+        // ranges do not need the file size; body reads must not trigger a stat.
+        let size = if !cache.cache_blocks(&self.path) {
+            None
+        } else if let Some(size) = known_size {
             cache.put_file_size(&cache_path, size, &read_token).await;
-            size
+            Some(size)
         } else if let Some(size) = cache.file_size(&cache_path, &read_token).await {
-            size
+            Some(size)
         } else {
             let size = op.stat(&relative_path).await?.content_length();
             cache.put_file_size(&cache_path, size, &read_token).await;
-            size
+            Some(size)
         };
         Ok(InputFileReader::Cached(CachedFileReader::new_with_token(
             Arc::new(reader),
@@ -1678,10 +1688,75 @@ mod input_output_test {
     }
 
     #[tokio::test]
+    async fn test_blob_metadata_reader_needs_no_stat() {
+        let source = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let path = source.path().join("data.blob");
+        let input = setup_cached_fs_file_io(cache_dir.path())
+            .new_input(path.to_str().unwrap())
+            .unwrap();
+        // Opening the reader must succeed even when a source stat would fail.
+        assert!(input.metadata().await.is_err());
+        let reader = input.reader().await.unwrap();
+        std::fs::write(&path, b"metabody").unwrap();
+        assert_eq!(reader.read(4..8).await.unwrap(), b"body"[..]);
+        assert_eq!(reader.read_blob_metadata(0..4).await.unwrap(), b"meta"[..]);
+        drop(reader);
+        std::fs::remove_file(&path).unwrap();
+        let reader = input.reader().await.unwrap();
+        assert_eq!(reader.read_blob_metadata(0..4).await.unwrap(), b"meta"[..]);
+        assert!(reader.read(4..8).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_root_metadata_range_cache_uses_logical_path() {
+        for disk in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut options = Options::new();
+            options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+            if disk {
+                options.set(
+                    CatalogOptions::LOCAL_CACHE_DIR,
+                    directory.path().to_string_lossy(),
+                );
+            }
+            options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
+            let cache = Arc::new(
+                LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap())
+                    .unwrap(),
+            );
+            let file_io = FileIOBuilder::new("memory")
+                .with_local_cache(cache)
+                .build()
+                .unwrap();
+            for path in [
+                "memory:/snapshot-1",
+                "memory:/schema-1",
+                "memory:/snapshot/snapshot-1",
+            ] {
+                file_io
+                    .new_output(path)
+                    .unwrap()
+                    .write(Bytes::from_static(b"metadata"))
+                    .await
+                    .unwrap();
+                let input = file_io.new_input(path).unwrap();
+                let reader = input.reader().await.unwrap();
+                assert_eq!(reader.read(1..7).await.unwrap(), b"etadat"[..]);
+                // Delete the source directly, without invalidating the cache.
+                let (op, relative_path, _) = input.source.resolve(path).await.unwrap();
+                op.delete(&relative_path).await.unwrap();
+                let reader = input.reader().await.unwrap();
+                assert_eq!(reader.read(1..7).await.unwrap(), b"etadat"[..], "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_reader_with_file_size_skips_source_stat() {
         let source = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
-        let path = source.path().join("missing.blob");
+        let path = source.path().join("snapshot-1");
         let input = setup_cached_fs_file_io(cache_dir.path())
             .new_input(path.to_str().unwrap())
             .unwrap();

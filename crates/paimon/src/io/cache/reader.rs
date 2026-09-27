@@ -27,7 +27,8 @@ use super::{CacheReadToken, LocalCache};
 pub(crate) struct CachedFileReader {
     delegate: Arc<dyn FileRead>,
     path: String,
-    file_size: u64,
+    // Some enables aligned blocks; None caches only explicit BLOB metadata ranges.
+    block_file_size: Option<u64>,
     cache: Arc<LocalCache>,
     read_token: CacheReadToken,
 }
@@ -42,30 +43,31 @@ impl CachedFileReader {
     ) -> Self {
         let path = path.into();
         let read_token = cache.read_token(&path);
-        Self::new_with_token(delegate, path, file_size, cache, read_token)
+        let block_file_size = cache.cache_blocks(&path).then_some(file_size);
+        Self::new_with_token(delegate, path, block_file_size, cache, read_token)
     }
 
     pub(in crate::io) fn new_with_token(
         delegate: Arc<dyn FileRead>,
         path: impl Into<String>,
-        file_size: u64,
+        block_file_size: Option<u64>,
         cache: Arc<LocalCache>,
         read_token: CacheReadToken,
     ) -> Self {
         Self {
             delegate,
             path: path.into(),
-            file_size,
+            block_file_size,
             cache,
             read_token,
         }
     }
 
-    async fn read_block(&self, block_index: u64) -> crate::Result<Bytes> {
+    async fn read_block(&self, block_index: u64, file_size: u64) -> crate::Result<Bytes> {
         let block_size = self.cache.block_size();
         let key = self.cache.block_key(&self.path, block_index);
         let start = block_index * block_size;
-        let end = start.saturating_add(block_size).min(self.file_size);
+        let end = start.saturating_add(block_size).min(file_size);
         let expected_len = usize::try_from(end - start).map_err(|_| crate::Error::DataInvalid {
             message: format!("Cache block is too large for '{}'", self.path),
             source: None,
@@ -130,21 +132,24 @@ impl CachedFileReader {
     }
 
     pub(crate) async fn read_full(&self) -> crate::Result<Bytes> {
-        if self.file_size == 0 {
+        let file_size = self
+            .block_file_size
+            .expect("full reads require block caching");
+        if file_size == 0 {
             return Ok(Bytes::new());
         }
-        if let Some(payload) = self.read_cached_full().await {
+        if let Some(payload) = self.read_cached_full(file_size).await {
             return Ok(payload);
         }
 
         let first_key = self.cache.block_key(&self.path, 0);
         let load_lock = self.cache.block_load_lock(&first_key).await;
         let load_guard = load_lock.lock().await;
-        let result = if let Some(payload) = self.read_cached_full().await {
+        let result = if let Some(payload) = self.read_cached_full(file_size).await {
             Ok(payload)
         } else {
-            match self.delegate.read(0..self.file_size).await {
-                Ok(payload) if payload.len() as u64 == self.file_size => {
+            match self.delegate.read(0..file_size).await {
+                Ok(payload) if payload.len() as u64 == file_size => {
                     let chunk_size = usize::try_from(self.cache.block_size()).map_err(|_| {
                         crate::Error::DataInvalid {
                             message: format!("Cache block size is too large for '{}'", self.path),
@@ -169,7 +174,7 @@ impl CachedFileReader {
                         "Source file '{}' has length {}, expected {}",
                         self.path,
                         payload.len(),
-                        self.file_size
+                        file_size
                     ),
                     source: None,
                 }),
@@ -183,15 +188,15 @@ impl CachedFileReader {
         result
     }
 
-    async fn read_cached_full(&self) -> Option<Bytes> {
+    async fn read_cached_full(&self, file_size: u64) -> Option<Bytes> {
         let block_size = self.cache.block_size();
-        let block_count = self.file_size.div_ceil(block_size);
-        let output_len = usize::try_from(self.file_size).ok()?;
+        let block_count = file_size.div_ceil(block_size);
+        let output_len = usize::try_from(file_size).ok()?;
         let mut output = BytesMut::with_capacity(output_len);
         for block_index in 0..block_count {
             let key = self.cache.block_key(&self.path, block_index);
             let start = block_index * block_size;
-            let expected_len = (self.file_size - start).min(block_size) as usize;
+            let expected_len = (file_size - start).min(block_size) as usize;
             let payload = self
                 .cache
                 .get_block(&key, expected_len, &self.read_token)
@@ -209,10 +214,10 @@ impl CachedFileReader {
 #[async_trait::async_trait]
 impl FileRead for CachedFileReader {
     async fn read_blob_metadata(&self, range: Range<u64>) -> crate::Result<Bytes> {
-        if !self.cache.cache_blob_metadata(&self.path) || self.cache.cache_blocks(&self.path) {
+        if self.block_file_size.is_some() {
             return self.read(range).await;
         }
-        if range.start >= range.end || range.end > self.file_size {
+        if range.start >= range.end {
             return self.delegate.read(range).await;
         }
         let key = self.cache.range_key(&self.path, &range);
@@ -262,10 +267,10 @@ impl FileRead for CachedFileReader {
     }
 
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
-        if !self.cache.cache_blocks(&self.path) {
+        let Some(file_size) = self.block_file_size else {
             return self.delegate.read(range).await;
-        }
-        if range.start > range.end || range.end > self.file_size {
+        };
+        if range.start > range.end || range.end > file_size {
             return self.delegate.read(range).await;
         }
         let end = range.end;
@@ -284,7 +289,7 @@ impl FileRead for CachedFileReader {
         let mut output = BytesMut::with_capacity(output_len);
 
         for block_index in first_block..=last_block {
-            let block = self.read_block(block_index).await?;
+            let block = self.read_block(block_index, file_size).await?;
             let block_start = block_index * block_size;
             let copy_start = range.start.max(block_start) - block_start;
             let copy_end = end.min(block_start + block.len() as u64) - block_start;
