@@ -117,7 +117,7 @@ impl AppendDedicatedFormatFileWriter {
                         write_buffer_size,
                         "blob".to_string(),
                         vec![field.clone()],
-                        HashMap::new(),
+                        format_options.clone(),
                         Some(0),
                         None,
                         Some(vec![field.name().to_string()]),

@@ -1404,6 +1404,23 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(1)
     }
 
+    pub(crate) fn validate_data_file_path_directory(&self) -> crate::Result<()> {
+        if self.data_file_path_directory() == Some("") {
+            return Err(crate::Error::ConfigInvalid {
+                message: "data-file.path-directory must not be empty".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Directory containing bucket data, resolved against the table location.
+    /// Supports relative paths, absolute paths, and URIs, like Java `Path`.
+    pub fn data_file_path_directory(&self) -> Option<&str> {
+        self.options
+            .get("data-file.path-directory")
+            .map(String::as_str)
+    }
+
     /// File name prefix for data files. Default is `"data-"`.
     pub fn data_file_prefix(&self) -> &str {
         self.options

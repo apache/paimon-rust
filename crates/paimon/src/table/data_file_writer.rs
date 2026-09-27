@@ -378,7 +378,11 @@ impl DataFileWriter {
     }
 
     fn bucket_dir(&self) -> String {
-        bucket_path_under(&self.table_location, &self.partition_path, self.bucket)
+        let data_root = crate::spec::data_file_path(
+            &self.table_location,
+            CoreOptions::new(&self.format_options).data_file_path_directory(),
+        );
+        bucket_path_under(&data_root, &self.partition_path, self.bucket)
     }
 
     #[allow(clippy::too_many_arguments)]

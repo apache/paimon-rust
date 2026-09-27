@@ -149,10 +149,10 @@ impl TableSchema {
     /// override, and the declared `type` can't be changed by one: an override
     /// could re-route foreign data through the Paimon reader.
     ///
-    /// `index-file-in-data-file-dir` can't be changed by one either. It selects
-    /// the directory every bucket-local index file is written to and read from,
-    /// while an index manifest records only the file name, so a copy carrying an
-    /// overridden value would write hash and deletion-vector index files where a
+    /// `index-file-in-data-file-dir` and `data-file.path-directory` also retain
+    /// their stored values. They select where data and bucket-local indexes are
+    /// written and read, while manifests record file names, so a copy carrying an
+    /// overridden value would write files where a
     /// normally loaded table cannot find them. Java rejects such an override
     /// outright in `AbstractFileStoreTable.checkImmutability`; this copy cannot
     /// fail, so the stored value wins instead, and an absent one leaves the
@@ -165,13 +165,15 @@ impl TableSchema {
             Some(declared) => extra.insert(TABLE_TYPE_OPTION.to_string(), declared.clone()),
             None => extra.remove(TABLE_TYPE_OPTION),
         };
-        match self.options.get(INDEX_FILE_IN_DATA_FILE_DIR_OPTION) {
-            Some(stored) => extra.insert(
-                INDEX_FILE_IN_DATA_FILE_DIR_OPTION.to_string(),
-                stored.clone(),
-            ),
-            None => extra.remove(INDEX_FILE_IN_DATA_FILE_DIR_OPTION),
-        };
+        for key in [
+            INDEX_FILE_IN_DATA_FILE_DIR_OPTION,
+            "data-file.path-directory",
+        ] {
+            match self.options.get(key) {
+                Some(stored) => extra.insert(key.to_string(), stored.clone()),
+                None => extra.remove(key),
+            };
+        }
         let mut new_schema = self.clone();
         new_schema.options.extend(extra);
         new_schema
@@ -1213,6 +1215,7 @@ impl Schema {
         Self::validate_bucket_keys(options, fields, partition_keys, primary_keys)?;
         Self::validate_sequence_field(options, fields, partition_keys, primary_keys)?;
         Self::validate_read_batch_size(options)?;
+        CoreOptions::new(options).validate_data_file_path_directory()?;
         let core_options = CoreOptions::new(options);
         if !core_options.is_format_table() {
             core_options.target_file_row_num()?;

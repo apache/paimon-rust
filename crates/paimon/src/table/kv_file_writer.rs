@@ -491,7 +491,10 @@ impl KeyValueFileWriter {
             write.file_format,
         );
         let bucket_dir = bucket_path_under(
-            &self.config.table_location,
+            &crate::spec::data_file_path(
+                &self.config.table_location,
+                CoreOptions::new(&self.config.table_options).data_file_path_directory(),
+            ),
             &self.config.partition_path,
             self.config.bucket,
         );
@@ -1173,7 +1176,10 @@ impl KeyValueFileWriter {
             let _ = reservation.try_resize(0);
         }
         let bucket_path = bucket_path_under(
-            &self.config.table_location,
+            &crate::spec::data_file_path(
+                &self.config.table_location,
+                CoreOptions::new(&self.config.table_options).data_file_path_directory(),
+            ),
             &self.config.partition_path,
             self.config.bucket,
         );

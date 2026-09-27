@@ -704,8 +704,8 @@ fn local_datetime_to_millis<Tz: TimeZone>(
 ///   snapshot is not required: a format table holds data without ever writing
 ///   one, so a snapshot check would not catch it. Java special-cases `type` the
 ///   same way (`SchemaManager.generateTableSchema`).
-/// * `index-file-in-data-file-dir` picks the directory every bucket-local index
-///   file is written to and read from, so flipping it hides every index file the
+/// * `index-file-in-data-file-dir` and `data-file.path-directory` pick the directories
+///   files are written to and read from, so flipping them hides files the
 ///   table already has. A change is rejected once the table exists, and a
 ///   `SetOption` repeating the stored value or a `RemoveOption` for an option that
 ///   is not set is let through, since neither moves anything.
@@ -745,25 +745,27 @@ fn reject_immutable_option_changes(
                 });
             }
             crate::spec::SchemaChange::SetOption { key, value }
-                if key == INDEX_FILE_IN_DATA_FILE_DIR_OPTION
+                if (key == INDEX_FILE_IN_DATA_FILE_DIR_OPTION
+                    || key == "data-file.path-directory")
                     && current_options.get(key.as_str()) != Some(value) =>
             {
                 return Err(Error::Unsupported {
                     message: format!(
-                        "changing '{INDEX_FILE_IN_DATA_FILE_DIR_OPTION}' after the table exists \
-                         is not supported: it selects the directory index files are written to, \
+                        "changing '{key}' after the table exists \
+                         is not supported: it selects the directory files are written to, \
                          so the files already written would no longer be found"
                     ),
                 });
             }
             crate::spec::SchemaChange::RemoveOption { key }
-                if key == INDEX_FILE_IN_DATA_FILE_DIR_OPTION
+                if (key == INDEX_FILE_IN_DATA_FILE_DIR_OPTION
+                    || key == "data-file.path-directory")
                     && current_options.contains_key(key.as_str()) =>
             {
                 return Err(Error::Unsupported {
                     message: format!(
-                        "removing '{INDEX_FILE_IN_DATA_FILE_DIR_OPTION}' is not supported: \
-                         it selects the directory index files are written to, so the files \
+                        "removing '{key}' is not supported: \
+                         it selects the directory files are written to, so the files \
                          already written would no longer be found"
                     ),
                 });
@@ -1275,6 +1277,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_cannot_change_data_directory() {
+        use crate::spec::SchemaChange;
+        for stored in [None, Some("data/nested")] {
+            let (_temp_dir, catalog) = create_test_catalog();
+            let options = stored
+                .map(|value| {
+                    HashMap::from([("data-file.path-directory".to_string(), value.to_string())])
+                })
+                .unwrap_or_default();
+            let identifier = create_table_for_alter(&catalog, options).await;
+            give_the_table_a_snapshot(&catalog, &identifier).await;
+            let key = "data-file.path-directory".to_string();
+            let original = catalog.get_table(&identifier).await.unwrap();
+            let mut changes = vec![SchemaChange::set_option(key.clone(), "other".to_string())];
+            if stored.is_some() {
+                changes.push(SchemaChange::remove_option(key.clone()));
+            }
+            for change in changes {
+                let error = catalog
+                    .alter_table(&identifier, vec![change], false)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, Error::Unsupported { .. }), "{error:?}");
+            }
+            let no_op = match stored {
+                Some(value) => SchemaChange::set_option(key, value.to_string()),
+                None => SchemaChange::remove_option(key),
+            };
+            catalog
+                .alter_table(&identifier, vec![no_op], false)
+                .await
+                .unwrap();
+            let reloaded = catalog.get_table(&identifier).await.unwrap();
+            assert_eq!(
+                reloaded.schema().core_options().data_file_path_directory(),
+                stored
+            );
+            assert_eq!(reloaded.schema().options(), original.schema().options());
+        }
     }
 
     #[tokio::test]

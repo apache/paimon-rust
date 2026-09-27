@@ -318,6 +318,14 @@ impl Table {
         &self.location
     }
 
+    /// Root for bucket data. Metadata continues to use `location()`.
+    pub(crate) fn data_file_location(&self) -> String {
+        crate::spec::data_file_path(
+            self.location(),
+            self.schema().core_options().data_file_path_directory(),
+        )
+    }
+
     /// Get the table's schema.
     pub fn schema(&self) -> &TableSchema {
         &self.schema
