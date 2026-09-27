@@ -63,6 +63,9 @@ pub(super) fn supported_key_type(data_type: &DataType) -> bool {
             | DataType::FixedSizeBinary(_)
             | DataType::Date32
             | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
     )
@@ -242,5 +245,63 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("upsert key type differs"));
+    }
+    #[test]
+    fn temporal_keys_keep_units_nulls_and_composite_identity() {
+        use arrow_schema::TimeUnit;
+        for data_type in [
+            DataType::Time32(TimeUnit::Millisecond),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ] {
+            let temporal = |values: Vec<Option<i64>>| {
+                let array: ArrayRef = if matches!(data_type, DataType::Time32(_)) {
+                    Arc::new(Int32Array::from_iter(
+                        values.into_iter().map(|v| v.map(|v| v as i32)),
+                    ))
+                } else {
+                    Arc::new(Int64Array::from(values))
+                };
+                arrow_cast::cast(array.as_ref(), &data_type).unwrap()
+            };
+            let source = RecordBatch::try_from_iter([
+                (
+                    "key",
+                    temporal(vec![Some(9), None, Some(10), Some(12), Some(10), Some(10)]),
+                ),
+                (
+                    "part",
+                    Arc::new(StringArray::from(vec!["a", "a", "a", "a", "a", "b"])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let existing = RecordBatch::try_from_iter([
+                (
+                    "key",
+                    temporal(vec![Some(10), Some(10), None, Some(9), Some(11), Some(10)]),
+                ),
+                (
+                    "part",
+                    Arc::new(StringArray::from(vec!["a", "a", "a", "a", "a", "b"])) as ArrayRef,
+                ),
+                (
+                    ROW_ID,
+                    Arc::new(Int64Array::from(vec![10, 11, 12, 13, 14, 15])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let mut matcher =
+                UpsertKeyMatcher::new(&source, vec!["key".into(), "part".into()]).unwrap();
+            matcher.add_existing_batch(&existing.slice(0, 2)).unwrap();
+            matcher.add_existing_batch(&existing.slice(2, 4)).unwrap();
+            assert_eq!(
+                matcher.finish(),
+                (vec![0, 1, 4, 4, 5], vec![13, 12, 10, 11, 15], vec![3]),
+                "{data_type:?}"
+            );
+        }
     }
 }
