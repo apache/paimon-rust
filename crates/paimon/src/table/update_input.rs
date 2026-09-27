@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{
     new_null_array, Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array,
     GenericListArray, Int64Array, LargeListArray, ListArray, MapArray, OffsetSizeTrait,
@@ -130,8 +131,24 @@ pub(super) fn cast_update_value(
     mode: CastMode,
 ) -> crate::Result<ArrayRef> {
     if mode == CastMode::RowUpdate {
-        cast_values(array, target, CastMode::Assignment)
-            .or_else(|_| cast_values(array, target, CastMode::Constructor))
+        cast_values(array, target, CastMode::Assignment).or_else(|_| {
+            validate_map_constructor_input(array, target)?;
+            let decoded = decode_dictionary(array)?;
+            // Python converts lists of pairs to tuples only for a top-level MAP.
+            if let DataType::Map(field, sorted) = target {
+                if matches!(
+                    decoded.data_type(),
+                    DataType::List(_)
+                        | DataType::LargeList(_)
+                        | DataType::ListView(_)
+                        | DataType::LargeListView(_)
+                        | DataType::FixedSizeList(..)
+                ) {
+                    return constructor_map(&decoded, field, *sorted);
+                }
+            }
+            cast_values(array, target, CastMode::Constructor)
+        })
     } else {
         cast_values(array, target, mode)
     }
@@ -169,9 +186,26 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
             "Run-end encoded update inputs are not supported by PyArrow casts",
         ));
     }
+    if mode == CastMode::Constructor {
+        match (array.data_type(), target) {
+            (DataType::Struct(_), DataType::Map(field, sorted)) => {
+                return constructor_map(array, field, *sorted);
+            }
+            (DataType::Map(..), DataType::Struct(fields)) => {
+                return constructor_struct_from_map(
+                    array.as_any().downcast_ref::<MapArray>().unwrap(),
+                    fields,
+                );
+            }
+            _ => {}
+        }
+    }
     let nested: Option<ArrayRef> = match (array.data_type(), target) {
         (DataType::Struct(_), DataType::Struct(fields)) => {
             let input = array.as_any().downcast_ref::<StructArray>().unwrap();
+            if mode == CastMode::Assignment {
+                validate_struct_cast_fields(input.fields(), fields)?;
+            }
             let columns = fields
                 .iter()
                 .map(|field| match input.column_by_name(field.name()) {
@@ -287,6 +321,235 @@ fn cast_values(array: &ArrayRef, target: &DataType, mode: CastMode) -> crate::Re
         .map_err(|error| invalid(error.to_string()));
     }
     cast_primitive(array, target, mode)
+}
+
+// PyPaimon's row-ID fallback reconstructs Python dicts only after a whole-column
+// safe cast fails. At the top level it rejects ambiguous schema-less null keys.
+fn validate_map_constructor_input(array: &ArrayRef, target: &DataType) -> crate::Result<()> {
+    if matches!(target, DataType::Map(..)) {
+        if let Some(input) = array.as_any().downcast_ref::<StructArray>() {
+            if input.columns().iter().any(|column| {
+                column.logical_nulls().is_some_and(|nulls| {
+                    (0..input.len()).any(|row| input.is_valid(row) && nulls.is_null(row))
+                })
+            }) {
+                return Err(invalid(
+                    "Cannot coerce schema-less dict input with null values to map type; pass an explicit map-typed array or list-of-pairs instead",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_struct_cast_fields(
+    source: &arrow_schema::Fields,
+    target: &arrow_schema::Fields,
+) -> crate::Result<()> {
+    let mut previous = None;
+    for field in target {
+        if let Some(index) = source.iter().position(|f| f.name() == field.name()) {
+            if previous.is_some_and(|previous| index <= previous) {
+                return Err(invalid(
+                    "Struct fields are in the wrong order for a safe cast",
+                ));
+            }
+            if source[index].is_nullable() && !field.is_nullable() {
+                return Err(invalid(
+                    "Cannot safely cast a nullable Struct field to non-nullable",
+                ));
+            }
+            previous = Some(index);
+        }
+    }
+    Ok(())
+}
+
+fn constructor_struct_from_map(
+    input: &MapArray,
+    fields: &arrow_schema::Fields,
+) -> crate::Result<ArrayRef> {
+    let keys = decode_dictionary(input.keys())?;
+    let columns = fields
+        .iter()
+        .enumerate()
+        .map(|(field_index, field)| {
+            let indices = (0..input.len())
+                .map(|row| {
+                    let range = input.value_offsets();
+                    if input.is_null(row) || field_index >= (range[row + 1] - range[row]) as usize {
+                        return Ok(None);
+                    }
+                    let index = range[row] as usize + field_index;
+                    let key = match keys.data_type() {
+                        DataType::Utf8 => keys.as_string::<i32>().value(index).as_bytes(),
+                        DataType::LargeUtf8 => keys.as_string::<i64>().value(index).as_bytes(),
+                        DataType::Utf8View => keys.as_string_view().value(index).as_bytes(),
+                        DataType::Binary => keys.as_binary::<i32>().value(index),
+                        DataType::LargeBinary => keys.as_binary::<i64>().value(index),
+                        DataType::BinaryView => keys.as_binary_view().value(index),
+                        DataType::FixedSizeBinary(_) => keys.as_fixed_size_binary().value(index),
+                        _ => {
+                            return Err(invalid(
+                                "Expected a string or bytes field name in MAP-to-ROW input",
+                            ))
+                        }
+                    };
+                    if key != field.name().as_bytes() {
+                        return Err(invalid(format!(
+                            "Expected field name '{}' in MAP-to-ROW input",
+                            field.name()
+                        )));
+                    }
+                    Ok(Some(index as u64))
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            // Missing fields, NULL parents and trailing entries do not participate
+            // in conversion, matching PyArrow's ordered pair constructor for ROW.
+            let values = arrow_select::take::take(
+                input.values().as_ref(),
+                &arrow_array::UInt64Array::from(indices),
+                None,
+            )
+            .map_err(|error| invalid(error.to_string()))?;
+            cast_values(&values, field.data_type(), CastMode::Constructor)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(Arc::new(
+        StructArray::try_new_with_length(
+            fields.clone(),
+            columns,
+            input.nulls().cloned(),
+            input.len(),
+        )
+        .map_err(|error| invalid(error.to_string()))?,
+    ))
+}
+
+fn constructor_map(
+    input: &ArrayRef,
+    entries_field: &arrow_schema::FieldRef,
+    sorted: bool,
+) -> crate::Result<ArrayRef> {
+    let DataType::Struct(fields) = entries_field.data_type() else {
+        return Err(invalid("Map entries must have a struct type"));
+    };
+    let mut offsets = vec![0_i32];
+    let (keys, values) = if let Some(input) = input.as_any().downcast_ref::<StructArray>() {
+        let mut indices = Vec::new();
+        let mut keys = Vec::new();
+        for row in 0..input.len() {
+            if input.is_valid(row) {
+                for (index, field) in input.fields().iter().enumerate() {
+                    keys.push(field.name().as_str());
+                    indices.push((index, row));
+                }
+            }
+            offsets.push(i32::try_from(indices.len()).map_err(|_| invalid("Map offset overflow"))?);
+        }
+        let columns = input
+            .columns()
+            .iter()
+            .map(|column| {
+                let visible = constructor_child(column, input.nulls(), 1, CastMode::Constructor)?;
+                cast_values(&visible, fields[1].data_type(), CastMode::Constructor)
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        let values = if columns.is_empty() {
+            arrow_array::new_empty_array(fields[1].data_type())
+        } else {
+            let columns = columns
+                .iter()
+                .map(|column| column.as_ref())
+                .collect::<Vec<_>>();
+            arrow_select::interleave::interleave(&columns, &indices)
+                .map_err(|error| invalid(error.to_string()))?
+        };
+        (Arc::new(StringArray::from(keys)) as ArrayRef, values)
+    } else {
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        for row in 0..input.len() {
+            if input.is_valid(row) {
+                let pairs = constructor_list_value(input, row)?;
+                for index in 0..pairs.len() {
+                    if pairs.is_null(index) {
+                        return Err(invalid("Map key/value pair must not be null"));
+                    }
+                    let pair = constructor_list_value(&pairs, index)?;
+                    if pair.len() != 2 {
+                        return Err(invalid(
+                            "Map key/value pair must contain exactly two values",
+                        ));
+                    }
+                    keys.push(pair.slice(0, 1));
+                    values.push(pair.slice(1, 1));
+                }
+            }
+            offsets.push(i32::try_from(keys.len()).map_err(|_| invalid("Map offset overflow"))?);
+        }
+        (
+            concat_constructor_values(&keys, fields[0].data_type())?,
+            concat_constructor_values(&values, fields[1].data_type())?,
+        )
+    };
+    let keys = cast_values(&keys, fields[0].data_type(), CastMode::Constructor)?;
+    let entries = StructArray::try_new(fields.clone(), vec![keys, values], None)
+        .map_err(|error| invalid(error.to_string()))?;
+    Ok(Arc::new(
+        MapArray::try_new(
+            entries_field.clone(),
+            OffsetBuffer::new(offsets.into()),
+            entries,
+            input.nulls().cloned(),
+            sorted,
+        )
+        .map_err(|error| invalid(error.to_string()))?,
+    ))
+}
+
+fn constructor_list_value(input: &ArrayRef, index: usize) -> crate::Result<ArrayRef> {
+    match input.data_type() {
+        DataType::List(_) => Ok(input
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(index)),
+        DataType::LargeList(_) => Ok(input
+            .as_any()
+            .downcast_ref::<LargeListArray>()
+            .unwrap()
+            .value(index)),
+        DataType::FixedSizeList(..) => Ok(input
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap()
+            .value(index)),
+        DataType::ListView(_) => Ok(input
+            .as_any()
+            .downcast_ref::<arrow_array::ListViewArray>()
+            .unwrap()
+            .value(index)),
+        DataType::LargeListView(_) => Ok(input
+            .as_any()
+            .downcast_ref::<arrow_array::LargeListViewArray>()
+            .unwrap()
+            .value(index)),
+        _ => Err(invalid("Map input must contain key/value pairs")),
+    }
+}
+
+fn concat_constructor_values(values: &[ArrayRef], target: &DataType) -> crate::Result<ArrayRef> {
+    if values.is_empty() {
+        return Ok(arrow_array::new_empty_array(target));
+    }
+    let values = values
+        .iter()
+        .map(|array| array.as_ref())
+        .collect::<Vec<_>>();
+    let combined =
+        arrow_select::concat::concat(&values).map_err(|error| invalid(error.to_string()))?;
+    cast_values(&combined, target, CastMode::Constructor)
 }
 
 fn cast_list<O: OffsetSizeTrait>(
@@ -2085,5 +2348,248 @@ mod tests {
         ] {
             assert!(float_to_decimal(value, false, 5, 2).is_err());
         }
+    }
+
+    fn test_map_type(key: DataType, value: DataType) -> DataType {
+        DataType::Map(
+            Arc::new(arrow_schema::Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        arrow_schema::Field::new("key", key, false),
+                        arrow_schema::Field::new("value", value, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        )
+    }
+
+    #[test]
+    fn row_update_dict_to_map_distinguishes_root_and_nested_nulls() {
+        use arrow_schema::Field;
+        let input: ArrayRef = Arc::new(StructArray::new(
+            vec![Field::new("a", DataType::Float64, true)].into(),
+            vec![Arc::new(Float64Array::from(vec![
+                Some(1.5),
+                None,
+                Some(f64::NAN),
+            ]))],
+            Some(arrow_buffer::NullBuffer::from(vec![true, true, false])),
+        ));
+        let target = test_map_type(DataType::Utf8, DataType::Int32);
+        assert!(cast_update_value(&input, &target, CastMode::RowUpdate).is_err());
+        assert!(cast_assignment(&input.slice(0, 1), &target).is_err());
+        let result = cast_update_value(&input.slice(0, 1), &target, CastMode::RowUpdate).unwrap();
+        let map = result.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.keys().to_data(), StringArray::from(vec!["a"]).to_data());
+        assert_eq!(map.values().to_data(), Int32Array::from(vec![1]).to_data());
+
+        let nested: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("m", input.data_type().clone(), true)),
+            input,
+        )]));
+        let nested_target = DataType::Struct(vec![Field::new("m", target, true)].into());
+        let output = cast_update_value(&nested, &nested_target, CastMode::RowUpdate).unwrap();
+        let map = output
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        assert_eq!(
+            map.values().to_data(),
+            Int32Array::from(vec![Some(1), None]).to_data()
+        );
+        assert!(map.is_null(2));
+    }
+
+    #[test]
+    fn map_to_row_constructor_checks_prefix_and_ignores_unused_entries() {
+        use arrow_schema::Field;
+        let entries = StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(StringArray::from(vec![
+                    "a", "b", "ignored", "a", "wrong", "b",
+                ])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", DataType::Float64, true)),
+                Arc::new(Float64Array::from(vec![1.5, 2.5, f64::NAN, 3.5, 5.0, 6.0])) as ArrayRef,
+            ),
+        ]);
+        let input: ArrayRef = Arc::new(MapArray::new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0_i32, 3, 4, 6].into()),
+            entries,
+            None,
+            false,
+        ));
+        let target = DataType::Struct(
+            vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Int32, true),
+            ]
+            .into(),
+        );
+        for key_type in [
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+        ] {
+            let map = input.as_map();
+            let keys = arrow_cast::cast(map.keys().as_ref(), &key_type).unwrap();
+            let entries = StructArray::from(vec![
+                (Arc::new(Field::new("key", key_type, false)), keys),
+                (
+                    Arc::new(Field::new("value", DataType::Float64, true)),
+                    map.values().clone(),
+                ),
+            ]);
+            let input: ArrayRef = Arc::new(MapArray::new(
+                Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                map.offsets().clone(),
+                entries,
+                None,
+                false,
+            ));
+            assert!(cast_assignment(&input.slice(0, 2), &target).is_err());
+            assert!(cast_update_value(&input, &target, CastMode::RowUpdate).is_err());
+            let output =
+                cast_update_value(&input.slice(0, 2), &target, CastMode::RowUpdate).unwrap();
+            let row = output.as_struct();
+            assert_eq!(
+                row.column(0).to_data(),
+                Int32Array::from(vec![1, 3]).to_data()
+            );
+            assert_eq!(
+                row.column(1).to_data(),
+                Int32Array::from(vec![Some(2), None]).to_data()
+            );
+        }
+    }
+
+    #[test]
+    fn list_pairs_constructor_is_top_level_only_and_preserves_slices() {
+        use arrow_array::builder::{Float64Builder, ListBuilder};
+        use arrow_schema::Field;
+        let mut builder = ListBuilder::new(ListBuilder::new(Float64Builder::new()));
+        for row in [
+            Some(vec![vec![Some(999.0)]]),
+            Some(vec![vec![Some(1.9), Some(10.9)], vec![Some(2.0), None]]),
+            None,
+            Some(vec![]),
+        ] {
+            if let Some(row) = row {
+                for pair in row {
+                    for value in pair {
+                        builder.values().values().append_option(value);
+                    }
+                    builder.values().append(true);
+                }
+                builder.append(true);
+            } else {
+                builder.append(false);
+            }
+        }
+        let all: ArrayRef = Arc::new(builder.finish());
+        let input = all.slice(1, 3);
+        let target = test_map_type(DataType::Int32, DataType::Int32);
+        assert!(cast_update_value(&all, &target, CastMode::RowUpdate).is_err());
+        let output = cast_update_value(&input, &target, CastMode::RowUpdate).unwrap();
+        let map = output.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map.keys().to_data(), Int32Array::from(vec![1, 2]).to_data());
+        assert_eq!(
+            map.values().to_data(),
+            Int32Array::from(vec![Some(10), None]).to_data()
+        );
+        assert!(map.is_null(1));
+        assert_eq!(map.value_length(2), 0);
+        let DataType::List(field) = input.data_type() else {
+            unreachable!()
+        };
+        for layout in [
+            DataType::ListView(field.clone()),
+            DataType::LargeListView(field.clone()),
+        ] {
+            let view = arrow_cast::cast(input.as_ref(), &layout).unwrap();
+            assert_eq!(
+                cast_update_value(&view, &target, CastMode::RowUpdate)
+                    .unwrap()
+                    .to_data(),
+                output.to_data()
+            );
+        }
+        let nested: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("m", input.data_type().clone(), true)),
+            input,
+        )]));
+        let nested_target = DataType::Struct(vec![Field::new("m", target, true)].into());
+        assert!(cast_update_value(&nested, &nested_target, CastMode::RowUpdate).is_err());
+    }
+
+    #[test]
+    fn struct_cast_order_and_nullability_select_whole_column_constructor() {
+        use arrow_schema::Field;
+        let input: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("a", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("b", DataType::Int32, true)),
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            ),
+        ]));
+        let reversed = DataType::Struct(
+            vec![
+                Field::new("b", DataType::Utf8, true),
+                Field::new("a", DataType::Int32, true),
+            ]
+            .into(),
+        );
+        assert!(cast_assignment(&input, &reversed).is_err());
+        // The reordered constructor cannot inherit the safe cast's int->string conversion.
+        assert!(cast_update_value(&input, &reversed, CastMode::RowUpdate).is_err());
+        let required = DataType::Struct(
+            vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, true),
+            ]
+            .into(),
+        );
+        assert!(cast_assignment(&input, &required).is_err());
+        assert!(cast_update_value(&input, &required, CastMode::RowUpdate).is_ok());
+    }
+    #[test]
+    fn dict_map_ambiguity_checks_dictionary_logical_nulls() {
+        use arrow_array::{types::Int32Type, DictionaryArray};
+        use arrow_schema::Field;
+        let child: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1]),
+                Arc::new(Int32Array::from(vec![Some(1), None])),
+            )
+            .unwrap(),
+        );
+        let input: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("a", child.data_type().clone(), true)),
+            child,
+        )]));
+        let target = test_map_type(DataType::Utf8, DataType::Int32);
+        assert!(cast_update_value(&input, &target, CastMode::RowUpdate).is_err());
+        let output = cast_update_value(&input.slice(0, 1), &target, CastMode::RowUpdate).unwrap();
+        assert_eq!(
+            output.as_map().values().to_data(),
+            Int32Array::from(vec![1]).to_data()
+        );
     }
 }

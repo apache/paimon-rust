@@ -25,6 +25,7 @@ use arrow_select::{concat::concat_batches, take::take};
 use futures::TryStreamExt;
 
 use super::upsert_key_matcher::UpsertKeyMatcher;
+use super::write_batch_normalize::normalize_write_array;
 use crate::spec::CoreOptions;
 use crate::table::{CommitMessage, Table};
 
@@ -119,7 +120,8 @@ impl TableUpsert {
     }
 
     /// Add full rows. Column order may differ from the table schema; names and
-    /// Arrow types must agree. Multiple batches form one logical upsert input.
+    /// Arrow layouts follow the same normalization as ordinary writes. Multiple
+    /// batches form one logical upsert input.
     pub(super) fn add_batch(&mut self, batch: RecordBatch) -> crate::Result<()> {
         let target = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
         if batch.num_columns() != target.fields().len() {
@@ -130,15 +132,11 @@ impl TableUpsert {
             let column = batch
                 .column_by_name(field.name())
                 .ok_or_else(|| invalid(format!("missing upsert column '{}'", field.name())))?;
-            if column.data_type() != field.data_type() {
-                return Err(invalid(format!(
-                    "upsert column '{}' type differs from table: {:?} != {:?}",
-                    field.name(),
-                    column.data_type(),
-                    field.data_type()
-                )));
-            }
-            columns.push(column.clone());
+            columns.push(
+                normalize_write_array(column, field.data_type()).map_err(|error| {
+                    invalid(format!("Invalid upsert column '{}': {error}", field.name()))
+                })?,
+            );
         }
         let ordered = RecordBatch::try_new(target, columns)
             .map_err(|error| invalid(format!("cannot order upsert columns: {error}")))?;

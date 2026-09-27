@@ -86,13 +86,21 @@ pub(super) fn normalize_write_array(array: &ArrayRef, expected: &DataType) -> Re
         }
         (DataType::Map(_, _), DataType::Map(expected_entries, expected_ordered)) => {
             let map = array.as_any().downcast_ref::<MapArray>().unwrap();
-            let entries: ArrayRef = Arc::new(map.entries().clone());
-            let entries = normalize_write_array(&entries, expected_entries.data_type())?;
-            let entries = entries
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .unwrap()
-                .clone();
+            // MAP key/value roles are positional. Their Arrow field names are
+            // aliases, unlike user-defined ROW field names.
+            let DataType::Struct(fields) = expected_entries.data_type() else {
+                return Err(Error::DataInvalid {
+                    message: "MAP entries must have a struct type".into(),
+                    source: None,
+                });
+            };
+            let columns = [map.keys(), map.values()]
+                .into_iter()
+                .zip(fields)
+                .map(|(column, field)| normalize_write_array(column, field.data_type()))
+                .collect::<Result<Vec<_>>>()?;
+            let entries =
+                StructArray::try_new(fields.clone(), columns, None).map_err(normalization_error)?;
             let normalized = MapArray::try_new(
                 expected_entries.clone(),
                 map.offsets().clone(),
@@ -193,9 +201,9 @@ mod tests {
 
     #[test]
     fn map_value_list_alias_is_normalized_recursively() {
-        let key_field = Arc::new(Field::new("key", DataType::Int32, false));
+        let key_field = Arc::new(Field::new("source_key", DataType::Int32, false));
         let value_field = Arc::new(Field::new(
-            "value",
+            "source_value",
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
             true,
         ));
@@ -229,7 +237,13 @@ mod tests {
         ));
         let expected_entries = Arc::new(Field::new(
             "entries",
-            DataType::Struct(vec![key_field, expected_value].into()),
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Int32, false)),
+                    expected_value,
+                ]
+                .into(),
+            ),
             false,
         ));
         let expected = DataType::Map(expected_entries, false);
