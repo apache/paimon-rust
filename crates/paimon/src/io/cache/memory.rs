@@ -49,8 +49,21 @@ impl MemoryCache {
         state.entries.get(key).cloned()
     }
 
+    pub(super) fn can_store(&self, key: &BlockKey, payload_len: usize) -> bool {
+        let Some(payload_size) = key.checked_memory_cost(payload_len) else {
+            return false;
+        };
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .max_size
+            .is_none_or(|max_size| payload_size <= max_size)
+    }
+
     pub(super) fn put_block(&self, key: &BlockKey, payload: Bytes) {
-        let payload_size = key.memory_cost(payload.len());
+        let Some(payload_size) = key.checked_memory_cost(payload.len()) else {
+            return;
+        };
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state
             .max_size

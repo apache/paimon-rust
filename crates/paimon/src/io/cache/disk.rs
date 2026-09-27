@@ -161,6 +161,17 @@ impl DiskCache {
         self.coordinator.clone()
     }
 
+    pub(super) fn can_store(&self, key: &BlockKey, payload_len: usize) -> bool {
+        let Some(encoded_size) = encoded_block_disk_cost(key, payload_len) else {
+            return false;
+        };
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .max_size
+            .is_none_or(|max_size| encoded_size <= max_size)
+    }
+
     pub(super) async fn get_block(&self, key: &BlockKey) -> Option<Bytes> {
         self.ensure_recovered().await;
         if !self.is_active(key) {
@@ -181,7 +192,7 @@ impl DiskCache {
                 return None;
             }
         };
-        match decode_block(key, &encoded) {
+        match decode_owned_block(key, encoded) {
             Ok(payload) if self.touch_entry(key) => Some(payload),
             Ok(_) => None,
             Err(error) => {
@@ -198,10 +209,11 @@ impl DiskCache {
 
     pub(super) async fn put_block(&self, key: &BlockKey, payload: Bytes) {
         self.ensure_recovered().await;
-        let encoded = encode_block(key, &payload);
-        let mut encoded_size = encoded.len() as u64;
-        if key.exact_range {
-            encoded_size = encoded_size.max(4096);
+        let Some(mut encoded_size) = encoded_block_disk_cost(key, payload.len()) else {
+            return;
+        };
+        if key.exact_range && payload.len() > super::MAX_EXACT_RANGE_CACHE_ENTRY_SIZE {
+            return;
         }
         if self
             .state
@@ -212,6 +224,9 @@ impl DiskCache {
         {
             return;
         }
+        let Some(header) = encode_block_header(key, payload.len()) else {
+            return;
+        };
 
         let path = self.root.join(key.cache_relative_path());
         let Some(parent) = path.parent() else {
@@ -246,8 +261,14 @@ impl DiskCache {
                 return;
             }
         };
+        let mut checksum = crc32fast::Hasher::new();
+        checksum.update(&header);
+        checksum.update(&payload);
+        let checksum = checksum.finalize().to_le_bytes();
         let write_result = async {
-            temporary_file.write_all(&encoded).await?;
+            temporary_file.write_all(&header).await?;
+            temporary_file.write_all(&payload).await?;
+            temporary_file.write_all(&checksum).await?;
             // Tokio may return from write_all before the blocking write completes.
             temporary_file.flush().await
         }
@@ -683,38 +704,81 @@ fn is_cache_temporary_name(name: &str, shard: &str) -> bool {
     is_cache_block_name(digest, shard) && uuid::Uuid::parse_str(suffix).is_ok()
 }
 
-fn encode_block(key: &BlockKey, payload: &Bytes) -> Vec<u8> {
+fn encoded_block_len(key: &BlockKey, payload_len: usize) -> Option<usize> {
+    let key_len = key.namespace.len().checked_add(key.path.len())?;
+    if key_len > MAX_CACHE_KEY_HEADER_LEN
+        || u32::try_from(key.namespace.len()).is_err()
+        || u32::try_from(key.path.len()).is_err()
+    {
+        return None;
+    }
+    FIXED_HEADER_LEN
+        .checked_add(key_len)?
+        .checked_add(payload_len)?
+        .checked_add(CHECKSUM_LEN)
+}
+
+fn encoded_block_disk_cost(key: &BlockKey, payload_len: usize) -> Option<u64> {
+    let encoded_len = u64::try_from(encoded_block_len(key, payload_len)?).ok()?;
+    if key.exact_range {
+        encoded_len
+            .checked_add(4095)
+            .map(|length| length / 4096 * 4096)
+    } else {
+        Some(encoded_len)
+    }
+}
+
+fn encode_block_header(key: &BlockKey, payload_len: usize) -> Option<Vec<u8>> {
     let namespace = key.namespace.as_bytes();
     let path = key.path.as_bytes();
-    let mut encoded = Vec::with_capacity(
-        FIXED_HEADER_LEN + namespace.len() + path.len() + payload.len() + CHECKSUM_LEN,
-    );
-    encoded.extend_from_slice(CACHE_MAGIC);
-    encoded.push(CACHE_FORMAT_VERSION);
-    encoded.push(u8::from(key.exact_range));
-    encoded.extend_from_slice(&(namespace.len() as u32).to_le_bytes());
-    encoded.extend_from_slice(&(path.len() as u32).to_le_bytes());
-    encoded.extend_from_slice(&key.block_size.to_le_bytes());
-    encoded.extend_from_slice(&key.block_index.to_le_bytes());
-    encoded.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-    encoded.extend_from_slice(namespace);
-    encoded.extend_from_slice(path);
+    let encoded_len = encoded_block_len(key, payload_len)?;
+    let header_len = FIXED_HEADER_LEN
+        .checked_add(namespace.len())?
+        .checked_add(path.len())?;
+    let mut header = Vec::with_capacity(header_len);
+    header.extend_from_slice(CACHE_MAGIC);
+    header.push(CACHE_FORMAT_VERSION);
+    header.push(u8::from(key.exact_range));
+    header.extend_from_slice(&u32::try_from(namespace.len()).ok()?.to_le_bytes());
+    header.extend_from_slice(&u32::try_from(path.len()).ok()?.to_le_bytes());
+    header.extend_from_slice(&key.block_size.to_le_bytes());
+    header.extend_from_slice(&key.block_index.to_le_bytes());
+    header.extend_from_slice(&u64::try_from(payload_len).ok()?.to_le_bytes());
+    header.extend_from_slice(namespace);
+    header.extend_from_slice(path);
+    debug_assert_eq!(encoded_len, header.len() + payload_len + CHECKSUM_LEN);
+    Some(header)
+}
+
+#[cfg(test)]
+fn encode_block(key: &BlockKey, payload: &Bytes) -> Vec<u8> {
+    let mut encoded = encode_block_header(key, payload.len()).unwrap();
     encoded.extend_from_slice(payload);
     let checksum = crc32fast::hash(&encoded);
     encoded.extend_from_slice(&checksum.to_le_bytes());
     encoded
 }
 
+#[cfg(test)]
 fn decode_block(key: &BlockKey, encoded: &[u8]) -> Result<Bytes, BlockDecodeError> {
-    let (decoded_key, payload) = decode_block_any(encoded)?;
+    decode_bytes_block(key, Bytes::copy_from_slice(encoded))
+}
+
+fn decode_owned_block(key: &BlockKey, encoded: Vec<u8>) -> Result<Bytes, BlockDecodeError> {
+    decode_bytes_block(key, Bytes::from(encoded))
+}
+
+fn decode_bytes_block(key: &BlockKey, encoded: Bytes) -> Result<Bytes, BlockDecodeError> {
+    let (decoded_key, payload) = decode_bytes_block_any(encoded)?;
     if &decoded_key != key {
         return Err(BlockDecodeError("cache block key does not match"));
     }
     Ok(payload)
 }
 
-fn decode_block_any(encoded: &[u8]) -> Result<(BlockKey, Bytes), BlockDecodeError> {
-    let (key, layout) = decode_block_header(encoded, encoded.len() as u64)?;
+fn decode_bytes_block_any(encoded: Bytes) -> Result<(BlockKey, Bytes), BlockDecodeError> {
+    let (key, layout) = decode_block_header(&encoded, encoded.len() as u64)?;
     let payload_len = usize::try_from(layout.payload_len)
         .map_err(|_| BlockDecodeError("cache block payload is too large"))?;
     let payload_end = layout
@@ -730,10 +794,7 @@ fn decode_block_any(encoded: &[u8]) -> Result<(BlockKey, Bytes), BlockDecodeErro
         return Err(BlockDecodeError("cache block checksum does not match"));
     }
 
-    Ok((
-        key,
-        Bytes::copy_from_slice(&encoded[layout.header_len..payload_end]),
-    ))
+    Ok((key, encoded.slice(layout.header_len..payload_end)))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -893,6 +954,14 @@ mod tests {
         let decoded = decode_block(&key, &encoded).unwrap();
 
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_disk_block_size_preflight_rejects_overflow() {
+        let mut key = BlockKey::new("data.blob", 1, 0);
+        key.exact_range = true;
+
+        assert_eq!(encoded_block_disk_cost(&key, usize::MAX), None);
     }
 
     #[test]

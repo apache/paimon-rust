@@ -221,6 +221,9 @@ impl FileRead for CachedFileReader {
                 message: "BLOB metadata range is too large".to_string(),
                 source: None,
             })?;
+        if !self.cache.can_cache_exact_range(&key, expected_len) {
+            return self.delegate.read(range).await;
+        }
         if let Some(payload) = self
             .cache
             .get_block(&key, expected_len, &self.read_token)
@@ -244,10 +247,11 @@ impl FileRead for CachedFileReader {
             }
             let payload = self.delegate.read(range).await?;
             if payload.len() == expected_len {
-                // Own only this range, even if the delegate returns a slice of a larger buffer.
+                let payload = Bytes::copy_from_slice(&payload);
                 self.cache
-                    .put_block(&key, Bytes::copy_from_slice(&payload), &self.read_token)
+                    .put_block(&key, payload.clone(), &self.read_token)
                     .await;
+                return Ok(payload);
             }
             Ok(payload)
         }
@@ -366,6 +370,42 @@ mod tests {
             .into_iter()
             .all(|result| result.unwrap() == b"bc"[..]));
         assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_uncacheable_blob_metadata_reads_are_not_serialized() {
+        for disk in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let delegate = Arc::new(ConcurrentCountingReader {
+                data: Bytes::from_static(b"abcdefgh"),
+                reads: AtomicUsize::new(0),
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+            });
+            let cache = Arc::new(
+                LocalCache::new(LocalCacheConfig {
+                    dir: disk.then(|| directory.path().to_path_buf()),
+                    namespace: "test".into(),
+                    max_size: Some(1),
+                    block_size: 1024,
+                    whitelist: std::collections::HashSet::from([FileType::BlobMeta]),
+                })
+                .unwrap(),
+            );
+            let readers: Vec<_> = (0..16)
+                .map(|_| CachedFileReader::new(delegate.clone(), "data.blob", 8, cache.clone()))
+                .collect();
+            let results = futures::future::join_all(
+                readers.iter().map(|reader| reader.read_blob_metadata(1..3)),
+            )
+            .await;
+
+            assert!(results
+                .into_iter()
+                .all(|result| result.unwrap() == b"bc"[..]));
+            assert_eq!(delegate.reads.load(Ordering::SeqCst), 16);
+            assert!(delegate.max_in_flight.load(Ordering::SeqCst) > 1);
+        }
     }
 
     #[allow(dead_code)]
@@ -552,6 +592,26 @@ mod tests {
     struct SlowCountingReader {
         data: Bytes,
         reads: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct ConcurrentCountingReader {
+        data: Bytes,
+        reads: AtomicUsize,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for ConcurrentCountingReader {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        }
     }
 
     #[async_trait::async_trait]

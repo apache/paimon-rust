@@ -36,6 +36,7 @@ pub(super) use reader::CachedFileReader;
 
 const CACHE_DIRECTORY_NAME: &str = "paimon-local-cache-v3";
 const MAX_CACHE_ENTRIES: usize = 65_536;
+const MAX_EXACT_RANGE_CACHE_ENTRY_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_FILE_SIZE_CAPACITY: usize = 65_536;
 
 #[derive(Debug)]
@@ -128,6 +129,17 @@ impl LocalCache {
             BlockKey::with_namespace(&self.namespace, path, range.end - range.start, range.start);
         key.exact_range = true;
         key
+    }
+
+    fn can_cache_exact_range(&self, key: &BlockKey, payload_len: usize) -> bool {
+        if !key.exact_range || payload_len > MAX_EXACT_RANGE_CACHE_ENTRY_SIZE {
+            return false;
+        }
+        match &self.backend {
+            CacheBackend::Memory(memory) => memory.can_store(key, payload_len),
+            CacheBackend::Disk(disk) => disk.can_store(key, payload_len),
+            CacheBackend::External(_) => true,
+        }
     }
 
     async fn get_block(
@@ -374,6 +386,22 @@ mod tests {
         assert!(LocalCacheConfig::from_options(&Options::new())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn test_exact_range_cache_entry_has_a_hard_limit() {
+        let cache = LocalCache::new(LocalCacheConfig {
+            dir: None,
+            namespace: "test".into(),
+            max_size: None,
+            block_size: 1024,
+            whitelist: HashSet::from([FileType::BlobMeta]),
+        })
+        .unwrap();
+        let key = cache.range_key("data.blob", &(0..MAX_EXACT_RANGE_CACHE_ENTRY_SIZE as u64));
+
+        assert!(cache.can_cache_exact_range(&key, MAX_EXACT_RANGE_CACHE_ENTRY_SIZE));
+        assert!(!cache.can_cache_exact_range(&key, MAX_EXACT_RANGE_CACHE_ENTRY_SIZE + 1));
     }
 
     #[test]

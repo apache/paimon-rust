@@ -58,16 +58,21 @@ impl BlockKey {
         }
     }
 
-    pub(super) fn memory_cost(&self, payload_len: usize) -> u64 {
-        let payload_len = payload_len as u64;
+    pub(super) fn checked_memory_cost(&self, payload_len: usize) -> Option<u64> {
+        let payload_len = u64::try_from(payload_len).ok()?;
         if self.exact_range {
             payload_len
-                .saturating_add((self.namespace.len() + self.path.len()) as u64)
-                .saturating_add(256)
-                .max(512)
+                .checked_add(u64::try_from(self.namespace.len()).ok()?)?
+                .checked_add(u64::try_from(self.path.len()).ok()?)?
+                .checked_add(256)
+                .map(|cost| cost.max(512))
         } else {
-            payload_len
+            Some(payload_len)
         }
+    }
+
+    pub(super) fn memory_cost(&self, payload_len: usize) -> u64 {
+        self.checked_memory_cost(payload_len).unwrap_or(u64::MAX)
     }
 
     pub(super) fn matches_path(&self, namespace: &str, path: &str) -> bool {
