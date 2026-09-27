@@ -107,7 +107,7 @@ impl FileIO {
     /// `block_size` controls the aligned ranges presented to the cache.
     /// `whitelist` uses the same comma-separated values as
     /// `local-cache.whitelist`: `meta`, `global-index`, `bucket-index`, `data`,
-    /// and `file-index`.
+    /// `file-index`, and `blob-meta` (exact BLOB metadata ranges).
     pub fn with_file_block_cache(
         mut self,
         cache: Arc<dyn FileBlockCache>,
@@ -688,6 +688,11 @@ impl FileIOBuilder {
 
 #[async_trait::async_trait]
 pub trait FileRead: Send + Sync + Unpin + 'static {
+    /// Read BLOB metadata, allowing caches to retain only the requested range.
+    async fn read_blob_metadata(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        self.read(range).await
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 }
 
@@ -705,6 +710,13 @@ enum InputFileReader {
 
 #[async_trait::async_trait]
 impl FileRead for InputFileReader {
+    async fn read_blob_metadata(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        match self {
+            Self::Direct(reader) => reader.read_blob_metadata(range).await,
+            Self::Cached(reader) => reader.read_blob_metadata(range).await,
+        }
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         match self {
             Self::Direct(reader) => FileRead::read(reader, range).await,
@@ -879,6 +891,9 @@ impl InputFile {
         let Some(cache) = &self.cache else {
             return Ok(op.read(&relative_path).await?.to_bytes());
         };
+        if !cache.cache_blocks(&self.path) {
+            return Ok(op.read(&relative_path).await?.to_bytes());
+        }
         let read_token = cache.read_token(&cache_path);
         let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
             size
@@ -1623,6 +1638,26 @@ mod input_output_test {
             .with_local_cache(cache)
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_blob_metadata_default_file_io_cache_does_not_cache_body() {
+        let source = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let path = source.path().join("data.blob");
+        std::fs::write(&path, b"metabody").unwrap();
+        let location = path.to_str().unwrap();
+        let file_io = setup_cached_fs_file_io(cache_dir.path());
+        let input = file_io.new_input(location).unwrap();
+        let reader = input.reader().await.unwrap();
+        assert_eq!(reader.read_blob_metadata(0..4).await.unwrap(), b"meta"[..]);
+        assert_eq!(reader.read(4..8).await.unwrap(), b"body"[..]);
+        drop(reader);
+        std::fs::remove_file(&path).unwrap();
+        let reader = input.reader().await.unwrap();
+        assert_eq!(reader.read_blob_metadata(0..4).await.unwrap(), b"meta"[..]);
+        assert!(reader.read(4..8).await.is_err());
+        assert!(input.read().await.is_err());
     }
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {

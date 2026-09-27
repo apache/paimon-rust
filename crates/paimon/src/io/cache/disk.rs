@@ -27,15 +27,15 @@ use tokio::io::AsyncWriteExt;
 use super::state::{BlockKey, CacheCoordinator, LogicalPath};
 
 const CACHE_MAGIC: &[u8; 8] = b"PAIMONLC";
-const CACHE_FORMAT_VERSION: u8 = 2;
-const FIXED_HEADER_LEN: usize = CACHE_MAGIC.len() + 1 + 4 + 4 + 8 + 8 + 8;
+const CACHE_FORMAT_VERSION: u8 = 3;
+const FIXED_HEADER_LEN: usize = CACHE_MAGIC.len() + 2 + 4 + 4 + 8 + 8 + 8;
 const CHECKSUM_LEN: usize = 4;
 const MAX_CACHE_KEY_HEADER_LEN: usize = 1024 * 1024;
 
 impl BlockKey {
     pub(super) fn cache_relative_path(&self) -> PathBuf {
         let mut digest = Sha256::new();
-        digest.update([CACHE_FORMAT_VERSION]);
+        digest.update([CACHE_FORMAT_VERSION, u8::from(self.exact_range)]);
         digest.update((self.namespace.len() as u64).to_le_bytes());
         digest.update(self.namespace.as_bytes());
         digest.update((self.path.len() as u64).to_le_bytes());
@@ -199,7 +199,10 @@ impl DiskCache {
     pub(super) async fn put_block(&self, key: &BlockKey, payload: Bytes) {
         self.ensure_recovered().await;
         let encoded = encode_block(key, &payload);
-        let encoded_size = encoded.len() as u64;
+        let mut encoded_size = encoded.len() as u64;
+        if key.exact_range {
+            encoded_size = encoded_size.max(4096);
+        }
         if self
             .state
             .lock()
@@ -257,6 +260,22 @@ impl DiskCache {
             drop(temporary_file);
             let _ = tokio::fs::remove_file(&temporary).await;
             return;
+        }
+        if key.exact_range {
+            if let Ok(metadata) = temporary_file.metadata().await {
+                encoded_size = range_disk_cost(&metadata);
+            }
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .max_size
+                .is_some_and(|limit| encoded_size > limit)
+            {
+                drop(temporary_file);
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return;
+            }
         }
         drop(temporary_file);
         if let Err(error) = tokio::fs::rename(&temporary, &path).await {
@@ -398,8 +417,12 @@ fn prepare_cache_root(root: &Path) -> crate::Result<PathBuf> {
 
 fn collect_evictions(state: &mut CacheState) -> Vec<BlockKey> {
     let mut to_evict = Vec::new();
-    if let Some(max_size) = state.max_size {
-        while state.current_size > max_size {
+    {
+        while state.entries.len() > super::MAX_CACHE_ENTRIES
+            || state
+                .max_size
+                .is_some_and(|limit| state.current_size > limit)
+        {
             let Some((eldest, size)) = state.entries.shift_remove_index(0) else {
                 break;
             };
@@ -594,14 +617,34 @@ fn collect_cache_file(
             return;
         }
     };
+    let cost = if key.exact_range {
+        range_disk_cost(&metadata)
+    } else {
+        metadata.len()
+    };
     discovered.push((
         metadata
             .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
         path,
         key,
-        metadata.len(),
+        cost,
     ));
+}
+
+fn range_disk_cost(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata
+            .len()
+            .max(metadata.blocks().saturating_mul(512))
+            .max(4096)
+    }
+    #[cfg(not(unix))]
+    {
+        metadata.len().saturating_add(4095) / 4096 * 4096
+    }
 }
 
 fn read_block_key_header(path: &Path, encoded_len: u64) -> Result<BlockKey, BlockDecodeError> {
@@ -648,6 +691,7 @@ fn encode_block(key: &BlockKey, payload: &Bytes) -> Vec<u8> {
     );
     encoded.extend_from_slice(CACHE_MAGIC);
     encoded.push(CACHE_FORMAT_VERSION);
+    encoded.push(u8::from(key.exact_range));
     encoded.extend_from_slice(&(namespace.len() as u32).to_le_bytes());
     encoded.extend_from_slice(&(path.len() as u32).to_le_bytes());
     encoded.extend_from_slice(&key.block_size.to_le_bytes());
@@ -694,6 +738,7 @@ fn decode_block_any(encoded: &[u8]) -> Result<(BlockKey, Bytes), BlockDecodeErro
 
 #[derive(Clone, Copy, Debug)]
 struct BlockLayout {
+    exact_range: bool,
     namespace_len: usize,
     path_len: usize,
     block_size: u64,
@@ -716,7 +761,12 @@ fn decode_block_layout(
         return Err(BlockDecodeError("cache block version is unsupported"));
     }
 
-    let mut offset = CACHE_MAGIC.len() + 1;
+    let exact_range = match fixed_header[CACHE_MAGIC.len() + 1] {
+        0 => false,
+        1 => true,
+        _ => return Err(BlockDecodeError("invalid cache range kind")),
+    };
+    let mut offset = CACHE_MAGIC.len() + 2;
     let namespace_len = read_u32(fixed_header, &mut offset)? as usize;
     let path_len = read_u32(fixed_header, &mut offset)? as usize;
     let block_size = read_u64(fixed_header, &mut offset)?;
@@ -745,6 +795,7 @@ fn decode_block_layout(
     }
 
     Ok(BlockLayout {
+        exact_range,
         namespace_len,
         path_len,
         block_size,
@@ -771,10 +822,9 @@ fn decode_block_header(
     let path = std::str::from_utf8(&header[namespace_end..path_end])
         .map_err(|_| BlockDecodeError("cache block path is not UTF-8"))?;
 
-    Ok((
-        BlockKey::with_namespace(namespace, path, layout.block_size, layout.block_index),
-        layout,
-    ))
+    let mut key = BlockKey::with_namespace(namespace, path, layout.block_size, layout.block_index);
+    key.exact_range = layout.exact_range;
+    Ok((key, layout))
 }
 
 fn read_u32(encoded: &[u8], offset: &mut usize) -> Result<u32, BlockDecodeError> {
@@ -803,6 +853,36 @@ fn read_u64(encoded: &[u8], offset: &mut usize) -> Result<u64, BlockDecodeError>
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_metadata_ranges_charge_disk_allocation_and_recover() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::new(directory.path(), Some(8192)).unwrap();
+        let manifest = BlockKey::new("manifest", 8, 0);
+        cache
+            .put_block(&manifest, Bytes::from_static(b"manifest"))
+            .await;
+        let mut key = BlockKey::new("data.blob", 16384, 0);
+        key.exact_range = true;
+        cache.put_block(&key, Bytes::from(vec![0; 16384])).await;
+        assert!(cache.get_block(&manifest).await.is_some());
+        key.block_size = 1;
+        for offset in 0..100 {
+            key.block_index = offset;
+            cache.put_block(&key, Bytes::from_static(b"x")).await;
+        }
+        {
+            let state = cache.state.lock().unwrap();
+            assert!(state.current_size <= 8192);
+            assert!(state.entries.len() <= 2);
+        }
+        drop(cache);
+        let cache = DiskCache::new(directory.path(), Some(8192)).unwrap();
+        assert_eq!(cache.get_block(&key).await.unwrap(), b"x"[..]);
+        let state = cache.state.lock().unwrap();
+        assert!(state.current_size <= 8192);
+        assert!(state.entries.len() <= 2);
+    }
 
     #[test]
     fn test_disk_block_codec_round_trip() {

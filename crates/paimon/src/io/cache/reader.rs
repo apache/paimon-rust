@@ -208,7 +208,59 @@ impl CachedFileReader {
 
 #[async_trait::async_trait]
 impl FileRead for CachedFileReader {
+    async fn read_blob_metadata(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        if !self.cache.cache_blob_metadata(&self.path) || self.cache.cache_blocks(&self.path) {
+            return self.read(range).await;
+        }
+        if range.start >= range.end || range.end > self.file_size {
+            return self.delegate.read(range).await;
+        }
+        let key = self.cache.range_key(&self.path, &range);
+        let expected_len =
+            usize::try_from(range.end - range.start).map_err(|_| crate::Error::DataInvalid {
+                message: "BLOB metadata range is too large".to_string(),
+                source: None,
+            })?;
+        if let Some(payload) = self
+            .cache
+            .get_block(&key, expected_len, &self.read_token)
+            .await
+        {
+            if payload.len() == expected_len {
+                return Ok(payload);
+            }
+        }
+        let load_lock = self.cache.block_load_lock(&key).await;
+        let guard = load_lock.lock().await;
+        let result = async {
+            if let Some(payload) = self
+                .cache
+                .get_block(&key, expected_len, &self.read_token)
+                .await
+            {
+                if payload.len() == expected_len {
+                    return Ok(payload);
+                }
+            }
+            let payload = self.delegate.read(range).await?;
+            if payload.len() == expected_len {
+                // Own only this range, even if the delegate returns a slice of a larger buffer.
+                self.cache
+                    .put_block(&key, Bytes::copy_from_slice(&payload), &self.read_token)
+                    .await;
+            }
+            Ok(payload)
+        }
+        .await;
+        drop(guard);
+        self.cache.release_block_load_lock(&key, &load_lock).await;
+        result
+    }
+
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        if !self.cache.cache_blocks(&self.path) {
+            return self.delegate.read(range).await;
+        }
         if range.start > range.end || range.end > self.file_size {
             return self.delegate.read(range).await;
         }
@@ -247,6 +299,205 @@ mod tests {
     use super::*;
     use crate::common::{CatalogOptions, Options};
     use crate::io::cache::create_local_cache;
+
+    #[tokio::test]
+    async fn test_blob_metadata_exact_ranges_and_body_bypass() {
+        for disk in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let config = || LocalCacheConfig {
+                dir: disk.then(|| directory.path().to_path_buf()),
+                namespace: "blob-test".into(),
+                max_size: Some(64 * 1024),
+                block_size: 1024,
+                whitelist: std::collections::HashSet::from([FileType::BlobMeta]),
+            };
+            let cache = Arc::new(LocalCache::new(config()).unwrap());
+            let delegate = Arc::new(CountingReader {
+                data: Bytes::from_static(b"abcdefgh"),
+                reads: AtomicUsize::new(0),
+            });
+            let reader = CachedFileReader::new(delegate.clone(), "data.blob", 8, cache.clone());
+            assert_eq!(reader.read_blob_metadata(1..3).await.unwrap(), b"bc"[..]);
+            assert_eq!(reader.read_blob_metadata(1..4).await.unwrap(), b"bcd"[..]);
+            assert_eq!(reader.read_blob_metadata(1..3).await.unwrap(), b"bc"[..]);
+            assert_eq!(delegate.reads.load(Ordering::SeqCst), 2);
+            // Values never enter the metadata cache.
+            reader.read(4..8).await.unwrap();
+            reader.read(4..8).await.unwrap();
+            assert_eq!(delegate.reads.load(Ordering::SeqCst), 4);
+            drop(reader);
+            drop(cache);
+            if disk {
+                let cache = Arc::new(LocalCache::new(config()).unwrap());
+                let reader = CachedFileReader::new(delegate.clone(), "data.blob", 8, cache.clone());
+                assert_eq!(reader.read_blob_metadata(1..3).await.unwrap(), b"bc"[..]);
+                assert_eq!(delegate.reads.load(Ordering::SeqCst), 4);
+                cache.invalidate_path("data.blob").await;
+                let reader = CachedFileReader::new(delegate.clone(), "data.blob", 8, cache);
+                reader.read_blob_metadata(1..3).await.unwrap();
+                assert_eq!(delegate.reads.load(Ordering::SeqCst), 5);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blob_metadata_cold_reads_are_coalesced() {
+        let delegate = Arc::new(SlowCountingReader {
+            data: Bytes::from_static(b"abcdefgh"),
+            reads: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(
+            LocalCache::new(LocalCacheConfig {
+                dir: None,
+                namespace: "test".into(),
+                max_size: Some(65536),
+                block_size: 1024,
+                whitelist: std::collections::HashSet::from([FileType::BlobMeta]),
+            })
+            .unwrap(),
+        );
+        let readers: Vec<_> = (0..16)
+            .map(|_| CachedFileReader::new(delegate.clone(), "data.blob", 8, cache.clone()))
+            .collect();
+        let results =
+            futures::future::join_all(readers.iter().map(|reader| reader.read_blob_metadata(1..3)))
+                .await;
+        assert!(results
+            .into_iter()
+            .all(|result| result.unwrap() == b"bc"[..]));
+        assert_eq!(delegate.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(dead_code)]
+    mod blob_utils {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/blob_test_utils.rs"));
+    }
+
+    #[tokio::test]
+    async fn test_blob_descriptor_scans_cache_metadata_not_values() {
+        use crate::arrow::format::{blob::BlobFormatReader, FormatFileReader};
+        use crate::spec::{ArrayType, BlobType, DataField, DataType, MapType, VarCharType};
+        use futures::TryStreamExt;
+        use std::sync::Mutex;
+
+        struct RecordingReader {
+            data: Bytes,
+            ranges: Mutex<Vec<Range<u64>>>,
+        }
+        #[async_trait::async_trait]
+        impl FileRead for RecordingReader {
+            async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+                self.ranges.lock().unwrap().push(range.clone());
+                Ok(self.data.slice(range.start as usize..range.end as usize))
+            }
+        }
+        let blob_type = DataType::Blob(BlobType::new());
+        let mut map_payload = Vec::new();
+        map_payload.extend_from_slice(&0x4D424342_i32.to_le_bytes());
+        map_payload.push(1);
+        map_payload.extend_from_slice(&1_i32.to_le_bytes());
+        map_payload.extend_from_slice(b"keyhello");
+        let key_index = blob_utils::encode_delta_varints(&[3]);
+        let value_index = blob_utils::encode_delta_varints(&[5]);
+        map_payload.extend_from_slice(&key_index);
+        map_payload.extend_from_slice(&value_index);
+        map_payload.extend_from_slice(&(key_index.len() as i32).to_le_bytes());
+        map_payload.extend_from_slice(&(value_index.len() as i32).to_le_bytes());
+        let cases = [
+            (
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/testdata/blob/blob-basic.blob"
+                ))
+                .to_vec(),
+                blob_type.clone(),
+            ),
+            (
+                include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/testdata/blob/blob-array.blob"
+                ))
+                .to_vec(),
+                DataType::Array(ArrayType::new(blob_type.clone())),
+            ),
+            (
+                blob_utils::build_blob_file_bytes(&[Some(&map_payload)]),
+                DataType::Map(MapType::new(
+                    DataType::VarChar(VarCharType::new(100).unwrap()),
+                    blob_type,
+                )),
+            ),
+        ];
+        for disk in [false, true] {
+            for (data, data_type) in &cases {
+                let directory = tempfile::tempdir().unwrap();
+                let cache = Arc::new(
+                    LocalCache::new(LocalCacheConfig {
+                        dir: disk.then(|| directory.path().to_path_buf()),
+                        namespace: "scan".into(),
+                        max_size: Some(65536),
+                        block_size: 1024,
+                        whitelist: std::collections::HashSet::from([FileType::BlobMeta]),
+                    })
+                    .unwrap(),
+                );
+                let delegate = Arc::new(RecordingReader {
+                    data: Bytes::copy_from_slice(data),
+                    ranges: Mutex::new(Vec::new()),
+                });
+                let fields = [DataField::new(0, "value".into(), data_type.clone())];
+                let scan = |descriptor| {
+                    let reader = CachedFileReader::new(
+                        delegate.clone(),
+                        "data.blob",
+                        data.len() as u64,
+                        cache.clone(),
+                    );
+                    let fields = fields.clone();
+                    async move {
+                        BlobFormatReader::new("data.blob".into(), descriptor)
+                            .read_batch_stream(
+                                Box::new(reader),
+                                data.len() as u64,
+                                &fields,
+                                None,
+                                Some(1024),
+                                None,
+                            )
+                            .await
+                            .unwrap()
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .unwrap()
+                    }
+                };
+                let first = scan(true).await;
+                let reads = delegate.ranges.lock().unwrap().clone();
+                assert!(!reads.is_empty());
+                for needle in [b"hello", b"world"] {
+                    for (offset, _) in data
+                        .windows(needle.len())
+                        .enumerate()
+                        .filter(|(_, bytes)| *bytes == needle)
+                    {
+                        assert!(reads.iter().all(|range| range.end <= offset as u64
+                            || range.start >= (offset + needle.len()) as u64));
+                    }
+                }
+                assert_eq!(scan(true).await, first);
+                assert_eq!(delegate.ranges.lock().unwrap().len(), reads.len());
+                let materialized = scan(false).await;
+                assert_eq!(
+                    materialized
+                        .iter()
+                        .map(|batch| batch.num_rows())
+                        .sum::<usize>(),
+                    first.iter().map(|batch| batch.num_rows()).sum::<usize>()
+                );
+                assert!(delegate.ranges.lock().unwrap().len() > reads.len());
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct CountingReader {

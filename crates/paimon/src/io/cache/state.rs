@@ -23,8 +23,10 @@ use std::sync::{Arc, Mutex, Weak};
 pub(super) struct BlockKey {
     pub(super) namespace: String,
     pub(super) path: String,
+    // Exact ranges use length/start; aligned blocks use block size/index.
     pub(super) block_size: u64,
     pub(super) block_index: u64,
+    pub(super) exact_range: bool,
 }
 
 impl BlockKey {
@@ -44,6 +46,27 @@ impl BlockKey {
             path: path.into(),
             block_size,
             block_index,
+            exact_range: false,
+        }
+    }
+
+    pub(super) fn offset(&self) -> Option<u64> {
+        if self.exact_range {
+            Some(self.block_index)
+        } else {
+            self.block_index.checked_mul(self.block_size)
+        }
+    }
+
+    pub(super) fn memory_cost(&self, payload_len: usize) -> u64 {
+        let payload_len = payload_len as u64;
+        if self.exact_range {
+            payload_len
+                .saturating_add((self.namespace.len() + self.path.len()) as u64)
+                .saturating_add(256)
+                .max(512)
+        } else {
+            payload_len
         }
     }
 

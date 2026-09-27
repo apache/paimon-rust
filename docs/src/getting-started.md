@@ -313,7 +313,7 @@ options.set(CatalogOptions::LOCAL_CACHE_MAX_SIZE, "20 GiB");
 options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "1 MiB");
 options.set(
     CatalogOptions::LOCAL_CACHE_WHITELIST,
-    "meta,global-index",
+    "meta,global-index,blob-meta",
 );
 let catalog = CatalogFactory::create(options).await?;
 ```
@@ -324,7 +324,13 @@ let catalog = CatalogFactory::create(options).await?;
 | `local-cache.dir` | none | Optional base directory. When set, Paimon uses a persistent disk cache in a private versioned child directory; otherwise it uses memory. |
 | `local-cache.max-size` | unlimited | Maximum cache size. Memory caches count payload bytes; disk caches count encoded bytes. Values accept byte units such as `512 MiB` or `20 GiB`. |
 | `local-cache.block-size` | `1 MiB` | Block size used for cached range reads. |
-| `local-cache.whitelist` | `meta,global-index` | Comma-separated eligible types: `meta`, `global-index`, `bucket-index`, `data`, and `file-index`. |
+| `local-cache.whitelist` | `meta,global-index,blob-meta` | Cache categories: `meta`, `global-index`, `bucket-index`, `data`, `file-index`, and `blob-meta`. |
+
+`blob-meta` caches exact BLOB footer/index and ARRAY/MAP metadata ranges, including MAP keys,
+without caching value bodies. Metadata ranges share the cache budget, with estimated memory
+overhead (at least 512 bytes) or disk allocation (at least 4 KiB) charged per entry. Built-in
+caches hold at most 65,536 entries and skip entries larger than the budget. `data` still enables
+ordinary block caching. This caches bytes used to build descriptors, not decoded descriptors.
 
 Each catalog owns its in-memory cache for the catalog's lifetime. Disk caches
 are reused after process restarts. Cache keys include a catalog-configuration

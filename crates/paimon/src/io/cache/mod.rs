@@ -34,7 +34,8 @@ use std::sync::Arc;
 use disk::DiskCache;
 pub(super) use reader::CachedFileReader;
 
-const CACHE_DIRECTORY_NAME: &str = "paimon-local-cache-v2";
+const CACHE_DIRECTORY_NAME: &str = "paimon-local-cache-v3";
+const MAX_CACHE_ENTRIES: usize = 65_536;
 const DEFAULT_FILE_SIZE_CAPACITY: usize = 65_536;
 
 #[derive(Debug)]
@@ -111,7 +112,22 @@ impl LocalCache {
     }
 
     pub(super) fn is_cacheable(&self, path: &str) -> bool {
-        !FileType::is_mutable(path) && self.whitelist.contains(&FileType::classify(path))
+        !FileType::is_mutable(path) && (self.cache_blocks(path) || self.cache_blob_metadata(path))
+    }
+
+    pub(super) fn cache_blocks(&self, path: &str) -> bool {
+        self.whitelist.contains(&FileType::classify(path))
+    }
+
+    pub(super) fn cache_blob_metadata(&self, path: &str) -> bool {
+        path.ends_with(".blob") && self.whitelist.contains(&FileType::BlobMeta)
+    }
+
+    fn range_key(&self, path: &str, range: &std::ops::Range<u64>) -> BlockKey {
+        let mut key =
+            BlockKey::with_namespace(&self.namespace, path, range.end - range.start, range.start);
+        key.exact_range = true;
+        key
     }
 
     async fn get_block(
@@ -129,7 +145,7 @@ impl LocalCache {
             CacheBackend::Memory(memory) => memory.get_block(key),
             CacheBackend::Disk(disk) => disk.get_block(key).await,
             CacheBackend::External(cache) => {
-                let start = key.block_index.checked_mul(key.block_size)?;
+                let start = key.offset()?;
                 let length = u64::try_from(expected_len).ok()?;
                 let end = start.checked_add(length)?;
                 cache.get(&key.path, start..end).await
@@ -152,7 +168,7 @@ impl LocalCache {
             CacheBackend::Memory(memory) => memory.put_block(key, payload),
             CacheBackend::Disk(disk) => disk.put_block(key, payload).await,
             CacheBackend::External(cache) => {
-                if let Some(offset) = key.block_index.checked_mul(key.block_size) {
+                if let Some(offset) = key.offset() {
                     cache.put(&key.path, offset, payload).await;
                 }
             }
@@ -305,7 +321,7 @@ impl LocalCacheConfig {
         let whitelist = options
             .get(CatalogOptions::LOCAL_CACHE_WHITELIST)
             .map(String::as_str)
-            .unwrap_or("meta,global-index");
+            .unwrap_or("meta,global-index,blob-meta");
 
         Ok(Some(Self {
             dir,
@@ -372,7 +388,7 @@ mod tests {
         assert_eq!(config.block_size, 1024 * 1024);
         assert_eq!(
             config.whitelist,
-            HashSet::from([FileType::Meta, FileType::GlobalIndex])
+            HashSet::from([FileType::Meta, FileType::GlobalIndex, FileType::BlobMeta])
         );
     }
 
@@ -391,7 +407,11 @@ mod tests {
         assert_eq!(config.block_size, 1024 * 1024);
         assert_eq!(
             config.whitelist,
-            std::collections::HashSet::from([FileType::Meta, FileType::GlobalIndex])
+            std::collections::HashSet::from([
+                FileType::Meta,
+                FileType::GlobalIndex,
+                FileType::BlobMeta
+            ])
         );
     }
 

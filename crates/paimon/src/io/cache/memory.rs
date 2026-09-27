@@ -50,7 +50,7 @@ impl MemoryCache {
     }
 
     pub(super) fn put_block(&self, key: &BlockKey, payload: Bytes) {
-        let payload_size = payload.len() as u64;
+        let payload_size = key.memory_cost(payload.len());
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state
             .max_size
@@ -59,24 +59,31 @@ impl MemoryCache {
             return;
         }
         if let Some(previous) = state.entries.put(key.clone(), payload) {
-            state.current_size = state.current_size.saturating_sub(previous.len() as u64);
+            state.current_size = state
+                .current_size
+                .saturating_sub(key.memory_cost(previous.len()));
         }
         state.current_size = state.current_size.saturating_add(payload_size);
-        while state
-            .max_size
-            .is_some_and(|max_size| state.current_size > max_size)
+        while state.entries.len() > super::MAX_CACHE_ENTRIES
+            || state
+                .max_size
+                .is_some_and(|max_size| state.current_size > max_size)
         {
-            let Some((_, payload)) = state.entries.pop_lru() else {
+            let Some((key, payload)) = state.entries.pop_lru() else {
                 break;
             };
-            state.current_size = state.current_size.saturating_sub(payload.len() as u64);
+            state.current_size = state
+                .current_size
+                .saturating_sub(key.memory_cost(payload.len()));
         }
     }
 
     pub(super) fn remove_block(&self, key: &BlockKey) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(payload) = state.entries.pop(key) {
-            state.current_size = state.current_size.saturating_sub(payload.len() as u64);
+            state.current_size = state
+                .current_size
+                .saturating_sub(key.memory_cost(payload.len()));
         }
     }
 
@@ -100,7 +107,9 @@ impl MemoryCache {
             .collect::<Vec<_>>();
         for key in keys {
             if let Some(payload) = state.entries.pop(&key) {
-                state.current_size = state.current_size.saturating_sub(payload.len() as u64);
+                state.current_size = state
+                    .current_size
+                    .saturating_sub(key.memory_cost(payload.len()));
             }
         }
     }
@@ -109,6 +118,42 @@ impl MemoryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_metadata_range_entry_count_is_bounded_without_byte_limit() {
+        let cache = MemoryCache::new(None);
+        let mut key = BlockKey::new("data.blob", 1, 0);
+        key.exact_range = true;
+        for offset in 0..super::super::MAX_CACHE_ENTRIES + 1 {
+            key.block_index = offset as u64;
+            cache.put_block(&key, Bytes::from_static(b"x"));
+        }
+        assert_eq!(
+            cache.state.lock().unwrap().entries.len(),
+            super::super::MAX_CACHE_ENTRIES
+        );
+        key.block_index = 0;
+        assert!(cache.get_block(&key).is_none());
+    }
+
+    #[test]
+    fn test_metadata_ranges_have_bounded_cost_and_skip_oversized_entries() {
+        let cache = MemoryCache::new(Some(4096));
+        let manifest = BlockKey::new("manifest", 8, 0);
+        cache.put_block(&manifest, Bytes::from_static(b"manifest"));
+        let mut key = BlockKey::new("data.blob", 8192, 0);
+        key.exact_range = true;
+        cache.put_block(&key, Bytes::from(vec![0; 8192]));
+        assert!(cache.get_block(&manifest).is_some());
+        key.block_size = 1;
+        for offset in 0..1000 {
+            key.block_index = offset;
+            cache.put_block(&key, Bytes::from_static(b"x"));
+        }
+        let state = cache.state.lock().unwrap();
+        assert!(state.current_size <= 4096);
+        assert!(state.entries.len() <= 8);
+    }
 
     #[test]
     fn test_memory_cache_refreshes_lru_and_evicts_by_payload_bytes() {

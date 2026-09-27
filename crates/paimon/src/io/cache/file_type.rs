@@ -24,6 +24,7 @@ pub(super) enum FileType {
     BucketIndex,
     GlobalIndex,
     FileIndex,
+    BlobMeta,
 }
 
 impl FileType {
@@ -76,11 +77,12 @@ impl FileType {
                 "bucket-index" => Some(Self::BucketIndex),
                 "data" => Some(Self::Data),
                 "file-index" => Some(Self::FileIndex),
+                "blob-meta" => Some(Self::BlobMeta),
                 "" => None,
                 unknown => {
                     log::warn!(
                         "Unknown local-cache.whitelist value '{}'; supported values are \
-                         meta, global-index, bucket-index, data, file-index",
+                         meta, global-index, bucket-index, data, file-index, blob-meta",
                         unknown
                     );
                     None

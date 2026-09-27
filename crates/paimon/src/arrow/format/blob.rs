@@ -1173,7 +1173,7 @@ async fn read_blob_array_range(
 ) -> crate::Result<Bytes> {
     let expected_length = range.end - range.start;
     let bytes = reader
-        .read(range.clone())
+        .read_blob_metadata(range.clone())
         .await
         .map_err(|e| Error::UnexpectedError {
             message: format!("Failed to read ARRAY<BLOB> {part} range {range:?}: {e}"),
@@ -1613,7 +1613,7 @@ async fn read_blob_map_range(
     part: &str,
 ) -> crate::Result<Bytes> {
     let expected = range.end - range.start;
-    let bytes = reader.read(range.clone()).await?;
+    let bytes = reader.read_blob_metadata(range.clone()).await?;
     if bytes.len() as u64 != expected {
         return Err(Error::DataInvalid {
             message: format!(
@@ -1670,7 +1670,7 @@ impl BlobFileIndex {
         }
 
         let footer = reader
-            .read(file_size - BLOB_FOOTER_SIZE..file_size)
+            .read_blob_metadata(file_size - BLOB_FOOTER_SIZE..file_size)
             .await
             .map_err(|e| Error::UnexpectedError {
                 message: format!("Failed to read blob footer: {e}"),
@@ -1712,7 +1712,7 @@ impl BlobFileIndex {
         let index_start = file_size - BLOB_FOOTER_SIZE - index_length;
         let data_region_end = index_start;
         let index_bytes = reader
-            .read(index_start..index_start + index_length)
+            .read_blob_metadata(index_start..index_start + index_length)
             .await
             .map_err(|e| Error::UnexpectedError {
                 message: format!("Failed to read blob index bytes: {e}"),
