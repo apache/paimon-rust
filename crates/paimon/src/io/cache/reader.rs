@@ -275,6 +275,7 @@ mod tests {
                 max_size: None,
                 block_size: 4,
                 whitelist: std::collections::HashSet::from([FileType::Meta]),
+                excluded_extensions: std::collections::HashSet::new(),
             })
             .unwrap(),
         );
@@ -325,6 +326,7 @@ mod tests {
                 max_size: None,
                 block_size: 4,
                 whitelist: std::collections::HashSet::from([FileType::Meta]),
+                excluded_extensions: std::collections::HashSet::new(),
             })
             .unwrap(),
         );
@@ -355,6 +357,7 @@ mod tests {
             max_size: None,
             block_size: 4,
             whitelist: std::collections::HashSet::from([FileType::Meta]),
+            excluded_extensions: std::collections::HashSet::new(),
         };
         let first_reader = CachedFileReader::new(
             delegate.clone(),
@@ -402,6 +405,7 @@ mod tests {
                 max_size: None,
                 block_size: 4,
                 whitelist: std::collections::HashSet::from([FileType::Meta]),
+                excluded_extensions: std::collections::HashSet::new(),
             })
             .unwrap(),
         );
@@ -451,6 +455,7 @@ mod tests {
                 max_size: None,
                 block_size: 4,
                 whitelist: std::collections::HashSet::from([FileType::Meta]),
+                excluded_extensions: std::collections::HashSet::new(),
             })
             .unwrap(),
         );
@@ -461,6 +466,7 @@ mod tests {
                 max_size: None,
                 block_size: 4,
                 whitelist: std::collections::HashSet::from([FileType::Meta]),
+                excluded_extensions: std::collections::HashSet::new(),
             })
             .unwrap(),
         );
@@ -512,6 +518,7 @@ mod tests {
             max_size: None,
             block_size: 4,
             whitelist: std::collections::HashSet::from([FileType::Meta]),
+            excluded_extensions: std::collections::HashSet::new(),
         };
         let cache_a = Arc::new(LocalCache::new(config()).unwrap());
         let cache_b = Arc::new(LocalCache::new(config()).unwrap());
@@ -658,6 +665,7 @@ mod tests {
                 max_size: None,
                 block_size: 4,
                 whitelist: std::collections::HashSet::from([FileType::Meta]),
+                excluded_extensions: std::collections::HashSet::new(),
             })
             .unwrap(),
         );
@@ -692,6 +700,7 @@ mod tests {
                 max_size: None,
                 block_size: 4,
                 whitelist: std::collections::HashSet::from([FileType::Meta]),
+                excluded_extensions: std::collections::HashSet::new(),
             })
             .unwrap(),
         );
@@ -713,6 +722,7 @@ mod tests {
                 max_size: None,
                 block_size: 4,
                 whitelist: std::collections::HashSet::from([FileType::Meta]),
+                excluded_extensions: std::collections::HashSet::new(),
             })
             .unwrap(),
         );

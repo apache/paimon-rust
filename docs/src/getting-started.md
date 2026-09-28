@@ -324,9 +324,10 @@ let catalog = CatalogFactory::create(options).await?;
 | `local-cache.dir` | none | Optional base directory. When set, Paimon uses a persistent disk cache in a private versioned child directory; otherwise it uses memory. |
 | `local-cache.max-size` | unlimited | Maximum cache size. Memory caches count payload bytes; disk caches count encoded bytes. Values accept byte units such as `512 MiB` or `20 GiB`. |
 | `local-cache.block-size` | `1 MiB` | Block size used for cached range reads. |
-| `local-cache.whitelist` | `meta,global-index` | Comma-separated eligible types: `meta`, `global-index`, `bucket-index`, `data`, `parquet-data`, and `file-index`. |
+| `local-cache.whitelist` | `meta,global-index` | Comma-separated eligible types: `meta`, `global-index`, `bucket-index`, `data`, and `file-index`. |
+| `local-cache.exclude-extensions` | empty | Comma-separated file extensions to bypass, even when whitelisted. |
 
-Use `meta,global-index,parquet-data` to cache Parquet without BLOB bodies. `data` still includes all data formats.
+Use `meta,global-index,data` with `local-cache.exclude-extensions=blob` to cache data files except BLOB bodies.
 
 Each catalog owns its in-memory cache for the catalog's lifetime. Disk caches
 are reused after process restarts. Cache keys include a catalog-configuration
