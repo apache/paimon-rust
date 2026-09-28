@@ -2025,6 +2025,10 @@ impl SQLContext {
         ignore_if_table_not_exists: bool,
         enable_ident_normalization: bool,
     ) -> DFResult<DataFrame> {
+        // DROP PARTITION commits a data-deleting snapshot, so — like the other
+        // write operations — it must not run while the session is pinned to a
+        // historical snapshot via a time-travel scan option.
+        self.ensure_no_time_travel_for_write("ALTER TABLE DROP PARTITION")?;
         if requests
             .iter()
             .any(|(expressions, _)| expressions.is_empty())
@@ -7677,6 +7681,40 @@ mod tests {
             }
         }
         assert_eq!(rows, vec![("a".to_string(), 1), ("a".to_string(), 2)]);
+    }
+
+    #[tokio::test]
+    async fn test_drop_partition_rejected_under_time_travel() {
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
+
+        sql_context
+            .sql("CREATE TABLE paimon.test_db.tt (PT VARCHAR, ID INT) PARTITIONED BY (PT)")
+            .await
+            .unwrap();
+        sql_context
+            .sql("INSERT INTO paimon.test_db.tt VALUES ('a', 1), ('b', 2)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // Pin the session to a historical snapshot, then attempt a destructive
+        // partition drop: it must be rejected rather than committing against a
+        // stale read view.
+        sql_context
+            .sql("SET 'paimon.scan.snapshot-id' = '1'")
+            .await
+            .unwrap();
+        let err = sql_context
+            .sql("ALTER TABLE paimon.test_db.tt DROP PARTITION (PT = 'b')")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ALTER TABLE DROP PARTITION")
+                && err.to_string().contains("time-travel option"),
+            "expected time-travel guard error, got: {err}"
+        );
     }
 
     #[tokio::test]
