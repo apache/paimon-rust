@@ -130,6 +130,9 @@ where
         let _guard = EntryGuard::new(self, key.clone(), Arc::clone(&entry));
 
         let value = entry.value.get_or_try_init(load).await.map(Arc::clone)?;
+        if entry.weight.load(Ordering::Relaxed) != entry.base_weight {
+            return Ok(value);
+        }
         let loaded_weight = entry
             .base_weight
             .saturating_add(value_weight(value.as_ref()).max(1));
@@ -225,6 +228,34 @@ mod tests {
         }
 
         assert_eq!(loads.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn cache_hit_does_not_recalculate_weight() {
+        let cache = FileMetadataCache::<String, usize>::new(1024, 2);
+        let loads = AtomicUsize::new(0);
+        let weights = AtomicUsize::new(0);
+
+        for _ in 0..2 {
+            cache
+                .get_or_try_insert_with(
+                    Some("shared".to_string()),
+                    6,
+                    || async {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(Arc::new(7))
+                    },
+                    |_| {
+                        weights.fetch_add(1, Ordering::Relaxed);
+                        7
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+        assert_eq!(weights.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
