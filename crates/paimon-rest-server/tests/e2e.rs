@@ -324,6 +324,48 @@ async fn test_alter_table_columns() {
         )
         .await
         .is_err());
+
+    // Column errors survive the REST round trip as column errors (not table
+    // errors): adding an existing column yields `ColumnAlreadyExist`, and a
+    // change touching a missing column yields `ColumnNotExist`.
+    let dup = cat
+        .alter_table(
+            &ident,
+            vec![SchemaChange::add_column(
+                "age".to_string(),
+                DataType::Int(IntType::new()),
+            )],
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(dup, paimon::Error::ColumnAlreadyExist { .. }),
+        "adding an existing column should map to ColumnAlreadyExist, got {dup:?}"
+    );
+
+    let missing_col = cat
+        .alter_table(
+            &ident,
+            vec![SchemaChange::drop_column("ghost".to_string())],
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(missing_col, paimon::Error::ColumnNotExist { .. }),
+        "dropping a missing column should map to ColumnNotExist, got {missing_col:?}"
+    );
+
+    // A missing column is swallowed when `ignore_if_not_exists` is set, exactly
+    // like a missing table.
+    cat.alter_table(
+        &ident,
+        vec![SchemaChange::drop_column("ghost".to_string())],
+        true,
+    )
+    .await
+    .unwrap();
 }
 
 // ==================== list partitions over REST ====================
