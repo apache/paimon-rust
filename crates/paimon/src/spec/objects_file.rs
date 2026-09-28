@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use apache_avro::{from_value, to_value, Codec, Reader, Schema, Writer, ZstandardSettings};
+use apache_avro::{
+    from_value, to_value, Codec, DeflateSettings, Reader, Schema, Writer, ZstandardSettings,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -70,6 +72,7 @@ pub(crate) fn avro_codec(compression: &str) -> crate::Result<Codec> {
     match compression.to_ascii_lowercase().as_str() {
         "zstd" | "zstandard" => Ok(Codec::Zstandard(ZstandardSettings::default())),
         "null" | "none" | "uncompressed" => Ok(Codec::Null),
+        "deflate" => Ok(Codec::Deflate(DeflateSettings::default())),
         "snappy" => Ok(Codec::Snappy),
         other => Err(crate::Error::Unsupported {
             message: format!("Unsupported Avro compression: {other}"),
@@ -330,6 +333,18 @@ mod tests {
             assert_record_field_order(stats, &["_MIN_VALUES", "_MAX_VALUES", "_NULL_COUNTS"]);
         }
         let decoded = from_avro_bytes::<ManifestEntry>(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_manifest_entry_deflate() {
+        // Writing with the deflate codec and reading back through the fast
+        // decoder must round-trip, exercising both the write-side codec mapping
+        // and the read-side deflate decompression.
+        let original = vec![manifest_entry()];
+        let bytes =
+            to_avro_bytes_with_compression(MANIFEST_ENTRY_SCHEMA, &original, "deflate").unwrap();
+        let decoded = from_avro_bytes_fast::<ManifestEntry>(&bytes).unwrap();
         assert_eq!(original, decoded);
     }
 
