@@ -393,7 +393,12 @@ fn format_partition_value(
 
         DataType::Char(_) | DataType::VarChar(_) => {
             let s = row.get_string(pos)?;
-            if s.trim().is_empty() {
+            // Java folds a partition value to the default name when
+            // `StringUtils.isNullOrWhitespaceOnly` holds. Rust `str::trim` uses
+            // a different whitespace set (e.g. it trims NBSP / U+2007 / U+202F,
+            // which Java does not, and keeps U+001C-U+001F, which Java trims),
+            // so reuse the Java-matching predicate the Binary arm already uses.
+            if is_java_whitespace_only(s) {
                 return Ok(default_partition_name.to_string());
             }
             s.to_string()
@@ -1166,6 +1171,35 @@ mod tests {
             |b| b.write_string(0, "   "),
             "dt=__DEFAULT_PARTITION__/",
             true,
+        );
+    }
+
+    #[test]
+    fn test_string_partition_whitespace_matches_java() {
+        // U+001C (file separator) is whitespace to Java's `Character.isWhitespace`
+        // but not to Rust `str::trim`; Java folds such a value to the default
+        // partition name, so we must too.
+        assert_single_partition(
+            "dt",
+            DataType::VarChar(VarCharType::default()),
+            |b| b.write_string(0, "\u{001C}"),
+            "dt=__DEFAULT_PARTITION__/",
+            true,
+        );
+
+        // A non-breaking space (U+00A0) is whitespace to Rust `str::trim` but not
+        // to Java, so Java keeps it as the partition value rather than folding it.
+        let fields = vec![make_field("dt", DataType::VarChar(VarCharType::default()))];
+        let keys = vec!["dt".to_string()];
+        let computer =
+            PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, true).unwrap();
+        let mut builder = TestRowBuilder::new(1);
+        builder.write_string(0, "\u{00A0}");
+        let row = builder.build();
+        let result = computer.generate_partition_path(&row).unwrap();
+        assert_ne!(
+            result, "dt=__DEFAULT_PARTITION__/",
+            "a non-breaking space must not fold to the default partition (Java keeps it)"
         );
     }
 
