@@ -241,6 +241,7 @@ async fn read_all_manifest_entries(
     bucket_function_type: BucketFunctionType,
     row_range_index: Option<&RowRangeIndex>,
     manifest_sidecar_enabled: bool,
+    manifest_parallelism: usize,
     trace: Option<&mut ScanTrace>,
 ) -> crate::Result<Vec<ManifestEntry>> {
     let incremental = matches!(&source, ManifestListSource::AppendDeltas(_));
@@ -256,7 +257,7 @@ async fn read_all_manifest_entries(
                 .collect::<Vec<_>>();
             let delta = futures::stream::iter(names)
                 .map(|name| async move { read_manifest_list(file_io, table_path, &name).await })
-                .buffered(64)
+                .buffered(manifest_parallelism)
                 .try_fold(Vec::new(), |mut files, next| async move {
                     files.extend(next);
                     Ok(files)
@@ -398,10 +399,10 @@ async fn read_all_manifest_entries(
                 Ok::<_, crate::Error>((filtered, counters))
             }
         })
-        // Keep manifest read concurrency bounded. `try_fold` releases each
-        // yielded result after merging it, so peak retained results are the
-        // accumulator plus at most this bounded set of in-flight reads.
-        .buffered(64)
+        // Keep manifest read concurrency bounded by the table option. `try_fold`
+        // releases each yielded result after merging it, so peak retained results
+        // are the accumulator plus at most this bounded set of in-flight reads.
+        .buffered(manifest_parallelism)
         .try_fold(
             (Vec::new(), ManifestReadCounters::default()),
             |(mut all_entries, mut counters), (entries, manifest_counters)| async move {
@@ -1672,6 +1673,7 @@ impl<'a> PaimonTableScan<'a> {
             bucket_function_type,
             row_range_index,
             core_options.manifest_sidecar_enabled(),
+            core_options.scan_manifest_parallelism()?,
             trace,
         )
         .await?;
@@ -6332,6 +6334,33 @@ mod tests {
             .unwrap();
         assert!(changelog.splits().is_empty());
         assert_eq!(changelog.snapshot_id(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_plan_rejects_invalid_scan_manifest_parallelism() {
+        let table =
+            scan_trace_test_table("memory:/invalid_scan_manifest_parallelism").copy_with_options(
+                HashMap::from([("scan.manifest.parallelism".to_string(), "0".to_string())]),
+            );
+        setup_scan_trace_dirs(&table).await;
+
+        TableCommit::new(table.clone(), "manifest-parallelism-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![stats_trace_file("parallelism.parquet", 1, 1)],
+            )])
+            .await
+            .unwrap();
+
+        let error = table
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::DataInvalid { message, .. }
+            if message.contains("scan.manifest.parallelism")));
     }
 
     #[tokio::test]
