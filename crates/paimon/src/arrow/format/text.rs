@@ -25,7 +25,8 @@ use crate::spec::DataField;
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, RecordBatch, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, LargeBinaryArray,
+    RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
@@ -1081,6 +1082,22 @@ fn csv_cast_column(column: &ArrayRef, target: &DataType) -> crate::Result<ArrayR
             _ => unreachable!(),
         });
     }
+    if matches!(target, DataType::Boolean) {
+        // Java `CsvParser` reads BOOLEAN via `Boolean.parseBoolean`: only "true"
+        // (case-insensitive) is true, every other non-null token is false, and
+        // it never yields null. arrow-cast instead maps "1"/"yes"/"t"/"on"/"y"
+        // to true and unrecognized tokens (e.g. "2", "invalid") to null, so the
+        // same CSV file read through Rust would flip boolean values or turn them
+        // null relative to Java. Match Java so a format table reads the same
+        // across engines. (Null fields are already `None` from CSV decoding and
+        // stay null.)
+        let values = column.as_any().downcast_ref::<StringArray>().unwrap();
+        let booleans: BooleanArray = values
+            .iter()
+            .map(|value| value.map(|value| value.eq_ignore_ascii_case("true")))
+            .collect();
+        return Ok(Arc::new(booleans));
+    }
     arrow_cast::cast(column, target).map_err(arrow_error)
 }
 
@@ -1428,6 +1445,42 @@ mod tests {
         assert_eq!(
             value["outer"]["flags"],
             serde_json::json!(["false", null, "true"])
+        );
+    }
+
+    #[test]
+    fn csv_boolean_matches_java_parse_boolean() {
+        // Java `CsvParser` reads BOOLEAN via `Boolean.parseBoolean`: only "true"
+        // (case-insensitive) is true, every other non-null token is false, and
+        // null stays null. arrow-cast would instead read "1"/"yes"/"t" as true
+        // and "invalid" as null, flipping values for the same CSV file.
+        let input: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("true"),
+            Some("TRUE"),
+            Some("1"),
+            Some("yes"),
+            Some("t"),
+            Some("invalid"),
+            Some("false"),
+            Some("0"),
+            None,
+        ]));
+        let result = csv_cast_column(&input, &DataType::Boolean).unwrap();
+        let booleans = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let got: Vec<Option<bool>> = booleans.iter().collect();
+        assert_eq!(
+            got,
+            vec![
+                Some(true),  // "true"
+                Some(true),  // "TRUE"
+                Some(false), // "1"  (arrow-cast would say true)
+                Some(false), // "yes" (arrow-cast would say true)
+                Some(false), // "t"  (arrow-cast would say true)
+                Some(false), // "invalid" (arrow-cast would say null)
+                Some(false), // "false"
+                Some(false), // "0"
+                None,        // null stays null
+            ]
         );
     }
 }
