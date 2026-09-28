@@ -61,16 +61,18 @@ pub struct OssStorageConfig {
     service: OssConfig,
     retry_count: usize,
     retry_interval: Duration,
+    user_agent: String,
 }
 
 /// Parse paimon catalog options into an [`OssStorageConfig`].
 ///
 /// Extracts OSS-related configuration keys (endpoint, access key, secret key,
-/// optional security token, and retry settings) from the provided properties.
+/// optional security token, retry and User-Agent settings) from the provided properties.
 ///
 /// Returns an error if any required configuration key is missing.
 pub(crate) fn oss_config_parse(mut props: HashMap<String, String>) -> Result<OssStorageConfig> {
     let mut cfg = OssConfig::default();
+    let user_agent = super::user_agent::oss_user_agent(&props);
 
     cfg.endpoint = Some(
         props
@@ -107,6 +109,7 @@ pub(crate) fn oss_config_parse(mut props: HashMap<String, String>) -> Result<Oss
         service: cfg,
         retry_count,
         retry_interval: Duration::from_millis(retry_interval_millis),
+        user_agent,
     })
 }
 
@@ -140,17 +143,17 @@ pub(crate) fn oss_config_build(cfg: &OssStorageConfig, path: &str) -> Result<Ope
         .with_min_delay(cfg.retry_interval)
         .with_max_times(cfg.retry_count)
         .with_jitter();
-    Ok(super::with_http_transport(Operator::new(builder)?).layer(retry))
+    Ok(super::with_http_transport(Operator::new(builder)?, &cfg.user_agent).layer(retry))
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use axum::body::Body;
     use axum::extract::State;
-    use axum::http::{Response, StatusCode};
+    use axum::http::{header, HeaderMap, Response, StatusCode};
     use axum::routing::get;
     use axum::Router;
 
@@ -161,6 +164,7 @@ mod tests {
             service,
             retry_count: DEFAULT_OSS_RETRY_COUNT,
             retry_interval: Duration::from_millis(1),
+            user_agent: crate::io::user_agent::default_user_agent(),
         }
     }
 
@@ -194,6 +198,18 @@ mod tests {
     async fn always_fail(State(attempts): State<Arc<AtomicUsize>>) -> Response<Body> {
         attempts.fetch_add(1, Ordering::SeqCst);
         temporary_failure()
+    }
+
+    async fn record_user_agent(
+        State(user_agents): State<Arc<Mutex<Vec<String>>>>,
+        headers: HeaderMap,
+    ) -> StatusCode {
+        let user_agent = headers
+            .get(header::USER_AGENT)
+            .map(|value| value.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        user_agents.lock().unwrap().push(user_agent);
+        StatusCode::NOT_FOUND
     }
 
     #[test]
@@ -291,5 +307,45 @@ mod tests {
         let op = oss_config_build(&cfg, "oss://bucket/path").unwrap();
         assert!(op.read("object").await.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_oss_sends_configured_user_agent() {
+        use crate::io::user_agent::{
+            DLF_ACCESS_TRACKING_EXTENDED_INFO, OSS_USER_AGENT_EXTENDED, USER_AGENT_EXTENDED,
+            USER_AGENT_FEATURES,
+        };
+
+        let user_agents = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(record_user_agent)
+            .with_state(user_agents.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut props = required_props();
+        props.insert(OSS_ENDPOINT.to_string(), format!("http://{address}"));
+        props.insert(USER_AGENT_FEATURES.to_string(), "DataFusion".to_string());
+        props.insert(USER_AGENT_EXTENDED.to_string(), "overridden".to_string());
+        props.insert(OSS_USER_AGENT_EXTENDED.to_string(), "vvr".to_string());
+        props.insert(
+            DLF_ACCESS_TRACKING_EXTENDED_INFO.to_string(),
+            "uid/123".to_string(),
+        );
+        let mut cfg = oss_config_parse(props).unwrap();
+        cfg.service.addressing_style = Some("path".to_string());
+        cfg.service.skip_signature = true;
+
+        let op = oss_config_build(&cfg, "oss://bucket/path").unwrap();
+        assert!(!op.exists("object").await.unwrap());
+        assert_eq!(
+            *user_agents.lock().unwrap(),
+            vec![format!(
+                "paimon-rust/{}(opendal/{};DataFusion) vvr uid/123",
+                env!("CARGO_PKG_VERSION"),
+                opendal::raw::VERSION
+            )]
+        );
     }
 }

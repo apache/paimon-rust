@@ -53,7 +53,7 @@ pub(crate) fn obs_config_parse(props: HashMap<String, String>) -> Result<ObsConf
     Ok(cfg)
 }
 
-pub(crate) fn obs_config_build(cfg: &ObsConfig, path: &str) -> Result<Operator> {
+pub(crate) fn obs_config_build(cfg: &ObsConfig, path: &str, user_agent: &str) -> Result<Operator> {
     let url = Url::parse(path).map_err(|_| Error::ConfigInvalid {
         message: format!("Invalid OBS url: {path}"),
     })?;
@@ -63,7 +63,10 @@ pub(crate) fn obs_config_build(cfg: &ObsConfig, path: &str) -> Result<Operator> 
     })?;
 
     let builder = cfg.clone().into_builder().bucket(bucket);
-    Ok(super::with_http_transport(Operator::new(builder)?))
+    Ok(super::with_http_transport(
+        Operator::new(builder)?,
+        user_agent,
+    ))
 }
 
 #[cfg(test)]
@@ -120,14 +123,14 @@ mod tests {
         let mut cfg = ObsConfig::default();
         cfg.endpoint = Some("https://obs.cn-north-4.myhuaweicloud.com".to_string());
 
-        let op = obs_config_build(&cfg, "obs://my-bucket/some/path").unwrap();
+        let op = obs_config_build(&cfg, "obs://my-bucket/some/path", "paimon-rust/test").unwrap();
         assert_eq!(op.info().name(), "my-bucket");
     }
 
     #[test]
     fn test_obs_config_build_missing_bucket() {
         let cfg = ObsConfig::default();
-        let result = obs_config_build(&cfg, "obs:///path/without/bucket");
+        let result = obs_config_build(&cfg, "obs:///path/without/bucket", "paimon-rust/test");
         assert!(result.is_err());
     }
 }
