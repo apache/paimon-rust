@@ -586,7 +586,17 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
         let id = Identifier::new("database", "table");
-        let env = crate::table::RESTEnv::new(id.clone(), "uuid".into(), api, options, false, None);
+        let metadata_cache =
+            crate::io::FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
+        let env = crate::table::RESTEnv::new(
+            id.clone(),
+            "uuid".into(),
+            api,
+            options,
+            false,
+            None,
+            metadata_cache,
+        );
         let (io, manager) = setup("/rest-table").await;
         manager.commit_snapshot(&test_snapshot(2)).await.unwrap();
         let schema = TableSchema::new(
