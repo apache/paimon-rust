@@ -117,7 +117,8 @@ impl LocalCache {
         let extension = path
             .rsplit('/')
             .next()
-            .and_then(|name| name.rsplit_once('.'));
+            .and_then(|name| name.rsplit_once('.'))
+            .filter(|(stem, _)| !stem.is_empty());
         !FileType::is_mutable(path)
             && !extension.is_some_and(|(_, ext)| {
                 self.excluded_extensions.contains(&ext.to_ascii_lowercase())
@@ -562,11 +563,12 @@ mod tests {
             max_size: None,
             block_size: 4,
             whitelist: HashSet::from([FileType::Meta]),
-            excluded_extensions: HashSet::new(),
+            excluded_extensions: HashSet::from(["blob".to_string(), "snapshot-1".to_string()]),
         })
         .unwrap();
 
         assert!(cache.is_cacheable("s3://bucket/table/snapshot/snapshot-1"));
+        assert!(!cache.is_cacheable("s3://bucket/table/snapshot/snapshot-1.blob"));
         assert!(!cache.is_cacheable("s3://bucket/table/data/data-1.parquet"));
         assert!(!cache.is_cacheable("s3://bucket/table/snapshot/LATEST"));
         assert!(!cache.is_cacheable("s3://bucket/table/tag/tag-production"));
