@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! External index placement follows Java's FileStorePathFactory. Existing
+//! External file placement follows Java's FileStorePathFactory. Existing
 //! files always resolve using their recorded path, never current write options.
 
 use crate::Result;
@@ -46,7 +46,7 @@ pub(super) fn new_index_external_path(
 
 /// Mirrors Java's per-bucket ExternalPathProvider. The random starting point
 /// avoids concentrating single-file buckets on the first configured root.
-struct ExternalPathProvider {
+pub(super) struct ExternalPathProvider {
     paths: Vec<String>,
     bucket: String,
     position: usize,
@@ -55,7 +55,28 @@ struct ExternalPathProvider {
 }
 
 impl ExternalPathProvider {
-    fn new(options: &HashMap<String, String>, bucket: &str) -> Result<Option<Self>> {
+    pub(super) fn new(options: &HashMap<String, String>, bucket: &str) -> Result<Option<Self>> {
+        // Java parses configured weights even when a strategy will not use them.
+        let weights = options
+            .get("data-file.external-paths.weights")
+            .map(|weights| {
+                weights
+                    .trim_end_matches(',')
+                    .split(',')
+                    .map(|weight| {
+                        weight
+                            .trim()
+                            .parse::<i32>()
+                            .ok()
+                            .filter(|weight| *weight > 0)
+                            .map(|weight| weight as u64)
+                            .ok_or_else(|| {
+                                invalid("External path weights must be positive integers")
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
         let strategy = options
             .get("data-file.external-paths.strategy")
             .map(|value| value.to_ascii_lowercase())
@@ -66,16 +87,16 @@ impl ExternalPathProvider {
         else {
             return Ok(None);
         };
-        if strategy == "none" {
-            return Ok(None);
-        }
         if !matches!(
             strategy.as_str(),
-            "round-robin" | "specific-fs" | "weight-robin" | "entropy-inject"
+            "none" | "round-robin" | "specific-fs" | "weight-robin" | "entropy-inject"
         ) {
             return Err(invalid(format!(
                 "Unsupported external path strategy: {strategy}"
             )));
+        }
+        if strategy == "none" {
+            return Ok(None);
         }
         let specific_fs = if strategy == "specific-fs" {
             Some(
@@ -100,22 +121,11 @@ impl ExternalPathProvider {
         }
         let mut cumulative_weights = Vec::new();
         if strategy == "weight-robin" && roots.len() > 1 {
-            if let Some(weights) = options
-                .get("data-file.external-paths.weights")
-                .filter(|weights| !weights.trim().is_empty())
-            {
+            if let Some(weights) = weights {
                 let mut total = 0_u64;
-                for weight in weights.trim_end_matches(',').split(',') {
-                    let weight = weight
-                        .trim()
-                        .parse::<i32>()
-                        .ok()
-                        .filter(|weight| *weight > 0)
-                        .ok_or_else(|| {
-                            invalid("External path weights must be positive integers")
-                        })?;
+                for weight in weights {
                     total = total
-                        .checked_add(weight as u64)
+                        .checked_add(weight)
                         .ok_or_else(|| invalid("External path weight overflow"))?;
                     cumulative_weights.push(total);
                 }
@@ -141,7 +151,7 @@ impl ExternalPathProvider {
         }))
     }
 
-    fn next_path(&mut self, file_name: &str) -> String {
+    pub(super) fn next_path(&mut self, file_name: &str) -> String {
         let index = if let Some(total) = self.cumulative_weights.last() {
             let value = rand::thread_rng().gen_range(0..*total);
             self.cumulative_weights
@@ -274,6 +284,34 @@ mod tests {
         for _ in 0..10 {
             assert!(["file:/a/bucket-0/index", "file:/b/bucket-0/index"]
                 .contains(&provider.next_path("index").as_str()));
+        }
+    }
+
+    #[test]
+    fn disabled_strategy_does_not_resolve_unused_external_roots() {
+        let options = HashMap::from([(
+            "data-file.external-paths".into(),
+            "/unused/local/path".into(),
+        )]);
+        assert!(ExternalPathProvider::new(&options, "bucket-0")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_weights_are_rejected_even_without_weighted_distribution() {
+        for strategy in ["none", "round-robin", "weight-robin"] {
+            for roots in ["file:/one", "file:/one,file:/two"] {
+                for weights in ["", "0", "-1", "x", "2147483648", "1,,2"] {
+                    let mut options = options(strategy);
+                    options.insert("data-file.external-paths".into(), roots.into());
+                    options.insert("data-file.external-paths.weights".into(), weights.into());
+                    assert!(
+                        ExternalPathProvider::new(&options, "bucket-0").is_err(),
+                        "{strategy}/{roots}/{weights}"
+                    );
+                }
+            }
         }
     }
 

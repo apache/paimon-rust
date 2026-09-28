@@ -248,6 +248,11 @@ impl TableWrite {
         CoreOptions::new(table.schema().options()).validate_data_file_path_directory()?;
         let is_overwrite = false;
         let schema = table.schema();
+        crate::spec::Schema::validate_primary_key_blob_configuration(
+            schema.fields(),
+            schema.primary_keys(),
+            schema.options(),
+        )?;
         let write_schema = build_target_arrow_schema(schema.fields())?;
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
@@ -1119,7 +1124,7 @@ impl TableWrite {
         let writer = if self.primary_key_indices.is_empty() {
             self.create_append_writer(partition_path, bucket)?
         } else if bucket == POSTPONE_BUCKET {
-            self.create_postpone_writer(partition_path, bucket)
+            self.create_postpone_writer(partition_path, bucket)?
         } else {
             self.create_kv_writer(partition_path, bucket, &partition_bytes)
                 .await?
@@ -1167,7 +1172,7 @@ impl TableWrite {
                     self.table.schema().options(),
                     &self.blob_inline_fields,
                     &self.blob_view_fields,
-                )
+                )?
                 .with_resources(self.resources.clone()),
             )))
         } else {
@@ -1188,7 +1193,7 @@ impl TableWrite {
                     Some(0),
                     None,
                     None,
-                )
+                )?
                 .with_file_index(self.file_index_options.clone())
                 .with_target_file_row_num(self.target_file_row_num)
                 .with_resources(self.resources.clone()),
@@ -1197,16 +1202,17 @@ impl TableWrite {
     }
 
     /// Create a postpone writer (KV format, no sorting/dedup, special file naming).
-    fn create_postpone_writer(&self, partition_path: String, bucket: i32) -> FileWriter {
+    fn create_postpone_writer(&self, partition_path: String, bucket: i32) -> Result<FileWriter> {
         let data_file_prefix = format!(
             "{}-u-{}-s-{}-w-",
             self.data_file_prefix, self.commit_user, self.postpone_write_id
         );
-        FileWriter::Postpone(
+        Ok(FileWriter::Postpone(
             PostponeFileWriter::new(
                 self.table.file_io().clone(),
                 PostponeWriteConfig {
-                    table_location: self.table.data_file_location(),
+                    table_location: self.table.location().to_string(),
+                    table_options: self.table.schema().options().clone(),
                     partition_path,
                     bucket,
                     schema_id: self.schema_id,
@@ -1218,9 +1224,9 @@ impl TableWrite {
                     data_file_prefix,
                     file_index_options: self.file_index_options.clone(),
                 },
-            )
+            )?
             .with_resources(self.resources.clone()),
-        )
+        ))
     }
 
     /// Create a key-value writer for PK tables with normal buckets.

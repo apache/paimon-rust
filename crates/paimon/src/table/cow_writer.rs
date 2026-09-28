@@ -320,7 +320,7 @@ impl CopyOnWriteMergeWriter {
                         Some(0),
                         None,
                         None,
-                    )
+                    )?
                     .with_target_file_row_num(target_file_row_num);
                     writer.write(&rewritten).await?;
                     writer.prepare_commit().await?

@@ -1580,7 +1580,7 @@ impl Schema {
         Ok(())
     }
 
-    fn validate_primary_key_blob_configuration(
+    pub(crate) fn validate_primary_key_blob_configuration(
         fields: &[DataField],
         primary_keys: &[String],
         options: &HashMap<String, String>,
