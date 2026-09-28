@@ -34,5 +34,44 @@ pub struct PartitionStatistics {
     pub file_size_in_bytes: i64,
     pub file_count: i64,
     pub last_file_creation_time: i64,
+    /// Defaults to 0 when absent, e.g. statistics serialized by an older Paimon
+    /// version that predates this field (matches Java `PartitionStatistics`).
+    #[serde(default)]
     pub total_buckets: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_without_total_buckets() {
+        // Statistics written by an older Paimon version omit `totalBuckets`; it
+        // must default to 0 rather than failing to deserialize.
+        let json = r#"{
+            "spec": {"dt": "2024-01-01"},
+            "recordCount": 10,
+            "fileSizeInBytes": 2048,
+            "fileCount": 3,
+            "lastFileCreationTime": 1700000000000
+        }"#;
+        let stats: PartitionStatistics = serde_json::from_str(json).unwrap();
+        assert_eq!(stats.total_buckets, 0);
+        assert_eq!(stats.record_count, 10);
+        assert_eq!(stats.file_count, 3);
+    }
+
+    #[test]
+    fn deserializes_with_total_buckets() {
+        let json = r#"{
+            "spec": {},
+            "recordCount": 1,
+            "fileSizeInBytes": 1,
+            "fileCount": 1,
+            "lastFileCreationTime": 0,
+            "totalBuckets": 8
+        }"#;
+        let stats: PartitionStatistics = serde_json::from_str(json).unwrap();
+        assert_eq!(stats.total_buckets, 8);
+    }
 }
