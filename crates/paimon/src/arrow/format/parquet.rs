@@ -55,7 +55,7 @@ use parquet::file::statistics::Statistics as ParquetStatistics;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) struct ParquetFormatReader {
@@ -611,7 +611,7 @@ impl FormatFileReader for ParquetFormatReader {
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let shared_reader: Arc<dyn FileRead> = reader.into();
+        let shared_reader = shared_parquet_file_reader(reader, file_size);
         let arrow_file_reader = ArrowFileReader::new(file_size, Arc::clone(&shared_reader))
             .with_metadata_cache_enabled(self.metadata_cache_enabled);
 
@@ -2560,6 +2560,85 @@ const METADATA_SIZE_HINT: usize = 512 * 1024;
 /// avoid excessive small IO requests whose per-request overhead dominates.
 const IO_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 
+/// Reuses a whole-file metadata prefetch for subsequent data ranges.
+///
+/// `ParquetMetaDataReader` reads the entire object when it is no larger than
+/// [`METADATA_SIZE_HINT`]. Without this adapter, the decoded stream then asks
+/// the object store for the selected data range again. Keep the already-read
+/// bytes for the lifetime of this file reader and serve those ranges by slicing
+/// the same [`Bytes`] allocation.
+struct WholeFileCachingRead {
+    inner: Arc<dyn FileRead>,
+    file_size: u64,
+    whole_file: OnceLock<Bytes>,
+}
+
+impl WholeFileCachingRead {
+    fn new(inner: Arc<dyn FileRead>, file_size: u64) -> Self {
+        Self {
+            inner,
+            file_size,
+            whole_file: OnceLock::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl FileRead for WholeFileCachingRead {
+    async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+        if let Some(whole_file) = self.whole_file.get() {
+            let start = usize::try_from(range.start).map_err(|error| Error::DataInvalid {
+                message: format!("Parquet range start does not fit usize: {}", range.start),
+                source: Some(Box::new(error)),
+            })?;
+            let end = usize::try_from(range.end).map_err(|error| Error::DataInvalid {
+                message: format!("Parquet range end does not fit usize: {}", range.end),
+                source: Some(Box::new(error)),
+            })?;
+            if start > end || end > whole_file.len() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Parquet range {}..{} exceeds file size {}",
+                        range.start, range.end, self.file_size
+                    ),
+                    source: None,
+                });
+            }
+            return Ok(whole_file.slice(start..end));
+        }
+
+        let bytes = self.inner.read(range.clone()).await?;
+        if range.start == 0
+            && range.end == self.file_size
+            && u64::try_from(bytes.len()).ok() == Some(self.file_size)
+        {
+            let _ = self.whole_file.set(bytes.clone());
+        }
+        Ok(bytes)
+    }
+
+    fn cache_namespace(&self) -> Option<usize> {
+        self.inner.cache_namespace()
+    }
+
+    fn cache_key(&self) -> Option<&str> {
+        self.inner.cache_key()
+    }
+
+    fn file_format_metadata_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.inner.file_format_metadata_cache()
+    }
+}
+
+fn shared_parquet_file_reader(reader: Box<dyn FileRead>, file_size: u64) -> Arc<dyn FileRead> {
+    let reader: Arc<dyn FileRead> = reader.into();
+    if file_size <= METADATA_SIZE_HINT as u64 {
+        Arc::new(WholeFileCachingRead::new(reader, file_size))
+    } else {
+        reader
+    }
+}
+
 /// Rows in a Parquet file, read from its footer alone.
 pub(crate) async fn read_row_count(
     reader: Box<dyn FileRead>,
@@ -3418,10 +3497,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_parquet_reader_reads_row_groups_concurrently_in_order() {
-        const ROWS: i32 = 512;
+        // Keep this file above the whole-file metadata prefetch threshold so
+        // the test continues to exercise remote row-group concurrency.
+        const ROWS: i32 = 131_072;
         let schema = writer_arrow_schema();
         let props = parquet::file::properties::WriterProperties::builder()
-            .set_max_row_group_row_count(Some(64))
+            .set_max_row_group_row_count(Some(16_384))
+            .set_compression(Compression::UNCOMPRESSED)
             .set_dictionary_enabled(false)
             .build();
         let mut data = Vec::new();
@@ -3445,6 +3527,7 @@ mod tests {
             max_in_flight: Arc::clone(&max_in_flight),
         };
         let file_size = file_reader.data.len() as u64;
+        assert!(file_size > super::METADATA_SIZE_HINT as u64);
         let fields = vec![DataField::new(
             0,
             "id".to_string(),
@@ -3458,7 +3541,7 @@ mod tests {
             file_size,
             &fields,
             None,
-            Some(32),
+            Some(8192),
             None,
         )
         .await
@@ -3597,10 +3680,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_parquet_read_budget_is_shared_across_readers() {
-        const ROWS: i32 = 256;
+        // Keep this file above the whole-file metadata prefetch threshold so
+        // the test continues to observe shared remote-read concurrency.
+        const ROWS: i32 = 65_536;
         let schema = writer_arrow_schema();
         let props = parquet::file::properties::WriterProperties::builder()
-            .set_max_row_group_row_count(Some(32))
+            .set_max_row_group_row_count(Some(8192))
+            .set_compression(Compression::UNCOMPRESSED)
             .set_dictionary_enabled(false)
             .build();
         let mut data = Vec::new();
@@ -3625,6 +3711,7 @@ mod tests {
             max_in_flight: Arc::clone(&max_in_flight),
         };
         let file_size = data.len() as u64;
+        assert!(file_size > super::METADATA_SIZE_HINT as u64);
         let fields = vec![DataField::new(
             0,
             "id".to_string(),
@@ -3637,7 +3724,7 @@ mod tests {
                 file_size,
                 &fields,
                 None,
-                Some(32),
+                Some(8192),
                 None,
             )
             .await
@@ -3648,7 +3735,7 @@ mod tests {
                 file_size,
                 &fields,
                 None,
-                Some(32),
+                Some(8192),
                 None,
             )
             .await
@@ -4839,6 +4926,48 @@ mod tests {
                 .as_ref()
                 .map(|cache| cache.as_ref() as &(dyn std::any::Any + Send + Sync))
         }
+    }
+
+    #[tokio::test]
+    async fn small_parquet_reuses_whole_file_metadata_prefetch() {
+        let data = Bytes::from(
+            write_multi_row_group_parquet(64, 64, EnabledStatistics::Chunk, false).await,
+        );
+        assert!(data.len() <= super::METADATA_SIZE_HINT);
+        let tracker = TrackingFileRead::new(data.clone());
+        let fields = vec![int_field("id"), int_field("value")];
+
+        let batches = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(tracker.clone()),
+                data.len() as u64,
+                &fields,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 64);
+        assert_eq!(tracker.read_count(), 1);
+        assert_eq!(tracker.bytes_read(), data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn whole_file_reuse_is_limited_to_metadata_prefetch_size() {
+        let data = Bytes::from(vec![0; super::METADATA_SIZE_HINT + 1]);
+        let tracker = TrackingFileRead::new(data.clone());
+        let reader =
+            super::shared_parquet_file_reader(Box::new(tracker.clone()), data.len() as u64);
+
+        reader.read(0..data.len() as u64).await.unwrap();
+        reader.read(1..2).await.unwrap();
+
+        assert_eq!(tracker.read_count(), 2);
     }
 
     #[tokio::test]
