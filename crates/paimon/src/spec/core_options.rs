@@ -92,6 +92,7 @@ const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
 const MANIFEST_SIDECAR_ENABLED_OPTION: &str = "manifest.sidecar.enabled";
 const MANIFEST_SORT_ENABLED_OPTION: &str = "manifest-sort.enabled";
+const SCAN_MANIFEST_PARALLELISM_OPTION: &str = "scan.manifest.parallelism";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_FILTER_COLUMN_INDEX_ENABLED_OPTION: &str = "parquet.filter.columnindex.enabled";
@@ -407,6 +408,35 @@ impl<'a> CoreOptions<'a> {
             return Err(crate::Error::DataInvalid {
                 message: format!(
                     "Option '{PARQUET_ROW_GROUP_PARALLELISM_OPTION}' must be greater than 0"
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
+    }
+
+    /// Maximum concurrent manifest reads during scan planning.
+    ///
+    /// Matches Java Paimon's `scan.manifest.parallelism`: when unset, use the
+    /// number of processors available to this process.
+    pub fn scan_manifest_parallelism(&self) -> crate::Result<usize> {
+        let Some(raw) = self.options.get(SCAN_MANIFEST_PARALLELISM_OPTION) else {
+            return Ok(std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1));
+        };
+        let value = raw
+            .parse::<usize>()
+            .map_err(|error| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{SCAN_MANIFEST_PARALLELISM_OPTION}' must be a positive integer, got: {raw}"
+                ),
+                source: Some(Box::new(error)),
+            })?;
+        if value == 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{SCAN_MANIFEST_PARALLELISM_OPTION}' must be greater than 0"
                 ),
                 source: None,
             });
@@ -2709,6 +2739,31 @@ mod tests {
         assert_eq!(parallelism(Some("-3")), 1);
         assert_eq!(parallelism(Some("5000")), 1000);
         assert_eq!(parallelism(Some("many")), 64);
+    }
+
+    #[test]
+    fn test_scan_manifest_parallelism() {
+        let parallelism = |value: Option<&str>| {
+            let options = value
+                .map(|value| {
+                    HashMap::from([(
+                        SCAN_MANIFEST_PARALLELISM_OPTION.to_string(),
+                        value.to_string(),
+                    )])
+                })
+                .unwrap_or_default();
+            CoreOptions::new(&options).scan_manifest_parallelism()
+        };
+
+        assert_eq!(
+            parallelism(None).unwrap(),
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+        );
+        assert_eq!(parallelism(Some("8")).unwrap(), 8);
+        assert!(parallelism(Some("0")).is_err());
+        assert!(parallelism(Some("many")).is_err());
     }
 
     #[test]
