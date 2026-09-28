@@ -64,8 +64,20 @@ fn resolve_data_path(parent: &str, child: &str, windows: bool) -> String {
         }
         let leading = if path.starts_with('/') { "/" } else { "" };
         let normalized = format!("{leading}{}", components.join("/"));
-        if windows && has_drive(&normalized) && normalized.len() == 3 && path != normalized {
+        if windows
+            && normalized.starts_with('/')
+            && has_drive(&normalized)
+            && normalized.len() == 3
+            && path != normalized
+        {
             format!("{normalized}/")
+        } else if !normalized.starts_with('/')
+            && normalized
+                .split('/')
+                .next()
+                .is_some_and(|part| part.contains(':'))
+        {
+            format!("./{normalized}")
         } else {
             normalized
         }
@@ -133,12 +145,13 @@ fn resolve_data_path(parent: &str, child: &str, windows: bool) -> String {
     } else if child_path.starts_with('/') {
         (parent_scheme, parent_authority, child_path)
     } else {
-        let path =
-            if parent_path.is_empty() && parent_scheme.is_empty() && parent_authority.is_empty() {
-                child_path
-            } else {
-                format!("{}/{child_path}", parent_path.trim_end_matches('/'))
-            };
+        let path = if parent_path.is_empty()
+            && (child_path.is_empty() || (parent_scheme.is_empty() && parent_authority.is_empty()))
+        {
+            child_path
+        } else {
+            format!("{}/{child_path}", parent_path.trim_end_matches('/'))
+        };
         (parent_scheme, parent_authority, path)
     };
     let path = normalize(&path, windows);
@@ -830,6 +843,8 @@ mod tests {
             ("/t", "..", "/"),
             ("/t", "../../data", "/../data"),
             ("s3://bucket/", "data", "s3://bucket/data"),
+            ("s3://bucket", ".", "s3://bucket"),
+            ("s3://bucket", "x/..", "s3://bucket"),
             ("warehouse", "a/../b:c", "warehouse/b:c"),
             ("memory:/t", "a/../../b", "memory:/b"),
             ("/t", "///data", "/data"),
@@ -840,6 +855,8 @@ mod tests {
             ("s3://bucket/t", "//other:9000/data", "s3://other:9000/data"),
             ("//host:8020/table", "//other/data", "//other/data"),
             ("relative", "../b:c", "./b:c"),
+            ("relative", "../a:bb", "./a:bb"),
+            ("relative", "../b:c/x", "./b:c/x"),
             ("file:/t", "file:/data", "file:/data"),
         ] {
             assert_eq!(
@@ -853,6 +870,12 @@ mod tests {
     #[test]
     fn windows_data_directories_match_java() {
         for (parent, child, expected) in [
+            ("relative", "../b:c", "./b:c"),
+            ("relative", "../a:bb", "./a:bb"),
+            ("relative", "../b:c/x", "./b:c/x"),
+            ("warehouse/t", "data/../../../b:c", "./b:c"),
+            (".", "a/../b:c", "./b:c"),
+            ("s3://bucket", ".", "s3://bucket"),
             (r"C:\warehouse\table", "../data", "C:/warehouse/data"),
             (r"C:\warehouse\table", r"..\data", "C:/warehouse/data"),
             ("C:/warehouse/table", "/data", "/data"),
