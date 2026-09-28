@@ -61,8 +61,11 @@ impl CatalogOptions {
     /// DLF signing algorithm (default or openapi).
     pub const DLF_SIGNING_ALGORITHM: &'static str = "dlf.signing-algorithm";
 
-    /// DLF token loader type (e.g., "ecs").
+    /// DLF token loader type ("ecs" or "local_file").
     pub const DLF_TOKEN_LOADER: &'static str = "dlf.token-loader";
+
+    /// Path to a local DLF token file.
+    pub const DLF_TOKEN_PATH: &'static str = "dlf.token-path";
 
     /// DLF ECS metadata URL.
     pub const DLF_TOKEN_ECS_METADATA_URL: &'static str = "dlf.token-ecs-metadata-url";
