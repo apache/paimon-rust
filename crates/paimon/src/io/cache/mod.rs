@@ -44,6 +44,7 @@ pub(crate) struct LocalCache {
     namespace: String,
     block_size: u64,
     whitelist: HashSet<FileType>,
+    excluded_extensions: HashSet<String>,
     file_size_capacity: usize,
 }
 
@@ -71,6 +72,7 @@ impl LocalCache {
             namespace: String::new(),
             block_size,
             whitelist: FileType::parse_whitelist(whitelist),
+            excluded_extensions: HashSet::new(),
             file_size_capacity: DEFAULT_FILE_SIZE_CAPACITY,
         })
     }
@@ -98,6 +100,7 @@ impl LocalCache {
             namespace: config.namespace,
             block_size: config.block_size,
             whitelist: config.whitelist,
+            excluded_extensions: config.excluded_extensions,
             file_size_capacity,
         })
     }
@@ -111,7 +114,16 @@ impl LocalCache {
     }
 
     pub(super) fn is_cacheable(&self, path: &str) -> bool {
-        !FileType::is_mutable(path) && self.whitelist.contains(&FileType::classify(path))
+        let extension = path
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .filter(|(stem, _)| !stem.is_empty());
+        !FileType::is_mutable(path)
+            && !extension.is_some_and(|(_, ext)| {
+                self.excluded_extensions.contains(&ext.to_ascii_lowercase())
+            })
+            && self.whitelist.contains(&FileType::classify(path))
     }
 
     async fn get_block(
@@ -247,6 +259,7 @@ pub(crate) struct LocalCacheConfig {
     max_size: Option<u64>,
     block_size: u64,
     whitelist: HashSet<FileType>,
+    excluded_extensions: HashSet<String>,
 }
 
 impl LocalCacheConfig {
@@ -313,6 +326,14 @@ impl LocalCacheConfig {
             max_size,
             block_size,
             whitelist: FileType::parse_whitelist(whitelist),
+            excluded_extensions: options
+                .get(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS)
+                .map(String::as_str)
+                .unwrap_or("")
+                .split(',')
+                .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect(),
         }))
     }
 }
@@ -473,6 +494,7 @@ mod tests {
             max_size: None,
             block_size: 4,
             whitelist: HashSet::from([FileType::Meta]),
+            excluded_extensions: HashSet::new(),
         })
         .unwrap();
         let path = "s3://bucket/table/snapshot/snapshot-1";
@@ -494,6 +516,7 @@ mod tests {
             max_size: None,
             block_size: 4,
             whitelist: HashSet::from([FileType::Meta]),
+            excluded_extensions: HashSet::new(),
         };
         let first = LocalCache::new(config()).unwrap();
         let second = LocalCache::new(config()).unwrap();
@@ -516,6 +539,7 @@ mod tests {
             max_size: None,
             block_size: 4,
             whitelist: HashSet::from([FileType::Meta]),
+            excluded_extensions: HashSet::new(),
         };
         let first = LocalCache::new(config()).unwrap();
         let second = LocalCache::new(config()).unwrap();
@@ -539,10 +563,12 @@ mod tests {
             max_size: None,
             block_size: 4,
             whitelist: HashSet::from([FileType::Meta]),
+            excluded_extensions: HashSet::from(["blob".to_string(), "snapshot-1".to_string()]),
         })
         .unwrap();
 
         assert!(cache.is_cacheable("s3://bucket/table/snapshot/snapshot-1"));
+        assert!(!cache.is_cacheable("s3://bucket/table/snapshot/snapshot-1.blob"));
         assert!(!cache.is_cacheable("s3://bucket/table/data/data-1.parquet"));
         assert!(!cache.is_cacheable("s3://bucket/table/snapshot/LATEST"));
         assert!(!cache.is_cacheable("s3://bucket/table/tag/tag-production"));
@@ -566,6 +592,7 @@ mod tests {
             max_size: None,
             block_size: 4,
             whitelist: HashSet::from([FileType::Meta]),
+            excluded_extensions: HashSet::new(),
         })
         .unwrap();
 
@@ -586,6 +613,7 @@ mod tests {
             max_size: Some(8),
             block_size: 4,
             whitelist: HashSet::from([FileType::Meta]),
+            excluded_extensions: HashSet::new(),
         })
         .unwrap();
         let first_token = cache.read_token("snapshot-1");

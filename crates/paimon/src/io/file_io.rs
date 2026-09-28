@@ -1625,6 +1625,78 @@ mod input_output_test {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn test_data_cache_excludes_blob_extension() {
+        for disk in [false, true] {
+            for whitelist in ["meta,global-index", "data"] {
+                for exclusion in ["", " .BLOB, "] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut options = Options::new();
+                    options.set(CatalogOptions::LOCAL_CACHE_ENABLED, "true");
+                    options.set(CatalogOptions::LOCAL_CACHE_WHITELIST, whitelist);
+                    options.set(CatalogOptions::LOCAL_CACHE_EXCLUDE_EXTENSIONS, exclusion);
+                    options.set(CatalogOptions::LOCAL_CACHE_BLOCK_SIZE, "4");
+                    if disk {
+                        options.set(
+                            CatalogOptions::LOCAL_CACHE_DIR,
+                            directory.path().to_string_lossy(),
+                        );
+                    }
+                    let cache = Arc::new(
+                        LocalCache::new(LocalCacheConfig::from_options(&options).unwrap().unwrap())
+                            .unwrap(),
+                    );
+                    let file_io = FileIOBuilder::new("memory")
+                        .with_local_cache(cache)
+                        .build()
+                        .unwrap();
+                    for name in [
+                        "data.parquet",
+                        "data.blob",
+                        "data.orc",
+                        "data.avro",
+                        "data.parquet.index",
+                        "snapshot-1",
+                        "snapshot-1.blob",
+                    ] {
+                        let path = format!("memory:/{name}");
+                        file_io
+                            .new_output(&path)
+                            .unwrap()
+                            .write(Bytes::from_static(b"abcdefgh"))
+                            .await
+                            .unwrap();
+                        let input = file_io.new_input(&path).unwrap();
+                        let reader = input.reader().await.unwrap();
+                        assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
+                        drop(reader);
+                        let (op, relative_path, _) = input.source.resolve(&path).await.unwrap();
+                        op.delete(&relative_path).await.unwrap();
+                        let cached = match whitelist {
+                            "data" => {
+                                name.starts_with("data.")
+                                    && !(name.ends_with(".blob") && !exclusion.is_empty())
+                                    && !name.ends_with(".index")
+                            }
+                            _ => {
+                                name == "snapshot-1"
+                                    || (name == "snapshot-1.blob" && exclusion.is_empty())
+                            }
+                        };
+                        let result = input.read().await;
+                        if cached {
+                            assert_eq!(result.unwrap(), b"abcdefgh"[..], "{whitelist}: {name}");
+                            let reader = input.reader().await.unwrap();
+                            assert_eq!(reader.read(1..7).await.unwrap(), b"bcdefg"[..]);
+                        } else {
+                            assert!(result.is_err(), "{whitelist}: {name}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
         let output = file_io.new_output(path).unwrap();
         let mut writer = output.writer().await.unwrap();

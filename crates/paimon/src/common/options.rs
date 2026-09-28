@@ -87,6 +87,9 @@ impl CatalogOptions {
 
     /// Comma-separated file types eligible for local caching.
     pub const LOCAL_CACHE_WHITELIST: &'static str = "local-cache.whitelist";
+
+    /// Comma-separated file extensions that bypass the local cache.
+    pub const LOCAL_CACHE_EXCLUDE_EXTENSIONS: &'static str = "local-cache.exclude-extensions";
 }
 
 /// Configuration options container.
