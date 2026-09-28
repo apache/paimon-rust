@@ -42,6 +42,7 @@ mod data_evolution_nested;
 mod data_evolution_reader;
 pub mod data_evolution_writer;
 mod data_file_index_writer;
+mod data_file_path_factory;
 mod data_file_reader;
 mod data_file_writer;
 mod de_vector_read;

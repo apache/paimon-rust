@@ -82,7 +82,13 @@ impl AppendDedicatedFormatFileWriter {
         format_options: &HashMap<String, String>,
         blob_inline_fields: &HashSet<String>,
         blob_view_fields: &HashSet<String>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let paths = Arc::new(super::data_file_path_factory::DataFilePathFactory::new(
+            &table_location,
+            &partition_path,
+            bucket,
+            format_options,
+        )?);
         let mut normal_column_indices = Vec::new();
         let mut normal_arrow_fields = Vec::new();
         let mut normal_table_fields = Vec::new();
@@ -121,7 +127,8 @@ impl AppendDedicatedFormatFileWriter {
                         Some(0),
                         None,
                         Some(vec![field.name().to_string()]),
-                    )
+                    )?
+                    .with_path_factory(paths.clone())
                     .with_target_file_row_num(target_file_row_num),
                     field_name: field.name().to_string(),
                     column_index: idx,
@@ -160,7 +167,8 @@ impl AppendDedicatedFormatFileWriter {
                         Some(0),
                         None,
                         Some(vector_field_names.clone()),
-                    )
+                    )?
+                    .with_path_factory(paths.clone())
                     .with_target_file_row_num(target_file_row_num),
                     field_names: vector_field_names,
                     column_indices: vector_column_indices,
@@ -187,10 +195,11 @@ impl AppendDedicatedFormatFileWriter {
             Some(0),
             None,
             Some(normal_field_names),
-        )
+        )?
+        .with_path_factory(paths.clone())
         .with_target_file_row_num(target_file_row_num);
 
-        Self {
+        Ok(Self {
             normal_writer,
             blob_writers,
             vector_writer,
@@ -202,7 +211,7 @@ impl AppendDedicatedFormatFileWriter {
                 .filter(|(_, field)| blob_view_fields.contains(field.name()))
                 .map(|(idx, field)| (idx, field.name().to_string()))
                 .collect(),
-        }
+        })
     }
 
     pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
@@ -331,18 +340,102 @@ impl AppendDedicatedFormatFileWriter {
     }
 
     pub(crate) async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
-        let mut results = self.normal_writer.prepare_commit().await?;
+        let writers = std::iter::once(&mut self.normal_writer)
+            .chain(
+                self.blob_writers
+                    .iter_mut()
+                    .map(|writer| &mut writer.writer),
+            )
+            .chain(
+                self.vector_writer
+                    .iter_mut()
+                    .map(|writer| &mut writer.writer),
+            );
+        Ok(DataFileWriter::prepare_group(writers)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+}
 
-        for blob_writer in &mut self.blob_writers {
-            let blob_metas = blob_writer.writer.prepare_commit().await?;
-            results.extend(blob_metas);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::FileIOBuilder;
+    use crate::spec::{BlobType, IntType};
+    use arrow_array::{ArrayRef, Int32Array, LargeBinaryArray};
+
+    #[tokio::test]
+    async fn failed_blob_close_cleans_every_physical_column() {
+        for external in [false, true] {
+            let io = FileIOBuilder::new("memory").build().unwrap();
+            let batch = RecordBatch::try_from_iter([
+                ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+                (
+                    "a",
+                    Arc::new(LargeBinaryArray::from(vec![Some(b"a".as_slice())])) as ArrayRef,
+                ),
+                (
+                    "b",
+                    Arc::new(LargeBinaryArray::from(vec![Some(b"b".as_slice())])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            let fields = vec![
+                DataField::new(0, "id".into(), DataType::Int(IntType::new())),
+                DataField::new(1, "a".into(), DataType::Blob(BlobType::new())),
+                DataField::new(2, "b".into(), DataType::Blob(BlobType::new())),
+            ];
+            let options = if external {
+                HashMap::from([
+                    (
+                        "data-file.external-paths".into(),
+                        "memory:/first,memory:/second".into(),
+                    ),
+                    (
+                        "data-file.external-paths.strategy".into(),
+                        "entropy-inject".into(),
+                    ),
+                ])
+            } else {
+                HashMap::new()
+            };
+            let mut writer = AppendDedicatedFormatFileWriter::new(
+                io.clone(),
+                "memory:/table".into(),
+                "".into(),
+                0,
+                0,
+                i64::MAX,
+                i64::MAX,
+                i64::MAX,
+                "none".into(),
+                0,
+                i64::MAX,
+                "parquet".into(),
+                i64::MAX,
+                None,
+                batch.schema().as_ref(),
+                &fields,
+                &options,
+                &HashSet::new(),
+                &HashSet::new(),
+            )
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            writer.blob_writers[1].writer.inject_close_failure();
+            assert!(writer
+                .prepare_commit()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected close failure"));
+            assert!(io
+                .list_status_recursive("memory:/")
+                .await
+                .unwrap()
+                .is_empty());
         }
-
-        if let Some(vector_writer) = &mut self.vector_writer {
-            let vector_metas = vector_writer.writer.prepare_commit().await?;
-            results.extend(vector_metas);
-        }
-
-        Ok(results)
     }
 }

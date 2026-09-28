@@ -34,9 +34,9 @@ use crate::io::FileIO;
 use crate::resource::{MemoryReservation, ResourceContext};
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
-    bucket_path_under, data_file_to_file_index_file_name, extract_datum_from_arrow,
-    AggregationConfig, BigIntType, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta,
-    DataType, MergeEngine, PartialUpdateConfig, RowKind, TinyIntType, SEQUENCE_NUMBER_FIELD_ID,
+    data_file_to_file_index_file_name, extract_datum_from_arrow, AggregationConfig, BigIntType,
+    BinaryRowBuilder, CoreOptions, DataField, DataFileMeta, DataType, MergeEngine,
+    PartialUpdateConfig, RowKind, TinyIntType, SEQUENCE_NUMBER_FIELD_ID,
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
@@ -59,6 +59,7 @@ use std::sync::Arc;
 /// Internal writer for primary-key tables that buffers data in memory,
 /// sorts by primary key on flush, and prepends `_SEQUENCE_NUMBER` and `_VALUE_KIND` columns.
 pub(crate) struct KeyValueFileWriter {
+    paths: super::data_file_path_factory::DataFilePathFactory,
     file_io: FileIO,
     config: KeyValueWriteConfig,
     target_file_row_num: usize,
@@ -169,8 +170,15 @@ impl KeyValueFileWriter {
         }
 
         let managed_blob_writer = ManagedBlobWriteState::new(&file_io, &config)?;
+        let paths = super::data_file_path_factory::DataFilePathFactory::new(
+            &config.table_location,
+            &config.partition_path,
+            config.bucket,
+            &config.table_options,
+        )?;
 
         Ok(Self {
+            paths,
             file_io,
             config,
             target_file_row_num,
@@ -490,16 +498,10 @@ impl KeyValueFileWriter {
             write.file_ordinal,
             write.file_format,
         );
-        let bucket_dir = bucket_path_under(
-            &crate::spec::data_file_path(
-                &self.config.table_location,
-                CoreOptions::new(&self.config.table_options).data_file_path_directory(),
-            ),
-            &self.config.partition_path,
-            self.config.bucket,
-        );
+        let location = self.paths.new_path(&file_name)?;
+        let bucket_dir = location.parent();
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
-        let file_path = format!("{bucket_dir}/{file_name}");
+        let file_path = location.path.clone();
         let output = self.file_io.new_output(&file_path)?;
         // The physical KV file also contains sequence and row-kind columns. Give
         // Parquet only the logical value fields so metadata stats and their dense
@@ -685,7 +687,7 @@ impl KeyValueFileWriter {
             embedded_index: None,
             file_source: Some(0), // FileSource.APPEND
             value_stats_cols,
-            external_path: None,
+            external_path: location.external_path.clone(),
             first_row_id: None,
             write_cols: None,
             column_max_sequence_numbers: None,
@@ -730,7 +732,7 @@ impl KeyValueFileWriter {
             blob_references,
             &self.file_io,
             &file_path,
-            &bucket_dir,
+            bucket_dir,
             &mut meta,
         )
         .await?;
@@ -1175,20 +1177,13 @@ impl KeyValueFileWriter {
         if let Some(reservation) = &mut self.buffer_reservation {
             let _ = reservation.try_resize(0);
         }
-        let bucket_path = bucket_path_under(
-            &crate::spec::data_file_path(
-                &self.config.table_location,
-                CoreOptions::new(&self.config.table_options).data_file_path_directory(),
-            ),
-            &self.config.partition_path,
-            self.config.bucket,
-        );
+        let bucket_path = self.paths.bucket_path();
         for file in self
             .written_files
             .drain(..)
             .chain(self.written_changelog_files.drain(..))
         {
-            for path in file.collect_files(&bucket_path) {
+            for path in file.collect_files(bucket_path) {
                 let _ = self.file_io.delete_file(&path).await;
             }
         }

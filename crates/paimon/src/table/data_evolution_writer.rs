@@ -1557,7 +1557,7 @@ impl DataEvolutionPartialWriter {
                     Some(0), // file_source: APPEND
                     Some(first_row_id),
                     Some(write_set.write_columns.clone()),
-                )
+                )?
                 .with_file_index(write_set.file_index_options.clone());
                 self.writers.insert(key.clone(), writer);
             }

@@ -23,6 +23,7 @@
 //! [`DataFileMeta`] for the commit path.
 
 use super::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
+use super::data_file_path_factory::{DataFilePath, DataFilePathFactory};
 use crate::arrow::format::{
     create_format_writer, with_write_resources, FormatFileWriter, FormatValueStats,
 };
@@ -30,7 +31,7 @@ use crate::io::FileIO;
 use crate::resource::ResourceContext;
 use crate::spec::data_file_to_file_index_file_name;
 use crate::spec::stats::BinaryTableStats;
-use crate::spec::{bucket_path_under, CoreOptions, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
+use crate::spec::{CoreOptions, DataField, DataFileMeta, EMPTY_SERIALIZED_ROW};
 use crate::Result;
 use arrow_array::RecordBatch;
 use chrono::Utc;
@@ -47,9 +48,7 @@ use tokio::task::JoinSet;
 /// Call [`prepare_commit`](Self::prepare_commit) to finalize and collect file metadata.
 pub(crate) struct DataFileWriter {
     file_io: FileIO,
-    table_location: String,
-    partition_path: String,
-    bucket: i32,
+    paths: Arc<DataFilePathFactory>,
     schema_id: i64,
     target_file_size: i64,
     target_file_row_num: i64,
@@ -70,6 +69,7 @@ pub(crate) struct DataFileWriter {
     /// Current open format writer, lazily created on first write.
     current_writer: Option<Box<dyn FormatFileWriter>>,
     current_file_name: Option<String>,
+    current_file_path: Option<DataFilePath>,
     current_row_count: i64,
     index_options: Option<Arc<FileIndexOptions>>,
     current_index: Option<DataFileIndexWriter>,
@@ -96,15 +96,19 @@ impl DataFileWriter {
         file_source: Option<i32>,
         first_row_id: Option<i64>,
         write_cols: Option<Vec<String>>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let paths = Arc::new(DataFilePathFactory::new(
+            &table_location,
+            &partition_path,
+            bucket,
+            &format_options,
+        )?);
         let data_file_prefix = CoreOptions::new(&format_options)
             .data_file_prefix()
             .to_string();
-        Self {
+        Ok(Self {
             file_io,
-            table_location,
-            partition_path,
-            bucket,
+            paths,
             schema_id,
             target_file_size,
             target_file_row_num: i64::MAX,
@@ -123,12 +127,18 @@ impl DataFileWriter {
             in_flight_closes: JoinSet::new(),
             current_writer: None,
             current_file_name: None,
+            current_file_path: None,
             current_row_count: 0,
             index_options: None,
             current_index: None,
             resources: None,
             created_paths: Vec::new(),
-        }
+        })
+    }
+
+    pub(super) fn with_path_factory(mut self, paths: Arc<DataFilePathFactory>) -> Self {
+        self.paths = paths;
+        self
     }
 
     pub(super) fn with_file_index(mut self, options: Option<Arc<FileIndexOptions>>) -> Self {
@@ -205,10 +215,11 @@ impl DataFileWriter {
             self.next_file_ordinal,
             self.file_format,
         );
-        let bucket_dir = self.bucket_dir();
+        let location = self.paths.new_path(&file_name)?;
+        let bucket_dir = location.parent();
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
 
-        let file_path = format!("{bucket_dir}/{file_name}");
+        let file_path = location.path.clone();
         self.created_paths.push(file_path.clone());
         if self.index_options.is_some() {
             self.created_paths.push(format!(
@@ -230,6 +241,7 @@ impl DataFileWriter {
         self.current_writer = Some(with_write_resources(writer, self.resources.as_ref()));
         self.current_index = index;
         self.current_file_name = Some(file_name);
+        self.current_file_path = Some(location);
         self.current_row_count = 0;
         Ok(())
     }
@@ -260,7 +272,8 @@ impl DataFileWriter {
         let writer = self.current_writer.take()?;
         let index = self.current_index.take();
         let file_io = self.file_io.clone();
-        let bucket_dir = self.bucket_dir();
+        let location = self.current_file_path.take().unwrap();
+        let bucket_dir = location.parent().to_string();
         let threshold = self
             .index_options
             .as_ref()
@@ -285,6 +298,7 @@ impl DataFileWriter {
                 write_cols,
                 write_result.value_stats,
             );
+            meta.external_path = location.external_path;
             if let Some(index) = index {
                 let bytes = index.serialize()?;
                 if bytes.len() as u64 > threshold.unwrap() as u64 {
@@ -317,20 +331,32 @@ impl DataFileWriter {
     pub(super) async fn prepare_all<K>(
         writers: impl IntoIterator<Item = (K, Self)>,
     ) -> Result<Vec<(K, Vec<DataFileMeta>)>> {
-        let results =
-            futures::future::join_all(writers.into_iter().map(|(key, mut writer)| async {
-                let result = writer.prepare_commit().await;
-                (key, writer, result)
-            }))
-            .await;
-        if results.iter().any(|(_, _, result)| result.is_err()) {
+        let mut writers: Vec<_> = writers.into_iter().collect();
+        let files = Self::prepare_group(writers.iter_mut().map(|(_, writer)| writer)).await?;
+        Ok(writers
+            .into_iter()
+            .zip(files)
+            .map(|((key, _), files)| (key, files))
+            .collect())
+    }
+
+    /// Close all physical columns as one operation. Successful closes transfer
+    /// ownership here until every other column succeeds, including Blob files.
+    pub(super) async fn prepare_group<'a>(
+        writers: impl IntoIterator<Item = &'a mut Self>,
+    ) -> Result<Vec<Vec<DataFileMeta>>> {
+        let results = futures::future::join_all(writers.into_iter().map(|writer| async {
+            let result = writer.prepare_commit().await;
+            (writer, result)
+        }))
+        .await;
+        if results.iter().any(|(_, result)| result.is_err()) {
             let mut first_error = None;
-            for (_, mut writer, result) in results {
+            for (writer, result) in results {
                 match result {
                     Ok(files) => {
-                        // Successful prepare transferred these paths to us.
                         for file in files {
-                            for path in file.collect_files(&writer.bucket_dir()) {
+                            for path in file.collect_files(writer.bucket_dir()) {
                                 let _ = writer.file_io.delete_file(&path).await;
                             }
                         }
@@ -343,10 +369,17 @@ impl DataFileWriter {
             }
             return Err(first_error.unwrap());
         }
-        results
-            .into_iter()
-            .map(|(key, _, files)| files.map(|files| (key, files)))
-            .collect()
+        results.into_iter().map(|(_, files)| files).collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_close_failure(&mut self) {
+        self.in_flight_closes.spawn(async {
+            Err(crate::Error::DataInvalid {
+                message: "injected close failure".into(),
+                source: None,
+            })
+        });
     }
 
     async fn finish(&mut self) -> Result<Vec<DataFileMeta>> {
@@ -370,6 +403,7 @@ impl DataFileWriter {
         }
         self.current_index = None;
         self.current_file_name = None;
+        self.current_file_path = None;
         while self.in_flight_closes.join_next().await.is_some() {}
         for path in self.created_paths.drain(..) {
             let _ = self.file_io.delete_file(&path).await;
@@ -377,12 +411,8 @@ impl DataFileWriter {
         self.written_files.clear();
     }
 
-    fn bucket_dir(&self) -> String {
-        let data_root = crate::spec::data_file_path(
-            &self.table_location,
-            CoreOptions::new(&self.format_options).data_file_path_directory(),
-        );
-        bucket_path_under(&data_root, &self.partition_path, self.bucket)
+    fn bucket_dir(&self) -> &str {
+        self.paths.bucket_path()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -484,7 +514,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "id",
             ArrowDataType::Int32,
@@ -524,6 +555,7 @@ mod tests {
             None,
             None,
         )
+        .unwrap()
         .with_target_file_row_num(2);
         let schema = Arc::new(Schema::new(vec![Field::new(
             "id",
@@ -547,55 +579,71 @@ mod tests {
 
     #[tokio::test]
     async fn grouped_prepare_failure_removes_successful_and_failed_outputs() {
-        let file_io = FileIOBuilder::new("memory").build().unwrap();
-        let mut writers = Vec::new();
-        for first_row_id in [0, 1] {
-            let mut writer = DataFileWriter::new(
-                file_io.clone(),
-                "memory:///prepare-failure".into(),
-                String::new(),
-                0,
-                0,
-                i64::MAX,
-                "none".into(),
-                0,
-                i64::MAX,
-                "parquet".into(),
-                vec![DataField::new(
+        for external in [false, true] {
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let mut writers = Vec::new();
+            for first_row_id in [0, 1] {
+                let mut writer = DataFileWriter::new(
+                    file_io.clone(),
+                    "memory:///prepare-failure".into(),
+                    String::new(),
                     0,
-                    "id".into(),
-                    DataType::Int(IntType::new()),
-                )],
-                HashMap::new(),
-                Some(first_row_id),
-                None,
-                None,
-            );
-            let batch = RecordBatch::try_from_iter([(
-                "id",
-                Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
-            )])
-            .unwrap();
-            writer.write(&batch).await.unwrap();
-            if first_row_id == 1 {
-                // Simulate a background file close failing after another file
-                // in the operation has already finished successfully.
-                writer.in_flight_closes.spawn(async {
-                    Err(crate::Error::DataInvalid {
-                        message: "injected close failure".into(),
-                        source: None,
-                    })
-                });
+                    0,
+                    i64::MAX,
+                    "none".into(),
+                    0,
+                    i64::MAX,
+                    "parquet".into(),
+                    vec![DataField::new(
+                        0,
+                        "id".into(),
+                        DataType::Int(IntType::new()),
+                    )],
+                    if external {
+                        HashMap::from([
+                            (
+                                "data-file.external-paths".into(),
+                                "memory:/external-a,memory:/external-b".into(),
+                            ),
+                            (
+                                "data-file.external-paths.strategy".into(),
+                                "entropy-inject".into(),
+                            ),
+                        ])
+                    } else {
+                        HashMap::new()
+                    },
+                    Some(first_row_id),
+                    None,
+                    None,
+                )
+                .unwrap();
+                let batch = RecordBatch::try_from_iter([(
+                    "id",
+                    Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
+                )])
+                .unwrap();
+                writer.write(&batch).await.unwrap();
+                if first_row_id == 1 {
+                    // Simulate a background file close failing after another file
+                    // in the operation has already finished successfully.
+                    writer.in_flight_closes.spawn(async {
+                        Err(crate::Error::DataInvalid {
+                            message: "injected close failure".into(),
+                            source: None,
+                        })
+                    });
+                }
+                writers.push((first_row_id, writer));
             }
-            writers.push((first_row_id, writer));
+            let error = DataFileWriter::prepare_all(writers).await.unwrap_err();
+            assert!(error.to_string().contains("injected close failure"));
+            assert!(file_io
+                .list_status_recursive("memory:/")
+                .await
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.path.ends_with(".parquet")));
         }
-        let error = DataFileWriter::prepare_all(writers).await.unwrap_err();
-        assert!(error.to_string().contains("injected close failure"));
-        assert!(file_io
-            .list_status_recursive("memory:///prepare-failure")
-            .await
-            .unwrap()
-            .iter()
-            .all(|entry| !entry.path.ends_with(".parquet")));
     }
 }
