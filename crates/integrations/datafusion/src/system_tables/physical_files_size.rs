@@ -28,7 +28,9 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use paimon::table::referenced_files::{collect_physical_files_summary, PhysicalFilesSummary};
+use paimon::table::referenced_files::{
+    collect_physical_files_summary_with_options, PhysicalFilesSummary,
+};
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
@@ -78,7 +80,13 @@ impl TableProvider for PhysicalFilesSizeTable {
         let table = self.table.clone();
         let summary = crate::runtime::await_with_runtime(async move {
             let partition_depth = table.schema().partition_keys().len();
-            collect_physical_files_summary(table.file_io(), table.location(), partition_depth).await
+            collect_physical_files_summary_with_options(
+                table.file_io(),
+                table.location(),
+                partition_depth,
+                &table.schema().core_options(),
+            )
+            .await
         })
         .await
         .map_err(to_datafusion_error)?;

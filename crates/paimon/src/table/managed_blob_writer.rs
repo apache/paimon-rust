@@ -102,7 +102,10 @@ impl ManagedBlobWriteState {
         let options = CoreOptions::new(&config.table_options);
         let writer = ManagedBlobWriter::new(
             file_io.clone(),
-            &config.table_location,
+            &crate::spec::data_file_path(
+                &config.table_location,
+                options.data_file_path_directory(),
+            ),
             &config.partition_path,
             config.bucket,
             &config.data_file_prefix,

@@ -245,6 +245,7 @@ impl TableWrite {
         // A dynamic-bucket write reads the persisted PK hash index; the rest are
         // refused too, since their commit is blocked anyway.
         CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
+        CoreOptions::new(table.schema().options()).validate_data_file_path_directory()?;
         let is_overwrite = false;
         let schema = table.schema();
         let write_schema = build_target_arrow_schema(schema.fields())?;
@@ -405,20 +406,23 @@ impl TableWrite {
                 merge_engine,
             )))
         } else if is_dynamic_bucket {
-            BucketAssignerEnum::Dynamic(Box::new(DynamicBucketAssigner::new(
-                partition_field_indices,
-                primary_key_indices.clone(),
-                schema.fields().to_vec(),
-                target_bucket_row_number,
-                table.file_io().clone(),
-                table.location().to_string(),
-                is_overwrite,
-                // The same computer this writer already built: a hash index kept in
-                // the data-file directory must land in the directory the writer and
-                // the reader both derive, so both must agree on partition naming.
-                partition_computer.clone(),
-                core_options.index_file_in_data_file_dir(),
-            )))
+            BucketAssignerEnum::Dynamic(Box::new(
+                DynamicBucketAssigner::new(
+                    partition_field_indices,
+                    primary_key_indices.clone(),
+                    schema.fields().to_vec(),
+                    target_bucket_row_number,
+                    table.file_io().clone(),
+                    table.location().to_string(),
+                    is_overwrite,
+                    // The same computer this writer already built: a hash index kept in
+                    // the data-file directory must land in the directory the writer and
+                    // the reader both derive, so both must agree on partition naming.
+                    partition_computer.clone(),
+                    core_options.index_file_in_data_file_dir(),
+                )
+                .with_data_file_path_directory(core_options.data_file_path_directory()),
+            ))
         } else if total_buckets == POSTPONE_BUCKET {
             BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
                 partition_field_indices,
@@ -1202,7 +1206,7 @@ impl TableWrite {
             PostponeFileWriter::new(
                 self.table.file_io().clone(),
                 PostponeWriteConfig {
-                    table_location: self.table.location().to_string(),
+                    table_location: self.table.data_file_location(),
                     partition_path,
                     bucket,
                     schema_id: self.schema_id,

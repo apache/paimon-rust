@@ -134,7 +134,7 @@ impl ExternalPathProvider {
         };
         Ok(Some(Self {
             paths: roots,
-            bucket: bucket.trim_matches('/').into(),
+            bucket: bucket.to_string(),
             position,
             entropy,
             cumulative_weights,
@@ -150,11 +150,10 @@ impl ExternalPathProvider {
             self.position = (self.position + 1) % self.paths.len();
             self.position
         };
-        let mut path = self.paths[index].clone();
-        if !self.bucket.is_empty() {
-            path.push('/');
-            path.push_str(&self.bucket);
-        }
+        let mut path = crate::spec::data_file_path(
+            &self.paths[index],
+            (!self.bucket.is_empty()).then_some(self.bucket.as_str()),
+        );
         if self.entropy {
             let hash =
                 crate::spec::murmur_hash::hash_bytes_guava(file_name.as_bytes()) as u32 & 0xfffff;
@@ -195,8 +194,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let paths = [provider.next_path("index-1"), provider.next_path("index-1")];
-        assert!(paths.contains(&"file:///a/p=x/bucket-0/index-1".into()));
-        assert!(paths.contains(&"file:///b/p=x/bucket-0/index-1".into()));
+        assert!(paths.contains(&"file:/a/p=x/bucket-0/index-1".into()));
+        assert!(paths.contains(&"file:/b/p=x/bucket-0/index-1".into()));
         assert_eq!(
             new_index_external_path(&settings, false, "p=x/bucket-0", "index-1")
                 .unwrap()
@@ -208,6 +207,26 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn configured_directories_resolve_against_external_roots() {
+        for strategy in ["round-robin", "weight-robin", "entropy-inject"] {
+            for (bucket, expected) in [
+                ("/shared/bucket-0", "file:/shared/bucket-0/"),
+                (
+                    "s3://other:9000/shared/bucket-0",
+                    "s3://other:9000/shared/bucket-0/",
+                ),
+            ] {
+                let mut provider = ExternalPathProvider::new(&options(strategy), bucket)
+                    .unwrap()
+                    .unwrap();
+                let path = provider.next_path("index-1");
+                assert!(path.starts_with(expected), "{strategy}: {path}");
+                assert!(path.ends_with("/index-1"));
+            }
+        }
     }
 
     #[test]
@@ -224,7 +243,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .next_path("index-1"),
-            "file:///a/bucket-0/index-1"
+            "file:/a/bucket-0/index-1"
         );
         options.insert("data-file.external-paths.specific-fs".into(), "oss".into());
         assert!(ExternalPathProvider::new(&options, "").is_err());
@@ -253,7 +272,7 @@ mod tests {
             .unwrap();
         assert_eq!(provider.cumulative_weights, vec![1, 3]);
         for _ in 0..10 {
-            assert!(["file:///a/bucket-0/index", "file:///b/bucket-0/index"]
+            assert!(["file:/a/bucket-0/index", "file:/b/bucket-0/index"]
                 .contains(&provider.next_path("index").as_str()));
         }
     }
@@ -284,11 +303,11 @@ mod tests {
         // Guava murmur3_32(0), UTF-8 "hello": 0x248bfa47.
         assert_eq!(
             provider.next_path("hello"),
-            "file:///b/p=x/bucket-0/1011/1111/1010/01000111/hello"
+            "file:/b/p=x/bucket-0/1011/1111/1010/01000111/hello"
         );
         assert_eq!(
             provider.next_path("hello"),
-            "file:///a/p=x/bucket-0/1011/1111/1010/01000111/hello"
+            "file:/a/p=x/bucket-0/1011/1111/1010/01000111/hello"
         );
     }
 }

@@ -943,7 +943,11 @@ impl TableCommit {
             // An unpartitioned table's buckets sit directly under the table path,
             // so the partition blob is never decoded — callers are free to pass an
             // empty one.
-            return Ok(bucket_path_under(self.table.location(), "", bucket));
+            return Ok(bucket_path_under(
+                &self.table.data_file_location(),
+                "",
+                bucket,
+            ));
         }
         let core_options = CoreOptions::new(self.table.schema().options());
         let computer = PartitionComputer::new(
@@ -953,7 +957,7 @@ impl TableCommit {
             core_options.legacy_partition_name(),
         )?;
         bucket_path(
-            self.table.location(),
+            &self.table.data_file_location(),
             Some(&computer),
             &BinaryRow::from_serialized_bytes(partition)?,
             bucket,

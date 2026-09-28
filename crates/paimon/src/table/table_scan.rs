@@ -1498,7 +1498,7 @@ impl<'a> PaimonTableScan<'a> {
     /// for `scan.version`; the strict selectors mirror Java's typed
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
+        self.validate_read_options()?;
         self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let snapshot = match super::time_travel::resolve_snapshot(self.table).await? {
@@ -1511,7 +1511,7 @@ impl<'a> PaimonTableScan<'a> {
 
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        self.ensure_query_auth_allowed()?;
+        self.validate_read_options()?;
         self.validate_shard_strategy()?;
         let mut trace = ScanTrace {
             limit: self.limit,
@@ -1537,8 +1537,10 @@ impl<'a> PaimonTableScan<'a> {
     /// Fail closed for a `query-auth.enabled` table: scan planning — including
     /// `with_scan_all_files`, which read-facing system tables like `files` use —
     /// exposes file paths, row counts, and stats the client can't authorize.
-    fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
+    fn validate_read_options(&self) -> crate::Result<()> {
+        let options = CoreOptions::new(self.table.schema().options());
+        options.ensure_read_authorized()?;
+        options.validate_data_file_path_directory()
     }
 
     fn validate_shard_strategy(&self) -> crate::Result<()> {
@@ -1886,7 +1888,7 @@ impl<'a> PaimonTableScan<'a> {
     /// Reuses the same split-building path as a full snapshot plan, but only
     /// reads the delta manifest list and keeps ADD entries.
     pub(crate) async fn plan_snapshot_delta(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
+        self.validate_read_options()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut scan = self.clone();
         scan.incremental_split_mode = Some(IncrementalSplitMode::Streaming);
@@ -1905,7 +1907,7 @@ impl<'a> PaimonTableScan<'a> {
         snapshots: &[Snapshot],
         end_snapshot: &Snapshot,
     ) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
+        self.validate_read_options()?;
         self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut scan = self.clone();
@@ -1925,7 +1927,7 @@ impl<'a> PaimonTableScan<'a> {
     /// reads the changelog manifest list and keeps ADD entries. Snapshots
     /// without a changelog list yield an empty plan.
     pub(crate) async fn plan_snapshot_changelog(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
+        self.validate_read_options()?;
         let Some(list_name) = snapshot.changelog_manifest_list() else {
             return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         };
@@ -2008,7 +2010,7 @@ impl<'a> PaimonTableScan<'a> {
         before: &Snapshot,
         after: &Snapshot,
     ) -> crate::Result<(Plan, Plan)> {
-        self.ensure_query_auth_allowed()?;
+        self.validate_read_options()?;
         let core_options = CoreOptions::new(self.table.schema().options());
         // Both forms: without `first_row_id` a filter stays an ordinary data
         // predicate instead of becoming a row range.
@@ -2464,7 +2466,7 @@ impl<'a> PaimonTableScan<'a> {
         'groups: for ((partition, bucket), (total_buckets, data_files)) in groups {
             let partition_row = BinaryRow::from_serialized_bytes(&partition)?;
             let bucket_path = bucket_path(
-                base_path,
+                &self.table.data_file_location(),
                 partition_computer.as_ref(),
                 &partition_row,
                 bucket,

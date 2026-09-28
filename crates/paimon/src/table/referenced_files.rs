@@ -29,8 +29,8 @@ use std::sync::{
 
 use crate::io::FileIO;
 use crate::spec::{
-    bucket_dir_name, BinaryRow, DataField, DataFileMeta, IndexManifest, Manifest, ManifestEntry,
-    ManifestFileMeta, PartitionComputer,
+    bucket_dir_name, BinaryRow, CoreOptions, DataField, DataFileMeta, IndexManifest, Manifest,
+    ManifestEntry, ManifestFileMeta, PartitionComputer,
 };
 use crate::table::{BranchManager, SnapshotManager, TagManager};
 use futures::future::try_join_all;
@@ -188,9 +188,39 @@ pub async fn collect_referenced_files_summary(
     partition_keys: &[String],
     schema_fields: &[DataField],
 ) -> crate::Result<Vec<ReferencedFilesSummary>> {
+    collect_referenced_files_summary_with_options(
+        file_io,
+        table_location,
+        partition_keys,
+        schema_fields,
+        &CoreOptions::new(&HashMap::new()),
+    )
+    .await
+}
+
+/// Collect referenced sizes using the table's data-directory and partition options.
+pub async fn collect_referenced_files_summary_with_options(
+    file_io: &FileIO,
+    table_location: &str,
+    partition_keys: &[String],
+    schema_fields: &[DataField],
+    options: &CoreOptions<'_>,
+) -> crate::Result<Vec<ReferencedFilesSummary>> {
     let manifest_cache: ManifestCache = Mutex::new(HashMap::new());
     let manifest_cache_ref = &manifest_cache;
-    let extra_resolver = ExtraFileResolver::new(table_location, partition_keys, schema_fields);
+    let mut extra_resolver = ExtraFileResolver::new(
+        &crate::spec::data_file_path(table_location, options.data_file_path_directory()),
+        partition_keys,
+        schema_fields,
+    );
+    if !partition_keys.is_empty() {
+        extra_resolver.partition_computer = Some(PartitionComputer::new(
+            partition_keys,
+            schema_fields,
+            options.partition_default_name(),
+            options.legacy_partition_name(),
+        )?);
+    }
     let extra_resolver_ref = &extra_resolver;
 
     let sm = SnapshotManager::new(file_io.clone(), table_location.to_string());
@@ -728,62 +758,31 @@ fn is_index_file_in_bucket(segments: &[&str], partition_depth: usize) -> bool {
         && is_bucket_index_file_name(segments[partition_depth + 1])
 }
 
-fn is_data_file_in_data_dir(
-    relative_path: &str,
-    data_dir_relative_path: &str,
-    partition_depth: usize,
-) -> bool {
-    let data_dir_relative_path = data_dir_relative_path.trim_matches('/');
-    let data_relative_path = if data_dir_relative_path.is_empty() {
-        relative_path
-    } else {
-        let Some(rest) = relative_path
-            .strip_prefix(data_dir_relative_path)
-            .and_then(|rest| rest.strip_prefix('/'))
-        else {
-            return false;
-        };
-        rest
-    };
-    let segments = data_relative_path.split('/').collect::<Vec<_>>();
-    is_data_file_in_bucket(&segments, partition_depth)
-}
-
 fn classify_physical_path(
     table_location: &str,
     path: &str,
     partition_depth: usize,
     data_file_path_directory: Option<&str>,
 ) -> PhysicalFileKind {
-    let Some(relative_path) = table_relative_path(table_location, path) else {
+    let data_root = crate::spec::data_file_path(table_location, data_file_path_directory);
+    if let Some(relative) = table_relative_path(&data_root, path) {
+        let segments: Vec<_> = relative.split('/').collect();
+        if is_index_file_in_bucket(&segments, partition_depth) {
+            return PhysicalFileKind::Index;
+        }
+        if is_data_file_in_bucket(&segments, partition_depth) {
+            return PhysicalFileKind::Data;
+        }
+    }
+    let Some(relative) = table_relative_path(table_location, path) else {
         return PhysicalFileKind::Other;
     };
-    let relative_path = relative_path.trim_matches('/');
-    if relative_path.is_empty() {
-        return PhysicalFileKind::Other;
-    }
-
-    let segments = relative_path.split('/').collect::<Vec<_>>();
-
+    let segments: Vec<_> = relative.split('/').collect();
     match segments.as_slice() {
         ["manifest", name] if is_manifest_file_name(name) => PhysicalFileKind::Manifest,
         ["statistics", _] => PhysicalFileKind::Statistics,
         ["index", _] => PhysicalFileKind::Index,
-        _ if is_index_file_in_bucket(&segments, partition_depth) => PhysicalFileKind::Index,
-        _ => {
-            if let Some(data_dir) = data_file_path_directory {
-                let data_dir = table_relative_path(table_location, data_dir).unwrap_or(data_dir);
-                if is_data_file_in_data_dir(relative_path, data_dir, partition_depth) {
-                    PhysicalFileKind::Data
-                } else {
-                    PhysicalFileKind::Other
-                }
-            } else if is_data_file_in_bucket(&segments, partition_depth) {
-                PhysicalFileKind::Data
-            } else {
-                PhysicalFileKind::Other
-            }
-        }
+        _ => PhysicalFileKind::Other,
     }
 }
 
@@ -803,13 +802,31 @@ pub async fn collect_physical_files_summary(
     table_location: &str,
     partition_depth: usize,
 ) -> crate::Result<PhysicalFilesSummary> {
+    collect_physical_files_summary_with_options(
+        file_io,
+        table_location,
+        partition_depth,
+        &CoreOptions::new(&HashMap::new()),
+    )
+    .await
+}
+
+/// Include the configured data directory, including directories outside the table root.
+pub async fn collect_physical_files_summary_with_options(
+    file_io: &FileIO,
+    table_location: &str,
+    partition_depth: usize,
+    options: &CoreOptions<'_>,
+) -> crate::Result<PhysicalFilesSummary> {
+    let data_directory = options.data_file_path_directory();
+    let data_root = crate::spec::data_file_path(table_location, data_directory);
     // List top-level entries to discover subdirectories and top-level files
     let top_entries = match file_io.list_status(table_location).await {
         Ok(s) => s,
         Err(crate::Error::IoUnexpected { ref source, .. })
             if source.kind() == opendal::ErrorKind::NotFound =>
         {
-            return Ok(PhysicalFilesSummary::default());
+            Vec::new()
         }
         Err(e) => return Err(e),
     };
@@ -818,16 +835,21 @@ pub async fn collect_physical_files_summary(
 
     // Classify top-level files directly
     let mut sub_dirs = Vec::new();
+    if table_relative_path(table_location, &data_root).is_none() {
+        sub_dirs.push(data_root);
+    }
+    let mut seen = HashSet::new();
     for entry in &top_entries {
         if entry.is_dir {
             sub_dirs.push(entry.path.clone());
-        } else {
+        } else if seen.insert(entry.path.clone()) {
             accumulate_file(
                 &mut summary,
                 table_location,
                 &entry.path,
                 partition_depth,
                 entry.size,
+                data_directory,
             );
         }
     }
@@ -852,12 +874,16 @@ pub async fn collect_physical_files_summary(
     for result in dir_results {
         let statuses = result?;
         for status in &statuses {
+            if !seen.insert(status.path.clone()) {
+                continue;
+            }
             accumulate_file(
                 &mut summary,
                 table_location,
                 &status.path,
                 partition_depth,
                 status.size,
+                data_directory,
             );
         }
     }
@@ -871,8 +897,9 @@ fn accumulate_file(
     path: &str,
     partition_depth: usize,
     size: u64,
+    data_directory: Option<&str>,
 ) {
-    match classify_physical_path(table_location, path, partition_depth, None) {
+    match classify_physical_path(table_location, path, partition_depth, data_directory) {
         PhysicalFileKind::Manifest | PhysicalFileKind::Statistics => {
             summary.manifest_file_count += 1;
             summary.manifest_file_size += size as i64;
@@ -891,6 +918,49 @@ fn accumulate_file(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn configured_directory_counts_data_and_bucket_indexes_once() {
+        for directory in ["data/nested", "memory:/outside-data", ".."] {
+            let io = test_file_io();
+            let table_path = "memory:/sizes/table";
+            let options =
+                HashMap::from([("data-file.path-directory".into(), directory.to_string())]);
+            let root = crate::spec::data_file_path(table_path, Some(directory));
+            write_test_file(&io, &format!("{table_path}/manifest/manifest-1"), "meta").await;
+            write_test_file(
+                &io,
+                &format!("{root}/pt=a/bucket-0/data.parquet"),
+                "payload",
+            )
+            .await;
+            write_test_file(&io, &format!("{root}/pt=a/bucket-0/index-dv"), "dv").await;
+            write_test_file(&io, &format!("{table_path}/bucket-0/unrelated"), "ignore").await;
+            let sizes = collect_physical_files_summary_with_options(
+                &io,
+                table_path,
+                1,
+                &CoreOptions::new(&options),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (sizes.manifest_file_count, sizes.manifest_file_size),
+                (1, 4),
+                "{directory}"
+            );
+            assert_eq!(
+                (sizes.data_file_count, sizes.data_file_size),
+                (1, 7),
+                "{directory}"
+            );
+            assert_eq!(
+                (sizes.index_file_count, sizes.index_file_size),
+                (1, 2),
+                "{directory}"
+            );
+        }
+    }
+
     use super::*;
     use crate::io::FileIOBuilder;
     use crate::spec::{CommitKind, Snapshot};

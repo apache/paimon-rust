@@ -457,6 +457,7 @@ impl DataEvolutionWriter {
 /// write that follows it cannot disagree about where the file goes.
 struct DeletionVectorLayout {
     table_path: String,
+    relative_bucket_path: String,
     bucket_path: String,
     index_file_in_data_file_dir: bool,
 }
@@ -722,10 +723,19 @@ impl DataEvolutionDeleteWriter {
         } else {
             EMPTY_BINARY_ROW
         };
+        let partition_path = match &computer {
+            Some(computer) => computer.generate_partition_path(&partition_row)?,
+            None => String::new(),
+        };
         Ok(DeletionVectorLayout {
+            relative_bucket_path: crate::spec::relative_bucket_path(
+                &partition_path,
+                bucket,
+                core_options.data_file_path_directory(),
+            ),
             table_path: self.table.location().trim_end_matches('/').to_string(),
             bucket_path: bucket_path(
-                self.table.location(),
+                &self.table.data_file_location(),
                 computer.as_ref(),
                 &partition_row,
                 bucket,
@@ -806,10 +816,7 @@ impl DataEvolutionDeleteWriter {
         let external_path = super::external_path::new_index_external_path(
             self.table.schema().options(),
             layout.index_file_in_data_file_dir,
-            layout
-                .bucket_path
-                .strip_prefix(&format!("{}/", layout.table_path))
-                .expect("bucket path is under the table"),
+            &layout.relative_bucket_path,
             &file_name,
         )?;
         let path = layout

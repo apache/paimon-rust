@@ -150,7 +150,7 @@ pub(crate) async fn resolve_legacy_deletion_vector_entries(
         }
         let partition = BinaryRow::from_serialized_bytes(&entry.partition)?;
         let bucket_path = bucket_path(
-            table_path,
+            &table.data_file_location(),
             partition_computer.as_ref(),
             &partition,
             entry.bucket,
