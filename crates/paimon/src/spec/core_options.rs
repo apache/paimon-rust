@@ -730,6 +730,13 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    pub fn data_evolution_write_cols_optimization_enabled(&self) -> bool {
+        self.options
+            .get("data-evolution.write-cols-optimization.enabled")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
     pub fn data_evolution_nested_field_enabled(&self) -> bool {
         self.options
             .get(DATA_EVOLUTION_NESTED_FIELD_ENABLED_OPTION)

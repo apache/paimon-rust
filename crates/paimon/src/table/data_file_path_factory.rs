@@ -21,12 +21,15 @@ use super::external_path::ExternalPathProvider;
 use crate::spec::{bucket_path_under, data_file_path, relative_bucket_path, CoreOptions};
 use crate::Result;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Select a location once per new data/changelog/Blob file. Sidecars use the
 /// selected file's parent; they must never advance the external-path provider.
 pub(super) struct DataFilePathFactory {
     bucket_path: String,
+    file_uuid: uuid::Uuid,
+    file_counter: AtomicU64,
     external: Option<Mutex<ExternalPathProvider>>,
 }
 
@@ -57,12 +60,20 @@ impl DataFilePathFactory {
         let relative = relative_bucket_path(partition, bucket, directory);
         Ok(Self {
             bucket_path,
+            file_uuid: uuid::Uuid::new_v4(),
+            file_counter: AtomicU64::new(0),
             external: ExternalPathProvider::new(options, &relative)?.map(Mutex::new),
         })
     }
 
     pub fn bucket_path(&self) -> &str {
         &self.bucket_path
+    }
+
+    /// Java shares the UUID and counter across all physical column files.
+    pub fn new_file_name(&self, prefix: &str, format: &str) -> String {
+        let counter = self.file_counter.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}{}-{counter}.{format}", self.file_uuid)
     }
 
     pub fn new_path(&self, name: &str) -> Result<DataFilePath> {

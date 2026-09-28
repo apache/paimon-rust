@@ -460,11 +460,9 @@ impl TableWrite {
                 .any(|f| matches!(f.data_type(), DataType::Vector(_)));
 
         let file_index_options = FileIndexOptions::parse(schema.options(), schema.fields())?;
-        if file_index_options.is_some()
-            && (has_blob_fields || has_dedicated_vector_fields || !blob_view_fields.is_empty())
-        {
+        if file_index_options.is_some() && has_dedicated_vector_fields {
             return Err(crate::Error::Unsupported {
-                message: "FileIndex generation does not support dedicated Blob/Vector writes"
+                message: "FileIndex generation does not support dedicated Vector writes"
                     .to_string(),
             });
         }
@@ -619,6 +617,12 @@ impl TableWrite {
         let batch = self.validate_write_batch_schema(batch)?;
         if batch.num_rows() == 0 {
             return Ok(None);
+        }
+        if !self.primary_key_indices.is_empty() {
+            super::inline_blob::validate_inline_blob_columns(
+                &batch,
+                self.table.schema().options(),
+            )?;
         }
         let batch = self.enrich_rowkind_batch(&batch)?;
         Ok((batch.num_rows() != 0).then_some(batch))
@@ -1171,7 +1175,6 @@ impl TableWrite {
                     fields,
                     self.table.schema().options(),
                     &self.blob_inline_fields,
-                    &self.blob_view_fields,
                 )?
                 .with_resources(self.resources.clone()),
             )))

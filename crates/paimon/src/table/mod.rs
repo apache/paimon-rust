@@ -73,6 +73,7 @@ mod global_index_types;
 mod hybrid_search_builder;
 mod incremental_scan;
 pub(crate) mod index_file_path;
+mod inline_blob;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;

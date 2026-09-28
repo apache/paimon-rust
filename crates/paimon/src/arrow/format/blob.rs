@@ -2151,12 +2151,12 @@ impl FormatFileWriter for BlobFormatWriter {
                             .to_string(),
                     source: None,
                 })?;
-                let input = file_io.new_input(desc.uri())?;
+                let input = crate::io::uri_reader::UriInput::new(file_io, desc.uri())?;
                 let offset = range.offset();
                 let payload_len = match range.length() {
                     Some(length) => length,
                     None => input
-                        .metadata()
+                        .size()
                         .await
                         .map_err(|e| Error::UnexpectedError {
                             message: format!(
@@ -2165,7 +2165,6 @@ impl FormatFileWriter for BlobFormatWriter {
                             ),
                             source: Some(Box::new(e)),
                         })?
-                        .size
                         .saturating_sub(offset),
                 };
                 let end = offset
@@ -2191,7 +2190,7 @@ impl FormatFileWriter for BlobFormatWriter {
                 let reader = if payload_len == 0 {
                     None
                 } else {
-                    Some(input.reader().await?)
+                    Some(input.reader_for_range(offset..end).await?)
                 };
 
                 let mut hasher = crc32fast::Hasher::new();

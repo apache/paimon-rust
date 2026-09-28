@@ -1231,9 +1231,11 @@ async fn resolve_descriptor_columns(
         blob_descriptor_fields,
         limiter.parallelism(),
         |column| {
-        let file_io = file_io.clone();
-        let limiter = limiter.clone();
-        async move { super::blob_resolver::resolve_blob_column(&column, &file_io, limiter).await }
+            let file_io = file_io.clone();
+            let limiter = limiter.clone();
+            async move {
+                super::blob_resolver::resolve_descriptor_column(&column, &file_io, limiter).await
+            }
         },
     )
     .await

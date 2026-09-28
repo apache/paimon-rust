@@ -17,10 +17,10 @@
 
 use crate::io::FileIO;
 use crate::resource::ResourceContext;
-use crate::spec::{BlobViewStruct, DataField, DataFileMeta, DataType};
+use crate::spec::{CoreOptions, DataField, DataFileMeta, DataType};
 use crate::table::data_file_writer::DataFileWriter;
 use crate::Result;
-use arrow_array::{Array, RecordBatch};
+use arrow_array::RecordBatch;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -57,7 +57,8 @@ pub(crate) struct AppendDedicatedFormatFileWriter {
     vector_writer: Option<VectorFieldWriter>,
     normal_column_indices: Vec<usize>,
     normal_schema: Arc<arrow_schema::Schema>,
-    blob_view_column_indices: Vec<(usize, String)>,
+    // Completed normal + dedicated file groups, still owned until prepare_commit.
+    written_files: Vec<DataFileMeta>,
 }
 
 impl AppendDedicatedFormatFileWriter {
@@ -81,7 +82,6 @@ impl AppendDedicatedFormatFileWriter {
         table_fields: &[DataField],
         format_options: &HashMap<String, String>,
         blob_inline_fields: &HashSet<String>,
-        blob_view_fields: &HashSet<String>,
     ) -> Result<Self> {
         let paths = Arc::new(super::data_file_path_factory::DataFilePathFactory::new(
             &table_location,
@@ -179,6 +179,20 @@ impl AppendDedicatedFormatFileWriter {
             None
         };
 
+        let core_options = CoreOptions::new(format_options);
+        // Full append writes include all normal fields in schema order. Partial
+        // column writers must retain their explicit write_cols instead.
+        let normal_write_cols = if core_options.data_evolution_enabled()
+            && core_options.data_evolution_write_cols_optimization_enabled()
+        {
+            None
+        } else {
+            Some(normal_field_names)
+        };
+        let normal_index =
+            super::data_file_index_writer::FileIndexOptions::parse(format_options, table_fields)?
+                .and_then(|options| options.project_to_fields(&normal_table_fields))
+                .map(Arc::new);
         let normal_writer = DataFileWriter::new(
             file_io.clone(),
             table_location,
@@ -194,23 +208,19 @@ impl AppendDedicatedFormatFileWriter {
             format_options.clone(),
             Some(0),
             None,
-            Some(normal_field_names),
+            normal_write_cols,
         )?
         .with_path_factory(paths.clone())
+        .with_file_index(normal_index)
         .with_target_file_row_num(target_file_row_num);
 
         Ok(Self {
+            written_files: Vec::new(),
             normal_writer,
             blob_writers,
             vector_writer,
             normal_column_indices,
             normal_schema,
-            blob_view_column_indices: table_fields
-                .iter()
-                .enumerate()
-                .filter(|(_, field)| blob_view_fields.contains(field.name()))
-                .map(|(idx, field)| (idx, field.name().to_string()))
-                .collect(),
         })
     }
 
@@ -229,8 +239,6 @@ impl AppendDedicatedFormatFileWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-
-        self.validate_blob_view_columns(batch)?;
 
         // Write normal columns
         let normal_columns: Vec<Arc<dyn arrow_array::Array>> = self
@@ -260,7 +268,11 @@ impl AppendDedicatedFormatFileWriter {
                     ),
                     source: None,
                 })?;
-            blob_writer.writer.write(&blob_batch).await?;
+            // Serialized descriptor size says nothing about the payload size.
+            // Java checks the physical Blob bytes after every row.
+            for row in 0..blob_batch.num_rows() {
+                blob_writer.writer.write(&blob_batch.slice(row, 1)).await?;
+            }
         }
 
         if let Some(vector_writer) = &mut self.vector_writer {
@@ -285,51 +297,15 @@ impl AppendDedicatedFormatFileWriter {
             vector_writer.writer.write(&vector_batch).await?;
         }
 
-        Ok(())
-    }
-
-    fn validate_blob_view_columns(&self, batch: &RecordBatch) -> Result<()> {
-        for (column_index, field_name) in &self.blob_view_column_indices {
-            let Some(col) = batch
-                .column(*column_index)
-                .as_any()
-                .downcast_ref::<arrow_array::LargeBinaryArray>()
-            else {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "blob-view-field '{field_name}' requires a LargeBinaryArray value column"
-                    ),
-                    source: None,
-                });
-            };
-            for row in 0..col.len() {
-                if col.is_null(row) {
-                    continue;
-                }
-                let value = col.value(row);
-                if !BlobViewStruct::is_blob_view_struct(value) {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "blob-view-field '{field_name}' requires blob field value to be a serialized BlobViewStruct"
-                        ),
-                        source: None,
-                    });
-                }
-                let view = BlobViewStruct::deserialize(value)?;
-                if view.serialize()?.as_slice() != value {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "blob-view-field '{field_name}' contains a non-canonical BlobViewStruct payload"
-                        ),
-                        source: None,
-                    });
-                }
-            }
+        if !self.normal_writer.has_open_file() {
+            self.close_group().await?;
         }
         Ok(())
     }
 
     pub(crate) async fn abort(&mut self) {
+        self.normal_writer.delete_files(&self.written_files).await;
+        self.written_files.clear();
         self.normal_writer.abort().await;
         for writer in &mut self.blob_writers {
             writer.writer.abort().await;
@@ -340,6 +316,11 @@ impl AppendDedicatedFormatFileWriter {
     }
 
     pub(crate) async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
+        self.close_group().await?;
+        Ok(std::mem::take(&mut self.written_files))
+    }
+
+    async fn close_group(&mut self) -> Result<()> {
         let writers = std::iter::once(&mut self.normal_writer)
             .chain(
                 self.blob_writers
@@ -351,11 +332,14 @@ impl AppendDedicatedFormatFileWriter {
                     .iter_mut()
                     .map(|writer| &mut writer.writer),
             );
-        Ok(DataFileWriter::prepare_group(writers)
-            .await?
-            .into_iter()
-            .flatten()
-            .collect())
+        match DataFileWriter::prepare_group(writers).await {
+            Ok(files) => self.written_files.extend(files.into_iter().flatten()),
+            Err(error) => {
+                self.abort().await;
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -368,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_blob_close_cleans_every_physical_column() {
-        for external in [false, true] {
+        for (external, rolled) in [(false, false), (true, false), (false, true), (true, true)] {
             let io = FileIOBuilder::new("memory").build().unwrap();
             let batch = RecordBatch::try_from_iter([
                 ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
@@ -387,7 +371,7 @@ mod tests {
                 DataField::new(1, "a".into(), DataType::Blob(BlobType::new())),
                 DataField::new(2, "b".into(), DataType::Blob(BlobType::new())),
             ];
-            let options = if external {
+            let mut options = if external {
                 HashMap::from([
                     (
                         "data-file.external-paths".into(),
@@ -401,6 +385,11 @@ mod tests {
             } else {
                 HashMap::new()
             };
+            options.extend([
+                ("file-index.bloom-filter.columns".into(), "id".into()),
+                ("file-index.bloom-filter.id.items".into(), "10".into()),
+                ("file-index.in-manifest-threshold".into(), "0 B".into()),
+            ]);
             let mut writer = AppendDedicatedFormatFileWriter::new(
                 io.clone(),
                 "memory:/table".into(),
@@ -408,7 +397,7 @@ mod tests {
                 0,
                 0,
                 i64::MAX,
-                i64::MAX,
+                if rolled { 1 } else { i64::MAX },
                 i64::MAX,
                 "none".into(),
                 0,
@@ -420,17 +409,19 @@ mod tests {
                 &fields,
                 &options,
                 &HashSet::new(),
-                &HashSet::new(),
             )
             .unwrap();
             writer.write(&batch).await.unwrap();
             writer.blob_writers[1].writer.inject_close_failure();
-            assert!(writer
-                .prepare_commit()
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("injected close failure"));
+            let error = if rolled {
+                assert!(!writer.written_files.is_empty());
+                // A later group failure must also remove earlier successful
+                // groups, which have not been handed to a committer yet.
+                writer.write(&batch).await.unwrap_err()
+            } else {
+                writer.prepare_commit().await.unwrap_err()
+            };
+            assert!(error.to_string().contains("injected close failure"));
             assert!(io
                 .list_status_recursive("memory:/")
                 .await
