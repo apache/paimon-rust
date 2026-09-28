@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::SystemTime;
@@ -90,6 +91,13 @@ enum FileIOBackend {
 pub struct FileIO {
     backend: FileIOBackend,
     cache: Option<Arc<LocalCache>>,
+    cache_namespace: usize,
+}
+
+static NEXT_FILE_IO_CACHE_NAMESPACE: AtomicUsize = AtomicUsize::new(1);
+
+fn next_file_io_cache_namespace() -> usize {
+    NEXT_FILE_IO_CACHE_NAMESPACE.fetch_add(1, Ordering::Relaxed)
 }
 
 impl std::fmt::Debug for FileIO {
@@ -126,6 +134,7 @@ impl FileIO {
     /// subsequently created by [`Self::new_input`] and [`Self::new_output`].
     pub fn with_provider(mut self, provider: Arc<dyn FileIOProvider>) -> Self {
         self.backend = FileIOBackend::Provider(provider);
+        self.cache_namespace = next_file_io_cache_namespace();
         self
     }
 
@@ -211,6 +220,7 @@ impl FileIO {
         Ok(InputFile {
             source: self.file_source(path)?,
             path: path.to_string(),
+            cache_namespace: self.cache_namespace,
             cache: self
                 .cache
                 .as_ref()
@@ -227,6 +237,7 @@ impl FileIO {
         Ok(OutputFile {
             source: self.file_source(path)?,
             path: path.to_string(),
+            cache_namespace: self.cache_namespace,
             cache: self
                 .cache
                 .as_ref()
@@ -682,13 +693,22 @@ impl FileIOBuilder {
         } else {
             FileIOBackend::Storage(Arc::new(Storage::build(self)?))
         };
-        Ok(FileIO { backend, cache })
+        Ok(FileIO {
+            backend,
+            cache,
+            cache_namespace: next_file_io_cache_namespace(),
+        })
     }
 }
 
 #[async_trait::async_trait]
 pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
+
+    #[doc(hidden)]
+    fn cache_namespace(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -699,17 +719,23 @@ impl FileRead for opendal::Reader {
 }
 
 enum InputFileReader {
-    Direct(opendal::Reader),
-    Cached(CachedFileReader),
+    Direct(opendal::Reader, usize),
+    Cached(CachedFileReader, usize),
 }
 
 #[async_trait::async_trait]
 impl FileRead for InputFileReader {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
         match self {
-            Self::Direct(reader) => FileRead::read(reader, range).await,
-            Self::Cached(reader) => FileRead::read(reader, range).await,
+            Self::Direct(reader, _) => FileRead::read(reader, range).await,
+            Self::Cached(reader, _) => FileRead::read(reader, range).await,
         }
+    }
+
+    fn cache_namespace(&self) -> Option<usize> {
+        Some(match self {
+            Self::Direct(_, namespace) | Self::Cached(_, namespace) => *namespace,
+        })
     }
 }
 
@@ -847,6 +873,7 @@ impl FileSource {
 pub struct InputFile {
     source: FileSource,
     path: String,
+    cache_namespace: usize,
     cache: Option<Arc<LocalCache>>,
 }
 
@@ -897,7 +924,7 @@ impl InputFile {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let reader = op.reader(&relative_path).await?;
         let Some(cache) = &self.cache else {
-            return Ok(InputFileReader::Direct(reader));
+            return Ok(InputFileReader::Direct(reader, self.cache_namespace));
         };
         let read_token = cache.read_token(&cache_path);
         let size = if let Some(size) = cache.file_size(&cache_path, &read_token).await {
@@ -907,13 +934,16 @@ impl InputFile {
             cache.put_file_size(&cache_path, size, &read_token).await;
             size
         };
-        Ok(InputFileReader::Cached(CachedFileReader::new_with_token(
-            Arc::new(reader),
-            &cache_path,
-            size,
-            cache.clone(),
-            read_token,
-        )))
+        Ok(InputFileReader::Cached(
+            CachedFileReader::new_with_token(
+                Arc::new(reader),
+                &cache_path,
+                size,
+                cache.clone(),
+                read_token,
+            ),
+            self.cache_namespace,
+        ))
     }
 }
 
@@ -921,6 +951,7 @@ impl InputFile {
 pub struct OutputFile {
     source: FileSource,
     path: String,
+    cache_namespace: usize,
     cache: Option<Arc<LocalCache>>,
 }
 
@@ -939,6 +970,7 @@ impl OutputFile {
         InputFile {
             source: self.source,
             path: self.path,
+            cache_namespace: self.cache_namespace,
             cache,
         }
     }
