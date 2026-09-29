@@ -2161,7 +2161,7 @@ impl FormatFileWriter for BlobFormatWriter {
                         .map_err(|e| Error::UnexpectedError {
                             message: format!(
                                 "Failed to read metadata for BlobDescriptor '{}': {e}",
-                                desc.uri()
+                                crate::io::uri_reader::sanitize_blob_uri(desc.uri())
                             ),
                             source: Some(Box::new(e)),
                         })?
@@ -2209,7 +2209,7 @@ impl FormatFileWriter for BlobFormatWriter {
                             Error::UnexpectedError {
                                 message: format!(
                                     "Failed to read BlobDescriptor '{}' range {pos}..{chunk_end}: {e}",
-                                    desc.uri()
+                                    crate::io::uri_reader::sanitize_blob_uri(desc.uri())
                                 ),
                                 source: Some(Box::new(e)),
                             }
@@ -2220,7 +2220,7 @@ impl FormatFileWriter for BlobFormatWriter {
                             return Err(Error::DataInvalid {
                                 message: format!(
                                     "Failed to read BlobDescriptor '{}': short read for range {pos}..{chunk_end}, expected={expected_len} bytes, actual={actual_len} bytes",
-                                    desc.uri()
+                                    crate::io::uri_reader::sanitize_blob_uri(desc.uri())
                                 ),
                                 source: None,
                             });

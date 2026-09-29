@@ -199,10 +199,51 @@ impl FileRead for HttpRangeReader {
 }
 
 fn http_error(error: reqwest::Error) -> Error {
+    // Both Display and Debug/source chains can expose the final URL after a
+    // redirect. Like Java HttpClientUtils, retain safe diagnostics only; even
+    // removing the request URL would not sanitize arbitrary nested causes.
+    let message = if let Some(status) = error.status() {
+        format!("HTTP Blob request failed with status {status}")
+    } else {
+        let operation = if error.is_timeout() {
+            "timeout"
+        } else if error.is_redirect() {
+            "redirect"
+        } else if error.is_connect() {
+            "connection"
+        } else if error.is_decode() {
+            "response decoding"
+        } else if error.is_builder() {
+            "request construction"
+        } else if error.is_body() {
+            "response body"
+        } else {
+            "request"
+        };
+        format!("HTTP Blob {operation} failed")
+    };
     Error::UnexpectedError {
-        message: format!("HTTP Blob request failed: {error}"),
-        source: Some(Box::new(error)),
+        message,
+        source: None,
     }
+}
+
+/// Safe URI context for Blob I/O errors, including signed URLs and userinfo.
+pub(crate) fn sanitize_blob_uri(uri: &str) -> String {
+    if let Ok(mut url) = url::Url::parse(uri) {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        return url.to_string();
+    }
+    if uri.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    }) {
+        // A malformed authority cannot be safely split into host/userinfo.
+        return "<invalid HTTP URI>".into();
+    }
+    uri.split(['?', '#']).next().unwrap_or(uri).to_string()
 }
 
 fn invalid(message: &str) -> Error {
@@ -222,6 +263,18 @@ mod tests {
     use axum::Router;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn sanitize_http_uri_context() {
+        assert_eq!(
+            sanitize_blob_uri("https://user:password@example.com/path?signature=secret#fragment"),
+            "https://example.com/path"
+        );
+        assert_eq!(
+            sanitize_blob_uri("http://user:password@example.com:bad/path?signature=secret"),
+            "<invalid HTTP URI>"
+        );
+    }
 
     #[tokio::test]
     async fn http_reads_use_decoded_offsets_and_reuse_the_copy_stream() {

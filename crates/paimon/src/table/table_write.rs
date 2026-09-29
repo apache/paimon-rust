@@ -615,6 +615,9 @@ impl TableWrite {
 
     pub(super) fn normalize_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
         let batch = self.validate_write_batch_schema(batch)?;
+        // Java filters row kinds before extracting Blob values. Ignored rows
+        // need neither valid descriptor bytes nor physical files.
+        let batch = self.enrich_rowkind_batch(&batch)?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }
@@ -624,8 +627,7 @@ impl TableWrite {
                 self.table.schema().options(),
             )?;
         }
-        let batch = self.enrich_rowkind_batch(&batch)?;
-        Ok((batch.num_rows() != 0).then_some(batch))
+        Ok(Some(batch))
     }
 
     pub(super) async fn write_partition_bucket_batch(

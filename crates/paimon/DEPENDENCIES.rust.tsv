@@ -29,6 +29,7 @@ arrow-schema@58.4.0		X
 arrow-select@58.4.0		X																
 arrow-string@58.4.0		X																
 async-channel@2.5.0		X									X							
+async-compression@0.4.42		X									X							
 async-executor@1.14.0		X									X							
 async-fs@2.2.0		X									X							
 async-io@2.6.0		X									X							
@@ -89,6 +90,8 @@ cmake@0.1.58		X									X
 cmov@0.5.4		X									X							
 combine@4.6.7											X							
 comfy-table@7.2.2											X							
+compression-codecs@0.4.38		X									X							
+compression-core@0.4.32		X									X							
 concurrent-queue@2.5.0		X									X							
 const-oid@0.10.2		X									X							
 const-oid@0.9.6		X									X							

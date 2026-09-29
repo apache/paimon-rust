@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
+use crate::io::uri_reader::sanitize_blob_uri;
 use crate::io::{FileIO, FileRead};
 use crate::spec::BlobDescriptor;
 use crate::Result;
@@ -303,17 +304,6 @@ fn blob_error_with_context(
     }
 }
 
-fn sanitize_blob_uri(uri: &str) -> String {
-    if let Ok(mut url) = url::Url::parse(uri) {
-        let _ = url.set_username("");
-        let _ = url.set_password(None);
-        url.set_query(None);
-        url.set_fragment(None);
-        return url.to_string();
-    }
-    uri.split(['?', '#']).next().unwrap_or(uri).to_string()
-}
-
 /// Shared admission control for external descriptor metadata and range reads.
 ///
 /// The byte semaphore budgets active range I/O only. A single range larger than
@@ -381,7 +371,8 @@ impl BlobReadLimiter {
             .await
             .map_err(|e| crate::Error::UnexpectedError {
                 message: format!(
-                    "Failed to acquire BlobDescriptor byte permits for URI '{uri}': {e}"
+                    "Failed to acquire BlobDescriptor byte permits for URI '{}': {e}",
+                    sanitize_blob_uri(uri)
                 ),
                 source: Some(Box::new(e)),
             })?;
@@ -395,7 +386,8 @@ impl BlobReadLimiter {
             .await
             .map_err(|e| crate::Error::UnexpectedError {
                 message: format!(
-                    "Failed to acquire BlobDescriptor {operation} permit for URI '{uri}': {e}"
+                    "Failed to acquire BlobDescriptor {operation} permit for URI '{}': {e}",
+                    sanitize_blob_uri(uri)
                 ),
                 source: Some(Box::new(e)),
             })
@@ -480,7 +472,10 @@ async fn resolve_column(
                 .size()
                 .await
                 .map_err(|e| crate::Error::UnexpectedError {
-                    message: format!("Failed to read metadata for BlobDescriptor URI '{uri}': {e}"),
+                    message: format!(
+                        "Failed to read metadata for BlobDescriptor URI '{}': {e}",
+                        sanitize_blob_uri(&uri)
+                    ),
                     source: Some(Box::new(e)),
                 })?
         } else {
@@ -606,7 +601,7 @@ async fn read_merged_blob_ranges(
     let blob_parallelism = limiter.parallelism();
     stream::iter(reads)
         .map(|merged| {
-            let uri = uri.to_string();
+            let uri = sanitize_blob_uri(uri);
             let reader = reader.clone();
             let limiter = limiter.clone();
             async move {

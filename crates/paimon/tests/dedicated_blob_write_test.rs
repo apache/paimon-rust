@@ -86,6 +86,64 @@ async fn rows(table: &Table) -> Vec<(i32, Option<Vec<u8>>)> {
 }
 
 #[tokio::test]
+async fn partial_blob_updates_preserve_unmatched_descriptors_without_resolving() {
+    let table = table(&[("blob-descriptor-field", "payload")]).await;
+    // None of these references exist. Updating an inline reference must not
+    // read the old or new payloads, including rows retained in the same file.
+    let old = BlobDescriptor::new("memory:/missing/old".into(), 0, 3).serialize();
+    let retained = BlobDescriptor::new("memory:/missing/retained".into(), 7, -1).serialize();
+    let updated = BlobDescriptor::new("memory:/missing/updated".into(), 2, 5).serialize();
+    let builder = table.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&batch(
+            vec![1, 2, 3],
+            vec![Some(&old), Some(&retained), None],
+        ))
+        .await
+        .unwrap();
+    builder
+        .new_commit()
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let mut update = builder
+        .new_data_evolution_writer(vec!["payload".into()])
+        .unwrap();
+    update
+        .add_matched_batch(
+            RecordBatch::try_from_iter([
+                (
+                    "_ROW_ID",
+                    Arc::new(arrow_array::Int64Array::from(vec![0])) as ArrayRef,
+                ),
+                (
+                    "payload",
+                    Arc::new(LargeBinaryArray::from(vec![Some(updated.as_slice())])) as ArrayRef,
+                ),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    builder
+        .new_commit()
+        .commit(update.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    let descriptor_table = table.copy_with_options(
+        [("blob-as-descriptor".to_string(), "true".to_string())]
+            .into_iter()
+            .collect(),
+    );
+    assert_eq!(
+        rows(&descriptor_table).await,
+        vec![(1, Some(updated)), (2, Some(retained)), (3, None)]
+    );
+}
+
+#[tokio::test]
 async fn prepared_sequences_and_optimized_write_columns_match_java() {
     for optimize in [false, true] {
         let table = table(&[(
@@ -418,4 +476,81 @@ async fn primary_key_inline_descriptors_validate_and_resolve_legacy_bytes() {
             (3, None)
         ]
     );
+}
+
+#[tokio::test]
+async fn ignored_row_kinds_skip_inline_blob_validation() {
+    for generated in [false, true] {
+        let mut schema = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("payload", DataType::Blob(BlobType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("ignore-delete", "true")
+            .option("ignore-update-before", "true")
+            .option("blob-descriptor-field", "payload");
+        if generated {
+            schema = schema
+                .column(
+                    "kind",
+                    DataType::VarChar(paimon::spec::VarCharType::string_type()),
+                )
+                .option("rowkind.field", "kind");
+        }
+        let path = "memory:/ignored_inline_blob";
+        let (io, table) = memory_table(path, TableSchema::new(0, &schema.build().unwrap()));
+        setup_dirs(&io, path).await;
+        persist_table_schema(&io, path, table.schema()).await;
+        io.new_output("memory:/payload")
+            .unwrap()
+            .write(b"hello".to_vec().into())
+            .await
+            .unwrap();
+        let descriptor = BlobDescriptor::new("memory:/payload".into(), 0, 5).serialize();
+        let input = batch(
+            vec![1, 2, 3],
+            vec![Some(&descriptor), Some(b""), Some(b"raw")],
+        );
+        let mut columns: Vec<(String, ArrayRef)> = input
+            .schema()
+            .fields()
+            .iter()
+            .zip(input.columns())
+            .map(|(field, column)| (field.name().clone(), column.clone()))
+            .collect();
+        if generated {
+            columns.push((
+                "kind".into(),
+                Arc::new(arrow_array::StringArray::from(vec!["+I", "-D", "-U"])),
+            ));
+        } else {
+            columns.push((
+                "_VALUE_KIND".into(),
+                Arc::new(arrow_array::Int8Array::from(vec![0, 3, 1])),
+            ));
+        }
+        let input = RecordBatch::try_from_iter(columns).unwrap();
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        // An all-ignored batch creates no files, even with invalid payloads.
+        writer.write_arrow_batch(&input.slice(1, 2)).await.unwrap();
+        assert!(writer.prepare_commit().await.unwrap().is_empty());
+        writer.write_arrow_batch(&input).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        builder.new_commit().commit(messages).await.unwrap();
+        assert_eq!(rows(&table).await, vec![(1, Some(b"hello".to_vec()))]);
+        // Filtering must not bypass validation of a retained row.
+        let invalid = input.slice(0, 1);
+        let mut columns = invalid.columns().to_vec();
+        columns[1] = Arc::new(LargeBinaryArray::from(vec![Some(b"raw".as_slice())]));
+        let invalid = RecordBatch::try_new(invalid.schema(), columns).unwrap();
+        assert!(builder
+            .new_write()
+            .unwrap()
+            .write_arrow_batch(&invalid)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("blob-descriptor-field"));
+    }
 }
