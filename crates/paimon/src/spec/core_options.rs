@@ -37,6 +37,7 @@ const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-upda
 pub(crate) const INDEX_FILE_IN_DATA_FILE_DIR_OPTION: &str = "index-file-in-data-file-dir";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const BTREE_INDEX_RECORDS_PER_RANGE_OPTION: &str = "btree-index.records-per-range";
+const BTREE_INDEX_CACHE_SIZE_OPTION: &str = "btree-index.cache-size";
 const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
 const BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "bitmap-index.fallback-scan-max-size";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
@@ -169,6 +170,7 @@ const MAX_GLOBAL_INDEX_THREAD_NUM: i64 = {
     }
 };
 const DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE: i64 = 256 * 1024 * 1024;
+const DEFAULT_BTREE_INDEX_CACHE_SIZE: i64 = 128 * 1024 * 1024;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
 pub(crate) const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
@@ -1012,6 +1014,35 @@ impl<'a> CoreOptions<'a> {
 
     pub fn btree_index_fallback_scan_max_size(&self) -> crate::Result<i64> {
         self.fallback_scan_max_size(BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION)
+    }
+
+    pub fn btree_index_cache_size(&self) -> crate::Result<usize> {
+        let value = match self.options.get(BTREE_INDEX_CACHE_SIZE_OPTION) {
+            Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be a valid memory size, got: {}",
+                    BTREE_INDEX_CACHE_SIZE_OPTION, raw
+                ),
+                source: None,
+            })?,
+            None => DEFAULT_BTREE_INDEX_CACHE_SIZE,
+        };
+        if value < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be greater than or equal to 0, got: {}",
+                    BTREE_INDEX_CACHE_SIZE_OPTION, value
+                ),
+                source: None,
+            });
+        }
+        usize::try_from(value).map_err(|_| crate::Error::DataInvalid {
+            message: format!(
+                "Option '{}' is too large: {}",
+                BTREE_INDEX_CACHE_SIZE_OPTION, value
+            ),
+            source: None,
+        })
     }
 
     pub fn bitmap_index_fallback_scan_max_size(&self) -> crate::Result<i64> {
@@ -2453,6 +2484,34 @@ mod tests {
                 assert!(matches!(err, crate::Error::DataInvalid { message, .. }
                     if message.contains(option_name)));
             }
+        }
+    }
+
+    #[test]
+    fn test_btree_index_cache_size_matches_java_default_and_validates_values() {
+        assert_eq!(
+            CoreOptions::new(&HashMap::new())
+                .btree_index_cache_size()
+                .unwrap(),
+            128 * 1024 * 1024
+        );
+
+        let disabled =
+            HashMap::from([(BTREE_INDEX_CACHE_SIZE_OPTION.to_string(), "0".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&disabled)
+                .btree_index_cache_size()
+                .unwrap(),
+            0
+        );
+
+        for value in ["-1", "invalid"] {
+            let options =
+                HashMap::from([(BTREE_INDEX_CACHE_SIZE_OPTION.to_string(), value.to_string())]);
+            let error = CoreOptions::new(&options)
+                .btree_index_cache_size()
+                .expect_err("invalid BTree cache size should fail");
+            assert!(error.to_string().contains(BTREE_INDEX_CACHE_SIZE_OPTION));
         }
     }
 

@@ -38,6 +38,7 @@
 
 mod block;
 mod bloom_filter;
+mod data_block_cache;
 mod footer;
 pub(crate) mod key_serde;
 mod meta;
@@ -52,6 +53,7 @@ pub use block::BlockCompressionType;
 pub(crate) use block::{
     compress_block, compress_codec_block, compute_crc32, decompress_block, decompress_codec_block,
 };
+pub(crate) use data_block_cache::BTreeDataBlockCache;
 pub use footer::BTreeFileFooter;
 pub use key_serde::{make_key_comparator, serialize_datum};
 pub use meta::BTreeIndexMeta;
