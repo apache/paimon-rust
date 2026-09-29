@@ -23,6 +23,7 @@ arrow-row@58.4.0		X
 arrow-schema@58.4.0		X														
 arrow-select@58.4.0		X														
 arrow-string@58.4.0		X														
+async-compression@0.4.42		X									X					
 async-stream@0.3.6											X					
 async-stream-impl@0.3.6											X					
 async-trait@0.1.91		X									X					
@@ -59,6 +60,8 @@ cmake@0.1.58		X									X
 cmov@0.5.4		X									X					
 combine@4.6.7											X					
 comfy-table@7.2.2											X					
+compression-codecs@0.4.38		X									X					
+compression-core@0.4.32		X									X					
 const-oid@0.10.2		X									X					
 const-random@0.1.18		X									X					
 const-random-macro@0.1.16		X									X					

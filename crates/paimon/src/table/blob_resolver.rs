@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
+use crate::io::uri_reader::sanitize_blob_uri;
 use crate::io::{FileIO, FileRead};
 use crate::spec::BlobDescriptor;
 use crate::Result;
@@ -303,17 +304,6 @@ fn blob_error_with_context(
     }
 }
 
-fn sanitize_blob_uri(uri: &str) -> String {
-    if let Ok(mut url) = url::Url::parse(uri) {
-        let _ = url.set_username("");
-        let _ = url.set_password(None);
-        url.set_query(None);
-        url.set_fragment(None);
-        return url.to_string();
-    }
-    uri.split(['?', '#']).next().unwrap_or(uri).to_string()
-}
-
 /// Shared admission control for external descriptor metadata and range reads.
 ///
 /// The byte semaphore budgets active range I/O only. A single range larger than
@@ -381,7 +371,8 @@ impl BlobReadLimiter {
             .await
             .map_err(|e| crate::Error::UnexpectedError {
                 message: format!(
-                    "Failed to acquire BlobDescriptor byte permits for URI '{uri}': {e}"
+                    "Failed to acquire BlobDescriptor byte permits for URI '{}': {e}",
+                    sanitize_blob_uri(uri)
                 ),
                 source: Some(Box::new(e)),
             })?;
@@ -395,7 +386,8 @@ impl BlobReadLimiter {
             .await
             .map_err(|e| crate::Error::UnexpectedError {
                 message: format!(
-                    "Failed to acquire BlobDescriptor {operation} permit for URI '{uri}': {e}"
+                    "Failed to acquire BlobDescriptor {operation} permit for URI '{}': {e}",
+                    sanitize_blob_uri(uri)
                 ),
                 source: Some(Box::new(e)),
             })
@@ -410,9 +402,29 @@ pub(crate) async fn resolve_blob_column(
     file_io: &FileIO,
     limiter: BlobReadLimiter,
 ) -> Result<LargeBinaryArray> {
+    resolve_column(col, file_io, limiter, false).await
+}
+
+/// Resolve a schema-declared descriptor column, including version 1 descriptors
+/// which have no magic number and cannot be detected in arbitrary payload bytes.
+pub(crate) async fn resolve_descriptor_column(
+    col: &LargeBinaryArray,
+    file_io: &FileIO,
+    limiter: BlobReadLimiter,
+) -> Result<LargeBinaryArray> {
+    resolve_column(col, file_io, limiter, true).await
+}
+
+async fn resolve_column(
+    col: &LargeBinaryArray,
+    file_io: &FileIO,
+    limiter: BlobReadLimiter,
+    descriptor_only: bool,
+) -> Result<LargeBinaryArray> {
     let mut needs_resolve = false;
     for i in 0..col.len() {
-        if !col.is_null(i) && BlobDescriptor::is_blob_descriptor(col.value(i)) {
+        if !col.is_null(i) && (descriptor_only || BlobDescriptor::is_blob_descriptor(col.value(i)))
+        {
             needs_resolve = true;
             break;
         }
@@ -433,7 +445,7 @@ pub(crate) async fn resolve_blob_column(
         }
 
         let value = col.value(row);
-        if BlobDescriptor::is_blob_descriptor(value) {
+        if descriptor_only || BlobDescriptor::is_blob_descriptor(value) {
             let desc = BlobDescriptor::deserialize(value)?;
             let range = desc.range_spec()?;
             requests_by_uri
@@ -453,17 +465,19 @@ pub(crate) async fn resolve_blob_column(
 
     let mut read_groups = Vec::with_capacity(requests_by_uri.len());
     for (uri, requests) in requests_by_uri {
-        let input = file_io.new_input(&uri)?;
+        let input = crate::io::uri_reader::UriInput::new(file_io, &uri)?;
         let file_size = if requests.iter().any(|request| request.length.is_none()) {
             let _metadata_permit = limiter.acquire_request(&uri, "metadata").await?;
             input
-                .metadata()
+                .size()
                 .await
                 .map_err(|e| crate::Error::UnexpectedError {
-                    message: format!("Failed to read metadata for BlobDescriptor URI '{uri}': {e}"),
+                    message: format!(
+                        "Failed to read metadata for BlobDescriptor URI '{}': {e}",
+                        sanitize_blob_uri(&uri)
+                    ),
                     source: Some(Box::new(e)),
                 })?
-                .size
         } else {
             0
         };
@@ -498,7 +512,7 @@ pub(crate) async fn resolve_blob_column(
             continue;
         }
 
-        let reader: Arc<dyn FileRead> = Arc::new(input.reader().await?);
+        let reader = input.reader().await?;
         read_groups.push(BlobReadGroup {
             uri,
             reader,
@@ -587,7 +601,7 @@ async fn read_merged_blob_ranges(
     let blob_parallelism = limiter.parallelism();
     stream::iter(reads)
         .map(|merged| {
-            let uri = uri.to_string();
+            let uri = sanitize_blob_uri(uri);
             let reader = reader.clone();
             let limiter = limiter.clone();
             async move {
@@ -714,6 +728,30 @@ fn merge_blob_read_requests(mut requests: Vec<BlobReadRequest>) -> Vec<MergedBlo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_descriptor_parsing_requires_schema_context() {
+        let io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+        let uri = "memory:/payload";
+        io.new_output(uri)
+            .unwrap()
+            .write(Bytes::from_static(b"hello"))
+            .await
+            .unwrap();
+        let v2 = BlobDescriptor::new(uri.into(), 1, 3).serialize();
+        let mut v1 = vec![1];
+        v1.extend_from_slice(&v2[9..]);
+        let column = LargeBinaryArray::from(vec![Some(v1.as_slice()), None]);
+        let raw = resolve_blob_column(&column, &io, BlobReadLimiter::new())
+            .await
+            .unwrap();
+        assert_eq!(raw, column);
+        let resolved = resolve_descriptor_column(&column, &io, BlobReadLimiter::new())
+            .await
+            .unwrap();
+        assert_eq!(resolved.value(0), b"ell");
+        assert!(resolved.is_null(1));
+    }
 
     #[derive(Clone)]
     struct TrackingFileRead {

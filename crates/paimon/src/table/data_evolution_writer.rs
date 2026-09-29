@@ -319,7 +319,13 @@ impl DataEvolutionWriter {
         if self.matched_batches.is_empty() {
             return Ok(Vec::new());
         }
-        let read_table = &index.read_table;
+        // Rewriting an inline Blob column must preserve references for rows
+        // without an update. Resolving them would replace descriptors with
+        // payload bytes and unnecessarily require the external files to exist.
+        let read_table = index.read_table.copy_with_options(HashMap::from([(
+            "blob-as-descriptor".to_string(),
+            "true".to_string(),
+        )]));
         let file_index = &index.files;
         if file_index.is_empty() {
             return Err(crate::Error::DataInvalid {

@@ -128,7 +128,7 @@ tokio-util = { workspace = true, features = ["compat", "io-util"] }
 parquet = { workspace = true, features = ["async", "zstd", "lz4", "snap"] }
 orc-rust = "0.8.0"
 async-stream = "0.3.6"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "deflate"] }
 # DLF authentication dependencies
 base64 = "0.22"
 hex = "0.4"

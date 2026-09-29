@@ -175,6 +175,7 @@ impl DataFileWriter {
             return Ok(());
         }
 
+        super::inline_blob::validate_inline_blob_columns(batch, &self.format_options)?;
         if self.current_writer.is_none() {
             self.open_new_file(batch.schema()).await?;
         }
@@ -202,19 +203,19 @@ impl DataFileWriter {
         Ok(())
     }
 
+    pub(super) fn has_open_file(&self) -> bool {
+        self.current_writer.is_some()
+    }
+
     async fn open_new_file(&mut self, schema: arrow_schema::SchemaRef) -> Result<()> {
         let index = self
             .index_options
             .as_ref()
             .map(|options| options.create_writer())
             .transpose()?;
-        let file_name = format!(
-            "{}{}-{}.{}",
-            self.data_file_prefix,
-            uuid::Uuid::new_v4(),
-            self.next_file_ordinal,
-            self.file_format,
-        );
+        let file_name = self
+            .paths
+            .new_file_name(&self.data_file_prefix, &self.file_format);
         let location = self.paths.new_path(&file_name)?;
         let bucket_dir = location.parent();
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
@@ -285,6 +286,13 @@ impl DataFileWriter {
         let file_source = self.file_source;
         let first_row_id = self.first_row_id;
         let write_cols = self.write_cols.clone();
+        // Java creates a new row sequence counter for each physical DE file.
+        let max_sequence_number = if CoreOptions::new(&self.format_options).data_evolution_enabled()
+        {
+            row_count - 1
+        } else {
+            0
+        };
 
         Some(async move {
             let write_result = writer.close().await?;
@@ -298,6 +306,7 @@ impl DataFileWriter {
                 write_cols,
                 write_result.value_stats,
             );
+            meta.max_sequence_number = max_sequence_number;
             meta.external_path = location.external_path;
             if let Some(index) = index {
                 let bytes = index.serialize()?;
@@ -355,11 +364,7 @@ impl DataFileWriter {
             for (writer, result) in results {
                 match result {
                     Ok(files) => {
-                        for file in files {
-                            for path in file.collect_files(writer.bucket_dir()) {
-                                let _ = writer.file_io.delete_file(&path).await;
-                            }
-                        }
+                        writer.delete_files(&files).await;
                     }
                     Err(error) => {
                         first_error.get_or_insert(error);
@@ -409,6 +414,14 @@ impl DataFileWriter {
             let _ = self.file_io.delete_file(&path).await;
         }
         self.written_files.clear();
+    }
+
+    pub(super) async fn delete_files(&mut self, files: &[DataFileMeta]) {
+        for file in files {
+            for path in file.collect_files(self.bucket_dir()) {
+                let _ = self.file_io.delete_file(&path).await;
+            }
+        }
     }
 
     fn bucket_dir(&self) -> &str {
