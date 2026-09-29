@@ -44,6 +44,8 @@ const MIN_BLOCK_BYTES: usize = 6;
 const MAX_INT: u64 = i32::MAX as u64;
 const MAX_LONG: u64 = i64::MAX as u64;
 const BLOCK_READ_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
+// Cap the extra bytes spent to replace several range requests with one full read.
+const MAX_FULL_READ_AMPLIFICATION: usize = 4;
 
 type RowBlockFilter<'a> = dyn Fn(i64, i64) -> bool + Sync + 'a;
 type PartitionBlockFilter<'a> = dyn FnMut(&[u8]) -> bool + Send + 'a;
@@ -81,6 +83,7 @@ impl ManifestSidecarBlock {
 pub struct ManifestSidecarSelection {
     header: Bytes,
     blocks: Vec<ManifestSidecarBlock>,
+    manifest_size: u64,
 }
 
 impl ManifestSidecarSelection {
@@ -90,6 +93,64 @@ impl ManifestSidecarSelection {
 
     pub fn blocks(&self) -> &[ManifestSidecarBlock] {
         &self.blocks
+    }
+
+    /// Use a full read when it saves requests without multiplying transferred
+    /// bytes by more than the number of range reads (capped at four).
+    fn should_read_full(&self) -> Result<bool> {
+        let range_reads = self.read_ranges()?.len();
+        if range_reads <= 1 {
+            return Ok(false);
+        }
+        let selected_bytes = self.blocks.iter().try_fold(0u64, |total, block| {
+            total.checked_add(block.length).ok_or_else(invalid_sidecar)
+        })?;
+        Ok(
+            u128::from(selected_bytes) * range_reads.min(MAX_FULL_READ_AMPLIFICATION) as u128
+                >= u128::from(self.manifest_size),
+        )
+    }
+
+    pub(crate) async fn read_bytes(&self, file_io: &FileIO, manifest_path: &str) -> Result<Bytes> {
+        if self.should_read_full()? {
+            file_io.new_input(manifest_path)?.read().await
+        } else {
+            ManifestSidecar::read_selected_bytes(file_io, manifest_path, self).await
+        }
+    }
+
+    fn read_ranges(&self) -> Result<Vec<Range<u64>>> {
+        let mut ranges = Vec::new();
+        let mut block_index = 0usize;
+        while block_index < self.blocks.len() {
+            let first = self.blocks[block_index];
+            let mut span_end = first
+                .offset
+                .checked_add(first.length)
+                .ok_or_else(invalid_sidecar)?;
+            block_index += 1;
+            while block_index < self.blocks.len() {
+                let next = self.blocks[block_index];
+                let Some(next_end) = next.offset.checked_add(next.length) else {
+                    return Err(invalid_sidecar());
+                };
+                if next.offset != span_end
+                    || next_end.saturating_sub(first.offset) > BLOCK_READ_BUFFER_BYTES
+                {
+                    break;
+                }
+                span_end = next_end;
+                block_index += 1;
+            }
+
+            let mut position = first.offset;
+            while position < span_end {
+                let end = span_end.min(position + BLOCK_READ_BUFFER_BYTES);
+                ranges.push(position..end);
+                position = end;
+            }
+        }
+        Ok(ranges)
     }
 }
 
@@ -566,41 +627,10 @@ impl ManifestSidecar {
         );
         out.extend_from_slice(&selection.header);
 
-        let mut block_index = 0usize;
-        while block_index < selection.blocks.len() {
-            let first = selection.blocks[block_index];
-            let mut span_end = first
-                .offset
-                .checked_add(first.length)
-                .ok_or_else(invalid_sidecar)?;
-            block_index += 1;
-            while block_index < selection.blocks.len() {
-                let next = selection.blocks[block_index];
-                let Some(next_end) = next.offset.checked_add(next.length) else {
-                    return Err(invalid_sidecar());
-                };
-                if next.offset != span_end
-                    || next_end.saturating_sub(first.offset) > BLOCK_READ_BUFFER_BYTES
-                {
-                    break;
-                }
-                span_end = next_end;
-                block_index += 1;
-            }
-
-            let mut position = first.offset;
-            while position < span_end {
-                let end = span_end.min(position + BLOCK_READ_BUFFER_BYTES);
-                let bytes = reader
-                    .read(Range {
-                        start: position,
-                        end,
-                    })
-                    .await?;
-                require(bytes.len() as u64 == end - position)?;
-                out.extend_from_slice(&bytes);
-                position = end;
-            }
+        for range in selection.read_ranges()? {
+            let bytes = reader.read(range.clone()).await?;
+            require(bytes.len() as u64 == range.end - range.start)?;
+            out.extend_from_slice(&bytes);
         }
         Ok(Bytes::from(out))
     }
@@ -846,6 +876,7 @@ fn select_with_filters(
     Ok(ManifestSidecarSelection {
         header: Bytes::copy_from_slice(header),
         blocks: selected,
+        manifest_size,
     })
 }
 
@@ -1077,6 +1108,54 @@ mod tests {
         }
         let size = header.len() as u64 + 400;
         (builder.serialize(size, 7).unwrap(), meta(size, 7))
+    }
+
+    #[test]
+    fn full_read_policy_accounts_for_bytes_and_range_requests() {
+        const MIB: u64 = 1024 * 1024;
+        let selection = |blocks: &[(u64, u64)]| ManifestSidecarSelection {
+            header: Bytes::new(),
+            blocks: blocks
+                .iter()
+                .map(|&(offset, length)| ManifestSidecarBlock {
+                    offset,
+                    length,
+                    first_record: 0,
+                    record_count: 1,
+                })
+                .collect(),
+            manifest_size: 8 * MIB,
+        };
+
+        assert!(!selection(&[]).should_read_full().unwrap());
+        // A contiguous selection larger than the 4 MiB read buffer still needs
+        // two GETs, so a full read saves a request.
+        let large = selection(&[(0, 6 * MIB)]);
+        assert_eq!(large.read_ranges().unwrap().len(), 2);
+        assert!(large.should_read_full().unwrap());
+
+        assert!(selection(&[(0, 2 * MIB), (4 * MIB, 2 * MIB)])
+            .should_read_full()
+            .unwrap());
+        assert!(!selection(&[(0, MIB), (4 * MIB, MIB)])
+            .should_read_full()
+            .unwrap());
+        assert!(selection(&[
+            (0, MIB / 2),
+            (2 * MIB, MIB / 2),
+            (4 * MIB, MIB / 2),
+            (6 * MIB, MIB / 2),
+        ])
+        .should_read_full()
+        .unwrap());
+        assert!(!selection(&[
+            (0, MIB / 8),
+            (2 * MIB, MIB / 8),
+            (4 * MIB, MIB / 8),
+            (6 * MIB, MIB / 8),
+        ])
+        .should_read_full()
+        .unwrap());
     }
 
     fn partition(p: i32, q: Option<&str>) -> Vec<u8> {

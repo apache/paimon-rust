@@ -189,7 +189,7 @@ async fn read_manifest_bytes_with_sidecar(
     .await;
 
     match selection.as_ref() {
-        Some(selection) => ManifestSidecar::read_selected_bytes(file_io, path, selection).await,
+        Some(selection) => selection.read_bytes(file_io, path).await,
         None => file_io.new_input(path)?.read().await,
     }
 }
@@ -2746,11 +2746,11 @@ mod tests {
     use super::{
         data_evolution_row_range_groups, data_file_overlaps_row_range_index,
         group_data_files_by_partition_bucket, manifest_file_overlaps_row_range_index,
-        prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
-        retain_index_manifest_entry_for_scan, retain_manifest_buckets,
+        prune_data_evolution_group_by_read_fields, read_manifest_bytes_with_sidecar,
+        retain_index_manifest_entry, retain_index_manifest_entry_for_scan, retain_manifest_buckets,
         retain_manifest_entry_row_ranges, retain_manifest_row_ranges, scan_predicate_field_ids,
         should_skip_level_zero_for_scan, split_row_ranges_for_files, LimitPushdownAccumulator,
-        PaimonTableScan, RowRangeIndex, TableScan,
+        ManifestSidecarPruning, PaimonTableScan, RowRangeIndex, TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
@@ -2758,8 +2758,9 @@ mod tests {
         stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
         ColumnMove, CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta,
         FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry,
-        ManifestFileMeta, Predicate, PredicateBuilder, PredicateOperator, Schema as PaimonSchema,
-        SchemaChange, Snapshot, TableSchema, VarCharType,
+        ManifestFileMeta, ManifestSidecar, ManifestSidecarBuilder, Predicate, PredicateBuilder,
+        PredicateOperator, Schema as PaimonSchema, SchemaChange, Snapshot, TableSchema,
+        VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
@@ -3944,6 +3945,90 @@ mod tests {
             .map(|file| file.file_name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(delta_files, vec!["a-new", "a-old"]);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_sidecar_read_uses_full_file_only_for_dense_selection() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let manifest_path = "memory:/adaptive_manifest_read/manifest-test";
+        let sidecar_path = ManifestSidecar::path(manifest_path);
+        let mut header = b"Obj\x01".to_vec();
+        header.resize(32, 0);
+        let mut builder = ManifestSidecarBuilder::new(header.clone(), true, false);
+        let mut offset = header.len() as u64;
+        for (length, first_row_id) in [(200, 0), (50, 100), (200, 200)] {
+            builder.begin_block(offset, length, 1).unwrap();
+            builder
+                .add(Some(first_row_id), 1, None, None, None)
+                .unwrap();
+            builder.end_block().unwrap();
+            offset += length;
+        }
+        let sidecar = builder.serialize(offset, 3).unwrap();
+        let manifest = ManifestFileMeta::new(
+            "manifest-test".to_string(),
+            offset as i64,
+            3,
+            0,
+            BinaryTableStats::empty(),
+            0,
+        )
+        .with_extra_files(Some(vec!["manifest-test.avro.sidecar".to_string()]));
+        let mut avro = header.clone();
+        avro.extend((0..450).map(|value| value as u8));
+        file_io
+            .new_output(manifest_path)
+            .unwrap()
+            .write(Bytes::from(avro.clone()))
+            .await
+            .unwrap();
+        file_io
+            .new_output(&sidecar_path)
+            .unwrap()
+            .write(Bytes::from(sidecar))
+            .await
+            .unwrap();
+
+        let dense = RowRangeIndex::create(vec![RowRange::new(0, 0), RowRange::new(200, 200)]);
+        let dense_bytes = read_manifest_bytes_with_sidecar(
+            &file_io,
+            manifest_path,
+            &manifest,
+            true,
+            ManifestSidecarPruning {
+                row_range_index: Some(&dense),
+                partition_filter: None,
+                partition_arity: 0,
+                bucket_predicate: None,
+                bucket_key_fields: &[],
+                bucket_function_type: BucketFunctionType::Default,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dense_bytes.as_ref(), avro);
+
+        let sparse = RowRangeIndex::create(vec![RowRange::new(0, 0)]);
+        let sparse_bytes = read_manifest_bytes_with_sidecar(
+            &file_io,
+            manifest_path,
+            &manifest,
+            true,
+            ManifestSidecarPruning {
+                row_range_index: Some(&sparse),
+                partition_filter: None,
+                partition_arity: 0,
+                bucket_predicate: None,
+                bucket_key_fields: &[],
+                bucket_function_type: BucketFunctionType::Default,
+            },
+        )
+        .await
+        .unwrap();
+        let mut expected = header;
+        let start = expected.len();
+        expected.extend_from_slice(&avro[start..start + 200]);
+        assert_eq!(sparse_bytes.as_ref(), expected);
     }
 
     #[tokio::test]
