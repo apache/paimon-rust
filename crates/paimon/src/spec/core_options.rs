@@ -37,6 +37,8 @@ const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-upda
 pub(crate) const INDEX_FILE_IN_DATA_FILE_DIR_OPTION: &str = "index-file-in-data-file-dir";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const BTREE_INDEX_RECORDS_PER_RANGE_OPTION: &str = "btree-index.records-per-range";
+const BTREE_INDEX_CACHE_SIZE_OPTION: &str = "btree-index.cache-size";
+const BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION: &str = "btree-index.high-priority-pool-ratio";
 const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
 const BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "bitmap-index.fallback-scan-max-size";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
@@ -169,6 +171,8 @@ const MAX_GLOBAL_INDEX_THREAD_NUM: i64 = {
     }
 };
 const DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE: i64 = 256 * 1024 * 1024;
+const DEFAULT_BTREE_INDEX_CACHE_SIZE: i64 = 128 * 1024 * 1024;
+const DEFAULT_BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO: f64 = 0.1;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
 pub(crate) const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
@@ -1019,6 +1023,70 @@ impl<'a> CoreOptions<'a> {
 
     pub fn btree_index_fallback_scan_max_size(&self) -> crate::Result<i64> {
         self.fallback_scan_max_size(BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION)
+    }
+
+    pub fn btree_index_cache_size(&self) -> crate::Result<usize> {
+        let value = match self.options.get(BTREE_INDEX_CACHE_SIZE_OPTION) {
+            Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be a valid memory size, got: {}",
+                    BTREE_INDEX_CACHE_SIZE_OPTION, raw
+                ),
+                source: None,
+            })?,
+            None => DEFAULT_BTREE_INDEX_CACHE_SIZE,
+        };
+        if value < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be greater than or equal to 0, got: {}",
+                    BTREE_INDEX_CACHE_SIZE_OPTION, value
+                ),
+                source: None,
+            });
+        }
+        usize::try_from(value).map_err(|_| crate::Error::DataInvalid {
+            message: format!(
+                "Option '{}' is too large: {}",
+                BTREE_INDEX_CACHE_SIZE_OPTION, value
+            ),
+            source: None,
+        })
+    }
+
+    pub fn btree_index_high_priority_pool_ratio(&self) -> crate::Result<f64> {
+        let value = match self
+            .options
+            .get(BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION)
+        {
+            Some(raw) => raw
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| crate::Error::DataInvalid {
+                    message: format!(
+                        "Option '{}' must be a valid number, got: {}",
+                        BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION, raw
+                    ),
+                    source: None,
+                })?,
+            None => DEFAULT_BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO,
+        };
+        if !(0.0..1.0).contains(&value) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be in the range [0, 1), got: {}",
+                    BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION, value
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
+    }
+
+    pub fn btree_index_data_block_cache_size(&self) -> crate::Result<usize> {
+        let total = self.btree_index_cache_size()?;
+        let high_priority_ratio = self.btree_index_high_priority_pool_ratio()?;
+        Ok((total as f64 * (1.0 - high_priority_ratio)) as usize)
     }
 
     pub fn bitmap_index_fallback_scan_max_size(&self) -> crate::Result<i64> {
@@ -2460,6 +2528,74 @@ mod tests {
                 assert!(matches!(err, crate::Error::DataInvalid { message, .. }
                     if message.contains(option_name)));
             }
+        }
+    }
+
+    #[test]
+    fn test_btree_index_cache_size_matches_java_default_and_validates_values() {
+        assert_eq!(
+            CoreOptions::new(&HashMap::new())
+                .btree_index_cache_size()
+                .unwrap(),
+            128 * 1024 * 1024
+        );
+
+        let disabled =
+            HashMap::from([(BTREE_INDEX_CACHE_SIZE_OPTION.to_string(), "0".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&disabled)
+                .btree_index_cache_size()
+                .unwrap(),
+            0
+        );
+
+        for value in ["-1", "invalid"] {
+            let options =
+                HashMap::from([(BTREE_INDEX_CACHE_SIZE_OPTION.to_string(), value.to_string())]);
+            let error = CoreOptions::new(&options)
+                .btree_index_cache_size()
+                .expect_err("invalid BTree cache size should fail");
+            assert!(error.to_string().contains(BTREE_INDEX_CACHE_SIZE_OPTION));
+        }
+    }
+
+    #[test]
+    fn test_btree_index_data_block_cache_size_matches_java_pool_split() {
+        let empty = HashMap::new();
+        let defaults = CoreOptions::new(&empty);
+        assert_eq!(
+            defaults.btree_index_data_block_cache_size().unwrap(),
+            (128.0 * 1024.0 * 1024.0 * 0.9) as usize
+        );
+
+        let options = HashMap::from([
+            (
+                BTREE_INDEX_CACHE_SIZE_OPTION.to_string(),
+                (128 * 1024 * 1024).to_string(),
+            ),
+            (
+                BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION.to_string(),
+                "0.9".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            CoreOptions::new(&options)
+                .btree_index_data_block_cache_size()
+                .unwrap(),
+            (128.0 * 1024.0 * 1024.0 * 0.1) as usize
+        );
+
+        for value in ["-0.1", "1", "NaN", "invalid"] {
+            let options = HashMap::from([(
+                BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            let error = CoreOptions::new(&options)
+                .btree_index_data_block_cache_size()
+                .expect_err("invalid BTree cache ratio should fail");
+            assert!(error
+                .to_string()
+                .contains(BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION));
         }
     }
 

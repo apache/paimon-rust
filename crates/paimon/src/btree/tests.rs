@@ -23,6 +23,7 @@ use crate::btree::query::IndexQuery;
 use crate::btree::reader::BTreeIndexReader;
 use crate::btree::test_util::{BytesFileRead, VecFileWrite};
 use crate::btree::writer::BTreeIndexWriter;
+use crate::btree::BTreeDataBlockCache;
 use crate::io::FileRead;
 use crate::spec::murmur_hash::hash_bytes;
 use crate::spec::{DataType, Datum, PredicateOperator, VarCharType};
@@ -820,6 +821,239 @@ async fn test_sparse_in_query_reads_only_target_blocks_once() {
         rows.iter().collect::<Vec<_>>(),
         vec![1, 2, 500, 501, 998, 999]
     );
+    assert_eq!(ranges.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn test_repeated_equal_queries_reuse_data_block() {
+    let buf = VecFileWrite::new();
+    let mut writer =
+        BTreeIndexWriter::new(Box::new(buf.clone()), 1_000_000, BlockCompressionType::None);
+    for i in 0..100 {
+        writer.write(Some(&int_key(i)), i as i64).await.unwrap();
+    }
+
+    let write_result = writer.finish().await.unwrap();
+    let data = Bytes::from(buf.to_vec());
+    let file_size = data.len() as u64;
+
+    let uncached_ranges = Arc::new(Mutex::new(Vec::new()));
+    let uncached = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(RecordingFileRead {
+            data: data.clone(),
+            ranges: Arc::clone(&uncached_ranges),
+        }),
+        file_size,
+        &write_result.meta,
+        int_cmp,
+        Arc::new(BTreeDataBlockCache::new(0)),
+        Arc::from("memory:/uncached.btree"),
+    )
+    .await
+    .unwrap();
+    uncached_ranges.lock().unwrap().clear();
+    for key in [1, 2, 3] {
+        uncached.query_equal(&int_key(key)).await.unwrap();
+    }
+    assert_eq!(uncached_ranges.lock().unwrap().len(), 3);
+
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let reader = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(RecordingFileRead {
+            data,
+            ranges: Arc::clone(&ranges),
+        }),
+        file_size,
+        &write_result.meta,
+        int_cmp,
+        Arc::new(BTreeDataBlockCache::new(1024 * 1024)),
+        Arc::from("memory:/first.btree"),
+    )
+    .await
+    .unwrap();
+    ranges.lock().unwrap().clear();
+
+    for key in [1, 2, 3] {
+        let rows = reader.query_equal(&int_key(key)).await.unwrap();
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![key as u64]);
+    }
+    assert_eq!(ranges.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_data_block_cache_is_bounded_and_file_scoped() {
+    async fn write_file(row_id: i64) -> (Bytes, crate::btree::writer::BTreeWriteResult) {
+        let buf = VecFileWrite::new();
+        let mut writer =
+            BTreeIndexWriter::new(Box::new(buf.clone()), 1_000_000, BlockCompressionType::None);
+        writer.write(Some(&int_key(1)), row_id).await.unwrap();
+        let result = writer.finish().await.unwrap();
+        (Bytes::from(buf.to_vec()), result)
+    }
+
+    let cache = Arc::new(BTreeDataBlockCache::new(1024 * 1024));
+    let (first_data, first_result) = write_file(1).await;
+    let first_ranges = Arc::new(Mutex::new(Vec::new()));
+    let first = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(RecordingFileRead {
+            data: first_data.clone(),
+            ranges: Arc::clone(&first_ranges),
+        }),
+        first_data.len() as u64,
+        &first_result.meta,
+        int_cmp,
+        Arc::clone(&cache),
+        Arc::from("memory:/first.btree"),
+    )
+    .await
+    .unwrap();
+
+    let (second_data, second_result) = write_file(2).await;
+    let second_ranges = Arc::new(Mutex::new(Vec::new()));
+    let second = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(RecordingFileRead {
+            data: second_data.clone(),
+            ranges: Arc::clone(&second_ranges),
+        }),
+        second_data.len() as u64,
+        &second_result.meta,
+        int_cmp,
+        Arc::clone(&cache),
+        Arc::from("memory:/second.btree"),
+    )
+    .await
+    .unwrap();
+    first_ranges.lock().unwrap().clear();
+    second_ranges.lock().unwrap().clear();
+
+    assert_eq!(
+        first
+            .query_equal(&int_key(1))
+            .await
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        second
+            .query_equal(&int_key(1))
+            .await
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_eq!(first_ranges.lock().unwrap().len(), 1);
+    assert_eq!(second_ranges.lock().unwrap().len(), 1);
+
+    let two_file_bytes = cache.retained_bytes();
+    assert!(two_file_bytes > 1);
+    let bounded_cache = Arc::new(BTreeDataBlockCache::new(two_file_bytes - 1));
+    let bounded_first_ranges = Arc::new(Mutex::new(Vec::new()));
+    let bounded_first = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(RecordingFileRead {
+            data: first_data.clone(),
+            ranges: Arc::clone(&bounded_first_ranges),
+        }),
+        first_data.len() as u64,
+        &first_result.meta,
+        int_cmp,
+        Arc::clone(&bounded_cache),
+        Arc::from("memory:/bounded-first.btree"),
+    )
+    .await
+    .unwrap();
+    let bounded_second_ranges = Arc::new(Mutex::new(Vec::new()));
+    let bounded_second = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(RecordingFileRead {
+            data: second_data.clone(),
+            ranges: Arc::clone(&bounded_second_ranges),
+        }),
+        second_data.len() as u64,
+        &second_result.meta,
+        int_cmp,
+        Arc::clone(&bounded_cache),
+        Arc::from("memory:/bounded-second.btree"),
+    )
+    .await
+    .unwrap();
+    bounded_first_ranges.lock().unwrap().clear();
+    bounded_second_ranges.lock().unwrap().clear();
+
+    bounded_first.query_equal(&int_key(1)).await.unwrap();
+    bounded_second.query_equal(&int_key(1)).await.unwrap();
+    bounded_first.query_equal(&int_key(1)).await.unwrap();
+    assert_eq!(bounded_first_ranges.lock().unwrap().len(), 2);
+    assert_eq!(bounded_second_ranges.lock().unwrap().len(), 1);
+    assert!(bounded_cache.retained_bytes() < two_file_bytes);
+
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let uncached = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(RecordingFileRead {
+            data: first_data.clone(),
+            ranges: Arc::clone(&ranges),
+        }),
+        first_data.len() as u64,
+        &first_result.meta,
+        int_cmp,
+        Arc::new(BTreeDataBlockCache::new(0)),
+        Arc::from("memory:/uncached.btree"),
+    )
+    .await
+    .unwrap();
+    ranges.lock().unwrap().clear();
+    uncached.query_equal(&int_key(1)).await.unwrap();
+    uncached.query_equal(&int_key(1)).await.unwrap();
+    assert_eq!(ranges.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_data_block_cache_evicts_by_decoded_bytes() {
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::new(Box::new(buf.clone()), 64, BlockCompressionType::None);
+    for i in 0..100 {
+        writer.write(Some(&int_key(i)), i as i64).await.unwrap();
+    }
+    let write_result = writer.finish().await.unwrap();
+    let data = Bytes::from(buf.to_vec());
+    let file_size = data.len() as u64;
+
+    let measuring_cache = Arc::new(BTreeDataBlockCache::new(usize::MAX));
+    let measuring_reader = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(BytesFileRead(data.clone())),
+        file_size,
+        &write_result.meta,
+        int_cmp,
+        Arc::clone(&measuring_cache),
+        Arc::from("memory:/measuring.btree"),
+    )
+    .await
+    .unwrap();
+    measuring_reader.query_equal(&int_key(0)).await.unwrap();
+    measuring_reader.query_equal(&int_key(99)).await.unwrap();
+    let two_block_bytes = measuring_cache.retained_bytes();
+    assert!(two_block_bytes > 2);
+
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let reader = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(RecordingFileRead {
+            data,
+            ranges: Arc::clone(&ranges),
+        }),
+        file_size,
+        &write_result.meta,
+        int_cmp,
+        Arc::new(BTreeDataBlockCache::new(two_block_bytes - 1)),
+        Arc::from("memory:/bounded.btree"),
+    )
+    .await
+    .unwrap();
+    ranges.lock().unwrap().clear();
+
+    reader.query_equal(&int_key(0)).await.unwrap();
+    reader.query_equal(&int_key(99)).await.unwrap();
+    reader.query_equal(&int_key(0)).await.unwrap();
     assert_eq!(ranges.lock().unwrap().len(), 3);
 }
 

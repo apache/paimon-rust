@@ -245,13 +245,20 @@ impl GlobalIndexScanner {
         let file_reader = input.reader().await?;
 
         let cmp = make_key_comparator(data_type);
-        BTreeIndexReader::open(Box::new(file_reader), file_size, meta, cmp)
-            .await
-            .map(OpenedGlobalIndexReader::BTree)
-            .map_err(|e| crate::Error::DataInvalid {
-                message: format!("Failed to open BTree index file: {resolved_path}"),
-                source: Some(Box::new(e)),
-            })
+        BTreeIndexReader::open_with_data_block_cache(
+            Box::new(file_reader),
+            file_size,
+            meta,
+            cmp,
+            Arc::clone(&self.btree_data_block_cache),
+            Arc::from(resolved_path.as_str()),
+        )
+        .await
+        .map(OpenedGlobalIndexReader::BTree)
+        .map_err(|e| crate::Error::DataInvalid {
+            message: format!("Failed to open BTree index file: {resolved_path}"),
+            source: Some(Box::new(e)),
+        })
     }
 
     async fn open_reader_for_entry(

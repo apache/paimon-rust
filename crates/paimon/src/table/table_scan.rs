@@ -1765,6 +1765,7 @@ impl<'a> PaimonTableScan<'a> {
                 search_mode: settings.search_mode,
                 global_index_thread_num: settings.thread_num,
                 btree_fallback_scan_max_size: core_options.btree_index_fallback_scan_max_size()?,
+                btree_data_block_cache_size: core_options.btree_index_data_block_cache_size()?,
                 bitmap_fallback_scan_max_size: core_options
                     .bitmap_index_fallback_scan_max_size()?,
                 fm_read_options: if index_entries
