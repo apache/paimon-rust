@@ -146,6 +146,51 @@ async fn test_rename_branch() {
 }
 
 #[tokio::test]
+async fn test_rename_branch_rejects_path_separator() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+
+    // Renaming to `foo/bar` would move the branch under `branch-foo/` and hide it
+    // from `$branches`; it must be rejected and leave `b1` untouched.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.rename_branch(table => 'test_db.t1', from_branch => 'b1', to_branch => 'foo/bar')",
+        "path separator",
+    )
+    .await;
+
+    assert!(bm.branch_exists("b1").await.unwrap(), "b1 must remain");
+    assert!(
+        !bm.branch_exists("foo/bar").await.unwrap(),
+        "foo/bar must not exist"
+    );
+    let visible = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b1'",
+    )
+    .await;
+    assert_eq!(visible, 1);
+}
+
+#[tokio::test]
 async fn test_create_lumina_index_requires_index_column() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 
