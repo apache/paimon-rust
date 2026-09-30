@@ -28,7 +28,9 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
-use paimon::table::referenced_files::{collect_referenced_files_summary, ReferencedFilesSummary};
+use paimon::table::referenced_files::{
+    collect_referenced_files_summary_with_options, ReferencedFilesSummary,
+};
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
@@ -81,11 +83,12 @@ impl TableProvider for ReferencedFilesSizeTable {
             let schema = table.schema();
             let partition_keys = schema.partition_keys();
             let partition_fields = schema.partition_fields();
-            collect_referenced_files_summary(
+            collect_referenced_files_summary_with_options(
                 table.file_io(),
                 table.location(),
                 partition_keys,
                 &partition_fields,
+                &schema.core_options(),
             )
             .await
         })

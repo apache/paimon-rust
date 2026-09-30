@@ -1059,7 +1059,7 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn test_rest_catalog_reads_format_table() {
+async fn test_rest_catalog_reads_format_table_with_bearer_and_local_file_dlf_auth() {
     use parquet::arrow::ArrowWriter;
     use std::fs::File;
 
@@ -1143,6 +1143,40 @@ async fn test_rest_catalog_reads_format_table() {
             .map(|batch| batch.num_rows())
             .sum::<usize>(),
         1
+    );
+
+    let token_path = tmp.path().join("dlf-token.json");
+    tokio::fs::write(
+        &token_path,
+        r#"{"AccessKeyId":"test-ak","AccessKeySecret":"test-sk","SecurityToken":"test-sts"}"#,
+    )
+    .await
+    .unwrap();
+    let mut dlf_options = Options::new();
+    dlf_options.set(CatalogOptions::URI, ctx.server.url().unwrap());
+    dlf_options.set(CatalogOptions::WAREHOUSE, "test_warehouse");
+    dlf_options.set(CatalogOptions::TOKEN_PROVIDER, "dlf");
+    dlf_options.set(CatalogOptions::DLF_REGION, "cn-hangzhou");
+    dlf_options.set(CatalogOptions::DLF_TOKEN_LOADER, "local_file");
+    dlf_options.set(
+        CatalogOptions::DLF_TOKEN_PATH,
+        token_path.display().to_string(),
+    );
+    let dlf_catalog = RESTCatalog::new(dlf_options, true).await.unwrap();
+    let dlf_table = dlf_catalog.get_table(&identifier).await.unwrap();
+    let dlf_builder = dlf_table.new_read_builder();
+    let dlf_plan = dlf_builder.new_scan().plan().await.unwrap();
+    let dlf_batches = dlf_builder
+        .new_read()
+        .unwrap()
+        .to_arrow(dlf_plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        dlf_batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        2
     );
 }
 

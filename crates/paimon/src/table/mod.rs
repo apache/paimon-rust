@@ -37,14 +37,18 @@ mod chunk_shuffle;
 mod commit_message;
 mod consumer_manager;
 pub(crate) mod cow_writer;
+mod data_evolution_fields;
+mod data_evolution_nested;
 mod data_evolution_reader;
 pub mod data_evolution_writer;
 mod data_file_index_writer;
+mod data_file_path_factory;
 mod data_file_reader;
 mod data_file_writer;
 mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
+mod external_path;
 mod format_partition;
 mod format_partition_location;
 mod format_partition_stats;
@@ -69,6 +73,7 @@ mod global_index_types;
 mod hybrid_search_builder;
 mod incremental_scan;
 pub(crate) mod index_file_path;
+mod inline_blob;
 mod kv_file_reader;
 mod kv_file_writer;
 mod lumina_index_build_builder;
@@ -127,9 +132,15 @@ pub(crate) mod table_commit;
 mod table_read;
 mod table_scan;
 mod table_update;
+mod table_update_by_row_id;
+mod table_update_predicate;
+mod table_upsert;
 pub(crate) mod table_write;
 mod tag_manager;
 pub(crate) mod time_travel;
+mod update_assignment;
+mod update_input;
+mod upsert_key_matcher;
 mod vector_read;
 mod vector_scan;
 mod vector_search_builder;
@@ -138,6 +149,7 @@ pub(crate) mod vector_search_result;
 #[cfg(test)]
 mod vector_search_test_utils;
 mod vindex_index_build_builder;
+mod write_batch_normalize;
 mod write_builder;
 
 use crate::Result;
@@ -195,8 +207,10 @@ pub use table_commit::TableCommit;
 pub use table_read::{AuditLogRead, TableRead};
 pub use table_scan::{AuditLogScan, TableScan};
 pub use table_update::TableUpdate;
+pub use table_update_by_row_id::TableUpdateByRowId;
 pub use table_write::TableWrite;
 pub use tag_manager::TagManager;
+pub use update_assignment::UpdateAssignment;
 pub use vector_read::{BatchVectorRead, VectorRead};
 pub use vector_scan::{VectorScan, VectorScanPlan};
 pub use vector_search_builder::VectorSearchBuilder;
@@ -310,6 +324,14 @@ impl Table {
     /// Get the table's location.
     pub fn location(&self) -> &str {
         &self.location
+    }
+
+    /// Root for bucket data. Metadata continues to use `location()`.
+    pub(crate) fn data_file_location(&self) -> String {
+        crate::spec::data_file_path(
+            self.location(),
+            self.schema().core_options().data_file_path_directory(),
+        )
     }
 
     /// Get the table's schema.
@@ -848,6 +870,8 @@ pub(crate) async fn rest_query_auth_table() -> Table {
     options.set("token.provider", "bear");
     options.set("token", "test_token");
     let api = std::sync::Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+    let metadata_cache =
+        crate::io::FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
     let table = query_auth_table();
     Table {
         rest_env: Some(RESTEnv::new(
@@ -857,6 +881,7 @@ pub(crate) async fn rest_query_auth_table() -> Table {
             options,
             false,
             None,
+            metadata_cache,
         )),
         ..table
     }

@@ -189,7 +189,7 @@ async fn read_manifest_bytes_with_sidecar(
     .await;
 
     match selection.as_ref() {
-        Some(selection) => ManifestSidecar::read_selected_bytes(file_io, path, selection).await,
+        Some(selection) => selection.read_bytes(file_io, path).await,
         None => file_io.new_input(path)?.read().await,
     }
 }
@@ -241,6 +241,7 @@ async fn read_all_manifest_entries(
     bucket_function_type: BucketFunctionType,
     row_range_index: Option<&RowRangeIndex>,
     manifest_sidecar_enabled: bool,
+    manifest_parallelism: usize,
     trace: Option<&mut ScanTrace>,
 ) -> crate::Result<Vec<ManifestEntry>> {
     let incremental = matches!(&source, ManifestListSource::AppendDeltas(_));
@@ -256,7 +257,7 @@ async fn read_all_manifest_entries(
                 .collect::<Vec<_>>();
             let delta = futures::stream::iter(names)
                 .map(|name| async move { read_manifest_list(file_io, table_path, &name).await })
-                .buffered(64)
+                .buffered(manifest_parallelism)
                 .try_fold(Vec::new(), |mut files, next| async move {
                     files.extend(next);
                     Ok(files)
@@ -398,10 +399,10 @@ async fn read_all_manifest_entries(
                 Ok::<_, crate::Error>((filtered, counters))
             }
         })
-        // Keep manifest read concurrency bounded. `try_fold` releases each
-        // yielded result after merging it, so peak retained results are the
-        // accumulator plus at most this bounded set of in-flight reads.
-        .buffered(64)
+        // Keep manifest read concurrency bounded by the table option. `try_fold`
+        // releases each yielded result after merging it, so peak retained results
+        // are the accumulator plus at most this bounded set of in-flight reads.
+        .buffered(manifest_parallelism)
         .try_fold(
             (Vec::new(), ManifestReadCounters::default()),
             |(mut all_entries, mut counters), (entries, manifest_counters)| async move {
@@ -940,11 +941,6 @@ async fn resolve_data_file_field_ids(
         schema.fields()
     };
 
-    let field_id_by_name = fields
-        .iter()
-        .map(|field| (field.name(), field.id()))
-        .collect::<HashMap<_, _>>();
-
     let mut field_ids = HashSet::new();
     match file.write_cols.as_ref() {
         None => {
@@ -960,17 +956,14 @@ async fn resolve_data_file_field_ids(
                 if is_system_field_name(col) {
                     continue;
                 }
-                let Some(field_id) = field_id_by_name.get(col.as_str()) else {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "Cannot find write column '{}' in schema {}.",
-                            col, file.schema_id
-                        ),
-                        source: None,
-                    });
-                };
-                if !is_system_field_id(*field_id) {
-                    field_ids.insert(*field_id);
+                let projected = super::data_evolution_fields::project_by_paths(
+                    fields,
+                    std::slice::from_ref(col),
+                )?;
+                for field in projected {
+                    if !is_system_field_id(field.id()) {
+                        field_ids.insert(field.id());
+                    }
                 }
             }
         }
@@ -1575,6 +1568,7 @@ impl<'a> PaimonTableScan<'a> {
         let core_options = CoreOptions::new(self.table.schema().options());
         // Unconditional: unrelated to query-auth.
         core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        core_options.validate_data_file_path_directory()?;
 
         // File paths and stats, not table columns: the endpoint cannot rule on them.
         let query_auth = CoreOptions::new(self.table.schema().options()).query_auth_enabled();
@@ -1611,8 +1605,10 @@ impl<'a> PaimonTableScan<'a> {
 
     /// Fail closed on planning paths that do not authorize, `with_scan_all_files`
     /// included.
-    fn ensure_query_auth_allowed(&self) -> crate::Result<()> {
-        CoreOptions::new(self.table.schema().options()).ensure_read_authorized()
+    fn validate_read_options(&self) -> crate::Result<()> {
+        let options = CoreOptions::new(self.table.schema().options());
+        options.ensure_read_authorized()?;
+        options.validate_data_file_path_directory()
     }
 
     fn validate_shard_strategy(&self) -> crate::Result<()> {
@@ -1744,6 +1740,7 @@ impl<'a> PaimonTableScan<'a> {
             bucket_function_type,
             row_range_index,
             core_options.manifest_sidecar_enabled(),
+            core_options.scan_manifest_parallelism()?,
             trace,
         )
         .await?;
@@ -1960,7 +1957,7 @@ impl<'a> PaimonTableScan<'a> {
     /// Reuses the same split-building path as a full snapshot plan, but only
     /// reads the delta manifest list and keeps ADD entries.
     pub(crate) async fn plan_snapshot_delta(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
+        self.validate_read_options()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut scan = self.clone();
         scan.incremental_split_mode = Some(IncrementalSplitMode::Streaming);
@@ -1979,7 +1976,7 @@ impl<'a> PaimonTableScan<'a> {
         snapshots: &[Snapshot],
         end_snapshot: &Snapshot,
     ) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
+        self.validate_read_options()?;
         self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut scan = self.clone();
@@ -1999,7 +1996,7 @@ impl<'a> PaimonTableScan<'a> {
     /// reads the changelog manifest list and keeps ADD entries. Snapshots
     /// without a changelog list yield an empty plan.
     pub(crate) async fn plan_snapshot_changelog(&self, snapshot: &Snapshot) -> crate::Result<Plan> {
-        self.ensure_query_auth_allowed()?;
+        self.validate_read_options()?;
         let Some(list_name) = snapshot.changelog_manifest_list() else {
             return Ok(Plan::new(Vec::new()).with_snapshot_id(snapshot.id()));
         };
@@ -2082,7 +2079,7 @@ impl<'a> PaimonTableScan<'a> {
         before: &Snapshot,
         after: &Snapshot,
     ) -> crate::Result<(Plan, Plan)> {
-        self.ensure_query_auth_allowed()?;
+        self.validate_read_options()?;
         let core_options = CoreOptions::new(self.table.schema().options());
         // Both forms: without `first_row_id` a filter stays an ordinary data
         // predicate instead of becoming a row range.
@@ -2538,7 +2535,7 @@ impl<'a> PaimonTableScan<'a> {
         'groups: for ((partition, bucket), (total_buckets, data_files)) in groups {
             let partition_row = BinaryRow::from_serialized_bytes(&partition)?;
             let bucket_path = bucket_path(
-                base_path,
+                &self.table.data_file_location(),
                 partition_computer.as_ref(),
                 &partition_row,
                 bucket,
@@ -2816,11 +2813,11 @@ mod tests {
     use super::{
         data_evolution_row_range_groups, data_file_overlaps_row_range_index,
         group_data_files_by_partition_bucket, manifest_file_overlaps_row_range_index,
-        prune_data_evolution_group_by_read_fields, retain_index_manifest_entry,
-        retain_index_manifest_entry_for_scan, retain_manifest_buckets,
+        prune_data_evolution_group_by_read_fields, read_manifest_bytes_with_sidecar,
+        retain_index_manifest_entry, retain_index_manifest_entry_for_scan, retain_manifest_buckets,
         retain_manifest_entry_row_ranges, retain_manifest_row_ranges, scan_predicate_field_ids,
         should_skip_level_zero_for_scan, split_row_ranges_for_files, LimitPushdownAccumulator,
-        PaimonTableScan, RowRangeIndex, TableScan,
+        ManifestSidecarPruning, PaimonTableScan, RowRangeIndex, TableScan,
     };
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
@@ -2828,8 +2825,9 @@ mod tests {
         stats::BinaryTableStats, ArrayType, BinaryRow, BinaryRowBuilder, BucketFunctionType,
         ColumnMove, CommitKind, DataField, DataFileMeta, DataType, Datum, DeletionVectorMeta,
         FileKind, GlobalIndexMeta, IndexFileMeta, IndexManifestEntry, IntType, ManifestEntry,
-        ManifestFileMeta, Predicate, PredicateBuilder, PredicateOperator, Schema as PaimonSchema,
-        SchemaChange, Snapshot, TableSchema, VarCharType,
+        ManifestFileMeta, ManifestSidecar, ManifestSidecarBuilder, Predicate, PredicateBuilder,
+        PredicateOperator, Schema as PaimonSchema, SchemaChange, Snapshot, TableSchema,
+        VarCharType,
     };
     use crate::table::bucket_filter::{compute_target_buckets, extract_predicate_for_keys};
     use crate::table::partition_filter::PartitionFilter;
@@ -4044,6 +4042,90 @@ mod tests {
             .map(|file| file.file_name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(delta_files, vec!["a-new", "a-old"]);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_sidecar_read_uses_full_file_only_for_dense_selection() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let manifest_path = "memory:/adaptive_manifest_read/manifest-test";
+        let sidecar_path = ManifestSidecar::path(manifest_path);
+        let mut header = b"Obj\x01".to_vec();
+        header.resize(32, 0);
+        let mut builder = ManifestSidecarBuilder::new(header.clone(), true, false);
+        let mut offset = header.len() as u64;
+        for (length, first_row_id) in [(200, 0), (50, 100), (200, 200)] {
+            builder.begin_block(offset, length, 1).unwrap();
+            builder
+                .add(Some(first_row_id), 1, None, None, None)
+                .unwrap();
+            builder.end_block().unwrap();
+            offset += length;
+        }
+        let sidecar = builder.serialize(offset, 3).unwrap();
+        let manifest = ManifestFileMeta::new(
+            "manifest-test".to_string(),
+            offset as i64,
+            3,
+            0,
+            BinaryTableStats::empty(),
+            0,
+        )
+        .with_extra_files(Some(vec!["manifest-test.avro.sidecar".to_string()]));
+        let mut avro = header.clone();
+        avro.extend((0..450).map(|value| value as u8));
+        file_io
+            .new_output(manifest_path)
+            .unwrap()
+            .write(Bytes::from(avro.clone()))
+            .await
+            .unwrap();
+        file_io
+            .new_output(&sidecar_path)
+            .unwrap()
+            .write(Bytes::from(sidecar))
+            .await
+            .unwrap();
+
+        let dense = RowRangeIndex::create(vec![RowRange::new(0, 0), RowRange::new(200, 200)]);
+        let dense_bytes = read_manifest_bytes_with_sidecar(
+            &file_io,
+            manifest_path,
+            &manifest,
+            true,
+            ManifestSidecarPruning {
+                row_range_index: Some(&dense),
+                partition_filter: None,
+                partition_arity: 0,
+                bucket_predicate: None,
+                bucket_key_fields: &[],
+                bucket_function_type: BucketFunctionType::Default,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dense_bytes.as_ref(), avro);
+
+        let sparse = RowRangeIndex::create(vec![RowRange::new(0, 0)]);
+        let sparse_bytes = read_manifest_bytes_with_sidecar(
+            &file_io,
+            manifest_path,
+            &manifest,
+            true,
+            ManifestSidecarPruning {
+                row_range_index: Some(&sparse),
+                partition_filter: None,
+                partition_arity: 0,
+                bucket_predicate: None,
+                bucket_key_fields: &[],
+                bucket_function_type: BucketFunctionType::Default,
+            },
+        )
+        .await
+        .unwrap();
+        let mut expected = header;
+        let start = expected.len();
+        expected.extend_from_slice(&avro[start..start + 200]);
+        assert_eq!(sparse_bytes.as_ref(), expected);
     }
 
     #[tokio::test]
@@ -6434,6 +6516,33 @@ mod tests {
             .unwrap();
         assert!(changelog.splits().is_empty());
         assert_eq!(changelog.snapshot_id(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_plan_rejects_invalid_scan_manifest_parallelism() {
+        let table =
+            scan_trace_test_table("memory:/invalid_scan_manifest_parallelism").copy_with_options(
+                HashMap::from([("scan.manifest.parallelism".to_string(), "0".to_string())]),
+            );
+        setup_scan_trace_dirs(&table).await;
+
+        TableCommit::new(table.clone(), "manifest-parallelism-test".to_string())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                vec![stats_trace_file("parallelism.parquet", 1, 1)],
+            )])
+            .await
+            .unwrap();
+
+        let error = table
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::DataInvalid { message, .. }
+            if message.contains("scan.manifest.parallelism")));
     }
 
     #[tokio::test]

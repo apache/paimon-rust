@@ -550,15 +550,12 @@ impl<'a> PaimonReadBuilder<'a> {
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
         // The declared type needs no grant; only query-auth moved to `to_arrow`.
-        self.table
-            .schema
-            .core_options()
-            .ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        let core_options = self.table.schema.core_options();
+        core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        core_options.validate_data_file_path_directory()?;
         // A handle no catalog loaded holds no grant; refused here too, as bindings
         // skip `to_arrow` for an empty split list.
-        if self.table.schema.core_options().query_auth_enabled()
-            && self.table.query_auth_session().is_none()
-        {
+        if core_options.query_auth_enabled() && self.table.query_auth_session().is_none() {
             return Err(super::query_auth::unsupported(
                 "this table handle was assembled rather than loaded",
             ));

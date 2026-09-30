@@ -17,7 +17,7 @@
 
 //! Resolve BLOB descriptors after primary-key merge and row selection.
 
-use super::blob_resolver::{resolve_blob_column, BlobReadLimiter};
+use super::blob_resolver::{resolve_descriptor_column, BlobReadLimiter};
 use super::managed_blob_writer::{managed_blob_kind, ManagedBlobKind};
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::format::FilePredicates;
@@ -195,7 +195,8 @@ async fn resolve_batch(
         let column = match kind {
             ManagedBlobKind::Scalar => {
                 let values = blob_values(columns[index].as_ref())?;
-                Arc::new(resolve_blob_column(values, file_io, limiter.clone()).await?) as ArrayRef
+                Arc::new(resolve_descriptor_column(values, file_io, limiter.clone()).await?)
+                    as ArrayRef
             }
             ManagedBlobKind::Array => {
                 let array = columns[index]
@@ -205,7 +206,7 @@ async fn resolve_batch(
                 let values = blob_values(array.values().as_ref())?;
                 let visible = visible_child_values(values, array.value_offsets(), array)?;
                 let resolved =
-                    Arc::new(resolve_blob_column(&visible, file_io, limiter.clone()).await?);
+                    Arc::new(resolve_descriptor_column(&visible, file_io, limiter.clone()).await?);
                 let ArrowDataType::List(element) = array.data_type() else {
                     unreachable!()
                 };
@@ -227,7 +228,7 @@ async fn resolve_batch(
                 let values = blob_values(map.entries().column(1).as_ref())?;
                 let visible = visible_child_values(values, map.value_offsets(), map)?;
                 let resolved =
-                    Arc::new(resolve_blob_column(&visible, file_io, limiter.clone()).await?);
+                    Arc::new(resolve_descriptor_column(&visible, file_io, limiter.clone()).await?);
                 let ArrowDataType::Map(entries_field, ordered) = map.data_type() else {
                     unreachable!()
                 };

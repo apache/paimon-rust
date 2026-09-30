@@ -167,6 +167,7 @@ struct HashIndexLayout<'a> {
     table_path: &'a str,
     /// Partition directory, already terminated by `/`, or empty when unpartitioned.
     partition_path: &'a str,
+    data_file_path_directory: Option<&'a str>,
     index_file_in_data_file_dir: bool,
 }
 
@@ -182,7 +183,8 @@ impl HashIndexLayout<'_> {
     }
 
     fn bucket_path(&self, bucket: i32) -> String {
-        bucket_path_under(self.table_path, self.partition_path, bucket)
+        let data_root = crate::spec::data_file_path(self.table_path, self.data_file_path_directory);
+        bucket_path_under(&data_root, self.partition_path, bucket)
     }
 
     /// The directory a new hash index file for `bucket` is written into.
@@ -373,6 +375,7 @@ pub(crate) struct DynamicBucketAssigner {
     target_bucket_row_number: i64,
     file_io: FileIO,
     table_location: String,
+    data_file_path_directory: Option<String>,
     /// Cached index manifest entries from the latest snapshot (loaded once).
     cached_index_entries: Option<Vec<IndexManifestEntry>>,
     /// Overwrite mode: skip loading existing index entries.
@@ -406,11 +409,17 @@ impl DynamicBucketAssigner {
             target_bucket_row_number,
             file_io,
             table_location,
+            data_file_path_directory: None,
             cached_index_entries: None,
             is_overwrite,
             partition_computer,
             index_file_in_data_file_dir,
         }
+    }
+
+    pub(super) fn with_data_file_path_directory(mut self, directory: Option<&str>) -> Self {
+        self.data_file_path_directory = directory.map(str::to_string);
+        self
     }
 
     pub fn set_overwrite(&mut self, is_overwrite: bool) {
@@ -466,6 +475,7 @@ impl DynamicBucketAssigner {
         if !partition_entries.is_empty() {
             let partition_path = self.partition_path(partition_bytes)?;
             let layout = HashIndexLayout {
+                data_file_path_directory: self.data_file_path_directory.as_deref(),
                 table_path: self.table_location.trim_end_matches('/'),
                 partition_path: &partition_path,
                 index_file_in_data_file_dir: self.index_file_in_data_file_dir,
@@ -542,6 +552,7 @@ impl BucketAssigner for DynamicBucketAssigner {
         }
         for (partition_bytes, partition_path) in partition_keys.into_iter().zip(partition_paths) {
             let layout = HashIndexLayout {
+                data_file_path_directory: self.data_file_path_directory.as_deref(),
                 table_path: &table_path,
                 partition_path: &partition_path,
                 index_file_in_data_file_dir,
@@ -649,6 +660,7 @@ mod tests {
             let table_path = format!("file://{}", tmp.path().display());
             let file_io = FileIO::from_url(&table_path).unwrap().build().unwrap();
             let layout = super::HashIndexLayout {
+                data_file_path_directory: None,
                 table_path: &table_path,
                 partition_path: "pt=1/",
                 index_file_in_data_file_dir,
@@ -697,6 +709,7 @@ mod tests {
 
         for index_file_in_data_file_dir in [false, true] {
             let layout = super::HashIndexLayout {
+                data_file_path_directory: None,
                 table_path: &table_path,
                 partition_path: "pt=1/",
                 index_file_in_data_file_dir,

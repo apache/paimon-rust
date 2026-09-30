@@ -32,7 +32,7 @@ use crate::table::ArrowRecordBatchStream;
 use crate::Error;
 use arrow_array::{new_null_array, ArrayRef, Int64Array, Int8Array, RecordBatch};
 use arrow_ord::ord::make_comparator;
-use arrow_row::{RowConverter, Rows, SortField};
+use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
 use arrow_schema::{SchemaRef, SortOptions};
 use arrow_select::interleave::interleave;
 use async_stream::try_stream;
@@ -78,8 +78,9 @@ pub(crate) struct MergeRow {
     pub row_idx: usize,
     pub sequence_number: i64,
     pub value_kind: i8,
-    /// User-defined sequence values from `sequence.field` (empty if not configured).
-    pub user_sequences: Vec<Option<i128>>,
+    /// Row-encoded user-defined sequence fields, with Java's sort direction
+    /// and nulls-first ordering. `None` when `sequence.field` is not set.
+    pub user_sequence: Option<OwnedRow>,
 }
 
 #[cfg(test)]
@@ -152,21 +153,19 @@ pub(crate) trait MergeFunction: Send + Sync {
 }
 
 /// Deduplicate merge: keeps the row with the highest sequence.
-/// When `sequence.field` is configured (one or more fields), compares user
-/// sequences lexicographically first, then falls back to system
-/// `_SEQUENCE_NUMBER` as tie-breaker.
+/// When `sequence.field` is configured, compares its typed Arrow row encoding
+/// first, then falls back to system `_SEQUENCE_NUMBER` as tie-breaker.
 /// When sequence numbers are equal, keeps the last-added row (last-writer-wins).
 /// Filters out DELETE and UPDATE_BEFORE rows.
 pub(crate) struct DeduplicateMergeFunction;
 
 pub(super) fn compare_sequence_order(lhs: &MergeRow, rhs: &MergeRow) -> Ordering {
-    match (lhs.user_sequences.is_empty(), rhs.user_sequences.is_empty()) {
-        (false, false) => lhs
-            .user_sequences
-            .cmp(&rhs.user_sequences)
-            .then_with(|| lhs.sequence_number.cmp(&rhs.sequence_number)),
-        _ => lhs.sequence_number.cmp(&rhs.sequence_number),
-    }
+    lhs.user_sequence
+        .cmp(&rhs.user_sequence)
+        .then_with(|| lhs.sequence_number.cmp(&rhs.sequence_number))
+        // Java SortMergeReader compares isAdd() after equal sequence numbers:
+        // retracts come first, adds last.
+        .then_with(|| matches!(lhs.value_kind, 0 | 2).cmp(&matches!(rhs.value_kind, 0 | 2)))
 }
 
 impl MergeFunction for DeduplicateMergeFunction {
@@ -1026,6 +1025,8 @@ struct SortMergeCursor {
     batch: RecordBatch,
     /// Row-encoded keys for the current batch (via arrow-row).
     rows: Rows,
+    /// Typed user-defined sequence fields for the current batch.
+    user_rows: Option<Rows>,
     offset: usize,
 }
 
@@ -1059,54 +1060,10 @@ impl SortMergeCursor {
         }
     }
 
-    /// Read the user-defined sequence field value (cast to i64 for ordering).
-    /// Returns None if the column is NULL at this row.
-    ///
-    /// Supports the same types as Java Paimon's `UserDefinedSeqComparator`:
-    /// TinyInt, SmallInt, Int, BigInt, Timestamp, Date, Decimal.
-    fn user_sequence(&self, user_seq_index: usize) -> Option<i128> {
-        let col = self.batch.column(user_seq_index);
-        if col.is_null(self.offset) {
-            return None;
-        }
-        use arrow_array::*;
-        let any = col.as_any();
-        if let Some(arr) = any.downcast_ref::<Int64Array>() {
-            return Some(arr.value(self.offset) as i128);
-        }
-        if let Some(arr) = any.downcast_ref::<Int32Array>() {
-            return Some(arr.value(self.offset) as i128);
-        }
-        if let Some(arr) = any.downcast_ref::<Int16Array>() {
-            return Some(arr.value(self.offset) as i128);
-        }
-        if let Some(arr) = any.downcast_ref::<Int8Array>() {
-            return Some(arr.value(self.offset) as i128);
-        }
-        // Timestamps are stored as i64 internally (micros, millis, seconds, nanos).
-        if let Some(arr) = any.downcast_ref::<TimestampMicrosecondArray>() {
-            return Some(arr.value(self.offset) as i128);
-        }
-        if let Some(arr) = any.downcast_ref::<TimestampMillisecondArray>() {
-            return Some(arr.value(self.offset) as i128);
-        }
-        if let Some(arr) = any.downcast_ref::<TimestampNanosecondArray>() {
-            return Some(arr.value(self.offset) as i128);
-        }
-        if let Some(arr) = any.downcast_ref::<TimestampSecondArray>() {
-            return Some(arr.value(self.offset) as i128);
-        }
-        if let Some(arr) = any.downcast_ref::<Date32Array>() {
-            return Some(arr.value(self.offset) as i128);
-        }
-        if let Some(arr) = any.downcast_ref::<Date64Array>() {
-            return Some(arr.value(self.offset) as i128);
-        }
-        // Decimal128: use raw i128 value for ordering (same precision/scale within a column).
-        if let Some(arr) = any.downcast_ref::<Decimal128Array>() {
-            return Some(arr.value(self.offset));
-        }
-        None
+    fn user_sequence(&self) -> Option<OwnedRow> {
+        self.user_rows
+            .as_ref()
+            .map(|rows| rows.row(self.offset).owned())
     }
 }
 
@@ -1263,14 +1220,36 @@ impl SortMergeReaderBuilder {
             source: Some(Box::new(e)),
         })?;
 
+        let user_sequence_converter = if self.user_sequence_indices.is_empty() {
+            None
+        } else {
+            let fields = self
+                .user_sequence_indices
+                .iter()
+                .map(|&idx| {
+                    SortField::new_with_options(
+                        self.input_schema.field(idx).data_type().clone(),
+                        SortOptions {
+                            descending: self.user_sequence_descending,
+                            nulls_first: true,
+                        },
+                    )
+                })
+                .collect();
+            Some(RowConverter::new(fields).map_err(|e| Error::DataInvalid {
+                message: format!("Unsupported user sequence field type: {e}"),
+                source: Some(Box::new(e)),
+            })?)
+        };
+
         sort_merge_stream(
             self.streams,
             row_converter,
+            user_sequence_converter,
             self.key_indices,
             self.seq_index,
             self.value_kind_index,
             self.user_sequence_indices,
-            self.user_sequence_descending,
             self.value_indices,
             self.output_schema,
             self.merge_function,
@@ -1297,6 +1276,27 @@ fn convert_batch_keys(
         })
 }
 
+fn convert_batch_user_sequences(
+    batch: &RecordBatch,
+    indices: &[usize],
+    converter: Option<&mut RowConverter>,
+) -> crate::Result<Option<Rows>> {
+    let Some(converter) = converter else {
+        return Ok(None);
+    };
+    let columns = indices
+        .iter()
+        .map(|&idx| batch.column(idx).clone())
+        .collect::<Vec<_>>();
+    converter
+        .convert_columns(&columns)
+        .map(Some)
+        .map_err(|e| Error::DataInvalid {
+            message: format!("Failed to encode user sequence fields: {e}"),
+            source: Some(Box::new(e)),
+        })
+}
+
 /// Compare two cursors by their current key. `None` cursors are treated as
 /// greater than any value (exhausted streams sink to the bottom).
 fn compare_cursors(cursors: &[Option<SortMergeCursor>], a: usize, b: usize) -> Ordering {
@@ -1318,11 +1318,11 @@ fn compare_cursors(cursors: &[Option<SortMergeCursor>], a: usize, b: usize) -> O
 fn sort_merge_stream(
     mut streams: Vec<ArrowRecordBatchStream>,
     mut row_converter: RowConverter,
+    mut user_sequence_converter: Option<RowConverter>,
     key_indices: Vec<usize>,
     seq_index: usize,
     value_kind_index: usize,
     user_sequence_indices: Vec<usize>,
-    user_sequence_descending: bool,
     value_indices: Vec<usize>,
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
@@ -1351,7 +1351,12 @@ fn sort_merge_stream(
                 let batch = batch_result?;
                 if batch.num_rows() > 0 {
                     let rows = convert_batch_keys(&batch, &key_indices, &mut row_converter)?;
-                    cursors.push(Some(SortMergeCursor { batch, rows, offset: 0 }));
+                    let user_rows = convert_batch_user_sequences(
+                        &batch,
+                        &user_sequence_indices,
+                        user_sequence_converter.as_mut(),
+                    )?;
+                    cursors.push(Some(SortMergeCursor { batch, rows, user_rows, offset: 0 }));
                     found = true;
                     break;
                 }
@@ -1420,11 +1425,7 @@ fn sort_merge_stream(
                         row_idx: cursor.offset,
                         sequence_number: cursor.sequence_number(seq_index),
                         value_kind: cursor.value_kind(value_kind_index),
-                        user_sequences: user_sequence_indices.iter().map(|&idx| {
-                            cursor.user_sequence(idx).map(|value| {
-                                if user_sequence_descending { -value } else { value }
-                            })
-                        }).collect(),
+                        user_sequence: cursor.user_sequence(),
                     });
                 }
 
@@ -1440,10 +1441,15 @@ fn sort_merge_stream(
                             let batch = batch_result?;
                             if batch.num_rows() > 0 {
                                 let rows = convert_batch_keys(&batch, &key_indices, &mut row_converter)?;
+                                let user_rows = convert_batch_user_sequences(
+                                    &batch,
+                                    &user_sequence_indices,
+                                    user_sequence_converter.as_mut(),
+                                )?;
                                 let buf_idx = batch_buffer.len();
                                 batch_buffer.push(BufferedBatch::Source(batch.clone()));
                                 stream_batch_idx[current_winner] = Some(buf_idx);
-                                cursors[current_winner] = Some(SortMergeCursor { batch, rows, offset: 0 });
+                                cursors[current_winner] = Some(SortMergeCursor { batch, rows, user_rows, offset: 0 });
                                 break;
                             }
                         }
@@ -1613,7 +1619,7 @@ mod tests {
                 row_idx,
                 sequence_number,
                 value_kind: 0,
-                user_sequences: vec![],
+                user_sequence: None,
             })
             .collect();
         let result = FirstRowMergeFunction {
@@ -1639,14 +1645,14 @@ mod tests {
                     row_idx: 0,
                     sequence_number: 1,
                     value_kind: 0,
-                    user_sequences: vec![],
+                    user_sequence: None,
                 },
                 MergeRow {
                     batch_idx: 0,
                     row_idx: 1,
                     sequence_number: 2,
                     value_kind: kind,
-                    user_sequences: vec![],
+                    user_sequence: None,
                 },
             ];
             let merge = FirstRowMergeFunction {
@@ -2140,6 +2146,133 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(values.value(0), "low");
+    }
+
+    #[tokio::test]
+    async fn test_string_user_sequence_across_streams_in_both_orders() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("seq", DataType::Utf8, true),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("seq", DataType::Utf8, true),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        for (descending, expected) in [(false, "high"), (true, "low")] {
+            let streams = [
+                (Some("z"), 1, "high"),
+                (Some("a"), 2, "low"),
+                (None, 3, "null"),
+            ]
+            .into_iter()
+            .map(|(seq, number, value)| {
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![1])),
+                        Arc::new(Int64Array::from(vec![number])),
+                        Arc::new(Int8Array::from(vec![0])),
+                        Arc::new(StringArray::from(vec![seq])),
+                        Arc::new(StringArray::from(vec![value])),
+                    ],
+                )
+                .unwrap();
+                stream_from_batches(vec![batch])
+            })
+            .collect();
+            let batches = SortMergeReaderBuilder::new(
+                streams,
+                schema.clone(),
+                vec![0],
+                1,
+                2,
+                vec![3],
+                vec![3, 4],
+                output_schema.clone(),
+                Box::new(DeduplicateMergeFunction),
+            )
+            .with_user_sequence_descending(descending)
+            .build()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+            assert_eq!(batches.len(), 1);
+            let values = batches[0]
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(values.value(0), expected, "descending={descending}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_equal_sequence_places_retract_before_add() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("_SEQUENCE_NUMBER", DataType::Int64, false),
+            Field::new("_VALUE_KIND", DataType::Int8, false),
+            Field::new("seq", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("seq", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        for kinds in [[3, 0], [0, 3]] {
+            let streams = kinds
+                .into_iter()
+                .map(|kind| {
+                    let batch = RecordBatch::try_new(
+                        schema.clone(),
+                        vec![
+                            Arc::new(Int32Array::from(vec![1])),
+                            Arc::new(Int64Array::from(vec![5])),
+                            Arc::new(Int8Array::from(vec![kind])),
+                            Arc::new(StringArray::from(vec!["same"])),
+                            Arc::new(StringArray::from(vec![if kind == 0 {
+                                "add"
+                            } else {
+                                "delete"
+                            }])),
+                        ],
+                    )
+                    .unwrap();
+                    stream_from_batches(vec![batch])
+                })
+                .collect();
+            let batches = SortMergeReaderBuilder::new(
+                streams,
+                schema.clone(),
+                vec![0],
+                1,
+                2,
+                vec![3],
+                vec![3, 4],
+                output_schema.clone(),
+                Box::new(DeduplicateMergeFunction),
+            )
+            .build()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+            assert_eq!(batches.len(), 1);
+            let values = batches[0]
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(values.value(0), "add");
+        }
     }
 
     #[tokio::test]
