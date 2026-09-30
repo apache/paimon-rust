@@ -918,7 +918,7 @@ async fn test_data_block_cache_is_bounded_and_file_scoped() {
         second_data.len() as u64,
         &second_result.meta,
         int_cmp,
-        cache,
+        Arc::clone(&cache),
         Arc::from("memory:/second.btree"),
     )
     .await
@@ -946,6 +946,47 @@ async fn test_data_block_cache_is_bounded_and_file_scoped() {
     );
     assert_eq!(first_ranges.lock().unwrap().len(), 1);
     assert_eq!(second_ranges.lock().unwrap().len(), 1);
+
+    let two_file_bytes = cache.retained_bytes();
+    assert!(two_file_bytes > 1);
+    let bounded_cache = Arc::new(BTreeDataBlockCache::new(two_file_bytes - 1));
+    let bounded_first_ranges = Arc::new(Mutex::new(Vec::new()));
+    let bounded_first = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(RecordingFileRead {
+            data: first_data.clone(),
+            ranges: Arc::clone(&bounded_first_ranges),
+        }),
+        first_data.len() as u64,
+        &first_result.meta,
+        int_cmp,
+        Arc::clone(&bounded_cache),
+        Arc::from("memory:/bounded-first.btree"),
+    )
+    .await
+    .unwrap();
+    let bounded_second_ranges = Arc::new(Mutex::new(Vec::new()));
+    let bounded_second = BTreeIndexReader::open_with_data_block_cache(
+        Box::new(RecordingFileRead {
+            data: second_data.clone(),
+            ranges: Arc::clone(&bounded_second_ranges),
+        }),
+        second_data.len() as u64,
+        &second_result.meta,
+        int_cmp,
+        Arc::clone(&bounded_cache),
+        Arc::from("memory:/bounded-second.btree"),
+    )
+    .await
+    .unwrap();
+    bounded_first_ranges.lock().unwrap().clear();
+    bounded_second_ranges.lock().unwrap().clear();
+
+    bounded_first.query_equal(&int_key(1)).await.unwrap();
+    bounded_second.query_equal(&int_key(1)).await.unwrap();
+    bounded_first.query_equal(&int_key(1)).await.unwrap();
+    assert_eq!(bounded_first_ranges.lock().unwrap().len(), 2);
+    assert_eq!(bounded_second_ranges.lock().unwrap().len(), 1);
+    assert!(bounded_cache.retained_bytes() < two_file_bytes);
 
     let ranges = Arc::new(Mutex::new(Vec::new()));
     let uncached = BTreeIndexReader::open_with_data_block_cache(
