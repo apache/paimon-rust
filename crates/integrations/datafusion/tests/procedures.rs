@@ -126,6 +126,34 @@ async fn test_create_branch() {
 }
 
 #[tokio::test]
+async fn test_create_branch_rejects_path_separator() {
+    let (tmp, sql_context) = setup_table_with_snapshots().await;
+    exec(
+        &sql_context,
+        "CALL sys.create_branch(table => 'test_db.t1', branch => 'b1')",
+    )
+    .await;
+
+    // `b1/hidden` would be created under `branch-b1/` and never be listed as a branch.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_branch(table => 'test_db.t1', branch => 'b1/hidden')",
+        "path separator",
+    )
+    .await;
+
+    // The name is rejected before any schema file is copied into the nested path.
+    let b1_dir = tmp.path().join("test_db.db/t1/branch/branch-b1");
+    assert!(b1_dir.is_dir(), "{} is missing", b1_dir.display());
+    assert!(
+        !b1_dir.join("hidden").exists(),
+        "the nested branch was created"
+    );
+    let count = row_count(&sql_context, "SELECT * FROM paimon.test_db.`t1$branches`").await;
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn test_create_lumina_index_requires_index_column() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 
