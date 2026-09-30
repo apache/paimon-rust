@@ -1169,22 +1169,33 @@ fn test_read_with_data() {
 
 #[test]
 fn test_read_builder_with_limit_prunes_plan_splits() {
-    // `with_limit` is a plan-time hint: planning stops selecting splits once the
-    // retained ones already cover the limit (mirrors core `apply_limit_pushdown`).
-    // Assert the FFI threads the hint through to planning -- a zero limit prunes
-    // every split, a generous limit leaves the plan untouched. Without the hint
-    // reaching planning, the zero-limit plan would keep the baseline splits.
+    // `with_limit` is a plan-time hint: planning stops retaining splits once the
+    // kept ones already cover the limit (mirrors core `apply_limit_pushdown`).
+    // Three separate commits give multiple splits with known row counts, so this
+    // asserts the FFI threads the hint through to planning across splits: a zero
+    // limit prunes every split, a small limit keeps a strict non-empty subset,
+    // and a generous limit leaves the plan untouched.
     let path = "memory:/test_read_limit";
     let file_io = memory_file_io();
     setup_table_dirs(&file_io, path);
+    // Force a tiny split target so each committed file becomes its own split,
+    // giving multiple known-count splits instead of one bundled split.
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .option("source.split.target-size", "1")
+        .build()
+        .unwrap();
     let table = Table::new(
         file_io.clone(),
         Identifier::new("default", "test"),
         path.to_string(),
-        simple_table_schema(),
+        TableSchema::new(0, &schema),
         None,
     );
-    write_data_rust(&table, &[make_batch(vec![1, 2, 3], vec!["a", "b", "c"])]);
+    write_data_rust(&table, &[make_batch(vec![1, 2], vec!["a", "b"])]);
+    write_data_rust(&table, &[make_batch(vec![3, 4], vec!["c", "d"])]);
+    write_data_rust(&table, &[make_batch(vec![5, 6], vec!["e", "f"])]);
     let handle = unsafe { wrap_table(table) };
 
     unsafe fn plan_split_count(handle: *const paimon_table, limit: Option<usize>) -> usize {
@@ -1204,11 +1215,23 @@ fn test_read_builder_with_limit_prunes_plan_splits() {
 
     unsafe {
         let baseline = plan_split_count(handle, None);
-        assert!(baseline >= 1, "a table with rows should plan >= 1 split");
+        assert!(
+            baseline >= 2,
+            "three commits should plan multiple splits, got {baseline}"
+        );
         assert_eq!(
             plan_split_count(handle, Some(0)),
             0,
             "a zero limit must prune every split at plan time"
+        );
+        // A small positive limit is covered by the first retained split alone, so
+        // planning keeps a strict non-empty subset instead of every split. A limit
+        // that wrapped to a huge value (the negative-input bug) would instead keep
+        // the full baseline here.
+        let pruned = plan_split_count(handle, Some(1));
+        assert!(
+            pruned >= 1 && pruned < baseline,
+            "limit 1 should keep a strict non-empty subset of {baseline} splits, got {pruned}"
         );
         assert_eq!(
             plan_split_count(handle, Some(1000)),
