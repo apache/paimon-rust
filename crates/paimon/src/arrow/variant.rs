@@ -26,9 +26,10 @@ use crate::{Error, Result};
 
 /// Extracts literal top-level numeric fields from an Arrow Variant column.
 ///
-/// The result is row-major and preserves `fields` order. Missing fields and
-/// Variant nulls become child nulls; SQL-null input rows remain parent nulls.
-/// Numeric values are converted to `f32`, which may lose precision.
+/// The result is row-major and preserves `fields` order. Missing fields,
+/// non-object roots, and Variant nulls become child nulls; SQL-null input rows
+/// remain parent nulls. Numeric values are converted to `f32`, which may lose
+/// precision.
 pub fn variant_get_numeric_fields(
     column: &StructArray,
     fields: &[String],
@@ -227,10 +228,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_object_roots() {
-        let input = variant_column(&[Some("3")]);
-        let err = variant_get_numeric_fields(&input, &["value".to_string()]).unwrap_err();
-        assert!(matches!(err, Error::DataInvalid { .. }));
+    fn returns_null_fields_for_non_object_roots() {
+        let input = variant_column(&[
+            Some(r#"{"value":3}"#),
+            Some("null"),
+            Some("3"),
+            Some("[1,2]"),
+            None,
+        ]);
+        let output = variant_get_numeric_fields(&input, &["value".to_string()]).unwrap();
+        let values = output
+            .values()
+            .as_primitive::<arrow_array::types::Float32Type>();
+
+        assert_eq!(values.value(0), 3.0);
+        assert!(values.is_null(1));
+        assert!(values.is_null(2));
+        assert!(values.is_null(3));
+        assert!(output.is_valid(0));
+        assert!(output.is_valid(1));
+        assert!(output.is_valid(2));
+        assert!(output.is_valid(3));
+        assert!(output.is_null(4));
     }
 
     #[test]

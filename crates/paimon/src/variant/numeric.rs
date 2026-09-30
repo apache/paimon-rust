@@ -77,7 +77,8 @@ impl VariantFloat32Projection {
         }
         output.fill(None);
         if value_kind(value, 0)? != VariantKind::Object {
-            return data_invalid("Variant root must be an object");
+            validate_payload(value, metadata)?;
+            return Ok(());
         }
 
         let layout = object_layout(value, 0)?;
