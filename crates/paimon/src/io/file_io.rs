@@ -178,7 +178,7 @@ impl FileIO {
     /// `block_size` controls the aligned ranges presented to the cache.
     /// `whitelist` uses the same comma-separated values as
     /// `local-cache.whitelist`: `meta`, `global-index`, `bucket-index`, `data`,
-    /// and `file-index`.
+    /// and `file-index`, or `*` for all of them.
     pub fn with_file_block_cache(
         mut self,
         cache: Arc<dyn FileBlockCache>,

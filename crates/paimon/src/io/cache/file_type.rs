@@ -15,7 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::spec::MANIFEST_SIDECAR_SUFFIX;
 use std::collections::HashSet;
+
+// Suffix `.{uuid}.tmp` appended by Java `Path.createTempPath()`: 1 dot + 36-char UUID + `.tmp`.
+const TEMP_FILE_SUFFIX_LEN: usize = 41;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum FileType {
@@ -27,8 +31,18 @@ pub(super) enum FileType {
 }
 
 impl FileType {
+    const ALL: [Self; 5] = [
+        Self::Meta,
+        Self::Data,
+        Self::BucketIndex,
+        Self::GlobalIndex,
+        Self::FileIndex,
+    ];
+
+    /// Mirrors Java `org.apache.paimon.utils.FileType#classify`, including its check order.
     pub(super) fn classify(path: &str) -> Self {
-        let name = path.rsplit('/').next().unwrap_or(path);
+        let mut segments = path.rsplit('/');
+        let name = unwrap_temp_file_name(segments.next().unwrap_or(path));
 
         if name.starts_with("snapshot-")
             || name.starts_with("schema-")
@@ -36,7 +50,6 @@ impl FileType {
             || name.starts_with("tag-")
             || name.starts_with("consumer-")
             || name.starts_with("service-")
-            || name.contains("manifest")
         {
             return Self::Meta;
         }
@@ -49,8 +62,20 @@ impl FileType {
             };
         }
 
+        if name.contains("manifest") || name.ends_with(MANIFEST_SIDECAR_SUFFIX) {
+            return Self::Meta;
+        }
+
         if name.starts_with("index-") {
             return Self::BucketIndex;
+        }
+
+        if matches!(name, "LATEST" | "EARLIEST") || name.ends_with("_SUCCESS") {
+            return Self::Meta;
+        }
+
+        if name.starts_with("changelog-") && segments.next() == Some("changelog") {
+            return Self::Meta;
         }
 
         Self::Data
@@ -58,7 +83,11 @@ impl FileType {
 
     pub(super) fn is_mutable(path: &str) -> bool {
         let name = path.rsplit('/').next().unwrap_or(path);
-        matches!(name, "LATEST" | "EARLIEST")
+        // Iceberg-compatible `version-hint.text` and `retire-pending` are rewritten in place.
+        matches!(
+            name,
+            "LATEST" | "EARLIEST" | "version-hint.text" | "retire-pending"
+        ) || name.ends_with("_SUCCESS")
             || name.starts_with("tag-")
             || name.starts_with("consumer-")
             || name.starts_with("service-")
@@ -70,24 +99,42 @@ impl FileType {
     pub(super) fn parse_whitelist(value: &str) -> HashSet<Self> {
         value
             .split(',')
-            .filter_map(|name| match name.trim() {
-                "meta" => Some(Self::Meta),
-                "global-index" => Some(Self::GlobalIndex),
-                "bucket-index" => Some(Self::BucketIndex),
-                "data" => Some(Self::Data),
-                "file-index" => Some(Self::FileIndex),
-                "" => None,
-                unknown => {
-                    log::warn!(
-                        "Unknown local-cache.whitelist value '{}'; supported values are \
-                         meta, global-index, bucket-index, data, file-index",
-                        unknown
-                    );
-                    None
+            .flat_map(|name| -> &'static [Self] {
+                match name.trim() {
+                    "*" => &Self::ALL,
+                    "meta" => &[Self::Meta],
+                    "global-index" => &[Self::GlobalIndex],
+                    "bucket-index" => &[Self::BucketIndex],
+                    "data" => &[Self::Data],
+                    "file-index" => &[Self::FileIndex],
+                    "" => &[],
+                    unknown => {
+                        log::warn!(
+                            "Unknown local-cache.whitelist value '{}'; supported values are \
+                             meta, global-index, bucket-index, data, file-index, \
+                             or * for all of them",
+                            unknown
+                        );
+                        &[]
+                    }
                 }
             })
+            .copied()
             .collect()
     }
+}
+
+/// Returns `originalName` for a Java temp name `.{originalName}.{uuid}.tmp`, else `name`.
+fn unwrap_temp_file_name(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() < TEMP_FILE_SUFFIX_LEN + 2 || bytes[0] != b'.' || !name.ends_with(".tmp") {
+        return name;
+    }
+    let dot_before_uuid = bytes.len() - TEMP_FILE_SUFFIX_LEN;
+    if bytes[dot_before_uuid] != b'.' {
+        return name;
+    }
+    &name[1..dot_before_uuid]
 }
 
 #[cfg(test)]
@@ -121,10 +168,54 @@ mod tests {
                 "s3://bucket/table/bucket-0/data-abc.parquet",
                 FileType::Data,
             ),
+            (
+                "s3://bucket/table/manifest/manifest-123e4567-e89b-12d3-a456-426614174000-0.avro.sidecar",
+                FileType::Meta,
+            ),
+            // `.index` is checked before `manifest`, as in Java.
+            (
+                "s3://bucket/table/index/manifest-global-index-abc.index",
+                FileType::GlobalIndex,
+            ),
+            ("s3://bucket/table/changelog/changelog-5", FileType::Meta),
+            (
+                "s3://bucket/table/bucket-0/changelog-123e4567-e89b-12d3-a456-426614174000-0.parquet",
+                FileType::Data,
+            ),
+            (
+                "s3://bucket/table/snapshot/.snapshot-13.123e4567-e89b-12d3-a456-426614174000.tmp",
+                FileType::Meta,
+            ),
+            (
+                "s3://bucket/table/changelog/.changelog-5.123e4567-e89b-12d3-a456-426614174000.tmp",
+                FileType::Meta,
+            ),
+            (
+                "s3://bucket/table/bucket-0/.data-abc.parquet.123e4567-e89b-12d3-a456-426614174000.tmp",
+                FileType::Data,
+            ),
         ];
 
         for (path, expected) in cases {
             assert_eq!(FileType::classify(path), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn test_file_type_classifies_mutable_markers_as_meta() {
+        for path in [
+            "s3://bucket/table/snapshot/LATEST",
+            "s3://bucket/table/snapshot/EARLIEST",
+            "s3://bucket/table/changelog/LATEST",
+            "s3://bucket/table/changelog/EARLIEST",
+            "s3://bucket/table/branch/branch-dev/snapshot/LATEST",
+            "s3://bucket/table/branch/branch-dev/snapshot/EARLIEST",
+            "s3://bucket/table/dt=1/_SUCCESS",
+            "s3://bucket/table/tag/tag-success-file/t1_SUCCESS",
+            "s3://bucket/table/snapshot/.snapshot-13.123e4567-e89b-12d3-a456-426614174000.tmp",
+        ] {
+            assert_eq!(FileType::classify(path), FileType::Meta, "{path}");
+            assert!(FileType::is_mutable(path), "{path}");
         }
     }
 
@@ -138,28 +229,41 @@ mod tests {
             "s3://bucket/table/service/service-api",
             "s3://bucket/table/snapshot/.snapshot-1.123e4567-e89b-12d3-a456-426614174000.tmp",
             "s3://bucket/table/snapshot/snapshot-1.tmp-123e4567-e89b-12d3-a456-426614174000",
+            "s3://bucket/table/dt=1/_SUCCESS",
+            "s3://bucket/table/tag/tag-success-file/t1_SUCCESS",
+            "s3://bucket/table/metadata/version-hint.text",
+            "s3://bucket/table/metadata/retire-pending",
         ] {
             assert!(FileType::is_mutable(path), "{path}");
         }
-        assert!(!FileType::is_mutable(
-            "s3://bucket/table/snapshot/snapshot-1"
-        ));
+        for path in [
+            "s3://bucket/table/snapshot/snapshot-1",
+            "s3://bucket/table/changelog/changelog-5",
+        ] {
+            assert!(!FileType::is_mutable(path), "{path}");
+        }
     }
 
     #[test]
     fn test_file_type_parses_whitelist() {
-        let whitelist =
-            FileType::parse_whitelist(" meta,global-index, bucket-index,data,file-index,unknown ");
-
-        assert_eq!(whitelist.len(), 5);
-        for file_type in [
+        let all = HashSet::from([
             FileType::Meta,
             FileType::GlobalIndex,
             FileType::BucketIndex,
             FileType::Data,
             FileType::FileIndex,
+        ]);
+
+        for value in [
+            " meta,global-index, bucket-index,data,file-index,unknown ",
+            "*",
+            " meta , * ",
         ] {
-            assert!(whitelist.contains(&file_type));
+            assert_eq!(FileType::parse_whitelist(value), all, "{value}");
         }
+        assert_eq!(
+            FileType::parse_whitelist("meta,global-index"),
+            HashSet::from([FileType::Meta, FileType::GlobalIndex])
+        );
     }
 }

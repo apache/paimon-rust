@@ -546,6 +546,8 @@ mod tests {
         assert!(!cache.is_cacheable("s3://bucket/table/data/data-1.parquet"));
         assert!(!cache.is_cacheable("s3://bucket/table/snapshot/LATEST"));
         assert!(!cache.is_cacheable("s3://bucket/table/tag/tag-production"));
+        assert!(cache.is_cacheable("s3://bucket/table/changelog/changelog-1"));
+        assert!(!cache.is_cacheable("s3://bucket/table/dt=1/_SUCCESS"));
     }
 
     #[test]
