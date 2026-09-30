@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use chrono::NaiveDate;
 
 use crate::io::FileIO;
-use crate::spec::{escape_path_name, unescape_path_name, DataType, Datum};
+use crate::spec::{escape_path_name, is_java_whitespace_only, unescape_path_name, DataType, Datum};
 
 const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
 
@@ -78,7 +78,13 @@ impl FormatTablePartitionPaths {
         }
         let mut segments = Vec::with_capacity(leading_values.len());
         for (key, value) in self.partition_keys.iter().zip(leading_values) {
-            if value.trim().is_empty() {
+            // A value that folds to the default partition name (Java
+            // `StringUtils.isNullOrWhitespaceOnly`) is not stored under its
+            // literal spelling, so a prefix pattern built from it would miss the
+            // data; skip pushdown and let the caller list every partition.
+            // Mirrors Java `buildPartitionNamePrefixPattern`, which returns null
+            // for such a value; `str::trim` folds a different whitespace set.
+            if is_java_whitespace_only(value) {
                 return None;
             }
             segments.push(format!(
@@ -309,7 +315,11 @@ pub fn format_partition_value(
         (Datum::Int(value), DataType::Int(_)) => Some(value.to_string()),
         (Datum::Long(value), DataType::BigInt(_)) => Some(value.to_string()),
         (Datum::String(value), DataType::Char(_) | DataType::VarChar(_)) => {
-            if value.trim().is_empty() {
+            // Fold to the default partition name exactly when Java
+            // `InternalRowPartitionComputer` does (`isNullOrWhitespaceOnly`), so
+            // the directory matches cross-engine; `str::trim` uses a different
+            // whitespace set (folds NBSP, keeps U+001C-U+001F).
+            if is_java_whitespace_only(value) {
                 Some(default_partition_name.to_string())
             } else {
                 Some(value.clone())
@@ -378,7 +388,7 @@ fn last_path_segment(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{BooleanType, DateType};
+    use crate::spec::{BooleanType, DateType, VarCharType};
 
     #[test]
     fn test_parse_format_partition_value() {
@@ -523,5 +533,47 @@ mod tests {
             };
             assert_eq!(is_storage_not_found(&error), expected);
         }
+    }
+
+    #[test]
+    fn test_format_partition_value_folds_java_whitespace_only() {
+        let varchar = DataType::VarChar(VarCharType::string_type());
+        let default = "__DEFAULT_PARTITION__";
+
+        // U+00A0 (non-breaking space) is not `Character.isWhitespace` in Java, so
+        // it stays a real partition value. `str::trim` would wrongly fold it to
+        // the default and diverge from a Java-written directory.
+        assert_eq!(
+            format_partition_value(
+                &Datum::String("\u{00A0}".to_string()),
+                &varchar,
+                default,
+                false
+            ),
+            Some("\u{00A0}".to_string())
+        );
+
+        // U+001C (file separator) is `Character.isWhitespace` in Java, so it folds
+        // to the default. `str::trim` keeps it, which would produce a literal
+        // directory Java never writes.
+        assert_eq!(
+            format_partition_value(
+                &Datum::String("\u{001C}".to_string()),
+                &varchar,
+                default,
+                false
+            ),
+            Some(default.to_string())
+        );
+
+        // An ASCII-blank value folds under both rules; a normal value is kept.
+        assert_eq!(
+            format_partition_value(&Datum::String("   ".to_string()), &varchar, default, false),
+            Some(default.to_string())
+        );
+        assert_eq!(
+            format_partition_value(&Datum::String("dt".to_string()), &varchar, default, false),
+            Some("dt".to_string())
+        );
     }
 }

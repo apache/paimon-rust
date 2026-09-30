@@ -104,8 +104,8 @@ mod partition;
 pub use partition::Partition;
 mod partition_utils;
 pub(crate) use partition_utils::{
-    bucket_path, bucket_path_under, data_file_path, escape_path_name, relative_bucket_path,
-    unescape_path_name, PartitionComputer,
+    bucket_path, bucket_path_under, data_file_path, escape_path_name, is_java_whitespace_only,
+    relative_bucket_path, unescape_path_name, PartitionComputer,
 };
 mod predicate;
 pub(crate) use predicate::datum_cmp;

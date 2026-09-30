@@ -524,7 +524,7 @@ fn decode_java_utf8(mut bytes: &[u8]) -> String {
 
 /// Java `StringUtils.isNullOrWhitespaceOnly` checks each UTF-16 code unit with
 /// `Character.isWhitespace`; its whitespace set differs from Rust `str::trim`.
-fn is_java_whitespace_only(value: &str) -> bool {
+pub(crate) fn is_java_whitespace_only(value: &str) -> bool {
     value.chars().all(|ch| {
         matches!(
             ch,
