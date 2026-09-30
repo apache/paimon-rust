@@ -24,9 +24,11 @@ pub(crate) mod residual;
 mod row_filter;
 pub(crate) mod schema_evolution;
 pub(crate) mod shredding;
+mod variant;
 
 pub use read_budget::ReadBudget;
 pub use row_filter::{RowFilter, RowFilterContext, RowFilterFactory};
+pub use variant::variant_get_float32;
 
 use crate::spec::{
     ArrayType, BigIntType, BooleanType, DataField, DataType as PaimonDataType, DateType,

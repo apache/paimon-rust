@@ -26,6 +26,7 @@ mod schema;
 mod table;
 mod udf;
 mod update_assignment;
+mod variant;
 mod write;
 // ---- #285: observability ----
 mod partition;
@@ -35,5 +36,6 @@ mod tag;
 #[pymodule]
 fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     context::register_module(py, m)?;
+    variant::register_module(py, m)?;
     Ok(())
 }

@@ -27,6 +27,9 @@ use crate::spec::{
 use crate::{Error, Result};
 use base64::{engine::general_purpose, Engine as _};
 
+mod numeric;
+pub(crate) use numeric::VariantFloat32Projection;
+
 const BASIC_TYPE_BITS: u8 = 2;
 const BASIC_TYPE_MASK: u8 = 0x3;
 const TYPE_INFO_MASK: u8 = 0x3f;
@@ -228,7 +231,7 @@ impl<'a> VariantRef<'a> {
                     layout.id_start + layout.id_size * i,
                     layout.id_size,
                 )?;
-                if key == get_metadata_key(self.metadata, id)? {
+                if key == get_metadata_key_ref(self.metadata, id)? {
                     let offset = read_unsigned(
                         self.value,
                         layout.offset_start + layout.offset_size * i,
@@ -252,7 +255,7 @@ impl<'a> VariantRef<'a> {
                     layout.id_start + layout.id_size * mid,
                     layout.id_size,
                 )?;
-                match java_string_cmp(&get_metadata_key(self.metadata, id)?, key) {
+                match java_string_cmp(get_metadata_key_ref(self.metadata, id)?, key) {
                     std::cmp::Ordering::Less => low = mid + 1,
                     std::cmp::Ordering::Greater => high = mid,
                     std::cmp::Ordering::Equal => {
@@ -951,6 +954,10 @@ fn metadata_offset_size(metadata: &[u8]) -> Result<usize> {
 }
 
 fn get_metadata_key(metadata: &[u8], id: usize) -> Result<String> {
+    Ok(get_metadata_key_ref(metadata, id)?.to_string())
+}
+
+fn get_metadata_key_ref(metadata: &[u8], id: usize) -> Result<&str> {
     let offset_size = metadata_offset_size(metadata)?;
     let dict_size = read_unsigned(metadata, 1, offset_size)?;
     if id >= dict_size {
@@ -964,12 +971,10 @@ fn get_metadata_key(metadata: &[u8], id: usize) -> Result<String> {
     }
     check_range(metadata, string_start + offset, next_offset - offset)?;
     let bytes = &metadata[string_start + offset..string_start + next_offset];
-    std::str::from_utf8(bytes)
-        .map(|v| v.to_string())
-        .map_err(|e| Error::DataInvalid {
-            message: "Malformed Variant metadata UTF-8".to_string(),
-            source: Some(Box::new(e)),
-        })
+    std::str::from_utf8(bytes).map_err(|e| Error::DataInvalid {
+        message: "Malformed Variant metadata UTF-8".to_string(),
+        source: Some(Box::new(e)),
+    })
 }
 
 fn get_boolean(value: &[u8], pos: usize) -> Result<bool> {
