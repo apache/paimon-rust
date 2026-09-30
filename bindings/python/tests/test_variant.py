@@ -18,10 +18,10 @@
 import pyarrow as pa
 import pytest
 
-from pypaimon_rust.data import variant_get_float32
+from pypaimon_rust.data import variant_get_numeric_fields
 
 
-def test_variant_get_float32_returns_ordered_fixed_size_lists():
+def test_variant_get_numeric_fields_returns_ordered_fixed_size_lists():
     # Java-compatible encoding for {"age": 27, "city": "Beijing"}.
     value = bytes(
         [
@@ -54,12 +54,12 @@ def test_variant_get_float32_returns_ordered_fixed_size_lists():
         mask=pa.array([False, True]),
     )
 
-    output = variant_get_float32(column, ["missing", "age"])
+    output = variant_get_numeric_fields(column, ["missing", "age"])
 
     assert output.type == pa.list_(pa.field("item", pa.float32()), 2)
     assert output.to_pylist() == [[None, 27.0], None]
 
     with pytest.raises(NotImplementedError, match="city"):
-        variant_get_float32(column, ["city"])
+        variant_get_numeric_fields(column, ["city"])
     with pytest.raises(ValueError, match="must not be empty"):
-        variant_get_float32(column, [])
+        variant_get_numeric_fields(column, [])

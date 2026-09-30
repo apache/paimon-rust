@@ -21,9 +21,9 @@ use pyo3::prelude::*;
 
 use crate::error::to_py_err;
 
-/// Extract literal top-level numeric Variant fields into a row-major float32 array.
+/// Extract literal top-level numeric Variant fields into a row-major array.
 #[pyfunction]
-fn variant_get_float32(
+fn variant_get_numeric_fields(
     py: Python<'_>,
     column: &Bound<'_, PyAny>,
     fields: Vec<String>,
@@ -38,7 +38,7 @@ fn variant_get_float32(
                     message: "Expected a PyArrow Variant StructArray".to_string(),
                     source: None,
                 })?;
-            paimon::arrow::variant_get_float32(column, &fields)
+            paimon::arrow::variant_get_numeric_fields(column, &fields)
         })
         .map_err(to_py_err)?;
     Ok(output.to_data().to_pyarrow(py)?.unbind())
@@ -46,7 +46,7 @@ fn variant_get_float32(
 
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let this = PyModule::new(py, "data")?;
-    this.add_function(wrap_pyfunction!(variant_get_float32, &this)?)?;
+    this.add_function(wrap_pyfunction!(variant_get_numeric_fields, &this)?)?;
     m.add_submodule(&this)?;
     py.import("sys")?
         .getattr("modules")?

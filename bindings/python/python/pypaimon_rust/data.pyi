@@ -19,7 +19,7 @@ from typing import Sequence
 
 import pyarrow
 
-def variant_get_float32(
+def variant_get_numeric_fields(
     column: pyarrow.Array, fields: Sequence[str]
 ) -> pyarrow.FixedSizeListArray:
     """Extract literal top-level numeric fields as float32 in the requested order."""

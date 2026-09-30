@@ -29,7 +29,10 @@ use crate::{Error, Result};
 /// The result is row-major and preserves `fields` order. Missing fields and
 /// Variant nulls become child nulls; SQL-null input rows remain parent nulls.
 /// Numeric values are converted to `f32`, which may lose precision.
-pub fn variant_get_float32(column: &StructArray, fields: &[String]) -> Result<FixedSizeListArray> {
+pub fn variant_get_numeric_fields(
+    column: &StructArray,
+    fields: &[String],
+) -> Result<FixedSizeListArray> {
     if fields.is_empty() {
         return data_invalid("Variant numeric field list must not be empty");
     }
@@ -179,7 +182,7 @@ mod tests {
             "absent".to_string(),
         ];
 
-        let output = variant_get_float32(&input, &fields).unwrap();
+        let output = variant_get_numeric_fields(&input, &fields).unwrap();
         assert_eq!(output.len(), 3);
         assert!(output.is_valid(0));
         assert!(output.is_valid(1));
@@ -202,7 +205,7 @@ mod tests {
     #[test]
     fn treats_field_names_as_literals() {
         let input = variant_column(&[Some(r#"{"a.b":3,"a":{"b":9}}"#)]);
-        let output = variant_get_float32(&input, &["a.b".to_string()]).unwrap();
+        let output = variant_get_numeric_fields(&input, &["a.b".to_string()]).unwrap();
         let values = output
             .values()
             .as_primitive::<arrow_array::types::Float32Type>();
@@ -212,21 +215,21 @@ mod tests {
     #[test]
     fn rejects_non_numeric_fields() {
         let input = variant_column(&[Some(r#"{"value":"3"}"#)]);
-        let err = variant_get_float32(&input, &["value".to_string()]).unwrap_err();
+        let err = variant_get_numeric_fields(&input, &["value".to_string()]).unwrap_err();
         assert!(matches!(err, Error::Unsupported { .. }));
     }
 
     #[test]
     fn rejects_empty_field_list() {
         let input = variant_column(&[Some(r#"{"value":3}"#)]);
-        let err = variant_get_float32(&input, &[]).unwrap_err();
+        let err = variant_get_numeric_fields(&input, &[]).unwrap_err();
         assert!(matches!(err, Error::DataInvalid { .. }));
     }
 
     #[test]
     fn rejects_non_object_roots() {
         let input = variant_column(&[Some("3")]);
-        let err = variant_get_float32(&input, &["value".to_string()]).unwrap_err();
+        let err = variant_get_numeric_fields(&input, &["value".to_string()]).unwrap_err();
         assert!(matches!(err, Error::DataInvalid { .. }));
     }
 
@@ -245,7 +248,7 @@ mod tests {
             None,
         );
 
-        let err = variant_get_float32(&input, &["value".to_string()]).unwrap_err();
+        let err = variant_get_numeric_fields(&input, &["value".to_string()]).unwrap_err();
         assert!(matches!(err, Error::DataInvalid { .. }));
     }
 
@@ -253,7 +256,7 @@ mod tests {
     fn respects_sliced_array_offsets() {
         let input = variant_column(&[Some(r#"{"v":1}"#), Some(r#"{"v":2}"#)]);
         let sliced = input.slice(1, 1);
-        let output = variant_get_float32(&sliced, &["v".to_string()]).unwrap();
+        let output = variant_get_numeric_fields(&sliced, &["v".to_string()]).unwrap();
         let values = output
             .values()
             .as_primitive::<arrow_array::types::Float32Type>();
