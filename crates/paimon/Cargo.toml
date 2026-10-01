@@ -150,7 +150,7 @@ libloading = "0.9"
 log = "0.4"
 # Keep CI on the dependency set that passed before unicode-segmentation 1.13.3.
 # The 1.13.3 resolver update correlates with Linux Vortex tests hanging.
-unicode-segmentation = "=1.13.2"
+unicode-segmentation = "=1.13.3"
 
 [build-dependencies]
 cc = "1"
