@@ -44,6 +44,7 @@ Available storage features:
 | `storage-memory` | In-memory        |
 | `storage-s3`     | Amazon S3        |
 | `storage-oss`    | Alibaba Cloud OSS|
+| `storage-jindo`  | Alibaba Cloud OSS through JindoSDK |
 | `storage-cos`    | Tencent Cloud COS |
 | `storage-azdls`  | Azure Data Lake Storage Gen2 |
 | `storage-obs`    | Huawei Cloud OBS |
@@ -301,6 +302,15 @@ options.set(CatalogOptions::DLF_TOKEN_PATH, "/path/to/token.json");
 
 The JSON uses `AccessKeyId`, `AccessKeySecret`, optional `SecurityToken`, and
 optional `Expiration`. Expiring credentials are reloaded before expiration.
+
+With `storage-jindo`, set `fs.oss.impl` to `jindo` to use an installed JindoSDK
+for OSS scan planning. Set `fs.jindo.library.path` unless the library is
+available through `JINDOSDK_HOME` or `JINDOSDK_LIBRARY_PATH`. The Python binding
+also discovers it from an installed `pyjindosdk` package. This initial
+integration supports object stat, reads, and listings, but not writes, deletes,
+or copies. Jindo reads are limited to 8 concurrent requests per OSS operator by
+default. Set `fs.jindo.max.concurrent.reads` to a positive integer to tune this
+limit for the available network and JindoSDK connection capacity.
 
 Supported metastore types:
 
