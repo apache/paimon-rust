@@ -19,6 +19,7 @@ use std::ffi::{CStr, CString, OsStr};
 use std::fmt::{Debug, Formatter};
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use libloading::Library;
@@ -49,6 +50,7 @@ const JDO_REST_HTTP_503_ERROR: i32 = 6503;
 const JINDO_EXCEPTION_BUFFER_SIZE: usize = 1024;
 
 type JdoPtr = *mut c_void;
+type JindoTeardown = Box<dyn FnOnce() + Send + 'static>;
 
 type CreateOptions = unsafe extern "C" fn() -> JdoPtr;
 type FreeOptions = unsafe extern "C" fn(JdoPtr);
@@ -469,6 +471,43 @@ fn unsupported<T>(operation: &str) -> OpendalResult<T> {
     ))
 }
 
+fn jindo_teardown_sender() -> OpendalResult<&'static Sender<JindoTeardown>> {
+    static SENDER: OnceLock<std::result::Result<Sender<JindoTeardown>, String>> = OnceLock::new();
+
+    match SENDER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<JindoTeardown>();
+        std::thread::Builder::new()
+            .name("paimon-jindo-teardown".to_string())
+            .spawn(move || {
+                while let Ok(teardown) = receiver.recv() {
+                    teardown();
+                }
+            })
+            .map(|_| sender)
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(sender) => Ok(sender),
+        Err(message) => Err(OpendalError::new(
+            ErrorKind::Unexpected,
+            "failed to start Jindo teardown worker",
+        )
+        .with_context("message", message)),
+    }
+}
+
+fn enqueue_jindo_teardown(teardown: JindoTeardown) {
+    let Ok(sender) = jindo_teardown_sender() else {
+        // JindoClient::new starts the worker before allocating native resources.
+        // If it later becomes unavailable, leaking is safer than blocking an
+        // async executor or calling the SDK from an arbitrary drop thread.
+        std::mem::forget(teardown);
+        return;
+    };
+    if let Err(error) = sender.send(teardown) {
+        std::mem::forget(error.0);
+    }
+}
+
 struct JindoApi {
     create_options: CreateOptions,
     free_options: FreeOptions,
@@ -643,6 +682,7 @@ impl Debug for JindoClient {
 
 impl JindoClient {
     fn new(config: &JindoStorageConfig, bucket: &str) -> OpendalResult<Self> {
+        jindo_teardown_sender()?;
         let api = JindoApi::load(config.library_path.as_deref())?;
         let root = format!("oss://{bucket}/");
         let root_c = to_cstring(&root, "OSS root")?;
@@ -1011,19 +1051,28 @@ impl JindoClient {
 
 impl Drop for JindoClient {
     fn drop(&mut self) {
-        if self.initialized {
-            let handle = unsafe { (self.api.create_handle)(self.store) };
-            if !handle.is_null() {
-                unsafe {
-                    (self.api.destroy_store)(self.store);
-                    (self.api.free_handle)(handle);
+        let api = Arc::clone(&self.api);
+        let options = std::mem::replace(&mut self.options, std::ptr::null_mut()) as usize;
+        let store = std::mem::replace(&mut self.store, std::ptr::null_mut()) as usize;
+        let initialized = std::mem::replace(&mut self.initialized, false);
+
+        enqueue_jindo_teardown(Box::new(move || {
+            let options = options as JdoPtr;
+            let store = store as JdoPtr;
+            if initialized {
+                let handle = unsafe { (api.create_handle)(store) };
+                if !handle.is_null() {
+                    unsafe {
+                        (api.destroy_store)(store);
+                        (api.free_handle)(handle);
+                    }
                 }
             }
-        }
-        unsafe {
-            (self.api.free_store)(self.store);
-            (self.api.free_options)(self.options);
-        }
+            unsafe {
+                (api.free_store)(store);
+                (api.free_options)(options);
+            }
+        }));
     }
 }
 
@@ -1098,7 +1147,7 @@ fn to_cstring(value: &str, name: &str) -> OpendalResult<CString> {
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[cfg(target_os = "linux")]
     use axum::body::Body;
@@ -1241,6 +1290,37 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_teardown_does_not_block_async_runtime() {
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let returned_before_timeout = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&returned_before_timeout);
+        let watchdog = std::thread::spawn(move || {
+            observed.store(
+                returned_rx
+                    .recv_timeout(std::time::Duration::from_millis(500))
+                    .is_ok(),
+                Ordering::SeqCst,
+            );
+            release_tx.send(()).unwrap();
+        });
+
+        enqueue_jindo_teardown(Box::new(move || {
+            release_rx.recv().unwrap();
+            done_tx.send(()).unwrap();
+        }));
+        let _ = returned_tx.send(());
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        watchdog.join().unwrap();
+        assert!(returned_before_timeout.load(Ordering::SeqCst));
     }
 
     #[test]

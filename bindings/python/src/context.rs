@@ -584,8 +584,9 @@ impl PySQLContext {
         catalog_options: HashMap<String, String>,
         default_database: Option<String>,
     ) -> PyResult<()> {
+        let catalog_options = complete_jindo_options(catalog_options);
         let rt = runtime();
-        py.detach(|| {
+        py.detach(move || {
             rt.block_on(async {
                 let options = Options::from_map(catalog_options);
                 let catalog = CatalogFactory::create(options).await.map_err(to_py_err)?;
