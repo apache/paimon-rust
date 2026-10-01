@@ -191,6 +191,59 @@ async fn test_rename_branch_rejects_path_separator() {
 }
 
 #[tokio::test]
+async fn test_rename_branch_rejects_unopenable_source_and_target() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+
+    // A path-separated SOURCE would rename `branch-b1/schema` (an inner directory),
+    // not the branch, orphaning b1's metadata. It must be rejected before any move.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.rename_branch(table => 'test_db.t1', from_branch => 'b1/schema', to_branch => 'stolen')",
+        "path separator",
+    )
+    .await;
+    assert!(bm.branch_exists("b1").await.unwrap(), "b1 must remain");
+    assert!(
+        !bm.branch_exists("stolen").await.unwrap(),
+        "stolen must not exist"
+    );
+
+    // A `..` TARGET is a single directory segment but no reader can open it, so the
+    // rename must be rejected rather than moving b1 to an unopenable name.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.rename_branch(table => 'test_db.t1', from_branch => 'b1', to_branch => '..')",
+        "'.' or '..'",
+    )
+    .await;
+    assert!(
+        bm.branch_exists("b1").await.unwrap(),
+        "b1 must survive a rejected rename"
+    );
+    // b1 is still openable through the table reader.
+    table.copy_with_branch("b1").await.unwrap();
+}
+
+#[tokio::test]
 async fn test_create_lumina_index_requires_index_column() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 
