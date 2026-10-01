@@ -25,7 +25,7 @@ use libloading::Library;
 use opendal::raw::*;
 use opendal::{Buffer, Builder, BytesRange, Capability, EntryMode, ErrorKind, Metadata};
 use opendal::{Error as OpendalError, OperationContext, Operator, Result as OpendalResult};
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
 
 use crate::error::Error;
 use crate::Result;
@@ -34,6 +34,8 @@ const OSS_IMPL: &str = "fs.oss.impl";
 const JINDO_IMPL: &str = "jindo";
 const JINDO_LIBRARY_PATH: &str = "fs.jindo.library.path";
 const JINDO_USER: &str = "fs.jindo.user";
+const JINDO_MAX_CONCURRENT_READS: &str = "fs.jindo.max.concurrent.reads";
+const DEFAULT_JINDO_MAX_CONCURRENT_READS: usize = 8;
 const DEFAULT_JINDO_USER: &str = "root";
 const OSS_ENDPOINT: &str = "fs.oss.endpoint";
 const OSS_HTTPS_ENABLE: &str = "fs.oss.https.enable";
@@ -111,6 +113,7 @@ unsafe extern "C" {
 pub struct JindoStorageConfig {
     library_path: Option<PathBuf>,
     user: String,
+    max_concurrent_reads: usize,
     properties: HashMap<String, String>,
 }
 
@@ -119,6 +122,7 @@ impl Debug for JindoStorageConfig {
         f.debug_struct("JindoStorageConfig")
             .field("library_path", &self.library_path)
             .field("user", &self.user)
+            .field("max_concurrent_reads", &self.max_concurrent_reads)
             .finish_non_exhaustive()
     }
 }
@@ -139,6 +143,19 @@ pub(crate) fn jindo_config_parse(mut props: HashMap<String, String>) -> Result<J
     let user = props
         .remove(JINDO_USER)
         .unwrap_or_else(|| DEFAULT_JINDO_USER.to_string());
+    let max_concurrent_reads = match props.remove(JINDO_MAX_CONCURRENT_READS) {
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|&limit| (1..=Semaphore::MAX_PERMITS).contains(&limit))
+            .ok_or_else(|| Error::ConfigInvalid {
+                message: format!(
+                    "{JINDO_MAX_CONCURRENT_READS} must be between 1 and {}",
+                    Semaphore::MAX_PERMITS
+                ),
+            })?,
+        None => DEFAULT_JINDO_MAX_CONCURRENT_READS,
+    };
     props.remove(OSS_IMPL);
     props.insert(
         "fs.oss.user.agent.features".to_string(),
@@ -160,6 +177,7 @@ pub(crate) fn jindo_config_parse(mut props: HashMap<String, String>) -> Result<J
     Ok(JindoStorageConfig {
         library_path,
         user,
+        max_concurrent_reads,
         properties: props,
     })
 }
@@ -342,7 +360,10 @@ impl oio::Read for JindoReader {
     async fn read(&self, range: BytesRange) -> OpendalResult<(RpRead, Buffer)> {
         let client = self.client.get().await?;
         let path = self.path.clone();
-        let buffer = run_blocking(move || client.read(&path, range)).await?;
+        let buffer = run_blocking_with_gate(Arc::clone(&self.client.read_gate), move || {
+            client.read(&path, range)
+        })
+        .await?;
         Ok((RpRead::default(), Buffer::from(buffer)))
     }
 }
@@ -386,14 +407,17 @@ struct LazyJindoClient {
     config: JindoStorageConfig,
     bucket: String,
     client: OnceCell<Arc<JindoClient>>,
+    read_gate: Arc<Semaphore>,
 }
 
 impl LazyJindoClient {
     fn new(config: JindoStorageConfig, bucket: String) -> Self {
+        let read_gate = Arc::new(Semaphore::new(config.max_concurrent_reads));
         Self {
             config,
             bucket,
             client: OnceCell::new(),
+            read_gate,
         }
     }
 
@@ -420,6 +444,22 @@ async fn run_blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(call).await.map_err(|source| {
         OpendalError::new(ErrorKind::Unexpected, "Jindo task failed").set_source(source)
     })?
+}
+
+async fn run_blocking_with_gate<T: Send + 'static>(
+    gate: Arc<Semaphore>,
+    call: impl FnOnce() -> OpendalResult<T> + Send + 'static,
+) -> OpendalResult<T> {
+    let permit = gate.acquire_owned().await.map_err(|source| {
+        OpendalError::new(ErrorKind::Unexpected, "Jindo read gate closed").set_source(source)
+    })?;
+    run_blocking(move || {
+        // Keep the permit inside the blocking closure. Dropping an async
+        // caller cannot cancel an in-flight Jindo C SDK request.
+        let _permit = permit;
+        call()
+    })
+    .await
 }
 
 fn unsupported<T>(operation: &str) -> OpendalResult<T> {
@@ -1058,7 +1098,6 @@ fn to_cstring(value: &str, name: &str) -> OpendalResult<CString> {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[cfg(target_os = "linux")]
@@ -1110,6 +1149,10 @@ mod tests {
         );
         assert_eq!(config.user, DEFAULT_JINDO_USER);
         assert_eq!(
+            config.max_concurrent_reads,
+            DEFAULT_JINDO_MAX_CONCURRENT_READS
+        );
+        assert_eq!(
             config.properties.get("fs.oss.endpoint").map(String::as_str),
             Some("oss-cn-hangzhou.aliyuncs.com")
         );
@@ -1122,6 +1165,82 @@ mod tests {
             Some("file")
         );
         assert!(!config.properties.contains_key(OSS_IMPL));
+        assert!(!config.properties.contains_key(JINDO_MAX_CONCURRENT_READS));
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_reads() {
+        let config = jindo_config_parse(HashMap::from([(
+            JINDO_MAX_CONCURRENT_READS.to_string(),
+            "6".to_string(),
+        )]))
+        .unwrap();
+        assert_eq!(config.max_concurrent_reads, 6);
+        assert!(!config.properties.contains_key(JINDO_MAX_CONCURRENT_READS));
+
+        let client = LazyJindoClient::new(config, "bucket".to_string());
+        assert_eq!(client.read_gate.available_permits(), 6);
+
+        for invalid in ["0", "-1", "invalid", "18446744073709551615"] {
+            assert!(jindo_config_parse(HashMap::from([(
+                JINDO_MAX_CONCURRENT_READS.to_string(),
+                invalid.to_string(),
+            )]))
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_gate_limits_blocking_calls() {
+        let gate = Arc::new(Semaphore::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..6 {
+            let gate = Arc::clone(&gate);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.push(tokio::spawn(run_blocking_with_gate(gate, move || {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(gate.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_waiter_does_not_release_in_flight_permit() {
+        let gate = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(run_blocking_with_gate(Arc::clone(&gate), move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+        assert_eq!(gate.available_permits(), 0);
+
+        task.abort();
+        tokio::task::yield_now().await;
+        assert_eq!(gate.available_permits(), 0);
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while gate.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(gate.available_permits(), 1);
     }
 
     #[test]
@@ -1164,6 +1283,7 @@ mod tests {
         let config = JindoStorageConfig {
             library_path: Some(PathBuf::from("/missing/libjindosdk_c.so")),
             user: DEFAULT_JINDO_USER.to_string(),
+            max_concurrent_reads: DEFAULT_JINDO_MAX_CONCURRENT_READS,
             properties: HashMap::new(),
         };
         let operator = jindo_config_build(&config, "bucket").unwrap();

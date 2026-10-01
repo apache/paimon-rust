@@ -308,7 +308,9 @@ for OSS scan planning. Set `fs.jindo.library.path` unless the library is
 available through `JINDOSDK_HOME` or `JINDOSDK_LIBRARY_PATH`. The Python binding
 also discovers it from an installed `pyjindosdk` package. This initial
 integration supports object stat, reads, and listings, but not writes, deletes,
-or copies.
+or copies. Jindo reads are limited to 8 concurrent requests per OSS operator by
+default. Set `fs.jindo.max.concurrent.reads` to a positive integer to tune this
+limit for the available network and JindoSDK connection capacity.
 
 Supported metastore types:
 
