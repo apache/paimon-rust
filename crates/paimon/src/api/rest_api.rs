@@ -182,6 +182,8 @@ impl RESTApi {
             let rest_auth_function = RESTAuthFunction::new(base_headers, auth_provider);
 
             client.set_auth_function(rest_auth_function);
+            // Server config may carry user-agent.* options; header.User-Agent still wins per request.
+            client.set_user_agent(&super::user_agent::rest_user_agent(&merged))?;
 
             merged
         } else {

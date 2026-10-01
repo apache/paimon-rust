@@ -57,26 +57,32 @@ impl HttpClient {
         auth_function: Option<RESTAuthFunction>,
         agent: &str,
     ) -> Result<Self> {
-        let final_url = Self::normalize_uri(base_url)?;
+        Ok(HttpClient {
+            client: Self::build_client(agent)?,
+            base_url: Self::normalize_uri(base_url)?,
+            auth_function,
+        })
+    }
+
+    /// Replace the default User-Agent, e.g. after options are merged with the server config.
+    pub(crate) fn set_user_agent(&mut self, agent: &str) -> Result<()> {
+        self.client = Self::build_client(agent)?;
+        Ok(())
+    }
+
+    fn build_client(agent: &str) -> Result<reqwest::Client> {
         let agent = HeaderValue::from_str(agent).unwrap_or_else(|_| {
             log::warn!("Invalid REST User-Agent {agent:?}, using the default");
             HeaderValue::from_str(&user_agent::default_rest_user_agent())
                 .expect("the default User-Agent is visible ASCII")
         });
-
-        let client = reqwest::Client::builder()
+        reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent(agent)
             .build()
             .map_err(|e| Error::ConfigInvalid {
                 message: format!("Failed to create HTTP client: {e}"),
-            })?;
-
-        Ok(HttpClient {
-            client,
-            base_url: final_url,
-            auth_function,
-        })
+            })
     }
 
     /// Normalize and validate a URI.
@@ -348,9 +354,20 @@ mod tests {
 
     /// The User-Agent headers a REST catalog sends to list databases, with `extra` catalog options.
     async fn sent_user_agents(extra: &[(&str, &str)]) -> Vec<String> {
+        sent_user_agents_with_config(extra, None).await
+    }
+
+    /// Like [`sent_user_agents`], bootstrapping from a server returning `config` when set.
+    async fn sent_user_agents_with_config(
+        extra: &[(&str, &str)],
+        config: Option<serde_json::Value>,
+    ) -> Vec<String> {
         let user_agents = Arc::new(Mutex::new(Vec::new()));
+        let config_required = config.is_some();
+        let config = config.unwrap_or_else(|| serde_json::json!({}));
         let app = Router::new()
             .route("/v1/databases", get(record_user_agents))
+            .route("/v1/config", get(move || async move { Json(config) }))
             .with_state(user_agents.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -358,12 +375,13 @@ mod tests {
 
         let mut options = crate::common::Options::new();
         options.set("uri", format!("http://{address}"));
+        options.set("warehouse", "warehouse");
         options.set("token.provider", "bear");
         options.set("token", "token");
         for (key, value) in extra {
             options.set(*key, *value);
         }
-        let api = crate::api::rest_api::RESTApi::new(options, false)
+        let api = crate::api::rest_api::RESTApi::new(options, config_required)
             .await
             .unwrap();
         api.list_databases().await.unwrap();
@@ -407,6 +425,34 @@ mod tests {
         ];
         assert_eq!(
             sent_user_agents(&options).await,
+            vec!["starrocks/user".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_user_agent_options_from_server_config_are_sent() {
+        let config = serde_json::json!({
+            "defaults": {"user-agent.features": "ServerFeature"},
+            "overrides": {"user-agent.extended": "catalog-tag"},
+        });
+        assert_eq!(
+            sent_user_agents_with_config(&[], Some(config)).await,
+            vec![format!(
+                "paimon-rust/{}(reqwest;ServerFeature) catalog-tag",
+                env!("CARGO_PKG_VERSION")
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_user_agent_header_option_wins_over_server_config() {
+        let config = serde_json::json!({
+            "defaults": {"user-agent.features": "ServerFeature"},
+            "overrides": {"user-agent.extended": "catalog-tag"},
+        });
+        assert_eq!(
+            sent_user_agents_with_config(&[("header.User-Agent", "starrocks/user")], Some(config))
+                .await,
             vec!["starrocks/user".to_string()]
         );
     }
