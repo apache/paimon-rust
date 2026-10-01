@@ -483,8 +483,14 @@ pub(crate) async fn list_format_table_files(
         }
         let is_data_file = split_parent_and_file(&status.path).is_some_and(|(_, file_name)| {
             is_format_table_data_file_name(file_name)
-                && format_extension
-                    .is_none_or(|extension| file_name.to_ascii_lowercase().ends_with(extension))
+                && format_extension.is_none_or(|extension| {
+                    let file_name = file_name.to_ascii_lowercase();
+                    file_name.ends_with(extension)
+                        || (matches!(extension, ".csv" | ".json" | ".text")
+                            && crate::arrow::format::text::matches_compressed_extension(
+                                &file_name, extension,
+                            ))
+                })
         });
         if !is_data_file {
             continue;
@@ -868,6 +874,9 @@ fn supported_format_table_formats() -> Vec<&'static str> {
     vec![
         "parquet",
         "orc",
+        "csv",
+        "text",
+        "json",
         "avro",
         "row",
         "mosaic",
@@ -880,6 +889,9 @@ pub(crate) fn supported_format_table_extension(format: &str) -> crate::Result<&'
     match format.to_ascii_lowercase().as_str() {
         "parquet" => Ok(".parquet"),
         "orc" => Ok(".orc"),
+        "csv" => Ok(".csv"),
+        "text" => Ok(".text"),
+        "json" => Ok(".json"),
         "avro" => Ok(".avro"),
         "row" => Ok(".row"),
         "mosaic" => Ok(".mosaic"),
@@ -1253,11 +1265,11 @@ mod tests {
 
     #[test]
     fn test_unsupported_format_lists_the_supported_ones() {
-        let error = supported_format_table_extension("csv").unwrap_err();
+        let error = supported_format_table_extension("unknown").unwrap_err();
         let crate::Error::Unsupported { message } = error else {
             panic!("expected Unsupported, got {error:?}");
         };
-        assert!(message.contains("'csv'"), "{message}");
+        assert!(message.contains("'unknown'"), "{message}");
         for format in supported_format_table_formats() {
             assert!(message.contains(format), "{format} missing from {message}");
         }

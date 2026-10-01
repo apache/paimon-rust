@@ -34,9 +34,9 @@ use crate::io::FileIO;
 use crate::resource::{MemoryReservation, ResourceContext};
 use crate::spec::stats::{compute_column_stats, BinaryTableStats};
 use crate::spec::{
-    bucket_path_under, data_file_to_file_index_file_name, extract_datum_from_arrow,
-    AggregationConfig, BigIntType, BinaryRowBuilder, CoreOptions, DataField, DataFileMeta,
-    DataType, MergeEngine, PartialUpdateConfig, RowKind, TinyIntType, SEQUENCE_NUMBER_FIELD_ID,
+    data_file_to_file_index_file_name, extract_datum_from_arrow, AggregationConfig, BigIntType,
+    BinaryRowBuilder, CoreOptions, DataField, DataFileMeta, DataType, MergeEngine,
+    PartialUpdateConfig, RowKind, TinyIntType, SEQUENCE_NUMBER_FIELD_ID,
     SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::FileIndexOptions;
@@ -44,8 +44,8 @@ use crate::table::managed_blob_reference::ManagedBlobReferences;
 use crate::table::managed_blob_writer::ManagedBlobWriteState;
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::sort_merge::{
-    AggregateMergeFunction, BufferedBatch, MergeFunction, MergeResult, MergeRow,
-    PartialUpdateMergeFunction,
+    AggregateMergeFunction, BufferedBatch, FirstRowMergeFunction, MergeFunction, MergeResult,
+    MergeRow, PartialUpdateMergeFunction,
 };
 use crate::Result;
 use arrow_array::{Array, BooleanArray, Int64Array, Int8Array, RecordBatch, UInt32Array};
@@ -59,8 +59,10 @@ use std::sync::Arc;
 /// Internal writer for primary-key tables that buffers data in memory,
 /// sorts by primary key on flush, and prepends `_SEQUENCE_NUMBER` and `_VALUE_KIND` columns.
 pub(crate) struct KeyValueFileWriter {
+    paths: super::data_file_path_factory::DataFilePathFactory,
     file_io: FileIO,
     config: KeyValueWriteConfig,
+    target_file_row_num: usize,
     ignore_delete: bool,
     /// Next sequence number to assign (bucket-local, always auto-incremented).
     next_sequence_number: i64,
@@ -130,8 +132,13 @@ impl KeyValueFileWriter {
         config: KeyValueWriteConfig,
         next_sequence_number: i64,
     ) -> Result<Self> {
-        let ignore_delete = config.merge_engine == MergeEngine::PartialUpdate
-            && CoreOptions::new(&config.table_options).ignore_delete();
+        let core_options = CoreOptions::new(&config.table_options);
+        let target_file_row_num = core_options
+            .target_file_row_num()?
+            .try_into()
+            .unwrap_or(usize::MAX);
+        let ignore_delete =
+            config.merge_engine == MergeEngine::PartialUpdate && core_options.ignore_delete();
         if config.merge_engine == MergeEngine::PartialUpdate {
             let partial_update = PartialUpdateConfig::new(&config.table_options);
             partial_update.validate_write_mode(true, &config.table_name)?;
@@ -163,10 +170,18 @@ impl KeyValueFileWriter {
         }
 
         let managed_blob_writer = ManagedBlobWriteState::new(&file_io, &config)?;
+        let paths = super::data_file_path_factory::DataFilePathFactory::new(
+            &config.table_location,
+            &config.partition_path,
+            config.bucket,
+            &config.table_options,
+        )?;
 
         Ok(Self {
+            paths,
             file_io,
             config,
+            target_file_row_num,
             ignore_delete,
             next_sequence_number,
             buffer: Vec::new(),
@@ -268,11 +283,13 @@ impl KeyValueFileWriter {
                 }),
             });
         }
+        let user_sequence_descending =
+            !CoreOptions::new(&self.config.table_options).sequence_field_sort_order_is_ascending();
         for &idx in &self.config.sequence_field_indices {
             sort_columns.push(SortColumn {
                 values: combined.column(idx).clone(),
                 options: Some(SortOptions {
-                    descending: false,
+                    descending: user_sequence_descending,
                     nulls_first: true,
                 }),
             });
@@ -290,7 +307,7 @@ impl KeyValueFileWriter {
                 source: None,
             })?;
 
-        // After sorting by PK + seq fields + auto-seq (all ascending), merge
+        // After sorting by PK + configured user sequence + auto-seq, merge
         // each key group down to one row, mirroring Java's
         // MergeTreeWriter#flushWriteBuffer (the write buffer runs the merge
         // function before any file is written, so a flushed file never holds
@@ -324,61 +341,77 @@ impl KeyValueFileWriter {
             }
         };
 
-        let data_delete_row_count = Self::indexed_delete_row_count(&data_batch, &data_indices)?;
-        let changelog_delete_row_count = if self.config.input_changelog {
-            Some(Self::indexed_delete_row_count(&combined, &sorted_indices)?)
-        } else {
-            None
-        };
-
-        // Java derives file sequence bounds from emitted rows; allocation still
-        // advances over all buffered inputs, including rows folded away.
-        let output_sequences = data_seq.as_any().downcast_ref::<Int64Array>().unwrap();
-        let (min_output_seq, max_output_seq) = data_indices
-            .values()
-            .iter()
-            .map(|&idx| output_sequences.value(idx as usize))
-            .fold((i64::MAX, i64::MIN), |(min, max), seq| {
-                (min.min(seq), max.max(seq))
-            });
-        let data_file = self
-            .write_indexed_file(
-                &data_batch,
-                data_seq.as_ref(),
-                &data_indices,
-                IndexedFileWrite {
-                    is_changelog: false,
-                    file_prefix: &self.config.data_file_prefix,
-                    file_ordinal: self.written_files.len(),
-                    file_format: &self.config.file_format,
-                    file_compression: &self.config.file_compression,
-                    min_sequence_number: min_output_seq,
-                    max_sequence_number: max_output_seq,
-                    delete_row_count: data_delete_row_count,
-                },
-            )
-            .await?;
-        self.written_files.push(data_file);
-
-        if let Some(delete_row_count) = changelog_delete_row_count {
-            let changelog_file = self
+        // The sorted output is already materialized in FLUSH_CHUNK_ROWS batches.
+        // Use the row target as an upper bound for each emitted batch and keep
+        // every file's key bounds, sequence bounds, and index local to its rows.
+        let data_sequences = data_seq.as_any().downcast_ref::<Int64Array>().unwrap();
+        for offset in (0..data_indices.len()).step_by(self.target_file_row_num) {
+            let len = self.target_file_row_num.min(data_indices.len() - offset);
+            let file_indices = data_indices.slice(offset, len);
+            let (min_sequence_number, max_sequence_number) = file_indices
+                .values()
+                .iter()
+                .map(|&idx| data_sequences.value(idx as usize))
+                .fold((i64::MAX, i64::MIN), |(min, max), seq| {
+                    (min.min(seq), max.max(seq))
+                });
+            let file = self
                 .write_indexed_file(
-                    &combined,
-                    seq_array.as_ref(),
-                    &sorted_indices,
+                    &data_batch,
+                    data_seq.as_ref(),
+                    &file_indices,
                     IndexedFileWrite {
-                        is_changelog: true,
-                        file_prefix: &self.config.changelog_file_prefix,
-                        file_ordinal: self.written_changelog_files.len(),
-                        file_format: &self.config.changelog_file_format,
-                        file_compression: &self.config.changelog_file_compression,
-                        min_sequence_number: start_seq,
-                        max_sequence_number: end_seq,
-                        delete_row_count,
+                        is_changelog: false,
+                        file_prefix: &self.config.data_file_prefix,
+                        file_ordinal: self.written_files.len(),
+                        file_format: &self.config.file_format,
+                        file_compression: &self.config.file_compression,
+                        min_sequence_number,
+                        max_sequence_number,
+                        delete_row_count: Self::indexed_delete_row_count(
+                            &data_batch,
+                            &file_indices,
+                        )?,
                     },
                 )
                 .await?;
-            self.written_changelog_files.push(changelog_file);
+            self.written_files.push(file);
+        }
+
+        if self.config.input_changelog {
+            let input_sequences = seq_array.as_any().downcast_ref::<Int64Array>().unwrap();
+            for offset in (0..sorted_indices.len()).step_by(self.target_file_row_num) {
+                let len = self.target_file_row_num.min(sorted_indices.len() - offset);
+                let file_indices = sorted_indices.slice(offset, len);
+                let (min_sequence_number, max_sequence_number) = file_indices
+                    .values()
+                    .iter()
+                    .map(|&idx| input_sequences.value(idx as usize))
+                    .fold((i64::MAX, i64::MIN), |(min, max), seq| {
+                        (min.min(seq), max.max(seq))
+                    });
+                let file = self
+                    .write_indexed_file(
+                        &combined,
+                        seq_array.as_ref(),
+                        &file_indices,
+                        IndexedFileWrite {
+                            is_changelog: true,
+                            file_prefix: &self.config.changelog_file_prefix,
+                            file_ordinal: self.written_changelog_files.len(),
+                            file_format: &self.config.changelog_file_format,
+                            file_compression: &self.config.changelog_file_compression,
+                            min_sequence_number,
+                            max_sequence_number,
+                            delete_row_count: Self::indexed_delete_row_count(
+                                &combined,
+                                &file_indices,
+                            )?,
+                        },
+                    )
+                    .await?;
+                self.written_changelog_files.push(file);
+            }
         }
         Ok(())
     }
@@ -465,13 +498,10 @@ impl KeyValueFileWriter {
             write.file_ordinal,
             write.file_format,
         );
-        let bucket_dir = bucket_path_under(
-            &self.config.table_location,
-            &self.config.partition_path,
-            self.config.bucket,
-        );
+        let location = self.paths.new_path(&file_name)?;
+        let bucket_dir = location.parent();
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
-        let file_path = format!("{bucket_dir}/{file_name}");
+        let file_path = location.path.clone();
         let output = self.file_io.new_output(&file_path)?;
         // The physical KV file also contains sequence and row-kind columns. Give
         // Parquet only the logical value fields so metadata stats and their dense
@@ -657,7 +687,7 @@ impl KeyValueFileWriter {
             embedded_index: None,
             file_source: Some(0), // FileSource.APPEND
             value_stats_cols,
-            external_path: None,
+            external_path: location.external_path.clone(),
             first_row_id: None,
             write_cols: None,
             column_max_sequence_numbers: None,
@@ -702,7 +732,7 @@ impl KeyValueFileWriter {
             blob_references,
             &self.file_io,
             &file_path,
-            &bucket_dir,
+            bucket_dir,
             &mut meta,
         )
         .await?;
@@ -839,7 +869,7 @@ impl KeyValueFileWriter {
                 row_idx: idx as usize,
                 // Ordering is already established by the write buffer's Arrow sort.
                 sequence_number: 0,
-                user_sequences: Vec::new(),
+                user_sequence: None,
                 value_kind: value_kinds
                     .filter(|kinds| kinds.is_valid(idx as usize))
                     .map_or(0, |kinds| kinds.value(idx as usize)),
@@ -945,11 +975,15 @@ impl KeyValueFileWriter {
         let rows: Vec<_> = sorted_indices
             .values()
             .iter()
-            .map(|&idx| MergeRow {
+            .enumerate()
+            .map(|(sorted_rank, &idx)| MergeRow {
                 batch_idx: 0,
                 row_idx: idx as usize,
-                sequence_number: 0,
-                user_sequences: Vec::new(),
+                // The write buffer has already sorted by user sequence and
+                // arrival sequence. Preserve that order when the shared merge
+                // function sorts MergeRows again.
+                sequence_number: sorted_rank as i64,
+                user_sequence: None,
                 value_kind: value_kinds
                     .filter(|kinds| kinds.is_valid(idx as usize))
                     .map_or(0, |kinds| kinds.value(idx as usize)),
@@ -1060,40 +1094,80 @@ impl KeyValueFileWriter {
         batch: &RecordBatch,
         sorted_indices: &arrow_array::UInt32Array,
     ) -> Result<Vec<u32>> {
-        let n = sorted_indices.len();
-        if n == 0 {
-            return Ok(vec![]);
+        if sorted_indices.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let rows = self.convert_key_rows(batch)?;
-
-        let mut result: Vec<u32> = Vec::with_capacity(n);
-        // Track the start of the current key group and the candidate winner.
-        let mut group_winner = sorted_indices.value(0);
-
-        for i in 1..n {
-            let cur = sorted_indices.value(i);
-            if rows.row(group_winner as usize) == rows.row(cur as usize) {
-                // Same key group — update winner based on merge engine.
-                match self.config.merge_engine {
-                    // Deduplicate: keep last (highest seq), which is the current row
-                    // since we sorted ascending.
-                    MergeEngine::Deduplicate => group_winner = cur,
-                    // FirstRow: keep first (lowest seq), so don't update.
-                    MergeEngine::FirstRow => {}
-                    MergeEngine::PartialUpdate | MergeEngine::Aggregation => unreachable!(
-                        "{:?} should use select_flush_indices and skip dedup",
-                        self.config.merge_engine
-                    ),
-                }
-            } else {
-                // New key group — emit the winner of the previous group.
-                result.push(group_winner);
-                group_winner = cur;
+        let schema = batch.schema();
+        let value_kinds = if self.config.merge_engine == MergeEngine::FirstRow {
+            batch
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .map(|column| {
+                    column.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                        crate::Error::DataInvalid {
+                            message: "_VALUE_KIND column must be Int8".into(),
+                            source: None,
+                        }
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let first_row_merge = FirstRowMergeFunction {
+            ignore_delete: CoreOptions::new(&self.config.table_options).ignore_delete(),
+        };
+        let key_rows = self.convert_key_rows(batch)?;
+        let mut result = Vec::with_capacity(sorted_indices.len());
+        let mut start = 0;
+        while start < sorted_indices.len() {
+            let first = sorted_indices.value(start);
+            let mut end = start + 1;
+            while end < sorted_indices.len()
+                && key_rows.row(first as usize) == key_rows.row(sorted_indices.value(end) as usize)
+            {
+                end += 1;
             }
+            match self.config.merge_engine {
+                MergeEngine::Deduplicate => result.push(sorted_indices.value(end - 1)),
+                // Java's ReducerMergeFunctionWrapper bypasses the merge function
+                // for singleton groups. Insert-only batches need no kind validation.
+                MergeEngine::FirstRow if end - start == 1 || value_kinds.is_none() => {
+                    result.push(first);
+                }
+                MergeEngine::FirstRow => {
+                    let kinds = value_kinds.unwrap();
+                    let rows = sorted_indices.values()[start..end]
+                        .iter()
+                        .map(|&idx| MergeRow {
+                            batch_idx: 0,
+                            row_idx: idx as usize,
+                            // Keep the established user-sequence and arrival order.
+                            sequence_number: 0,
+                            user_sequence: None,
+                            value_kind: if kinds.is_null(idx as usize) {
+                                RowKind::Insert as i8
+                            } else {
+                                kinds.value(idx as usize)
+                            },
+                        })
+                        .collect::<Vec<_>>();
+                    // First-row returns a source index without reading/materializing values.
+                    match first_row_merge.merge(&rows, &[], &[], &schema)? {
+                        MergeResult::SourceRow { row_idx, .. } => result.push(row_idx as u32),
+                        MergeResult::Omit => {}
+                        MergeResult::MaterializedRow(_) | MergeResult::MaterializedDeleteRow(_) => {
+                            unreachable!("first-row merge must return an input row")
+                        }
+                    }
+                }
+                MergeEngine::PartialUpdate | MergeEngine::Aggregation => unreachable!(
+                    "{:?} should use select_flush_indices and skip dedup",
+                    self.config.merge_engine
+                ),
+            }
+            start = end;
         }
-        // Emit the last group's winner.
-        result.push(group_winner);
         Ok(result)
     }
 
@@ -1103,17 +1177,13 @@ impl KeyValueFileWriter {
         if let Some(reservation) = &mut self.buffer_reservation {
             let _ = reservation.try_resize(0);
         }
-        let bucket_path = bucket_path_under(
-            &self.config.table_location,
-            &self.config.partition_path,
-            self.config.bucket,
-        );
+        let bucket_path = self.paths.bucket_path();
         for file in self
             .written_files
             .drain(..)
             .chain(self.written_changelog_files.drain(..))
         {
-            for path in file.collect_files(&bucket_path) {
+            for path in file.collect_files(bucket_path) {
                 let _ = self.file_io.delete_file(&path).await;
             }
         }
@@ -1267,6 +1337,49 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn target_file_row_num_rolls_data_and_changelog_with_local_metadata() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("seq", ArrowDataType::Int64, false),
+            ArrowField::new("value", ArrowDataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![5, 1, 4, 2, 3])),
+                Arc::new(Int64Array::from(vec![50, 10, 40, 20, 30])),
+                Arc::new(Int32Array::from(vec![50, 10, 40, 20, 30])),
+            ],
+        )
+        .unwrap();
+        let mut config = test_write_config(MergeEngine::Deduplicate);
+        config.input_changelog = true;
+        config.write_buffer_size = i64::MAX;
+        config
+            .table_options
+            .insert("target-file-row-num".into(), "2".into());
+        let mut writer =
+            KeyValueFileWriter::new(FileIOBuilder::new("memory").build().unwrap(), config, 0)
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+
+        for files in [&prepared.data_files, &prepared.changelog_files] {
+            assert_eq!(
+                files.iter().map(|file| file.row_count).collect::<Vec<_>>(),
+                vec![2, 2, 1]
+            );
+            assert_eq!(
+                files
+                    .iter()
+                    .map(|file| (file.min_sequence_number, file.max_sequence_number))
+                    .collect::<Vec<_>>(),
+                vec![(1, 3), (2, 4), (0, 0)]
+            );
+        }
     }
 
     #[tokio::test]
@@ -1498,6 +1611,115 @@ mod tests {
             .unwrap();
 
         assert_eq!(deduped, vec![0, 2]);
+    }
+
+    fn first_row_kind_batch(ids: Vec<i32>, kinds: Vec<i8>) -> RecordBatch {
+        let len = ids.len();
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("seq", ArrowDataType::Int64, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int64Array::from_iter_values(0..len as i64)),
+                Arc::new(Int32Array::from_iter_values(10..10 + len as i32)),
+                Arc::new(Int8Array::from(kinds)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_first_row_flush_rejects_every_retract_in_a_multi_row_group() {
+        for retract in [RowKind::Delete, RowKind::UpdateBefore] {
+            for position in 1..=3 {
+                let mut kinds = vec![RowKind::Insert as i8; 5];
+                kinds[position] = retract as i8;
+                let batch = first_row_kind_batch(vec![0, 1, 1, 1, 2], kinds);
+                let mut config = test_write_config(MergeEngine::FirstRow);
+                config.write_buffer_size = i64::MAX;
+                config.input_changelog = true;
+                let mut writer = KeyValueFileWriter::new(
+                    FileIOBuilder::new("memory").build().unwrap(),
+                    config,
+                    0,
+                )
+                .unwrap();
+                // The invalid group spans batches and follows a valid key group.
+                writer.write(&batch.slice(0, 3)).await.unwrap();
+                writer.write(&batch.slice(3, 2)).await.unwrap();
+                let error = writer
+                    .prepare_commit()
+                    .await
+                    .err()
+                    .expect("retract must be rejected");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("does not support DELETE or UPDATE_BEFORE"),
+                    "{retract:?} at {position}: {error}"
+                );
+                assert!(writer.written_files.is_empty());
+                assert!(writer.written_changelog_files.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_first_row_flush_preserves_singleton_retracts_like_java_reducer() {
+        let batch = first_row_kind_batch(vec![1, 2, 3], vec![1, 3, 2]);
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let mut writer =
+            KeyValueFileWriter::new(io.clone(), test_write_config(MergeEngine::FirstRow), 0)
+                .unwrap();
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+        let stored = read_kv_file(&io, &prepared.data_files[0]).await;
+        assert_eq!(prepared.data_files[0].delete_row_count, Some(2));
+        assert_eq!(
+            stored
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_ref(),
+            batch
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_ref()
+        );
+        assert_eq!(
+            stored.column_by_name("value").unwrap().as_ref(),
+            batch.column_by_name("value").unwrap().as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_row_flush_ignore_delete_uses_first_add_and_omits_retract_group() {
+        let batch = first_row_kind_batch(vec![1, 1, 1, 1, 2, 2], vec![3, 2, 0, 1, 1, 3]);
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        let mut config = test_write_config(MergeEngine::FirstRow);
+        config
+            .table_options
+            .insert("ignore-delete".into(), "true".into());
+        let mut writer = KeyValueFileWriter::new(io.clone(), config, 0).unwrap();
+        writer.write(&batch).await.unwrap();
+        let prepared = writer.prepare_commit().await.unwrap();
+        assert_eq!(prepared.data_files[0].row_count, 1);
+        assert_eq!(prepared.data_files[0].delete_row_count, Some(0));
+        let stored = read_kv_file(&io, &prepared.data_files[0]).await;
+        assert_eq!(
+            stored.column_by_name("value").unwrap().as_ref(),
+            &Int32Array::from(vec![11]) as &dyn Array
+        );
+        assert_eq!(
+            stored
+                .column_by_name(VALUE_KIND_FIELD_NAME)
+                .unwrap()
+                .as_ref(),
+            &Int8Array::from(vec![RowKind::UpdateAfter as i8]) as &dyn Array
+        );
     }
 
     fn partial_update_writer() -> KeyValueFileWriter {
@@ -2088,6 +2310,10 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
+        let user_converter = RowConverter::new(vec![SortField::new(ArrowDataType::Int64)]).unwrap();
+        let user_sequences = user_converter
+            .convert_columns(&[Arc::new(seq_col.clone())])
+            .unwrap();
 
         for (group_idx, group_rows) in [vec![0usize, 2, 3], vec![1usize, 4]].iter().enumerate() {
             let rows: Vec<MergeRow> = group_rows
@@ -2097,7 +2323,7 @@ mod tests {
                     row_idx,
                     sequence_number: seq_values[row_idx],
                     value_kind: 0,
-                    user_sequences: vec![Some(seq_col.value(row_idx) as i128)],
+                    user_sequence: Some(user_sequences.row(row_idx).owned()),
                 })
                 .collect();
             let result = merge_fn.merge(&rows, &buffer, &identity, &schema).unwrap();

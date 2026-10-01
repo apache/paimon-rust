@@ -588,6 +588,16 @@ impl BlockReader {
         }
     }
 
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let seek_bytes = match &self.seek_info {
+            SeekInfo::Aligned { .. } => 0,
+            SeekInfo::Unaligned { offsets } => offsets
+                .capacity()
+                .saturating_mul(std::mem::size_of::<i32>()),
+        };
+        self.data.capacity().saturating_add(seek_bytes)
+    }
+
     #[allow(dead_code)]
     pub fn record_count(&self) -> usize {
         self.record_count

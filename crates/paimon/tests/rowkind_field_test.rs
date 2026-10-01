@@ -38,7 +38,7 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 use futures::StreamExt;
 use paimon::arrow::paimon_type_to_arrow;
 use paimon::spec::{
-    ArrayType, DataField, DataType, IntType, RowType, Schema, TableSchema, VarBinaryType,
+    ArrayType, DataField, DataType, IntType, RowKind, RowType, Schema, TableSchema, VarBinaryType,
     VarCharType, VALUE_KIND_FIELD_NAME,
 };
 
@@ -836,6 +836,94 @@ async fn rowkind_field_ignore_delete() {
         scan_pk_value_kind(&table, "kind").await,
         vec![(1, 20, "+I".to_string())]
     );
+}
+
+#[tokio::test]
+async fn aggregation_ignore_delete_supports_generated_and_explicit_row_kinds() {
+    for explicit_kind in [true, false] {
+        for option in [
+            "ignore-delete",
+            "first-row.ignore-delete",
+            "deduplicate.ignore-delete",
+            "partial-update.ignore-delete",
+        ] {
+            let path = format!("memory:/rowkind_field/aggregation_{option}_{explicit_kind}");
+            let mut schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("value", DataType::Int(IntType::new()))
+                .column("kind", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .option("merge-engine", "aggregation")
+                .option("fields.value.aggregate-function", "sum")
+                .option(option, "true");
+            if !explicit_kind {
+                schema = schema.option("rowkind.field", "kind");
+            }
+            let (file_io, table) =
+                memory_table(&path, TableSchema::new(0, &schema.build().unwrap()));
+            setup_dirs(&file_io, &path).await;
+            persist_table_schema(&file_io, &path, table.schema()).await;
+            let make_batch = |ids, values, kinds: Vec<&str>| {
+                let value_kinds = kinds
+                    .iter()
+                    .map(|kind| RowKind::from_short_string(kind).unwrap().to_value())
+                    .collect::<Vec<_>>();
+                let batch = make_batch_with_rowkind(ids, values, kinds, "kind");
+                if !explicit_kind {
+                    return batch;
+                }
+                let mut fields = batch.schema().fields().to_vec();
+                fields.push(Arc::new(ArrowField::new(
+                    VALUE_KIND_FIELD_NAME,
+                    ArrowDataType::Int8,
+                    false,
+                )));
+                let mut columns = batch.columns().to_vec();
+                columns.push(Arc::new(Int8Array::from(value_kinds)));
+                RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap()
+            };
+
+            write_batch(
+                &table,
+                &make_batch(
+                    vec![1, 1, 1, 1, 2],
+                    vec![10, 7, 20, 8, 100],
+                    vec!["+I", "-D", "+U", "-U", "-D"],
+                ),
+            )
+            .await;
+            assert_eq!(
+                scan_id_values(&table).await,
+                [(1, 30)].into_iter().collect(),
+                "{option}, explicit={explicit_kind}"
+            );
+
+            // A retract-only commit cannot cancel an earlier sum or add a new key.
+            write_batch(
+                &table,
+                &make_batch(vec![1, 2], vec![30, 100], vec!["-D", "-U"]),
+            )
+            .await;
+            assert_eq!(
+                scan_id_values(&table).await,
+                [(1, 30)].into_iter().collect(),
+                "{option}, explicit={explicit_kind}"
+            );
+
+            // The explicit global option takes precedence over a deprecated alias.
+            let table = table_with_options(
+                &table,
+                HashMap::from([("ignore-delete".to_string(), "false".to_string())]),
+            );
+            write_batch(&table, &make_batch(vec![1], vec![5], vec!["-D"])).await;
+            assert_eq!(
+                scan_id_values(&table).await,
+                [(1, 25)].into_iter().collect(),
+                "{option}, explicit={explicit_kind}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

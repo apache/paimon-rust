@@ -61,8 +61,11 @@ impl CatalogOptions {
     /// DLF signing algorithm (default or openapi).
     pub const DLF_SIGNING_ALGORITHM: &'static str = "dlf.signing-algorithm";
 
-    /// DLF token loader type (e.g., "ecs").
+    /// DLF token loader type ("ecs" or "local_file").
     pub const DLF_TOKEN_LOADER: &'static str = "dlf.token-loader";
+
+    /// Path to a local DLF token file.
+    pub const DLF_TOKEN_PATH: &'static str = "dlf.token-path";
 
     /// DLF ECS metadata URL.
     pub const DLF_TOKEN_ECS_METADATA_URL: &'static str = "dlf.token-ecs-metadata-url";
@@ -87,6 +90,10 @@ impl CatalogOptions {
 
     /// Comma-separated file types eligible for local caching.
     pub const LOCAL_CACHE_WHITELIST: &'static str = "local-cache.whitelist";
+
+    /// Maximum process-local cache size for parsed file-format metadata.
+    pub const FILE_FORMAT_METADATA_CACHE_MAX_SIZE: &'static str =
+        "file-format.metadata-cache.max-size";
 }
 
 /// Configuration options container.
@@ -276,6 +283,10 @@ mod tests {
         assert_eq!(
             CatalogOptions::LOCAL_CACHE_WHITELIST,
             "local-cache.whitelist"
+        );
+        assert_eq!(
+            CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE,
+            "file-format.metadata-cache.max-size"
         );
     }
 

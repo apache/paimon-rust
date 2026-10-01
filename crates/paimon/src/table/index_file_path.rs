@@ -83,7 +83,7 @@ impl IndexFileLocation<'_> {
     /// Older Python DV writers ignored the bucket-directory option. Resolve
     /// their existing files without changing the manifest or masking missing
     /// canonical files with a path that does not exist either.
-    async fn resolve_legacy_deletion_vector(
+    pub(super) async fn resolve_legacy_deletion_vector(
         &self,
         file_io: &FileIO,
         file: &mut IndexFileMeta,
@@ -150,7 +150,7 @@ pub(crate) async fn resolve_legacy_deletion_vector_entries(
         }
         let partition = BinaryRow::from_serialized_bytes(&entry.partition)?;
         let bucket_path = bucket_path(
-            table_path,
+            &table.data_file_location(),
             partition_computer.as_ref(),
             &partition,
             entry.bucket,

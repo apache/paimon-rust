@@ -25,6 +25,7 @@
 
 use crate::btree::block::{BlockHandle, BlockReader};
 use crate::btree::bloom_filter::BloomFilter;
+use crate::btree::data_block_cache::{BTreeDataBlockCache, DataBlockCacheKey};
 use crate::btree::footer::{BTreeFileFooter, BloomFilterHandle, BTREE_FOOTER_ENCODED_LENGTH};
 use crate::btree::key_serde::key_comparison_io_error;
 use crate::btree::meta::BTreeIndexMeta;
@@ -35,6 +36,7 @@ use crate::spec::murmur_hash::hash_bytes;
 use roaring::RoaringTreemap;
 use std::cmp::Ordering;
 use std::io;
+use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 struct LazyBloomFilter {
@@ -72,6 +74,8 @@ pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> {
     key_comparator: F,
     bloom_filter: Option<LazyBloomFilter>,
     file_version: u32,
+    data_block_cache: Arc<BTreeDataBlockCache>,
+    data_block_cache_file: Arc<str>,
 }
 
 impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
@@ -83,6 +87,25 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
         file_size: u64,
         meta: &BTreeIndexMeta,
         key_comparator: F,
+    ) -> io::Result<Self> {
+        Self::open_with_data_block_cache(
+            reader,
+            file_size,
+            meta,
+            key_comparator,
+            Arc::new(BTreeDataBlockCache::new(0)),
+            Arc::from(""),
+        )
+        .await
+    }
+
+    pub(crate) async fn open_with_data_block_cache(
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        meta: &BTreeIndexMeta,
+        key_comparator: F,
+        data_block_cache: Arc<BTreeDataBlockCache>,
+        data_block_cache_file: Arc<str>,
     ) -> io::Result<Self> {
         if file_size < BTREE_FOOTER_ENCODED_LENGTH as u64 {
             return Err(io::Error::new(
@@ -128,6 +151,8 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
             key_comparator,
             bloom_filter,
             file_version: footer.version,
+            data_block_cache,
+            data_block_cache_file,
         })
     }
 
@@ -287,14 +312,23 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
     }
 
     /// Read a data block from the file on demand.
-    async fn read_data_block(&self, handle: &BlockHandle) -> io::Result<BlockReader> {
+    async fn read_data_block(&self, handle: &BlockHandle) -> io::Result<Arc<BlockReader>> {
+        let key = DataBlockCacheKey {
+            file: Arc::clone(&self.data_block_cache_file),
+            offset: handle.offset,
+            size: handle.size,
+        };
+        if let Some(block) = self.data_block_cache.get(&key) {
+            return Ok(block);
+        }
         let end = handle.offset + handle.full_block_size() as u64;
         let bytes = self
             .reader
             .read(handle.offset..end)
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
-        read_block_from_bytes(&bytes, handle.size)
+        let block = Arc::new(read_block_from_bytes(&bytes, handle.size)?);
+        Ok(self.data_block_cache.put(key, block))
     }
 
     async fn bloom_might_contain(&self, key: &[u8]) -> io::Result<bool> {

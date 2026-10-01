@@ -40,7 +40,7 @@ use super::global_index_types::{
     normalize_queryable_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
     FM_GLOBAL_INDEX_TYPE, MULTIVALUE_GLOBAL_INDEX_TYPE,
 };
-use crate::btree::{BTreeIndexMeta, BTreeIndexReader};
+use crate::btree::{BTreeDataBlockCache, BTreeIndexMeta, BTreeIndexReader};
 use crate::fm_index::{manifest_row_range, FMReadContext, FMReadOptions};
 use crate::io::FileIO;
 use crate::spec::{DataField, FileKind, GlobalIndexSearchMode, IndexManifestEntry, Predicate};
@@ -107,6 +107,7 @@ pub(crate) struct GlobalIndexScanner {
     /// Scan-scoped shard I/O budget shared by all indexed fields.
     query_semaphore: Arc<Semaphore>,
     btree_fallback_scan_max_size: i64,
+    btree_data_block_cache: Arc<BTreeDataBlockCache>,
     bitmap_fallback_scan_max_size: i64,
     fm_read_options: FMReadOptions,
     fm_read_context: Arc<FMReadContext>,
@@ -141,6 +142,7 @@ impl GlobalIndexScanner {
             table_path,
             global_index_thread_num,
             btree_fallback_scan_max_size,
+            128 * 1024 * 1024,
             bitmap_fallback_scan_max_size,
             index_entries,
             schema_fields,
@@ -154,6 +156,7 @@ impl GlobalIndexScanner {
         table_path: &str,
         global_index_thread_num: usize,
         btree_fallback_scan_max_size: i64,
+        btree_data_block_cache_size: usize,
         bitmap_fallback_scan_max_size: i64,
         index_entries: &[IndexManifestEntry],
         schema_fields: &[DataField],
@@ -307,6 +310,7 @@ impl GlobalIndexScanner {
             global_index_thread_num,
             query_semaphore: Arc::new(Semaphore::new(global_index_thread_num)),
             btree_fallback_scan_max_size,
+            btree_data_block_cache: Arc::new(BTreeDataBlockCache::new(btree_data_block_cache_size)),
             bitmap_fallback_scan_max_size,
             fm_read_options,
             fm_read_context: Arc::new(FMReadContext::new(fm_read_options.cache_size)),
@@ -334,6 +338,7 @@ pub(crate) struct GlobalIndexEvaluation<'a> {
     pub(crate) search_mode: GlobalIndexSearchMode,
     pub(crate) global_index_thread_num: usize,
     pub(crate) btree_fallback_scan_max_size: i64,
+    pub(crate) btree_data_block_cache_size: usize,
     pub(crate) bitmap_fallback_scan_max_size: i64,
     pub(crate) fm_read_options: FMReadOptions,
     pub(crate) next_row_id: Option<i64>,
@@ -348,6 +353,7 @@ pub(crate) async fn evaluate_global_index(
         evaluation.table_path,
         evaluation.global_index_thread_num,
         evaluation.btree_fallback_scan_max_size,
+        evaluation.btree_data_block_cache_size,
         evaluation.bitmap_fallback_scan_max_size,
         evaluation.index_entries,
         evaluation.schema_fields,

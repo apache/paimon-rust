@@ -144,7 +144,7 @@ async fn ensure_data_evolution_table<C: Catalog + ?Sized>(catalog: &C) {
 
     let wb = table.new_write_builder();
     let mut update = wb
-        .new_update(vec!["name".to_string()])
+        .new_data_evolution_writer(vec!["name".to_string()])
         .expect("Failed to create data-evolution update writer");
     update
         .add_matched_batch(data_evolution_update_batch())

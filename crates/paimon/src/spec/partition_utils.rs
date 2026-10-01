@@ -31,6 +31,147 @@ use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone, Timelike};
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
 
+/// Java `FileStorePathFactory.dataFilePath`: resolve the configured directory
+/// against the table root. This applies only to data, never table metadata.
+/// Like Java Path, preserve literal percent signs, spaces, `?` and `#` in names.
+pub(crate) fn data_file_path(table_path: &str, directory: Option<&str>) -> String {
+    let Some(directory) = directory.filter(|directory| !directory.is_empty()) else {
+        return if table_path == "/" {
+            "/"
+        } else {
+            table_path.trim_end_matches('/')
+        }
+        .to_string();
+    };
+    resolve_data_path(table_path, directory, cfg!(windows))
+}
+
+fn resolve_data_path(parent: &str, child: &str, windows: bool) -> String {
+    fn has_drive(path: &str) -> bool {
+        let path = path.strip_prefix('/').unwrap_or(path).as_bytes();
+        path.len() >= 2 && path[0].is_ascii_alphabetic() && path[1] == b':'
+    }
+    fn normalize(path: &str, windows: bool) -> String {
+        let mut components = Vec::new();
+        for component in path.split('/') {
+            match component {
+                "" | "." => {}
+                ".." if components.last().is_some_and(|last| *last != "..") => {
+                    components.pop();
+                }
+                component => components.push(component),
+            }
+        }
+        let leading = if path.starts_with('/') { "/" } else { "" };
+        let normalized = format!("{leading}{}", components.join("/"));
+        if windows
+            && normalized.starts_with('/')
+            && has_drive(&normalized)
+            && normalized.len() == 3
+            && path != normalized
+        {
+            format!("{normalized}/")
+        } else if !normalized.starts_with('/')
+            && normalized
+                .split('/')
+                .next()
+                .is_some_and(|part| part.contains(':'))
+        {
+            format!("./{normalized}")
+        } else {
+            normalized
+        }
+    }
+    // Keep scheme and authority separate: a port or user-info can contain ':'.
+    fn parts(input: &str, windows: bool) -> (String, String, String) {
+        let input = if windows && has_drive(input) && !input.starts_with('/') {
+            format!("/{input}")
+        } else {
+            input.to_string()
+        };
+        let scheme_end = input
+            .find(':')
+            .filter(|&i| !input[..i].contains('/'))
+            .map_or(0, |i| i + 1);
+        let scheme = &input[..scheme_end];
+        let (authority, path) =
+            if input[scheme_end..].starts_with("//") && input.len() - scheme_end > 2 {
+                let start = scheme_end + 2;
+                let end = input[start..].find('/').map_or(input.len(), |i| start + i);
+                let authority = if end == start {
+                    ""
+                } else {
+                    &input[scheme_end..end]
+                };
+                (authority, &input[end..])
+            } else {
+                ("", &input[scheme_end..])
+            };
+        // Java collapses forward slashes before converting Windows separators.
+        let mut previous_slash = false;
+        let path: String = path
+            .chars()
+            .filter(|&c| {
+                let duplicate = c == '/' && previous_slash;
+                previous_slash = c == '/';
+                !duplicate
+            })
+            .collect();
+        let path = if windows && (has_drive(&path) || scheme.is_empty() || scheme == "file:") {
+            path.replace('\\', "/")
+        } else {
+            path.to_string()
+        };
+        // Java URI recognizes a UNC authority after Windows separator conversion.
+        let (authority, path) = if authority.is_empty() && path.starts_with("//") && path.len() > 2
+        {
+            let end = path[2..].find('/').map_or(path.len(), |i| i + 2);
+            (&path[..end], &path[end..])
+        } else {
+            (authority, path.as_str())
+        };
+        (
+            scheme.to_string(),
+            authority.to_string(),
+            normalize(path, windows),
+        )
+    }
+    let (parent_scheme, parent_authority, parent_path) = parts(parent, windows);
+    let (child_scheme, child_authority, child_path) = parts(child, windows);
+    let (scheme, authority, path) = if !child_scheme.is_empty() {
+        (child_scheme, child_authority, child_path)
+    } else if !child_authority.is_empty() {
+        (parent_scheme, child_authority, child_path)
+    } else if child_path.starts_with('/') {
+        (parent_scheme, parent_authority, child_path)
+    } else {
+        let path = if parent_path.is_empty()
+            && (child_path.is_empty() || (parent_scheme.is_empty() && parent_authority.is_empty()))
+        {
+            child_path
+        } else {
+            format!("{}/{child_path}", parent_path.trim_end_matches('/'))
+        };
+        (parent_scheme, parent_authority, path)
+    };
+    let path = normalize(&path, windows);
+    let path = if windows && scheme.is_empty() && authority.is_empty() && has_drive(&path) {
+        path.strip_prefix('/').unwrap_or(&path).to_string()
+    } else if scheme.is_empty()
+        && authority.is_empty()
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .next()
+            .is_some_and(|part| part.contains(':'))
+    {
+        format!("./{path}")
+    } else {
+        path
+    };
+    format!("{scheme}{authority}{path}")
+}
+
 /// The directory holding one bucket's data files, `<table>/[<partition>/]bucket-N`.
 ///
 /// Mirrors Java `FileStorePathFactory.bucketPath`. Every consumer that needs a
@@ -51,6 +192,20 @@ pub(crate) fn bucket_path(
         None => String::new(),
     };
     Ok(bucket_path_under(table_path, &partition_path, bucket))
+}
+
+/// Java `relativeBucketPath`, which may itself be absolute when the configured
+/// data directory is absolute. External path providers must resolve, not append it.
+pub(crate) fn relative_bucket_path(
+    partition_path: &str,
+    bucket: i32,
+    directory: Option<&str>,
+) -> String {
+    let relative = format!("{partition_path}{}", crate::spec::bucket_dir_name(bucket));
+    match directory.filter(|directory| !directory.is_empty()) {
+        Some(directory) => data_file_path(directory, Some(&relative)),
+        None => relative,
+    }
 }
 
 /// [`bucket_path`] for a partition directory that is already computed.
@@ -244,6 +399,16 @@ fn format_partition_value(
             s.to_string()
         }
 
+        DataType::Binary(_) | DataType::VarBinary(_) if !legacy => {
+            // Java's BinaryToStringCastRule wraps the raw bytes in a
+            // BinaryString, whose toString decodes them as UTF-8.
+            let value = decode_java_utf8(row.get_binary(pos)?);
+            if is_java_whitespace_only(&value) {
+                return Ok(default_partition_name.to_string());
+            }
+            value
+        }
+
         DataType::Date(_) => {
             if legacy {
                 // Legacy: field.toString() on the epoch-day Integer → raw int value.
@@ -314,6 +479,61 @@ fn format_partition_value(
     };
 
     Ok(value)
+}
+
+/// Decode as Java's UTF-8 decoder does for `BinaryString.toString()`.
+/// Rust's lossy decoder replaces each byte of a UTF-8 encoded surrogate,
+/// while Java replaces the complete malformed surrogate sequence once.
+fn decode_java_utf8(mut bytes: &[u8]) -> String {
+    let mut decoded = String::with_capacity(bytes.len());
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                decoded.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_len = error.valid_up_to();
+                decoded.push_str(std::str::from_utf8(&bytes[..valid_len]).unwrap());
+                bytes = &bytes[valid_len..];
+
+                let malformed_len =
+                    if bytes.len() >= 2 && bytes[0] == 0xED && (0xA0..=0xBF).contains(&bytes[1]) {
+                        // The first two bytes denote a surrogate. Java consumes
+                        // its third byte too when it is a continuation byte.
+                        if bytes.get(2).is_some_and(|byte| byte & 0xC0 == 0x80) {
+                            3
+                        } else {
+                            2
+                        }
+                    } else {
+                        error.error_len().unwrap_or(bytes.len())
+                    };
+                decoded.push('\u{FFFD}');
+                bytes = &bytes[malformed_len..];
+            }
+        }
+    }
+    decoded
+}
+
+/// Java `StringUtils.isNullOrWhitespaceOnly` checks each UTF-16 code unit with
+/// `Character.isWhitespace`; its whitespace set differs from Rust `str::trim`.
+fn is_java_whitespace_only(value: &str) -> bool {
+    value.chars().all(|ch| {
+        matches!(
+            ch,
+            '\u{0009}'..='\u{000D}'
+                | '\u{001C}'..='\u{0020}'
+                | '\u{1680}'
+                | '\u{180E}'
+                | '\u{2000}'..='\u{2006}'
+                | '\u{2008}'..='\u{200A}'
+                | '\u{2028}'..='\u{2029}'
+                | '\u{205F}'
+                | '\u{3000}'
+        )
+    })
 }
 
 /// Format epoch days (since 1970-01-01) to `yyyy-MM-dd`.
@@ -587,6 +807,101 @@ fn needs_escaping(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn data_directories_match_java_path_resolution() {
+        // Expected strings produced by the Java org.apache.paimon.fs.Path.
+        for (parent, child, expected) in [
+            ("/warehouse/t", "data/nested", "/warehouse/t/data/nested"),
+            (
+                "/warehouse/t/",
+                "data//discard/../nested/.",
+                "/warehouse/t/data/nested",
+            ),
+            (
+                "s3://bucket/warehouse/t",
+                "/shared/data",
+                "s3://bucket/shared/data",
+            ),
+            ("s3://bucket/t", "s3://other/data", "s3://other/data"),
+            (
+                "file:/warehouse/t",
+                "file:///other/data",
+                "file:/other/data",
+            ),
+            ("memory:/t", "../other", "memory:/other"),
+            ("warehouse/t", "../data", "warehouse/data"),
+            ("warehouse/t", "data", "warehouse/t/data"),
+            ("s3://bucket/t", "//other/data", "s3://other/data"),
+            (
+                "s3://bucket/t",
+                "data 100%?#/你好",
+                "s3://bucket/t/data 100%?#/你好",
+            ),
+            ("file:/t", "./data", "file:/t/data"),
+            ("/", "data", "/data"),
+            ("/t", ".", "/t"),
+            ("/t", "..", "/"),
+            ("/t", "../../data", "/../data"),
+            ("s3://bucket/", "data", "s3://bucket/data"),
+            ("s3://bucket", ".", "s3://bucket"),
+            ("s3://bucket", "x/..", "s3://bucket"),
+            ("warehouse", "a/../b:c", "warehouse/b:c"),
+            ("memory:/t", "a/../../b", "memory:/b"),
+            ("/t", "///data", "/data"),
+            ("/t", "////data", "/data"),
+            ("file:/t", "file:////data", "file:/data"),
+            ("/t", "//", "/"),
+            ("file:/t", "//", "file:/"),
+            ("s3://bucket/t", "//other:9000/data", "s3://other:9000/data"),
+            ("//host:8020/table", "//other/data", "//other/data"),
+            ("relative", "../b:c", "./b:c"),
+            ("relative", "../a:bb", "./a:bb"),
+            ("relative", "../b:c/x", "./b:c/x"),
+            ("file:/t", "file:/data", "file:/data"),
+        ] {
+            assert_eq!(
+                data_file_path(parent, Some(child)),
+                expected,
+                "{parent} + {child}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_data_directories_match_java() {
+        for (parent, child, expected) in [
+            ("relative", "../b:c", "./b:c"),
+            ("relative", "../a:bb", "./a:bb"),
+            ("relative", "../b:c/x", "./b:c/x"),
+            ("warehouse/t", "data/../../../b:c", "./b:c"),
+            (".", "a/../b:c", "./b:c"),
+            ("s3://bucket", ".", "s3://bucket"),
+            (r"C:\warehouse\table", "../data", "C:/warehouse/data"),
+            (r"C:\warehouse\table", r"..\data", "C:/warehouse/data"),
+            ("C:/warehouse/table", "/data", "/data"),
+            ("C:/warehouse/table", "../..", "C:/"),
+            ("file:/C:/warehouse/table", "../..", "file:/C:/"),
+            (r"\\server\share\table", "data", "//server/share/table/data"),
+            ("s3://bucket/table", r"\\other\share", "s3://other/share"),
+            (
+                "file:/C:/warehouse/table",
+                r"..\data",
+                "file:/C:/warehouse/data",
+            ),
+            (
+                "s3://bucket/t",
+                r"data\literal",
+                "s3://bucket/t/data/literal",
+            ),
+        ] {
+            assert_eq!(
+                resolve_data_path(parent, child, true),
+                expected,
+                "{parent} + {child}"
+            );
+        }
+    }
+
     use super::*;
     use crate::spec::types::*;
     use crate::spec::DataField;
@@ -640,8 +955,12 @@ mod tests {
         }
 
         fn write_string(&mut self, pos: usize, value: &str) {
+            self.write_bytes(pos, value.as_bytes());
+        }
+
+        fn write_bytes(&mut self, pos: usize, value: &[u8]) {
             let var_offset = self.data.len();
-            self.data.extend_from_slice(value.as_bytes());
+            self.data.extend_from_slice(value);
             let len = value.len();
             let encoded = ((var_offset as u64) << 32) | (len as u64);
             let offset = self.field_offset(pos);
@@ -1120,7 +1439,8 @@ mod tests {
 
     #[test]
     fn test_unsupported_types() {
-        // Binary
+        // Legacy binary uses byte[].toString() in Java, which contains an
+        // allocation-specific identity hash and cannot name a stable path.
         assert_single_partition_err(
             "data",
             DataType::Binary(BinaryType::new(10).unwrap()),
@@ -1148,6 +1468,73 @@ mod tests {
             |b| b.write_int(0, 0),
             true,
         );
+    }
+
+    #[test]
+    fn test_binary_partition_uses_utf8_cast_and_path_escaping() {
+        assert_single_partition(
+            "bin",
+            DataType::Binary(BinaryType::new(16).unwrap()),
+            |b| b.write_string(0, "a/b=c"),
+            "bin=a%2Fb%3Dc/",
+            false,
+        );
+        assert_single_partition(
+            "bin",
+            DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+            |b| b.write_string(0, "汉字"),
+            "bin=汉字/",
+            false,
+        );
+        assert_single_partition(
+            "bin",
+            DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+            |b| b.write_string(0, "  "),
+            "bin=__DEFAULT_PARTITION__/",
+            false,
+        );
+    }
+
+    #[test]
+    fn test_binary_partition_matches_java_whitespace() {
+        // JDK 8 Character.isWhitespace includes U+001C and U+180E, but not
+        // U+00A0 or U+2007. Rust str::trim differs for controls and NBSP.
+        for (value, expected) in [
+            (b"\x1c".as_slice(), "bin=__DEFAULT_PARTITION__/"),
+            ("\u{180E}".as_bytes(), "bin=__DEFAULT_PARTITION__/"),
+            ("\u{00A0}".as_bytes(), "bin=\u{00A0}/"),
+            ("\u{2007}".as_bytes(), "bin=\u{2007}/"),
+        ] {
+            assert_single_partition(
+                "bin",
+                DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+                |b| b.write_bytes(0, value),
+                expected,
+                false,
+            );
+        }
+    }
+
+    #[test]
+    fn test_binary_partition_matches_java_malformed_utf8() {
+        // Expected replacements were checked against JDK 8 new String(bytes, UTF_8).
+        for (value, expected) in [
+            (b"\xED\xA0\x80".as_slice(), "bin=\u{FFFD}/"),
+            (b"\xED\xA0".as_slice(), "bin=\u{FFFD}/"),
+            (b"\xED\xA0A".as_slice(), "bin=\u{FFFD}A/"),
+            (b"\xED\xA0\xFF".as_slice(), "bin=\u{FFFD}\u{FFFD}/"),
+            (b"\xE0\x80\x80".as_slice(), "bin=\u{FFFD}\u{FFFD}\u{FFFD}/"),
+            (b"\xE2\x82".as_slice(), "bin=\u{FFFD}/"),
+            (b"\xE2(\xA1".as_slice(), "bin=\u{FFFD}(\u{FFFD}/"),
+        ] {
+            assert_single_partition(
+                "bin",
+                DataType::VarBinary(VarBinaryType::new(16).unwrap()),
+                |b| b.write_bytes(0, value),
+                expected,
+                false,
+            );
+        }
     }
 
     #[test]

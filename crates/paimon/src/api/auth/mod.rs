@@ -25,5 +25,7 @@ mod factory;
 
 pub use base::{AuthProvider, RESTAuthFunction, RESTAuthParameter};
 pub use bearer_provider::BearerTokenAuthProvider;
-pub use dlf_provider::{DLFAuthProvider, DLFECSTokenLoader, DLFToken, DLFTokenLoader};
+pub use dlf_provider::{
+    DLFAuthProvider, DLFECSTokenLoader, DLFLocalFileTokenLoader, DLFToken, DLFTokenLoader,
+};
 pub use factory::{AuthProviderFactory, DLFAuthProviderFactory};

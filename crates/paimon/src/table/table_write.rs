@@ -26,7 +26,7 @@ use crate::resource::ResourceContext;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
-    DataType, MergeEngine, PartialUpdateConfig, RowKindFilter, EMPTY_SERIALIZED_ROW,
+    DataType, MergeEngine, PartialUpdateConfig, RowKind, RowKindFilter, EMPTY_SERIALIZED_ROW,
     POSTPONE_BUCKET, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
@@ -45,9 +45,10 @@ use crate::table::partition_filter::PartitionFilter;
 use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig};
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
+use crate::table::write_batch_normalize::normalize_write_array;
 use crate::table::{Snapshot, SnapshotManager, Table, TableScan};
 use crate::Result;
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -133,6 +134,7 @@ pub struct TableWrite {
     partition_keys: Vec<String>,
     schema_id: i64,
     target_file_size: i64,
+    target_file_row_num: i64,
     blob_target_file_size: i64,
     vector_target_file_size: i64,
     file_compression: String,
@@ -201,6 +203,7 @@ impl TableWrite {
             partition_keys: schema.partition_keys().to_vec(),
             schema_id: schema.id(),
             target_file_size: 0,
+            target_file_row_num: i64::MAX,
             blob_target_file_size: 0,
             vector_target_file_size: 0,
             file_compression: String::new(),
@@ -242,8 +245,14 @@ impl TableWrite {
         // A dynamic-bucket write reads the persisted PK hash index; the rest are
         // refused too, since their commit is blocked anyway.
         CoreOptions::new(table.schema().options()).ensure_read_authorized()?;
+        CoreOptions::new(table.schema().options()).validate_data_file_path_directory()?;
         let is_overwrite = false;
         let schema = table.schema();
+        crate::spec::Schema::validate_primary_key_blob_configuration(
+            schema.fields(),
+            schema.primary_keys(),
+            schema.options(),
+        )?;
         let write_schema = build_target_arrow_schema(schema.fields())?;
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
@@ -315,6 +324,7 @@ impl TableWrite {
             });
         }
         let target_file_size = core_options.target_file_size();
+        let target_file_row_num = core_options.target_file_row_num()?;
         let blob_target_file_size = core_options.blob_target_file_size();
         let vector_target_file_size = core_options.vector_target_file_size();
         let file_compression = core_options.file_compression().to_string();
@@ -401,20 +411,23 @@ impl TableWrite {
                 merge_engine,
             )))
         } else if is_dynamic_bucket {
-            BucketAssignerEnum::Dynamic(Box::new(DynamicBucketAssigner::new(
-                partition_field_indices,
-                primary_key_indices.clone(),
-                schema.fields().to_vec(),
-                target_bucket_row_number,
-                table.file_io().clone(),
-                table.location().to_string(),
-                is_overwrite,
-                // The same computer this writer already built: a hash index kept in
-                // the data-file directory must land in the directory the writer and
-                // the reader both derive, so both must agree on partition naming.
-                partition_computer.clone(),
-                core_options.index_file_in_data_file_dir(),
-            )))
+            BucketAssignerEnum::Dynamic(Box::new(
+                DynamicBucketAssigner::new(
+                    partition_field_indices,
+                    primary_key_indices.clone(),
+                    schema.fields().to_vec(),
+                    target_bucket_row_number,
+                    table.file_io().clone(),
+                    table.location().to_string(),
+                    is_overwrite,
+                    // The same computer this writer already built: a hash index kept in
+                    // the data-file directory must land in the directory the writer and
+                    // the reader both derive, so both must agree on partition naming.
+                    partition_computer.clone(),
+                    core_options.index_file_in_data_file_dir(),
+                )
+                .with_data_file_path_directory(core_options.data_file_path_directory()),
+            ))
         } else if total_buckets == POSTPONE_BUCKET {
             BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
                 partition_field_indices,
@@ -447,11 +460,9 @@ impl TableWrite {
                 .any(|f| matches!(f.data_type(), DataType::Vector(_)));
 
         let file_index_options = FileIndexOptions::parse(schema.options(), schema.fields())?;
-        if file_index_options.is_some()
-            && (has_blob_fields || has_dedicated_vector_fields || !blob_view_fields.is_empty())
-        {
+        if file_index_options.is_some() && has_dedicated_vector_fields {
             return Err(crate::Error::Unsupported {
-                message: "FileIndex generation does not support dedicated Blob/Vector writes"
+                message: "FileIndex generation does not support dedicated Vector writes"
                     .to_string(),
             });
         }
@@ -465,6 +476,7 @@ impl TableWrite {
             partition_keys,
             schema_id: schema.id(),
             target_file_size,
+            target_file_row_num,
             blob_target_file_size,
             vector_target_file_size,
             file_compression,
@@ -602,11 +614,19 @@ impl TableWrite {
     }
 
     pub(super) fn normalize_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
-        self.validate_write_batch_schema(batch)?;
+        let batch = self.validate_write_batch_schema(batch)?;
+        // Java filters row kinds before extracting Blob values. Ignored rows
+        // need neither valid descriptor bytes nor physical files.
+        let batch = self.enrich_rowkind_batch(&batch)?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }
-        let batch = self.enrich_rowkind_batch(batch)?;
+        if !self.primary_key_indices.is_empty() {
+            super::inline_blob::validate_inline_blob_columns(
+                &batch,
+                self.table.schema().options(),
+            )?;
+        }
         let config = PartialUpdateConfig::new(self.table.schema().options());
         let batch = if config.is_enabled()
             && config.remove_record_on_delete()
@@ -615,11 +635,11 @@ impl TableWrite {
                 .column_with_name(VALUE_KIND_FIELD_NAME)
                 .is_none()
         {
-            Self::add_value_kind_column(&batch, 0)?
+            Self::add_value_kind_column(&batch, RowKind::Insert as i8)?
         } else {
             batch
         };
-        Ok((batch.num_rows() != 0).then_some(batch))
+        Ok(Some(batch))
     }
 
     pub(super) async fn write_partition_bucket_batch(
@@ -631,7 +651,7 @@ impl TableWrite {
         self.write_bucket(partition, bucket, batch).await
     }
 
-    fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<()> {
+    fn validate_write_batch_schema(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let expected_schema = &self.write_schema;
         let actual_schema = batch.schema();
         let table_field_count = expected_schema.fields().len();
@@ -701,19 +721,20 @@ impl TableWrite {
             }
         }
 
+        let mut normalized_columns: Vec<ArrayRef> = Vec::with_capacity(actual_field_count);
         for (index, expected_field) in expected_schema.fields().iter().enumerate() {
             let actual_field = actual_schema.field(index);
-            if actual_field.data_type() != expected_field.data_type() {
-                return Err(crate::Error::DataInvalid {
+            let column = normalize_write_array(batch.column(index), expected_field.data_type())
+                .map_err(|error| crate::Error::DataInvalid {
                     message: format!(
-                        "write batch schema data type mismatch for field '{}' at index {index}: expected {:?}, actual {:?}",
+                        "write batch schema data type mismatch for field '{}' at index {index}: expected {:?}, actual {:?}: {error}",
                         expected_field.name(),
                         expected_field.data_type(),
                         actual_field.data_type()
                     ),
-                    source: None,
-                });
-            }
+                    source: Some(Box::new(error)),
+                })?;
+            normalized_columns.push(column);
         }
         if includes_value_kind {
             let actual_field = actual_schema.field(table_field_count);
@@ -727,9 +748,25 @@ impl TableWrite {
                     source: None,
                 });
             }
+            normalized_columns.push(batch.column(table_field_count).clone());
         }
 
-        Ok(())
+        let schema = if includes_value_kind {
+            let mut fields = expected_schema.fields().iter().cloned().collect::<Vec<_>>();
+            fields.push(actual_schema.fields()[table_field_count].clone());
+            Arc::new(arrow_schema::Schema::new_with_metadata(
+                fields,
+                expected_schema.metadata().clone(),
+            ))
+        } else {
+            expected_schema.clone()
+        };
+        RecordBatch::try_new(schema, normalized_columns).map_err(|error| {
+            crate::Error::DataInvalid {
+                message: format!("Failed to normalize write batch schema: {error}"),
+                source: Some(Box::new(error)),
+            }
+        })
     }
 
     /// Group rows by (partition_bytes, bucket) and return sub-batches.
@@ -870,7 +907,7 @@ impl TableWrite {
 
     fn enrich_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let Some(generator) = &self.row_kind_generator else {
-            return Ok(batch.clone());
+            return self.filter_rowkind_batch(batch);
         };
         if batch
             .schema()
@@ -884,23 +921,37 @@ impl TableWrite {
             });
         }
 
+        let kinds = (0..batch.num_rows())
+            .map(|row| generator.generate(batch, row).map(|kind| kind.to_value()))
+            .collect::<Result<Vec<_>>>()?;
+        let batch = Self::add_per_row_value_kind_column(batch, kinds)?;
+        self.filter_rowkind_batch(&batch)
+    }
+
+    /// Both generated row kinds and explicit caller-provided kinds use the
+    /// same Java RowKindFilter before bucket assignment and changelog writing.
+    fn filter_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let Some(filter) = &self.row_kind_filter else {
+            return Ok(batch.clone());
+        };
+        let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) else {
+            return Ok(batch.clone());
+        };
+        let kinds = column
+            .as_any()
+            .downcast_ref::<arrow_array::Int8Array>()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "_VALUE_KIND column must be Int8".to_string(),
+                source: None,
+            })?;
         let mut keep_rows = Vec::new();
-        let mut kinds = Vec::new();
-        for row in 0..batch.num_rows() {
-            let kind = generator.generate(batch, row)?;
-            if let Some(filter) = &self.row_kind_filter {
-                if !filter.test(kind) {
-                    continue;
-                }
+        for (row, kind) in kinds.iter().enumerate() {
+            let kind = RowKind::from_value(kind.unwrap_or(RowKind::Insert as i8))?;
+            if filter.test(kind) {
+                keep_rows.push(row);
             }
-            keep_rows.push(row);
-            kinds.push(kind.to_value());
         }
-        if keep_rows.is_empty() {
-            return Ok(RecordBatch::new_empty(batch.schema()));
-        }
-        let filtered = take_rows(batch, &keep_rows)?;
-        Self::add_per_row_value_kind_column(&filtered, kinds)
+        take_rows(batch, &keep_rows)
     }
 
     fn add_per_row_value_kind_column(
@@ -1089,7 +1140,7 @@ impl TableWrite {
         let writer = if self.primary_key_indices.is_empty() {
             self.create_append_writer(partition_path, bucket)?
         } else if bucket == POSTPONE_BUCKET {
-            self.create_postpone_writer(partition_path, bucket)
+            self.create_postpone_writer(partition_path, bucket)?
         } else {
             self.create_kv_writer(partition_path, bucket, &partition_bytes)
                 .await?
@@ -1124,6 +1175,7 @@ impl TableWrite {
                     bucket,
                     self.schema_id,
                     self.target_file_size,
+                    self.target_file_row_num,
                     self.blob_target_file_size,
                     self.file_compression.clone(),
                     self.file_compression_zstd_level,
@@ -1135,8 +1187,7 @@ impl TableWrite {
                     fields,
                     self.table.schema().options(),
                     &self.blob_inline_fields,
-                    &self.blob_view_fields,
-                )
+                )?
                 .with_resources(self.resources.clone()),
             )))
         } else {
@@ -1157,24 +1208,26 @@ impl TableWrite {
                     Some(0),
                     None,
                     None,
-                )
+                )?
                 .with_file_index(self.file_index_options.clone())
+                .with_target_file_row_num(self.target_file_row_num)
                 .with_resources(self.resources.clone()),
             ))
         }
     }
 
     /// Create a postpone writer (KV format, no sorting/dedup, special file naming).
-    fn create_postpone_writer(&self, partition_path: String, bucket: i32) -> FileWriter {
+    fn create_postpone_writer(&self, partition_path: String, bucket: i32) -> Result<FileWriter> {
         let data_file_prefix = format!(
             "{}-u-{}-s-{}-w-",
             self.data_file_prefix, self.commit_user, self.postpone_write_id
         );
-        FileWriter::Postpone(
+        Ok(FileWriter::Postpone(
             PostponeFileWriter::new(
                 self.table.file_io().clone(),
                 PostponeWriteConfig {
                     table_location: self.table.location().to_string(),
+                    table_options: self.table.schema().options().clone(),
                     partition_path,
                     bucket,
                     schema_id: self.schema_id,
@@ -1186,9 +1239,9 @@ impl TableWrite {
                     data_file_prefix,
                     file_index_options: self.file_index_options.clone(),
                 },
-            )
+            )?
             .with_resources(self.resources.clone()),
-        )
+        ))
     }
 
     /// Create a key-value writer for PK tables with normal buckets.
@@ -1863,6 +1916,55 @@ pub(in crate::table) mod tests {
         let messages = table_write.prepare_commit().await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].new_files[0].row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_remove_record_on_delete_with_rowkind_field() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_partial_update_delete_rowkind_field";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "partial-update")
+            .option("partial-update.remove-record-on-delete", "true")
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_partial_update_delete_rowkind_field"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("op", ArrowDataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(Int32Array::from(vec![10, 10])),
+                Arc::new(StringArray::from(vec!["+I", "-D"])),
+            ],
+        )
+        .unwrap();
+        let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+        assert!(read_id_value_rows(&table).await.is_empty());
     }
 
     #[tokio::test]

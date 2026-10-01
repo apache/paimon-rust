@@ -23,6 +23,7 @@ const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
 pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
 const DATA_EVOLUTION_ENABLED_OPTION: &str = "data-evolution.enabled";
+const DATA_EVOLUTION_NESTED_FIELD_ENABLED_OPTION: &str = "data-evolution.nested-field.enabled";
 const FILE_INDEX_READ_ENABLED_OPTION: &str = "file-index.read.enabled";
 const GLOBAL_INDEX_ENABLED_OPTION: &str = "global-index.enabled";
 const GLOBAL_INDEX_SEARCH_MODE_OPTION: &str = "global-index.search-mode";
@@ -36,6 +37,8 @@ const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-upda
 pub(crate) const INDEX_FILE_IN_DATA_FILE_DIR_OPTION: &str = "index-file-in-data-file-dir";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
 const BTREE_INDEX_RECORDS_PER_RANGE_OPTION: &str = "btree-index.records-per-range";
+const BTREE_INDEX_CACHE_SIZE_OPTION: &str = "btree-index.cache-size";
+const BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION: &str = "btree-index.high-priority-pool-ratio";
 const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
 const BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "bitmap-index.fallback-scan-max-size";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
@@ -91,9 +94,11 @@ const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
 const MANIFEST_TARGET_SIZE_OPTION: &str = "manifest.target-size";
 const MANIFEST_SIDECAR_ENABLED_OPTION: &str = "manifest.sidecar.enabled";
 const MANIFEST_SORT_ENABLED_OPTION: &str = "manifest-sort.enabled";
+const SCAN_MANIFEST_PARALLELISM_OPTION: &str = "scan.manifest.parallelism";
 const WRITE_PARQUET_BUFFER_SIZE_OPTION: &str = "write.parquet-buffer-size";
 const READ_BATCH_SIZE_OPTION: &str = "read.batch-size";
 const PARQUET_FILTER_COLUMN_INDEX_ENABLED_OPTION: &str = "parquet.filter.columnindex.enabled";
+const PARQUET_WRITE_PAGE_INDEX_ENABLED_OPTION: &str = "parquet.write-page-index.enabled";
 const PARQUET_ROW_GROUP_PARALLELISM_OPTION: &str = "read.parquet.row-group.parallelism";
 pub(crate) const PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES_OPTION: &str =
     "read.parquet.row-group.max-inflight-bytes";
@@ -111,7 +116,7 @@ pub(crate) const CHANGELOG_PRODUCER_OPTION: &str = "changelog-producer";
 const ROWKIND_FIELD_OPTION: &str = "rowkind.field";
 const IGNORE_DELETE_OPTION: &str = "ignore-delete";
 const IGNORE_UPDATE_BEFORE_OPTION: &str = "ignore-update-before";
-const IGNORE_DELETE_FALLBACK_KEYS: &[&str] = &[
+pub(super) const IGNORE_DELETE_FALLBACK_KEYS: &[&str] = &[
     "first-row.ignore-delete",
     "deduplicate.ignore-delete",
     "partial-update.ignore-delete",
@@ -166,6 +171,8 @@ const MAX_GLOBAL_INDEX_THREAD_NUM: i64 = {
     }
 };
 const DEFAULT_GLOBAL_INDEX_FALLBACK_SCAN_MAX_SIZE: i64 = 256 * 1024 * 1024;
+const DEFAULT_BTREE_INDEX_CACHE_SIZE: i64 = 128 * 1024 * 1024;
+const DEFAULT_BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO: f64 = 0.1;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
 pub(crate) const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
@@ -405,6 +412,35 @@ impl<'a> CoreOptions<'a> {
             return Err(crate::Error::DataInvalid {
                 message: format!(
                     "Option '{PARQUET_ROW_GROUP_PARALLELISM_OPTION}' must be greater than 0"
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
+    }
+
+    /// Maximum concurrent manifest reads during scan planning.
+    ///
+    /// Matches Java Paimon's `scan.manifest.parallelism`: when unset, use the
+    /// number of processors available to this process.
+    pub fn scan_manifest_parallelism(&self) -> crate::Result<usize> {
+        let Some(raw) = self.options.get(SCAN_MANIFEST_PARALLELISM_OPTION) else {
+            return Ok(std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1));
+        };
+        let value = raw
+            .parse::<usize>()
+            .map_err(|error| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{SCAN_MANIFEST_PARALLELISM_OPTION}' must be a positive integer, got: {raw}"
+                ),
+                source: Some(Box::new(error)),
+            })?;
+        if value == 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{SCAN_MANIFEST_PARALLELISM_OPTION}' must be greater than 0"
                 ),
                 source: None,
             });
@@ -728,6 +764,20 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    pub fn data_evolution_write_cols_optimization_enabled(&self) -> bool {
+        self.options
+            .get("data-evolution.write-cols-optimization.enabled")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    pub fn data_evolution_nested_field_enabled(&self) -> bool {
+        self.options
+            .get(DATA_EVOLUTION_NESTED_FIELD_ENABLED_OPTION)
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
     /// Maximum complete FileIndex size stored in the manifest. Default is 500 bytes.
     pub(crate) fn file_index_in_manifest_threshold(&self) -> crate::Result<i64> {
         match self.options.get("file-index.in-manifest-threshold") {
@@ -757,6 +807,22 @@ impl<'a> CoreOptions<'a> {
             _ => Err(crate::Error::ConfigInvalid {
                 message: format!(
                     "Option '{PARQUET_FILTER_COLUMN_INDEX_ENABLED_OPTION}' must be true or false, got: {raw}"
+                ),
+            }),
+        }
+    }
+
+    /// Whether newly written Parquet files include page indexes. Default is true.
+    pub fn parquet_write_page_index_enabled(&self) -> crate::Result<bool> {
+        let Some(raw) = self.options.get(PARQUET_WRITE_PAGE_INDEX_ENABLED_OPTION) else {
+            return Ok(true);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "Option '{PARQUET_WRITE_PAGE_INDEX_ENABLED_OPTION}' must be true or false, got: {raw}"
                 ),
             }),
         }
@@ -957,6 +1023,70 @@ impl<'a> CoreOptions<'a> {
 
     pub fn btree_index_fallback_scan_max_size(&self) -> crate::Result<i64> {
         self.fallback_scan_max_size(BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION)
+    }
+
+    pub fn btree_index_cache_size(&self) -> crate::Result<usize> {
+        let value = match self.options.get(BTREE_INDEX_CACHE_SIZE_OPTION) {
+            Some(raw) => parse_memory_size(raw).ok_or_else(|| crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be a valid memory size, got: {}",
+                    BTREE_INDEX_CACHE_SIZE_OPTION, raw
+                ),
+                source: None,
+            })?,
+            None => DEFAULT_BTREE_INDEX_CACHE_SIZE,
+        };
+        if value < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be greater than or equal to 0, got: {}",
+                    BTREE_INDEX_CACHE_SIZE_OPTION, value
+                ),
+                source: None,
+            });
+        }
+        usize::try_from(value).map_err(|_| crate::Error::DataInvalid {
+            message: format!(
+                "Option '{}' is too large: {}",
+                BTREE_INDEX_CACHE_SIZE_OPTION, value
+            ),
+            source: None,
+        })
+    }
+
+    pub fn btree_index_high_priority_pool_ratio(&self) -> crate::Result<f64> {
+        let value = match self
+            .options
+            .get(BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION)
+        {
+            Some(raw) => raw
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| crate::Error::DataInvalid {
+                    message: format!(
+                        "Option '{}' must be a valid number, got: {}",
+                        BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION, raw
+                    ),
+                    source: None,
+                })?,
+            None => DEFAULT_BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO,
+        };
+        if !(0.0..1.0).contains(&value) {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must be in the range [0, 1), got: {}",
+                    BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION, value
+                ),
+                source: None,
+            });
+        }
+        Ok(value)
+    }
+
+    pub fn btree_index_data_block_cache_size(&self) -> crate::Result<usize> {
+        let total = self.btree_index_cache_size()?;
+        let high_priority_ratio = self.btree_index_high_priority_pool_ratio()?;
+        Ok((total as f64 * (1.0 - high_priority_ratio)) as usize)
     }
 
     pub fn bitmap_index_fallback_scan_max_size(&self) -> crate::Result<i64> {
@@ -1292,6 +1422,24 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(DEFAULT_TARGET_FILE_SIZE)
     }
 
+    /// Maximum rows in a newly written data file. Java defaults to `Long.MAX_VALUE`.
+    pub fn target_file_row_num(&self) -> crate::Result<i64> {
+        let Some(raw) = self.options.get("target-file-row-num") else {
+            return Ok(i64::MAX);
+        };
+        let rows = raw
+            .parse::<i64>()
+            .map_err(|_| crate::Error::ConfigInvalid {
+                message: format!("target-file-row-num must be a positive integer, got '{raw}'"),
+            })?;
+        if rows <= 0 {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("target-file-row-num must be positive, got {rows}"),
+            });
+        }
+        Ok(rows)
+    }
+
     /// Explicit `file.block-size`, in bytes. Formats choose their own default.
     pub(crate) fn file_block_size(&self) -> crate::Result<Option<i64>> {
         self.options
@@ -1359,6 +1507,23 @@ impl<'a> CoreOptions<'a> {
             .get(FILE_COMPRESSION_ZSTD_LEVEL_OPTION)
             .and_then(|v| v.parse().ok())
             .unwrap_or(1)
+    }
+
+    pub(crate) fn validate_data_file_path_directory(&self) -> crate::Result<()> {
+        if self.data_file_path_directory() == Some("") {
+            return Err(crate::Error::ConfigInvalid {
+                message: "data-file.path-directory must not be empty".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Directory containing bucket data, resolved against the table location.
+    /// Supports relative paths, absolute paths, and URIs, like Java `Path`.
+    pub fn data_file_path_directory(&self) -> Option<&str> {
+        self.options
+            .get("data-file.path-directory")
+            .map(String::as_str)
     }
 
     /// File name prefix for data files. Default is `"data-"`.
@@ -2367,6 +2532,74 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_index_cache_size_matches_java_default_and_validates_values() {
+        assert_eq!(
+            CoreOptions::new(&HashMap::new())
+                .btree_index_cache_size()
+                .unwrap(),
+            128 * 1024 * 1024
+        );
+
+        let disabled =
+            HashMap::from([(BTREE_INDEX_CACHE_SIZE_OPTION.to_string(), "0".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&disabled)
+                .btree_index_cache_size()
+                .unwrap(),
+            0
+        );
+
+        for value in ["-1", "invalid"] {
+            let options =
+                HashMap::from([(BTREE_INDEX_CACHE_SIZE_OPTION.to_string(), value.to_string())]);
+            let error = CoreOptions::new(&options)
+                .btree_index_cache_size()
+                .expect_err("invalid BTree cache size should fail");
+            assert!(error.to_string().contains(BTREE_INDEX_CACHE_SIZE_OPTION));
+        }
+    }
+
+    #[test]
+    fn test_btree_index_data_block_cache_size_matches_java_pool_split() {
+        let empty = HashMap::new();
+        let defaults = CoreOptions::new(&empty);
+        assert_eq!(
+            defaults.btree_index_data_block_cache_size().unwrap(),
+            (128.0 * 1024.0 * 1024.0 * 0.9) as usize
+        );
+
+        let options = HashMap::from([
+            (
+                BTREE_INDEX_CACHE_SIZE_OPTION.to_string(),
+                (128 * 1024 * 1024).to_string(),
+            ),
+            (
+                BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION.to_string(),
+                "0.9".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            CoreOptions::new(&options)
+                .btree_index_data_block_cache_size()
+                .unwrap(),
+            (128.0 * 1024.0 * 1024.0 * 0.1) as usize
+        );
+
+        for value in ["-0.1", "1", "NaN", "invalid"] {
+            let options = HashMap::from([(
+                BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION.to_string(),
+                value.to_string(),
+            )]);
+            let error = CoreOptions::new(&options)
+                .btree_index_data_block_cache_size()
+                .expect_err("invalid BTree cache ratio should fail");
+            assert!(error
+                .to_string()
+                .contains(BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO_OPTION));
+        }
+    }
+
+    #[test]
     fn test_file_formats_are_normalized_to_lowercase() {
         // Java routes every file-format option through
         // `CoreOptions.normalizeFileFormat`, which lowercases it. The value ends
@@ -2649,6 +2882,31 @@ mod tests {
         assert_eq!(parallelism(Some("-3")), 1);
         assert_eq!(parallelism(Some("5000")), 1000);
         assert_eq!(parallelism(Some("many")), 64);
+    }
+
+    #[test]
+    fn test_scan_manifest_parallelism() {
+        let parallelism = |value: Option<&str>| {
+            let options = value
+                .map(|value| {
+                    HashMap::from([(
+                        SCAN_MANIFEST_PARALLELISM_OPTION.to_string(),
+                        value.to_string(),
+                    )])
+                })
+                .unwrap_or_default();
+            CoreOptions::new(&options).scan_manifest_parallelism()
+        };
+
+        assert_eq!(
+            parallelism(None).unwrap(),
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+        );
+        assert_eq!(parallelism(Some("8")).unwrap(), 8);
+        assert!(parallelism(Some("0")).is_err());
+        assert!(parallelism(Some("many")).is_err());
     }
 
     #[test]

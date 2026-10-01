@@ -227,7 +227,9 @@ fn bucket_path(
     partition: &BinaryRow,
     bucket: i32,
 ) -> Result<String> {
-    let base = table_location.trim_end_matches('/');
+    let data_root =
+        crate::spec::data_file_path(table_location, core_options.data_file_path_directory());
+    let base = data_root.trim_end_matches('/');
     if partition_keys.is_empty() {
         return Ok(format!("{base}/{}", bucket_dir_name(bucket)));
     }

@@ -24,13 +24,13 @@
 //!
 //! Reference: [PostponeBucketWriter](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/sink/PostponeBucketWriter.java)
 
+use super::data_file_path_factory::{DataFilePath, DataFilePathFactory};
 use crate::arrow::format::{create_format_writer, with_write_resources, FormatFileWriter};
 use crate::io::FileIO;
 use crate::resource::ResourceContext;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    bucket_path_under, data_file_to_file_index_file_name, DataFileMeta, EMPTY_SERIALIZED_ROW,
-    VALUE_KIND_FIELD_NAME,
+    data_file_to_file_index_file_name, DataFileMeta, EMPTY_SERIALIZED_ROW, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
 use crate::table::kv_file_writer::build_physical_schema;
@@ -42,6 +42,7 @@ use tokio::task::JoinSet;
 
 /// Configuration for [`PostponeFileWriter`].
 pub(crate) struct PostponeWriteConfig {
+    pub table_options: std::collections::HashMap<String, String>,
     pub table_location: String,
     pub partition_path: String,
     pub bucket: i32,
@@ -62,12 +63,14 @@ pub(crate) struct PostponeWriteConfig {
 /// prepending `_SEQUENCE_NUMBER` and `_VALUE_KIND` columns to each batch.
 /// Rolls to a new file when `target_file_size` is reached.
 pub(crate) struct PostponeFileWriter {
+    paths: DataFilePathFactory,
     file_io: FileIO,
     config: PostponeWriteConfig,
     next_sequence_number: i64,
     current_writer: Option<Box<dyn FormatFileWriter>>,
     current_index: Option<DataFileIndexWriter>,
     current_file_name: Option<String>,
+    current_file_path: Option<DataFilePath>,
     current_row_count: i64,
     /// Sequence number at which the current file started.
     current_file_start_seq: i64,
@@ -81,14 +84,22 @@ pub(crate) struct PostponeFileWriter {
 }
 
 impl PostponeFileWriter {
-    pub(crate) fn new(file_io: FileIO, config: PostponeWriteConfig) -> Self {
-        Self {
+    pub(crate) fn new(file_io: FileIO, config: PostponeWriteConfig) -> Result<Self> {
+        let paths = DataFilePathFactory::new(
+            &config.table_location,
+            &config.partition_path,
+            config.bucket,
+            &config.table_options,
+        )?;
+        Ok(Self {
+            paths,
             file_io,
             config,
             next_sequence_number: 0,
             current_writer: None,
             current_index: None,
             current_file_name: None,
+            current_file_path: None,
             current_row_count: 0,
             current_file_start_seq: 0,
             current_file_creation_time: Utc::now(),
@@ -96,7 +107,7 @@ impl PostponeFileWriter {
             created_paths: Vec::new(),
             in_flight_closes: JoinSet::new(),
             resources: None,
-        }
+        })
     }
 
     pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
@@ -199,6 +210,7 @@ impl PostponeFileWriter {
         }
         self.current_index = None;
         self.current_file_name = None;
+        self.current_file_path = None;
         while self.in_flight_closes.join_next().await.is_some() {}
         for path in self.created_paths.drain(..) {
             let _ = self.file_io.delete_file(&path).await;
@@ -236,11 +248,8 @@ impl PostponeFileWriter {
         let file_name = self.current_file_name.take().unwrap();
         let index = self.current_index.take();
         let file_io = self.file_io.clone();
-        let bucket_dir = bucket_path_under(
-            &self.config.table_location,
-            &self.config.partition_path,
-            self.config.bucket,
-        );
+        let location = self.current_file_path.take().unwrap();
+        let bucket_dir = location.parent().to_string();
         let threshold = self
             .config
             .file_index_options
@@ -266,6 +275,7 @@ impl PostponeFileWriter {
                 schema_id,
                 creation_time,
             );
+            meta.external_path = location.external_path;
             write_index(index, threshold, &file_io, &bucket_dir, &mut meta).await?;
             Ok(meta)
         });
@@ -285,14 +295,11 @@ impl PostponeFileWriter {
             self.written_files.len(),
             self.config.file_format,
         );
-        let bucket_dir = bucket_path_under(
-            &self.config.table_location,
-            &self.config.partition_path,
-            self.config.bucket,
-        );
+        let location = self.paths.new_path(&file_name)?;
+        let bucket_dir = location.parent();
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
         let physical_schema = build_physical_schema(&user_schema);
-        let file_path = format!("{bucket_dir}/{file_name}");
+        let file_path = location.path.clone();
         self.created_paths.push(file_path.clone());
         if index.is_some() {
             self.created_paths.push(format!(
@@ -314,6 +321,7 @@ impl PostponeFileWriter {
         self.current_writer = Some(with_write_resources(writer, self.resources.as_ref()));
         self.current_index = index;
         self.current_file_name = Some(file_name);
+        self.current_file_path = Some(location);
         self.current_row_count = 0;
         self.current_file_start_seq = self.next_sequence_number;
         self.current_file_creation_time = Utc::now();
@@ -343,16 +351,14 @@ impl PostponeFileWriter {
             self.config.schema_id,
             self.current_file_creation_time,
         );
-        let bucket_dir = bucket_path_under(
-            &self.config.table_location,
-            &self.config.partition_path,
-            self.config.bucket,
-        );
+        let location = self.current_file_path.take().unwrap();
+        let bucket_dir = location.parent().to_string();
         let threshold = self
             .config
             .file_index_options
             .as_ref()
             .map(|options| options.in_manifest_threshold);
+        meta.external_path = location.external_path;
         write_index(index, threshold, &self.file_io, &bucket_dir, &mut meta).await?;
         self.written_files.push(meta);
         Ok(())

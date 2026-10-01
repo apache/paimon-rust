@@ -1390,7 +1390,14 @@ mod tests {
         ];
         let options = HashMap::from([(
             "parquet.variant.shreddingSchema".to_string(),
-            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"age","type":"BIGINT"},{"name":"city","type":"STRING"}]}}]}"#.to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[
+                {"name":"age","type":"BIGINT"},
+                {"name":"city","type":"VARCHAR"},
+                {"name":"fixed","type":"BINARY"},
+                {"name":"raw","type":"VARBINARY"},
+                {"name":"tags","type":{"type":"ARRAY","element":"VARCHAR"}},
+                {"name":"address","type":{"type":"ROW","fields":[{"name":"street","type":"VARCHAR"}]}}
+            ]}}]}"#.to_string(),
         )]);
         let physical_fields = configured_variant_shredding_fields(&logical_fields, &options)
             .unwrap()
@@ -1398,14 +1405,24 @@ mod tests {
         assert_ne!(logical_fields, physical_fields);
 
         let variants = vec![
-            GenericVariant::parse_json(r#"{"age":27,"city":"Beijing"}"#).unwrap(),
+            GenericVariant::parse_json(
+                r#"{"age":27,"city":"Beijing","tags":["first","second"],"address":{"street":"Paimon Road"}}"#,
+            )
+            .unwrap(),
             GenericVariant::parse_json(r#"{"city":"Hangzhou","other":"x"}"#).unwrap(),
             GenericVariant::parse_json(r#"{"age":"old"}"#).unwrap(),
+            // PyPaimon GenericVariant.from_python({'fixed': b'\x00\x01\x02',
+            //                                    'raw': b'\x03\x04\x05\x06'}).
+            GenericVariant::from_parts(
+                hex::decode("020200010008113c030000000001023c0400000003040506").unwrap(),
+                hex::decode("01020005086669786564726177").unwrap(),
+            )
+            .unwrap(),
         ];
         let batch = RecordBatch::try_new(
             build_target_arrow_schema(&logical_fields).unwrap(),
             vec![
-                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
                 variant_array_for_test(&variants),
             ],
         )
@@ -1414,6 +1431,33 @@ mod tests {
         let physical =
             batch_to_shredded_physical(&batch, &logical_fields, &physical_fields).unwrap();
         assert!(is_shredded_variant_array(physical.column(1).as_ref()));
+
+        let shredded = physical
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let typed = shredded
+            .column_by_name("typed_value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        for (name, expected) in [("fixed", &[0, 1, 2][..]), ("raw", &[3, 4, 5, 6][..])] {
+            let field = typed
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            let binary = field
+                .column_by_name("typed_value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            assert_eq!(binary.value(3), expected);
+        }
 
         let assembled = assemble_shredded_variant_array(physical.column(1).as_ref()).unwrap();
         let assembled = assembled.as_any().downcast_ref::<StructArray>().unwrap();

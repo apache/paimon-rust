@@ -553,6 +553,7 @@ impl<'a> PaimonReadBuilder<'a> {
         // `to_arrow` (e.g. an empty-splits fast path) can't bypass the guard.
         let core_options = self.table.schema.core_options();
         core_options.ensure_read_authorized()?;
+        core_options.validate_data_file_path_directory()?;
         let read_type = match self.resolve_read_type()? {
             None => self.table.schema.fields().to_vec(),
             Some(fields) => fields,

@@ -149,10 +149,10 @@ impl TableSchema {
     /// override, and the declared `type` can't be changed by one: an override
     /// could re-route foreign data through the Paimon reader.
     ///
-    /// `index-file-in-data-file-dir` can't be changed by one either. It selects
-    /// the directory every bucket-local index file is written to and read from,
-    /// while an index manifest records only the file name, so a copy carrying an
-    /// overridden value would write hash and deletion-vector index files where a
+    /// `index-file-in-data-file-dir` and `data-file.path-directory` also retain
+    /// their stored values. They select where data and bucket-local indexes are
+    /// written and read, while manifests record file names, so a copy carrying an
+    /// overridden value would write files where a
     /// normally loaded table cannot find them. Java rejects such an override
     /// outright in `AbstractFileStoreTable.checkImmutability`; this copy cannot
     /// fail, so the stored value wins instead, and an absent one leaves the
@@ -165,13 +165,15 @@ impl TableSchema {
             Some(declared) => extra.insert(TABLE_TYPE_OPTION.to_string(), declared.clone()),
             None => extra.remove(TABLE_TYPE_OPTION),
         };
-        match self.options.get(INDEX_FILE_IN_DATA_FILE_DIR_OPTION) {
-            Some(stored) => extra.insert(
-                INDEX_FILE_IN_DATA_FILE_DIR_OPTION.to_string(),
-                stored.clone(),
-            ),
-            None => extra.remove(INDEX_FILE_IN_DATA_FILE_DIR_OPTION),
-        };
+        for key in [
+            INDEX_FILE_IN_DATA_FILE_DIR_OPTION,
+            "data-file.path-directory",
+        ] {
+            match self.options.get(key) {
+                Some(stored) => extra.insert(key.to_string(), stored.clone()),
+                None => extra.remove(key),
+            };
+        }
         let mut new_schema = self.clone();
         new_schema.options.extend(extra);
         new_schema
@@ -1213,6 +1215,11 @@ impl Schema {
         Self::validate_bucket_keys(options, fields, partition_keys, primary_keys)?;
         Self::validate_sequence_field(options, fields, partition_keys, primary_keys)?;
         Self::validate_read_batch_size(options)?;
+        CoreOptions::new(options).validate_data_file_path_directory()?;
+        let core_options = CoreOptions::new(options);
+        if !core_options.is_format_table() {
+            core_options.target_file_row_num()?;
+        }
         Self::validate_primary_key_vector_index(fields, primary_keys, options)?;
         Self::validate_primary_key_full_text_index(fields, primary_keys, options)?;
         Ok(())
@@ -1573,7 +1580,7 @@ impl Schema {
         Ok(())
     }
 
-    fn validate_primary_key_blob_configuration(
+    pub(crate) fn validate_primary_key_blob_configuration(
         fields: &[DataField],
         primary_keys: &[String],
         options: &HashMap<String, String>,
@@ -1816,15 +1823,6 @@ impl Schema {
         if primary_keys.is_empty() {
             return Err(crate::Error::ConfigInvalid {
                 message: "rowkind.field requires a primary-key table".to_string(),
-            });
-        }
-
-        let merge_engine = core
-            .merge_engine()
-            .map_err(Self::options_error_to_config_invalid)?;
-        if merge_engine != MergeEngine::Deduplicate {
-            return Err(crate::Error::ConfigInvalid {
-                message: "rowkind.field only supports merge-engine=deduplicate".to_string(),
             });
         }
 
@@ -3349,7 +3347,8 @@ mod tests {
     #[test]
     fn test_aggregation_schema_validation_rejects_unsupported_options() {
         for (key, value) in [
-            ("ignore-delete", "true"),
+            ("aggregation.ignore-delete", "true"),
+            ("fields.value.ignore-delete", "true"),
             ("fields.value.sequence-group", "g1"),
         ] {
             let err = Schema::builder()
@@ -5808,20 +5807,17 @@ mod tests {
     }
 
     #[test]
-    fn rowkind_field_rejects_non_deduplicate_merge_engine() {
-        let err = Schema::builder()
-            .column("id", DataType::Int(IntType::new()))
-            .column("op", DataType::VarChar(VarCharType::string_type()))
-            .primary_key(["id"])
-            .option("merge-engine", "partial-update")
-            .option("rowkind.field", "op")
-            .build()
-            .unwrap_err();
-        assert!(
-            matches!(err, crate::Error::ConfigInvalid { ref message }
-                if message.contains("deduplicate")),
-            "got {err:?}"
-        );
+    fn rowkind_field_accepts_supported_merge_engines() {
+        for engine in ["deduplicate", "first-row", "partial-update", "aggregation"] {
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("op", DataType::VarChar(VarCharType::string_type()))
+                .primary_key(["id"])
+                .option("merge-engine", engine)
+                .option("rowkind.field", "op")
+                .build()
+                .unwrap();
+        }
     }
 
     #[test]
