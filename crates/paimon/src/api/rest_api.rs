@@ -964,6 +964,18 @@ impl RESTApi {
         tag_name: &str,
         snapshot_id: Option<i64>,
     ) -> Result<()> {
+        self.create_tag_with_retention(identifier, tag_name, snapshot_id, None)
+            .await
+    }
+
+    /// Create a tag, forwarding the optional retention string to the server unchanged.
+    pub async fn create_tag_with_retention(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+        time_retained: Option<&str>,
+    ) -> Result<()> {
         let database = identifier.database();
         let table = identifier.object();
         validate_non_empty_multi(&[
@@ -972,7 +984,8 @@ impl RESTApi {
             (tag_name, "tag name"),
         ])?;
         let path = self.resource_paths.tags(database, table);
-        let request = CreateTagRequest::new(tag_name.to_string(), snapshot_id);
+        let mut request = CreateTagRequest::new(tag_name.to_string(), snapshot_id);
+        request.time_retained = time_retained.map(str::to_string);
         let _response: serde_json::Value = self.client.post(&path, &request).await?;
         Ok(())
     }

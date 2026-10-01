@@ -1857,6 +1857,70 @@ async fn test_catalog_alter_table() {
 }
 
 #[tokio::test]
+async fn test_catalog_create_tag_with_retention() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    ctx.server.add_table("default", "managed_table");
+    let identifier = Identifier::new("default", "managed_table");
+    let catalog: &dyn Catalog = &ctx.catalog;
+    for (name, snapshot_id, retention) in [
+        ("explicit", Some(1), Some("1d")),
+        ("latest", None, Some(" 12 HOURS ")),
+        ("micro", Some(1), Some("500micro")),
+        ("plain", None, None),
+    ] {
+        catalog
+            .create_tag_with_retention(&identifier, name, snapshot_id, retention, false)
+            .await
+            .unwrap();
+        let tag = catalog.get_tag(&identifier, name).await.unwrap();
+        assert_eq!(tag.snapshot.id(), 1);
+        assert_eq!(tag.tag_time_retained.as_deref(), retention);
+    }
+
+    assert!(matches!(
+        catalog
+            .create_tag_with_retention(&identifier, "explicit", Some(1), Some("12h"), false)
+            .await,
+        Err(paimon::Error::TagAlreadyExist { .. })
+    ));
+    catalog
+        .create_tag_with_retention(&identifier, "explicit", Some(1), Some("12h"), true)
+        .await
+        .unwrap();
+    catalog
+        .create_tag(&identifier, "explicit", Some(1), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .get_tag(&identifier, "explicit")
+            .await
+            .unwrap()
+            .tag_time_retained
+            .as_deref(),
+        Some("1d")
+    );
+    assert!(matches!(
+        catalog
+            .create_tag_with_retention(&identifier, "missing", Some(2), Some("1d"), false)
+            .await,
+        Err(paimon::Error::SnapshotNotExist { snapshot_id: 2 })
+    ));
+    assert!(matches!(
+        catalog
+            .create_tag_with_retention(
+                &Identifier::new("default", "missing"),
+                "tag",
+                None,
+                Some("1d"),
+                false
+            )
+            .await,
+        Err(paimon::Error::TableNotExist { .. })
+    ));
+}
+
+#[tokio::test]
 async fn test_catalog_tag_lifecycle() {
     let ctx = setup_catalog(vec!["default"]).await;
     ctx.server.add_table("default", "managed_table");

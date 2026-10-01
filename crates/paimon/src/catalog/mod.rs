@@ -510,6 +510,29 @@ pub trait Catalog: Send + Sync {
         })
     }
 
+    /// Create a tag with an optional retention, such as `"1d"`, `"12h"`, or `"500micro"`.
+    ///
+    /// `None` preserves [`Self::create_tag`] behavior. An explicit retention records the
+    /// creation time and TTL; this method does not run tag expiration.
+    /// Catalogs that do not support retention return [`Error::Unsupported`].
+    async fn create_tag_with_retention(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+        time_retained: Option<&str>,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        if time_retained.is_none() {
+            return self
+                .create_tag(identifier, tag_name, snapshot_id, ignore_if_exists)
+                .await;
+        }
+        Err(Error::Unsupported {
+            message: "tag retention is not supported by this catalog".to_string(),
+        })
+    }
+
     /// Return a tag and its snapshot metadata.
     async fn get_tag(&self, _identifier: &Identifier, _tag_name: &str) -> Result<GetTagResponse> {
         Err(Error::Unsupported {

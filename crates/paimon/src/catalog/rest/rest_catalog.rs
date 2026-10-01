@@ -410,9 +410,21 @@ impl Catalog for RESTCatalog {
         snapshot_id: Option<i64>,
         ignore_if_exists: bool,
     ) -> Result<()> {
+        self.create_tag_with_retention(identifier, tag_name, snapshot_id, None, ignore_if_exists)
+            .await
+    }
+
+    async fn create_tag_with_retention(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+        time_retained: Option<&str>,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
         let result = self
             .api
-            .create_tag(identifier, tag_name, snapshot_id)
+            .create_tag_with_retention(identifier, tag_name, snapshot_id, time_retained)
             .await
             .map_err(|error| map_rest_error_for_tag(error, identifier, tag_name, snapshot_id));
         ignore_error_if(result, |error| {
