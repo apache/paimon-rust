@@ -628,14 +628,28 @@ impl TableWrite {
             )?;
         }
         let config = PartialUpdateConfig::new(self.table.schema().options());
-        let batch = if config.is_enabled()
-            && config.remove_record_on_delete()
-            && batch
+        let batch = if config.is_enabled() && config.remove_record_on_delete() {
+            let batch = if batch
                 .schema()
                 .column_with_name(VALUE_KIND_FIELD_NAME)
                 .is_none()
-        {
-            Self::add_value_kind_column(&batch, RowKind::Insert as i8)?
+            {
+                Self::add_value_kind_column(&batch, RowKind::Insert as i8)?
+            } else {
+                batch
+            };
+            // NULL kinds are Inserts. Every buffered batch must allow them,
+            // including batches with synthesized Insert kinds.
+            let schema = batch.schema();
+            let kind_index = schema.index_of(VALUE_KIND_FIELD_NAME).unwrap();
+            let mut schema = arrow_schema::SchemaBuilder::from(schema.as_ref());
+            Arc::make_mut(schema.field_mut(kind_index)).set_nullable(true);
+            batch
+                .with_schema(Arc::new(schema.finish()))
+                .map_err(|error| crate::Error::DataInvalid {
+                    message: format!("Failed to normalize _VALUE_KIND schema: {error}"),
+                    source: Some(Box::new(error)),
+                })?
         } else {
             batch
         };

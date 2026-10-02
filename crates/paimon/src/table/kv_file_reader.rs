@@ -2888,6 +2888,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kv_read_partial_update_mixed_value_kind_schemas() {
+        for (nullable, insert_kind) in [(true, None), (true, Some(0)), (false, Some(0))] {
+            for kinds_first in [false, true] {
+                let file_io = test_file_io();
+                let table_path = format!(
+                    "memory:/kv_partial_update_mixed_kinds_{nullable}_{insert_kind:?}_{kinds_first}"
+                );
+                setup_dirs(&file_io, &table_path).await;
+                let table = pk_table(
+                    &file_io,
+                    &table_path,
+                    &[
+                        ("merge-engine", "partial-update"),
+                        ("partial-update.remove-record-on-delete", "true"),
+                    ],
+                );
+                let ordinary = int_batch(vec![1, 3, 4], vec![Some(10), Some(30), Some(40)]);
+                let explicit_kinds = RecordBatch::try_new(
+                    Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("id", ArrowDataType::Int32, false),
+                        ArrowField::new("value", ArrowDataType::Int32, true),
+                        ArrowField::new(VALUE_KIND_FIELD_NAME, ArrowDataType::Int8, nullable),
+                    ])),
+                    vec![
+                        Arc::new(Int32Array::from(vec![2, 3, 4])),
+                        Arc::new(Int32Array::from(vec![Some(20), None, Some(42)])),
+                        Arc::new(Int8Array::from(vec![insert_kind, Some(3), Some(2)])),
+                    ],
+                )
+                .unwrap();
+                let batches = if kinds_first {
+                    [&explicit_kinds, &ordinary]
+                } else {
+                    [&ordinary, &explicit_kinds]
+                };
+                let mut write = TableWrite::new(&table, "test-user".to_string()).unwrap();
+                for batch in batches {
+                    write.write_arrow_batch(batch).await.unwrap();
+                }
+                let messages = write.prepare_commit().await.unwrap();
+                TableCommit::new(table.clone(), "test-user".to_string())
+                    .commit(messages)
+                    .await
+                    .unwrap();
+
+                let batches = read_rows(&table, None, None).await;
+                let mut rows: Vec<_> = int_column(&batches, "id")
+                    .into_iter()
+                    .zip(int_column(&batches, "value"))
+                    .collect();
+                rows.sort_unstable();
+                let expected = if kinds_first {
+                    vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+                } else {
+                    vec![(1, 10), (2, 20), (4, 42)]
+                };
+                assert_eq!(rows, expected, "{table_path}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn kv_read_partial_update_sequence_groups_with_projection() {
         let file_io = test_file_io();
         let table_path = "memory:/kv_partial_update_sequence_groups";
