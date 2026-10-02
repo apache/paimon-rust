@@ -136,7 +136,9 @@ impl FileSystemCatalog {
     }
 
     fn build_file_io(&self, path: &str) -> Result<FileIO> {
-        let mut builder = FileIO::from_path(path)?.with_props(self.options.to_map().iter());
+        let mut builder = FileIO::from_path(path)?
+            .with_props(self.options.to_map().iter())
+            .with_cache_context(self.file_io.cache_context());
         if let Some(local_cache) = &self.local_cache {
             builder = builder.with_local_cache(local_cache.clone());
         }
@@ -820,6 +822,7 @@ fn fill_table_name(err: Error, identifier: &Identifier) -> Error {
 #[cfg(not(windows))]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     /// Returns a temp dir guard (keep alive for test duration) and a catalog using it as warehouse.
@@ -851,6 +854,21 @@ mod tests {
         let catalog = FileSystemCatalog::new(options).unwrap();
 
         assert!(catalog.file_io().has_local_cache());
+    }
+
+    #[test]
+    fn test_filesystem_catalog_derived_file_io_shares_metadata_caches() {
+        let catalog = create_memory_catalog();
+        let derived = catalog.build_file_io("memory:/objects").unwrap();
+
+        assert!(Arc::ptr_eq(
+            &catalog.file_io().file_format_metadata_cache(),
+            &derived.file_format_metadata_cache()
+        ));
+        assert!(Arc::ptr_eq(
+            &catalog.file_io().blob_index_cache(),
+            &derived.blob_index_cache()
+        ));
     }
 
     fn testing_schema() -> Schema {

@@ -870,8 +870,7 @@ pub(crate) async fn rest_query_auth_table() -> Table {
     options.set("token.provider", "bear");
     options.set("token", "test_token");
     let api = std::sync::Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
-    let metadata_cache =
-        crate::io::FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
+    let file_io_cache = crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap();
     let table = query_auth_table();
     Table {
         rest_env: Some(RESTEnv::new(
@@ -881,7 +880,7 @@ pub(crate) async fn rest_query_auth_table() -> Table {
             options,
             false,
             None,
-            metadata_cache,
+            file_io_cache,
         )),
         ..table
     }

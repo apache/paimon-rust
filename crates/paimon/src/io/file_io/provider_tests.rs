@@ -24,6 +24,7 @@ struct PrefixProvider {
     routes: Vec<(String, Operator)>,
     calls: AtomicUsize,
     reject: AtomicBool,
+    cacheable: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -43,6 +44,18 @@ impl FileIOProvider for PrefixProvider {
         }
         RejectingProvider.create(path).await
     }
+
+    async fn create_with_cache_namespace(
+        &self,
+        path: &str,
+    ) -> Result<(Operator, String, Option<String>)> {
+        let (op, relative) = self.create(path).await?;
+        let namespace = self
+            .cacheable
+            .load(Ordering::SeqCst)
+            .then(|| format!("{:p}", Arc::as_ptr(op.service())));
+        Ok((op, relative, namespace))
+    }
 }
 
 fn memory_operator() -> Operator {
@@ -54,6 +67,7 @@ fn provider_io(routes: Vec<(String, Operator)>) -> (FileIO, Arc<PrefixProvider>)
         routes,
         calls: AtomicUsize::new(0),
         reject: AtomicBool::new(false),
+        cacheable: AtomicBool::new(false),
     });
     let io = FileIOBuilder::new("application-storage")
         .with_provider(provider.clone())
@@ -393,6 +407,24 @@ fn with_memory_cache(mut io: FileIO) -> FileIO {
 }
 
 #[tokio::test]
+async fn provider_without_namespace_bypasses_caches() {
+    let op = memory_operator();
+    let (io, _) = provider_io(vec![("s3://bucket/".to_string(), op.clone())]);
+    let io = with_memory_cache(io);
+    let path = "s3://bucket/table/snapshot/snapshot-1";
+    let input = io.new_input(path).unwrap();
+    op.write("table/snapshot/snapshot-1", "first")
+        .await
+        .unwrap();
+    assert_eq!(input.reader().await.unwrap().cache_key(), None);
+    assert_eq!(input.read().await.unwrap(), "first");
+    op.write("table/snapshot/snapshot-1", "later")
+        .await
+        .unwrap();
+    assert_eq!(input.read().await.unwrap(), "later");
+}
+
+#[tokio::test]
 async fn provider_cache_isolates_buckets_and_invalidates_aliases() {
     use tokio::io::AsyncWriteExt;
 
@@ -403,6 +435,7 @@ async fn provider_cache_isolates_buckets_and_invalidates_aliases() {
         ("s3a://first/".to_string(), first.clone()),
         ("oss://second/".to_string(), second.clone()),
     ]);
+    provider.cacheable.store(true, Ordering::SeqCst);
     let io = with_memory_cache(io);
     let key = "table/snapshot/snapshot-1";
     let a = io.new_input(&format!("s3://first/{key}")).unwrap();

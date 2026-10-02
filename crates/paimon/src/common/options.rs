@@ -94,6 +94,9 @@ impl CatalogOptions {
     /// Maximum process-local cache size for parsed file-format metadata.
     pub const FILE_FORMAT_METADATA_CACHE_MAX_SIZE: &'static str =
         "file-format.metadata-cache.max-size";
+
+    /// Maximum catalog-local cache size for decoded BLOB indexes.
+    pub const BLOB_INDEX_CACHE_MAX_SIZE: &'static str = "cache.blob-index.max-size";
 }
 
 /// Configuration options container.
@@ -287,6 +290,10 @@ mod tests {
         assert_eq!(
             CatalogOptions::FILE_FORMAT_METADATA_CACHE_MAX_SIZE,
             "file-format.metadata-cache.max-size"
+        );
+        assert_eq!(
+            CatalogOptions::BLOB_INDEX_CACHE_MAX_SIZE,
+            "cache.blob-index.max-size"
         );
     }
 

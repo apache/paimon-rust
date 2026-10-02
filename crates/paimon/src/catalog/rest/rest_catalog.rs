@@ -37,7 +37,7 @@ use crate::catalog::{
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
-use crate::io::FileFormatMetadataCacheContext;
+use crate::io::FileIOCacheContext;
 use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange};
 use crate::table::{RESTEnv, Table};
 use crate::Result;
@@ -61,7 +61,7 @@ pub struct RESTCatalog {
     data_token_enabled: bool,
     /// Catalog-scoped cache shared by all table FileIO instances.
     local_cache: Option<Arc<LocalCache>>,
-    file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+    file_io_cache: FileIOCacheContext,
 }
 
 impl RESTCatalog {
@@ -90,8 +90,7 @@ impl RESTCatalog {
 
         let api_options = api.options().clone();
         let local_cache = create_local_cache_with_namespace(&options, &api_options)?;
-        let file_format_metadata_cache =
-            FileFormatMetadataCacheContext::from_props(api_options.to_map())?;
+        let file_io_cache = FileIOCacheContext::from_props(api_options.to_map())?;
 
         Ok(Self {
             api,
@@ -99,7 +98,7 @@ impl RESTCatalog {
             warehouse,
             data_token_enabled,
             local_cache,
-            file_format_metadata_cache,
+            file_io_cache,
         })
     }
 
@@ -285,7 +284,7 @@ impl Catalog for RESTCatalog {
             self.options.clone(),
             self.data_token_enabled,
             self.local_cache.clone(),
-            self.file_format_metadata_cache.clone(),
+            self.file_io_cache.clone(),
         )
         .await
     }
@@ -303,7 +302,7 @@ impl Catalog for RESTCatalog {
                     self.options.clone(),
                     self.data_token_enabled,
                     self.local_cache.clone(),
-                    self.file_format_metadata_cache.clone(),
+                    self.file_io_cache.clone(),
                 )
                 .await
                 .map(crate::catalog::LoadedTable::Object);
@@ -324,7 +323,7 @@ impl Catalog for RESTCatalog {
             self.options.clone(),
             self.data_token_enabled,
             self.local_cache.clone(),
-            self.file_format_metadata_cache.clone(),
+            self.file_io_cache.clone(),
         )
         .await
         .map(|table| crate::catalog::LoadedTable::Paimon(Box::new(table)))
