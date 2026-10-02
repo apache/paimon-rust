@@ -457,6 +457,25 @@ impl TableSchema {
                             });
                         }
                     }
+                    // A CSV format table reads existing files positionally (no
+                    // per-column header mapping), so dropping a non-trailing column
+                    // shifts every later physical column: the permissive reader
+                    // would truncate the trailing field and mis-assign the rest,
+                    // silently returning wrong values. Dropping the trailing column
+                    // is safe. Reject the position-shifting case instead.
+                    {
+                        let core_options = CoreOptions::new(&new_schema.options);
+                        if core_options.is_format_table()
+                            && core_options.file_format() == "csv"
+                            && idx != fields.len() - 1
+                        {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Cannot drop non-trailing column '{name}' of a CSV format table: it shifts the physical column positions of existing files"
+                                ),
+                            });
+                        }
+                    }
                     if fields.len() == 1 {
                         return Err(crate::Error::Unsupported {
                             message: "Cannot drop all fields in table".to_string(),
@@ -5500,6 +5519,44 @@ mod tests {
                 if message.contains("bucket-key") && message.contains("name")),
             "drop of a bucket-key column should be rejected, got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_csv_format_table_rejects_dropping_non_trailing_column() {
+        // A CSV format table reads files positionally; dropping a non-trailing
+        // column shifts physical positions and would make the permissive reader
+        // silently mis-decode old rows. The trailing column is safe to drop.
+        let build = || {
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("label", DataType::VarChar(VarCharType::string_type()))
+                    .column("extra", DataType::VarChar(VarCharType::string_type()))
+                    .option("type", "format-table")
+                    .option("file.format", "csv")
+                    .build()
+                    .unwrap(),
+            )
+        };
+
+        let err = build()
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "label".to_string(),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("physical column positions") && message.contains("label")),
+            "dropping a non-trailing CSV column should be rejected, got {err:?}"
+        );
+
+        // Dropping the trailing column keeps positions aligned and is allowed.
+        build()
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "extra".to_string(),
+            )])
+            .unwrap();
     }
 
     #[test]
