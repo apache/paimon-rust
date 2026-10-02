@@ -306,6 +306,10 @@ impl Clean {
 
     /// Old non-snapshot files in the snapshot and changelog directories, such
     /// as temporary files of interrupted commits. Java `cleanBranchSnapshotDir`.
+    ///
+    /// Only `snapshot-<id>` / `changelog-<id>` and the hint files are kept: a
+    /// writer's temporary file is `snapshot-<id>.tmp-<uuid>`, which shares the
+    /// prefix.
     async fn non_snapshot_files(&self, branch_root: &str) -> Result<Vec<(String, u64)>> {
         let mut files = Vec::new();
         for (dir, prefix) in [
@@ -315,7 +319,7 @@ impl Clean {
             for status in self.list(&format!("{branch_root}/{dir}")).await? {
                 let name = file_name(&status.path);
                 if !status.is_dir
-                    && !name.starts_with(prefix)
+                    && !is_numbered(name, prefix)
                     && name != EARLIEST
                     && name != LATEST
                     && self.old_enough(&status)
@@ -497,6 +501,12 @@ impl Clean {
             log::warn!("Failed to delete orphan file {path}: {error}");
         }
     }
+}
+
+/// Whether `name` is `<prefix><decimal id>`, e.g. `snapshot-12`.
+fn is_numbered(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn file_name(path: &str) -> &str {
