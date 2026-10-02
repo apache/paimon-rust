@@ -93,11 +93,7 @@ class ReadBuilder:
         *,
         variant_fields: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> "ReadBuilder":
-        """Project columns and optionally extract typed paths from Variant columns.
-
-        Each ``variant_fields`` value contains ``paths``, ``target_type``, and
-        optional ``fail_on_error``. The Variant column must occur in ``columns``.
-        """
+        """Project columns, optionally extracting typed Variant paths."""
         ...
     def with_nested_projection(self, paths: List[List[str]]) -> "ReadBuilder":
         """Project top-level fields or nested ROW leaves by exact name paths. A MAP
