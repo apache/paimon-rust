@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::variant::{extract_numeric_fields, NumericFieldMode};
 use super::{option_bool, option_f64, option_usize, FieldMetadata, ShreddingWritePlan};
 use crate::arrow::{
     arrow_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields, paimon_type_to_arrow,
@@ -813,10 +814,12 @@ fn assemble_plain_variant_projection(
         fail_on_error.push(field_metadata.fail_on_error());
     }
 
-    let projected = super::super::variant::variant_get_numeric_fields_with_policy(
+    let projected = extract_numeric_fields(
         input,
         &keys,
-        Some(&fail_on_error),
+        NumericFieldMode::Cast {
+            fail_on_error: &fail_on_error,
+        },
     )?;
     let values = projected
         .values()
