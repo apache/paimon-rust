@@ -2348,6 +2348,45 @@ mod tests {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/blob_test_utils.rs"));
     }
 
+    struct ForkFailingBlobRead {
+        tail: Option<Bytes>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for ForkFailingBlobRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            if range == (4..4100) {
+                if let Some(tail) = &self.tail {
+                    return Ok(tail.clone());
+                }
+            }
+            Err(Error::ProcessForkUnsupported {
+                message: crate::error::JINDO_FORK_ERROR.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_index_reads_preserve_fork_safety_error() {
+        let error = BlobFileIndex::load(&ForkFailingBlobRead { tail: None }, 4100)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+
+        let mut tail = vec![0; 4096];
+        tail[4091..4095].copy_from_slice(&4092_i32.to_le_bytes());
+        tail[4095] = BLOB_FORMAT_VERSION;
+        let error = BlobFileIndex::load(
+            &ForkFailingBlobRead {
+                tail: Some(Bytes::from(tail)),
+            },
+            4100,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+    }
+
     #[tokio::test]
     async fn test_index_tail_prefetch_boundaries() {
         for rows in [0, 1, 4090, 4091, 4092, 9000] {

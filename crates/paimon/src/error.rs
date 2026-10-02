@@ -17,6 +17,9 @@
 
 use snafu::prelude::*;
 
+pub(crate) const JINDO_FORK_ERROR: &str =
+    "Jindo SDK cannot be reused after process fork; use spawn or avoid initializing Jindo in the parent process";
+
 /// Result type used in paimon.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -66,6 +69,8 @@ pub enum Error {
         display("Paimon hitting unsupported io error {}", message)
     )]
     IoUnsupported { message: String },
+    #[snafu(display("{}", message))]
+    ProcessForkUnsupported { message: String },
     #[snafu(
         visibility(pub(crate)),
         display("Paimon hitting invalid config: {}", message)
@@ -136,12 +141,78 @@ pub enum Error {
 
 impl From<opendal::Error> for Error {
     fn from(source: opendal::Error) -> Self {
-        // TODO: Simple use IoUnexpected for now
+        Error::from_opendal_with_context(source, "IO operation failed on underlying storage")
+    }
+}
+
+impl Error {
+    pub(crate) fn from_opendal_with_context(
+        source: opendal::Error,
+        message: impl Into<String>,
+    ) -> Self {
+        if source.kind() == opendal::ErrorKind::Unsupported && source.message() == JINDO_FORK_ERROR
+        {
+            return Error::ProcessForkUnsupported {
+                message: source.message().to_string(),
+            };
+        }
         Error::IoUnexpected {
-            message: "IO operation failed on underlying storage".to_string(),
+            message: message.into(),
             source: Box::new(source),
         }
     }
+
+    pub(crate) fn with_context(self, message: impl Into<String>) -> Self {
+        match self {
+            Error::ProcessForkUnsupported { .. } => self,
+            source => Error::UnexpectedError {
+                message: message.into(),
+                source: Some(Box::new(source)),
+            },
+        }
+    }
+
+    /// Whether this error or one of its wrapped causes rejects inherited native state.
+    #[doc(hidden)]
+    pub fn is_process_fork_unsupported(&self) -> bool {
+        match self {
+            Error::ProcessForkUnsupported { .. } => true,
+            Error::DataInvalid { source, .. } | Error::UnexpectedError { source, .. } => source
+                .as_deref()
+                .is_some_and(|source| error_chain_contains_process_fork(source)),
+            Error::IoUnexpected { source, .. } => is_jindo_fork_error(source),
+            Error::DataUnexpected { source, .. } => error_chain_contains_process_fork(source),
+            Error::ParquetDataUnexpected { source, .. } => {
+                error_chain_contains_process_fork(source)
+            }
+            Error::RestApi { source } => error_chain_contains_process_fork(source),
+            _ => false,
+        }
+    }
+}
+
+fn is_jindo_fork_error(error: &opendal::Error) -> bool {
+    error.kind() == opendal::ErrorKind::Unsupported && error.message() == JINDO_FORK_ERROR
+}
+
+fn error_chain_contains_process_fork(error: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = error.downcast_ref::<Error>() {
+        return error.is_process_fork_unsupported();
+    }
+    if let Some(error) = error.downcast_ref::<opendal::Error>() {
+        return is_jindo_fork_error(error);
+    }
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        if error
+            .get_ref()
+            .is_some_and(|source| error_chain_contains_process_fork(source))
+        {
+            return true;
+        }
+    }
+    error
+        .source()
+        .is_some_and(error_chain_contains_process_fork)
 }
 
 impl From<apache_avro::Error> for Error {
@@ -153,17 +224,82 @@ impl From<apache_avro::Error> for Error {
     }
 }
 
-impl From<parquet::errors::ParquetError> for Error {
-    fn from(source: parquet::errors::ParquetError) -> Self {
+impl Error {
+    pub(crate) fn from_parquet_with_context(
+        source: parquet::errors::ParquetError,
+        context: &str,
+    ) -> Self {
+        let source = match source {
+            parquet::errors::ParquetError::External(source) => match source.downcast::<Error>() {
+                Ok(source) => return *source,
+                Err(source) => parquet::errors::ParquetError::External(source),
+            },
+            source => source,
+        };
         Error::ParquetDataUnexpected {
-            message: format!("Failed to read a Parquet file: {source}"),
+            message: format!("{context}: {source}"),
             source: Box::new(source),
         }
+    }
+}
+
+impl From<parquet::errors::ParquetError> for Error {
+    fn from(source: parquet::errors::ParquetError) -> Self {
+        Error::from_parquet_with_context(source, "Failed to read a Parquet file")
     }
 }
 
 impl From<crate::api::rest_error::RestError> for Error {
     fn from(source: crate::api::rest_error::RestError) -> Self {
         Error::RestApi { source }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_jindo_fork_error_kind() {
+        let error: Error =
+            opendal::Error::new(opendal::ErrorKind::Unsupported, JINDO_FORK_ERROR).into();
+        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+    }
+
+    #[test]
+    fn preserves_paimon_error_through_parquet_external_error() {
+        let parquet_error =
+            parquet::errors::ParquetError::External(Box::new(Error::ProcessForkUnsupported {
+                message: JINDO_FORK_ERROR.to_string(),
+            }));
+
+        let error: Error = parquet_error.into();
+        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+    }
+
+    #[test]
+    fn keeps_non_paimon_parquet_external_error_wrapped() {
+        let parquet_error = parquet::errors::ParquetError::External(Box::new(
+            std::io::Error::other("external parquet failure"),
+        ));
+
+        let error: Error = parquet_error.into();
+        assert!(matches!(error, Error::ParquetDataUnexpected { .. }));
+    }
+
+    #[test]
+    fn detects_wrapped_process_fork_error() {
+        let error = Error::UnexpectedError {
+            message: "outer context".to_string(),
+            source: Some(Box::new(Error::IoUnexpected {
+                message: "storage context".to_string(),
+                source: Box::new(opendal::Error::new(
+                    opendal::ErrorKind::Unsupported,
+                    JINDO_FORK_ERROR,
+                )),
+            })),
+        };
+
+        assert!(error.is_process_fork_unsupported());
     }
 }
