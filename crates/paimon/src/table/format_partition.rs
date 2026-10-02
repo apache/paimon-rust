@@ -566,6 +566,19 @@ mod tests {
             Some(default.to_string())
         );
 
+        // U+180E is whitespace only on legacy JDK 8 (Unicode 6.2); a modern JVM
+        // (Java 11/17) treats it as a format character and keeps it literal, so a
+        // `dt=<U+180E>` directory written by a modern JVM stays matchable.
+        assert_eq!(
+            format_partition_value(
+                &Datum::String("\u{180E}".to_string()),
+                &varchar,
+                default,
+                false
+            ),
+            Some("\u{180E}".to_string())
+        );
+
         // An ASCII-blank value folds under both rules; a normal value is kept.
         assert_eq!(
             format_partition_value(&Datum::String("   ".to_string()), &varchar, default, false),

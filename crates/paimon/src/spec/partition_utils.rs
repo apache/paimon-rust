@@ -524,6 +524,15 @@ fn decode_java_utf8(mut bytes: &[u8]) -> String {
 
 /// Java `StringUtils.isNullOrWhitespaceOnly` checks each UTF-16 code unit with
 /// `Character.isWhitespace`; its whitespace set differs from Rust `str::trim`.
+///
+/// The set targets the supported modern JVMs (Java 11/17). The only code point
+/// whose `Character.isWhitespace` result is JVM-version dependent is U+180E
+/// (MONGOLIAN VOWEL SEPARATOR): it was a space separator under the Unicode 6.2
+/// bundled with JDK 8, but Unicode 6.3 reclassified it as a format character, so
+/// Java 9+ returns `false`. We follow the modern result and keep U+180E as a
+/// literal partition value — a `dt=<U+180E>` directory written by a modern JVM is
+/// then preserved and matched by an equality filter instead of being folded to
+/// the default partition.
 pub(crate) fn is_java_whitespace_only(value: &str) -> bool {
     value.chars().all(|ch| {
         matches!(
@@ -531,7 +540,6 @@ pub(crate) fn is_java_whitespace_only(value: &str) -> bool {
             '\u{0009}'..='\u{000D}'
                 | '\u{001C}'..='\u{0020}'
                 | '\u{1680}'
-                | '\u{180E}'
                 | '\u{2000}'..='\u{2006}'
                 | '\u{2008}'..='\u{200A}'
                 | '\u{2028}'..='\u{2029}'
@@ -1201,6 +1209,20 @@ mod tests {
             result, "dt=__DEFAULT_PARTITION__/",
             "a non-breaking space must not fold to the default partition (Java keeps it)"
         );
+
+        // U+180E is whitespace only on legacy JDK 8 (Unicode 6.2); a modern JVM
+        // (Java 11/17) treats it as a format character and keeps it as a literal
+        // partition value, so we must not fold it to the default partition.
+        let computer =
+            PartitionComputer::new(&keys, &fields, TEST_DEFAULT_PARTITION_NAME, true).unwrap();
+        let mut builder = TestRowBuilder::new(1);
+        builder.write_string(0, "\u{180E}");
+        let row = builder.build();
+        let result = computer.generate_partition_path(&row).unwrap();
+        assert_eq!(
+            result, "dt=\u{180E}/",
+            "U+180E must stay a literal partition value on modern JVMs"
+        );
     }
 
     #[test]
@@ -1531,11 +1553,13 @@ mod tests {
 
     #[test]
     fn test_binary_partition_matches_java_whitespace() {
-        // JDK 8 Character.isWhitespace includes U+001C and U+180E, but not
-        // U+00A0 or U+2007. Rust str::trim differs for controls and NBSP.
+        // Modern JVMs (Java 11/17) treat U+001C as whitespace but U+180E as a
+        // format character, and never fold U+00A0 or U+2007. Rust str::trim
+        // differs for controls and NBSP, so we match Java explicitly.
         for (value, expected) in [
             (b"\x1c".as_slice(), "bin=__DEFAULT_PARTITION__/"),
-            ("\u{180E}".as_bytes(), "bin=__DEFAULT_PARTITION__/"),
+            // U+180E is whitespace only on legacy JDK 8; a modern JVM keeps it.
+            ("\u{180E}".as_bytes(), "bin=\u{180E}/"),
             ("\u{00A0}".as_bytes(), "bin=\u{00A0}/"),
             ("\u{2007}".as_bytes(), "bin=\u{2007}/"),
         ] {
