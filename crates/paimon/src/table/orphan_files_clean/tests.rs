@@ -608,3 +608,39 @@ async fn test_vanished_owner_is_skipped_but_a_tag_aborts() {
     };
     assert!(clean.missing(&tag, &path).await.is_err());
 }
+
+#[tokio::test]
+async fn test_writer_temporary_snapshot_files_are_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = setup(&dir, false).await;
+    commit(&table, &[1], "a", false).await;
+    // The names SnapshotManager uses while committing: `<target>.tmp-<uuid>`.
+    let orphans = BTreeSet::from([
+        plant(
+            &dir,
+            "snapshot/snapshot-2.tmp-0b0c6e0e-6a3b-4f27-9d43-2c1f8f0e9a11",
+        ),
+        plant(
+            &dir,
+            "snapshot/LATEST.tmp-5d1f5a3c-3a4e-4a1f-8f4b-6e9b6a1c2d33",
+        ),
+        plant(
+            &dir,
+            "changelog/changelog-2.tmp-7a4e9b11-1c2d-4e5f-8a9b-0c1d2e3f4a55",
+        ),
+    ]);
+    let before = all_files(dir.path());
+
+    let result = clean_later(&table, false).await;
+    assert_eq!(relative(&dir, &result), orphans);
+    let after = all_files(dir.path());
+    assert_eq!(
+        after,
+        before
+            .difference(&orphans)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    );
+    assert!(after.contains("snapshot/snapshot-1"));
+    assert_eq!(read_ids(&table).await, vec![1]);
+}
