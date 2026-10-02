@@ -162,16 +162,6 @@ impl Error {
         }
     }
 
-    pub(crate) fn with_context(self, message: impl Into<String>) -> Self {
-        match self {
-            Error::ProcessForkUnsupported { .. } => self,
-            source => Error::UnexpectedError {
-                message: message.into(),
-                source: Some(Box::new(source)),
-            },
-        }
-    }
-
     /// Whether this error or one of its wrapped causes rejects inherited native state.
     #[doc(hidden)]
     pub fn is_process_fork_unsupported(&self) -> bool {
