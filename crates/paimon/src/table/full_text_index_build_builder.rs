@@ -35,9 +35,7 @@ use crate::table::global_index_build_common::{
     copy_local_file_to_output, indexed_row_ranges, validate_existing_index_overlap,
 };
 use crate::table::global_index_types::FULL_TEXT_GLOBAL_INDEX_TYPE;
-use crate::table::{
-    CommitMessage, DataSplitBuilder, RowRange, SnapshotManager, Table, TableCommit,
-};
+use crate::table::{CommitMessage, DataSplitBuilder, RowRange, Table, TableCommit};
 use crate::{Error, Result};
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
@@ -114,10 +112,9 @@ impl<'a> FullTextIndexBuildBuilder<'a> {
         full_text_config(&native_options)?;
         let index_meta = serialize_index_meta(&native_options)?;
 
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
+        // The table's manager resolves a REST-managed table's latest snapshot
+        // through the catalog, like reads and commit validation do.
+        let snapshot_manager = self.table.snapshot_manager();
         let snapshot = snapshot_manager
             .get_latest_snapshot()
             .await?
