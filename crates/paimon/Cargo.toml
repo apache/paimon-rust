@@ -158,5 +158,5 @@ unicode-segmentation = "=1.13.2"
 cc = "1"
 
 [dev-dependencies]
-axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
+axum = { version = "0.8", features = ["macros", "tokio", "http1", "http2"] }
 libc = "0.2"
