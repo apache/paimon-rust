@@ -1673,6 +1673,21 @@ struct BlobFileIndex {
     entries: Vec<BlobEntry>,
 }
 
+async fn read_blob_range(reader: &dyn FileRead, range: Range<u64>) -> crate::Result<Bytes> {
+    let expected = range.end - range.start;
+    let bytes = reader.read(range.clone()).await?;
+    if bytes.len() as u64 != expected {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Short BLOB index read for {range:?}: expected {expected} bytes, got {}",
+                bytes.len()
+            ),
+            source: None,
+        });
+    }
+    Ok(bytes)
+}
+
 impl BlobFileIndex {
     async fn load_cached(
         reader: &dyn FileRead,
@@ -1715,19 +1730,11 @@ impl BlobFileIndex {
             });
         }
 
-        let footer = reader
-            .read(file_size - BLOB_FOOTER_SIZE..file_size)
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to read blob footer: {e}"),
-                source: Some(Box::new(e)),
-            })?;
-
-        let footer_bytes: [u8; BLOB_FOOTER_SIZE as usize] =
-            footer.as_ref().try_into().map_err(|_| Error::DataInvalid {
-                message: "Blob footer should be exactly 5 bytes".to_string(),
-                source: None,
-            })?;
+        const TAIL_PREFETCH_SIZE: u64 = 4096;
+        let tail_start = file_size - file_size.min(TAIL_PREFETCH_SIZE);
+        let tail = read_blob_range(reader, tail_start..file_size).await?;
+        let footer_start = tail.len() - BLOB_FOOTER_SIZE as usize;
+        let footer_bytes = &tail[footer_start..];
         let index_length = i32::from_le_bytes(footer_bytes[..4].try_into().unwrap());
         if index_length < 0 {
             return Err(Error::DataInvalid {
@@ -1757,13 +1764,12 @@ impl BlobFileIndex {
 
         let index_start = file_size - BLOB_FOOTER_SIZE - index_length;
         let data_region_end = index_start;
-        let index_bytes = reader
-            .read(index_start..index_start + index_length)
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to read blob index bytes: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+        let index_bytes = if index_start >= tail_start {
+            tail.slice((index_start - tail_start) as usize..footer_start)
+        } else {
+            // Reread the small tail overlap rather than copy the entire index.
+            read_blob_range(reader, index_start..file_size - BLOB_FOOTER_SIZE).await?
+        };
 
         let lengths = decode_delta_varints(index_bytes.as_ref())?;
         let entries = BlobEntry::build_all(&lengths, data_region_end)?;
@@ -2343,6 +2349,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_index_tail_prefetch_boundaries() {
+        for rows in [0, 1, 4090, 4091, 4092, 9000] {
+            let mut data = vec![0; 8192];
+            let index = encode_delta_varints_write(&vec![-1; rows]);
+            assert_eq!(index.len(), rows);
+            data.extend_from_slice(&index);
+            data.extend_from_slice(&(index.len() as i32).to_le_bytes());
+            data.push(BLOB_FORMAT_VERSION);
+            let size = data.len() as u64;
+            let reader = TrackingFileRead::new(Bytes::from(data));
+            let result = BlobFileIndex::load(&reader, size).await.unwrap();
+            assert_eq!(result.num_rows(), rows);
+            assert!(result
+                .entries
+                .iter()
+                .all(|entry| matches!(entry, BlobEntry::Null)));
+            let mut expected = Vec::with_capacity(2);
+            expected.push(size - 4096..size);
+            if rows + 5 > 4096 {
+                expected.push(8192..size - BLOB_FOOTER_SIZE);
+            }
+            assert_eq!(reader.ranges(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_large_index_varint_crosses_tail_boundary() {
+        let lengths = vec![128; 4091];
+        let index = encode_delta_varints_write(&lengths);
+        assert_eq!(index.len(), 4092);
+        // The tail starts between the two bytes encoding the first length.
+        assert_ne!(index[0] & 0x80, 0);
+        assert_eq!(index[1] & 0x80, 0);
+        let index_start = 128 * lengths.len() as u64;
+        let expected = BlobEntry::build_all(&lengths, index_start).unwrap();
+        let mut data = vec![0; index_start as usize];
+        data.extend_from_slice(&index);
+        data.extend_from_slice(&(index.len() as i32).to_le_bytes());
+        data.push(BLOB_FORMAT_VERSION);
+        let size = data.len() as u64;
+        assert_eq!(size - 4096, index_start + 1);
+        let reader = TrackingFileRead::new(Bytes::from(data));
+        let actual = BlobFileIndex::load(&reader, size).await.unwrap();
+        assert_eq!(format!("{:?}", actual.entries), format!("{expected:?}"));
+        assert_eq!(
+            reader.ranges(),
+            vec![size - 4096..size, index_start..size - BLOB_FOOTER_SIZE]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_index_tail_prefetch_matches_legacy_fixtures() {
+        for name in [
+            "blob-basic.blob",
+            "blob-array.blob",
+            "blob-placeholder.blob",
+        ] {
+            let data = load_blob_fixture(name);
+            let size = data.len() as u64;
+            let index_length =
+                i32::from_le_bytes(data[data.len() - 5..data.len() - 1].try_into().unwrap())
+                    as usize;
+            let index_start = data.len() - 5 - index_length;
+            let legacy = BlobEntry::build_all(
+                &decode_delta_varints(&data[index_start..data.len() - 5]).unwrap(),
+                index_start as u64,
+            )
+            .unwrap();
+            let reader = TrackingFileRead::new(Bytes::from(data));
+            let actual = BlobFileIndex::load(&reader, size).await.unwrap();
+            assert_eq!(format!("{:?}", actual.entries), format!("{legacy:?}"));
+            let positions = (0..actual.num_rows()).rev().collect::<Vec<_>>();
+            let old = BlobFileIndex { entries: legacy };
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    build_descriptor_values(&actual, &positions, "file:///test.blob").unwrap()
+                ),
+                format!(
+                    "{:?}",
+                    build_descriptor_values(&old, &positions, "file:///test.blob").unwrap()
+                ),
+            );
+            assert_eq!(reader.ranges(), vec![size.saturating_sub(4096)..size]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_index_tail_prefetch_invalid_input() {
+        for size in 0..5 {
+            let reader = TrackingFileRead::new(Bytes::from(vec![0; size]));
+            assert!(BlobFileIndex::load(&reader, size as u64).await.is_err());
+            assert!(reader.ranges().is_empty());
+        }
+        for (index, length, version) in [
+            (vec![], -1_i32, 1_u8),
+            (vec![], 1, 1),
+            (vec![], 0, 2),
+            (vec![0x80], 1, 1),
+        ] {
+            let mut data = index;
+            data.extend_from_slice(&length.to_le_bytes());
+            data.push(version);
+            let size = data.len() as u64;
+            let reader = TrackingFileRead::new(Bytes::from(data));
+            assert!(BlobFileIndex::load(&reader, size).await.is_err());
+            assert_eq!(reader.ranges(), vec![0..size]);
+        }
+        let reader = TrackingFileRead::new(Bytes::from_static(&[0, 0, 0, 0, 1]));
+        assert_eq!(BlobFileIndex::load(&reader, 5).await.unwrap().num_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_index_tail_prefetch_short_reads_and_errors() {
+        for bytes in [Bytes::new(), Bytes::from_static(&[0; 4])] {
+            let reader = SparseFileRead::new(vec![(0..5, bytes)]);
+            assert!(matches!(
+                BlobFileIndex::load(&reader, 5).await,
+                Err(Error::DataInvalid { .. })
+            ));
+        }
+        let reader = SparseFileRead::new(vec![]);
+        assert!(BlobFileIndex::load(&reader, 5).await.is_err());
+        let mut tail = vec![0; 4091];
+        tail.extend_from_slice(&5000_i32.to_le_bytes());
+        tail.push(1);
+        for index in [None, Some(Bytes::new()), Some(Bytes::from(vec![0; 4999]))] {
+            let mut responses = vec![(909..5005, Bytes::from(tail.clone()))];
+            if let Some(index) = index {
+                responses.push((0..5000, index));
+            }
+            let reader = SparseFileRead::new(responses);
+            assert!(BlobFileIndex::load(&reader, 5005).await.is_err());
+            assert_eq!(reader.ranges(), vec![909..5005, 0..5000]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_index_tail_prefetch_sixteen_cold_files() {
+        let mut requests = 0;
+        let mut bytes = 0;
+        let mut legacy_bytes = 0;
+        let mut legacy_requests = 0;
+        for rows in (1526..).take(16) {
+            let index = encode_delta_varints_write(&vec![-1; rows]);
+            let mut data = vec![0; 8192];
+            data.extend_from_slice(&index);
+            data.extend_from_slice(&(index.len() as i32).to_le_bytes());
+            data.push(1);
+            let size = data.len() as u64;
+            let reader = TrackingFileRead::new(Bytes::from(data.clone()));
+            let legacy_reader = TrackingFileRead::new(Bytes::from(data));
+            let footer = legacy_reader.read(size - 5..size).await.unwrap();
+            let length = i32::from_le_bytes(footer[..4].try_into().unwrap()) as u64;
+            let old_index = legacy_reader
+                .read(size - 5 - length..size - 5)
+                .await
+                .unwrap();
+            let old_entries = BlobEntry::build_all(
+                &decode_delta_varints(&old_index).unwrap(),
+                size - 5 - length,
+            )
+            .unwrap();
+            let loaded = BlobFileIndex::load(&reader, size).await.unwrap();
+            assert_eq!(loaded.num_rows(), rows);
+            assert_eq!(format!("{:?}", loaded.entries), format!("{old_entries:?}"));
+            requests += reader.ranges().len();
+            bytes += reader
+                .ranges()
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<u64>();
+            legacy_requests += legacy_reader.ranges().len();
+            legacy_bytes += legacy_reader
+                .ranges()
+                .iter()
+                .map(|r| r.end - r.start)
+                .sum::<u64>();
+        }
+        assert_eq!(legacy_requests, 32);
+        assert_eq!((requests, bytes, legacy_bytes), (16, 65536, 24616));
+    }
+
+    #[tokio::test]
     async fn test_blob_reader_reads_inline_bytes_and_selection() {
         let read_fields = vec![DataField::new(
             0,
@@ -2424,7 +2614,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(first_reader.num_rows(), second_reader.num_rows());
-        assert_eq!(first.ranges().len(), 2);
+        assert_eq!(first.ranges().len(), 1);
         assert!(second.ranges().is_empty());
     }
 
@@ -2641,6 +2831,7 @@ mod tests {
         let payload_reads = reader
             .ranges()
             .into_iter()
+            .skip(1) // The bounded index prefetch may include payload bytes.
             .filter(|range| range.start < payload_end && range.end > 0)
             .collect::<Vec<_>>();
         assert_eq!(payload_reads, vec![0..payload_end]);
@@ -2675,6 +2866,7 @@ mod tests {
             assert!(reader
                 .ranges()
                 .iter()
+                .skip(1) // Exclude the bounded index prefetch.
                 .all(|range| range.end <= value_range.start || range.start >= value_range.end));
         }
     }
@@ -2919,8 +3111,9 @@ mod tests {
             !reader
                 .ranges()
                 .iter()
+                .skip(1) // Exclude the bounded index prefetch.
                 .any(|range| range.start < 23 && range.end > 13),
-            "descriptor mode must not read element payload bytes"
+            "descriptor mode must not read element payload bytes beyond the index prefetch"
         );
     }
 
@@ -2950,6 +3143,7 @@ mod tests {
         let overlapping_reads = reader
             .ranges()
             .into_iter()
+            .skip(1) // Exclude the bounded index prefetch.
             .filter(|range| {
                 range.start < element_data_range.end && element_data_range.start < range.end
             })
@@ -3099,6 +3293,7 @@ mod tests {
         let payload_reads = reader
             .ranges()
             .into_iter()
+            .skip(1) // The bounded index prefetch may include payload bytes.
             .filter(|range| range.start < payload_end && range.end > 0)
             .collect::<Vec<_>>();
         assert_eq!(payload_reads, vec![0..payload_end]);
