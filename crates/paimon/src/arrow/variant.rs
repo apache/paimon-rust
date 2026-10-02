@@ -34,8 +34,19 @@ pub fn variant_get_numeric_fields(
     column: &StructArray,
     fields: &[String],
 ) -> Result<FixedSizeListArray> {
+    variant_get_float32_fields(column, fields, None)
+}
+
+pub(crate) fn variant_get_float32_fields(
+    column: &StructArray,
+    fields: &[String],
+    fail_on_error: Option<&[bool]>,
+) -> Result<FixedSizeListArray> {
     if fields.is_empty() {
         return data_invalid("Variant numeric field list must not be empty");
+    }
+    if fail_on_error.is_some_and(|flags| flags.len() != fields.len()) {
+        return data_invalid("Variant float32 projection width mismatch");
     }
 
     let width = i32::try_from(fields.len()).map_err(|_| Error::ResourceExhausted {
@@ -78,12 +89,21 @@ pub fn variant_get_numeric_fields(
             projection = Some(VariantFloat32Projection::new(metadata, fields)?);
             projection_metadata = Some(metadata);
         }
-        projection.as_mut().unwrap().extract_float32(
-            value_column.value(row),
-            metadata,
-            &mut offsets,
-            &mut extracted,
-        )?;
+        match fail_on_error {
+            Some(flags) => projection.as_mut().unwrap().extract_float32_cast(
+                value_column.value(row),
+                metadata,
+                flags,
+                &mut offsets,
+                &mut extracted,
+            )?,
+            None => projection.as_mut().unwrap().extract_float32(
+                value_column.value(row),
+                metadata,
+                &mut offsets,
+                &mut extracted,
+            )?,
+        }
         for value in &extracted {
             builder.values().append_option(*value);
         }

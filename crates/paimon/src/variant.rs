@@ -1295,6 +1295,19 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
     Ok(segments)
 }
 
+/// Return the literal key selected by a one-segment object path.
+///
+/// Variant extraction read types carry SQL-style paths. The vectorized
+/// numeric projection can batch literal top-level keys, while nested paths
+/// continue through the general `variant_get` implementation.
+pub(crate) fn top_level_path_key(path: &str) -> Result<Option<String>> {
+    let segments = parse_path(path)?;
+    Ok(match segments.as_slice() {
+        [PathSegment::Key(key)] => Some(key.clone()),
+        _ => None,
+    })
+}
+
 #[derive(Clone)]
 struct FieldEntry {
     key: String,
