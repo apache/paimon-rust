@@ -1459,20 +1459,21 @@ impl Schema {
         Ok(())
     }
 
-    /// Reject types that cannot serve as a key. Mirrors Java
-    /// `SchemaValidation.validateOnlyContainPrimitiveType`, which forbids
+    /// Reject types that cannot serve as a key. Primary and partition keys mirror
+    /// Java `SchemaValidation.validateOnlyContainPrimitiveType`, which forbids
     /// nested/complex types (`MAP`, `ARRAY`, `ROW`, `MULTISET`, `VECTOR`,
-    /// `VARIANT`) for **both** primary keys and partition keys, as well as an
-    /// explicit `bucket-key`: these types have no key ordering, and a partition
-    /// value is encoded into a directory path, so bucket/merge/partition
-    /// behavior is undefined and the table is unreadable across engines.
+    /// `VARIANT`): they have no key ordering, and a partition value is encoded
+    /// into a directory path. A bucket key only hashes a `BinaryRow`, so it allows
+    /// the one extra type that encodes into that row without ordering — `VARIANT`
+    /// — mirroring Java's narrower nested-type bucket check (`ARRAY`/`MULTISET`/
+    /// `MAP`/`ROW`). `VECTOR` stays rejected everywhere.
     fn validate_key_field_types(
         fields: &[DataField],
         partition_keys: &[String],
         primary_keys: &[String],
         options: &HashMap<String, String>,
     ) -> crate::Result<()> {
-        let reject = |key_kind: &str, name: &str| -> crate::Result<()> {
+        let reject = |key_kind: &str, name: &str, for_bucket: bool| -> crate::Result<()> {
             let Some(field) = fields.iter().find(|f| f.name() == name) else {
                 return Ok(());
             };
@@ -1482,7 +1483,12 @@ impl Schema {
                 DataType::Multiset(_) => Some("MULTISET"),
                 DataType::Row(_) => Some("ROW"),
                 DataType::Vector(_) => Some("VECTOR"),
-                DataType::Variant(_) => Some("VARIANT"),
+                // VARIANT is the one non-primitive allowed as a bucket key: it
+                // encodes into the hashed BinaryRow and needs no ordering, so
+                // only primary/partition keys reject it (Java's bucket check
+                // lists ARRAY/MULTISET/MAP/ROW, not VARIANT; VECTOR stays rejected
+                // everywhere).
+                DataType::Variant(_) if !for_bucket => Some("VARIANT"),
                 _ => None,
             };
             if let Some(type_name) = unsupported {
@@ -1496,14 +1502,14 @@ impl Schema {
         };
 
         for pk in primary_keys {
-            reject("primary key", pk)?;
+            reject("primary key", pk, false)?;
         }
         for partition_key in partition_keys {
-            reject("partition key", partition_key)?;
+            reject("partition key", partition_key, false)?;
         }
         if let Some(bucket_keys) = CoreOptions::new(options).bucket_key() {
             for bk in &bucket_keys {
-                reject("bucket key", bk)?;
+                reject("bucket key", bk, true)?;
             }
         }
         Ok(())
@@ -2394,7 +2400,9 @@ impl Default for SchemaBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::{BlobType, CharType, FloatType, IntType, VarCharType, VectorType};
+    use crate::spec::{
+        BlobType, CharType, FloatType, IntType, VarCharType, VariantType, VectorType,
+    };
 
     use super::*;
 
@@ -3005,6 +3013,41 @@ mod tests {
         assert!(
             matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("MAP") && message.contains("primary key")),
             "MAP primary key must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_variant_bucket_key_is_accepted() {
+        // A bucket key only hashes a BinaryRow, which already encodes VARIANT, so
+        // a VARIANT bucket key stays valid (Java's bucket check lists only
+        // ARRAY/MULTISET/MAP/ROW). Primary/partition keys still reject VARIANT.
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("v", DataType::Variant(VariantType::new()))
+            .option("bucket", "2")
+            .option("bucket-key", "v")
+            .build()
+            .unwrap();
+        assert_eq!(schema.fields().len(), 2);
+    }
+
+    #[test]
+    fn test_schema_validation_rejects_non_primitive_bucket_key() {
+        // Nested types still have no hash-key semantics as a bucket key; Java
+        // rejects ARRAY/MULTISET/MAP/ROW there even though VARIANT is allowed.
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "tags",
+                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            )
+            .option("bucket", "2")
+            .option("bucket-key", "tags")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("ARRAY") && message.contains("bucket key")),
+            "ARRAY bucket key must be rejected, got {err:?}"
         );
     }
 
