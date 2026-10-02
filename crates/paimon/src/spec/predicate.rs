@@ -1037,12 +1037,111 @@ fn json_to_datum(value: &serde_json::Value, data_type: &DataType) -> Result<Datu
             .as_str()
             .map(|s| Datum::String(s.to_string()))
             .ok_or_else(type_err),
-        // Temporal/decimal literals fail closed: Java's own JSON deserializer
-        // cannot round-trip them.
+        // Java `LeafPredicate.toJsonFriendly`: ISO strings, and a plain decimal
+        // string rounded HALF_UP to the column scale (`Decimal.fromBigDecimal`).
+        DataType::Date(_) => value
+            .as_str()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .map(|date| {
+                let epoch = chrono::DateTime::UNIX_EPOCH.date_naive();
+                Datum::Date((date - epoch).num_days() as i32)
+            })
+            .ok_or_else(type_err),
+        DataType::Time(_) => value
+            .as_str()
+            .and_then(|s| {
+                chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+                    .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M"))
+                    .ok()
+            })
+            .map(|time| {
+                use chrono::Timelike;
+                let millis =
+                    time.num_seconds_from_midnight() * 1000 + time.nanosecond() / 1_000_000;
+                Datum::Time(millis as i32)
+            })
+            .ok_or_else(type_err),
+        DataType::Timestamp(_) => value
+            .as_str()
+            .and_then(|s| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M"))
+                    .ok()
+            })
+            .map(|datetime| {
+                let (millis, nanos) = millis_and_nanos(datetime.and_utc());
+                Datum::Timestamp { millis, nanos }
+            })
+            .ok_or_else(type_err),
+        DataType::LocalZonedTimestamp(_) => value
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|instant| {
+                let (millis, nanos) = millis_and_nanos(instant.to_utc());
+                Datum::LocalZonedTimestamp { millis, nanos }
+            })
+            .ok_or_else(type_err),
+        DataType::Decimal(decimal) => value
+            .as_str()
+            .and_then(|s| decimal_literal(s, decimal.precision(), decimal.scale()))
+            .ok_or_else(type_err),
         other => Err(rest_json_err(format!(
             "literal conversion for type {other:?} is not supported"
         ))),
     }
+}
+
+/// Epoch millis and the nanos within that milli, as Paimon `Timestamp` keeps them.
+fn millis_and_nanos(instant: chrono::DateTime<chrono::Utc>) -> (i64, i32) {
+    (
+        instant.timestamp_millis(),
+        (instant.timestamp_subsec_nanos() % 1_000_000) as i32,
+    )
+}
+
+/// `None` when the rounded value no longer fits `precision`, where Java gives a
+/// null literal.
+fn decimal_literal(text: &str, precision: u32, scale: u32) -> Option<Datum> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || !whole
+            .chars()
+            .chain(fraction.chars())
+            .all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut unscaled: i128 = 0;
+    for c in whole.chars().chain(fraction.chars()) {
+        unscaled = unscaled
+            .checked_mul(10)?
+            .checked_add(i128::from(c as u8 - b'0'))?;
+    }
+    let literal_scale = fraction.len() as u32;
+    if literal_scale > scale {
+        let divisor = 10i128.checked_pow(literal_scale - scale)?;
+        let (quotient, remainder) = (unscaled / divisor, unscaled % divisor);
+        // HALF_UP on the magnitude, before the sign is applied; `remainder * 2`
+        // can overflow at 38 digits.
+        unscaled = quotient + i128::from(remainder >= divisor - remainder);
+    } else {
+        unscaled = unscaled.checked_mul(10i128.checked_pow(scale - literal_scale)?)?;
+    }
+    let digit_count = unscaled.checked_ilog10().map_or(1, |log| log + 1);
+    // Java counts the digits of the rounded value, dropping leading zeros, so
+    // `0.05` at scale 2 has precision 1.
+    if digit_count > precision {
+        return None;
+    }
+    Some(Datum::Decimal {
+        unscaled: if negative { -unscaled } else { unscaled },
+        precision,
+        scale,
+    })
 }
 
 fn int_datum(value: &serde_json::Value, build: impl Fn(i64) -> Option<Datum>) -> Result<Datum> {
@@ -3666,8 +3765,11 @@ mod tests {
                 "must parse {function}: {json}"
             );
         }
-        // DATE has no Java-round-trippable wire form; every shape fails closed.
-        for literals in ["[19000]", "[\"2022-01-15\"]", "[[2022,1,15]]"] {
+        // DATE travels as an ISO string since Java #9640; the older Jackson
+        // shapes still fail closed.
+        let json = rest_leaf_json("EQUAL", "dt", "[\"2022-01-15\"]");
+        assert!(Predicate::from_rest_json(&json, &fields).is_ok(), "{json}");
+        for literals in ["[19000]", "[[2022,1,15]]"] {
             let json = rest_leaf_json("EQUAL", "dt", literals);
             assert!(
                 Predicate::from_rest_json(&json, &fields).is_err(),
@@ -3763,6 +3865,84 @@ mod tests {
                 Predicate::from_rest_json(&json, &double_fields).is_ok(),
                 "{json}"
             );
+        }
+    }
+
+    #[test]
+    fn test_from_rest_json_reads_java_temporal_and_decimal_literals() {
+        use crate::spec::{DecimalType, LocalZonedTimestampType, TimeType, TimestampType};
+        let literal = |data_type: DataType, json: &str| {
+            let fields = vec![DataField::new(0, "c".to_string(), data_type)];
+            let leaf = rest_leaf_json_typed("EQUAL", "c", "ANY", &format!("[{json}]"));
+            Predicate::from_rest_json(&leaf, &fields).map(|p| match p {
+                Predicate::Leaf { literals, .. } => literals[0].clone(),
+                other => panic!("expected leaf, got {other:?}"),
+            })
+        };
+        let date = || DataType::Date(DateType::new());
+        assert_eq!(
+            literal(date(), r#""2024-01-15""#).unwrap(),
+            Datum::Date(19737)
+        );
+        assert_eq!(literal(date(), r#""1969-12-31""#).unwrap(), Datum::Date(-1));
+
+        let time = || DataType::Time(TimeType::new(3).unwrap());
+        assert_eq!(
+            literal(time(), r#""10:15""#).unwrap(),
+            Datum::Time(36_900_000)
+        );
+        assert_eq!(
+            literal(time(), r#""10:15:30.123456""#).unwrap(),
+            Datum::Time(36_930_123)
+        );
+
+        let timestamp = || DataType::Timestamp(TimestampType::new(9).unwrap());
+        let at = |millis, nanos| Datum::Timestamp { millis, nanos };
+        // `LocalDateTime.toString()` drops zero seconds.
+        assert_eq!(
+            literal(timestamp(), r#""2024-01-15T10:15""#).unwrap(),
+            at(1_705_313_700_000, 0)
+        );
+        assert_eq!(
+            literal(timestamp(), r#""2024-01-15T10:15:30.123456789""#).unwrap(),
+            at(1_705_313_730_123, 456_789)
+        );
+        let instant = || DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap());
+        assert_eq!(
+            literal(instant(), r#""2024-01-15T10:15:30.5Z""#).unwrap(),
+            Datum::LocalZonedTimestamp {
+                millis: 1_705_313_730_500,
+                nanos: 0
+            }
+        );
+
+        // Rounded HALF_UP to the column scale, then checked against its precision.
+        let decimal = || DataType::Decimal(DecimalType::new(5, 2).unwrap());
+        let unscaled = |datum: Datum| match datum {
+            Datum::Decimal { unscaled, .. } => unscaled,
+            other => panic!("expected decimal, got {other:?}"),
+        };
+        assert_eq!(unscaled(literal(decimal(), r#""123.45""#).unwrap()), 12345);
+        assert_eq!(unscaled(literal(decimal(), r#""1.005""#).unwrap()), 101);
+        assert_eq!(unscaled(literal(decimal(), r#""-1.005""#).unwrap()), -101);
+        assert_eq!(unscaled(literal(decimal(), r#""7""#).unwrap()), 700);
+        let one_digit = || DataType::Decimal(DecimalType::new(1, 0).unwrap());
+        let nines = format!(r#""0.{}""#, "9".repeat(38));
+        assert_eq!(unscaled(literal(one_digit(), &nines).unwrap()), 1);
+        assert!(
+            literal(decimal(), r#""999.995""#).is_err(),
+            "rounds past DECIMAL(5, 2)"
+        );
+
+        for (data_type, json) in [
+            (date(), r#""2024-13-01""#),
+            (date(), "19737"),
+            (timestamp(), r#""2024-01-15 10:15:30""#),
+            (instant(), r#""2024-01-15T10:15:30""#),
+            (decimal(), r#""1e3""#),
+            (decimal(), "1.5"),
+        ] {
+            assert!(literal(data_type, json).is_err(), "{json}");
         }
     }
 
