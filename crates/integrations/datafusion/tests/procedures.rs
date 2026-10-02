@@ -241,6 +241,45 @@ async fn test_delete_branch_batch_stops_at_protected_branch() {
 }
 
 #[tokio::test]
+async fn test_delete_branch_rejects_path_separated_name() {
+    // A separator-bearing name slips past the configured-branch guard (it is not
+    // literally `prod`), so without name validation `branch_exists` finds the real
+    // `branch-prod/schema` directory and `drop_branch` deletes it, destroying the
+    // protected branch's schema. The name must be rejected before any deletion.
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id)) WITH ('scan.primary-branch' = 'prod')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("prod").await.unwrap();
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.delete_branch(table => 'test_db.t1', branch => 'prod/schema')",
+        "path separator",
+    )
+    .await;
+
+    // The protected branch and its schema survive and stay openable.
+    assert!(bm.branch_exists("prod").await.unwrap(), "prod must remain");
+    table.copy_with_branch("prod").await.unwrap();
+}
+
+#[tokio::test]
 async fn test_create_lumina_index_requires_index_column() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 

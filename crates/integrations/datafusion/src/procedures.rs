@@ -471,6 +471,11 @@ async fn proc_delete_branch(
         if branch_name.is_empty() {
             continue;
         }
+        // Validate the logical name before any existence check or deletion: a
+        // separator-bearing name like `prod/schema` would otherwise slip past the
+        // configured-branch guard (it is not literally `prod`) and recursively
+        // delete the inner directory of a protected branch.
+        BranchManager::validate_branch_name(branch_name).map_err(to_datafusion_error)?;
         BranchManager::ensure_branch_deletable(options, branch_name)
             .map_err(to_datafusion_error)?;
         if !bm

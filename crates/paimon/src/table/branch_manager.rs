@@ -70,23 +70,18 @@ impl BranchManager {
 
     /// Validate branch name format.
     ///
-    /// Rules:
-    /// - Cannot be "main"
-    /// - Cannot be blank or whitespace only
-    /// - Cannot be a pure numeric string
-    fn validate_branch_name(branch_name: &str) -> crate::Result<()> {
+    /// Enforces the catalog/table reader contract (`copy_with_branch`,
+    /// `$branch_...` resolution): rejects blank, `.`/`..`, path separators and
+    /// control characters, plus the manager's own main/pure-numeric rules. A
+    /// name accepted here is always openable by a reader.
+    pub fn validate_branch_name(branch_name: &str) -> crate::Result<()> {
+        crate::catalog::validate_branch_name(branch_name)?;
         if branch_name == DEFAULT_MAIN_BRANCH {
             return Err(crate::Error::DataInvalid {
                 message: format!(
                     "Branch name '{}' is the default branch and cannot be used.",
                     DEFAULT_MAIN_BRANCH
                 ),
-                source: None,
-            });
-        }
-        if branch_name.trim().is_empty() {
-            return Err(crate::Error::DataInvalid {
-                message: format!("Branch name '{}' is blank.", branch_name),
                 source: None,
             });
         }
@@ -425,7 +420,19 @@ mod tests {
         let result = BranchManager::validate_branch_name("");
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("blank"));
+        assert!(msg.contains("empty"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_validate_branch_name_rejects_reader_unopenable_names() {
+        // `.`/`..`, path separators and control chars must be rejected to match
+        // the catalog/table reader contract.
+        for name in [".", "..", "a/b", "a\\b", "a\u{001C}b"] {
+            assert!(
+                BranchManager::validate_branch_name(name).is_err(),
+                "{name:?} should be rejected"
+            );
+        }
     }
 
     #[tokio::test]
