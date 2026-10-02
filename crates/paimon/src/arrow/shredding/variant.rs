@@ -724,7 +724,7 @@ fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> R
         })
         .collect::<Result<Vec<_>>>()?;
 
-    if let Some(projected) = assemble_plain_variant_float32_projection(input, fields, &metadata)? {
+    if let Some(projected) = assemble_plain_variant_projection(input, fields, &metadata)? {
         return Ok(projected);
     }
 
@@ -790,7 +790,7 @@ fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> R
     ))
 }
 
-fn assemble_plain_variant_float32_projection(
+fn assemble_plain_variant_projection(
     input: &StructArray,
     fields: &[DataField],
     metadata: &[crate::spec::VariantFieldMetadata],
