@@ -417,10 +417,12 @@ impl Table {
     }
 
     /// Whether this user may read this table; `None` when it is not
-    /// `query-auth.enabled`. `query_auth` is the loaded option, as in Java.
+    /// `query-auth.enabled`. `query_auth` is the loaded option, as in Java;
+    /// `select` is what the read touches, `None` for the whole table.
     pub(crate) async fn authorize_read(
         &self,
         query_auth: bool,
+        select: Option<Vec<String>>,
     ) -> Result<Option<std::sync::Arc<query_auth::QueryAuthGrant>>> {
         let local = CoreOptions::new(self.schema.options());
         let Some(rest_env) = &self.rest_env else {
@@ -451,13 +453,12 @@ impl Table {
             query_auth::unsupported("this table handle was assembled rather than loaded")
         })?;
 
-        // Naming a system column here would fail the server's column check.
         let response = rest_env
-            .table_query_auth(self.schema.id(), self.schema.fields(), None)
+            .table_query_auth(self.schema.id(), self.schema.fields(), select.clone())
             .await?;
-        Ok(Some(std::sync::Arc::new(query_auth::QueryAuthGrant::new(
-            response, session,
-        ))))
+        Ok(Some(std::sync::Arc::new(
+            query_auth::QueryAuthGrant::parse(&response, session, select, self.schema.fields())?,
+        )))
     }
 
     /// Handed out once per catalog-loaded table; wraps only after 2^64 loads.
