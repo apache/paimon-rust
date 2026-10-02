@@ -357,15 +357,50 @@ async fn test_alter_table_columns() {
         "dropping a missing column should map to ColumnNotExist, got {missing_col:?}"
     );
 
-    // A missing column is swallowed when `ignore_if_not_exists` is set, exactly
-    // like a missing table.
-    cat.alter_table(
-        &ident,
-        vec![SchemaChange::drop_column("ghost".to_string())],
-        true,
-    )
-    .await
-    .unwrap();
+    // On an existing table, `ignore_if_not_exists` is the `ALTER TABLE IF EXISTS`
+    // *table* flag; it must NOT swallow a column error. Dropping a missing column
+    // still fails, so a caller is never told a schema change persisted when it
+    // did not.
+    let still_fails = cat
+        .alter_table(
+            &ident,
+            vec![SchemaChange::drop_column("ghost".to_string())],
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(still_fails, paimon::Error::ColumnNotExist { .. }),
+        "ignore_if_not_exists must not swallow a column error on an existing table, got {still_fails:?}"
+    );
+
+    // A batch mixing a valid change with a missing-column change is rejected
+    // atomically and surfaces the column error even under ignore_if_not_exists;
+    // the valid change must not persist.
+    let batch_err = cat
+        .alter_table(
+            &ident,
+            vec![
+                SchemaChange::add_column("extra".to_string(), DataType::Int(IntType::new())),
+                SchemaChange::drop_column("ghost".to_string()),
+            ],
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(batch_err, paimon::Error::ColumnNotExist { .. }),
+        "a batch touching a missing column must fail, got {batch_err:?}"
+    );
+    let reloaded = cat.get_table(&ident).await.unwrap();
+    assert!(
+        !reloaded
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| f.name() == "extra"),
+        "the atomically-rejected batch must not add column 'extra'"
+    );
 }
 
 // ==================== list partitions over REST ====================

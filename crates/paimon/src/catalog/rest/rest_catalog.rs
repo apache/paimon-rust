@@ -399,14 +399,13 @@ impl Catalog for RESTCatalog {
             .await
             .map_err(|e| map_rest_error_for_table(e, identifier));
         ignore_error_if(result, |e| {
-            // `ignore_if_not_exists` covers both a missing table and a missing
-            // column: once column errors are distinguished from table errors,
-            // altering a missing column must stay swallowed here too.
-            ignore_if_not_exists
-                && matches!(
-                    e,
-                    Error::TableNotExist { .. } | Error::ColumnNotExist { .. }
-                )
+            // `ignore_if_not_exists` is the `ALTER TABLE IF EXISTS` *table* flag,
+            // matching `FileSystemCatalog` and the `Catalog::alter_table`
+            // contract: it swallows only a missing table. A `ColumnNotExist` from
+            // an existing table is a real schema failure (e.g. DROP of an absent
+            // column, or a batch the server rejected atomically) and must surface,
+            // or a caller would believe a column change persisted when it did not.
+            ignore_if_not_exists && matches!(e, Error::TableNotExist { .. })
         })
     }
 
