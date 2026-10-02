@@ -36,6 +36,7 @@ pub struct OcfHeader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OcfCodec {
     Null,
+    Deflate,
     Snappy,
     Zstandard,
 }
@@ -113,6 +114,20 @@ impl<'a> OcfBlockIter<'a> {
     fn decompress(&mut self, data: &'a [u8]) -> crate::Result<Cow<'a, [u8]>> {
         match self.codec {
             OcfCodec::Null => Ok(Cow::Borrowed(data)),
+            OcfCodec::Deflate => {
+                // The Avro `deflate` codec is raw DEFLATE (RFC 1951), with no
+                // zlib or gzip wrapper.
+                use std::io::Read;
+                let mut decoder = flate2::read::DeflateDecoder::new(data);
+                let mut decompressed = Vec::new();
+                decoder
+                    .read_to_end(&mut decompressed)
+                    .map_err(|e| Error::UnexpectedError {
+                        message: format!("avro ocf: deflate decompression failed: {e}"),
+                        source: None,
+                    })?;
+                Ok(Cow::Owned(decompressed))
+            }
             OcfCodec::Snappy => {
                 if data.len() < 4 {
                     return Err(Error::UnexpectedError {
@@ -176,6 +191,7 @@ pub fn parse_ocf_streaming(bytes: &[u8]) -> crate::Result<(OcfHeader, OcfBlockIt
 
     let codec = match meta.get("avro.codec").map(|s| s.as_str()) {
         None | Some("null") => OcfCodec::Null,
+        Some("deflate") => OcfCodec::Deflate,
         Some("snappy") => OcfCodec::Snappy,
         Some("zstandard") => OcfCodec::Zstandard,
         Some(other) => {
@@ -308,5 +324,38 @@ mod tests {
         assert_eq!(header.codec, OcfCodec::Snappy);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].object_count, 1);
+    }
+
+    #[test]
+    fn test_parse_ocf_deflate() {
+        use apache_avro::{from_avro_datum, types::Value, Codec, DeflateSettings, Schema, Writer};
+
+        let schema = Schema::parse_str(
+            r#"{"type": "record", "name": "test", "fields": [{"name": "x", "type": "long"}]}"#,
+        )
+        .unwrap();
+        let mut writer = Writer::with_codec(
+            &schema,
+            Vec::new(),
+            Codec::Deflate(DeflateSettings::default()),
+        );
+        let mut record = apache_avro::types::Record::new(&schema).unwrap();
+        record.put("x", 424242i64);
+        writer.append(record).unwrap();
+        let bytes = writer.into_inner().unwrap();
+
+        let (header, blocks) = parse_ocf(&bytes).unwrap();
+        assert_eq!(header.codec, OcfCodec::Deflate);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].object_count, 1);
+
+        // The decompressed block must decode back to the original record, which
+        // proves the deflate output is correct rather than merely non-erroring.
+        let mut cursor = blocks[0].data.as_ref();
+        let value = from_avro_datum(&schema, &mut cursor, None).unwrap();
+        assert_eq!(
+            value,
+            Value::Record(vec![("x".to_string(), Value::Long(424242))])
+        );
     }
 }
