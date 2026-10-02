@@ -17,24 +17,51 @@
 
 //! What the REST server authorized a user to read from one table.
 
-use crate::api::AuthTableQueryResponse;
+mod rules;
 
-/// The server's answer for one user on one table, kept unparsed; `session`
-/// ties it to the handle that asked, as the response names no table or user.
+use crate::api::AuthTableQueryResponse;
+pub(crate) use rules::{filter_batch, Rules};
+
+/// The server's answer for one user on one table; `session` ties it to the
+/// handle that asked, as the response names no table or user.
 #[derive(Debug, PartialEq)]
 pub(crate) struct QueryAuthGrant {
-    response: AuthTableQueryResponse,
     session: u64,
+    /// The columns the request asked about; `None` asked about the whole table.
+    select: Option<Vec<String>>,
+    rules: Rules,
 }
 
 impl QueryAuthGrant {
-    pub(crate) fn new(response: AuthTableQueryResponse, session: u64) -> Self {
-        Self { response, session }
+    /// Parses the rules against `fields`, the schema the server ruled on.
+    pub(crate) fn parse(
+        response: &AuthTableQueryResponse,
+        session: u64,
+        select: Option<Vec<String>>,
+        fields: &[crate::spec::DataField],
+    ) -> crate::Result<Self> {
+        Ok(Self::new(session, select, Rules::parse(response, fields)?))
     }
 
-    /// The only case this client can serve.
+    pub(crate) fn new(session: u64, select: Option<Vec<String>>, rules: Rules) -> Self {
+        Self {
+            session,
+            select,
+            rules,
+        }
+    }
+
+    /// No row filter and no masking.
     pub(crate) fn is_unrestricted(&self) -> bool {
-        self.response.is_unrestricted()
+        self.rules.is_empty()
+    }
+
+    pub(crate) fn rules(&self) -> &Rules {
+        &self.rules
+    }
+
+    pub(crate) fn select(&self) -> Option<&[String]> {
+        self.select.as_deref()
     }
 
     /// A view of another schema is not the one the server ruled on.
@@ -126,6 +153,28 @@ fn contains(wide: &crate::spec::DataType, narrow: &crate::spec::DataType) -> boo
         }
         (w, n) => w == n,
     }
+}
+
+/// Every leaf's column name, system columns included.
+pub(crate) fn leaf_names(
+    predicates: &[crate::spec::Predicate],
+) -> std::collections::HashSet<String> {
+    fn collect(predicate: &crate::spec::Predicate, out: &mut std::collections::HashSet<String>) {
+        use crate::spec::Predicate;
+        match predicate {
+            Predicate::Leaf { column, .. } => {
+                out.insert(column.clone());
+            }
+            Predicate::And(children) | Predicate::Or(children) => {
+                children.iter().for_each(|child| collect(child, out));
+            }
+            Predicate::Not(inner) => collect(inner, out),
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    predicates.iter().for_each(|p| collect(p, &mut out));
+    out
 }
 
 /// A refusal naming the option, so callers never match on prose.
@@ -222,10 +271,8 @@ mod tests {
     async fn test_a_grant_is_pinned_to_the_handle_that_obtained_it() {
         let a = crate::table::rest_query_auth_table().await;
         let b = crate::table::rest_query_auth_table().await;
-        let grant = super::QueryAuthGrant::new(
-            crate::api::AuthTableQueryResponse::default(),
-            a.query_auth_session().unwrap(),
-        );
+        let grant =
+            super::QueryAuthGrant::new(a.query_auth_session().unwrap(), None, Default::default());
         assert!(grant.matches_table(&a));
         assert!(
             !grant.matches_table(&b),
@@ -251,7 +298,7 @@ mod tests {
                         "1".to_string(),
                     )]));
             assert!(!table.is_time_traveled(), "{selector} sets no flag");
-            let err = table.authorize_read(true).await.unwrap_err();
+            let err = table.authorize_read(true, None).await.unwrap_err();
             assert!(
                 matches!(err, crate::Error::Unsupported { ref message }
                     if message.contains("time-travelled or branch read")),
@@ -285,7 +332,7 @@ mod tests {
             ("scan.snapshot-id".to_string(), "invalid".to_string()),
         ]));
         assert!(table.reads_another_schema().unwrap());
-        assert!(table.authorize_read(false).await.unwrap().is_none());
+        assert!(table.authorize_read(false, None).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -302,8 +349,9 @@ mod tests {
     async fn test_a_grant_does_not_cross_into_a_travelled_or_branch_view() {
         let table = crate::table::rest_query_auth_table().await;
         let grant = super::QueryAuthGrant::new(
-            crate::api::AuthTableQueryResponse::default(),
             table.query_auth_session().unwrap(),
+            None,
+            Default::default(),
         );
         assert!(grant.matches_table(&table));
 
@@ -547,7 +595,7 @@ mod tests {
     async fn test_time_travelled_or_branch_read_is_refused() {
         let mut travelled = rest_query_auth_table().await;
         travelled.time_traveled = true;
-        let err = travelled.authorize_read(true).await.unwrap_err();
+        let err = travelled.authorize_read(true, None).await.unwrap_err();
         assert!(
             matches!(err, crate::Error::Unsupported { ref message }
                 if message.contains("time-travelled or branch read")),
@@ -556,6 +604,6 @@ mod tests {
 
         let mut branch = rest_query_auth_table().await;
         branch.branch_reference = true;
-        assert!(branch.authorize_read(true).await.is_err());
+        assert!(branch.authorize_read(true, None).await.is_err());
     }
 }

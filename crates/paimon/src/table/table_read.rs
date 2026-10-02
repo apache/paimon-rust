@@ -311,22 +311,6 @@ impl<'a> TableRead<'a> {
     }
 }
 
-/// Every leaf's column name, system columns included.
-fn collect_leaf_column_names(predicate: &Predicate, out: &mut std::collections::HashSet<String>) {
-    match predicate {
-        Predicate::Leaf { column, .. } => {
-            out.insert(column.clone());
-        }
-        Predicate::And(children) | Predicate::Or(children) => {
-            children
-                .iter()
-                .for_each(|child| collect_leaf_column_names(child, out));
-        }
-        Predicate::Not(inner) => collect_leaf_column_names(inner, out),
-        Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
-    }
-}
-
 #[derive(Debug, Clone)]
 struct PaimonTableRead<'a> {
     table: &'a Table,
@@ -507,7 +491,14 @@ impl<'a> PaimonTableRead<'a> {
         data_splits: &[DataSplit],
     ) -> crate::Result<ArrowRecordBatchStream> {
         // Streaming primary-key splits are read raw below, so decide here for all.
-        self.ensure_authorized_by_splits(&self.table.schema.core_options(), data_splits)?;
+        if self
+            .ensure_authorized_by_splits(&self.table.schema.core_options(), data_splits)?
+            .is_some()
+        {
+            return Err(super::query_auth::unsupported(
+                "a row-kind read cannot apply a row filter or column masking",
+            ));
+        }
         let schema = audit_schema_for_read_type(&self.read_type, false)?;
         let (streaming, materialized): (Vec<_>, Vec<_>) = data_splits
             .iter()
@@ -974,13 +965,13 @@ impl<'a> PaimonTableRead<'a> {
         reader.read(splits)
     }
 
-    /// Reads only splits carrying a grant that the server imposed nothing;
-    /// nothing is fetched here, so a split without one fails closed.
+    /// Every split must carry this handle's grant; returns it when it restricts
+    /// the read. Nothing is fetched here, so a split without one fails closed.
     fn ensure_authorized_by_splits(
         &self,
         core_options: &CoreOptions,
         data_splits: &[DataSplit],
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Option<Arc<super::query_auth::QueryAuthGrant>>> {
         // Unconditional: unrelated to query-auth.
         core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
         // Decided at plan time, as in Java: a split predating the option, or built
@@ -988,7 +979,7 @@ impl<'a> PaimonTableRead<'a> {
         let required = core_options.query_auth_enabled()
             || data_splits.iter().any(|s| s.query_auth_required());
         if !required {
-            return Ok(());
+            return Ok(None);
         }
         // Only the catalog mints a session, so a handle without one holds no grant.
         if self.table.query_auth_session().is_none() {
@@ -997,10 +988,7 @@ impl<'a> PaimonTableRead<'a> {
             ));
         }
         // The read's own scope: a caller can plan clean, then read differently.
-        let mut filter_columns = std::collections::HashSet::new();
-        for predicate in &self.data_predicates {
-            collect_leaf_column_names(predicate, &mut filter_columns);
-        }
+        let filter_columns = super::query_auth::leaf_names(&self.data_predicates);
         super::query_auth::reject_system_columns(
             self.read_type
                 .iter()
@@ -1013,7 +1001,9 @@ impl<'a> PaimonTableRead<'a> {
             &self.read_type,
             self.table.schema().fields(),
         )?;
-        // Per split, as Java binds one `QueryAuthSplit` each.
+        // Per split, as Java binds one `QueryAuthSplit` each; one read applies one
+        // rule set, so a restricted split's grant must cover them all.
+        let mut restricted: Option<&Arc<super::query_auth::QueryAuthGrant>> = None;
         for split in data_splits {
             let Some(grant) = split.query_auth_grant() else {
                 return Err(super::query_auth::unsupported(
@@ -1027,21 +1017,124 @@ impl<'a> PaimonTableRead<'a> {
                      scan",
                 ));
             }
-            if !grant.is_unrestricted() {
+            // The server ruled on these columns only, whether or not it set rules.
+            if let Some(select) = grant.select() {
+                if let Some(outside) = self
+                    .read_type
+                    .iter()
+                    .map(|f| f.name())
+                    .chain(filter_columns.iter().map(String::as_str))
+                    .find(|name| !select.iter().any(|s| s == name))
+                {
+                    return Err(super::query_auth::unsupported(&format!(
+                        "'{outside}' is outside the columns this plan was authorized for; plan \
+                         with it"
+                    )));
+                }
+            }
+            if !grant.is_unrestricted() && restricted.is_none() {
+                restricted = Some(grant);
+            }
+        }
+        if let Some(grant) = restricted {
+            if data_splits
+                .iter()
+                .any(|s| s.query_auth_grant().is_none_or(|g| **g != **grant))
+            {
                 return Err(super::query_auth::unsupported(
-                    "this client cannot apply a row filter or column masking, so it refuses \
-                     rather than return unfiltered rows",
+                    "the splits were planned under different rules; re-plan the scan",
                 ));
             }
         }
-        Ok(())
+        Ok(restricted.cloned())
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
     pub fn to_arrow(&self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
-        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let core_options = self.table.schema.core_options();
-        self.ensure_authorized_by_splits(&core_options, data_splits)?;
+        match self.ensure_authorized_by_splits(&core_options, data_splits)? {
+            Some(grant) => self.read_restricted(data_splits, &grant),
+            None => self.read_splits(data_splits, &core_options),
+        }
+    }
+
+    /// Reads what the row filter needs, filters on stored values and projects
+    /// back (Java `doAuth`).
+    fn read_restricted(
+        &self,
+        data_splits: &[DataSplit],
+        grant: &super::query_auth::QueryAuthGrant,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        use super::query_auth::{filter_batch, unsupported};
+
+        let schema_fields = self.table.schema().fields().to_vec();
+        let rules = grant.rules();
+        let index_of = |field: &DataField| schema_fields.iter().position(|s| s.id() == field.id());
+        let needed = rules.filter_columns();
+        // A partly projected column would feed the filter a partial value (Java
+        // `validateReadType`).
+        for field in &self.read_type {
+            if let Some(index) = index_of(field) {
+                if needed.contains(&index) && field.data_type() != schema_fields[index].data_type()
+                {
+                    return Err(unsupported(&format!(
+                        "the server's row filter reads '{}', which the read projects only in part",
+                        field.name()
+                    )));
+                }
+            }
+        }
+
+        let mut physical = self.read_type.clone();
+        let mut needed: Vec<usize> = needed.into_iter().collect();
+        needed.sort_unstable();
+        for index in needed {
+            let field = &schema_fields[index];
+            if !physical.iter().any(|f| f.id() == field.id()) {
+                physical.push(field.clone());
+            }
+        }
+        let mut inner = self.clone();
+        inner.read_type = physical.clone();
+        inner.limit = None;
+        let stream = inner.read_splits(data_splits, &self.table.schema.core_options())?;
+
+        let filters = rules.filters.clone();
+        let projection: Vec<usize> = (0..self.read_type.len()).collect();
+        let stream = stream.map(move |batch| {
+            let batch = batch?;
+            let names_match = batch.num_columns() == physical.len()
+                && batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .zip(&physical)
+                    .all(|(column, field)| column.name() == field.name());
+            if !names_match {
+                return Err(unsupported(
+                    "the read returned columns the rules cannot address",
+                ));
+            }
+            let batch = filter_batch(&batch, &filters, &schema_fields, &physical)?;
+            batch
+                .project(&projection)
+                .map_err(|e| crate::Error::DataInvalid {
+                    message: format!("failed to project the authorized batch: {e}"),
+                    source: Some(Box::new(e)),
+                })
+        });
+        Ok(match self.limit {
+            None => Box::pin(stream),
+            Some(limit) => limit_rows(Box::pin(stream), limit),
+        })
+    }
+
+    fn read_splits(
+        &self,
+        data_splits: &[DataSplit],
+        core_options: &CoreOptions<'_>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let has_primary_keys = !self.table.schema.primary_keys().is_empty();
         let merge_engine = core_options.merge_engine()?;
 
         // Route supported PK merge engines through the split-aware reader.
@@ -1056,11 +1149,11 @@ impl<'a> PaimonTableRead<'a> {
                     | MergeEngine::Aggregation
             )
         {
-            return self.read_pk_with_blob(data_splits, &core_options);
+            return self.read_pk_with_blob(data_splits, core_options);
         }
 
         if core_options.data_evolution_enabled() {
-            self.read_with_evolution(data_splits, &core_options)
+            self.read_with_evolution(data_splits, core_options)
         } else {
             self.read_raw(data_splits)
         }
@@ -1261,6 +1354,26 @@ impl<'a> PaimonTableRead<'a> {
         }
         Ok(reader)
     }
+}
+
+/// Stops once `limit` rows are out, without polling for more.
+fn limit_rows(stream: ArrowRecordBatchStream, limit: usize) -> ArrowRecordBatchStream {
+    Box::pin(stream::unfold(
+        (stream, 0usize),
+        move |(mut inner, emitted)| async move {
+            if emitted >= limit {
+                return None;
+            }
+            match inner.next().await? {
+                Err(e) => Some((Err(e), (inner, limit))),
+                Ok(batch) => {
+                    let batch = batch.slice(0, batch.num_rows().min(limit - emitted));
+                    let emitted = emitted + batch.num_rows();
+                    Some((Ok(batch), (inner, emitted)))
+                }
+            }
+        },
+    ))
 }
 
 fn prepend_insert_row_kind_stream(
@@ -2438,13 +2551,17 @@ mod tests {
 
     fn grant_for(table: &Table, restricted: bool) -> crate::table::query_auth::QueryAuthGrant {
         crate::table::query_auth::QueryAuthGrant::new(
-            crate::api::AuthTableQueryResponse {
-                filter: restricted.then(|| vec!["{}".to_string()]),
-                column_masking: None,
-            },
             table
                 .query_auth_session()
                 .expect("a catalog-loaded table has a session"),
+            None,
+            crate::table::query_auth::Rules {
+                filters: if restricted {
+                    vec![crate::spec::Predicate::AlwaysTrue]
+                } else {
+                    Vec::new()
+                },
+            },
         )
     }
 
@@ -2607,17 +2724,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_restricted_grant_on_a_split_refuses_the_read() {
+    async fn test_a_restricted_grant_must_cover_every_split_of_the_read() {
         let table = crate::table::rest_query_auth_table().await;
         let read = TableRead::new(&table, table.schema.fields().to_vec(), Vec::new());
-        let split = split_with_grant(Some(grant_for(&table, true)));
-        assert!(
-            matches!(
-                read.to_arrow(&[split]),
-                Err(crate::Error::Unsupported { ref message }) if message.contains("query-auth.enabled")
-            ),
-            "a row filter this client cannot apply must refuse the read"
-        );
+        let restricted = split_with_grant(Some(grant_for(&table, true)));
+        assert!(read.to_arrow(std::slice::from_ref(&restricted)).is_ok());
+        let unrestricted = split_with_grant(Some(grant_for(&table, false)));
+        for splits in [
+            [restricted.clone(), unrestricted.clone()],
+            [unrestricted, restricted.clone()],
+        ] {
+            assert!(
+                matches!(read.to_arrow(&splits), Err(crate::Error::Unsupported { ref message })
+                    if message.contains("different rules")),
+                "one rule set per read, whatever the order"
+            );
+        }
+        // Streaming primary-key splits are read raw.
+        assert!(matches!(
+            read.to_arrow_with_row_kind(&[restricted]),
+            Err(crate::Error::Unsupported { ref message }) if message.contains("row-kind")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_a_read_stays_inside_the_authorized_columns() {
+        let table = crate::table::rest_query_auth_table().await;
+        let fields = table.schema.fields().to_vec();
+        // Without rules too: a column permission scoped the grant all the same.
+        for filters in [vec![Predicate::AlwaysTrue], Vec::new()] {
+            // Planned with no columns, as `COUNT(*)` is.
+            let grant = crate::table::query_auth::QueryAuthGrant::new(
+                table.query_auth_session().unwrap(),
+                Some(Vec::new()),
+                crate::table::query_auth::Rules { filters },
+            );
+            let split = split_with_grant(Some(grant));
+            let narrow = TableRead::new(&table, Vec::new(), Vec::new());
+            assert!(narrow.to_arrow(std::slice::from_ref(&split)).is_ok());
+            let wide = TableRead::new(&table, fields.clone(), Vec::new());
+            assert!(
+                matches!(wide.to_arrow(&[split]), Err(crate::Error::Unsupported { ref message })
+                    if message.contains("outside the columns")),
+                "the server ruled on the planned columns only"
+            );
+        }
     }
 
     #[tokio::test]

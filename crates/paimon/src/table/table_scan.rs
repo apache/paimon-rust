@@ -1538,30 +1538,40 @@ impl<'a> PaimonTableScan<'a> {
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
         let grant = self.authorize_query().await?;
-        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let plan = match super::time_travel::resolve_snapshot(self.table).await? {
+        let restricted = grant
+            .as_deref()
+            .filter(|grant| !grant.is_unrestricted())
+            .map(|grant| self.restricted_by(grant));
+        let scan = restricted.as_ref().unwrap_or(self);
+        let data_evolution_read_field_ids = scan.projected_read_field_ids()?;
+        let plan = match super::time_travel::resolve_snapshot(scan.table).await? {
             Some(snapshot) => {
-                self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
+                scan.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
                     .await?
             }
             None => Plan::new(Vec::new()),
         };
-        self.check_planned_files(&plan, grant.is_some()).await?;
+        scan.check_planned_files(&plan, grant.is_some()).await?;
         Ok(plan.planned(grant))
     }
 
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         let grant = self.authorize_query().await?;
+        let restricted = grant
+            .as_deref()
+            .filter(|grant| !grant.is_unrestricted())
+            .map(|grant| self.restricted_by(grant));
+        let scan = restricted.as_ref().unwrap_or(self);
         let mut trace = ScanTrace {
-            limit: self.limit,
+            limit: scan.limit,
             ..Default::default()
         };
-        let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let plan = match super::time_travel::resolve_snapshot(self.table).await? {
+        let data_evolution_read_field_ids = scan.projected_read_field_ids()?;
+        let plan = match super::time_travel::resolve_snapshot(scan.table).await? {
             Some(snapshot) => {
                 trace.snapshot_id = Some(snapshot.id());
-                let plan = self
+                let plan = scan
                     .plan_snapshot(
                         snapshot,
                         data_evolution_read_field_ids.as_ref(),
@@ -1573,8 +1583,65 @@ impl<'a> PaimonTableScan<'a> {
             }
             None => Plan::new(Vec::new()),
         };
-        self.check_planned_files(&plan, grant.is_some()).await?;
+        scan.check_planned_files(&plan, grant.is_some()).await?;
         Ok((plan.planned(grant), trace))
+    }
+
+    /// The scan a restricted grant plans: a limit cannot count rows the row
+    /// filter drops.
+    fn restricted_by(&self, grant: &super::query_auth::QueryAuthGrant) -> Self {
+        let rules = grant.rules();
+        let mut scan = self.clone();
+        if !rules.filters.is_empty() {
+            scan.limit = scan.limit.filter(|limit| *limit == 0);
+        }
+        // Column-slice pruning must keep the files holding the filter's columns.
+        if let Some(ids) = scan.projected_read_field_ids.as_mut() {
+            let fields = self.table.schema().fields();
+            ids.extend(
+                rules
+                    .filter_columns()
+                    .into_iter()
+                    .filter_map(|i| fields.get(i))
+                    .map(|f| f.id()),
+            );
+        }
+        scan
+    }
+
+    /// Java's `select`: the projection plus what the filters read; `None` (the
+    /// whole table) without a projection.
+    fn query_auth_select(&self) -> Option<Vec<String>> {
+        let ids = self.projected_read_field_ids.as_ref()?;
+        let mut select: Vec<String> = self
+            .table
+            .schema()
+            .fields()
+            .iter()
+            .filter(|f| ids.contains(&f.id()))
+            .map(|f| f.name().to_string())
+            .collect();
+        for key in self.partition_filter_columns() {
+            if !select.contains(&key) {
+                select.push(key);
+            }
+        }
+        Some(select)
+    }
+
+    /// Columns the caller's partition filter reads; a pinned partition set reads them all.
+    fn partition_filter_columns(&self) -> Vec<String> {
+        match &self.partition_filter {
+            None => Vec::new(),
+            Some(PartitionFilter::Predicate(predicate)) => {
+                super::query_auth::leaf_names(std::slice::from_ref(predicate))
+                    .into_iter()
+                    .collect()
+            }
+            Some(PartitionFilter::PartitionSet { .. }) => {
+                self.table.schema().partition_keys().to_vec()
+            }
+        }
     }
 
     /// The grant predates the manifest read, so the table can have been
@@ -1627,14 +1694,10 @@ impl<'a> PaimonTableScan<'a> {
             super::query_auth::reject_system_columns([ROW_ID_FIELD_NAME])?;
         }
 
-        let grant = self.table.authorize_read(query_auth).await?;
-        // A plan already answers COUNT/MIN/MAX from row counts and bounds.
-        if grant.as_ref().is_some_and(|g| !g.is_unrestricted()) {
-            return Err(super::query_auth::unsupported(
-                "a plan already carries file paths, row counts and column bounds that a row \
-                 filter or column masking must not expose",
-            ));
-        }
+        let grant = self
+            .table
+            .authorize_read(query_auth, self.query_auth_select())
+            .await?;
         Ok(grant)
     }
 

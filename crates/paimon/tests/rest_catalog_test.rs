@@ -2866,27 +2866,64 @@ fn assert_drifted(err: paimon::Error, what: &str) {
     );
 }
 
-fn restricted() -> paimon::api::AuthTableQueryResponse {
+/// A row filter of `filters` (ANDed) and `masks` by column, as the server sends them.
+fn rules(
+    filters: &[serde_json::Value],
+    masks: &[(&str, serde_json::Value)],
+) -> paimon::api::AuthTableQueryResponse {
     paimon::api::AuthTableQueryResponse {
-        filter: Some(vec!["{\"field\":\"id\"}".to_string()]),
-        column_masking: None,
+        filter: (!filters.is_empty()).then(|| filters.iter().map(|f| f.to_string()).collect()),
+        column_masking: (!masks.is_empty()).then(|| {
+            masks
+                .iter()
+                .map(|(column, mask)| (column.to_string(), mask.to_string()))
+                .collect()
+        }),
     }
 }
 
-#[tokio::test]
-async fn test_query_auth_restricted_user_is_refused_at_plan_time() {
-    let g = guarded("restricted", &["id"]).await;
-    g.ctx
-        .server
-        .set_auth_response("default", "restricted", restricted());
+/// Java `LeafPredicate` JSON over an INT column.
+fn int_leaf(index: usize, column: &str, function: &str, literal: i32) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "LEAF",
+        "transform": {
+            "name": "FIELD_REF",
+            "fieldRef": {"index": index, "name": column, "type": "INT"},
+        },
+        "function": function,
+        "literals": [literal],
+    })
+}
 
-    assert_refused(
-        plan_err(
-            &g.table,
-            "a restricted user must be refused before a plan exists",
-        )
-        .await,
-    );
+#[tokio::test]
+async fn test_query_auth_rules_this_client_cannot_parse_fail_closed_at_planning() {
+    let g = guarded("unparseable", &["id"]).await;
+    let widened = serde_json::json!({
+        "name": "CAST",
+        "fieldRef": {"index": 0, "name": "id", "type": "INT"},
+        "type": "BIGINT",
+    });
+    for response in [
+        // Not a predicate, or nothing at all.
+        rules(&[serde_json::json!({"field": "id"})], &[]),
+        paimon::api::AuthTableQueryResponse {
+            filter: Some(vec![String::new()]),
+            column_masking: None,
+        },
+        // Functions and transforms this client does not know.
+        rules(&[int_leaf(0, "id", "REGEXP", 1)], &[]),
+        rules(&[], &[("id", serde_json::json!({"name": "invalid"}))]),
+        // Columns the table does not have.
+        rules(&[int_leaf(0, "missing", "EQUAL", 1)], &[]),
+        rules(&[], &[("missing", serde_json::json!({"name": "NULL"}))]),
+        // A mask must keep its column's type.
+        rules(&[], &[("id", widened)]),
+    ] {
+        g.ctx
+            .server
+            .set_auth_response("default", "unparseable", response.clone());
+        assert_refused(plan_err(&g.table, &format!("{response:?}")).await);
+    }
 }
 
 #[tokio::test]
@@ -3137,6 +3174,363 @@ async fn test_query_auth_refuses_an_assembled_handle() {
         );
         assert_refused(plan_err(&assembled, "an assembled handle carries no session").await);
     }
+}
+
+fn people(options: &[(&str, &str)]) -> Schema {
+    let mut builder = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::new(255).unwrap()));
+    for (key, value) in options {
+        builder = builder.option(*key, *value);
+    }
+    builder.build().unwrap()
+}
+
+fn people_batch(rows: &[(i32, &str)]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.0))),
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
+        ],
+    )
+    .unwrap()
+}
+
+const NAMES: [&str; 10] = [
+    "alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi", "ivan", "judy",
+];
+
+/// Ids `ids`, each with its name from [`NAMES`].
+fn people_rows(ids: std::ops::RangeInclusive<i32>) -> RecordBatch {
+    let rows: Vec<(i32, &str)> = ids.map(|id| (id, NAMES[id as usize - 1])).collect();
+    people_batch(&rows)
+}
+
+/// Writes one commit per batch through a filesystem catalog, then serves the
+/// files as a `query-auth.enabled` table.
+async fn written(
+    name: &str,
+    schema: impl Fn(&[(&str, &str)]) -> Schema,
+    commits: Vec<RecordBatch>,
+) -> Guarded {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fs_options = Options::new();
+    fs_options.set(
+        CatalogOptions::WAREHOUSE,
+        format!("file://{}", tmp.path().display()),
+    );
+    let fs_catalog = FileSystemCatalog::new(fs_options).unwrap();
+    fs_catalog
+        .create_database("default", true, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("default", name);
+    fs_catalog
+        .create_table(&identifier, schema(&[]), false)
+        .await
+        .unwrap();
+    let plain = fs_catalog.get_table(&identifier).await.unwrap();
+    for batch in commits {
+        write_batch(&plain, batch, "query-auth-fixture").await;
+    }
+
+    let ctx = setup_catalog(vec!["default"]).await;
+    ctx.server
+        .add_table_with_schema("default", name, schema(GUARDED), plain.location());
+    let table = ctx.catalog.get_table(&identifier).await.unwrap();
+    Guarded {
+        ctx,
+        table,
+        identifier,
+        _tmp: tmp,
+    }
+}
+
+async fn read_all(builder: &paimon::table::ReadBuilder<'_>) -> paimon::Result<Vec<RecordBatch>> {
+    let plan = builder.new_scan().plan().await?;
+    builder
+        .new_read()?
+        .to_arrow(plan.splits())?
+        .try_collect()
+        .await
+}
+
+fn column<'b, T: 'static>(batch: &'b RecordBatch, name: &str) -> &'b T {
+    batch
+        .column_by_name(name)
+        .unwrap_or_else(|| panic!("no column '{name}'"))
+        .as_any()
+        .downcast_ref::<T>()
+        .unwrap()
+}
+
+fn ids(batches: &[RecordBatch]) -> Vec<i32> {
+    let mut ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| column::<Int32Array>(b, "id").values().to_vec())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// `(id, name)` sorted by id; a null name is `None`.
+fn id_names(batches: &[RecordBatch]) -> Vec<(i32, Option<String>)> {
+    let mut rows: Vec<_> = batches
+        .iter()
+        .flat_map(|b| {
+            let ids = column::<Int32Array>(b, "id");
+            let names = column::<StringArray>(b, "name");
+            (0..b.num_rows())
+                .map(|r| {
+                    (
+                        ids.value(r),
+                        names.is_valid(r).then(|| names.value(r).to_string()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[track_caller]
+fn assert_forbidden(err: paimon::Error) {
+    assert!(
+        matches!(
+            err,
+            paimon::Error::RestApi {
+                source: paimon::api::RestError::Forbidden { .. }
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_row_filter_returns_only_the_rows_it_admits() {
+    // One split per commit, so a pushed-down limit could stop after the first.
+    let g = written(
+        "filtered",
+        |options| people(&[options, &[("source.split.target-size", "1b")]].concat()),
+        vec![people_rows(1..=5), people_rows(6..=10)],
+    )
+    .await;
+    g.ctx.server.set_auth_response(
+        "default",
+        "filtered",
+        rules(&[int_leaf(0, "id", "GREATER_THAN", 6)], &[]),
+    );
+
+    let rows = id_names(&read_all(&g.table.new_read_builder()).await.unwrap());
+    let expected: Vec<_> = (7..=10)
+        .map(|id| (id, Some(NAMES[id as usize - 1].to_string())))
+        .collect();
+    assert_eq!(rows, expected);
+
+    // What COUNT(*) reads: no columns, only the admitted rows.
+    let mut counted = g.table.new_read_builder();
+    counted.with_projection(&[]).unwrap();
+    let batches = read_all(&counted).await.unwrap();
+    assert!(batches.iter().all(|b| b.num_columns() == 0));
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+
+    let mut limited = g.table.new_read_builder();
+    limited.with_limit(2);
+    let plan = limited.new_scan().plan().await.unwrap();
+    assert!(plan.splits().iter().all(|s| s.has_query_auth_rules()));
+    assert_eq!(
+        plan.splits().len(),
+        2,
+        "the row filter must disable limit pushdown"
+    );
+    let batches: Vec<RecordBatch> = limited
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let limited_ids = ids(&batches);
+    assert_eq!(limited_ids.len(), 2, "{limited_ids:?}");
+    assert!(limited_ids.iter().all(|id| *id > 6), "{limited_ids:?}");
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_asks_about_the_projection_and_the_columns_filters_read() {
+    let g = written("scoped", people, vec![people_rows(1..=3)]).await;
+    g.ctx
+        .server
+        .set_column_auth("default", "scoped", vec!["id".to_string()]);
+
+    let mut id_only = g.table.new_read_builder();
+    id_only.with_projection(&["id"]).unwrap();
+    assert_eq!(ids(&read_all(&id_only).await.unwrap()), vec![1, 2, 3]);
+
+    let mut with_name = g.table.new_read_builder();
+    with_name.with_projection(&["id", "name"]).unwrap();
+    assert_forbidden(read_all(&with_name).await.unwrap_err());
+
+    let mut filtered = g.table.new_read_builder();
+    filtered.with_projection(&["id"]).unwrap().with_filter(
+        PredicateBuilder::new(g.table.schema().fields())
+            .equal("name", Datum::String("bob".to_string()))
+            .unwrap(),
+    );
+    assert_forbidden(read_all(&filtered).await.unwrap_err());
+
+    assert_forbidden(read_all(&g.table.new_read_builder()).await.unwrap_err());
+
+    // The order of a select is not part of what it asks.
+    let asked: Vec<Option<std::collections::BTreeSet<String>>> = g
+        .ctx
+        .server
+        .auth_selects("default", "scoped")
+        .into_iter()
+        .map(|select| select.map(|columns| columns.into_iter().collect()))
+        .collect();
+    let select = |columns: &[&str]| Some(columns.iter().map(|c| c.to_string()).collect());
+    assert_eq!(
+        asked,
+        vec![
+            select(&["id"]),
+            select(&["id", "name"]),
+            select(&["id", "name"]),
+            None
+        ]
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_refuses_a_read_wider_than_its_plan() {
+    let g = written("narrow", people, vec![people_rows(1..=10)]).await;
+    let mut planned = g.table.new_read_builder();
+    planned.with_projection(&["id"]).unwrap();
+    let mut filtered = g.table.new_read_builder();
+    filtered.with_projection(&["id"]).unwrap().with_filter(
+        PredicateBuilder::new(g.table.schema().fields())
+            .equal("name", Datum::String("bob".to_string()))
+            .unwrap(),
+    );
+    let wider = [g.table.new_read_builder(), filtered];
+
+    // Scoped once under a row filter, once by a column permission alone.
+    g.ctx.server.set_auth_response(
+        "default",
+        "narrow",
+        rules(&[int_leaf(0, "id", "GREATER_THAN", 6)], &[]),
+    );
+    let under_rules = planned.new_scan().plan().await.unwrap();
+    g.ctx
+        .server
+        .set_auth_response("default", "narrow", rules(&[], &[]));
+    g.ctx
+        .server
+        .set_column_auth("default", "narrow", vec!["id".to_string()]);
+    let under_permission = planned.new_scan().plan().await.unwrap();
+
+    for (plan, admitted) in [(under_rules, 4), (under_permission, 10)] {
+        let read: Vec<RecordBatch> = planned
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(ids(&read).len(), admitted);
+        for builder in &wider {
+            let Err(err) = builder.new_read().unwrap().to_arrow(plan.splits()) else {
+                panic!("'name' was never authorized");
+            };
+            assert!(
+                matches!(err, paimon::Error::Unsupported { ref message }
+                    if message.contains("query-auth.enabled")
+                        && message.contains("outside the columns")),
+                "{err:?}"
+            );
+        }
+    }
+}
+
+/// A primary-key table whose second commit updates keys 1 and 2.
+async fn scores() -> Guarded {
+    let schema = |options: &[(&str, &str)]| {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::with_nullable(false)))
+            .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column("score", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1");
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    };
+    let batch = |rows: &[(i32, &str, i32)]| {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("name", ArrowDataType::Utf8, true),
+                ArrowField::new("score", ArrowDataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.2))),
+            ],
+        )
+        .unwrap()
+    };
+    written(
+        "scores",
+        schema,
+        vec![
+            batch(&[(1, "alice", 10), (2, "bob", 50), (3, "carol", 90)]),
+            batch(&[(1, "alicia", 80), (2, "bobby", 20)]),
+        ],
+    )
+    .await
+}
+
+fn score_rows(batches: &[RecordBatch]) -> Vec<(i32, String, i32)> {
+    let mut rows: Vec<(i32, String, i32)> = batches
+        .iter()
+        .flat_map(|b| {
+            let ids = column::<Int32Array>(b, "id");
+            let names = column::<StringArray>(b, "name");
+            let scores = column::<Int32Array>(b, "score");
+            (0..b.num_rows())
+                .map(|r| (ids.value(r), names.value(r).to_string(), scores.value(r)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_filters_the_merged_primary_key_row() {
+    let g = scores().await;
+    g.ctx.server.set_auth_response(
+        "default",
+        "scores",
+        rules(&[int_leaf(2, "score", "GREATER_THAN", 30)], &[]),
+    );
+    // Filtering each commit before the merge would bring back bob's first row.
+    assert_eq!(
+        score_rows(&read_all(&g.table.new_read_builder()).await.unwrap()),
+        vec![(1, "alicia".to_string(), 80), (3, "carol".to_string(), 90)]
+    );
 }
 
 #[tokio::test]

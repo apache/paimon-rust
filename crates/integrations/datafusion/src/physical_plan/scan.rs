@@ -947,6 +947,14 @@ impl PaimonTableScan {
         self.limit
     }
 
+    /// Planned under the server's rules: counts and bounds precede them.
+    fn has_query_auth_rules(&self) -> bool {
+        self.planned_partitions
+            .iter()
+            .flat_map(|splits| splits.iter())
+            .any(DataSplit::has_query_auth_rules)
+    }
+
     fn manifest_column_statistics(&self, partitions: &[Arc<[DataSplit]>]) -> Vec<ColumnStatistics> {
         if self.read_type.len() != self.schema().fields().len() {
             return Statistics::unknown_column(&self.schema());
@@ -1182,6 +1190,10 @@ impl ExecutionPlan for PaimonTableScan {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
+        // They include the rows the server's rules drop.
+        if self.has_query_auth_rules() {
+            return Ok(Arc::new(Statistics::new_unknown(&self.schema())));
+        }
         let partitions: &[Arc<[DataSplit]>] = match partition {
             Some(idx) => std::slice::from_ref(&self.planned_partitions[idx]),
             None => &self.planned_partitions,
@@ -1229,6 +1241,11 @@ impl DisplayAs for PaimonTableScan {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         write!(f, "PaimonTableScan: table={}", self.table.identifier())?;
+        let restricted = self.has_query_auth_rules();
+        if restricted {
+            // Split and file counts describe the data before the server's rules.
+            write!(f, ", query-auth=restricted")?;
+        }
 
         let total_splits: usize = self.planned_partitions.iter().map(|p| p.len()).sum();
         let total_files: usize = self
@@ -1237,11 +1254,13 @@ impl DisplayAs for PaimonTableScan {
             .flat_map(|p| p.iter())
             .map(|s| s.data_files().len())
             .sum();
-        write!(
-            f,
-            ", partitions={}, splits={total_splits}, files={total_files}",
-            self.planned_partitions.len()
-        )?;
+        if !restricted {
+            write!(
+                f,
+                ", partitions={}, splits={total_splits}, files={total_files}",
+                self.planned_partitions.len()
+            )?;
+        }
 
         let columns = self
             .read_type
@@ -1255,7 +1274,7 @@ impl DisplayAs for PaimonTableScan {
         if let Some(limit) = self.limit {
             write!(f, ", limit={limit}")?;
         }
-        if let Some(ref trace) = self.scan_trace {
+        if let Some(trace) = self.scan_trace.as_ref().filter(|_| !restricted) {
             write!(f, ", trace={trace}")?;
         }
         if let Some(ref pushed_variants) = self.pushed_variants {
