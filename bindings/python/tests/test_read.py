@@ -123,6 +123,65 @@ def test_with_projection_variant_fields_honors_fail_on_error():
             builder.new_read().read(plan.splits())
 
 
+def test_with_projection_variant_fields_keeps_explicit_null():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.vdb")
+        ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+        ctx.sql("INSERT INTO paimon.vdb.t SELECT 1, parse_json('{\"x\":null}')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+        builder = table.new_read_builder().with_projection(
+            ["payload"],
+            variant_fields={
+                "payload": {
+                    "paths": ["$.x"],
+                    "target_type": pa.float32(),
+                    "fail_on_error": True,
+                }
+            },
+        )
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.column("payload").combine_chunks().to_pylist() == [{"0": None}]
+
+
+@pytest.mark.parametrize(
+    "target_type",
+    [
+        pa.list_(pa.int32()),
+        pa.map_(pa.string(), pa.int32()),
+        pa.struct([pa.field("x", pa.int32())]),
+        pa.time32("s"),
+    ],
+)
+def test_with_projection_variant_fields_rejects_unsupported_target(target_type):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        with pytest.raises(ValueError, match="supported scalar type"):
+            table.new_read_builder().with_projection(
+                ["payload"],
+                variant_fields={
+                    "payload": {"paths": ["$.age"], "target_type": target_type}
+                },
+            )
+
+
+def test_with_nested_projection_replaces_variant_fields():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(
+            ["payload"],
+            variant_fields={
+                "payload": {"paths": ["$.age"], "target_type": pa.float32()}
+            },
+        ).with_nested_projection([["id"]])
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.schema.names == ["id"]
+        assert sorted(result.column("id").to_pylist()) == [1, 2]
+
+
 def test_with_projection_variant_fields_requires_projected_variant_column():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_variant_table_with_data(warehouse)

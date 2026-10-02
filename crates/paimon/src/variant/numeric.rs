@@ -185,11 +185,10 @@ impl VariantFloat32Projection {
             let numeric = match mode {
                 Float32ProjectionMode::Numeric => numeric_to_float32(child, &projected.name)?,
                 Float32ProjectionMode::Cast { fail_on_error } => {
-                    let numeric = if child.is_null()? {
-                        None
-                    } else {
-                        cast_variant_to_f64(child).map(|value| value as f32)
-                    };
+                    if child.is_null()? {
+                        continue;
+                    }
+                    let numeric = cast_variant_to_f64(child).map(|value| value as f32);
                     if numeric.is_none()
                         && projected
                             .outputs

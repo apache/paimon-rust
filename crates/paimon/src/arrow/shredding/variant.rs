@@ -807,7 +807,7 @@ fn assemble_plain_variant_projection(
     let mut keys = Vec::with_capacity(fields.len());
     let mut fail_on_error = Vec::with_capacity(fields.len());
     for field_metadata in metadata {
-        let Some(key) = top_level_path_key(field_metadata.path())? else {
+        let Ok(Some(key)) = top_level_path_key(field_metadata.path()) else {
             return Ok(None);
         };
         keys.push(key);
@@ -1698,6 +1698,92 @@ mod tests {
             assemble_array_to_logical(input.as_ref(), &DataType::Row(row_type)).unwrap_err();
         assert!(matches!(error, Error::DataInvalid { ref message, .. }
             if message.contains("Cannot cast Variant value to")));
+    }
+
+    #[test]
+    fn variant_extraction_row_preserves_null_with_fail_on_error() {
+        let variant = GenericVariant::parse_json(r#"{"value":null}"#).unwrap();
+        let input = variant_array(vec![Some(variant)]).unwrap();
+        let row_type = variant_extraction_row(
+            true,
+            [(
+                DataType::Float(FloatType::new()),
+                "$.value".to_string(),
+                true,
+                "UTC".to_string(),
+            )],
+        );
+
+        let projected = assemble_array_to_logical(input.as_ref(), &DataType::Row(row_type))
+            .unwrap()
+            .unwrap();
+        let projected = projected.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(projected.is_valid(0));
+        assert!(projected.column(0).is_null(0));
+    }
+
+    #[test]
+    fn invalid_try_path_returns_null_for_plain_and_shredded_variant() {
+        let logical_fields = vec![DataField::new(
+            1,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"age","type":"INT"}]}}]}"#.to_string(),
+        )]);
+        let physical_fields = configured_variant_shredding_fields(&logical_fields, &options)
+            .unwrap()
+            .unwrap();
+        let variant = GenericVariant::parse_json(r#"{"age":27}"#).unwrap();
+        let plain = variant_array_for_test(&[variant]);
+        let row_type = variant_extraction_row(
+            true,
+            [(
+                DataType::Float(FloatType::new()),
+                "$.".to_string(),
+                false,
+                "UTC".to_string(),
+            )],
+        );
+
+        let plain_result =
+            assemble_array_to_logical(plain.as_ref(), &DataType::Row(row_type.clone()))
+                .unwrap()
+                .unwrap();
+        let plain_result = plain_result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(plain_result.column(0).is_null(0));
+
+        let strict_row_type = variant_extraction_row(
+            true,
+            [(
+                DataType::Float(FloatType::new()),
+                "$.".to_string(),
+                true,
+                "UTC".to_string(),
+            )],
+        );
+        assert!(
+            assemble_array_to_logical(plain.as_ref(), &DataType::Row(strict_row_type)).is_err()
+        );
+
+        let batch = RecordBatch::try_new(
+            build_target_arrow_schema(&logical_fields).unwrap(),
+            vec![plain],
+        )
+        .unwrap();
+        let physical =
+            batch_to_shredded_physical(&batch, &logical_fields, &physical_fields).unwrap();
+        let read_fields = vec![DataField::new(1, "v".to_string(), DataType::Row(row_type))];
+        let shredded_result = assemble_shredded_variant_batch(physical, &read_fields).unwrap();
+        let shredded_result = shredded_result
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(shredded_result.column(0).is_null(0));
     }
 
     #[test]

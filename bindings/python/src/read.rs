@@ -252,6 +252,30 @@ fn apply_variant_projections(
     Ok(fields)
 }
 
+fn supports_variant_target_type(data_type: &ArrowDataType) -> bool {
+    match data_type {
+        ArrowDataType::Boolean
+        | ArrowDataType::Int8
+        | ArrowDataType::Int16
+        | ArrowDataType::Int32
+        | ArrowDataType::Int64
+        | ArrowDataType::Float32
+        | ArrowDataType::Float64
+        | ArrowDataType::Decimal128(_, _)
+        | ArrowDataType::Utf8
+        | ArrowDataType::LargeUtf8
+        | ArrowDataType::Utf8View
+        | ArrowDataType::Binary
+        | ArrowDataType::LargeBinary
+        | ArrowDataType::BinaryView
+        | ArrowDataType::FixedSizeBinary(_)
+        | ArrowDataType::Date32
+        | ArrowDataType::Timestamp(_, _) => true,
+        ArrowDataType::Dictionary(_, value) => supports_variant_target_type(value),
+        _ => false,
+    }
+}
+
 fn extract_variant_projections(
     variant_fields: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Vec<PyVariantProjection>> {
@@ -300,6 +324,11 @@ fn extract_variant_projections(
             ))
         })?;
         let arrow_type = ArrowDataType::from_pyarrow_bound(&target_type)?;
+        if !supports_variant_target_type(&arrow_type) {
+            return Err(PyValueError::new_err(format!(
+                "variant_fields['{column}']['target_type'] must be a supported scalar type, got {arrow_type:?}"
+            )));
+        }
         let data_type =
             paimon::arrow::arrow_to_paimon_type(&arrow_type, true).map_err(to_py_err)?;
         let fail_on_error = options
@@ -518,7 +547,7 @@ impl PyReadBuilder {
 
 #[pymethods]
 impl PyReadBuilder {
-    /// Project columns, optionally extracting typed paths from projected Variant columns.
+    /// Project columns, optionally extracting scalar paths from Variant columns.
     #[pyo3(signature = (columns, *, variant_fields = None))]
     fn with_projection<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -562,6 +591,7 @@ impl PyReadBuilder {
         }
         slf.read_type = Some(read_type);
         slf.projection = None;
+        slf.variant_projections.clear();
         Ok(slf)
     }
 
