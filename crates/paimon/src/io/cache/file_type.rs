@@ -83,11 +83,13 @@ impl FileType {
 
     pub(super) fn is_mutable(path: &str) -> bool {
         let name = path.rsplit('/').next().unwrap_or(path);
-        // Iceberg-compatible `version-hint.text` and `retire-pending` are rewritten in place.
+        // Iceberg-compatible `version-hint.text`, `retire-pending` and `v{N}.metadata.json`
+        // (on tag changes) are rewritten in place.
         matches!(
             name,
             "LATEST" | "EARLIEST" | "version-hint.text" | "retire-pending"
-        ) || name.ends_with("_SUCCESS")
+        ) || name.ends_with(".metadata.json")
+            || name.ends_with("_SUCCESS")
             || name.starts_with("tag-")
             || name.starts_with("consumer-")
             || name.starts_with("service-")
@@ -233,12 +235,14 @@ mod tests {
             "s3://bucket/table/tag/tag-success-file/t1_SUCCESS",
             "s3://bucket/table/metadata/version-hint.text",
             "s3://bucket/table/metadata/retire-pending",
+            "s3://bucket/table/metadata/v3.metadata.json",
         ] {
             assert!(FileType::is_mutable(path), "{path}");
         }
         for path in [
             "s3://bucket/table/snapshot/snapshot-1",
             "s3://bucket/table/changelog/changelog-5",
+            "s3://bucket/table/metadata/snap-1-1-123e4567-e89b-12d3-a456-426614174000.avro",
         ] {
             assert!(!FileType::is_mutable(path), "{path}");
         }
