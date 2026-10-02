@@ -177,8 +177,10 @@ async fn physical_data_files(table: &Table) -> BTreeSet<String> {
         .collect()
 }
 
-/// Snapshots that must stay readable: every remaining snapshot and every tag.
+/// Snapshots that must stay readable: every remaining snapshot and tag of
+/// main and every branch, and every long-lived changelog.
 async fn live_snapshots(table: &Table) -> Vec<Snapshot> {
+    let file_io = table.file_io();
     let mut snapshots = table.snapshot_manager().list_all().await.unwrap();
     snapshots.extend(
         table
@@ -189,6 +191,32 @@ async fn live_snapshots(table: &Table) -> Vec<Snapshot> {
             .into_iter()
             .map(|(_, snapshot)| snapshot),
     );
+    snapshots.extend(
+        crate::table::snapshot_deletion::read_long_lived_changelogs(file_io, table.location())
+            .await
+            .unwrap(),
+    );
+    let branches = crate::table::BranchManager::new(file_io.clone(), table.location().to_string());
+    for branch in branches.list_all().await.unwrap() {
+        snapshots.extend(
+            table
+                .snapshot_manager()
+                .with_branch(&branch)
+                .list_all()
+                .await
+                .unwrap(),
+        );
+        snapshots.extend(
+            table
+                .tag_manager()
+                .with_branch(&branch)
+                .list_all()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, snapshot)| snapshot),
+        );
+    }
     snapshots
 }
 
@@ -1006,4 +1034,187 @@ async fn test_slowest_consumer_limits_expiration() {
     }
     assert_eq!(expire_keeping(&table, 1).await, 2);
     assert_eq!(snapshot_ids(&table).await, vec![3, 4, 5]);
+}
+
+fn branch_table(table: &Table, branch: &str) -> Table {
+    Table::from_resolved_schema(
+        table.file_io().clone(),
+        Identifier::new("default", "expire_table"),
+        table.location().to_string(),
+        table.schema().clone(),
+        branch,
+    )
+    .unwrap()
+}
+
+async fn write_schema_file(table: &Table) {
+    table
+        .file_io()
+        .new_output(&format!("{}/schema/schema-0", table.location()))
+        .unwrap()
+        .write(bytes::Bytes::from(
+            serde_json::to_vec(table.schema()).unwrap(),
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_branch_keeps_the_files_it_shares_with_main() {
+    let table = test_table("memory:/expire_branch", &[], false);
+    setup_dirs(&table).await;
+    write_schema_file(&table).await;
+    append(&table, &[1]).await;
+    let sm = table.snapshot_manager();
+    table
+        .tag_manager()
+        .create("t1", &sm.get_snapshot(1).await.unwrap())
+        .await
+        .unwrap();
+    crate::table::BranchManager::new(table.file_io().clone(), table.location().to_string())
+        .create_branch_from_tag("b1", "t1")
+        .await
+        .unwrap();
+    table.tag_manager().delete("t1").await.unwrap();
+    let branch = branch_table(&table, "b1");
+    assert_eq!(read_ids(&branch).await, vec![1]);
+    overwrite(&table, &[2]).await;
+
+    assert_eq!(expire_keeping(&table, 1).await, 1);
+    assert_eq!(read_ids(&table).await, vec![2]);
+    assert_eq!(
+        read_ids(&branch).await,
+        vec![1],
+        "the branch still reads its data"
+    );
+    assert_files_match_references(&table).await;
+}
+
+#[tokio::test]
+async fn test_unreadable_branch_aborts_before_any_deletion() {
+    let table = test_table("memory:/expire_branch_unreadable", &[], false);
+    setup_dirs(&table).await;
+    write_schema_file(&table).await;
+    append(&table, &[1]).await;
+    let sm = table.snapshot_manager();
+    table
+        .tag_manager()
+        .create("t1", &sm.get_snapshot(1).await.unwrap())
+        .await
+        .unwrap();
+    crate::table::BranchManager::new(table.file_io().clone(), table.location().to_string())
+        .create_branch_from_tag("b1", "t1")
+        .await
+        .unwrap();
+    table.tag_manager().delete("t1").await.unwrap();
+    overwrite(&table, &[2]).await;
+    overwrite(&table, &[3]).await;
+    corrupt_manifest(
+        &table,
+        sm.get_snapshot(1).await.unwrap().delta_manifest_list(),
+    )
+    .await;
+    let data_before = physical_data_files(&table).await;
+    let manifests_before = file_names_under(&table, "manifest").await;
+
+    let err = table
+        .new_expire_snapshots()
+        .with_retain_min(1)
+        .with_older_than_millis(i64::MAX)
+        .execute()
+        .await;
+    assert!(err.is_err(), "the branch's files cannot be accounted for");
+    assert_eq!(snapshot_ids(&table).await, vec![1, 2, 3]);
+    assert_eq!(physical_data_files(&table).await, data_before);
+    assert_eq!(file_names_under(&table, "manifest").await, manifests_before);
+}
+
+#[tokio::test]
+async fn test_long_lived_changelog_keeps_its_files() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("dt", DataType::VarChar(VarCharType::string_type()))
+        .primary_key(["id"])
+        .option("changelog-producer", "input")
+        .build()
+        .unwrap();
+    let table = table_with_schema("memory:/expire_long_lived_changelog", schema);
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    // Java's decoupled expiration writes changelog-1 before it removes
+    // snapshot-1; an interrupted run leaves both.
+    let sm = table.snapshot_manager();
+    let snapshot_1 = sm.get_snapshot(1).await.unwrap();
+    let changelog_list = snapshot_1
+        .changelog_manifest_list()
+        .expect("input changelog")
+        .to_string();
+    table
+        .file_io()
+        .new_output(&format!("{}/changelog/changelog-1", table.location()))
+        .unwrap()
+        .write(bytes::Bytes::from(serde_json::to_vec(&snapshot_1).unwrap()))
+        .await
+        .unwrap();
+    append(&table, &[2]).await;
+
+    assert_eq!(expire_keeping(&table, 1).await, 1);
+    let manifests = file_names_under(&table, "manifest").await;
+    assert!(
+        manifests.contains(&changelog_list),
+        "the changelog's manifest list stays"
+    );
+    // Every file the changelog references, changelog files included, stays.
+    assert_files_match_references(&table).await;
+    assert_eq!(read_ids(&table).await, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn test_legacy_deletion_vector_location_is_expired() {
+    let table = test_table(
+        "memory:/expire_legacy_dv",
+        &[
+            ("row-tracking.enabled", "true"),
+            ("data-evolution.enabled", "true"),
+            ("deletion-vectors.enabled", "true"),
+            ("index-file-in-data-file-dir", "true"),
+        ],
+        false,
+    );
+    setup_dirs(&table).await;
+    append(&table, &[1, 2, 3]).await;
+    delete_row(&table, 0).await;
+    let sm = table.snapshot_manager();
+    let legacy_dv = index_file_names(&table, &sm.get_snapshot(2).await.unwrap())
+        .await
+        .into_iter()
+        .next()
+        .unwrap();
+    // An older Python writer put the vector under the table `index/` directory.
+    let file_io = table.file_io();
+    let canonical = format!("{}/bucket-0/{legacy_dv}", table.location());
+    let legacy = format!("{}/index/{legacy_dv}", table.location());
+    let bytes = file_io.new_input(&canonical).unwrap().read().await.unwrap();
+    file_io
+        .new_output(&legacy)
+        .unwrap()
+        .write(bytes)
+        .await
+        .unwrap();
+    file_io.delete_file(&canonical).await.unwrap();
+    assert_eq!(
+        read_ids(&table).await,
+        vec![2, 3],
+        "reads find the legacy vector"
+    );
+
+    // Supersede the legacy vector, then expire the snapshots that used it.
+    delete_row(&table, 1).await;
+    assert_eq!(expire_keeping(&table, 1).await, 2);
+    assert!(
+        !file_io.exists(&legacy).await.unwrap(),
+        "the obsolete legacy vector is deleted"
+    );
+    assert_files_match_references(&table).await;
+    assert_eq!(read_ids(&table).await, vec![3]);
 }

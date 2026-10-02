@@ -33,8 +33,8 @@
 //! snapshot readable and a later run finishes the job.
 
 use crate::spec::{CoreOptions, Snapshot};
-use crate::table::snapshot_deletion::{DataFileKey, SnapshotDeletion};
-use crate::table::Table;
+use crate::table::snapshot_deletion::{read_long_lived_changelogs, DataFileKey, SnapshotDeletion};
+use crate::table::{BranchManager, Table};
 use crate::{Error, Result};
 use futures::{stream, StreamExt, TryStreamExt};
 use std::collections::hash_map::Entry;
@@ -221,6 +221,10 @@ impl<'a> ExpireSnapshots<'a> {
 
         let tagged = self.tagged_snapshots().await?;
         let deletion = SnapshotDeletion::new(self.table)?;
+        // Branches and long-lived changelogs share files with this history.
+        // Read everything they reference before deleting anything; if that is
+        // impossible, the run stops with nothing changed.
+        let external = self.external_owners(&deletion).await?;
 
         // Data files deleted by a snapshot are unused from that snapshot on,
         // so the range is (begin, end].
@@ -228,12 +232,17 @@ impl<'a> ExpireSnapshots<'a> {
             .iter()
             .filter(|snapshot| snapshot.id() != begin_inclusive)
             .collect::<Vec<_>>();
-        self.clean_data_files(&deletion, &data_snapshots, &tagged)
+        self.clean_data_files(&deletion, &data_snapshots, &tagged, &external.data_files)
             .await;
 
         let mut changelog_files = Vec::new();
         for snapshot in &snapshots_excluding_end {
-            changelog_files.extend(deletion.changelog_files(snapshot).await);
+            let still_read = snapshot
+                .changelog_manifest_list()
+                .is_some_and(|list| external.changelog_lists.contains(list));
+            if !still_read {
+                changelog_files.extend(deletion.changelog_files(snapshot).await);
+            }
         }
         deletion.delete_quietly(changelog_files).await;
 
@@ -247,7 +256,22 @@ impl<'a> ExpireSnapshots<'a> {
         }
         let mut skipping_snapshots = find_skipping_tags(&tagged, begin_inclusive, end_exclusive);
         skipping_snapshots.push(last);
-        match deletion.manifest_skipping_set(&skipping_snapshots).await {
+        let external_snapshots = external.snapshots.iter().collect::<Vec<_>>();
+        let skipping = match deletion
+            .manifest_skipping_set(&skipping_snapshots, false)
+            .await
+        {
+            Ok(mut skipping) => {
+                skipping.extend(
+                    deletion
+                        .manifest_skipping_set(&external_snapshots, true)
+                        .await?,
+                );
+                Ok(skipping)
+            }
+            Err(error) => Err(error),
+        };
+        match skipping {
             Ok(mut skipping) => {
                 let mut manifest_files = Vec::new();
                 for snapshot in &snapshots_excluding_end {
@@ -282,6 +306,7 @@ impl<'a> ExpireSnapshots<'a> {
         deletion: &SnapshotDeletion,
         snapshots: &[&Snapshot],
         tagged: &[Snapshot],
+        external: &HashSet<DataFileKey>,
     ) {
         let plans = snapshots
             .iter()
@@ -296,7 +321,7 @@ impl<'a> ExpireSnapshots<'a> {
         let mut paths = Vec::new();
         for (snapshot, plan) in snapshots.iter().zip(&plans) {
             let Some(tag) = previous_tag(tagged, snapshot.id()) else {
-                paths.extend(plan.paths_to_delete(None));
+                paths.extend(plan.paths_to_delete(&[external]));
                 continue;
             };
             if let Entry::Vacant(slot) = tag_files.entry(tag.id()) {
@@ -313,7 +338,7 @@ impl<'a> ExpireSnapshots<'a> {
                 slot.insert(files);
             }
             match &tag_files[&tag.id()] {
-                Some(files) => paths.extend(plan.paths_to_delete(Some(files))),
+                Some(files) => paths.extend(plan.paths_to_delete(&[files, external])),
                 None => log::info!(
                     "Skip cleaning data files of snapshot {} because tag snapshot {} cannot be read",
                     snapshot.id(),
@@ -322,6 +347,57 @@ impl<'a> ExpireSnapshots<'a> {
             }
         }
         deletion.delete_quietly(paths).await;
+    }
+
+    /// Snapshots and tags of every branch, and long-lived changelogs of main
+    /// and every branch. Unlike main's own history, their files cannot be
+    /// reasoned about from the expired range, so everything they reference is
+    /// kept.
+    async fn external_owners(&self, deletion: &SnapshotDeletion) -> Result<ExternalOwners> {
+        let file_io = self.table.file_io();
+        let branch_manager = BranchManager::new(file_io.clone(), self.table.location().to_string());
+        let mut snapshots = read_long_lived_changelogs(file_io, self.table.location()).await?;
+        for branch in branch_manager.list_all().await? {
+            let snapshot_manager = self.table.snapshot_manager().with_branch(&branch);
+            for id in snapshot_manager.list_all_ids().await? {
+                snapshots.extend(snapshot_manager.try_get_snapshot(id).await?);
+            }
+            snapshots.extend(
+                self.table
+                    .tag_manager()
+                    .with_branch(&branch)
+                    .list_all()
+                    .await?
+                    .into_iter()
+                    .map(|(_, snapshot)| snapshot),
+            );
+            snapshots.extend(
+                read_long_lived_changelogs(file_io, &branch_manager.branch_path(&branch)).await?,
+            );
+        }
+        // A branch created from a tag copies the same snapshot; read it once.
+        let mut seen = HashSet::new();
+        snapshots.retain(|snapshot| {
+            seen.insert((
+                snapshot.base_manifest_list().to_string(),
+                snapshot.delta_manifest_list().to_string(),
+                snapshot.changelog_manifest_list().map(str::to_string),
+            ))
+        });
+
+        let mut data_files = HashSet::new();
+        for snapshot in &snapshots {
+            data_files.extend(deletion.tag_data_files(snapshot).await?);
+        }
+        let changelog_lists = snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot.changelog_manifest_list().map(str::to_string))
+            .collect();
+        Ok(ExternalOwners {
+            snapshots,
+            data_files,
+            changelog_lists,
+        })
     }
 
     /// Snapshots of all tags, sorted by id and deduplicated.
@@ -339,6 +415,13 @@ impl<'a> ExpireSnapshots<'a> {
         snapshots.sort_by_key(Snapshot::id);
         Ok(snapshots)
     }
+}
+
+/// What owners outside main's history (branches, long-lived changelogs) read.
+struct ExternalOwners {
+    snapshots: Vec<Snapshot>,
+    data_files: HashSet<DataFileKey>,
+    changelog_lists: HashSet<String>,
 }
 
 fn positive(name: &str, value: i32) -> Result<i32> {

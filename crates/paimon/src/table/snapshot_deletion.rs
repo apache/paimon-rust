@@ -30,7 +30,9 @@ use crate::spec::{
     bucket_path, BinaryRow, CoreOptions, FileKind, IndexManifest, Manifest, ManifestEntry,
     ManifestFileMeta, ManifestList, PartitionComputer, Snapshot,
 };
-use crate::table::index_file_path::committed_index_file_path;
+use crate::table::index_file_path::{
+    committed_index_file_path, resolve_legacy_deletion_vector_entries,
+};
 use crate::table::{SnapshotManager, Table};
 use crate::Result;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -57,17 +59,18 @@ pub(crate) struct DataFileDeletionPlan {
 }
 
 impl DataFileDeletionPlan {
-    /// Paths of candidates that `retained` does not protect.
-    pub(crate) fn paths_to_delete(&self, retained: Option<&HashSet<DataFileKey>>) -> Vec<String> {
+    /// Paths of candidates that none of `retained` protects.
+    pub(crate) fn paths_to_delete(&self, retained: &[&HashSet<DataFileKey>]) -> Vec<String> {
         self.candidates
             .iter()
-            .filter(|(key, _)| retained.is_none_or(|retained| !retained.contains(key)))
+            .filter(|(key, _)| !retained.iter().any(|retained| retained.contains(key)))
             .flat_map(|(_, paths)| paths.iter().cloned())
             .collect()
     }
 }
 
 pub(crate) struct SnapshotDeletion {
+    table: Table,
     file_io: FileIO,
     table_location: String,
     snapshot_manager: SnapshotManager,
@@ -90,6 +93,7 @@ impl SnapshotDeletion {
             )?)
         };
         Ok(Self {
+            table: table.clone(),
             file_io: table.file_io().clone(),
             table_location: table.location().trim_end_matches('/').to_string(),
             snapshot_manager: table.snapshot_manager(),
@@ -274,16 +278,25 @@ impl SnapshotDeletion {
     /// manifest lists, manifests and their extra files, the index manifest and
     /// its index files, the statistics file, and the reassign plan. Java
     /// `FileDeletionBase#manifestSkippingSet`.
+    ///
+    /// With `include_changelog`, the changelog manifest list and its manifests
+    /// are covered too: owners outside the expired history (branches,
+    /// long-lived changelogs) may read a changelog the expired snapshot wrote.
     pub(crate) async fn manifest_skipping_set(
         &self,
         snapshots: &[&Snapshot],
+        include_changelog: bool,
     ) -> Result<HashSet<String>> {
         let mut skipping = HashSet::new();
         for snapshot in snapshots {
-            for list in [
+            let mut lists = vec![
                 snapshot.base_manifest_list(),
                 snapshot.delta_manifest_list(),
-            ] {
+            ];
+            if include_changelog {
+                lists.extend(snapshot.changelog_manifest_list());
+            }
+            for list in lists {
                 skipping.insert(list.to_string());
                 for manifest in self.read_manifest_list(list).await? {
                     skipping.insert(manifest.file_name().to_string());
@@ -327,7 +340,12 @@ impl SnapshotDeletion {
 
         if let Some(index_manifest) = snapshot.index_manifest() {
             match IndexManifest::read(&self.file_io, &self.manifest_path(index_manifest)).await {
-                Ok(entries) => {
+                Ok(mut entries) => {
+                    // Older Python writers left deletion vectors under the
+                    // table `index/` directory even with
+                    // `index-file-in-data-file-dir`; delete them where reads
+                    // find them.
+                    resolve_legacy_deletion_vector_entries(&self.table, &mut entries).await?;
                     for entry in entries {
                         if skipping.insert(entry.index_file.file_name.clone()) {
                             let bucket_path = self.bucket_path(&entry.partition, entry.bucket)?;
@@ -414,6 +432,51 @@ impl SnapshotDeletion {
             .collect::<Vec<_>>()
             .await;
     }
+}
+
+/// Long-lived changelogs under `<branch_root>/changelog`, which Java writes as
+/// `changelog-<id>` in the snapshot JSON format before removing the snapshot
+/// they replace.
+pub(crate) async fn read_long_lived_changelogs(
+    file_io: &FileIO,
+    branch_root: &str,
+) -> Result<Vec<Snapshot>> {
+    let dir = format!("{}/changelog", branch_root.trim_end_matches('/'));
+    if !file_io.exists_dir(&dir).await? {
+        return Ok(Vec::new());
+    }
+    let mut changelogs = Vec::new();
+    for status in file_io.list_status(&dir).await? {
+        let name = status
+            .path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+        let is_changelog = name
+            .strip_prefix("changelog-")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+        if status.is_dir || !is_changelog {
+            continue;
+        }
+        let bytes = match file_io.new_input(&status.path)?.read().await {
+            Ok(bytes) => bytes,
+            // Removed concurrently; nothing to protect.
+            Err(crate::Error::IoUnexpected { ref source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        let changelog =
+            serde_json::from_slice::<Snapshot>(&bytes).map_err(|e| crate::Error::DataInvalid {
+                message: format!("changelog {} JSON invalid: {e}", status.path),
+                source: Some(Box::new(e)),
+            })?;
+        changelogs.push(changelog);
+    }
+    Ok(changelogs)
 }
 
 fn data_file_key(entry: &ManifestEntry) -> DataFileKey {
