@@ -1238,6 +1238,19 @@ fn test_read_builder_with_limit_prunes_plan_splits() {
             baseline,
             "a limit above the row count must not prune any split"
         );
+        // A limit above i64::MAX must not wrap negative in the accumulator's
+        // signed comparison and truncate the scan: SIZE_MAX and i64::MAX + 1
+        // keep every split, like any limit the row count cannot reach.
+        assert_eq!(
+            plan_split_count(handle, Some(usize::MAX)),
+            baseline,
+            "SIZE_MAX must not truncate the plan"
+        );
+        assert_eq!(
+            plan_split_count(handle, Some((i64::MAX as usize) + 1)),
+            baseline,
+            "i64::MAX + 1 must not truncate the plan"
+        );
         unwrap_table(handle);
     }
 }
