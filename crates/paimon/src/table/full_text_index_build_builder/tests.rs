@@ -530,3 +530,100 @@ fn test_native_options_strip_prefix_and_meta_is_sorted_flat_json() {
         br#"{"lower-case":"false","tokenizer":"jieba"}"#.to_vec()
     );
 }
+
+#[tokio::test]
+async fn test_execute_plans_against_the_catalog_snapshot() {
+    use crate::api::rest_api::RESTApi;
+    use crate::common::Options;
+    use crate::spec::Snapshot;
+    use axum::{
+        body::Bytes,
+        http::{Method, Uri},
+        Json, Router,
+    };
+    use std::sync::Mutex;
+
+    // A REST-managed table whose catalog reports snapshot 7 while the file
+    // system only holds snapshot-1 with the same content.
+    let path = "memory:/test_full_text_build_rest";
+    let seed = test_table(path, table_options("10"));
+    setup_dirs(&seed).await;
+    write_rows(&seed, vec![1, 2], vec![Some("paimon rest"), Some("other")]).await;
+    let seed_snapshot = seed
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    let mut value = serde_json::to_value(&seed_snapshot).unwrap();
+    value["id"] = 7.into();
+    let catalog_snapshot = Arc::new(Mutex::new(
+        serde_json::from_value::<Snapshot>(value).unwrap(),
+    ));
+    let published = Arc::new(Mutex::new(None::<Snapshot>));
+
+    let handler_snapshot = catalog_snapshot.clone();
+    let handler_published = published.clone();
+    let app = Router::new().fallback(move |method: Method, uri: Uri, body: Bytes| {
+        let snapshot = handler_snapshot.clone();
+        let published = handler_published.clone();
+        async move {
+            let response = if method == Method::POST && uri.path().ends_with("/commit") {
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let next: Snapshot = serde_json::from_value(request["snapshot"].clone()).unwrap();
+                assert_eq!(next.id(), snapshot.lock().unwrap().id() + 1);
+                *snapshot.lock().unwrap() = next.clone();
+                *published.lock().unwrap() = Some(next);
+                serde_json::json!({"success": true})
+            } else if uri.path().ends_with("/snapshot") {
+                serde_json::json!({"snapshot": {"snapshot": *snapshot.lock().unwrap(), "recordCount": 2}})
+            } else {
+                serde_json::json!({"schemaId": 0})
+            };
+            Json(response)
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut options = Options::new();
+    options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
+    options.set("prefix", "test");
+    options.set("token.provider", "bear");
+    options.set("token", "test-token");
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+    let identifier = Identifier::new("default", "test_table");
+    let metadata_cache =
+        crate::io::FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
+    let env = crate::table::RESTEnv::new(
+        identifier.clone(),
+        "uuid".into(),
+        api,
+        options,
+        false,
+        None,
+        metadata_cache,
+    );
+    let table = Table::new(
+        seed.file_io().clone(),
+        identifier,
+        path.to_string(),
+        seed.schema().clone(),
+        Some(env),
+    );
+
+    let file_count = table
+        .new_full_text_index_build_builder()
+        .with_index_column("name")
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(file_count, 1);
+    let published = published
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("committed through the catalog");
+    assert_eq!(published.id(), 8, "planned against catalog snapshot 7");
+    assert!(published.index_manifest().is_some());
+    server.abort();
+}
