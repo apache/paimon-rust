@@ -1767,11 +1767,8 @@ impl BlobFileIndex {
         let index_bytes = if index_start >= tail_start {
             tail.slice((index_start - tail_start) as usize..footer_start)
         } else {
-            let prefix = read_blob_range(reader, index_start..tail_start).await?;
-            let mut index = Vec::with_capacity(index_length as usize);
-            index.extend_from_slice(&prefix);
-            index.extend_from_slice(&tail[..footer_start]);
-            Bytes::from(index)
+            // Reread the small tail overlap rather than copy the entire index.
+            read_blob_range(reader, index_start..file_size - BLOB_FOOTER_SIZE).await?
         };
 
         let lengths = decode_delta_varints(index_bytes.as_ref())?;
@@ -2371,10 +2368,35 @@ mod tests {
             let mut expected = Vec::with_capacity(2);
             expected.push(size - 4096..size);
             if rows + 5 > 4096 {
-                expected.push(8192..size - 4096);
+                expected.push(8192..size - BLOB_FOOTER_SIZE);
             }
             assert_eq!(reader.ranges(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn test_large_index_varint_crosses_tail_boundary() {
+        let lengths = vec![128; 4091];
+        let index = encode_delta_varints_write(&lengths);
+        assert_eq!(index.len(), 4092);
+        // The tail starts between the two bytes encoding the first length.
+        assert_ne!(index[0] & 0x80, 0);
+        assert_eq!(index[1] & 0x80, 0);
+        let index_start = 128 * lengths.len() as u64;
+        let expected = BlobEntry::build_all(&lengths, index_start).unwrap();
+        let mut data = vec![0; index_start as usize];
+        data.extend_from_slice(&index);
+        data.extend_from_slice(&(index.len() as i32).to_le_bytes());
+        data.push(BLOB_FORMAT_VERSION);
+        let size = data.len() as u64;
+        assert_eq!(size - 4096, index_start + 1);
+        let reader = TrackingFileRead::new(Bytes::from(data));
+        let actual = BlobFileIndex::load(&reader, size).await.unwrap();
+        assert_eq!(format!("{:?}", actual.entries), format!("{expected:?}"));
+        assert_eq!(
+            reader.ranges(),
+            vec![size - 4096..size, index_start..size - BLOB_FOOTER_SIZE]
+        );
     }
 
     #[tokio::test]
@@ -2453,14 +2475,14 @@ mod tests {
         let mut tail = vec![0; 4091];
         tail.extend_from_slice(&5000_i32.to_le_bytes());
         tail.push(1);
-        for prefix in [None, Some(Bytes::new()), Some(Bytes::from(vec![0; 908]))] {
+        for index in [None, Some(Bytes::new()), Some(Bytes::from(vec![0; 4999]))] {
             let mut responses = vec![(909..5005, Bytes::from(tail.clone()))];
-            if let Some(prefix) = prefix {
-                responses.push((0..909, prefix));
+            if let Some(index) = index {
+                responses.push((0..5000, index));
             }
             let reader = SparseFileRead::new(responses);
             assert!(BlobFileIndex::load(&reader, 5005).await.is_err());
-            assert_eq!(reader.ranges(), vec![909..5005, 0..909]);
+            assert_eq!(reader.ranges(), vec![909..5005, 0..5000]);
         }
     }
 
