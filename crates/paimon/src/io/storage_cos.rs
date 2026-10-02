@@ -59,7 +59,7 @@ pub(crate) fn cos_config_parse(props: HashMap<String, String>) -> Result<CosConf
     Ok(cfg)
 }
 
-pub(crate) fn cos_config_build(cfg: &CosConfig, path: &str) -> Result<Operator> {
+pub(crate) fn cos_config_build(cfg: &CosConfig, path: &str, user_agent: &str) -> Result<Operator> {
     let url = Url::parse(path).map_err(|_| Error::ConfigInvalid {
         message: format!("Invalid COS url: {path}"),
     })?;
@@ -69,7 +69,10 @@ pub(crate) fn cos_config_build(cfg: &CosConfig, path: &str) -> Result<Operator> 
     })?;
 
     let builder = cfg.clone().into_builder().bucket(bucket);
-    Ok(super::with_http_transport(Operator::new(builder)?))
+    Ok(super::with_http_transport(
+        Operator::new(builder)?,
+        user_agent,
+    ))
 }
 
 #[cfg(test)]
@@ -124,14 +127,14 @@ mod tests {
             ..Default::default()
         };
 
-        let op = cos_config_build(&cfg, "cosn://my-bucket/some/path").unwrap();
+        let op = cos_config_build(&cfg, "cosn://my-bucket/some/path", "paimon-rust/test").unwrap();
         assert_eq!(op.info().name(), "my-bucket");
     }
 
     #[test]
     fn test_cos_config_build_missing_bucket() {
         let cfg = CosConfig::default();
-        let result = cos_config_build(&cfg, "cosn:///path/without/bucket");
+        let result = cos_config_build(&cfg, "cosn:///path/without/bucket", "paimon-rust/test");
         assert!(result.is_err());
     }
 }

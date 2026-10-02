@@ -4674,6 +4674,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.12.1",
+ "http",
  "indexmap 2.14.0",
  "jiff",
  "libloading 0.9.0",

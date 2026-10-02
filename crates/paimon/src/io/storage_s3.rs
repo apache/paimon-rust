@@ -128,7 +128,7 @@ pub(crate) fn s3_config_parse(props: HashMap<String, String>) -> Result<S3Config
 /// Parses the bucket name from the `s3://bucket/key` or `s3a://bucket/key`
 /// URL and combines it with the provided [`S3Config`] to construct an
 /// OpenDAL operator.
-pub(crate) fn s3_config_build(cfg: &S3Config, path: &str) -> Result<Operator> {
+pub(crate) fn s3_config_build(cfg: &S3Config, path: &str, user_agent: &str) -> Result<Operator> {
     let url = Url::parse(path).map_err(|_| Error::ConfigInvalid {
         message: format!("Invalid S3 url: {path}"),
     })?;
@@ -138,7 +138,10 @@ pub(crate) fn s3_config_build(cfg: &S3Config, path: &str) -> Result<Operator> {
     })?;
 
     let builder = cfg.clone().into_builder().bucket(bucket);
-    Ok(super::with_http_transport(Operator::new(builder)?))
+    Ok(super::with_http_transport(
+        Operator::new(builder)?,
+        user_agent,
+    ))
 }
 
 #[cfg(test)]
@@ -309,7 +312,7 @@ mod tests {
         cfg.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
         cfg.region = Some("us-east-1".to_string());
 
-        let op = s3_config_build(&cfg, "s3://my-bucket/some/path").unwrap();
+        let op = s3_config_build(&cfg, "s3://my-bucket/some/path", "paimon-rust/test").unwrap();
         assert_eq!(op.info().name(), "my-bucket");
     }
 
@@ -320,21 +323,21 @@ mod tests {
         cfg.endpoint = Some("https://s3.us-east-1.amazonaws.com".to_string());
         cfg.region = Some("us-east-1".to_string());
 
-        let op = s3_config_build(&cfg, "s3a://my-bucket/some/path").unwrap();
+        let op = s3_config_build(&cfg, "s3a://my-bucket/some/path", "paimon-rust/test").unwrap();
         assert_eq!(op.info().name(), "my-bucket");
     }
 
     #[test]
     fn test_s3_config_build_invalid_url() {
         let cfg = S3Config::default();
-        let result = s3_config_build(&cfg, "not-a-valid-url");
+        let result = s3_config_build(&cfg, "not-a-valid-url", "paimon-rust/test");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_s3_config_build_missing_bucket() {
         let cfg = S3Config::default();
-        let result = s3_config_build(&cfg, "s3:///path/without/bucket");
+        let result = s3_config_build(&cfg, "s3:///path/without/bucket", "paimon-rust/test");
         assert!(result.is_err());
     }
 
