@@ -1245,12 +1245,14 @@ impl Schema {
         let Some(raw) = options.get("bucket") else {
             return Ok(());
         };
-        let bucket: i32 = raw
-            .trim()
-            .parse()
-            .map_err(|_| crate::Error::ConfigInvalid {
-                message: format!("Option 'bucket' must be an integer, got: '{raw}'."),
-            })?;
+        // Parse the raw value exactly as `CoreOptions::bucket()` does (no trim):
+        // it uses `v.parse().ok().unwrap_or(-1)`, so a padded value like `" 4 "`
+        // silently runs as dynamic (-1). Validating a trimmed copy would accept
+        // `" 4 "` here yet persist a value the runtime reads as -1, so reject what
+        // the runtime cannot parse.
+        let bucket: i32 = raw.parse().map_err(|_| crate::Error::ConfigInvalid {
+            message: format!("Option 'bucket' must be an integer, got: '{raw}'."),
+        })?;
         if bucket < 1 && bucket != -1 && bucket != -2 {
             return Err(crate::Error::ConfigInvalid {
                 message: format!(
@@ -6001,6 +6003,33 @@ mod tests {
                 .build()
                 .unwrap_or_else(|e| panic!("bucket={value} should be accepted, got {e:?}"));
         }
+    }
+
+    #[test]
+    fn bucket_padded_value_is_rejected_matching_runtime() {
+        // `CoreOptions::bucket()` parses the raw value without trimming and falls
+        // back to -1, so a padded `" 4 "` silently runs as dynamic. Validation
+        // must use the same grammar and reject it, not persist a value the runtime
+        // reads as -1.
+        let padded = HashMap::from([("bucket".to_string(), " 4 ".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&padded).bucket(),
+            -1,
+            "runtime reads a padded bucket value as dynamic"
+        );
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("bucket", " 4 ")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("must be an integer")),
+            "got {err:?}"
+        );
+        // The accepted spelling runs as the fixed count the user asked for.
+        let fixed = HashMap::from([("bucket".to_string(), "4".to_string())]);
+        assert_eq!(CoreOptions::new(&fixed).bucket(), 4);
     }
 
     #[test]
