@@ -2567,13 +2567,9 @@ pub(crate) async fn read_row_count(
 ) -> crate::Result<i64> {
     let mut reader =
         ArrowFileReader::new(file_size, Arc::from(reader)).with_metadata_cache_enabled(false);
-    let metadata = reader
-        .get_metadata(None)
-        .await
-        .map_err(|error| Error::UnexpectedError {
-            message: format!("Failed to read the Parquet footer: {error}"),
-            source: Some(Box::new(error)),
-        })?;
+    let metadata = reader.get_metadata(None).await.map_err(|error| {
+        Error::from_parquet_with_context(error, "Failed to read the Parquet footer")
+    })?;
     Ok(metadata.file_metadata().num_rows())
 }
 
@@ -2592,10 +2588,11 @@ impl ArrowFileReader {
     }
 
     fn read_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
-        Box::pin(self.r.read(range.start..range.end).map_err(|err| {
-            let err_msg = format!("{err}");
-            parquet::errors::ParquetError::External(err_msg.into())
-        }))
+        Box::pin(
+            self.r
+                .read(range.start..range.end)
+                .map_err(|error| parquet::errors::ParquetError::External(Box::new(error))),
+        )
     }
 
     async fn load_metadata(
@@ -2655,15 +2652,15 @@ impl AsyncFileReader for ArrowFileReader {
                 // All ranges fit within the concurrency limit — fire them all at once.
                 futures::future::try_join_all(fetch_ranges.iter().map(|range| {
                     r.read(range.clone())
-                        .map_err(|e| parquet::errors::ParquetError::External(format!("{e}").into()))
+                        .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))
                 }))
                 .await?
             } else {
                 // More ranges than concurrency slots — use buffered stream.
                 futures::stream::iter(fetch_ranges.iter().cloned())
                     .map(|range| async move {
-                        r.read(range).await.map_err(|e| {
-                            parquet::errors::ParquetError::External(format!("{e}").into())
+                        r.read(range).await.map_err(|error| {
+                            parquet::errors::ParquetError::External(Box::new(error))
                         })
                     })
                     .buffered(concurrency)
@@ -3395,6 +3392,54 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    struct ForkFailingFileRead;
+
+    #[async_trait::async_trait]
+    impl crate::io::FileRead for ForkFailingFileRead {
+        async fn read(&self, _range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            Err(Error::ProcessForkUnsupported {
+                message: crate::error::JINDO_FORK_ERROR.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn parquet_read_paths_preserve_fork_safety_error() {
+        let fields = vec![DataField::new(
+            0,
+            "id".to_string(),
+            DataType::Int(IntType::new()),
+        )];
+        let error = match ParquetFormatReader::default()
+            .read_batch_stream(Box::new(ForkFailingFileRead), 8, &fields, None, None, None)
+            .await
+        {
+            Ok(_) => panic!("Parquet reader should propagate the storage error"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+
+        let error = super::read_row_count(Box::new(ForkFailingFileRead), 8)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+
+        for count in [2, super::RANGE_FETCH_CONCURRENCY + 1] {
+            let step = super::RANGE_COALESCE_BYTES + 2;
+            let ranges = (0..count)
+                .map(|index| {
+                    let start = index as u64 * step;
+                    start..start + 1
+                })
+                .collect::<Vec<_>>();
+            let mut reader =
+                super::ArrowFileReader::new(count as u64 * step + 1, Arc::new(ForkFailingFileRead));
+            let error = reader.get_byte_ranges(ranges).await.unwrap_err();
+            let error = Error::from(error);
+            assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+        }
     }
 
     #[derive(Clone)]

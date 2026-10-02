@@ -310,7 +310,9 @@ also discovers it from an installed `pyjindosdk` package. This initial
 integration supports object stat, reads, and listings, but not writes, deletes,
 or copies. Jindo reads are limited to 8 concurrent requests per OSS operator by
 default. Set `fs.jindo.max.concurrent.reads` to a positive integer to tune this
-limit for the available network and JindoSDK connection capacity.
+limit for the available network and JindoSDK connection capacity. JindoSDK state
+initialized before `fork` cannot be reused in the child; use `spawn` or initialize
+Jindo only after worker processes start.
 
 Supported metastore types:
 

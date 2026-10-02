@@ -19,7 +19,12 @@ import multiprocessing
 
 import pytest
 
+from pypaimon_rust import ForkSafetyError
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
+
+
+def test_fork_safety_error_is_runtime_error():
+    assert issubclass(ForkSafetyError, RuntimeError)
 
 
 def _plan_rows(catalog):
