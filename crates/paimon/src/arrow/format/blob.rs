@@ -1699,6 +1699,9 @@ impl BlobFileIndex {
         else {
             return Ok(Arc::new(Self::load(reader, file_size).await?));
         };
+        if !context.belongs_to_current_process() {
+            return Ok(Arc::new(Self::load(reader, file_size).await?));
+        }
         let cache = context.get_or_init(BlobIndexCache::new);
         let cache_key = reader.cache_key().map(ToOwned::to_owned);
         let key_heap_bytes = cache_key.as_ref().map_or(0, String::capacity);
@@ -2469,6 +2472,120 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ForkBoundBlobRead {
+        parent_pid: u32,
+        cache: Arc<BlobIndexCacheContext>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait::async_trait]
+    impl FileRead for ForkBoundBlobRead {
+        async fn read(&self, _range: Range<u64>) -> crate::Result<Bytes> {
+            if std::process::id() != self.parent_pid {
+                return Err(Error::ProcessForkUnsupported {
+                    message: crate::error::JINDO_FORK_ERROR.to_string(),
+                });
+            }
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        fn cache_key(&self) -> Option<&str> {
+            Some("fork-pending-blob")
+        }
+
+        fn blob_index_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+            Some(self.cache.as_ref())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_index_cache_does_not_join_parent_load_after_fork() {
+        let cache = blob_index_cache("64 MiB");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let parent_pid = std::process::id();
+        let parent_reader = ForkBoundBlobRead {
+            parent_pid,
+            cache: Arc::clone(&cache),
+            started: Arc::clone(&started),
+        };
+        let parent_load =
+            tokio::spawn(async move { BlobFileIndex::load_cached(&parent_reader, 5).await });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("parent load did not start");
+
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork failed");
+        if child_pid == 0 {
+            let passed = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let reader = ForkBoundBlobRead {
+                        parent_pid,
+                        cache,
+                        started,
+                    };
+                    matches!(
+                        tokio::time::timeout(
+                            Duration::from_millis(500),
+                            BlobFileIndex::load_cached(&reader, 5),
+                        )
+                        .await,
+                        Ok(Err(Error::ProcessForkUnsupported { .. }))
+                    )
+                })
+            })
+            .join()
+            .unwrap_or(false);
+            unsafe { libc::_exit(i32::from(!passed)) };
+        }
+
+        let (status, timed_out) = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let mut status = 0;
+                let waited = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+                if waited == child_pid {
+                    return Ok::<_, std::io::Error>((status, false));
+                }
+                if waited < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                    loop {
+                        let waited = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+                        if waited == child_pid {
+                            return Ok((status, true));
+                        }
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        parent_load.abort();
+        assert!(!timed_out, "child hung on inherited BLOB cache state");
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
     #[tokio::test]

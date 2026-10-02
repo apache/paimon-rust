@@ -167,6 +167,7 @@ impl FileFormatMetadataCacheContext {
 
 pub(crate) struct BlobIndexCacheContext {
     max_bytes: usize,
+    process_id: u32,
     cache: OnceLock<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -197,8 +198,13 @@ impl BlobIndexCacheContext {
             .unwrap_or(DEFAULT_BLOB_INDEX_CACHE_MAX_BYTES);
         Ok(Arc::new(Self {
             max_bytes,
+            process_id: std::process::id(),
             cache: OnceLock::new(),
         }))
+    }
+
+    pub(crate) fn belongs_to_current_process(&self) -> bool {
+        self.process_id == std::process::id()
     }
 
     pub(crate) fn max_bytes(&self) -> usize {
