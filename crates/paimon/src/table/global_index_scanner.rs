@@ -52,7 +52,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize as TestAtomicUsize, Ordering as TestOrdering};
+use std::sync::atomic::{
+    AtomicBool as TestAtomicBool, AtomicUsize as TestAtomicUsize, Ordering as TestOrdering,
+};
 
 type BoxedCmp = Box<dyn Fn(&[u8], &[u8]) -> Result<Ordering> + Send + Sync>;
 
@@ -65,6 +67,10 @@ struct QueryIoProbe {
     peak: TestAtomicUsize,
     predicate_queries: TestAtomicUsize,
     range_queries: TestAtomicUsize,
+    btree_opens: TestAtomicUsize,
+    pause_on_enter: TestAtomicBool,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -73,6 +79,10 @@ impl QueryIoProbe {
         let current = self.active.fetch_add(1, TestOrdering::SeqCst) + 1;
         self.peak.fetch_max(current, TestOrdering::SeqCst);
         let guard = QueryIoProbeGuard { probe: self };
+        if self.pause_on_enter.load(TestOrdering::SeqCst) {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
         tokio::task::yield_now().await;
         guard
     }
@@ -118,8 +128,10 @@ pub(crate) struct GlobalIndexScanner {
     coverage_by_field: HashMap<i32, Vec<RowRange>>,
     /// Schema fields for field_id lookup.
     schema_fields: Vec<DataField>,
-    /// Cache of opened BTree readers, keyed by file name.
+    /// Cache of opened BTree readers, keyed by resolved path.
     reader_cache: Mutex<HashMap<String, BTreeIndexReader<BoxedCmp>>>,
+    /// Serialize use of each BTree reader across concurrent predicate branches.
+    btree_file_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
     query_io_probe: Option<Arc<QueryIoProbe>>,
 }
@@ -319,9 +331,20 @@ impl GlobalIndexScanner {
             coverage_by_field,
             schema_fields: schema_fields.to_vec(),
             reader_cache: Mutex::new(HashMap::new()),
+            btree_file_locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             query_io_probe: None,
         }))
+    }
+
+    fn btree_file_lock(&self, entry: &GlobalIndexEntry) -> Arc<tokio::sync::Mutex<()>> {
+        let path = entry.resolved_path(&self.table_path);
+        let mut locks = self.btree_file_locks.lock().unwrap();
+        Arc::clone(
+            locks
+                .entry(path)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 }
 

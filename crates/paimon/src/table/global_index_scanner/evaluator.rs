@@ -239,8 +239,13 @@ impl GlobalIndexScanner {
                     let mut all_ranges: Vec<RowRange> = Vec::new();
                     let mut evaluated_field_ids = HashSet::new();
                     let mut indexed_coverage: Option<Vec<RowRange>> = None;
-                    for child in children {
-                        match self.evaluate(child).await? {
+                    let child_futures: Vec<_> =
+                        children.iter().map(|child| self.evaluate(child)).collect();
+                    let stream =
+                        futures::stream::iter(child_futures).buffered(self.global_index_thread_num);
+                    futures::pin_mut!(stream);
+                    while let Some(result) = stream.try_next().await? {
+                        match result {
                             Some(child_result) => {
                                 all_ranges.extend(child_result.row_ranges);
                                 evaluated_field_ids.extend(child_result.evaluated_field_ids);
@@ -563,6 +568,11 @@ impl GlobalIndexScanner {
         let futures =
             query_plans.into_iter().map(|plan| async move {
                 let entry = &entries[plan.entry_idx];
+                let _file_guard = if matches!(entry.index_type, GlobalIndexFileKind::BTree) {
+                    Some(self.btree_file_lock(entry).lock_owned().await)
+                } else {
+                    None
+                };
                 let _permit = self.query_semaphore.acquire().await.map_err(|error| {
                     Error::UnexpectedError {
                         message: "global-index query concurrency budget was closed".to_string(),

@@ -235,6 +235,11 @@ impl GlobalIndexScanner {
             }
         }
 
+        #[cfg(test)]
+        if let Some(probe) = &self.query_io_probe {
+            probe.btree_opens.fetch_add(1, super::TestOrdering::SeqCst);
+        }
+
         // Open new reader
         let input = self.file_io.new_input(&resolved_path)?;
         let file_size = if entry.file_size > 0 {
