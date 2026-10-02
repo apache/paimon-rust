@@ -1129,8 +1129,10 @@ and falls back to a table option:
 A snapshot expires only when every rule allows it: it is outside `retain_min`,
 the snapshot after it is older than the cut-off, and no consumer
 (`consumer-id`) still reads from it. Data files, changelog files, manifests,
-index files and statistics that a remaining snapshot or any tag still uses are
-kept, so tagged snapshots stay readable. Snapshot files are removed last, so an
+index files and statistics that a remaining snapshot, any tag, any branch or
+a long-lived changelog (`changelog/changelog-<id>`) still uses are kept, so
+tagged snapshots and branches stay readable. If those references cannot be
+read, the call fails before deleting anything. Snapshot files are removed last, so an
 interrupted call leaves the table readable and a later call finishes the work.
 This follows Java's `expire_snapshots` procedure; changelog files are expired
 together with their snapshots (`changelog.num-retained.*` and
