@@ -566,6 +566,18 @@ impl Catalog for FileSystemCatalog {
         snapshot_id: Option<i64>,
         ignore_if_exists: bool,
     ) -> Result<()> {
+        self.create_tag_with_retention(identifier, tag_name, snapshot_id, None, ignore_if_exists)
+            .await
+    }
+
+    async fn create_tag_with_retention(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+        time_retained: Option<&str>,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
         let table = self.get_table(identifier).await?;
         let manager = table.tag_manager();
         if manager.tag_exists(tag_name).await? {
@@ -579,7 +591,9 @@ impl Catalog for FileSystemCatalog {
         }
 
         let snapshot = resolve_tag_snapshot(&table, snapshot_id).await?;
-        manager.create(tag_name, &snapshot).await
+        manager
+            .create_with_retention(tag_name, &snapshot, time_retained)
+            .await
     }
 
     async fn get_tag(&self, identifier: &Identifier, tag_name: &str) -> Result<GetTagResponse> {
@@ -655,8 +669,14 @@ async fn resolve_tag_snapshot(table: &Table, snapshot_id: Option<i64>) -> Result
     }
 }
 
-fn format_tag_time_retained(seconds: f64) -> Option<String> {
-    let duration = std::time::Duration::try_from_secs_f64(seconds).ok()?;
+fn format_tag_time_retained(seconds: serde_json::Number) -> Option<String> {
+    // Java writes decimal seconds with nanosecond precision. Parse that decimal directly
+    // before falling back to the existing float behavior for other JSON number forms.
+    let duration = format!("PT{seconds}S")
+        .parse::<jiff::SignedDuration>()
+        .ok()
+        .and_then(|duration| std::time::Duration::try_from(duration).ok())
+        .or_else(|| std::time::Duration::try_from_secs_f64(seconds.as_f64()?).ok())?;
     let total_seconds = duration.as_secs();
     let hours = total_seconds / 3600;
     let minutes = total_seconds % 3600 / 60;
@@ -1126,6 +1146,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_tag_with_retention() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db1", "t");
+        catalog
+            .create_table(&identifier, testing_schema(), false)
+            .await
+            .unwrap();
+        give_the_table_a_snapshot(&catalog, &identifier).await;
+        let catalog: &dyn Catalog = &catalog;
+        for (name, snapshot_id, retention, expected) in [
+            ("explicit", Some(1), "1d", "PT24H"),
+            ("latest", None, "12h", "PT12H"),
+            ("micro", Some(1), "500micro", "PT0.0005S"),
+            ("nano", Some(1), "1ns", "PT0.000000001S"),
+            (
+                "large-nano",
+                Some(1),
+                "9223372036854775807ns",
+                "PT2562047H47M16.854775807S",
+            ),
+            (
+                "max-seconds",
+                Some(1),
+                "9223372036854775807s",
+                "PT2562047788015215H30M7S",
+            ),
+            ("zero", Some(1), "0", "PT0S"),
+        ] {
+            catalog
+                .create_tag_with_retention(&identifier, name, snapshot_id, Some(retention), false)
+                .await
+                .unwrap();
+            let tag = catalog.get_tag(&identifier, name).await.unwrap();
+            assert_eq!(tag.snapshot.id(), 1);
+            assert!(tag.tag_create_time.is_some());
+            assert_eq!(tag.tag_time_retained.as_deref(), Some(expected));
+        }
+        catalog
+            .create_tag_with_retention(&identifier, "plain", None, None, false)
+            .await
+            .unwrap();
+        let plain = catalog.get_tag(&identifier, "plain").await.unwrap();
+        assert!(plain.tag_create_time.is_none());
+        assert!(plain.tag_time_retained.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_with_retention_preserves_existing_tag() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db1", "t");
+        catalog
+            .create_table(&identifier, testing_schema(), false)
+            .await
+            .unwrap();
+        give_the_table_a_snapshot(&catalog, &identifier).await;
+        catalog
+            .create_tag_with_retention(&identifier, "retained", Some(1), Some("1d"), false)
+            .await
+            .unwrap();
+        let table = catalog.get_table(&identifier).await.unwrap();
+        let input = table
+            .file_io()
+            .new_input(&table.tag_manager().tag_path("retained"))
+            .unwrap();
+        let before = input.read().await.unwrap();
+        catalog
+            .create_tag_with_retention(&identifier, "retained", Some(2), Some("invalid"), true)
+            .await
+            .unwrap();
+        catalog
+            .create_tag(&identifier, "retained", None, true)
+            .await
+            .unwrap();
+        assert_eq!(input.read().await.unwrap(), before);
+        assert!(matches!(
+            catalog
+                .create_tag_with_retention(&identifier, "retained", Some(2), Some("invalid"), false)
+                .await,
+            Err(Error::TagAlreadyExist { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_with_retention_errors_and_snapshot_fallback() {
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let identifier = Identifier::new("db1", "t");
+        catalog
+            .create_table(&identifier, testing_schema(), false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            catalog
+                .create_tag_with_retention(&identifier, "empty", None, Some("1d"), false)
+                .await,
+            Err(Error::DataInvalid { .. })
+        ));
+        give_the_table_a_snapshot(&catalog, &identifier).await;
+        assert!(matches!(
+            catalog
+                .create_tag_with_retention(&identifier, "missing", Some(2), Some("1d"), false)
+                .await,
+            Err(Error::SnapshotNotExist { snapshot_id: 2 })
+        ));
+        assert!(matches!(
+            catalog
+                .create_tag_with_retention(&identifier, "invalid", Some(1), Some("-1d"), false)
+                .await,
+            Err(Error::ConfigInvalid { .. })
+        ));
+        assert!(matches!(
+            catalog
+                .create_tag_with_retention(&identifier, "nested/tag", Some(1), Some("1d"), false)
+                .await,
+            Err(Error::ConfigInvalid { .. })
+        ));
+        let table = catalog.get_table(&identifier).await.unwrap();
+        assert!(table
+            .tag_manager()
+            .list_all_names()
+            .await
+            .unwrap()
+            .is_empty());
+
+        catalog
+            .create_tag(&identifier, "source", Some(1), false)
+            .await
+            .unwrap();
+        table.snapshot_manager().delete_snapshot(1).await.unwrap();
+        catalog
+            .create_tag_with_retention(&identifier, "from-tag", Some(1), Some("1d"), false)
+            .await
+            .unwrap();
+        let tag = catalog.get_tag(&identifier, "from-tag").await.unwrap();
+        assert_eq!(tag.snapshot.id(), 1);
+        assert_eq!(tag.tag_time_retained.as_deref(), Some("PT24H"));
+    }
+
+    #[tokio::test]
     async fn test_delete_expired_tag_is_unsupported() {
         let (_temp_dir, catalog) = create_test_catalog();
         catalog
@@ -1168,13 +1338,19 @@ mod tests {
 
     #[test]
     fn test_format_tag_time_retained() {
-        assert_eq!(format_tag_time_retained(0.0).as_deref(), Some("PT0S"));
-        assert_eq!(format_tag_time_retained(90.0).as_deref(), Some("PT1M30S"));
-        assert_eq!(
-            format_tag_time_retained(259_200.0).as_deref(),
-            Some("PT72H")
-        );
-        assert_eq!(format_tag_time_retained(1.5).as_deref(), Some("PT1.5S"));
+        for (seconds, expected) in [
+            ("0.0", Some("PT0S")),
+            ("90.0", Some("PT1M30S")),
+            ("259200.0", Some("PT72H")),
+            ("1.5", Some("PT1.5S")),
+            ("1e-6", Some("PT0.000001S")),
+            ("9223372036.854775807", Some("PT2562047H47M16.854775807S")),
+            ("-1.0", None),
+            ("1e100", None),
+        ] {
+            let number = serde_json::from_str(seconds).unwrap();
+            assert_eq!(format_tag_time_retained(number).as_deref(), expected);
+        }
     }
 
     #[test]

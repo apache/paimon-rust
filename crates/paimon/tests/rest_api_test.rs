@@ -83,6 +83,39 @@ async fn setup_partition_api() -> (TestContext, Identifier) {
     (ctx, identifier)
 }
 
+// ==================== Tag Tests ====================
+#[tokio::test]
+async fn test_create_tag_with_retention() {
+    let ctx = setup_test_server(vec!["default"]).await;
+    ctx.server.add_table("default", "managed_table");
+    let identifier = Identifier::new("default", "managed_table");
+    for (name, snapshot_id, retention) in [
+        ("explicit", Some(1), Some("1d")),
+        ("latest", None, Some(" 12 HOURS ")),
+        ("nano", Some(1), Some("1ns")),
+        ("plain", None, None),
+    ] {
+        ctx.api
+            .create_tag_with_retention(&identifier, name, snapshot_id, retention)
+            .await
+            .unwrap();
+        let response = ctx.api.get_tag(&identifier, name).await.unwrap();
+        assert_eq!(response.snapshot.id(), 1);
+        assert_eq!(response.tag_time_retained.as_deref(), retention);
+    }
+    ctx.api
+        .create_tag(&identifier, "legacy", Some(1))
+        .await
+        .unwrap();
+    assert!(ctx
+        .api
+        .get_tag(&identifier, "legacy")
+        .await
+        .unwrap()
+        .tag_time_retained
+        .is_none());
+}
+
 // ==================== Database Tests ====================
 #[tokio::test]
 async fn test_list_databases() {

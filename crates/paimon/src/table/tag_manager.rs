@@ -15,15 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Tag manager for reading tag metadata using FileIO.
+//! Tag manager for reading and writing tag metadata using FileIO.
 //!
 //! Reference: [org.apache.paimon.utils.TagManager](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/TagManager.java)
 //! and [pypaimon.tag.tag_manager.TagManager](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/tag/tag_manager.py).
 
 use crate::io::FileIO;
 use crate::spec::Snapshot;
+use chrono::{Datelike, Timelike};
 use futures::future::try_join_all;
 use opendal::raw::get_basename;
+use std::time::Duration;
 
 const TAG_DIR: &str = "tag";
 const TAG_PREFIX: &str = "tag-";
@@ -31,7 +33,8 @@ const TAG_PREFIX: &str = "tag-";
 /// Manager for tag files using unified FileIO.
 ///
 /// Tags are named snapshots stored as JSON files at `{table_path}/tag/tag-{name}`.
-/// The tag file format is identical to a Snapshot JSON file.
+/// Tags without retention use Snapshot JSON. Retained tags also include Java-compatible
+/// creation time and retention metadata.
 ///
 /// Reference: [org.apache.paimon.utils.TagManager](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/TagManager.java)
 #[derive(Debug, Clone)]
@@ -110,7 +113,7 @@ impl TagManager {
                 (
                     snapshot,
                     create_time.map(|value| value.and_utc().timestamp_millis()),
-                    time_retained,
+                    time_retained.and_then(|value| value.as_f64()),
                 )
             },
         ))
@@ -119,7 +122,13 @@ impl TagManager {
     pub(crate) async fn get_with_raw_metadata(
         &self,
         tag_name: &str,
-    ) -> crate::Result<Option<(Snapshot, Option<chrono::NaiveDateTime>, Option<f64>)>> {
+    ) -> crate::Result<
+        Option<(
+            Snapshot,
+            Option<chrono::NaiveDateTime>,
+            Option<serde_json::Number>,
+        )>,
+    > {
         validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
         let input = self.file_io.new_input(&path)?;
@@ -147,7 +156,8 @@ impl TagManager {
             .and_then(parse_tag_create_time);
         let time_retained = value
             .get(FIELD_TAG_TIME_RETAINED)
-            .and_then(serde_json::Value::as_f64);
+            .and_then(serde_json::Value::as_number)
+            .cloned();
         Ok(Some((snapshot, create_time, time_retained)))
     }
 
@@ -199,12 +209,54 @@ impl TagManager {
 
     /// Create a tag by writing the snapshot JSON to the tag path.
     pub async fn create(&self, tag_name: &str, snapshot: &Snapshot) -> crate::Result<()> {
+        self.create_with_retention(tag_name, snapshot, None).await
+    }
+
+    /// Create a tag with an optional retention in Java's `TimeUtils.parseDuration` format.
+    /// A bare integer denotes milliseconds; units from days through nanoseconds are supported.
+    pub async fn create_with_retention(
+        &self,
+        tag_name: &str,
+        snapshot: &Snapshot,
+        time_retained: Option<&str>,
+    ) -> crate::Result<()> {
         validate_tag_name(tag_name)?;
         let path = self.tag_path(tag_name);
-        let json = serde_json::to_string(snapshot).map_err(|e| crate::Error::DataInvalid {
+        let serialize_error = |e| crate::Error::DataInvalid {
             message: format!("failed to serialize snapshot for tag '{tag_name}': {e}"),
             source: Some(Box::new(e)),
-        })?;
+        };
+        let json = if let Some(value) = time_retained {
+            let duration =
+                parse_tag_time_retained(value).ok_or_else(|| crate::Error::ConfigInvalid {
+                    message: format!("Invalid tag retention: {value:?}"),
+                })?;
+            let now = chrono::Local::now();
+            let tag = RetainedTag {
+                snapshot,
+                tag_create_time: [
+                    i64::from(now.year()),
+                    i64::from(now.month()),
+                    i64::from(now.day()),
+                    i64::from(now.hour()),
+                    i64::from(now.minute()),
+                    i64::from(now.second()),
+                    i64::from(now.nanosecond()),
+                ],
+                // Decimal seconds preserve nanoseconds even when the duration is too large
+                // for an f64 to represent its fractional part.
+                tag_time_retained: serde_json::from_str(&format!(
+                    "{}.{:09}",
+                    duration.as_secs(),
+                    duration.subsec_nanos()
+                ))
+                .map_err(&serialize_error)?,
+            };
+            serde_json::to_string(&tag)
+        } else {
+            serde_json::to_string(snapshot)
+        }
+        .map_err(serialize_error)?;
         self.file_io.mkdirs(&self.tag_directory()).await?;
         let output = self.file_io.new_output(&path)?;
         output.write(bytes::Bytes::from(json)).await
@@ -237,6 +289,40 @@ impl TagManager {
 /// Java `Tag` adds these two fields on top of the snapshot schema.
 const FIELD_TAG_CREATE_TIME: &str = "tagCreateTime";
 const FIELD_TAG_TIME_RETAINED: &str = "tagTimeRetained";
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetainedTag<'a> {
+    #[serde(flatten)]
+    snapshot: &'a Snapshot,
+    tag_create_time: [i64; 7],
+    tag_time_retained: serde_json::Number,
+}
+
+/// Match Java's unsigned integer syntax and signed 64-bit value/seconds limits.
+fn parse_tag_time_retained(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    let pos = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(pos);
+    let number = number.parse::<i64>().ok()? as u64;
+    let duration = match unit.trim().to_ascii_lowercase().as_str() {
+        "d" | "day" | "days" => Duration::from_secs(number.checked_mul(86_400)?),
+        "h" | "hour" | "hours" => Duration::from_secs(number.checked_mul(3_600)?),
+        "m" | "min" | "minute" | "minutes" => Duration::from_secs(number.checked_mul(60)?),
+        "s" | "sec" | "secs" | "second" | "seconds" => Duration::from_secs(number),
+        "" | "ms" | "milli" | "millis" | "millisecond" | "milliseconds" => {
+            Duration::from_millis(number)
+        }
+        "\u{b5}s" | "micro" | "micros" | "microsecond" | "microseconds" => {
+            Duration::from_micros(number)
+        }
+        "ns" | "nano" | "nanos" | "nanosecond" | "nanoseconds" => Duration::from_nanos(number),
+        _ => return None,
+    };
+    (duration.as_secs() <= i64::MAX as u64).then_some(duration)
+}
 
 fn validate_tag_name(tag_name: &str) -> crate::Result<()> {
     let invalid = tag_name.trim().is_empty()
@@ -314,6 +400,148 @@ mod tests {
         let json = serde_json::to_string(snapshot).unwrap();
         let output = file_io.new_output(&path).unwrap();
         output.write(Bytes::from(json)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_without_retention_writes_plain_snapshot() {
+        let file_io = test_file_io();
+        let tm = TagManager::new(file_io.clone(), "memory:/test_tag_create_plain".to_string());
+        let snapshot = test_snapshot(1);
+        for name in ["legacy", "none"] {
+            if name == "legacy" {
+                tm.create(name, &snapshot).await.unwrap();
+            } else {
+                tm.create_with_retention(name, &snapshot, None)
+                    .await
+                    .unwrap();
+            }
+            let bytes = file_io
+                .new_input(&tm.tag_path(name))
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), serde_json::to_vec(&snapshot).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_with_retention_writes_java_metadata() {
+        let file_io = test_file_io();
+        let tm = TagManager::new(
+            file_io.clone(),
+            "memory:/test_tag_create_retained".to_string(),
+        );
+        let snapshot = test_snapshot(1);
+        for (retention, expected) in [
+            ("1d", "86400.000000000"),
+            ("12h", "43200.000000000"),
+            ("30m", "1800.000000000"),
+            ("500micro", "0.000500000"),
+            ("1ns", "0.000000001"),
+            ("0", "0.000000000"),
+            ("9223372036854775807ns", "9223372036.854775807"),
+            ("9223372036854775807", "9223372036854775.807000000"),
+            ("9223372036854775807s", "9223372036854775807.000000000"),
+        ] {
+            let before = chrono::Local::now().naive_local();
+            tm.create_with_retention("retained", &snapshot, Some(retention))
+                .await
+                .unwrap();
+            let after = chrono::Local::now().naive_local();
+            let bytes = file_io
+                .new_input(&tm.tag_path("retained"))
+                .unwrap()
+                .read()
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                value[FIELD_TAG_TIME_RETAINED]
+                    .as_number()
+                    .unwrap()
+                    .to_string(),
+                expected
+            );
+            assert_eq!(value[FIELD_TAG_CREATE_TIME].as_array().unwrap().len(), 7);
+            let created = parse_tag_create_time(&value[FIELD_TAG_CREATE_TIME]).unwrap();
+            assert!(before <= created && created <= after);
+            assert_eq!(serde_json::from_value::<Snapshot>(value).unwrap(), snapshot);
+            assert_eq!(tm.get("retained").await.unwrap(), Some(snapshot.clone()));
+        }
+    }
+
+    #[test]
+    fn test_parse_tag_retention_matches_java_units() {
+        for (units, duration) in [
+            (vec!["d", "day", "days"], Duration::from_secs(86_400)),
+            (vec!["h", "hour", "hours"], Duration::from_secs(3_600)),
+            (
+                vec!["m", "min", "minute", "minutes"],
+                Duration::from_secs(60),
+            ),
+            (
+                vec!["s", "sec", "secs", "second", "seconds"],
+                Duration::from_secs(1),
+            ),
+            (
+                vec!["", "ms", "milli", "millis", "millisecond", "milliseconds"],
+                Duration::from_millis(1),
+            ),
+            (
+                vec!["\u{b5}s", "micro", "micros", "microsecond", "microseconds"],
+                Duration::from_micros(1),
+            ),
+            (
+                vec!["ns", "nano", "nanos", "nanosecond", "nanoseconds"],
+                Duration::from_nanos(1),
+            ),
+        ] {
+            for unit in units {
+                assert_eq!(
+                    parse_tag_time_retained(&format!(" 1 {} ", unit.to_ascii_uppercase())),
+                    Some(duration)
+                );
+            }
+        }
+        assert_eq!(
+            parse_tag_time_retained("106751991167300d"),
+            Some(Duration::from_secs(106_751_991_167_300 * 86_400))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_tag_with_invalid_retention_does_not_write() {
+        let file_io = test_file_io();
+        let tm = TagManager::new(
+            file_io.clone(),
+            "memory:/test_tag_create_invalid".to_string(),
+        );
+        let snapshot = test_snapshot(1);
+        for value in [
+            "",
+            " ",
+            "-1d",
+            "+1d",
+            "1.5h",
+            "PT24H",
+            "1fortnight",
+            "1us",
+            "9223372036854775808ns",
+            "106751991167301d",
+            "9223372036854775807h",
+        ] {
+            assert!(
+                matches!(
+                    tm.create_with_retention("invalid", &snapshot, Some(value))
+                        .await,
+                    Err(crate::Error::ConfigInvalid { .. })
+                ),
+                "{value:?}"
+            );
+            assert!(!tm.tag_exists("invalid").await.unwrap());
+        }
+        assert!(!file_io.exists(&tm.tag_directory()).await.unwrap());
     }
 
     #[tokio::test]
