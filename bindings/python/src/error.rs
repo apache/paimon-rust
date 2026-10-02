@@ -42,6 +42,26 @@ pub fn to_py_err(err: paimon::Error) -> PyErr {
 }
 
 pub fn df_to_py_err(err: datafusion::error::DataFusionError) -> PyErr {
+    let mut causes: Vec<&(dyn std::error::Error + 'static)> = vec![&err];
+    while let Some(cause) = causes.pop() {
+        if cause
+            .downcast_ref::<paimon::Error>()
+            .is_some_and(paimon::Error::is_process_fork_unsupported)
+        {
+            return ForkSafetyError::new_err(err.to_string());
+        }
+        if let Some(datafusion::error::DataFusionError::Collection(errors)) =
+            cause.downcast_ref::<datafusion::error::DataFusionError>()
+        {
+            causes.extend(
+                errors
+                    .iter()
+                    .map(|error| error as &(dyn std::error::Error + 'static)),
+            );
+        } else if let Some(source) = cause.source() {
+            causes.push(source);
+        }
+    }
     PyValueError::new_err(err.to_string())
 }
 
@@ -69,6 +89,55 @@ mod tests {
                 })),
             });
             assert!(error.is_instance_of::<ForkSafetyError>(py));
+        });
+    }
+
+    #[test]
+    fn datafusion_fork_error_has_distinct_python_type() {
+        Python::attach(|py| {
+            let error = datafusion::error::DataFusionError::External(Box::new(
+                paimon::Error::ProcessForkUnsupported {
+                    message: "fork is not supported".to_string(),
+                },
+            ));
+            assert!(df_to_py_err(error).is_instance_of::<ForkSafetyError>(py));
+        });
+    }
+
+    #[test]
+    fn datafusion_context_preserves_fork_error_type() {
+        Python::attach(|py| {
+            let error = datafusion::error::DataFusionError::External(Box::new(
+                paimon::Error::ProcessForkUnsupported {
+                    message: "fork is not supported".to_string(),
+                },
+            ))
+            .context("SQL collection failed");
+            assert!(df_to_py_err(error).is_instance_of::<ForkSafetyError>(py));
+        });
+    }
+
+    #[test]
+    fn datafusion_collection_preserves_fork_error_type() {
+        Python::attach(|py| {
+            let error = datafusion::error::DataFusionError::Collection(vec![
+                datafusion::error::DataFusionError::Plan("invalid SQL".to_string()),
+                datafusion::error::DataFusionError::External(Box::new(
+                    paimon::Error::ProcessForkUnsupported {
+                        message: "fork is not supported".to_string(),
+                    },
+                )),
+            ])
+            .context("SQL planning failed");
+            assert!(df_to_py_err(error).is_instance_of::<ForkSafetyError>(py));
+        });
+    }
+
+    #[test]
+    fn unrelated_datafusion_error_remains_value_error() {
+        Python::attach(|py| {
+            let error = datafusion::error::DataFusionError::Plan("invalid SQL".to_string());
+            assert!(df_to_py_err(error).is_instance_of::<PyValueError>(py));
         });
     }
 }
