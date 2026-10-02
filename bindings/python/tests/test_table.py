@@ -223,3 +223,18 @@ def test_expire_snapshots(tmp_path):
 
     with pytest.raises(ValueError, match="must not be less than"):
         table.expire_snapshots(retain_max=1, retain_min=2)
+
+
+def test_expire_snapshots_keeps_branch_files(branch_tables):
+    main, blue, _ = branch_tables
+
+    def ids(table):
+        builder = table.new_read_builder()
+        batches = builder.new_read().read(builder.new_scan().plan().splits())
+        return sorted(pa.Table.from_batches(batches).column("id").to_pylist())
+
+    assert ids(blue) == [1]
+    assert main.expire_snapshots(retain_min=1, older_than_ms=2**62) == 1
+    assert ids(main) == [1, 2]
+    # The branch shares snapshot 1's files with main; they must survive.
+    assert ids(blue) == [1]
