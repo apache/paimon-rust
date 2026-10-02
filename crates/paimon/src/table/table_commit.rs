@@ -363,6 +363,9 @@ impl TableCommit {
         validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() && self.ignore_empty_commit {
+            // Nothing to publish, but like Java (`expireForEmptyCommit`) a
+            // successful commit still runs maintenance.
+            self.maintain().await;
             return Ok(());
         }
 
@@ -413,6 +416,9 @@ impl TableCommit {
         validate_bucket_ownership(&commit_messages)?;
 
         if commit_messages.is_empty() {
+            // Nothing to publish, but like Java (`expireForEmptyCommit`) a
+            // successful commit still runs maintenance.
+            self.maintain().await;
             return Ok(());
         }
 
@@ -513,6 +519,9 @@ impl TableCommit {
             && static_partitions.is_none()
             && !self.table.schema().partition_fields().is_empty()
         {
+            // Nothing to publish, but like Java (`expireForEmptyCommit`) a
+            // successful commit still runs maintenance.
+            self.maintain().await;
             return Ok(());
         }
 
@@ -528,6 +537,9 @@ impl TableCommit {
             let partition_fields = self.table.schema().partition_fields();
             Some(self.build_static_partition_predicate(&sp, &partition_fields)?)
         } else if !self.table.schema().partition_fields().is_empty() && !has_new_data_entries {
+            // Nothing to publish, but like Java (`expireForEmptyCommit`) a
+            // successful commit still runs maintenance.
+            self.maintain().await;
             return Ok(());
         } else {
             self.build_dynamic_partition_filter(&new_entries)?
@@ -770,6 +782,9 @@ impl TableCommit {
         self.table.ensure_not_branch_reference_for_write()?;
 
         if partitions.is_empty() {
+            // Nothing to publish, but like Java (`expireForEmptyCommit`) a
+            // successful commit still runs maintenance.
+            self.maintain().await;
             return Ok(());
         }
 

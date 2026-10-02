@@ -1543,3 +1543,71 @@ async fn test_every_commit_path_expires() {
     latest_only(table.clone()).await;
     assert_files_match_references(&table).await;
 }
+
+#[tokio::test]
+async fn test_empty_commit_runs_maintenance() {
+    let options = [
+        ("snapshot.num-retained.min", "1"),
+        ("snapshot.num-retained.max", "1"),
+        ("write-only", "true"),
+    ];
+    let table = test_table("memory:/expire_empty_commit", &options, false);
+    setup_dirs(&table).await;
+    for id in 1..=3 {
+        append(&table, &[id]).await;
+    }
+    assert_eq!(snapshot_ids(&table).await, vec![1, 2, 3]);
+
+    // Maintenance is switched back on; an idle batch commits no messages.
+    let table = table.copy_with_options(HashMap::from([(
+        "write-only".to_string(),
+        "false".to_string(),
+    )]));
+    TableCommit::new(table.clone(), "u".to_string())
+        .commit(Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(snapshot_ids(&table).await, vec![3]);
+    assert_eq!(read_ids(&table).await, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn test_commit_expiration_keeps_branch_files() {
+    let table = test_table(
+        "memory:/expire_after_commit_branch",
+        &[
+            ("snapshot.num-retained.min", "1"),
+            ("snapshot.num-retained.max", "1"),
+        ],
+        false,
+    );
+    setup_dirs(&table).await;
+    write_schema_file(&table).await;
+    append(&table, &[1]).await;
+    table
+        .tag_manager()
+        .create(
+            "t1",
+            &table.snapshot_manager().get_snapshot(1).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    crate::table::BranchManager::new(table.file_io().clone(), table.location().to_string())
+        .create_branch_from_tag("b1", "t1")
+        .await
+        .unwrap();
+    table.tag_manager().delete("t1").await.unwrap();
+    let branch = branch_table(&table, "b1");
+    assert_eq!(read_ids(&branch).await, vec![1]);
+
+    // A plain overwrite expires snapshot 1 on its own.
+    overwrite(&table, &[2]).await;
+    assert_eq!(snapshot_ids(&table).await, vec![2]);
+    assert_eq!(read_ids(&table).await, vec![2]);
+    assert_eq!(
+        read_ids(&branch).await,
+        vec![1],
+        "the branch still reads its data"
+    );
+    assert_files_match_references(&table).await;
+}
