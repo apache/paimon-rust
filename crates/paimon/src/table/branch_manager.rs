@@ -69,6 +69,12 @@ impl BranchManager {
     /// - Cannot be blank or whitespace only
     /// - Cannot be a pure numeric string
     fn validate_branch_name(branch_name: &str) -> crate::Result<()> {
+        // Enforce the same name contract the catalog/table reader applies
+        // (`copy_with_branch` and `$branch_...` resolution): reject blank,
+        // `.`/`..`, path separators and control characters. A name accepted here
+        // must be openable by a reader; otherwise create would place metadata
+        // under a directory the table API can never resolve.
+        crate::catalog::validate_branch_name(branch_name)?;
         if branch_name == DEFAULT_MAIN_BRANCH {
             return Err(crate::Error::DataInvalid {
                 message: format!(
@@ -78,28 +84,11 @@ impl BranchManager {
                 source: None,
             });
         }
-        if branch_name.trim().is_empty() {
-            return Err(crate::Error::DataInvalid {
-                message: format!("Branch name '{}' is blank.", branch_name),
-                source: None,
-            });
-        }
         if branch_name.chars().all(|c| c.is_ascii_digit()) {
             return Err(crate::Error::DataInvalid {
                 message: format!(
                     "Branch name cannot be pure numeric string but is '{}'.",
                     branch_name
-                ),
-                source: None,
-            });
-        }
-        // A path separator would place the branch directory at a nested path
-        // (`branch-b1/hidden`), so the branch is created but never listed back by
-        // `$branches`, leaving it silently orphaned. Reject it up front.
-        if branch_name.contains('/') || branch_name.contains('\\') {
-            return Err(crate::Error::DataInvalid {
-                message: format!(
-                    "Branch name '{branch_name}' must not contain a path separator ('/' or '\\')."
                 ),
                 source: None,
             });
@@ -187,12 +176,19 @@ impl BranchManager {
         let tag_dst = tag_manager.with_branch(branch_name).tag_path(tag_name);
         self.file_io.copy_file(&tag_src, &tag_dst).await?;
 
-        // Copy snapshot file to branch
+        // Copy snapshot file to branch. A tag can outlive its main snapshot JSON
+        // (expiration keeps tagged data but may delete `snapshot/snapshot-<id>`),
+        // so when the live file is gone, materialize the snapshot already resolved
+        // from the tag instead of failing. Mirrors Java
+        // `FileSystemBranchManager.createBranch`.
         let snap_src = snapshot_manager.snapshot_path(snapshot.id());
-        let snap_dst = snapshot_manager
-            .with_branch(branch_name)
-            .snapshot_path(snapshot.id());
-        self.file_io.copy_file(&snap_src, &snap_dst).await?;
+        let branch_snapshot_manager = snapshot_manager.with_branch(branch_name);
+        let snap_dst = branch_snapshot_manager.snapshot_path(snapshot.id());
+        if self.file_io.exists(&snap_src).await? {
+            self.file_io.copy_file(&snap_src, &snap_dst).await?;
+        } else {
+            branch_snapshot_manager.commit_snapshot(&snapshot).await?;
+        }
 
         // Copy schemas to branch
         self.copy_schemas_to_branch(branch_name, snapshot.schema_id())
@@ -403,7 +399,19 @@ mod tests {
         let result = BranchManager::validate_branch_name("");
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("blank"));
+        assert!(msg.contains("empty"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_validate_branch_name_rejects_reader_unopenable_names() {
+        // `.`/`..`, path separators and control chars must be rejected to match
+        // the catalog/table reader contract.
+        for name in [".", "..", "a/b", "a\\b", "a\u{001C}b"] {
+            assert!(
+                BranchManager::validate_branch_name(name).is_err(),
+                "{name:?} should be rejected"
+            );
+        }
     }
 
     #[tokio::test]
@@ -496,6 +504,41 @@ mod tests {
         let branch_schema_manager = schema_manager.with_branch("my_branch");
         let schemas = branch_schema_manager.list_all().await.unwrap();
         assert_eq!(schemas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_from_tag_materializes_missing_live_snapshot() {
+        // A tag can outlive its main snapshot JSON: expiration deletes
+        // `snapshot/snapshot-<id>` but keeps the tag, schema and data. Creating a
+        // branch from such a tag must materialize the tag's snapshot, not fail
+        // copying a missing file.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_create_branch_tag_retained".to_string();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+        let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.clone());
+        let tag_manager = TagManager::new(file_io.clone(), table_path.clone());
+
+        write_schema(&file_io, &schema_manager, &test_schema()).await;
+        let snap = test_snapshot(1);
+        write_snapshot(&file_io, &snapshot_manager, &snap).await;
+        write_tag(&file_io, &tag_manager, "v1", &snap).await;
+
+        // Expire the live snapshot JSON while keeping the tag.
+        snapshot_manager.delete_snapshot(1).await.unwrap();
+        assert!(
+            !file_io
+                .exists(&snapshot_manager.snapshot_path(1))
+                .await
+                .unwrap(),
+            "live snapshot JSON should be gone"
+        );
+
+        let bm = BranchManager::new(file_io.clone(), table_path.clone());
+        bm.create_branch_from_tag("retained", "v1").await.unwrap();
+
+        // The branch snapshot was materialized from the tag and is readable.
+        let branch_snap_manager = snapshot_manager.with_branch("retained");
+        assert_eq!(branch_snap_manager.get_snapshot(1).await.unwrap().id(), 1);
     }
 
     #[tokio::test]
