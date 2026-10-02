@@ -4939,6 +4939,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_rest_catalog_view_infers_dictionary_column_type() {
+        let catalog = Arc::new(MockCatalog::new());
+        let ctx = make_sql_context(Arc::clone(&catalog)).await;
+
+        // DataFusion emits dictionary-encoded columns for low-cardinality
+        // strings; the view schema should infer the value type (VarChar)
+        // rather than failing as an unsupported Arrow type.
+        ctx.sql(
+            "CREATE VIEW paimon.default.dict_view AS \
+             SELECT arrow_cast('hello', 'Dictionary(Int32, Utf8)') AS label",
+        )
+        .await
+        .unwrap();
+
+        let view = catalog
+            .get_view(&Identifier::new("default", "dict_view"))
+            .await
+            .unwrap();
+        let fields = view.schema().fields();
+        assert!(matches!(fields[0].data_type(), PaimonDataType::VarChar(_)));
+    }
+
+    #[tokio::test]
     async fn persistent_rest_catalog_view_expands_function_in_owning_database() {
         let catalog = Arc::new(MockCatalog::new());
         add_unary_sql_function_in_database(&catalog, "default", "plus_one", "x + 1", true);
