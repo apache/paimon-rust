@@ -35,6 +35,7 @@ mod tag;
 
 #[pymodule]
 fn pypaimon_rust(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    error::register_module(py, m)?;
     context::register_module(py, m)?;
     variant::register_module(py, m)?;
     Ok(())

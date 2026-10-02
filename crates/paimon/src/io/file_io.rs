@@ -33,7 +33,6 @@ use futures::{StreamExt, TryStreamExt};
 use opendal::raw::{normalize_path, normalize_root};
 use opendal::Operator;
 use sha2::{Digest, Sha256};
-use snafu::ResultExt;
 use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use url::Url;
 
@@ -455,12 +454,12 @@ impl FileIO {
     /// Reference: <https://github.com/apache/paimon/blob/release-0.8.2/paimon-common/src/main/java/org/apache/paimon/fs/FileIO.java#L97>
     pub async fn get_status(&self, path: &str) -> Result<FileStatus> {
         let (op, relative_path) = self.create(path).await?;
-        let meta = op
-            .stat(relative_path.as_ref())
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to get file status for '{path}'"),
-            })?;
+        let meta = op.stat(relative_path.as_ref()).await.map_err(|error| {
+            Error::from_opendal_with_context(
+                error,
+                format!("Failed to get file status for '{path}'"),
+            )
+        })?;
 
         Ok(FileStatus {
             size: meta.content_length(),
@@ -484,8 +483,8 @@ impl FileIO {
         // use normalize_root to make sure it end with `/`.
         let list_path = normalize_root(relative_path.as_ref());
 
-        let entries = op.list_with(&list_path).await.context(IoUnexpectedSnafu {
-            message: format!("Failed to list files in '{path}'"),
+        let entries = op.list_with(&list_path).await.map_err(|error| {
+            Error::from_opendal_with_context(error, format!("Failed to list files in '{path}'"))
         })?;
 
         let mut statuses = Vec::new();
@@ -542,21 +541,27 @@ impl FileIO {
         let has_provider = matches!(self.backend, FileIOBackend::Provider(_));
         let list_path = normalize_root(relative_path.as_ref());
 
-        let entries =
-            op.lister_with(&list_path)
-                .recursive(true)
-                .await
-                .context(IoUnexpectedSnafu {
-                    message: format!("Failed to list files recursively in '{path}'"),
-                })?;
+        let entries = op
+            .lister_with(&list_path)
+            .recursive(true)
+            .await
+            .map_err(|error| {
+                Error::from_opendal_with_context(
+                    error,
+                    format!("Failed to list files recursively in '{path}'"),
+                )
+            })?;
 
         let path = path.to_string();
         let list_path_normalized = list_path.trim_start_matches('/').to_string();
         Ok(Box::pin(async_stream::try_stream! {
             let mut entries = entries;
             let mut emitted = 0usize;
-            while let Some(entry) = entries.try_next().await.context(IoUnexpectedSnafu {
-                message: format!("Failed to list files recursively in '{path}'"),
+            while let Some(entry) = entries.try_next().await.map_err(|error| {
+                Error::from_opendal_with_context(
+                    error,
+                    format!("Failed to list files recursively in '{path}'"),
+                )
             })? {
                 let entry_path = entry.path();
                 if has_provider {
@@ -591,11 +596,12 @@ impl FileIO {
     pub async fn exists(&self, path: &str) -> Result<bool> {
         let (op, relative_path) = self.create(path).await?;
 
-        op.exists(relative_path.as_ref())
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to check existence of '{path}'"),
-            })
+        op.exists(relative_path.as_ref()).await.map_err(|error| {
+            Error::from_opendal_with_context(
+                error,
+                format!("Failed to check existence of '{path}'"),
+            )
+        })
     }
 
     /// Check if a directory exists.
@@ -603,8 +609,11 @@ impl FileIO {
         let (op, relative_path) = self.create(path).await?;
         let dir_path = normalize_root(relative_path.as_ref());
 
-        op.exists(&dir_path).await.context(IoUnexpectedSnafu {
-            message: format!("Failed to check existence of directory '{path}'"),
+        op.exists(&dir_path).await.map_err(|error| {
+            Error::from_opendal_with_context(
+                error,
+                format!("Failed to check existence of directory '{path}'"),
+            )
         })
     }
 
@@ -614,11 +623,9 @@ impl FileIO {
     pub async fn delete_file(&self, path: &str) -> Result<()> {
         let (op, relative_path, cache_path) = self.create_with_cache_path(path).await?;
 
-        op.delete(relative_path.as_ref())
-            .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to delete file '{path}'"),
-            })?;
+        op.delete(relative_path.as_ref()).await.map_err(|error| {
+            Error::from_opendal_with_context(error, format!("Failed to delete file '{path}'"))
+        })?;
         if let (Some(cache), Some(cache_path)) = (
             self.cache.as_ref().filter(|cache| cache.is_cacheable(path)),
             cache_path,
@@ -638,8 +645,11 @@ impl FileIO {
         op.delete_with(relative_path.as_ref())
             .recursive(true)
             .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to delete directory '{path}'"),
+            .map_err(|error| {
+                Error::from_opendal_with_context(
+                    error,
+                    format!("Failed to delete directory '{path}'"),
+                )
             })?;
         if let (Some(cache), Some(cache_path)) = (&self.cache, cache_path) {
             cache.invalidate_prefix(&cache_path).await;
@@ -657,8 +667,8 @@ impl FileIO {
         let (op, relative_path) = self.create(path).await?;
         // Opendal create_dir expects the path to end with `/` to indicate a directory.
         let dir_path = normalize_root(relative_path.as_ref());
-        op.create_dir(&dir_path).await.context(IoUnexpectedSnafu {
-            message: format!("Failed to create directory '{path}'"),
+        op.create_dir(&dir_path).await.map_err(|error| {
+            Error::from_opendal_with_context(error, format!("Failed to create directory '{path}'"))
         })?;
 
         Ok(())
@@ -723,8 +733,11 @@ impl FileIO {
         op_src
             .rename(relative_path_src.as_ref(), relative_path_dst.as_ref())
             .await
-            .context(IoUnexpectedSnafu {
-                message: format!("Failed to rename '{src}' to '{dst}'"),
+            .map_err(|error| {
+                Error::from_opendal_with_context(
+                    error,
+                    format!("Failed to rename '{src}' to '{dst}'"),
+                )
             })?;
         if let Some(cache) = &self.cache {
             if let Some(cache_path) = cache_path_src {
@@ -1381,6 +1394,7 @@ mod file_action_test {
         async fn create(&self, _path: &str) -> crate::Result<(Operator, String)> {
             let service: Servicer = Arc::new(CountingListService {
                 pulls: Arc::clone(&self.pulls),
+                fail_with_fork_error: false,
             });
             Ok((
                 Operator::from_parts(OperationContext::default(), service),
@@ -1392,6 +1406,7 @@ mod file_action_test {
     #[derive(Debug)]
     struct CountingListService {
         pulls: Arc<AtomicUsize>,
+        fail_with_fork_error: bool,
     }
 
     impl Service for CountingListService {
@@ -1407,6 +1422,7 @@ mod file_action_test {
 
         fn capability(&self) -> Capability {
             Capability {
+                stat: true,
                 list: true,
                 list_with_recursive: true,
                 ..Default::default()
@@ -1428,6 +1444,9 @@ mod file_action_test {
             _path: &str,
             _args: OpStat,
         ) -> opendal::Result<RpStat> {
+            if self.fail_with_fork_error {
+                return Err(fork_test_error());
+            }
             Err(unsupported_test_operation())
         }
 
@@ -1462,6 +1481,7 @@ mod file_action_test {
             Ok(CountingLister {
                 pulls: Arc::clone(&self.pulls),
                 next: 0,
+                fail_with_fork_error: self.fail_with_fork_error,
             })
         }
 
@@ -1503,14 +1523,22 @@ mod file_action_test {
         )
     }
 
+    fn fork_test_error() -> opendal::Error {
+        opendal::Error::new(opendal::ErrorKind::Unsupported, JINDO_FORK_ERROR)
+    }
+
     struct CountingLister {
         pulls: Arc<AtomicUsize>,
         next: usize,
+        fail_with_fork_error: bool,
     }
 
     impl oio::List for CountingLister {
         async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
             self.pulls.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail_with_fork_error {
+                return Err(fork_test_error());
+            }
             if self.next == 0 {
                 self.next += 1;
                 return Ok(Some(oio::Entry::new(
@@ -1651,6 +1679,50 @@ mod file_action_test {
 
         assert_eq!(statuses.len(), 1);
         assert_eq!(pulls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn file_status_reads_preserve_fork_safety_error() {
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let service: Servicer = Arc::new(CountingListService {
+            pulls,
+            fail_with_fork_error: true,
+        });
+        let operator = Operator::from_parts(OperationContext::default(), service);
+
+        #[derive(Debug)]
+        struct FixedProvider(Operator);
+
+        #[async_trait::async_trait]
+        impl FileIOProvider for FixedProvider {
+            async fn create(&self, path: &str) -> crate::Result<(Operator, String)> {
+                Ok((
+                    self.0.clone(),
+                    path.strip_prefix("counting:/").unwrap().to_string(),
+                ))
+            }
+        }
+
+        let file_io = setup_memory_file_io().with_provider(Arc::new(FixedProvider(operator)));
+        let error = file_io
+            .get_status("counting:/objects/file")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::ProcessForkUnsupported { .. }),
+            "{error:?}"
+        );
+
+        let error = file_io.list_status("counting:/objects/").await.unwrap_err();
+        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+
+        let snapshots =
+            crate::table::SnapshotManager::new(file_io, "counting:/objects/table".to_string());
+        let error = snapshots.get_latest_snapshot_id().await.unwrap_err();
+        assert!(
+            matches!(error, Error::ProcessForkUnsupported { .. }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

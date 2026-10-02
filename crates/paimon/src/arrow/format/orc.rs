@@ -30,6 +30,7 @@ use orc_rust::projection::ProjectionMask;
 use orc_rust::reader::AsyncChunkReader;
 use orc_rust::ArrowReaderBuilder;
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +39,37 @@ use tokio::sync::{mpsc, oneshot};
 const ORC_IN_PREDICATE_MAX_LITERALS: usize = 20;
 
 pub(crate) struct OrcFormatReader;
+
+fn orc_error<E>(error: E, context: &str) -> Error
+where
+    E: StdError + Send + Sync + 'static,
+{
+    if let Some(error) = find_fork_error(&error) {
+        return error;
+    }
+    Error::UnexpectedError {
+        message: format!("{context}: {error}"),
+        source: Some(Box::new(error)),
+    }
+}
+
+fn find_fork_error(error: &(dyn StdError + 'static)) -> Option<Error> {
+    if let Some(Error::ProcessForkUnsupported { message }) = error.downcast_ref::<Error>() {
+        return Some(Error::ProcessForkUnsupported {
+            message: message.clone(),
+        });
+    }
+    // `std::io::Error::source` does not expose the custom error stored by
+    // `Error::other`, so inspect it explicitly before following normal sources.
+    if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+        if let Some(source) = io_error.get_ref() {
+            if let Some(error) = find_fork_error(source) {
+                return Some(error);
+            }
+        }
+    }
+    error.source().and_then(find_fork_error)
+}
 
 const ORC_STRIPE_SIZE: usize = 64 * 1024 * 1024;
 const ORC_WORKER_COUNT: usize = 4;
@@ -336,10 +368,7 @@ impl FormatFileReader for OrcFormatReader {
 
         let builder = ArrowReaderBuilder::try_new_async(orc_reader)
             .await
-            .map_err(|e| Error::UnexpectedError {
-                message: format!("Failed to open ORC file: {e}"),
-                source: Some(Box::new(e)),
-            })?;
+            .map_err(|error| orc_error(error, "Failed to open ORC file"))?;
 
         // Widen the scan to include predicate columns so the residual filter can
         // see every column it references, even when a predicate column is not part
@@ -394,10 +423,7 @@ impl FormatFileReader for OrcFormatReader {
         });
         Ok(stream
             .map(move |r| {
-                let batch = r.map_err(|e| Error::UnexpectedError {
-                    message: format!("ORC read error: {e}"),
-                    source: Some(Box::new(e)),
-                })?;
+                let batch = r.map_err(|error| orc_error(error, "ORC read error"))?;
                 match &residual {
                     Some((fp, scan_fields)) => {
                         crate::arrow::residual::filter_record_batch_by_predicates(
@@ -664,10 +690,7 @@ pub(crate) async fn read_row_count(
 ) -> crate::Result<i64> {
     let builder = ArrowReaderBuilder::try_new_async(OrcFileReader::new(file_size, reader))
         .await
-        .map_err(|error| Error::UnexpectedError {
-            message: format!("Failed to open ORC file: {error}"),
-            source: Some(Box::new(error)),
-        })?;
+        .map_err(|error| orc_error(error, "Failed to open ORC file"))?;
     let rows = builder
         .file_metadata()
         .stripe_metadatas()
@@ -709,7 +732,7 @@ impl AsyncChunkReader for OrcFileReader {
             self.r
                 .read(offset_from_start..offset_from_start + length)
                 .await
-                .map_err(|e| std::io::Error::other(e.to_string()))
+                .map_err(std::io::Error::other)
         })
     }
 }
@@ -1037,6 +1060,79 @@ mod tests {
         writer.write(batch).unwrap();
         writer.close().unwrap();
         buf
+    }
+
+    #[derive(Clone)]
+    struct SwitchableForkFailingFileRead {
+        data: Bytes,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for SwitchableForkFailingFileRead {
+        async fn read(&self, range: std::ops::Range<u64>) -> crate::Result<Bytes> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::ProcessForkUnsupported {
+                    message: crate::error::JINDO_FORK_ERROR.to_string(),
+                });
+            }
+            Ok(self.data.slice(range.start as usize..range.end as usize))
+        }
+    }
+
+    #[tokio::test]
+    async fn orc_read_paths_preserve_fork_safety_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            ArrowDataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let data = Bytes::from(write_single_stripe_orc(schema, &batch));
+        let file_size = data.len() as u64;
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let file_read = SwitchableForkFailingFileRead {
+            data,
+            fail: Arc::clone(&fail),
+        };
+        let fields = vec![field(0, "id", DataType::Int(IntType::new()))];
+
+        let error = match OrcFormatReader
+            .read_batch_stream(
+                Box::new(file_read.clone()),
+                file_size,
+                &fields,
+                None,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("ORC metadata read should propagate the storage error"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, Error::ProcessForkUnsupported { .. }),
+            "{error:?}"
+        );
+
+        let error = super::read_row_count(Box::new(file_read.clone()), file_size)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut stream = OrcFormatReader
+            .read_batch_stream(Box::new(file_read), file_size, &fields, None, None, None)
+            .await
+            .unwrap();
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
     }
 
     #[tokio::test]
