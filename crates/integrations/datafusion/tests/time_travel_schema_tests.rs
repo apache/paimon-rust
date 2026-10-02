@@ -344,6 +344,59 @@ async fn test_write_guard_rejects_snapshot_id_and_tag_name_selectors() {
 }
 
 #[tokio::test]
+async fn test_write_guard_rejects_watermark_selector_including_drop_partition() {
+    // scan.watermark is a time-travel selector too; a write — including DROP
+    // PARTITION, which commits a data-deleting snapshot — must be rejected while
+    // it is set, or the mutation commits against the latest table while the
+    // session's reads resolve a historical snapshot.
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let warehouse = format!("file://{}", temp_dir.path().display());
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, warehouse);
+    let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    let sql_context = create_sql_context(catalog).await;
+
+    sql_context
+        .sql("CREATE TABLE paimon.default.p (id INT, pt STRING) PARTITIONED BY (pt) WITH ('bucket' = '1', 'bucket-key' = 'id')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("INSERT INTO paimon.default.p VALUES (1, 'a'), (2, 'b')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    sql_context
+        .sql("SET 'paimon.scan.watermark' = '100'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    for sql in [
+        "ALTER TABLE paimon.default.p DROP PARTITION (pt = 'a')",
+        "DELETE FROM paimon.default.p WHERE id = 1",
+    ] {
+        let err = match sql_context.sql(sql).await {
+            Err(e) => e.to_string(),
+            Ok(df) => match df.collect().await {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{sql} should fail while scan.watermark is set"),
+            },
+        };
+        assert!(
+            err.contains("time-travel option") && err.contains("scan.watermark"),
+            "{sql} should be rejected while scan.watermark is set: {err}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_relation_planner_version_as_of_uses_snapshot_schema() {
     let (_tmp, sql_context) = setup_evolved_table().await;
 
