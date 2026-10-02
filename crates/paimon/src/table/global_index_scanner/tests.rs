@@ -21,7 +21,9 @@ use super::predicates::*;
 use super::row_ranges::*;
 use super::*;
 use crate::btree::test_util::VecFileWrite;
-use crate::btree::{serialize_datum, BTreeIndexWriter, BlockCompressionType};
+use crate::btree::{
+    make_key_comparator, serialize_datum, BTreeFileFooter, BTreeIndexWriter, BlockCompressionType,
+};
 use crate::fm_index::{FMGlobalIndexWriter, FMWriteOptions};
 use crate::spec::{DataType, Datum, IndexFileMeta, PredicateOperator};
 use crate::table::bitmap_global_index_format::{
@@ -1487,6 +1489,121 @@ async fn test_evaluate_global_index_eq() {
         .unwrap();
     let ranges = result.unwrap();
     assert_eq!(ranges, vec![RowRange::new(25, 25)]);
+}
+
+#[tokio::test]
+async fn test_evaluate_btree_null_bitmap_and_deferred_crc_error() {
+    let data_type = DataType::Int(crate::spec::IntType::new());
+    for version in [1, 2] {
+        for corrupt_crc in [false, true] {
+            let buf = VecFileWrite::new();
+            let mut writer = BTreeIndexWriter::with_comparator(
+                Box::new(buf.clone()),
+                256,
+                BlockCompressionType::None,
+                make_key_comparator(&data_type),
+            )
+            .with_file_version(version)
+            .unwrap();
+            writer.write(None, 0).await.unwrap();
+            writer.write(Some(&le_int_key(1)), 1).await.unwrap();
+            writer.write(Some(&le_int_key(2)), 2).await.unwrap();
+            writer.write(None, 3).await.unwrap();
+            let result = writer.finish().await.unwrap();
+            let mut data = buf.to_vec();
+            if corrupt_crc {
+                let footer = BTreeFileFooter::read_footer(
+                    &data[data.len() - BTreeFileFooter::ENCODED_LENGTH..],
+                )
+                .unwrap();
+                let handle = footer.null_bitmap_handle.unwrap();
+                data[handle.offset as usize + handle.size as usize] ^= 1;
+            }
+            let file_io = crate::io::FileIOBuilder::new("memory").build().unwrap();
+            let table_path = "memory:/table";
+            let file_name = "nullable.btree";
+            let mut entry = make_global_index_entry(file_name, 1, 100, 103, &result.meta);
+            entry.index_file.file_size = data.len() as i64;
+            entry.index_file.row_count = result.row_count as i64;
+            file_io
+                .new_output(&format!("{table_path}/index/{file_name}"))
+                .unwrap()
+                .write(bytes::Bytes::from(data))
+                .await
+                .unwrap();
+            let entries = [entry];
+            let fields = int_schema_fields();
+
+            for (op, literals, expected) in [
+                (
+                    PredicateOperator::Eq,
+                    vec![Datum::Int(1)],
+                    vec![RowRange::new(101, 101)],
+                ),
+                (
+                    PredicateOperator::Between,
+                    vec![Datum::Int(1), Datum::Int(2)],
+                    vec![RowRange::new(101, 102)],
+                ),
+                (
+                    PredicateOperator::IsNotNull,
+                    vec![],
+                    vec![RowRange::new(101, 102)],
+                ),
+            ] {
+                let predicate = Predicate::Leaf {
+                    column: "id".to_string(),
+                    index: 0,
+                    data_type: data_type.clone(),
+                    op,
+                    literals,
+                };
+                let rows = evaluate_global_index_fast(
+                    &file_io,
+                    table_path,
+                    &entries,
+                    &[predicate],
+                    &fields,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    rows,
+                    Some(expected),
+                    "{op:?}, V{version}, CRC={corrupt_crc}"
+                );
+            }
+
+            let predicate = Predicate::Leaf {
+                column: "id".to_string(),
+                index: 0,
+                data_type: data_type.clone(),
+                op: PredicateOperator::IsNull,
+                literals: vec![],
+            };
+            let rows =
+                evaluate_global_index_fast(&file_io, table_path, &entries, &[predicate], &fields)
+                    .await;
+            if corrupt_crc {
+                let error = rows.expect_err("a corrupt null bitmap must fail the IS NULL scan");
+                let Error::DataInvalid {
+                    message,
+                    source: Some(source),
+                } = error
+                else {
+                    panic!("expected a global index query error with its I/O source");
+                };
+                assert!(message.contains("Global index query failed"));
+                assert!(message.contains(file_name));
+                assert!(source.to_string().contains("Null bitmap CRC mismatch"));
+            } else {
+                assert_eq!(
+                    rows.unwrap(),
+                    Some(vec![RowRange::new(100, 100), RowRange::new(103, 103)]),
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
