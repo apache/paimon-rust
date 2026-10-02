@@ -813,8 +813,11 @@ fn assemble_plain_variant_projection(
         fail_on_error.push(field_metadata.fail_on_error());
     }
 
-    let projected =
-        super::super::variant::variant_get_float32_fields(input, &keys, Some(&fail_on_error))?;
+    let projected = super::super::variant::variant_get_numeric_fields_with_policy(
+        input,
+        &keys,
+        Some(&fail_on_error),
+    )?;
     let values = projected
         .values()
         .as_any()

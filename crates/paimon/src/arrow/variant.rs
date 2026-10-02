@@ -34,10 +34,10 @@ pub fn variant_get_numeric_fields(
     column: &StructArray,
     fields: &[String],
 ) -> Result<FixedSizeListArray> {
-    variant_get_float32_fields(column, fields, None)
+    variant_get_numeric_fields_with_policy(column, fields, None)
 }
 
-pub(crate) fn variant_get_float32_fields(
+pub(crate) fn variant_get_numeric_fields_with_policy(
     column: &StructArray,
     fields: &[String],
     fail_on_error: Option<&[bool]>,
