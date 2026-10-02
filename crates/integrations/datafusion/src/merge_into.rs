@@ -1102,6 +1102,24 @@ fn validate_merge_insert_columns(
 ) -> DFResult<()> {
     for insert in inserts {
         validate_target_columns(&insert.columns, table_fields, "MERGE INSERT")?;
+        // A column-less positional INSERT maps its VALUES to the table columns by
+        // position, so the value count must match the column count. Validate it
+        // here, upfront: this runs in both CoW and data-evolution modes before any
+        // batch is built, whereas `insert_select_clause` only runs when unmatched
+        // rows exist — an all-matched MERGE would otherwise skip the arity check
+        // and commit. `INSERT *`/`INSERT ROW` (no columns and no values) is left
+        // untouched.
+        if insert.columns.is_empty()
+            && !insert.value_exprs.is_empty()
+            && insert.value_exprs.len() != table_fields.len()
+        {
+            return Err(DataFusionError::Plan(format!(
+                "MERGE INSERT has {} value(s) but the table has {} column(s); \
+                 list the target columns explicitly or provide one value per column",
+                insert.value_exprs.len(),
+                table_fields.len()
+            )));
+        }
     }
 
     Ok(())
@@ -2259,6 +2277,59 @@ mod tests {
                 (3, "charlie".to_string(), 30),
                 (4, "dave".to_string(), 40),
                 (5, "eve".to_string(), 50),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cow_merge_insert_arity_validated_even_when_all_matched() {
+        let (_tmp, sql_context, table) = setup_append_only_table("t_cow_ins_arity").await;
+
+        sql_context
+            .sql("CREATE TABLE paimon.test_db.source (id INT, name VARCHAR, value INT)")
+            .await
+            .unwrap();
+        // id = 1 matches the target, so the NOT MATCHED INSERT branch is never
+        // built — the arity check must still run upfront.
+        sql_context
+            .sql("INSERT INTO paimon.test_db.source VALUES (1, 'ALICE', 99)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // The column-less INSERT lists 2 values for a 3-column table. Even with no
+        // row to insert, the invalid arity must be rejected before execution so the
+        // matched UPDATE is not applied.
+        let merge = parse_merge(
+            "MERGE INTO paimon.test_db.t_cow_ins_arity t USING paimon.test_db.source s \
+             ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET value = s.value \
+             WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.name)",
+        );
+        let err = execute_merge_into(&sql_context, &merge, table, true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("value(s) but the table has"),
+            "got {err}"
+        );
+
+        // The target is unchanged: the matched UPDATE did not apply.
+        let batches = sql_context
+            .sql("SELECT id, name, value FROM paimon.test_db.t_cow_ins_arity ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            collect_rows(&batches),
+            vec![
+                (1, "alice".to_string(), 10),
+                (2, "bob".to_string(), 20),
+                (3, "charlie".to_string(), 30),
             ]
         );
     }
