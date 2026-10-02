@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use super::base::{AuthProvider, RESTAuthParameter, AUTHORIZATION_HEADER_KEY};
 use super::dlf_signer::{DLFRequestSigner, DLFSignerFactory};
+use crate::api::user_agent;
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::Result;
@@ -474,6 +475,7 @@ impl TokenHTTPClient {
         let client = Client::builder()
             .timeout(read_timeout)
             .connect_timeout(connect_timeout)
+            .user_agent(user_agent::default_rest_user_agent())
             .build()
             .expect("Failed to create HTTP client");
 
@@ -519,6 +521,43 @@ impl TokenHTTPClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_ecs_token_loader_sends_rest_user_agent() {
+        use axum::http::{header, HeaderMap};
+        use axum::routing::get;
+        use axum::Router;
+        use std::sync::Mutex;
+
+        let user_agents = Arc::new(Mutex::new(Vec::new()));
+        let recorded = user_agents.clone();
+        let app = Router::new().route(
+            "/role",
+            get(move |headers: HeaderMap| async move {
+                recorded.lock().unwrap().extend(
+                    headers
+                        .get_all(header::USER_AGENT)
+                        .iter()
+                        .map(|value| value.to_str().unwrap().to_string()),
+                );
+                r#"{"AccessKeyId":"ak","AccessKeySecret":"sk","SecurityToken":"st"}"#
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let loader = DLFECSTokenLoader::new(format!("http://{address}/"), Some("role".to_string()));
+        loader.load_token().await.unwrap();
+
+        assert_eq!(
+            *user_agents.lock().unwrap(),
+            vec![format!(
+                "paimon-rust/{}(reqwest)",
+                env!("CARGO_PKG_VERSION")
+            )]
+        );
+    }
 
     #[test]
     fn test_extract_host() {

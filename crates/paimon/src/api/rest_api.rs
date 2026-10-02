@@ -146,7 +146,11 @@ impl RESTApi {
         // Create auth function first, before making any requests
         let rest_auth_function = RESTAuthFunction::new(base_headers.clone(), auth_provider);
 
-        let mut client = HttpClient::new(uri, Some(rest_auth_function))?;
+        let mut client = HttpClient::with_user_agent(
+            uri,
+            Some(rest_auth_function),
+            &super::user_agent::rest_user_agent(&options),
+        )?;
 
         let options = if config_required {
             let warehouse = options.get(CatalogOptions::WAREHOUSE).ok_or_else(|| {
@@ -178,6 +182,8 @@ impl RESTApi {
             let rest_auth_function = RESTAuthFunction::new(base_headers, auth_provider);
 
             client.set_auth_function(rest_auth_function);
+            // Server config may carry user-agent.* options; header.User-Agent still wins per request.
+            client.set_user_agent(&super::user_agent::rest_user_agent(&merged))?;
 
             merged
         } else {
