@@ -65,6 +65,7 @@ const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 struct QueryIoProbe {
     active: TestAtomicUsize,
     peak: TestAtomicUsize,
+    evaluate_futures: TestAtomicUsize,
     predicate_queries: TestAtomicUsize,
     range_queries: TestAtomicUsize,
     btree_opens: TestAtomicUsize,

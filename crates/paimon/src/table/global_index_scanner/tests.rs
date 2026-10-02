@@ -2930,6 +2930,35 @@ async fn test_or_reuses_one_btree_reader_for_same_file() {
 }
 
 #[tokio::test]
+async fn test_wide_or_fallback_creates_only_bounded_child_futures() {
+    let (io, path, name, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+    let entries = vec![make_global_index_entry(&name, 1, 0, 99, &meta)];
+    let mut scanner = GlobalIndexScanner::create(
+        &io,
+        &path,
+        4,
+        i64::MAX,
+        i64::MAX,
+        &entries,
+        &int_schema_fields(),
+    )
+    .unwrap()
+    .unwrap();
+    let probe = Arc::new(QueryIoProbe::default());
+    scanner.query_io_probe = Some(Arc::clone(&probe));
+
+    let mut children = vec![int_eq("missing", 1, 50)];
+    children.extend((0..1024).map(|_| int_eq("id", 0, 50)));
+    assert!(scanner
+        .evaluate(&Predicate::or(children))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(probe.evaluate_futures.load(TestOrdering::SeqCst) <= 5);
+}
+
+#[tokio::test]
 async fn test_or_fallback_and_cancel_leave_reader_usable() {
     let (io, path, name, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
     let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
