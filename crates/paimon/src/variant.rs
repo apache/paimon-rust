@@ -2950,22 +2950,24 @@ fn cast_variant_to_timestamp(
         }
         VariantKind::String => {
             let value = variant.get_string().ok()?;
-            let value = value.trim();
-            if !with_local_zone {
-                if let Ok(micros) = value.parse::<i64>() {
-                    return Some(micros);
-                }
+            if value.trim() != value {
+                return None;
+            }
+            if !with_local_zone
+                && !value.is_empty()
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return value.parse::<i64>().ok();
             }
             let datetime = [
                 "%Y-%m-%d %H:%M:%S%.f",
                 "%Y-%m-%dT%H:%M:%S%.f",
-                "%Y-%m-%d %H:%M",
                 "%Y-%m-%dT%H:%M",
             ]
             .iter()
-            .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+            .find_map(|format| NaiveDateTime::parse_from_str(&value, format).ok())
             .or_else(|| {
-                NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                NaiveDate::parse_from_str(&value, "%Y-%m-%d")
                     .ok()?
                     .and_hms_opt(0, 0, 0)
             })?;
@@ -3662,6 +3664,61 @@ mod tests {
             &jiff::tz::TimeZone::UTC
         )
         .is_err());
+    }
+
+    #[test]
+    fn variant_timestamp_string_cast_rejects_inputs_java_rejects() {
+        let timestamp_type = DataType::Timestamp(TimestampType::new(6).unwrap());
+        let ltz_type = DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap());
+        for input in [
+            "2023-11-14 22:13", // Space-separated form requires seconds.
+            " 2023-11-14 22:13:20",
+            "2023-11-14 22:13:20 ",
+        ] {
+            let variant = GenericVariant::parse_json(&format!("\"{input}\"")).unwrap();
+            for target_type in [&timestamp_type, &ltz_type] {
+                assert!(
+                    cast_variant_to_shredded_value(
+                        variant.as_ref().unwrap(),
+                        target_type,
+                        false,
+                        &jiff::tz::TimeZone::UTC,
+                    )
+                    .unwrap()
+                    .is_none(),
+                    "unexpectedly cast {input:?} to {target_type:?}"
+                );
+                assert!(cast_variant_to_shredded_value(
+                    variant.as_ref().unwrap(),
+                    target_type,
+                    true,
+                    &jiff::tz::TimeZone::UTC,
+                )
+                .is_err());
+            }
+        }
+        for input in ["+27", "-27", " 27"] {
+            let variant = GenericVariant::parse_json(&format!("\"{input}\"")).unwrap();
+            assert!(cast_variant_to_shredded_value(
+                variant.as_ref().unwrap(),
+                &timestamp_type,
+                false,
+                &jiff::tz::TimeZone::UTC,
+            )
+            .unwrap()
+            .is_none());
+        }
+        let valid = GenericVariant::parse_json(r#""2023-11-14T22:13""#).unwrap();
+        assert!(matches!(
+            cast_variant_to_shredded_value(
+                valid.as_ref().unwrap(),
+                &timestamp_type,
+                true,
+                &jiff::tz::TimeZone::UTC,
+            )
+            .unwrap(),
+            Some(ShreddedValue::Timestamp(1_699_999_980_000_000))
+        ));
     }
 
     #[test]
