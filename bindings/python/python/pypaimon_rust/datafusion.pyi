@@ -93,10 +93,7 @@ class ReadBuilder:
         *,
         variant_fields: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> "ReadBuilder":
-        """Project columns, optionally extracting scalar Variant paths.
-
-        Timestamp targets require microseconds and UTC or no timezone.
-        """
+        """Project columns, optionally extracting Variant paths as float32."""
         ...
     def with_nested_projection(self, paths: List[List[str]]) -> "ReadBuilder":
         """Project top-level fields or nested ROW leaves by exact name paths. A MAP
