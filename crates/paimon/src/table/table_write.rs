@@ -411,23 +411,13 @@ impl TableWrite {
                 merge_engine,
             )))
         } else if is_dynamic_bucket {
-            BucketAssignerEnum::Dynamic(Box::new(
-                DynamicBucketAssigner::new(
-                    partition_field_indices,
-                    primary_key_indices.clone(),
-                    schema.fields().to_vec(),
-                    target_bucket_row_number,
-                    table.file_io().clone(),
-                    table.location().to_string(),
-                    is_overwrite,
-                    // The same computer this writer already built: a hash index kept in
-                    // the data-file directory must land in the directory the writer and
-                    // the reader both derive, so both must agree on partition naming.
-                    partition_computer.clone(),
-                    core_options.index_file_in_data_file_dir(),
-                )
-                .with_data_file_path_directory(core_options.data_file_path_directory()),
-            ))
+            BucketAssignerEnum::Dynamic(Box::new(DynamicBucketAssigner::new(
+                table.clone(),
+                partition_field_indices,
+                primary_key_indices.clone(),
+                is_overwrite,
+                partition_computer.clone(),
+            )?))
         } else if total_buckets == POSTPONE_BUCKET {
             BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
                 partition_field_indices,
@@ -605,7 +595,13 @@ impl TableWrite {
             return Ok(());
         };
 
-        let grouped = self.divide_by_partition_bucket(&batch).await?;
+        let grouped = match self.divide_by_partition_bucket(&batch).await {
+            Ok(grouped) => grouped,
+            Err(error) => {
+                self.fail_write().await;
+                return Err(error);
+            }
+        };
         for ((partition_bytes, bucket), sub_batch) in grouped {
             self.write_bucket(partition_bytes, bucket, sub_batch)
                 .await?;
@@ -1008,10 +1004,16 @@ impl TableWrite {
         }
         .await;
         if result.is_err() {
-            self.close().await;
-            self.failed = true;
+            self.fail_write().await;
         }
         result
+    }
+
+    /// Routing can update persistent bucket-index state before it fails, just
+    /// as file writes can produce output. Neither failure permits a later commit.
+    async fn fail_write(&mut self) {
+        self.close().await;
+        self.failed = true;
     }
 
     fn ensure_active(&self) -> Result<()> {

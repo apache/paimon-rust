@@ -156,7 +156,9 @@ const DEFAULT_PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES: i64 = 256 * 1024 * 1024;
 const DEFAULT_MOSAIC_READ_PREFETCH_ROW_GROUPS: usize = 8;
 const DEFAULT_MOSAIC_READ_PREFETCH_MAX_BYTES: i64 = 64 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
-const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
+const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 2_000_000;
+pub(crate) const MAX_DYNAMIC_BUCKETS: i32 = 32768;
+const DYNAMIC_BUCKET_MAX_BUCKETS_OPTION: &str = "dynamic-bucket.max-buckets";
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const DEFAULT_GLOBAL_INDEX_THREAD_NUM: i64 = 32;
 pub(crate) const DEFAULT_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM: usize = 64;
@@ -1714,12 +1716,26 @@ impl<'a> CoreOptions<'a> {
 
     /// Target row number per bucket for dynamic bucket mode (bucket=-1).
     /// When a bucket reaches this number, a new bucket is created.
-    /// Default is 200,000. Java Paimon defaults this to 2,000,000.
+    /// Default is 2,000,000, matching Java Paimon.
     pub fn dynamic_bucket_target_row_num(&self) -> i64 {
         self.options
             .get(DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION)
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM)
+    }
+
+    /// Maximum number of dynamic buckets in each partition. `-1` grows up to
+    /// Java's signed-short bucket id limit; an explicit limit reuses full buckets.
+    pub fn dynamic_bucket_max_buckets(&self) -> crate::Result<i32> {
+        let value = self
+            .parse_i64_option(DYNAMIC_BUCKET_MAX_BUCKETS_OPTION)?
+            .unwrap_or(-1);
+        if value != -1 && !(1..=i64::from(MAX_DYNAMIC_BUCKETS)).contains(&value) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("'{DYNAMIC_BUCKET_MAX_BUCKETS_OPTION}' must be -1 or between 1 and {MAX_DYNAMIC_BUCKETS}, but was {value}"),
+            });
+        }
+        Ok(value as i32)
     }
 
     /// When true, blob field reads return serialized BlobDescriptor bytes

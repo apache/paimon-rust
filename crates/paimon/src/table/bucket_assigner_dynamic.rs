@@ -21,15 +21,20 @@
 //! and per-partition index (`PartitionIndex`) used by both dynamic and cross-partition modes.
 
 use crate::io::FileIO;
+use crate::spec::MAX_DYNAMIC_BUCKETS;
 use crate::spec::{
-    batch_hash_codes, batch_to_serialized_bytes, bucket_path_under, BinaryRow, DataField,
-    IndexFileMeta, IndexManifest, IndexManifestEntry, PartitionComputer, EMPTY_SERIALIZED_ROW,
+    batch_hash_codes, batch_to_serialized_bytes, bucket_path_under, BinaryRow, CoreOptions,
+    DataField, IndexFileMeta, IndexManifest, IndexManifestEntry, PartitionComputer,
+    EMPTY_SERIALIZED_ROW,
 };
 use crate::table::bucket_assigner::{BatchAssignOutput, BucketAssigner, PartitionBucketKey};
+use crate::table::data_file_path_factory::{DataFilePath, DataFilePathFactory};
 use crate::table::index_file_path::IndexFileLocation;
-use crate::table::SnapshotManager;
+use crate::table::partition_filter::PartitionFilter;
+use crate::table::{Snapshot, SnapshotManager, Table, TableScan};
 use crate::Result;
 use arrow_array::RecordBatch;
+use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -51,11 +56,15 @@ impl HashIndexFile {
     async fn read(file_io: &FileIO, path: &str) -> Result<Vec<i32>> {
         let input = file_io.new_input(path)?;
         let content = input.read().await?;
-        debug_assert!(
-            content.len() % 4 == 0,
-            "hash index file size {} is not aligned to 4 bytes",
-            content.len()
-        );
+        if content.len() % 4 != 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Corrupt HASH index {path}: expected a multiple of 4 bytes, got {}",
+                    content.len()
+                ),
+                source: None,
+            });
+        }
         let count = content.len() / 4;
         let mut hashes = Vec::with_capacity(count);
         for i in 0..count {
@@ -72,10 +81,13 @@ impl HashIndexFile {
     }
 
     /// Write key hashes to a new hash index file, returning its metadata.
-    async fn write(file_io: &FileIO, dir: &str, hashes: &[i32]) -> Result<IndexFileMeta> {
-        let file_name = format!("index-{}-0", Uuid::new_v4());
-        let path = format!("{dir}/{file_name}");
-
+    async fn write_at(
+        file_io: &FileIO,
+        file_name: String,
+        location: DataFilePath,
+        hashes: &[i32],
+    ) -> Result<IndexFileMeta> {
+        file_io.mkdirs(location.parent()).await?;
         let mut buf = Vec::with_capacity(hashes.len() * 4);
         for &h in hashes {
             buf.extend_from_slice(&h.to_be_bytes());
@@ -85,8 +97,11 @@ impl HashIndexFile {
             .len()
             .try_into()
             .expect("hash index file size exceeds i64::MAX");
-        let output = file_io.new_output(&path)?;
-        output.write(bytes::Bytes::from(buf)).await?;
+        let output = file_io.new_output(&location.path)?;
+        if let Err(error) = output.write(bytes::Bytes::from(buf)).await {
+            let _ = file_io.delete_file(&location.path).await;
+            return Err(error);
+        }
 
         Ok(IndexFileMeta {
             index_type: HASH_INDEX.to_string(),
@@ -97,7 +112,7 @@ impl HashIndexFile {
                 .try_into()
                 .expect("hash index row count exceeds i32::MAX"),
             deletion_vectors_ranges: None,
-            external_path: None,
+            external_path: location.external_path,
             global_index_meta: None,
         })
     }
@@ -113,11 +128,13 @@ impl HashIndexFile {
 /// `prepare_commit` writes the full hash set to a new hash index file.
 ///
 /// Reference: [org.apache.paimon.index.DynamicBucketIndexMaintainer](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/index/DynamicBucketIndexMaintainer.java)
-pub(crate) struct DynamicBucketIndexMaintainer {
+struct DynamicBucketIndexMaintainer {
     /// All key hashes in this bucket (restored + new).
     hashes: HashSet<i32>,
     /// Whether any new hashes were added since last commit.
     modified: bool,
+    /// Java caches a per-bucket index path factory across checkpoints.
+    paths: Option<DataFilePathFactory>,
 }
 
 impl DynamicBucketIndexMaintainer {
@@ -127,6 +144,7 @@ impl DynamicBucketIndexMaintainer {
         Self {
             hashes,
             modified: false,
+            paths: None,
         }
     }
 
@@ -141,13 +159,34 @@ impl DynamicBucketIndexMaintainer {
     pub async fn prepare_commit(
         &mut self,
         file_io: &FileIO,
-        index_dir: &str,
+        layout: &HashIndexLayout<'_>,
+        bucket: i32,
+        options: &HashMap<String, String>,
     ) -> Result<Vec<IndexFileMeta>> {
         if !self.modified {
             return Ok(Vec::new());
         }
         let hashes: Vec<i32> = self.hashes.iter().copied().collect();
-        let meta = HashIndexFile::write(file_io, index_dir, &hashes).await?;
+        let file_name = format!("index-{}-0", Uuid::new_v4());
+        let location = if layout.index_file_in_data_file_dir {
+            if self.paths.is_none() {
+                self.paths = Some(DataFilePathFactory::new(
+                    layout.table_path,
+                    layout.partition_path,
+                    bucket,
+                    options,
+                )?);
+            }
+            self.paths.as_ref().unwrap().new_path(&file_name)?
+        } else {
+            let external_path =
+                super::external_path::new_index_external_path(options, false, "", &file_name)?;
+            DataFilePath {
+                path: layout.resolve(bucket, &file_name, external_path.as_deref()),
+                external_path,
+            }
+        };
+        let meta = HashIndexFile::write_at(file_io, file_name, location, &hashes).await?;
         self.modified = false;
         Ok(vec![meta])
     }
@@ -187,7 +226,8 @@ impl HashIndexLayout<'_> {
         bucket_path_under(&data_root, self.partition_path, bucket)
     }
 
-    /// The directory a new hash index file for `bucket` is written into.
+    /// The default directory for a hash index without an external location.
+    #[cfg(test)]
     fn directory(&self, bucket: i32) -> String {
         let bucket_path = self.bucket_path(bucket);
         self.location(&bucket_path).directory()
@@ -214,8 +254,9 @@ struct PartitionIndex {
     non_full_buckets: HashMap<i32, i64>,
     /// All known bucket ids
     all_buckets: HashSet<i32>,
-    /// Next bucket id to allocate (avoids linear scan).
+    /// Next unused bucket id to try, including holes in a restored index.
     next_bucket_id: i32,
+    bucket_ids: Vec<i32>,
     target_bucket_row_number: i64,
     /// Per-bucket index maintainers for writing hash index files at commit time.
     bucket_maintainers: HashMap<i32, DynamicBucketIndexMaintainer>,
@@ -229,6 +270,7 @@ impl PartitionIndex {
             non_full_buckets: HashMap::new(),
             all_buckets: HashSet::new(),
             next_bucket_id: 0,
+            bucket_ids: Vec::new(),
             target_bucket_row_number,
             bucket_maintainers: HashMap::new(),
         }
@@ -253,6 +295,21 @@ impl PartitionIndex {
                 continue;
             }
             let bucket = entry.bucket;
+            if !(0..MAX_DYNAMIC_BUCKETS).contains(&bucket) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Dynamic bucket id must be between 0 and {}, but was {bucket}",
+                        MAX_DYNAMIC_BUCKETS - 1
+                    ),
+                    source: None,
+                });
+            }
+            if bucket_hashes.contains_key(&bucket) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Multiple HASH indexes for dynamic bucket {bucket}"),
+                    source: None,
+                });
+            }
             let path = layout.resolve(
                 bucket,
                 &entry.index_file.file_name,
@@ -260,8 +317,23 @@ impl PartitionIndex {
             );
             let hashes = HashIndexFile::read(file_io, &path).await?;
             let count = hashes.len() as i64;
+            if count != entry.index_file.row_count {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Corrupt HASH index {path}: expected {} hashes, got {count}",
+                        entry.index_file.row_count
+                    ),
+                    source: None,
+                });
+            }
             for &h in &hashes {
-                hash_to_bucket.insert(h, bucket);
+                if let Some(previous) = hash_to_bucket.insert(h, bucket) {
+                    if previous != bucket {
+                        return Err(crate::Error::DataInvalid {
+                            message: format!("HASH index assigns hash {h} to both buckets {previous} and {bucket}"), source: None,
+                        });
+                    }
+                }
             }
             *bucket_row_counts.entry(bucket).or_insert(0) += count;
             bucket_hashes.entry(bucket).or_default().extend(hashes);
@@ -278,13 +350,14 @@ impl PartitionIndex {
             .map(|(bucket, hashes)| (bucket, DynamicBucketIndexMaintainer::new(hashes)))
             .collect();
 
-        let next_bucket_id = all_buckets.iter().copied().max().map_or(0, |m| m + 1);
+        let bucket_ids = all_buckets.iter().copied().collect();
 
         Ok(Self {
             hash_to_bucket,
             non_full_buckets,
             all_buckets,
-            next_bucket_id,
+            next_bucket_id: 0,
+            bucket_ids,
             target_bucket_row_number,
             bucket_maintainers,
         })
@@ -295,10 +368,10 @@ impl PartitionIndex {
     /// 1. If the hash was seen before, return its existing bucket.
     /// 2. Otherwise, find a non-full bucket and assign the hash there.
     /// 3. If all buckets are full, create a new bucket.
-    fn assign(&mut self, hash: i32) -> i32 {
+    fn assign(&mut self, hash: i32, max_buckets: i32) -> Result<i32> {
         // 1. Already assigned
         if let Some(&bucket) = self.hash_to_bucket.get(&hash) {
-            return bucket;
+            return Ok(bucket);
         }
 
         // 2. Find a non-full bucket
@@ -322,20 +395,45 @@ impl PartitionIndex {
                 .entry(bucket)
                 .or_insert_with(|| DynamicBucketIndexMaintainer::new(vec![]))
                 .notify_new_record(hash);
-            return bucket;
+            return Ok(bucket);
         }
 
-        // 3. Create a new bucket
-        let new_bucket = self.next_bucket_id;
-        self.next_bucket_id += 1;
-        self.all_buckets.insert(new_bucket);
-        self.non_full_buckets.insert(new_bucket, 1);
-        self.hash_to_bucket.insert(hash, new_bucket);
+        // Java PartitionIndex first allocates an unused id in range. A configured
+        // maximum is a soft row-count limit: once reached, reuse an existing bucket.
+        let limit = if max_buckets == -1 {
+            MAX_DYNAMIC_BUCKETS
+        } else {
+            max_buckets
+        };
+        while self.next_bucket_id < limit && self.all_buckets.contains(&self.next_bucket_id) {
+            self.next_bucket_id += 1;
+        }
+        let bucket = if self.next_bucket_id < limit {
+            let bucket = self.next_bucket_id;
+            self.next_bucket_id += 1;
+            self.all_buckets.insert(bucket);
+            self.bucket_ids.push(bucket);
+            self.non_full_buckets.insert(bucket, 1);
+            bucket
+        } else if max_buckets == -1 {
+            return Err(crate::Error::DataInvalid {
+                message: "No dynamic bucket id remains below Java Short.MAX_VALUE. Increase dynamic-bucket.target-row-num.".to_string(), source: None,
+            });
+        } else {
+            *self
+                .bucket_ids
+                .choose(&mut rand::thread_rng())
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: "No dynamic bucket is available".to_string(),
+                    source: None,
+                })?
+        };
+        self.hash_to_bucket.insert(hash, bucket);
         self.bucket_maintainers
-            .entry(new_bucket)
+            .entry(bucket)
             .or_insert_with(|| DynamicBucketIndexMaintainer::new(vec![]))
             .notify_new_record(hash);
-        new_bucket
+        Ok(bucket)
     }
 
     /// Write hash index files for all modified buckets, returning (bucket, index_files) pairs.
@@ -343,13 +441,23 @@ impl PartitionIndex {
         &mut self,
         file_io: &FileIO,
         layout: &HashIndexLayout<'_>,
+        options: &HashMap<String, String>,
+        created_paths: &mut Vec<String>,
     ) -> Result<Vec<(i32, Vec<IndexFileMeta>)>> {
         let mut result = Vec::new();
         let buckets: Vec<i32> = self.bucket_maintainers.keys().copied().collect();
         for bucket in buckets {
             if let Some(maintainer) = self.bucket_maintainers.get_mut(&bucket) {
-                let index_dir = layout.directory(bucket);
-                let files = maintainer.prepare_commit(file_io, &index_dir).await?;
+                let files = maintainer
+                    .prepare_commit(file_io, layout, bucket, options)
+                    .await?;
+                for file in &files {
+                    created_paths.push(layout.resolve(
+                        bucket,
+                        &file.file_name,
+                        file.external_path.as_deref(),
+                    ));
+                }
                 if !files.is_empty() {
                     result.push((bucket, files));
                 }
@@ -373,9 +481,9 @@ pub(crate) struct DynamicBucketAssigner {
     fields: Vec<DataField>,
     partition_indexes: HashMap<Vec<u8>, PartitionIndex>,
     target_bucket_row_number: i64,
-    file_io: FileIO,
-    table_location: String,
-    data_file_path_directory: Option<String>,
+    table: Table,
+    max_buckets: i32,
+    snapshot: Option<Snapshot>,
     /// Cached index manifest entries from the latest snapshot (loaded once).
     cached_index_entries: Option<Vec<IndexManifestEntry>>,
     /// Overwrite mode: skip loading existing index entries.
@@ -389,37 +497,33 @@ pub(crate) struct DynamicBucketAssigner {
 }
 
 impl DynamicBucketAssigner {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        table: Table,
         partition_field_indices: Vec<usize>,
         primary_key_indices: Vec<usize>,
-        fields: Vec<DataField>,
-        target_bucket_row_number: i64,
-        file_io: FileIO,
-        table_location: String,
         is_overwrite: bool,
         partition_computer: PartitionComputer,
-        index_file_in_data_file_dir: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let options = CoreOptions::new(table.schema().options());
+        if table.schema().options().contains_key("bucket-key") {
+            return Err(crate::Error::ConfigInvalid {
+                message: "Cannot define 'bucket-key' in dynamic bucket mode".to_string(),
+            });
+        }
+        Ok(Self {
             partition_field_indices,
             primary_key_indices,
-            fields,
+            fields: table.schema().fields().to_vec(),
             partition_indexes: HashMap::new(),
-            target_bucket_row_number,
-            file_io,
-            table_location,
-            data_file_path_directory: None,
+            target_bucket_row_number: options.dynamic_bucket_target_row_num(),
+            max_buckets: options.dynamic_bucket_max_buckets()?,
+            snapshot: None,
             cached_index_entries: None,
             is_overwrite,
             partition_computer,
-            index_file_in_data_file_dir,
-        }
-    }
-
-    pub(super) fn with_data_file_path_directory(mut self, directory: Option<&str>) -> Self {
-        self.data_file_path_directory = directory.map(str::to_string);
-        self
+            index_file_in_data_file_dir: options.index_file_in_data_file_dir(),
+            table,
+        })
     }
 
     pub fn set_overwrite(&mut self, is_overwrite: bool) {
@@ -436,21 +540,24 @@ impl DynamicBucketAssigner {
             self.cached_index_entries = Some(Vec::new());
             return Ok(());
         }
-        let snapshot_manager =
-            SnapshotManager::new(self.file_io.clone(), self.table_location.clone());
+        let snapshot_manager = SnapshotManager::new(
+            self.table.file_io().clone(),
+            self.table.location().to_string(),
+        );
         let latest_snapshot = snapshot_manager.get_latest_snapshot().await?;
 
-        let entries = if let Some(snapshot) = latest_snapshot {
+        let entries = if let Some(snapshot) = &latest_snapshot {
             if let Some(index_manifest_name) = snapshot.index_manifest() {
                 let manifest_dir = snapshot_manager.manifest_dir();
                 let index_manifest_path = format!("{manifest_dir}/{index_manifest_name}");
-                IndexManifest::read(&self.file_io, &index_manifest_path).await?
+                IndexManifest::read(self.table.file_io(), &index_manifest_path).await?
             } else {
                 Vec::new()
             }
         } else {
             Vec::new()
         };
+        self.snapshot = latest_snapshot;
         self.cached_index_entries = Some(entries);
         Ok(())
     }
@@ -472,16 +579,19 @@ impl DynamicBucketAssigner {
             .cloned()
             .collect();
 
+        self.validate_data_buckets(partition_bytes, &partition_entries)
+            .await?;
         if !partition_entries.is_empty() {
             let partition_path = self.partition_path(partition_bytes)?;
+            let options = CoreOptions::new(self.table.schema().options());
             let layout = HashIndexLayout {
-                data_file_path_directory: self.data_file_path_directory.as_deref(),
-                table_path: self.table_location.trim_end_matches('/'),
+                data_file_path_directory: options.data_file_path_directory(),
+                table_path: self.table.location().trim_end_matches('/'),
                 partition_path: &partition_path,
                 index_file_in_data_file_dir: self.index_file_in_data_file_dir,
             };
             return PartitionIndex::load(
-                &self.file_io,
+                self.table.file_io(),
                 &layout,
                 &partition_entries,
                 self.target_bucket_row_number,
@@ -490,6 +600,39 @@ impl DynamicBucketAssigner {
         }
 
         Ok(PartitionIndex::empty(self.target_bucket_row_number))
+    }
+
+    /// Use the same snapshot as index restoration. Treating existing data without
+    /// its HASH index as a new partition can assign an old key to a different bucket.
+    async fn validate_data_buckets(
+        &self,
+        partition: &[u8],
+        indexes: &[IndexManifestEntry],
+    ) -> Result<()> {
+        let Some(snapshot) = &self.snapshot else {
+            return Ok(());
+        };
+        let fields = self.table.schema().partition_fields();
+        let filter = if fields.is_empty() {
+            None
+        } else {
+            Some(PartitionFilter::from_partition_set(
+                HashSet::from([partition.to_vec()]),
+                &fields,
+            )?)
+        };
+        let scan =
+            TableScan::new(&self.table, filter, vec![], None, None, None).with_scan_all_files();
+        let indexed: HashSet<i32> = indexes.iter().map(|entry| entry.bucket).collect();
+        for entry in scan.plan_manifest_entries(snapshot).await? {
+            if !indexed.contains(&entry.bucket()) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Dynamic-bucket partition has data files but no complete HASH index for bucket {}. Rewrite the partition before incremental writes.", entry.bucket()),
+                    source: None,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -527,7 +670,7 @@ impl BucketAssigner for DynamicBucketAssigner {
         let mut buckets = Vec::with_capacity(batch.num_rows());
         for (row_idx, pb) in partition_bytes_vec.iter().enumerate() {
             let partition_index = self.partition_indexes.get_mut(pb).unwrap();
-            buckets.push(partition_index.assign(hash_codes[row_idx]));
+            buckets.push(partition_index.assign(hash_codes[row_idx], self.max_buckets)?);
         }
 
         Ok(BatchAssignOutput {
@@ -542,35 +685,76 @@ impl BucketAssigner for DynamicBucketAssigner {
         &mut self,
         file_io: &FileIO,
     ) -> Result<HashMap<PartitionBucketKey, Vec<IndexFileMeta>>> {
-        let mut result = HashMap::new();
-        let table_path = self.table_location.trim_end_matches('/').to_string();
-        let index_file_in_data_file_dir = self.index_file_in_data_file_dir;
-        let partition_keys: Vec<Vec<u8>> = self.partition_indexes.keys().cloned().collect();
-        let mut partition_paths = Vec::with_capacity(partition_keys.len());
-        for partition_bytes in &partition_keys {
-            partition_paths.push(self.partition_path(partition_bytes)?);
-        }
-        for (partition_bytes, partition_path) in partition_keys.into_iter().zip(partition_paths) {
-            let layout = HashIndexLayout {
-                data_file_path_directory: self.data_file_path_directory.as_deref(),
-                table_path: &table_path,
-                partition_path: &partition_path,
-                index_file_in_data_file_dir,
-            };
-            if let Some(partition_index) = self.partition_indexes.get_mut(&partition_bytes) {
-                let bucket_files = partition_index.prepare_commit(file_io, &layout).await?;
-                for (bucket, idx_files) in bucket_files {
-                    result.insert((partition_bytes.clone(), bucket), idx_files);
+        let mut created_paths = Vec::new();
+        let result = async {
+            let mut result = HashMap::new();
+            let table_path = self.table.location().trim_end_matches('/').to_string();
+            let index_file_in_data_file_dir = self.index_file_in_data_file_dir;
+            let partition_keys: Vec<Vec<u8>> = self.partition_indexes.keys().cloned().collect();
+            let mut partition_paths = Vec::with_capacity(partition_keys.len());
+            for partition_bytes in &partition_keys {
+                partition_paths.push(self.partition_path(partition_bytes)?);
+            }
+            for (partition_bytes, partition_path) in partition_keys.into_iter().zip(partition_paths)
+            {
+                let options = CoreOptions::new(self.table.schema().options());
+                let layout = HashIndexLayout {
+                    data_file_path_directory: options.data_file_path_directory(),
+                    table_path: &table_path,
+                    partition_path: &partition_path,
+                    index_file_in_data_file_dir,
+                };
+                if let Some(partition_index) = self.partition_indexes.get_mut(&partition_bytes) {
+                    let bucket_files = partition_index
+                        .prepare_commit(
+                            file_io,
+                            &layout,
+                            self.table.schema().options(),
+                            &mut created_paths,
+                        )
+                        .await?;
+                    for (bucket, idx_files) in bucket_files {
+                        result.insert((partition_bytes.clone(), bucket), idx_files);
+                    }
                 }
             }
+            Ok(result)
         }
-        Ok(result)
+        .await;
+        if result.is_err() {
+            for path in created_paths {
+                let _ = file_io.delete_file(&path).await;
+            }
+        }
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn table_layout(table_path: &str) -> HashIndexLayout<'_> {
+        HashIndexLayout {
+            table_path,
+            partition_path: "",
+            data_file_path_directory: None,
+            index_file_in_data_file_dir: false,
+        }
+    }
+
+    async fn write_hash_index(
+        file_io: &FileIO,
+        dir: &str,
+        hashes: &[i32],
+    ) -> Result<IndexFileMeta> {
+        let file_name = format!("index-{}-0", Uuid::new_v4());
+        let location = DataFilePath {
+            path: format!("{dir}/{file_name}"),
+            external_path: None,
+        };
+        HashIndexFile::write_at(file_io, file_name, location, hashes).await
+    }
 
     // -- DynamicBucketIndexMaintainer tests --
 
@@ -582,20 +766,29 @@ mod tests {
 
         let mut m = DynamicBucketIndexMaintainer::new(vec![]);
         // No modification → empty
-        let files = m.prepare_commit(&file_io, &dir).await.unwrap();
+        let files = m
+            .prepare_commit(&file_io, &table_layout(&dir), 0, &HashMap::new())
+            .await
+            .unwrap();
         assert!(files.is_empty());
 
         // Add hashes
         m.notify_new_record(1);
         m.notify_new_record(2);
         m.notify_new_record(1); // duplicate, no effect
-        let files = m.prepare_commit(&file_io, &dir).await.unwrap();
+        let files = m
+            .prepare_commit(&file_io, &table_layout(&dir), 0, &HashMap::new())
+            .await
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].index_type, HASH_INDEX);
         assert_eq!(files[0].row_count, 2);
 
         // No new modification → empty again
-        let files = m.prepare_commit(&file_io, &dir).await.unwrap();
+        let files = m
+            .prepare_commit(&file_io, &table_layout(&dir), 0, &HashMap::new())
+            .await
+            .unwrap();
         assert!(files.is_empty());
     }
 
@@ -607,14 +800,62 @@ mod tests {
 
         let mut m = DynamicBucketIndexMaintainer::new(vec![10, 20]);
         // Restored hashes don't count as modified
-        let files = m.prepare_commit(&file_io, &dir).await.unwrap();
+        let files = m
+            .prepare_commit(&file_io, &table_layout(&dir), 0, &HashMap::new())
+            .await
+            .unwrap();
         assert!(files.is_empty());
 
         // Adding a new hash triggers write (includes restored + new)
         m.notify_new_record(30);
-        let files = m.prepare_commit(&file_io, &dir).await.unwrap();
+        let files = m
+            .prepare_commit(&file_io, &table_layout(&dir), 0, &HashMap::new())
+            .await
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].row_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_hash_external_round_robin_survives_checkpoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = format!("file://{}", tmp.path().display());
+        let io = FileIO::from_url(&root).unwrap().build().unwrap();
+        let options = HashMap::from([
+            (
+                "data-file.external-paths".to_string(),
+                format!("{root}/one,{root}/two"),
+            ),
+            (
+                "data-file.external-paths.strategy".to_string(),
+                "round-robin".to_string(),
+            ),
+            ("data-file.path-directory".to_string(), "data".to_string()),
+        ]);
+        let layout = HashIndexLayout {
+            table_path: &root,
+            partition_path: "p=a/",
+            data_file_path_directory: Some("data"),
+            index_file_in_data_file_dir: true,
+        };
+        let mut maintainer = DynamicBucketIndexMaintainer::new(vec![]);
+        let mut locations = Vec::new();
+        for hash in [1, 2, 3] {
+            maintainer.notify_new_record(hash);
+            let files = maintainer
+                .prepare_commit(&io, &layout, 0, &options)
+                .await
+                .unwrap();
+            let path = files[0].external_path.as_ref().unwrap();
+            assert!(path.contains("/data/p=a/bucket-0/index-"));
+            assert_eq!(
+                HashIndexFile::read(&io, path).await.unwrap().len(),
+                hash as usize
+            );
+            locations.push(path.rsplit_once("/data/").unwrap().0.to_string());
+        }
+        assert_ne!(locations[0], locations[1]);
+        assert_eq!(locations[0], locations[2]);
     }
 
     // -- PartitionIndex tests --
@@ -622,31 +863,198 @@ mod tests {
     #[test]
     fn test_assign_new_keys() {
         let mut index = PartitionIndex::empty(3);
-        assert_eq!(index.assign(100), 0);
-        assert_eq!(index.assign(200), 0);
-        assert_eq!(index.assign(300), 0);
+        assert_eq!(index.assign(100, -1).unwrap(), 0);
+        assert_eq!(index.assign(200, -1).unwrap(), 0);
+        assert_eq!(index.assign(300, -1).unwrap(), 0);
         // Bucket 0 is full, next key goes to bucket 1
-        assert_eq!(index.assign(400), 1);
+        assert_eq!(index.assign(400, -1).unwrap(), 1);
     }
 
     #[test]
     fn test_assign_existing_key() {
         let mut index = PartitionIndex::empty(10);
-        assert_eq!(index.assign(42), 0);
+        assert_eq!(index.assign(42, -1).unwrap(), 0);
         // Same hash returns same bucket
-        assert_eq!(index.assign(42), 0);
+        assert_eq!(index.assign(42, -1).unwrap(), 0);
     }
 
     #[test]
     fn test_multiple_buckets() {
         let mut index = PartitionIndex::empty(2);
-        assert_eq!(index.assign(1), 0);
-        assert_eq!(index.assign(2), 0);
+        assert_eq!(index.assign(1, -1).unwrap(), 0);
+        assert_eq!(index.assign(2, -1).unwrap(), 0);
         // Bucket 0 full
-        assert_eq!(index.assign(3), 1);
-        assert_eq!(index.assign(4), 1);
+        assert_eq!(index.assign(3, -1).unwrap(), 1);
+        assert_eq!(index.assign(4, -1).unwrap(), 1);
         // Bucket 1 full
-        assert_eq!(index.assign(5), 2);
+        assert_eq!(index.assign(5, -1).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_dynamic_bucket_short_limit_and_explicit_reuse() {
+        let mut index = PartitionIndex::empty(1);
+        for bucket in 0..MAX_DYNAMIC_BUCKETS {
+            assert_eq!(index.assign(bucket, -1).unwrap(), bucket);
+        }
+        assert!(index
+            .assign(MAX_DYNAMIC_BUCKETS, -1)
+            .unwrap_err()
+            .to_string()
+            .contains("Short.MAX_VALUE"));
+        // Existing keys remain usable at the upper bound.
+        assert_eq!(
+            index.assign(MAX_DYNAMIC_BUCKETS - 1, -1).unwrap(),
+            MAX_DYNAMIC_BUCKETS - 1
+        );
+        let bucket = index
+            .assign(MAX_DYNAMIC_BUCKETS, MAX_DYNAMIC_BUCKETS)
+            .unwrap();
+        assert!((0..MAX_DYNAMIC_BUCKETS).contains(&bucket));
+        assert_eq!(
+            index
+                .assign(MAX_DYNAMIC_BUCKETS, MAX_DYNAMIC_BUCKETS)
+                .unwrap(),
+            bucket
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_bucket_restore_reuses_unused_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = format!("file://{}", tmp.path().display());
+        let io = FileIO::from_url(&root).unwrap().build().unwrap();
+        let meta = write_hash_index(&io, &format!("{root}/index"), &[42])
+            .await
+            .unwrap();
+        let entries = vec![IndexManifestEntry {
+            version: 1,
+            kind: crate::spec::FileKind::Add,
+            partition: EMPTY_SERIALIZED_ROW.to_vec(),
+            bucket: 2,
+            index_file: meta,
+        }];
+        let layout = HashIndexLayout {
+            table_path: &root,
+            partition_path: "",
+            data_file_path_directory: None,
+            index_file_in_data_file_dir: false,
+        };
+        let mut index = PartitionIndex::load(&io, &layout, &entries, 1)
+            .await
+            .unwrap();
+        assert_eq!(index.assign(42, 3).unwrap(), 2);
+        assert_eq!(index.assign(43, 3).unwrap(), 0);
+        assert_eq!(index.assign(44, 3).unwrap(), 1);
+        assert!((0..3).contains(&index.assign(45, 3).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_bucket_rejects_invalid_restored_indexes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = format!("file://{}", tmp.path().display());
+        let io = FileIO::from_url(&root).unwrap().build().unwrap();
+        let meta = write_hash_index(&io, &format!("{root}/index"), &[42])
+            .await
+            .unwrap();
+        let entry = IndexManifestEntry {
+            version: 1,
+            kind: crate::spec::FileKind::Add,
+            partition: EMPTY_SERIALIZED_ROW.to_vec(),
+            bucket: 0,
+            index_file: meta,
+        };
+        let layout = HashIndexLayout {
+            table_path: &root,
+            partition_path: "",
+            data_file_path_directory: None,
+            index_file_in_data_file_dir: false,
+        };
+        for bucket in [-1, MAX_DYNAMIC_BUCKETS] {
+            let mut invalid = entry.clone();
+            invalid.bucket = bucket;
+            let result = PartitionIndex::load(&io, &layout, &[invalid], 1).await;
+            assert!(result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Dynamic bucket id"));
+        }
+        let duplicate = vec![entry.clone(), entry.clone()];
+        assert!(PartitionIndex::load(&io, &layout, &duplicate, 1)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Multiple HASH"));
+        let mut conflicting = entry.clone();
+        conflicting.bucket = 1;
+        assert!(
+            PartitionIndex::load(&io, &layout, &[entry.clone(), conflicting], 1)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("both buckets")
+        );
+        let mut truncated = entry.clone();
+        truncated.index_file.row_count = 2;
+        assert!(PartitionIndex::load(&io, &layout, &[truncated], 1)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("expected 2 hashes"));
+        let path = layout.resolve(0, &entry.index_file.file_name, None);
+        io.new_output(&path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(&[0, 0, 0]))
+            .await
+            .unwrap();
+        assert!(PartitionIndex::load(&io, &layout, &[entry], 1)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("multiple of 4"));
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_bucket_requires_configured_index_location() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = format!("file://{}", tmp.path().display());
+        let io = FileIO::from_url(&root).unwrap().build().unwrap();
+        let meta = write_hash_index(&io, &format!("{root}/index"), &[42])
+            .await
+            .unwrap();
+        let layout = HashIndexLayout {
+            table_path: &root,
+            partition_path: "p=a/",
+            data_file_path_directory: Some("data"),
+            index_file_in_data_file_dir: true,
+        };
+        let canonical = layout.resolve(0, &meta.file_name, None);
+        let entry = IndexManifestEntry {
+            version: 1,
+            kind: crate::spec::FileKind::Add,
+            partition: EMPTY_SERIALIZED_ROW.to_vec(),
+            bucket: 0,
+            index_file: meta,
+        };
+        let error = PartitionIndex::load(&io, &layout, std::slice::from_ref(&entry), 1)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains(&entry.index_file.file_name));
+        io.new_output(&canonical)
+            .unwrap()
+            .write(bytes::Bytes::from_static(&[0, 0, 0, 43]))
+            .await
+            .unwrap();
+        let index = PartitionIndex::load(&io, &layout, &[entry], 1)
+            .await
+            .unwrap();
+        assert_eq!(index.hash_to_bucket.get(&43), Some(&0));
+        assert!(!index.hash_to_bucket.contains_key(&42));
     }
 
     // -- HashIndexFile tests --
@@ -670,7 +1078,7 @@ mod tests {
             let dir = layout.directory(3);
             file_io.mkdirs(&dir).await.unwrap();
             let hashes = vec![7i32, 8, 9];
-            let meta = HashIndexFile::write(&file_io, &dir, &hashes).await.unwrap();
+            let meta = write_hash_index(&file_io, &dir, &hashes).await.unwrap();
             let entries = vec![IndexManifestEntry {
                 version: 1,
                 kind: crate::spec::FileKind::Add,
@@ -702,7 +1110,7 @@ mod tests {
         let file_io = FileIO::from_url(&table_path).unwrap().build().unwrap();
         let external_dir = format!("{table_path}/elsewhere");
         file_io.mkdirs(&external_dir).await.unwrap();
-        let mut index_file = HashIndexFile::write(&file_io, &external_dir, &[42i32])
+        let mut index_file = write_hash_index(&file_io, &external_dir, &[42i32])
             .await
             .unwrap();
         index_file.external_path = Some(format!("{external_dir}/{}", index_file.file_name));
@@ -735,7 +1143,7 @@ mod tests {
         let file_io = FileIO::from_url(&dir).unwrap().build().unwrap();
 
         let hashes = vec![42, -1, 0, i32::MAX, i32::MIN];
-        let meta = HashIndexFile::write(&file_io, &dir, &hashes).await.unwrap();
+        let meta = write_hash_index(&file_io, &dir, &hashes).await.unwrap();
 
         assert_eq!(meta.index_type, HASH_INDEX);
         assert_eq!(meta.row_count, 5);
@@ -752,7 +1160,7 @@ mod tests {
         let dir = format!("file://{}", tmp.path().display());
         let file_io = FileIO::from_url(&dir).unwrap().build().unwrap();
 
-        let meta = HashIndexFile::write(&file_io, &dir, &[]).await.unwrap();
+        let meta = write_hash_index(&file_io, &dir, &[]).await.unwrap();
         assert_eq!(meta.row_count, 0);
         assert_eq!(meta.file_size, 0);
 

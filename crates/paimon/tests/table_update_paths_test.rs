@@ -420,7 +420,7 @@ async fn external_deletion_vectors_repeat_time_travel_and_abort() {
 }
 
 #[tokio::test]
-async fn delete_reads_legacy_index_directory_without_changing_manifest_identity() {
+async fn delete_requires_bucket_index_and_preserves_manifest_on_failure() {
     let table = table(&[("index-file-in-data-file-dir", "true")]).await;
     seed(&table).await;
     let ids = row_ids(&table).await;
@@ -428,7 +428,7 @@ async fn delete_reads_legacy_index_directory_without_changing_manifest_identity(
     let old = messages[0].new_index_files[0].clone();
     assert!(old.external_path.is_none());
     let bucket_path = format!("{}/p=a/q=1/bucket-0/{}", table.location(), old.file_name);
-    let legacy_path = format!("{}/index/{}", table.location(), old.file_name);
+    let table_index_path = format!("{}/index/{}", table.location(), old.file_name);
     let bytes = table
         .file_io()
         .new_input(&bucket_path)
@@ -438,18 +438,60 @@ async fn delete_reads_legacy_index_directory_without_changing_manifest_identity(
         .unwrap();
     table
         .file_io()
-        .new_output(&legacy_path)
+        .new_output(&table_index_path)
         .unwrap()
-        .write(bytes)
+        .write(bytes.clone())
         .await
         .unwrap();
     table.file_io().delete_file(&bucket_path).await.unwrap();
     commit(&table, messages).await;
+
+    let mut writer = table.new_write_builder().new_delete().unwrap();
+    writer.add_row_ids(vec![ids[&1]]).unwrap();
+    let before = files(&table).await;
+    let error = writer.prepare_commit().await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(bucket_path.trim_start_matches("memory:/")),
+        "{error}"
+    );
+    assert_eq!(files(&table).await, before);
+    assert_eq!(
+        table
+            .snapshot_manager()
+            .get_latest_snapshot_id()
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    let snapshot = table.snapshot_manager().get_snapshot(2).await.unwrap();
+    let entries = paimon::spec::IndexManifest::read(
+        table.file_io(),
+        &format!(
+            "{}/manifest/{}",
+            table.location(),
+            snapshot.index_manifest().unwrap()
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].index_file, old);
+
+    // Restoring the required Java location allows a fresh writer to proceed.
+    table
+        .file_io()
+        .new_output(&bucket_path)
+        .unwrap()
+        .write(bytes)
+        .await
+        .unwrap();
     let messages = delete(&table, vec![ids[&1]]).await;
     assert_eq!(messages[0].deleted_index_files, vec![old]);
     commit(&table, messages).await;
     assert_eq!(row_ids(&table).await.len(), 2);
-    assert!(table.file_io().exists(&legacy_path).await.unwrap());
+    assert!(table.file_io().exists(&table_index_path).await.unwrap());
     let historical = table
         .copy_with_time_travel(HashMap::from([("scan.snapshot-id".into(), "2".into())]))
         .await
