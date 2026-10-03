@@ -533,7 +533,11 @@ fn decode_java_utf8(mut bytes: &[u8]) -> String {
 /// literal partition value — a `dt=<U+180E>` directory written by a modern JVM is
 /// then preserved and matched by an equality filter instead of being folded to
 /// the default partition.
-pub(crate) fn is_java_whitespace_only(value: &str) -> bool {
+///
+/// Public so the DataFusion partition-DDL layer validates mutating partition
+/// values with the same classification that this crate folds by, matching Java
+/// `PaimonFormatTable.requireNameablePartitionValues`.
+pub fn is_java_whitespace_only(value: &str) -> bool {
     value.chars().all(|ch| {
         matches!(
             ch,
