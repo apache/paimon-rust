@@ -731,6 +731,8 @@ fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> R
 
     let mut values_by_field = vec![Vec::with_capacity(input.len()); fields.len()];
     let mut validities = Vec::with_capacity(input.len());
+    // Java's temporal cast executors use the process default time zone.
+    let zone = jiff::tz::TimeZone::system();
     for row in 0..input.len() {
         if input.is_null(row) {
             validities.push(false);
@@ -750,6 +752,7 @@ fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> R
                         extracted,
                         field.data_type(),
                         field_metadata.fail_on_error(),
+                        &zone,
                     )?,
                     Ok(None) => None,
                     Err(e) if !field_metadata.fail_on_error() => {
@@ -1865,15 +1868,19 @@ mod tests {
         let shredded = assemble_shredded_variant_batch(physical, &read_fields).unwrap();
         let shredded_result = shredded.column_by_name("v").unwrap();
 
+        let local_micros = 1_700_000_000_123_456;
+        let expected_ltz =
+            crate::variant::instant_from_local_micros(local_micros, &jiff::tz::TimeZone::system())
+                .unwrap();
         for result in [plain_result.as_ref(), shredded_result.as_ref()] {
             let result = result.as_any().downcast_ref::<StructArray>().unwrap();
-            for index in 0..2 {
+            for (index, expected) in [(0, expected_ltz), (1, local_micros)] {
                 let timestamps = result
                     .column(index)
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .unwrap();
-                assert_eq!(timestamps.value(0), 1_700_000_000_123_456);
+                assert_eq!(timestamps.value(0), expected);
             }
             let dates = result
                 .column(2)
