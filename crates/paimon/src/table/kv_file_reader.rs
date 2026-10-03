@@ -31,15 +31,17 @@ use super::sort_merge::{
     PartialUpdateMergeFunction, SortMergeReaderBuilder,
 };
 use crate::arrow::format::MosaicPrefetchOptions;
+use crate::arrow::shredding::variant::assemble_variant_extraction_array;
 use crate::arrow::{build_target_arrow_schema, ReadBudget};
 use crate::deletion_vector::DeletionVectorFactory;
 use crate::file_index::evaluator::evaluate_file_index;
 use crate::file_index::file_index_result::FileIndexResult;
 use crate::io::FileIO;
 use crate::spec::{
-    BigIntType, CoreOptions, DataField, DataFileMeta, DataType as PaimonDataType, MergeEngine,
-    PartialUpdateConfig, Predicate, TinyIntType, SEQUENCE_NUMBER_FIELD_ID,
-    SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID, VALUE_KIND_FIELD_NAME,
+    is_variant_extraction_row, is_variant_extraction_row_type, BigIntType, CoreOptions, DataField,
+    DataFileMeta, DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate,
+    TinyIntType, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
+    VALUE_KIND_FIELD_NAME,
 };
 use crate::table::schema_manager::SchemaManager;
 use crate::table::ArrowRecordBatchStream;
@@ -392,6 +394,33 @@ impl KeyValueFileReader {
             .map(|s| s.as_str())
             .collect();
 
+        // File readers run before PK deduplication. Keep Variant values in their
+        // logical storage type until the visible row has been selected: a strict
+        // extraction must not fail on an older, overwritten version.
+        let merge_read_type: Vec<DataField> = self
+            .config
+            .read_type
+            .iter()
+            .map(|field| {
+                if !is_variant_extraction_row_type(field.data_type()) {
+                    return Ok(field.clone());
+                }
+                self.config
+                    .table_fields
+                    .iter()
+                    .find(|source| source.id() == field.id())
+                    .filter(|source| matches!(source.data_type(), PaimonDataType::Variant(_)))
+                    .cloned()
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: format!(
+                            "Variant extraction field '{}' has no matching VARIANT table field",
+                            field.name()
+                        ),
+                        source: None,
+                    })
+            })
+            .collect::<crate::Result<_>>()?;
+
         // Collect key fields from table schema.
         let key_fields: Vec<DataField> = self
             .config
@@ -423,10 +452,8 @@ impl KeyValueFileReader {
         //              + any sequence fields not already included. Physical system
         // fields are already the first two columns of every KV file.
         let read_type_names: std::collections::HashSet<&str> =
-            self.config.read_type.iter().map(|f| f.name()).collect();
-        let mut user_fields: Vec<DataField> = self
-            .config
-            .read_type
+            merge_read_type.iter().map(|f| f.name()).collect();
+        let mut user_fields: Vec<DataField> = merge_read_type
             .iter()
             .filter(|field| !matches!(field.id(), SEQUENCE_NUMBER_FIELD_ID | VALUE_KIND_FIELD_ID))
             .cloned()
@@ -781,8 +808,18 @@ impl KeyValueFileReader {
                         // Reorder columns from [keys..., values...] to read_type order.
                         let columns: Vec<_> = reorder_map
                             .iter()
-                            .map(|&src| batch.column(src).clone())
-                            .collect();
+                            .enumerate()
+                            .map(|(out_idx, &src)| {
+                                let column = batch.column(src);
+                                match config.read_type[out_idx].data_type() {
+                                    PaimonDataType::Row(row) if is_variant_extraction_row(row) =>
+                                    {
+                                        assemble_variant_extraction_array(column.as_ref(), row)
+                                    }
+                                    _ => Ok(column.clone()),
+                                }
+                            })
+                            .collect::<crate::Result<Vec<_>>>()?;
                         // An explicit row count keeps empty projections working
                         // (e.g. COUNT(*) reads no columns).
                         let options =
@@ -808,19 +845,22 @@ impl KeyValueFileReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::build_target_arrow_schema;
     use crate::arrow::format::create_format_writer;
+    use crate::arrow::{build_target_arrow_schema, variant_arrow_type};
     use crate::catalog::Identifier;
     use crate::deletion_vector::DeletionVector;
     use crate::io::FileIOBuilder;
     use crate::spec::{
-        stats::BinaryTableStats, BinaryRow, DataFileMeta, DataType, Datum, IntType,
-        PredicateBuilder, Schema, TableSchema, VarCharType,
+        stats::BinaryTableStats, variant_extraction_row, BinaryRow, DataFileMeta, DataType, Datum,
+        FloatType, IntType, PredicateBuilder, Schema, TableSchema, VarCharType, VariantType,
     };
     use crate::table::source::{DataSplitBuilder, DeletionFile};
     use crate::table::table_commit::TableCommit;
     use crate::table::{Table, TableWrite};
-    use arrow_array::{Array, Int32Array, Int64Array, Int8Array, StringArray};
+    use arrow_array::{
+        Array, BinaryArray, Float32Array, Int32Array, Int64Array, Int8Array, StringArray,
+        StructArray,
+    };
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
     use bytes::Bytes;
     use futures::TryStreamExt;
@@ -830,6 +870,104 @@ mod tests {
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn kv_variant_projection_casts_only_visible_rows() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_variant_projection_visible_rows";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Variant(VariantType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "kv_variant_projection_visible_rows"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = |id, json| {
+            let variant = crate::variant::GenericVariant::parse_json(json).unwrap();
+            let ArrowDataType::Struct(fields) = variant_arrow_type() else {
+                unreachable!()
+            };
+            let payload = StructArray::try_new(
+                fields,
+                vec![
+                    Arc::new(BinaryArray::from(vec![Some(variant.value())])),
+                    Arc::new(BinaryArray::from(vec![Some(variant.metadata())])),
+                ],
+                None,
+            )
+            .unwrap();
+            RecordBatch::try_new(
+                build_target_arrow_schema(table.schema().fields()).unwrap(),
+                vec![Arc::new(Int32Array::from(vec![id])), Arc::new(payload)],
+            )
+            .unwrap()
+        };
+
+        write_commit(&table, &batch(1, r#"{"x":"invalid"}"#)).await;
+        write_commit(&table, &batch(1, r#"{"x":1.5}"#)).await;
+
+        let mut read_builder = table.new_read_builder();
+        read_builder.with_read_type(vec![
+            table.schema().fields()[0].clone(),
+            DataField::new(
+                1,
+                "payload".to_string(),
+                DataType::Row(variant_extraction_row(
+                    true,
+                    [(
+                        DataType::Float(FloatType::new()),
+                        "$.x".to_string(),
+                        true,
+                        "UTC".to_string(),
+                    )],
+                )),
+            ),
+        ]);
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        let batches = read_builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(int_column(&batches, "id"), vec![1]);
+        let payload = batches[0]
+            .column_by_name("payload")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let x = payload
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(x.value(0), 1.5);
+
+        // A bad value that survives the merge must still fail strict projection.
+        write_commit(&table, &batch(1, r#"{"x":"still invalid"}"#)).await;
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        let error = read_builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::DataInvalid { ref message, .. }
+            if message.contains("Cannot cast Variant value")));
+    }
 
     #[test]
     fn kv_row_layout_preserves_file_schema_key_names_and_fields() {

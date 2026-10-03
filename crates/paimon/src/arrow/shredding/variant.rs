@@ -703,7 +703,11 @@ fn assemble_array_to_logical(
     }
 }
 
-fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> Result<ArrayRef> {
+/// Extract projected fields from a logical Variant column after PK merge.
+pub(crate) fn assemble_variant_extraction_array(
+    array: &dyn Array,
+    row_type: &RowType,
+) -> Result<ArrayRef> {
     let input = array
         .as_any()
         .downcast_ref::<StructArray>()
