@@ -89,6 +89,8 @@ struct MockState {
     drop_policy_error: Option<ErrorResponse>,
     auth_responses: HashMap<String, AuthTableQueryResponse>,
     column_auth: HashMap<String, Vec<String>>,
+    /// The `select` of every auth request, per `"{db}.{table}"`.
+    auth_selects: HashMap<String, Vec<Option<Vec<String>>>>,
     uuid_after_auth: HashMap<String, String>,
     uuid_after_calls: HashMap<String, (String, usize)>,
     /// ECS metadata role name (for token loader testing)
@@ -871,8 +873,12 @@ impl RESTServer {
         Extension(state): Extension<Arc<RESTServer>>,
         Json(request): Json<paimon::api::AuthTableQueryRequest>,
     ) -> impl IntoResponse {
-        let s = state.inner.lock().unwrap();
+        let mut s = state.inner.lock().unwrap();
         let key = format!("{db}.{table}");
+        s.auth_selects
+            .entry(key.clone())
+            .or_default()
+            .push(request.select.clone());
 
         // Mirrors the reference server: a null select means the real schema
         // fields, and any column outside the grant denies the query.
@@ -936,6 +942,14 @@ impl RESTServer {
     pub fn set_column_auth(&self, database: &str, table: &str, columns: Vec<String>) {
         let mut s = self.inner.lock().unwrap();
         s.column_auth.insert(format!("{database}.{table}"), columns);
+    }
+
+    pub fn auth_selects(&self, database: &str, table: &str) -> Vec<Option<Vec<String>>> {
+        let s = self.inner.lock().unwrap();
+        s.auth_selects
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Handle DELETE /databases/:db/tables/:table - drop a table.

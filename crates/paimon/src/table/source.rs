@@ -540,6 +540,15 @@ impl DataSplit {
         self.query_auth_grant.as_ref()
     }
 
+    /// Whether the server attached rules to this split's read: its row counts
+    /// and column statistics then describe rows the read will not return as
+    /// they are.
+    pub fn has_query_auth_rules(&self) -> bool {
+        self.query_auth_grant
+            .as_ref()
+            .is_some_and(|grant| !grant.is_unrestricted())
+    }
+
     pub fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
@@ -658,8 +667,18 @@ impl DataSplit {
     /// [`DataFileMeta::ROW_COUNT_UNKNOWN`] — no arithmetic over a placeholder
     /// produces a number a caller may trust.
     ///
+    /// Also `None` under a query-auth row filter, which drops rows the count
+    /// includes, as Java `QueryAuthSplit` does.
+    ///
     /// Reference: [DataSplit.mergedRowCount()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java#L133)
     pub fn merged_row_count(&self) -> Option<i64> {
+        if self
+            .query_auth_grant
+            .as_ref()
+            .is_some_and(|grant| !grant.rules().filters.is_empty())
+        {
+            return None;
+        }
         if let Some(ranges) = &self.row_ranges {
             return Some(ranges.iter().map(RowRange::count).sum());
         }
@@ -1604,6 +1623,24 @@ mod tests {
     fn test_merged_row_count_raw_convertible_sums_physical_rows() {
         let s = split(vec![file("a", 10, None), file("b", 5, None)], true);
         assert_eq!(s.merged_row_count(), Some(15));
+    }
+
+    #[tokio::test]
+    async fn test_merged_row_count_is_unknown_under_a_row_filter() {
+        let table = crate::table::rest_query_auth_table().await;
+        let grant = |filters| {
+            Some(Arc::new(crate::table::query_auth::QueryAuthGrant::new(
+                table.query_auth_session().unwrap(),
+                None,
+                crate::table::query_auth::Rules { filters },
+            )))
+        };
+        let s = || split(vec![file("a", 10, None)], true);
+        assert_eq!(s().planned(grant(Vec::new())).merged_row_count(), Some(10));
+        let filtered = s().planned(grant(vec![crate::spec::Predicate::AlwaysTrue]));
+        assert_eq!(filtered.merged_row_count(), None);
+        // The physical count stays, as Java's `rowCount` does.
+        assert_eq!(filtered.row_count(), 10);
     }
 
     /// A placeholder row count must surface as "unknown", not as a number.
