@@ -28,7 +28,8 @@ use crate::btree::BTreeIndexWriter;
 use crate::fm_index::{FMGlobalIndexWriter, FMWriteOptions};
 use crate::io::FileWrite;
 use crate::spec::{
-    extract_datum_from_arrow, DataField, GlobalIndexMeta, IndexFileMeta, ROW_ID_FIELD_NAME,
+    extract_datum_from_arrow, DataField, DataType, GlobalIndexMeta, IndexFileMeta, RowType,
+    ROW_ID_FIELD_NAME,
 };
 use crate::table::bitmap_global_index_writer::{BitmapGlobalIndexWriter, BitmapWriteResult};
 use crate::table::global_index_types::{
@@ -44,8 +45,7 @@ impl SortedGlobalIndexBuildBuilder<'_> {
     pub(super) async fn build_index_file(
         &self,
         shard: &SortedGlobalIndexShard,
-        index_field: &DataField,
-        index_column: &str,
+        index_fields: &[&DataField],
         write_options: &GlobalIndexWriteOptions,
     ) -> Result<IndexFileMeta> {
         let index_type = normalize_queryable_global_index_type(&self.index_type).ok_or_else(|| {
@@ -57,7 +57,16 @@ impl SortedGlobalIndexBuildBuilder<'_> {
             }
         })?;
         let row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
-        let key_type = index_key_type(index_type, index_field)?;
+        let index_field = index_fields[0];
+        let index_column = index_field.name();
+        let composite_type = DataType::Row(RowType::new(
+            index_fields.iter().map(|field| (*field).clone()).collect(),
+        ));
+        let key_type = if index_fields.len() > 1 {
+            &composite_type
+        } else {
+            index_key_type(index_type, index_field)?
+        };
         let codec_type = if matches!(
             index_type,
             MULTIVALUE_GLOBAL_INDEX_TYPE | FM_GLOBAL_INDEX_TYPE
@@ -70,15 +79,7 @@ impl SortedGlobalIndexBuildBuilder<'_> {
         let mut rows = if index_type == FM_GLOBAL_INDEX_TYPE {
             Vec::new()
         } else {
-            extract_index_rows(
-                self.table,
-                shard,
-                index_column,
-                index_field,
-                index_type,
-                serialize_key,
-            )
-            .await?
+            extract_index_rows(self.table, shard, index_fields, index_type, serialize_key).await?
         };
         if !rows.is_empty() {
             sort_index_rows(&mut rows, &cmp)?;
@@ -255,7 +256,13 @@ impl SortedGlobalIndexBuildBuilder<'_> {
                 row_range_start: shard.row_range_start,
                 row_range_end: shard.row_range_end,
                 index_field_id: index_field.id(),
-                extra_field_ids: None,
+                extra_field_ids: (index_fields.len() > 1).then(|| {
+                    index_fields
+                        .iter()
+                        .skip(1)
+                        .map(|field| field.id())
+                        .collect()
+                }),
                 source_meta: None,
                 index_meta: Some(index_meta),
             }),

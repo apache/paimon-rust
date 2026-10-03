@@ -28,6 +28,54 @@ const TIMESTAMP_COMPACT_PRECISION: u32 = 3;
 /// Decimal precision <= 18 is compact (fits in i64).
 const DECIMAL_COMPACT_PRECISION: u32 = 18;
 
+/// Slice comparison uses the column's physical layout. Preserve the literal's
+/// value when converting to that layout, or decline the index so the ordinary
+/// data predicate can compare the original value without losing precision.
+pub(crate) fn normalize_key_literal(literal: &mut Datum, data_type: &DataType) -> bool {
+    match (literal, data_type) {
+        (
+            Datum::Decimal {
+                unscaled,
+                precision,
+                scale,
+            },
+            DataType::Decimal(ty),
+        ) => {
+            if *unscaled != 0 && *scale != ty.scale() {
+                let Some(factor) = 10i128.checked_pow(scale.abs_diff(ty.scale())) else {
+                    return false;
+                };
+                if *scale < ty.scale() {
+                    let Some(value) = unscaled.checked_mul(factor) else {
+                        return false;
+                    };
+                    *unscaled = value;
+                } else {
+                    if *unscaled % factor != 0 {
+                        return false;
+                    }
+                    *unscaled /= factor;
+                }
+            }
+            if ty.precision() <= DECIMAL_COMPACT_PRECISION && i64::try_from(*unscaled).is_err() {
+                return false;
+            }
+            *precision = ty.precision();
+            *scale = ty.scale();
+            true
+        }
+        (Datum::Timestamp { nanos, .. }, DataType::Timestamp(ty)) => {
+            (0..1_000_000).contains(nanos)
+                && (ty.precision() > TIMESTAMP_COMPACT_PRECISION || *nanos == 0)
+        }
+        (Datum::LocalZonedTimestamp { nanos, .. }, DataType::LocalZonedTimestamp(ty)) => {
+            (0..1_000_000).contains(nanos)
+                && (ty.precision() > TIMESTAMP_COMPACT_PRECISION || *nanos == 0)
+        }
+        _ => true,
+    }
+}
+
 /// Key comparator type alias.
 ///
 /// Fallible because the bytes come from an index file that may have been written when
@@ -122,6 +170,10 @@ pub(crate) fn is_key_comparison_failure(error: &std::io::Error) -> bool {
 /// For variable-length types (string, bytes), uses lexicographic byte comparison.
 pub fn make_key_comparator(data_type: &DataType) -> KeyComparator {
     match data_type {
+        DataType::Row(row) => {
+            let codec = super::CompositeKeyCodec::new(row.fields());
+            Box::new(move |a, b| codec.compare_keys(a, b))
+        }
         DataType::TinyInt(_) => Box::new(|a: &[u8], b: &[u8]| {
             let av = i8::from_le_bytes(fixed_key_bytes::<1>(a, "TINYINT")?);
             let bv = i8::from_le_bytes(fixed_key_bytes::<1>(b, "TINYINT")?);

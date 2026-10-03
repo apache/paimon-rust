@@ -15,18 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::global_index_build_common::IndexColumns;
 use super::global_index_types::{
     normalize_global_index_type_for_drop, BTREE_GLOBAL_INDEX_TYPE,
     SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
-use crate::spec::{DataField, FileKind, IndexFileMeta, IndexManifest};
+use crate::spec::{FileKind, IndexFileMeta, IndexManifest};
 use crate::table::{CommitMessage, SnapshotManager, Table, TableCommit};
 use crate::{Error, Result};
 use std::collections::HashMap;
 
 pub struct GlobalIndexDropBuilder<'a> {
     table: &'a Table,
-    index_column: Option<String>,
+    index_column: Option<IndexColumns>,
     index_type: String,
 }
 
@@ -40,7 +41,15 @@ impl<'a> GlobalIndexDropBuilder<'a> {
     }
 
     pub fn with_index_column(&mut self, column: &str) -> &mut Self {
-        self.index_column = Some(column.to_string());
+        self.index_column = Some(IndexColumns::Column(column.to_string()));
+        self
+    }
+
+    /// Drop exactly the definition with these ordered BTree columns.
+    pub fn with_index_columns(&mut self, columns: &[&str]) -> &mut Self {
+        self.index_column = Some(IndexColumns::Columns(
+            columns.iter().map(|column| (*column).to_string()).collect(),
+        ));
         self
     }
 
@@ -66,12 +75,21 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             })?;
         let index_column = self
             .index_column
-            .as_deref()
+            .as_ref()
             .ok_or_else(|| Error::DataInvalid {
                 message: "Global index column is required".to_string(),
                 source: None,
             })?;
-        let index_field = find_index_field(self.table, index_column)?;
+        let index_fields = super::global_index_build_common::resolve_index_fields(
+            self.table,
+            index_column,
+            index_type,
+        )?;
+        let extra_field_ids = index_fields
+            .iter()
+            .skip(1)
+            .map(|field| field.id())
+            .collect::<Vec<_>>();
 
         let snapshot_manager = SnapshotManager::new(
             self.table.file_io().clone(),
@@ -104,7 +122,12 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             let Some(global_meta) = entry.index_file.global_index_meta.as_ref() else {
                 continue;
             };
-            if global_meta.index_field_id != index_field.id() {
+            if global_meta.index_field_id != index_fields[0].id()
+                || !super::global_index_build_common::same_extra_field_ids(
+                    global_meta.extra_field_ids.as_deref(),
+                    Some(&extra_field_ids),
+                )
+            {
                 continue;
             }
             dropped += 1;
@@ -145,18 +168,6 @@ impl<'a> GlobalIndexDropBuilder<'a> {
 
         Ok(dropped)
     }
-}
-
-fn find_index_field<'a>(table: &'a Table, column: &str) -> Result<&'a DataField> {
-    table
-        .schema()
-        .fields()
-        .iter()
-        .find(|field| field.name() == column)
-        .ok_or_else(|| Error::ColumnNotExist {
-            full_name: table.identifier().full_name(),
-            column: column.to_string(),
-        })
 }
 
 #[cfg(test)]

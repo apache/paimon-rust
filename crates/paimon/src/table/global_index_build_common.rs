@@ -24,11 +24,77 @@
 //! `index_type` string, so it lives here once rather than being copied into
 //! each builder.
 
-use crate::spec::{FileKind, IndexManifest};
+use crate::spec::{DataField, FileKind, IndexManifest};
 use crate::table::{merge_row_ranges, RowRange, Table};
 use crate::{Error, Result};
 
 pub(crate) mod vector;
+
+pub(crate) enum IndexColumns {
+    Column(String),
+    Columns(Vec<String>),
+}
+
+/// Resolve an ordered definition, shared by build and drop. The leading field
+/// and ordered extra IDs together identify a composite definition.
+pub(crate) fn resolve_index_fields<'a>(
+    table: &'a Table,
+    columns: &IndexColumns,
+    index_type: &str,
+) -> Result<Vec<&'a DataField>> {
+    let columns = match columns {
+        IndexColumns::Column(column) => {
+            if table
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| field.name() == column)
+            {
+                vec![column.as_str()]
+            } else {
+                column.split(',').map(str::trim).collect()
+            }
+        }
+        IndexColumns::Columns(columns) => columns.iter().map(String::as_str).collect(),
+    };
+    if columns.is_empty() {
+        return Err(Error::DataInvalid {
+            message: "Global index column list is empty".into(),
+            source: None,
+        });
+    }
+    let mut fields = Vec::new();
+    for column in columns {
+        if column.is_empty() {
+            return Err(Error::DataInvalid {
+                message: "Global index column list contains an empty column".into(),
+                source: None,
+            });
+        }
+        let field = table
+            .schema()
+            .fields()
+            .iter()
+            .find(|field| field.name() == column)
+            .ok_or_else(|| Error::ColumnNotExist {
+                full_name: table.identifier().full_name(),
+                column: column.to_string(),
+            })?;
+        if fields.contains(&field) {
+            return Err(Error::DataInvalid {
+                message: format!("Duplicate global index column '{column}'"),
+                source: None,
+            });
+        }
+        fields.push(field);
+    }
+    if fields.len() > 1 && index_type != super::global_index_types::BTREE_GLOBAL_INDEX_TYPE {
+        return Err(Error::Unsupported {
+            message: "Only BTree global indexes support multiple index columns".into(),
+        });
+    }
+    Ok(fields)
+}
 
 /// Java `sameExtraFieldIds`: null/empty are equal; otherwise exact ordered equality.
 pub(crate) fn same_extra_field_ids(a: Option<&[i32]>, b: Option<&[i32]>) -> bool {

@@ -2609,3 +2609,878 @@ async fn incremental_build_splits_gap_around_mid_coverage_indexed_hole() {
         );
     }
 }
+
+async fn composite_entries(
+    table: &Table,
+) -> (crate::spec::Snapshot, Vec<crate::spec::IndexManifestEntry>) {
+    let manager = SnapshotManager::new(table.file_io().clone(), table.location().into());
+    let snapshot = manager.get_latest_snapshot().await.unwrap().unwrap();
+    let entries = IndexManifest::read(
+        table.file_io(),
+        &manager.manifest_path(snapshot.index_manifest().unwrap()),
+    )
+    .await
+    .unwrap();
+    (snapshot, entries)
+}
+
+async fn composite_ranges(
+    table: &Table,
+    predicates: &[Predicate],
+    budget: i64,
+    mode: GlobalIndexSearchMode,
+) -> Option<Vec<RowRange>> {
+    let (snapshot, entries) = composite_entries(table).await;
+    evaluate_global_index(GlobalIndexEvaluation {
+        file_io: table.file_io(),
+        table_path: table.location(),
+        index_entries: &entries,
+        predicates,
+        schema_fields: table.schema().fields(),
+        search_mode: mode,
+        global_index_thread_num: 2,
+        btree_fallback_scan_max_size: budget,
+        btree_data_block_cache_size: 1024 * 1024,
+        bitmap_fallback_scan_max_size: budget,
+        fm_read_options: crate::fm_index::FMReadOptions::default(),
+        next_row_id: snapshot.next_row_id(),
+        data_ranges: &[RowRange::new(0, snapshot.next_row_id().unwrap() - 1)],
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_composite_btree_build_query_coverage_and_drop() {
+    for version in [1, 2] {
+        let mut options = table_options("2");
+        options.insert("btree-index.file-version".into(), version.to_string());
+        options.insert("btree-index.bloom-filter.enabled".into(), "true".into());
+        let table =
+            test_table_with_path(&format!("memory:/composite_btree_e2e_v{version}"), options);
+        setup_dirs(&table).await;
+        let mut writer = TableWrite::new(&table, "composite-test".into()).unwrap();
+        writer
+            .write_arrow_batch(&data_batch(
+                vec![1, 2, 3, 1, 4, 5],
+                vec!["a", "a", "b", "a", "b", "c"],
+            ))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "composite-test".into())
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            table
+                .new_btree_global_index_build_builder()
+                .with_index_columns(&["name", "id"])
+                .execute()
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            table
+                .new_btree_global_index_build_builder()
+                .with_index_column(" name , id ")
+                .execute()
+                .await
+                .unwrap(),
+            0
+        );
+        let b = PredicateBuilder::new(table.schema().fields());
+        let point = Predicate::and(vec![
+            b.equal("id", Datum::Int(1)).unwrap(),
+            b.equal("name", Datum::String("a".into())).unwrap(),
+        ]);
+        assert_eq!(
+            composite_ranges(
+                &table,
+                std::slice::from_ref(&point),
+                0,
+                GlobalIndexSearchMode::Fast
+            )
+            .await
+            .unwrap(),
+            vec![RowRange::new(0, 0), RowRange::new(3, 3)]
+        );
+        assert_eq!(scan_ids(&table, point.clone()).await, vec![1, 1]);
+        let prefix = b.equal("name", Datum::String("a".into())).unwrap();
+        assert!(composite_ranges(
+            &table,
+            std::slice::from_ref(&prefix),
+            0,
+            GlobalIndexSearchMode::Fast
+        )
+        .await
+        .is_none());
+        let range = Predicate::and(vec![
+            prefix.clone(),
+            b.greater_than("id", Datum::Int(1)).unwrap(),
+        ]);
+        assert_eq!(
+            composite_ranges(
+                &table,
+                std::slice::from_ref(&range),
+                i64::MAX,
+                GlobalIndexSearchMode::Fast
+            )
+            .await
+            .unwrap(),
+            vec![RowRange::new(1, 1)]
+        );
+        assert_eq!(scan_ids(&table, range.clone()).await, vec![2]);
+        let suffix = b.equal("id", Datum::Int(1)).unwrap();
+        assert!(
+            composite_ranges(&table, &[suffix], i64::MAX, GlobalIndexSearchMode::Fast)
+                .await
+                .is_none()
+        );
+        let disjunction = Predicate::or(vec![
+            point.clone(),
+            Predicate::and(vec![
+                b.equal("name", Datum::String("b".into())).unwrap(),
+                b.equal("id", Datum::Int(4)).unwrap(),
+            ]),
+        ]);
+        assert_eq!(
+            composite_ranges(&table, &[disjunction], 0, GlobalIndexSearchMode::Fast)
+                .await
+                .unwrap(),
+            vec![RowRange::new(0, 0), RowRange::new(3, 4)]
+        );
+        let (_, entries) = composite_entries(&table).await;
+        let max_size = entries
+            .iter()
+            .map(|entry| entry.index_file.file_size)
+            .max()
+            .unwrap();
+        assert!(
+            composite_ranges(
+                &table,
+                std::slice::from_ref(&prefix),
+                max_size,
+                GlobalIndexSearchMode::Fast
+            )
+            .await
+            .is_some(),
+            "budget is per row-range group, not summed across all shards"
+        );
+        assert!(entries.iter().all(|entry| entry
+            .index_file
+            .global_index_meta
+            .as_ref()
+            .unwrap()
+            .extra_field_ids
+            == Some(vec![0])));
+        // Append outside the composite coverage. FULL and DETAIL must retain
+        // those rows for residual data filtering; FAST uses indexed coverage.
+        let mut writer = TableWrite::new(&table, "append-test".into()).unwrap();
+        writer
+            .write_arrow_batch(&data_batch(vec![6], vec!["a"]))
+            .await
+            .unwrap();
+        TableCommit::new(table.clone(), "append-test".into())
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        for mode in [GlobalIndexSearchMode::Full, GlobalIndexSearchMode::Detail] {
+            assert_eq!(
+                composite_ranges(&table, std::slice::from_ref(&point), 0, mode)
+                    .await
+                    .unwrap(),
+                vec![
+                    RowRange::new(0, 0),
+                    RowRange::new(3, 3),
+                    RowRange::new(6, 6)
+                ]
+            );
+        }
+        assert_eq!(scan_ids(&table, point).await, vec![1, 1]);
+        assert_eq!(
+            table
+                .new_btree_global_index_build_builder()
+                .with_index_columns(&["name", "id"])
+                .execute()
+                .await
+                .unwrap(),
+            1
+        );
+        // Independent scalar and reversed tuple definitions coexist.
+        assert!(
+            table
+                .new_btree_global_index_build_builder()
+                .with_index_column("name")
+                .execute()
+                .await
+                .unwrap()
+                > 0
+        );
+        assert!(
+            table
+                .new_btree_global_index_build_builder()
+                .with_index_columns(&["id", "name"])
+                .execute()
+                .await
+                .unwrap()
+                > 0
+        );
+        let (_, entries) = composite_entries(&table).await;
+        let target_count = entries
+            .iter()
+            .filter(|entry| {
+                let meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                meta.index_field_id == 1 && meta.extra_field_ids == Some(vec![0])
+            })
+            .count();
+        assert_eq!(
+            table
+                .new_global_index_drop_builder()
+                .with_index_columns(&["name", "id"])
+                .execute()
+                .await
+                .unwrap(),
+            target_count
+        );
+        let (_, retained) = composite_entries(&table).await;
+        assert!(retained.iter().any(|entry| {
+            let meta = entry.index_file.global_index_meta.as_ref().unwrap();
+            meta.index_field_id == 1 && meta.extra_field_ids.is_none()
+        }));
+        assert!(retained.iter().any(|entry| entry
+            .index_file
+            .global_index_meta
+            .as_ref()
+            .unwrap()
+            .extra_field_ids
+            == Some(vec![1])));
+        assert_eq!(
+            table
+                .new_global_index_drop_builder()
+                .with_index_columns(&["name", "id"])
+                .execute()
+                .await
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_composite_btree_column_validation() {
+    let table = test_table(table_options("10"));
+    for columns in ["", "name,", "name,name", "name,missing"] {
+        assert!(table
+            .new_btree_global_index_build_builder()
+            .with_index_column(columns)
+            .execute()
+            .await
+            .is_err());
+        assert!(table
+            .new_global_index_drop_builder()
+            .with_index_column(columns)
+            .execute()
+            .await
+            .is_err());
+    }
+    for index_type in ["bitmap", "multivalue", "fm"] {
+        assert!(matches!(
+            table
+                .new_btree_global_index_build_builder()
+                .with_index_columns(&["name", "id"])
+                .with_index_type(index_type)
+                .execute()
+                .await
+                .unwrap_err(),
+            Error::Unsupported { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn test_composite_btree_all_null_tuple_and_residual_filter() {
+    let table = test_table_with_path("memory:/composite_null_tuple", table_options("10"));
+    setup_dirs(&table).await;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("name", ArrowDataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![None, Some(1), Some(2)])) as ArrayRef,
+            Arc::new(StringArray::from(vec![None, Some("a"), None])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut writer = TableWrite::new(&table, "null-test".into()).unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "null-test".into())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    table
+        .new_btree_global_index_build_builder()
+        .with_index_columns(&["name", "id"])
+        .execute()
+        .await
+        .unwrap();
+    let b = PredicateBuilder::new(table.schema().fields());
+    let all_null = Predicate::and(vec![b.is_null("name").unwrap(), b.is_null("id").unwrap()]);
+    assert_eq!(
+        composite_ranges(&table, &[all_null], 0, GlobalIndexSearchMode::Fast)
+            .await
+            .unwrap(),
+        vec![RowRange::new(0, 0)]
+    );
+    let null_range = Predicate::and(vec![
+        b.is_null("name").unwrap(),
+        b.greater_than("id", Datum::Int(0)).unwrap(),
+    ]);
+    assert_eq!(
+        composite_ranges(&table, &[null_range], i64::MAX, GlobalIndexSearchMode::Fast)
+            .await
+            .unwrap(),
+        vec![RowRange::new(2, 2)]
+    );
+    // A constraint after the first range is a data filter, so the candidate
+    // includes row 1, while the ordinary reader rejects it.
+    let residual = Predicate::and(vec![
+        b.is_not_null("name").unwrap(),
+        b.equal("id", Datum::Int(2)).unwrap(),
+    ]);
+    assert_eq!(
+        composite_ranges(
+            &table,
+            std::slice::from_ref(&residual),
+            i64::MAX,
+            GlobalIndexSearchMode::Fast
+        )
+        .await
+        .unwrap(),
+        vec![RowRange::new(1, 1)]
+    );
+    assert!(scan_ids(&table, residual).await.is_empty());
+}
+
+#[tokio::test]
+async fn test_composite_btree_literal_precision_preserves_scan_results() {
+    use crate::spec::{DecimalType, TimestampType};
+    use arrow_array::{Decimal128Array, TimestampMillisecondArray};
+
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("d", DataType::Decimal(DecimalType::new(10, 2).unwrap()))
+        .column("ts", DataType::Timestamp(TimestampType::new(3).unwrap()))
+        .options(table_options("10"))
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "literal_precision"),
+        "memory:/composite_literal_precision".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    setup_dirs(&table).await;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("d", ArrowDataType::Decimal128(10, 2), false),
+            ArrowField::new(
+                "ts",
+                ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                false,
+            ),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(
+                Decimal128Array::from(vec![100, 200, 50])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(TimestampMillisecondArray::from(vec![1000, 2000, 3000])),
+        ],
+    )
+    .unwrap();
+    let mut writer = TableWrite::new(&table, "precision-test".into()).unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "precision-test".into())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    let b = PredicateBuilder::new(table.schema().fields());
+    let decimal = |unscaled, scale| Datum::Decimal {
+        unscaled,
+        precision: 10,
+        scale,
+    };
+    let queries = vec![
+        (
+            Predicate::and(vec![
+                b.equal("d", decimal(10, 1)).unwrap(),
+                b.equal("id", Datum::Int(1)).unwrap(),
+            ]),
+            vec![1],
+        ),
+        (b.less_than("d", decimal(10, 1)).unwrap(), vec![3]),
+        (b.less_than("d", decimal(1005, 3)).unwrap(), vec![1, 3]),
+        (
+            Predicate::and(vec![
+                b.equal("d", decimal(500, 3)).unwrap(),
+                b.equal("id", Datum::Int(3)).unwrap(),
+            ]),
+            vec![3],
+        ),
+        (
+            b.less_than(
+                "ts",
+                Datum::Timestamp {
+                    millis: 1000,
+                    nanos: 1,
+                },
+            )
+            .unwrap(),
+            vec![1],
+        ),
+        (
+            b.is_in("d", vec![decimal(1, 0), decimal(500, 3), decimal(10, 1)])
+                .unwrap(),
+            vec![1, 3],
+        ),
+        (
+            b.between("d", decimal(5, 1), decimal(1000, 3)).unwrap(),
+            vec![1, 3],
+        ),
+    ];
+    for (predicate, expected) in &queries {
+        assert_eq!(scan_ids(&table, predicate.clone()).await, *expected);
+    }
+    for columns in [["d", "id"], ["ts", "id"]] {
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_columns(&columns)
+            .execute()
+            .await
+            .unwrap();
+    }
+    for (predicate, expected) in &queries {
+        assert_eq!(
+            scan_ids(&table, predicate.clone()).await,
+            *expected,
+            "{predicate:?}"
+        );
+    }
+    // Exact rescaling retains point lookups even with a zero range-scan budget.
+    assert_eq!(
+        composite_ranges(
+            &table,
+            &[queries[0].0.clone()],
+            0,
+            GlobalIndexSearchMode::Fast
+        )
+        .await
+        .unwrap(),
+        vec![RowRange::new(0, 0)]
+    );
+    for index in [2, 4] {
+        assert!(composite_ranges(
+            &table,
+            &[queries[index].0.clone()],
+            i64::MAX,
+            GlobalIndexSearchMode::Fast
+        )
+        .await
+        .is_none());
+    }
+    // A fully covering scalar index is preferred for a leading-only query.
+    // That path must preserve the same literal values as the tuple query.
+    for index_type in ["btree", "bitmap"] {
+        for column in ["d", "ts"] {
+            table
+                .new_btree_global_index_build_builder()
+                .with_index_column(column)
+                .with_index_type(index_type)
+                .execute()
+                .await
+                .unwrap();
+        }
+        for (predicate, expected) in &queries {
+            assert_eq!(
+                scan_ids(&table, predicate.clone()).await,
+                *expected,
+                "{index_type}: {predicate:?}"
+            );
+        }
+        for column in ["d", "ts"] {
+            table
+                .new_global_index_drop_builder()
+                .with_index_column(column)
+                .with_index_type(index_type)
+                .execute()
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_composite_btree_intersects_independent_indexes() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("name", DataType::VarChar(VarCharType::string_type()))
+        .column("flag", DataType::Int(IntType::new()))
+        .options(table_options("10"))
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "independent_indexes"),
+        "memory:/composite_independent_indexes".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    setup_dirs(&table).await;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("name", ArrowDataType::Utf8, false),
+            ArrowField::new("flag", ArrowDataType::Int32, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["a", "a", "b", "a"])),
+            Arc::new(Int32Array::from(vec![1, 0, 1, 1])),
+        ],
+    )
+    .unwrap();
+    let mut writer = TableWrite::new(&table, "intersection-test".into()).unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "intersection-test".into())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    table
+        .new_btree_global_index_build_builder()
+        .with_index_type("bitmap")
+        .with_index_column("flag")
+        .execute()
+        .await
+        .unwrap();
+    table
+        .new_btree_global_index_build_builder()
+        .with_index_columns(&["name", "id"])
+        .execute()
+        .await
+        .unwrap();
+    let b = PredicateBuilder::new(table.schema().fields());
+    let predicate = Predicate::And(vec![
+        b.equal("name", Datum::String("a".into())).unwrap(),
+        Predicate::And(vec![
+            b.greater_than("id", Datum::Int(1)).unwrap(),
+            b.equal("flag", Datum::Int(1)).unwrap(),
+        ]),
+    ]);
+    for _ in 0..2 {
+        assert_eq!(
+            composite_ranges(
+                &table,
+                std::slice::from_ref(&predicate),
+                i64::MAX,
+                GlobalIndexSearchMode::Fast
+            )
+            .await
+            .unwrap(),
+            vec![RowRange::new(3, 3)]
+        );
+        assert_eq!(scan_ids(&table, predicate.clone()).await, vec![4]);
+        // Repeat with a second composite definition instead of the scalar bitmap.
+        table
+            .new_global_index_drop_builder()
+            .with_index_column("flag")
+            .with_index_type("bitmap")
+            .execute()
+            .await
+            .unwrap();
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_columns(&["flag", "id"])
+            .execute()
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_composite_btree_combines_different_index_coverage() {
+    for independent_type in ["bitmap", "composite"] {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::string_type()))
+            .column("flag", DataType::Int(IntType::new()))
+            .options(table_options("2"))
+            .build()
+            .unwrap();
+        let table = Table::new(
+            FileIOBuilder::new("memory").build().unwrap(),
+            Identifier::new("default", independent_type),
+            format!("memory:/composite_partial_coverage_{independent_type}"),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        setup_dirs(&table).await;
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("name", ArrowDataType::Utf8, false),
+                ArrowField::new("flag", ArrowDataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b", "a", "b", "a", "b"])),
+                Arc::new(Int32Array::from(vec![1, 0, 0, 1, 0, 1])),
+            ],
+        )
+        .unwrap();
+        let mut writer = TableWrite::new(&table, "coverage-test".into()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        TableCommit::new(table.clone(), "coverage-test".into())
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_columns(&["name", "id"])
+            .execute()
+            .await
+            .unwrap();
+        let mut independent = table.new_btree_global_index_build_builder();
+        if independent_type == "bitmap" {
+            independent
+                .with_index_type("bitmap")
+                .with_index_column("flag");
+        } else {
+            independent.with_index_columns(&["flag", "id"]);
+        }
+        independent.execute().await.unwrap();
+        // Keep real persisted files, with (name,id) covering [0,3] and the
+        // independent flag definition covering [2,5]. Neither covers the table.
+        let (snapshot, entries) = composite_entries(&table).await;
+        let mut deletions = HashMap::<_, Vec<IndexFileMeta>>::new();
+        for entry in entries {
+            let meta = entry.index_file.global_index_meta.as_ref().unwrap();
+            if (meta.index_field_id == 1 && meta.row_range_start == 4)
+                || (meta.index_field_id == 2 && meta.row_range_start == 0)
+            {
+                deletions
+                    .entry((entry.partition, entry.bucket))
+                    .or_default()
+                    .push(entry.index_file);
+            }
+        }
+        assert_eq!(deletions.values().map(Vec::len).sum::<usize>(), 2);
+        let messages = deletions
+            .into_iter()
+            .map(|((partition, bucket), files)| {
+                let mut message = crate::table::CommitMessage::new(partition, bucket, vec![]);
+                message.deleted_index_files = files;
+                message
+            })
+            .collect();
+        TableCommit::new(table.clone(), "partial-coverage-test".into())
+            .commit_if_latest_snapshot(messages, snapshot.id())
+            .await
+            .unwrap();
+        let (_, entries) = composite_entries(&table).await;
+        for (field_id, expected) in [(1, RowRange::new(0, 3)), (2, RowRange::new(2, 5))] {
+            let ranges = entries
+                .iter()
+                .filter_map(|entry| {
+                    let meta = entry.index_file.global_index_meta.as_ref().unwrap();
+                    (meta.index_field_id == field_id)
+                        .then(|| RowRange::new(meta.row_range_start, meta.row_range_end))
+                })
+                .collect();
+            assert_eq!(merge_row_ranges(ranges), vec![expected]);
+        }
+        let b = PredicateBuilder::new(table.schema().fields());
+        let tuple = Predicate::and(vec![
+            b.equal("name", Datum::String("a".into())).unwrap(),
+            b.greater_than("id", Datum::Int(0)).unwrap(),
+        ]);
+        let flag = b.equal("flag", Datum::Int(1)).unwrap();
+        let ordinary = table.copy_with_options(HashMap::from([(
+            "global-index.enabled".into(),
+            "false".into(),
+        )]));
+        for (predicate, fast_ranges, complete_ranges, fast_ids, complete_ids) in [
+            (
+                Predicate::and(vec![tuple.clone(), flag.clone()]),
+                vec![],
+                vec![RowRange::new(0, 1), RowRange::new(4, 5)],
+                vec![],
+                vec![1],
+            ),
+            (
+                Predicate::or(vec![tuple, flag]),
+                vec![
+                    RowRange::new(0, 0),
+                    RowRange::new(2, 3),
+                    RowRange::new(5, 5),
+                ],
+                vec![RowRange::new(0, 5)],
+                vec![1, 3, 4, 6],
+                vec![1, 3, 4, 5, 6],
+            ),
+        ] {
+            assert_eq!(scan_ids(&ordinary, predicate.clone()).await, complete_ids);
+            for (mode, option) in [
+                (GlobalIndexSearchMode::Fast, "fast"),
+                (GlobalIndexSearchMode::Full, "full"),
+                (GlobalIndexSearchMode::Detail, "detail"),
+            ] {
+                let (ranges, ids) = if mode == GlobalIndexSearchMode::Fast {
+                    (&fast_ranges, &fast_ids)
+                } else {
+                    (&complete_ranges, &complete_ids)
+                };
+                assert_eq!(
+                    composite_ranges(&table, std::slice::from_ref(&predicate), i64::MAX, mode)
+                        .await
+                        .unwrap(),
+                    *ranges,
+                    "{independent_type}, {option}, {predicate:?}"
+                );
+                let indexed = table.copy_with_options(HashMap::from([(
+                    "global-index.search-mode".into(),
+                    option.into(),
+                )]));
+                assert_eq!(
+                    scan_ids(&indexed, predicate.clone()).await,
+                    *ids,
+                    "{independent_type}, {option}, {predicate:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_composite_btree_preserves_exact_column_names() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("a,b", DataType::VarChar(VarCharType::string_type()))
+        .column(" c ", DataType::Int(IntType::new()))
+        .options(table_options("10"))
+        .build()
+        .unwrap();
+    let table = Table::new(
+        FileIOBuilder::new("memory").build().unwrap(),
+        Identifier::new("default", "exact_names"),
+        "memory:/composite_exact_names".into(),
+        TableSchema::new(0, &schema),
+        None,
+    );
+    setup_dirs(&table).await;
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, false),
+            ArrowField::new("a,b", ArrowDataType::Utf8, false),
+            ArrowField::new(" c ", ArrowDataType::Int32, false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["x", "y"])),
+            Arc::new(Int32Array::from(vec![10, 20])),
+        ],
+    )
+    .unwrap();
+    let mut writer = TableWrite::new(&table, "name-test".into()).unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    TableCommit::new(table.clone(), "name-test".into())
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_columns(&["a,b", " c "])
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_column("a,b")
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        table
+            .new_btree_global_index_build_builder()
+            .with_index_column(" c ")
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+    let b = PredicateBuilder::new(table.schema().fields());
+    let point = Predicate::and(vec![
+        b.equal("a,b", Datum::String("x".into())).unwrap(),
+        b.equal(" c ", Datum::Int(10)).unwrap(),
+    ]);
+    assert_eq!(scan_ids(&table, point).await, vec![1]);
+    assert_eq!(
+        table
+            .new_global_index_drop_builder()
+            .with_index_columns(&["a,b", " c "])
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+    let (_, entries) = composite_entries(&table).await;
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| entry
+        .index_file
+        .global_index_meta
+        .as_ref()
+        .unwrap()
+        .extra_field_ids
+        .is_none()));
+    assert_eq!(
+        table
+            .new_global_index_drop_builder()
+            .with_index_column("a,b")
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        table
+            .new_global_index_drop_builder()
+            .with_index_column(" c ")
+            .execute()
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(table
+        .new_btree_global_index_build_builder()
+        .with_index_columns(&[])
+        .execute()
+        .await
+        .is_err());
+    assert!(table
+        .new_global_index_drop_builder()
+        .with_index_columns(&[])
+        .execute()
+        .await
+        .is_err());
+}

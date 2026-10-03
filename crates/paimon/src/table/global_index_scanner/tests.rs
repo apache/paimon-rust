@@ -1440,7 +1440,7 @@ fn test_unindexed_ranges_counts_extra_field_coverage() {
 }
 
 #[tokio::test]
-async fn test_evaluate_extra_field_only_without_composite_reader_falls_back() {
+async fn test_evaluate_composite_extra_field_only_without_left_prefix_falls_back() {
     let (file_io, table_path, file_name, _tmp) =
         setup_testdata_table("btree_int_100_no_compress.bin");
     let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
@@ -1459,7 +1459,7 @@ async fn test_evaluate_extra_field_only_without_composite_reader_falls_back() {
         .unwrap();
     assert!(
         result.is_none(),
-        "extra-field-only predicates must fall back until composite-key btree reads are supported"
+        "extra-field-only predicates must fall back without a constrained left prefix"
     );
 }
 
@@ -1781,6 +1781,52 @@ async fn test_evaluate_java_bitmap_golden_index_eq_and_null() {
             .await
             .unwrap();
     assert_eq!(null_result.unwrap(), vec![RowRange::new(104, 104)]);
+}
+
+#[tokio::test]
+async fn test_composite_prefers_fully_covering_leading_bitmap() {
+    let (file_io, table_path, file_name, meta, _tmp) = setup_java_bitmap_testdata_table();
+    let mut fields = string_schema_fields();
+    fields.push(DataField::new(
+        2,
+        "id".into(),
+        DataType::Int(crate::spec::IntType::new()),
+    ));
+    let key = |name: &str, id| {
+        crate::btree::serialize_composite_key(
+            &[Some(Datum::String(name.into())), Some(Datum::Int(id))],
+            &fields,
+        )
+        .unwrap()
+    };
+    let composite_meta = BTreeIndexMeta::new(Some(key("alpha", 0)), Some(key("office", 9)), false);
+    let mut composite =
+        make_global_index_entry("missing_composite.btree", 1, 100, 109, &composite_meta);
+    composite
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .extra_field_ids = Some(vec![2]);
+    let bitmap =
+        make_global_index_entry_with_type(BITMAP_GLOBAL_INDEX_TYPE, &file_name, 1, 100, 109, &meta);
+    let predicates = [Predicate::Leaf {
+        column: "name".into(),
+        index: 0,
+        data_type: fields[0].data_type().clone(),
+        op: PredicateOperator::Eq,
+        literals: vec![Datum::String("k2".into())],
+    }];
+    let result = evaluate_global_index_fast(
+        &file_io,
+        &table_path,
+        &[composite, bitmap],
+        &predicates,
+        &fields,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.unwrap(), vec![RowRange::new(105, 106)]);
 }
 
 async fn assert_bitmap_int_fixture(file_name: &str) {
@@ -2571,15 +2617,19 @@ async fn test_evaluate_global_index_and_uses_evaluated_field_coverage_for_raw_fa
     let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
     let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
 
-    let mut first = make_global_index_entry("index_part1.bin", 1, 0, 49, &meta);
-    first
+    let first = make_global_index_entry("index_part1.bin", 1, 0, 49, &meta);
+    // A separate tuple definition has narrower coverage and incompatible
+    // metadata. It must be declined without reading its keys as scalar INTs,
+    // and must not alter the coverage of the evaluated scalar definition.
+    let mut composite = make_global_index_entry("missing_composite.bin", 1, 0, 49, &meta);
+    composite
         .index_file
         .global_index_meta
         .as_mut()
         .unwrap()
         .extra_field_ids = Some(vec![2]);
     let second = make_global_index_entry("index_part2.bin", 1, 50, 99, &meta);
-    let entries = vec![first, second];
+    let entries = vec![first, second, composite];
     let fields = two_field_schema_fields();
 
     let predicates = vec![Predicate::and(vec![

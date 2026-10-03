@@ -220,6 +220,58 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
         Ok(result)
     }
 
+    /// Seek to each virtual tuple boundary; NULLs in individual components are
+    /// ordinary tuple keys and never use the scalar NULL bitmap.
+    pub(crate) async fn query_composite(
+        &self,
+        plan: &super::CompositePlan,
+    ) -> io::Result<RoaringTreemap> {
+        let mut result = RoaringTreemap::new();
+        for interval in &plan.intervals {
+            if let Some(key) = &interval.point_key {
+                result |= self.query_equal(key).await?;
+                continue;
+            }
+            let cmp = |key: &[u8], _: &[u8]| {
+                interval
+                    .lower
+                    .compare_key(key, &plan.codec)
+                    .map_err(key_comparison_io_error)
+            };
+            let (_, mut index_iter) = self.sst_reader.index_block().seek_and_iter(&[], &cmp)?;
+            let mut first = true;
+            while let Some((_, handle_bytes)) = index_iter.next() {
+                let handle = BlockHandle::decode(handle_bytes)?;
+                let block = self.read_data_block(&handle).await?;
+                let mut offset = if first {
+                    first = false;
+                    block.seek_and_iter(&[], &cmp)?.1.offset
+                } else {
+                    0
+                };
+                let mut done = false;
+                while offset < block.data.len() {
+                    let (key, value, next) = block.read_entry_at(offset);
+                    offset = next;
+                    if interval
+                        .upper
+                        .compare_key(key, &plan.codec)
+                        .map_err(key_comparison_io_error)?
+                        != Ordering::Less
+                    {
+                        done = true;
+                        break;
+                    }
+                    posting_list::add_to(value, self.file_version, &mut result)?;
+                }
+                if done {
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Range query: returns a bitmap of all row ids whose keys fall in [from, to]
     /// with configurable inclusivity. Reads data blocks on demand.
     pub async fn range_query(

@@ -33,6 +33,7 @@ use super::query_plan::{
 use super::row_ranges::unindexed_ranges_for_coverage;
 use super::row_ranges::{bitmap_to_ranges, intersect_sorted_ranges};
 use super::GlobalIndexScanner;
+use crate::btree::key_serde::normalize_key_literal;
 use crate::btree::query::extract_between;
 use crate::btree::{make_key_comparator, serialize_datum};
 #[cfg(test)]
@@ -44,6 +45,7 @@ use crate::table::bitmap_global_index_format::{
 use crate::table::RowRange;
 use crate::{Error, Result};
 use futures::{StreamExt, TryStreamExt};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::future::Future;
 
@@ -79,6 +81,31 @@ where
 }
 
 impl GlobalIndexScanner {
+    fn predicate_within_fields(
+        &self,
+        predicate: &Predicate,
+        fields: &HashSet<i32>,
+    ) -> Result<bool> {
+        match predicate {
+            Predicate::Leaf { column, .. } => Ok(self
+                .find_field_id_by_name(column)?
+                .is_some_and(|id| fields.contains(&id))),
+            Predicate::And(children) | Predicate::Or(children) => {
+                if children.is_empty() {
+                    return Ok(false);
+                }
+                for child in children {
+                    if !self.predicate_within_fields(child, fields)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Predicate::Not(inner) => self.predicate_within_fields(inner, fields),
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => Ok(false),
+        }
+    }
+
     /// Evaluate a predicate against the global indexes and return matching row ranges.
     /// Returns `None` if the predicate cannot be evaluated by the global index.
     pub(super) fn evaluate<'a>(&'a self, predicate: &'a Predicate) -> EvaluateFuture<'a> {
@@ -89,6 +116,11 @@ impl GlobalIndexScanner {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         Box::pin(async move {
+            if !matches!(predicate, Predicate::And(_)) {
+                if let Some(composite) = self.evaluate_composite(predicate).await? {
+                    return Ok(Some(composite.result));
+                }
+            }
             match predicate {
                 Predicate::Leaf {
                     column,
@@ -124,13 +156,51 @@ impl GlobalIndexScanner {
                             })
                         })
                 }
-                Predicate::And(children) => {
+                Predicate::And(_) => {
+                    let mut children = predicate.clone().split_and();
+                    let mut row_ranges: Option<Vec<RowRange>> = None;
+                    let mut indexed_coverage: Option<Vec<RowRange>> = None;
+                    let mut evaluated_field_ids = HashSet::new();
+                    loop {
+                        let remaining_predicate = Predicate::And(children.clone());
+                        let Some(composite) = self.evaluate_composite(&remaining_predicate).await?
+                        else {
+                            break;
+                        };
+                        let result = composite.result;
+                        row_ranges = Some(match row_ranges {
+                            None => result.row_ranges,
+                            Some(existing) => {
+                                intersect_sorted_ranges(&existing, &result.row_ranges)
+                            }
+                        });
+                        indexed_coverage = Some(match indexed_coverage {
+                            None => result.indexed_coverage,
+                            Some(existing) => {
+                                intersect_sorted_ranges(&existing, &result.indexed_coverage)
+                            }
+                        });
+                        evaluated_field_ids.extend(result.evaluated_field_ids);
+                        // Java keeps suffix constraints on this tuple as data
+                        // filters, then continues planning independent indexes.
+                        let previous_len = children.len();
+                        let mut remaining = Vec::new();
+                        for child in children {
+                            if !self.predicate_within_fields(&child, &composite.key_field_ids)? {
+                                remaining.push(child);
+                            }
+                        }
+                        children = remaining;
+                        if children.len() == previous_len || children.is_empty() {
+                            break;
+                        }
+                    }
                     // Group leaf predicates by field_id to reuse readers
                     let mut leaf_groups: std::collections::HashMap<i32, Vec<PredicateTuple<'_>>> =
                         std::collections::HashMap::new();
                     let mut non_leaf_children = Vec::new();
 
-                    for child in children {
+                    for child in &children {
                         if let Predicate::Leaf {
                             column,
                             op,
@@ -193,7 +263,7 @@ impl GlobalIndexScanner {
                         try_fold_bounded(
                             leaf_futures,
                             leaf_group_count.max(1),
-                            (None::<Vec<RowRange>>, None::<Vec<RowRange>>, HashSet::new()),
+                            (row_ranges, indexed_coverage, evaluated_field_ids),
                             |(row_ranges, indexed_coverage, evaluated_field_ids),
                              (field_id, result)| {
                                 if let Some((ranges, coverage)) = result {
@@ -289,7 +359,7 @@ impl GlobalIndexScanner {
         entries: &[&GlobalIndexEntry],
         predicates: &[(PredicateOperator, &[Datum], &DataType)],
     ) -> Result<Option<(Vec<RowRange>, Vec<RowRange>)>> {
-        let normalized_predicates = predicates
+        let Some(normalized_predicates) = predicates
             .iter()
             .map(|(op, literals, data_type)| {
                 let key_type = if is_multivalue_predicate(*op) {
@@ -305,10 +375,30 @@ impl GlobalIndexScanner {
                 } else {
                     *data_type
                 };
-                Ok((*op, *literals, key_type))
+                let mut literals = Cow::Borrowed(*literals);
+                if matches!(
+                    key_type,
+                    DataType::Decimal(_)
+                        | DataType::Timestamp(_)
+                        | DataType::LocalZonedTimestamp(_)
+                ) {
+                    for literal in literals.to_mut() {
+                        if !normalize_key_literal(literal, key_type) {
+                            return Ok(None);
+                        }
+                    }
+                }
+                Ok(Some((*op, literals, key_type)))
             })
-            .collect::<Result<Vec<_>>>()?;
-        let predicates = normalized_predicates.as_slice();
+            .collect::<Result<Option<Vec<_>>>>()?
+        else {
+            return Ok(None);
+        };
+        let predicates = normalized_predicates
+            .iter()
+            .map(|(op, literals, data_type)| (*op, literals.as_ref(), *data_type))
+            .collect::<Vec<_>>();
+        let predicates = predicates.as_slice();
         // Try to detect between pattern and split into (between, remaining)
         let (between, remaining) = extract_between(predicates);
 

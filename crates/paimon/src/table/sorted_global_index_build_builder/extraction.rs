@@ -35,18 +35,32 @@ use std::cmp::Ordering;
 pub(super) async fn extract_index_rows(
     table: &Table,
     shard: &SortedGlobalIndexShard,
-    index_column: &str,
-    index_field: &DataField,
+    index_fields: &[&DataField],
     index_type: &str,
     serialize_key: SerializeKeyFn,
 ) -> Result<Vec<SortedIndexKeyRow>> {
     let splits = build_read_splits_for_shard(shard)?;
 
     let mut read_builder = table.new_read_builder();
-    read_builder.with_projection(&[index_column, ROW_ID_FIELD_NAME])?;
+    let mut projection = index_fields
+        .iter()
+        .map(|field| field.name())
+        .collect::<Vec<_>>();
+    projection.push(ROW_ID_FIELD_NAME);
+    read_builder.with_projection(&projection)?;
     let read = read_builder.new_read()?;
     let batches = read.to_arrow(&splits)?.try_collect::<Vec<_>>().await?;
     let expected_row_count = checked_row_count(shard.row_range_start, shard.row_range_end)?;
+    let index_field = index_fields[0];
+    let index_column = index_field.name();
+    if index_fields.len() > 1 {
+        return extract_composite_index_rows_from_batches(
+            &batches,
+            index_fields,
+            shard.row_range_start,
+            expected_row_count,
+        );
+    }
     if index_type == MULTIVALUE_GLOBAL_INDEX_TYPE {
         let DataType::Array(array_type) = index_field.data_type() else {
             unreachable!("multivalue field was validated before extraction")
@@ -69,6 +83,81 @@ pub(super) async fn extract_index_rows(
             serialize_key,
         )
     }
+}
+
+fn extract_composite_index_rows_from_batches(
+    batches: &[RecordBatch],
+    fields: &[&DataField],
+    row_range_start: i64,
+    expected_row_count: i64,
+) -> Result<Vec<SortedIndexKeyRow>> {
+    let fields = fields
+        .iter()
+        .map(|field| (*field).clone())
+        .collect::<Vec<_>>();
+    let codec = crate::btree::CompositeKeyCodec::new(&fields);
+    let mut expected_row_id = row_range_start;
+    let mut rows = Vec::new();
+    for batch in batches {
+        let indices = fields
+            .iter()
+            .map(|field| batch.schema().index_of(field.name()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Error::DataInvalid {
+                message: format!("Composite index column missing: {error}"),
+                source: None,
+            })?;
+        let row_id_index = batch
+            .schema()
+            .index_of(ROW_ID_FIELD_NAME)
+            .map_err(|error| Error::DataInvalid {
+                message: format!("_ROW_ID column missing: {error}"),
+                source: None,
+            })?;
+        let row_ids = batch
+            .column(row_id_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| Error::DataInvalid {
+                message: "Composite index requires Int64 _ROW_ID".into(),
+                source: None,
+            })?;
+        for row in 0..batch.num_rows() {
+            if row_ids.is_null(row) || row_ids.value(row) != expected_row_id {
+                return Err(Error::DataInvalid {
+                    message: format!("Composite index expected non-null _ROW_ID {expected_row_id}"),
+                    source: None,
+                });
+            }
+            let values = fields
+                .iter()
+                .zip(&indices)
+                .map(|(field, index)| {
+                    extract_datum_from_arrow(batch, row, *index, field.data_type())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rows.push((
+                Some(codec.serialize(&values)?),
+                expected_row_id - row_range_start,
+            ));
+            expected_row_id = expected_row_id
+                .checked_add(1)
+                .ok_or_else(|| Error::DataInvalid {
+                    message: "Composite index row ID overflow".into(),
+                    source: None,
+                })?;
+        }
+    }
+    if expected_row_id - row_range_start != expected_row_count {
+        return Err(Error::DataInvalid {
+            message: format!(
+                "Composite index expected {expected_row_count} rows, got {}",
+                rows.len()
+            ),
+            source: None,
+        });
+    }
+    Ok(rows)
 }
 
 pub(super) fn build_read_splits_for_shard(
