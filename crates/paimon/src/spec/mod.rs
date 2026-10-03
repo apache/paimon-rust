@@ -114,6 +114,7 @@ pub(crate) use predicate::extract_datum;
 pub(crate) use predicate::like_match;
 #[cfg(test)]
 pub(crate) use predicate::row_id_leaf;
+pub(crate) use predicate::validate_datum_matches_type;
 pub use predicate::{
     field_idx_to_partition_idx, Datum, Predicate, PredicateBuilder, PredicateOperator, Transform,
     TransformInput,

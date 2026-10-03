@@ -21,6 +21,7 @@
 //! Reference: [org.apache.paimon.index.GlobalIndexScanner](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/index/GlobalIndexScanner.java)
 
 mod all_match;
+mod composite;
 mod deletion_vectors;
 mod entry;
 mod evaluator;
@@ -124,6 +125,9 @@ pub(crate) struct GlobalIndexScanner {
     fm_read_context: Arc<FMReadContext>,
     /// Global index entries grouped by field_id.
     entries_by_field: Vec<(i32, Vec<GlobalIndexEntry>)>,
+    /// Composite BTree files grouped by the full ordered definition. These
+    /// must never be passed to a scalar reader for their leading column.
+    composite_entries: Vec<(Vec<i32>, Vec<GlobalIndexEntry>)>,
     /// Indexed row-id coverage grouped by field_id.
     #[cfg(test)]
     coverage_by_field: HashMap<i32, Vec<RowRange>>,
@@ -192,6 +196,7 @@ impl GlobalIndexScanner {
         }
         let mut entries_by_field: std::collections::HashMap<i32, Vec<GlobalIndexEntry>> =
             std::collections::HashMap::new();
+        let mut composite_entries: HashMap<Vec<i32>, Vec<GlobalIndexEntry>> = HashMap::new();
         #[cfg(test)]
         let mut coverage_by_field: HashMap<i32, Vec<RowRange>> = HashMap::new();
 
@@ -305,15 +310,26 @@ impl GlobalIndexScanner {
                 }
             }
 
-            entries_by_field
-                .entry(global_meta.index_field_id)
-                .or_default()
-                .push(resolved);
+            if kind == GlobalIndexFileKind::BTree
+                && global_meta
+                    .extra_field_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.is_empty())
+            {
+                let mut ids = vec![global_meta.index_field_id];
+                ids.extend(global_meta.extra_field_ids.as_ref().unwrap());
+                composite_entries.entry(ids).or_default().push(resolved);
+            } else {
+                entries_by_field
+                    .entry(global_meta.index_field_id)
+                    .or_default()
+                    .push(resolved);
+            }
         }
 
         validate_fm_file_sets(&entries_by_field)?;
 
-        if entries_by_field.is_empty() {
+        if entries_by_field.is_empty() && composite_entries.is_empty() {
             return Ok(None);
         }
 
@@ -328,6 +344,7 @@ impl GlobalIndexScanner {
             fm_read_options,
             fm_read_context: Arc::new(FMReadContext::new(fm_read_options.cache_size)),
             entries_by_field: entries_by_field.into_iter().collect(),
+            composite_entries: composite_entries.into_iter().collect(),
             #[cfg(test)]
             coverage_by_field,
             schema_fields: schema_fields.to_vec(),
@@ -386,7 +403,6 @@ pub(crate) async fn evaluate_global_index(
         Some(s) => s,
         None => return Ok(None),
     };
-
     let combined = Predicate::and(evaluation.predicates.to_vec());
 
     let scan_result = match scanner.evaluate(&combined).await? {

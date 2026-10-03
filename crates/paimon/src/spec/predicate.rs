@@ -1541,7 +1541,7 @@ impl PredicateBuilder {
 ///
 /// This is a fail-fast check at predicate construction time, preventing
 /// type mismatches from propagating to evaluators.
-fn validate_datum_matches_type(datum: &Datum, data_type: &DataType) -> Result<()> {
+pub(crate) fn validate_datum_matches_type(datum: &Datum, data_type: &DataType) -> Result<()> {
     let ok = matches!(
         (datum, data_type),
         (Datum::Bool(_), DataType::Boolean(_))

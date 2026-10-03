@@ -59,6 +59,7 @@ pub(super) fn validate_table_options(table: &Table, core_options: &CoreOptions) 
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn find_index_field<'a>(table: &'a Table, column: &str) -> Result<&'a DataField> {
     table
         .schema()

@@ -42,3 +42,38 @@ Rust tests read the Java files and compare the Rust V2 writer's uncompressed
 output byte-for-byte with the Java fixture. A writer/reader round-trip alone
 would not catch incompatible posting tags, portable bitmap layout, or footer
 versions.
+
+## Composite BTree interoperability fixtures
+
+`btree_composite_v{1,2}_java_{none,lz4}.bin` and their `.meta` files were
+produced by `GenerateCompositeBTree.java` with the current Java
+`CompositeKeySerializer` and production `BTreeIndexWriter`, and verified by
+regenerating all files against the current Java sources. The verified serializer
+source SHA-256 is `f2cddf1eb63e81046dd25ad6a35a39f28a1e014cb603be0f44ecc603f14d547e`.
+The keys use `RowCompactedSerializer` bytes with a canonical INSERT header.
+
+Each fixture has 45 `(STRING, INT, STRING)` tuples: categories NULL/a/b,
+items NULL/-2/0/1/2, and tags NULL/empty/z. Tuple ordinal `i` has postings
+`i` and `i + 1000`; all-NULL tuples are ordinary keys. Uncompressed files use
+64-byte blocks to exercise seeks across blocks; LZ4 files use 512-byte blocks
+to ensure real compression. Rust tests compare queries with ordinary
+row filtering and compare uncompressed Rust output byte-for-byte with Java.
+
+Compile against the current Java classes and runtime dependencies (including
+RoaringBitmap, aircompressor, LZ4, and SLF4J). When Java target classes are stale,
+compile the relevant sources into the helper's output directory first:
+
+```sh
+javac -cp "$PAIMON_CLASSPATH" -d "$CLASSES_DIR" \
+  "$PAIMON_SOURCE/paimon-common/src/main/java/org/apache/paimon/data/serializer/RowCompactedSerializer.java" \
+  "$PAIMON_SOURCE/paimon-common/src/main/java/org/apache/paimon/globalindex/KeySerializer.java" \
+  "$PAIMON_SOURCE/paimon-common/src/main/java/org/apache/paimon/globalindex/CompositeKeySerializer.java" \
+  "$PAIMON_SOURCE/paimon-common/src/main/java/org/apache/paimon/globalindex/btree/BTreeIndexWriter.java" \
+  GenerateCompositeBTree.java
+java -cp "$CLASSES_DIR:$PAIMON_CLASSPATH" \
+  org.apache.paimon.globalindex.btree.GenerateCompositeBTree .
+```
+
+`btree_composite_java_scalar.key` covers BOOLEAN, TINYINT, SMALLINT, INT,
+BIGINT, canonical FLOAT/DOUBLE NaNs, non-compact DECIMAL(20,2), TIMESTAMP(6),
+UTF-8 strings and a NULL suffix across multiple header bytes.
