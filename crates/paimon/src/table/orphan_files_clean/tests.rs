@@ -586,6 +586,8 @@ async fn test_vanished_owner_is_skipped_but_a_tag_aborts() {
     let clean = super::Clean {
         file_io: table.file_io().clone(),
         table_location: table.location().to_string(),
+        data_location: table.data_file_location(),
+        data_directory: None,
         older_than: 0,
     };
     let path = format!("{}/manifest/missing", table.location());
@@ -642,5 +644,146 @@ async fn test_writer_temporary_snapshot_files_are_removed() {
             .collect::<BTreeSet<_>>()
     );
     assert!(after.contains("snapshot/snapshot-1"));
+    assert_eq!(read_ids(&table).await, vec![1]);
+}
+
+fn walk_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return out;
+    }
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk_files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_format_table_is_rejected_and_its_files_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .option("type", "format-table")
+        .option("file.format", "parquet")
+        .build()
+        .unwrap();
+    let table = setup_with(&dir, schema).await;
+    let rows = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int32,
+            true,
+        )])),
+        vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+    )
+    .unwrap();
+    let builder = table.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    write.write_arrow_batch(&rows).await.unwrap();
+    builder
+        .new_commit()
+        .commit(write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    // Put the data file where the reviewer's table had it: bucket-0/part-0.parquet.
+    let written = walk_files(dir.path())
+        .into_iter()
+        .find(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .expect("format table data file");
+    std::fs::create_dir_all(dir.path().join("bucket-0")).unwrap();
+    let live = dir.path().join("bucket-0/part-0.parquet");
+    std::fs::rename(&written, &live).unwrap();
+    assert_eq!(read_ids(&table).await, vec![1, 2]);
+
+    let err = table
+        .new_remove_orphan_files()
+        .with_current_time_millis(current_time_millis() + 2 * DAY_MS)
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Unsupported { ref message } if message.contains("format-table")),
+        "{err:?}"
+    );
+    assert!(
+        live.exists(),
+        "a live Format Table file must not be deleted"
+    );
+    assert_eq!(read_ids(&table).await, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn test_relative_data_directory_is_scanned() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = base_schema()
+        .option("data-file.path-directory", "data")
+        .build()
+        .unwrap();
+    let table = setup_with(&dir, schema).await;
+    commit(&table, &[1], "a", false).await;
+    let bucket = bucket_dir(&dir);
+    assert_eq!(bucket, "data/bucket-0");
+    let orphan = plant(&dir, &format!("{bucket}/data-orphan.parquet"));
+
+    let result = clean_later(&table, false).await;
+    assert_eq!(relative(&dir, &result), BTreeSet::from([orphan]));
+    assert_eq!(read_ids(&table).await, vec![1]);
+}
+
+#[tokio::test]
+async fn test_entropy_injected_external_files_are_scanned() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = tempfile::tempdir().unwrap();
+    let external_root = format!("file://{}", external.path().display());
+    let schema = base_schema()
+        .option("data-file.external-paths", external_root.as_str())
+        .option("data-file.external-paths.strategy", "entropy-inject")
+        .build()
+        .unwrap();
+    let table = setup_with(&dir, schema).await;
+    commit(&table, &[1], "a", false).await;
+    let live = walk_files(external.path());
+    assert_eq!(live.len(), 1, "{live:?}");
+    let orphan = live[0].parent().unwrap().join("data-orphan.parquet");
+    std::fs::write(&orphan, b"orphan").unwrap();
+
+    let result = clean_later(&table, false).await;
+    assert_eq!(result.deleted_file_count, 1, "{:?}", result.deleted_files);
+    assert!(!orphan.exists());
+    assert!(live[0].exists());
+    assert_eq!(read_ids(&table).await, vec![1]);
+}
+
+#[tokio::test]
+async fn test_absolute_data_directory_is_scanned() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let schema = base_schema()
+        .option(
+            "data-file.path-directory",
+            format!("file://{}", data.path().display()).as_str(),
+        )
+        .build()
+        .unwrap();
+    let table = setup_with(&dir, schema).await;
+    commit(&table, &[1], "a", false).await;
+    let live = walk_files(data.path());
+    assert_eq!(
+        live.len(),
+        1,
+        "data lives outside the table directory: {live:?}"
+    );
+    let orphan = live[0].parent().unwrap().join("data-orphan.parquet");
+    std::fs::write(&orphan, b"orphan").unwrap();
+
+    let result = clean_later(&table, false).await;
+    assert_eq!(result.deleted_file_count, 1, "{:?}", result.deleted_files);
+    assert!(!orphan.exists());
+    assert!(live[0].exists());
     assert_eq!(read_ids(&table).await, vec![1]);
 }

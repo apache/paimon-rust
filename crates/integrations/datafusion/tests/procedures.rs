@@ -1133,6 +1133,56 @@ async fn test_remove_orphan_files_procedure() {
 }
 
 #[tokio::test]
+async fn test_remove_orphan_files_procedure_rejects_format_tables() {
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.orph_fmt (id INT, name VARCHAR(100)) WITH (\
+            'type' = 'format-table',\
+            'file.format' = 'parquet'\
+        )",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.orph_fmt VALUES (1, 'a'), (2, 'b')",
+    )
+    .await;
+    let files_before = walk(&tmp.path().join("test_db.db/orph_fmt"));
+    assert!(!files_before.is_empty());
+
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let older_than = now_millis() - 200;
+    assert_sql_error(
+        &sql_context,
+        &format!(
+            "CALL sys.remove_orphan_files(table => 'test_db.orph_fmt', older_than => '{older_than}')"
+        ),
+        "only supports Paimon tables",
+    )
+    .await;
+    assert_eq!(walk(&tmp.path().join("test_db.db/orph_fmt")), files_before);
+    assert_eq!(
+        row_count(&sql_context, "SELECT * FROM paimon.test_db.orph_fmt").await,
+        2
+    );
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test]
 async fn test_remove_orphan_files_procedure_rejects_bad_arguments() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
     for (sql, expected) in [
