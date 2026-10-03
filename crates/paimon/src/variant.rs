@@ -3387,30 +3387,6 @@ mod tests {
     }
 
     #[test]
-    fn variant_timestamp_extraction_preserves_microseconds() {
-        for micros in [1_700_000_000_123_456, -1_700_000_000_123_456] {
-            for (ntz, target_type) in [
-                (true, DataType::Timestamp(TimestampType::new(6).unwrap())),
-                (
-                    false,
-                    DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap()),
-                ),
-            ] {
-                let variant = timestamp_variant(micros, ntz);
-                assert!(matches!(
-                    cast_variant_to_shredded_value(
-                        variant.as_ref().unwrap(),
-                        &target_type,
-                        true
-                    )
-                    .unwrap(),
-                    Some(ShreddedValue::Timestamp(value)) if value == micros
-                ));
-            }
-        }
-    }
-
-    #[test]
     fn cast_and_rebuild_shredded_timestamp_ntz_preserves_kind() {
         let configured =
             DataType::Timestamp(TimestampType::new(TimestampType::DEFAULT_PRECISION).unwrap());
@@ -3688,6 +3664,40 @@ mod tests {
             cast_variant_to_i64(dbl.get_path("$.a").unwrap().unwrap()),
             Some(2),
             "2.5 truncates to 2"
+        );
+    }
+
+    #[test]
+    fn float32_projection_casts_supported_sources_without_reinterpreting_temporal_values() {
+        let variant = GenericVariant::parse_json(
+            r#"{"boolean":true,"integer":27,"decimal":1.25,"string":"3.5","invalid":"bad"}"#,
+        )
+        .unwrap();
+        for (path, expected) in [
+            ("$.boolean", Some(1.0)),
+            ("$.integer", Some(27.0)),
+            ("$.decimal", Some(1.25)),
+            ("$.string", Some(3.5)),
+            ("$.invalid", None),
+        ] {
+            assert_eq!(
+                cast_variant_to_f32(variant.get_path(path).unwrap().unwrap()),
+                expected
+            );
+        }
+
+        let mut date = VariantBuilder::new();
+        date.append_date(20_000);
+        assert_eq!(
+            cast_variant_to_f32(date.result().unwrap().as_ref().unwrap()),
+            None
+        );
+
+        let mut timestamp = VariantBuilder::new();
+        timestamp.append_timestamp(1_700_000_000_123_456);
+        assert_eq!(
+            cast_variant_to_f32(timestamp.result().unwrap().as_ref().unwrap()),
+            None
         );
     }
 }

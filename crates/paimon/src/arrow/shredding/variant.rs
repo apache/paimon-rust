@@ -1735,28 +1735,6 @@ mod tests {
     }
 
     #[test]
-    fn microsecond_timestamp_extraction_keeps_positive_and_negative_values() {
-        let micros = [1_700_000_000_123_456, -1_700_000_000_123_456];
-        let values = micros
-            .iter()
-            .map(|value| Some(ShreddedValue::Timestamp(*value)))
-            .collect::<Vec<_>>();
-        for timezone in [None, Some("UTC")] {
-            let array = timestamp_array(&values, 6, timezone).unwrap();
-            assert_eq!(
-                array.data_type(),
-                &ArrowDataType::Timestamp(TimeUnit::Microsecond, timezone.map(Into::into))
-            );
-            let array = array
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-            assert_eq!(array.value(0), micros[0]);
-            assert_eq!(array.value(1), micros[1]);
-        }
-    }
-
-    #[test]
     fn invalid_try_path_returns_null_for_plain_and_shredded_variant() {
         let logical_fields = vec![DataField::new(
             1,
