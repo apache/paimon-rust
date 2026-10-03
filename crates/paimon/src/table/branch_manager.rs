@@ -69,18 +69,18 @@ impl BranchManager {
     /// - Cannot be blank or whitespace only
     /// - Cannot be a pure numeric string
     fn validate_branch_name(branch_name: &str) -> crate::Result<()> {
+        // Enforce the same name contract the catalog/table reader applies
+        // (`copy_with_branch` and `$branch_...` resolution): reject blank,
+        // `.`/`..`, path separators and control characters. A name accepted here
+        // must be openable by a reader; otherwise create/rename/delete would move
+        // metadata under a directory the table API can never resolve.
+        crate::catalog::validate_branch_name(branch_name)?;
         if branch_name == DEFAULT_MAIN_BRANCH {
             return Err(crate::Error::DataInvalid {
                 message: format!(
                     "Branch name '{}' is the default branch and cannot be used.",
                     DEFAULT_MAIN_BRANCH
                 ),
-                source: None,
-            });
-        }
-        if branch_name.trim().is_empty() {
-            return Err(crate::Error::DataInvalid {
-                message: format!("Branch name '{}' is blank.", branch_name),
                 source: None,
             });
         }
@@ -211,6 +211,10 @@ impl BranchManager {
                 source: None,
             });
         }
+        // Validate the source name before touching the filesystem: a malformed
+        // logical name like `b1/schema` would otherwise rename a branch's inner
+        // directory, not the branch, orphaning its metadata.
+        Self::validate_branch_name(from)?;
         if !self.branch_exists(from).await? {
             return Err(crate::Error::DataInvalid {
                 message: format!("Branch name '{}' doesn't exist.", from),
@@ -392,7 +396,7 @@ mod tests {
         let result = BranchManager::validate_branch_name("");
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("blank"));
+        assert!(msg.contains("empty"), "got: {msg}");
     }
 
     #[tokio::test]
@@ -407,6 +411,30 @@ mod tests {
     async fn test_validate_branch_name_accepts_valid() {
         assert!(BranchManager::validate_branch_name("my_branch").is_ok());
         assert!(BranchManager::validate_branch_name("branch-1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_branch_name_rejects_path_separator() {
+        // A '/'-bearing rename target creates an unlistable, orphaned branch.
+        for name in ["b1/hidden", "a\\b"] {
+            let result = BranchManager::validate_branch_name(name);
+            assert!(result.is_err(), "'{name}' should be rejected");
+            let msg = format!("{}", result.unwrap_err());
+            assert!(msg.contains("path separator"), "got: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_validate_branch_name_rejects_reader_unopenable_names() {
+        // Names the catalog/table reader rejects (`.`, `..`, control chars) must
+        // also be rejected here, so a created/renamed branch is always openable
+        // via `copy_with_branch` / `$branch_...`.
+        for name in [".", "..", "a\u{0007}b", "a\u{001C}b"] {
+            assert!(
+                BranchManager::validate_branch_name(name).is_err(),
+                "{name:?} should be rejected"
+            );
+        }
     }
 
     #[tokio::test]
