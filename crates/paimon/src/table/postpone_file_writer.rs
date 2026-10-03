@@ -30,7 +30,8 @@ use crate::io::FileIO;
 use crate::resource::ResourceContext;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    data_file_to_file_index_file_name, DataFileMeta, EMPTY_SERIALIZED_ROW, VALUE_KIND_FIELD_NAME,
+    data_file_to_file_index_file_name, BinaryRow, DataField, DataFileMeta, RowKind,
+    EMPTY_SERIALIZED_ROW, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
 use crate::table::kv_file_writer::build_physical_schema;
@@ -48,6 +49,9 @@ pub(crate) struct PostponeWriteConfig {
     pub bucket: i32,
     pub schema_id: i64,
     pub target_file_size: i64,
+    pub target_file_row_num: i64,
+    pub primary_key_indices: Vec<usize>,
+    pub value_fields: Vec<DataField>,
     pub file_compression: String,
     pub file_compression_zstd_level: i32,
     pub write_buffer_size: i64,
@@ -61,7 +65,7 @@ pub(crate) struct PostponeWriteConfig {
 ///
 /// Streams data directly to a FormatFileWriter in arrival order (no sort/dedup),
 /// prepending `_SEQUENCE_NUMBER` and `_VALUE_KIND` columns to each batch.
-/// Rolls to a new file when `target_file_size` is reached.
+/// Rolls after a batch reaches the configured size or row limit.
 pub(crate) struct PostponeFileWriter {
     paths: DataFilePathFactory,
     file_io: FileIO,
@@ -71,9 +75,7 @@ pub(crate) struct PostponeFileWriter {
     current_index: Option<DataFileIndexWriter>,
     current_file_name: Option<String>,
     current_file_path: Option<DataFilePath>,
-    current_row_count: i64,
-    /// Sequence number at which the current file started.
-    current_file_start_seq: i64,
+    current_stats: PostponeFileStats,
     /// Timestamp captured when the current file was opened (used for deterministic replay order).
     current_file_creation_time: DateTime<Utc>,
     written_files: Vec<DataFileMeta>,
@@ -100,8 +102,7 @@ impl PostponeFileWriter {
             current_index: None,
             current_file_name: None,
             current_file_path: None,
-            current_row_count: 0,
-            current_file_start_seq: 0,
+            current_stats: PostponeFileStats::default(),
             current_file_creation_time: Utc::now(),
             written_files: Vec::new(),
             created_paths: Vec::new(),
@@ -186,10 +187,12 @@ impl PostponeFileWriter {
             index.write(&logical_batch)?;
         }
         self.next_sequence_number = end_seq + 1;
-        self.current_row_count += num_rows as i64;
+        self.current_stats
+            .add_batch(batch, &self.config, start_seq, end_seq)?;
 
         // Roll to a new file if target size is reached — close in background
         if self.current_writer.as_ref().unwrap().num_bytes() as i64 >= self.config.target_file_size
+            || self.current_stats.row_count >= self.config.target_file_row_num
         {
             self.roll_file();
         }
@@ -235,6 +238,10 @@ impl PostponeFileWriter {
             })??;
             self.written_files.push(meta);
         }
+        // Java replays postpone files by millisecond creation time, retaining
+        // manifest order for ties. Background closes must not reorder arrivals.
+        self.written_files
+            .sort_by_key(|file| file.min_sequence_number);
         self.created_paths.clear();
         Ok(std::mem::take(&mut self.written_files))
     }
@@ -255,10 +262,7 @@ impl PostponeFileWriter {
             .file_index_options
             .as_ref()
             .map(|options| options.in_manifest_threshold);
-        let row_count = self.current_row_count;
-        let min_seq = self.current_file_start_seq;
-        let max_seq = self.next_sequence_number - 1;
-        self.current_row_count = 0;
+        let stats = std::mem::take(&mut self.current_stats);
         let schema_id = self.config.schema_id;
         // Capture creation_time from when the file was opened, not when the async close finishes.
         // Java's postpone compaction sorts by creationTime for replay order.
@@ -266,15 +270,7 @@ impl PostponeFileWriter {
 
         self.in_flight_closes.spawn(async move {
             let file_size = writer.close().await?.file_size as i64;
-            let mut meta = build_meta(
-                file_name,
-                file_size,
-                row_count,
-                min_seq,
-                max_seq,
-                schema_id,
-                creation_time,
-            );
+            let mut meta = build_meta(file_name, file_size, stats, schema_id, creation_time);
             meta.external_path = location.external_path;
             write_index(index, threshold, &file_io, &bucket_dir, &mut meta).await?;
             Ok(meta)
@@ -322,8 +318,7 @@ impl PostponeFileWriter {
         self.current_index = index;
         self.current_file_name = Some(file_name);
         self.current_file_path = Some(location);
-        self.current_row_count = 0;
-        self.current_file_start_seq = self.next_sequence_number;
+        self.current_stats = PostponeFileStats::default();
         self.current_file_creation_time = Utc::now();
         Ok(())
     }
@@ -335,19 +330,13 @@ impl PostponeFileWriter {
         };
         let file_name = self.current_file_name.take().unwrap();
         let index = self.current_index.take();
-        let row_count = self.current_row_count;
-        self.current_row_count = 0;
+        let stats = std::mem::take(&mut self.current_stats);
         let file_size = writer.close().await?.file_size as i64;
-
-        let min_seq = self.current_file_start_seq;
-        let max_seq = self.next_sequence_number - 1;
 
         let mut meta = build_meta(
             file_name,
             file_size,
-            row_count,
-            min_seq,
-            max_seq,
+            stats,
             self.config.schema_id,
             self.current_file_creation_time,
         );
@@ -388,21 +377,72 @@ async fn write_index(
     Ok(())
 }
 
+/// Java KeyValueDataFileWriter retains the first/last keys even for unsorted
+/// postpone input. These bounds must still be decodable using the key schema.
+#[derive(Default)]
+struct PostponeFileStats {
+    row_count: i64,
+    delete_row_count: i64,
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
+    min_sequence_number: i64,
+    max_sequence_number: i64,
+}
+
+impl PostponeFileStats {
+    fn add_batch(
+        &mut self,
+        batch: &RecordBatch,
+        config: &PostponeWriteConfig,
+        min_seq: i64,
+        max_seq: i64,
+    ) -> Result<()> {
+        let key_at = |row| -> Result<Vec<u8>> {
+            Ok(BinaryRow::from_arrow(
+                batch,
+                row,
+                &config.primary_key_indices,
+                &config.value_fields,
+            )?
+            .to_serialized_bytes())
+        };
+        if self.row_count == 0 {
+            self.first_key = key_at(0)?;
+            self.min_sequence_number = min_seq;
+        }
+        self.last_key = key_at(batch.num_rows() - 1)?;
+        self.max_sequence_number = max_seq;
+        self.row_count += batch.num_rows() as i64;
+        if let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) {
+            let kinds = column.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                crate::Error::DataInvalid {
+                    message: "_VALUE_KIND column must be Int8".into(),
+                    source: None,
+                }
+            })?;
+            for kind in kinds.iter().flatten() {
+                if !RowKind::from_value(kind)?.is_add() {
+                    self.delete_row_count += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 fn build_meta(
     file_name: String,
     file_size: i64,
-    row_count: i64,
-    min_seq: i64,
-    max_seq: i64,
+    stats: PostponeFileStats,
     schema_id: i64,
     creation_time: DateTime<Utc>,
 ) -> DataFileMeta {
     DataFileMeta {
         file_name,
         file_size,
-        row_count,
-        min_key: EMPTY_SERIALIZED_ROW.clone(),
-        max_key: EMPTY_SERIALIZED_ROW.clone(),
+        row_count: stats.row_count,
+        min_key: stats.first_key,
+        max_key: stats.last_key,
         key_stats: BinaryTableStats::new(
             EMPTY_SERIALIZED_ROW.clone(),
             EMPTY_SERIALIZED_ROW.clone(),
@@ -413,13 +453,13 @@ fn build_meta(
             EMPTY_SERIALIZED_ROW.clone(),
             vec![],
         ),
-        min_sequence_number: min_seq,
-        max_sequence_number: max_seq,
+        min_sequence_number: stats.min_sequence_number,
+        max_sequence_number: stats.max_sequence_number,
         schema_id,
         level: 0,
         extra_files: vec![],
         creation_time: Some(creation_time),
-        delete_row_count: Some(0),
+        delete_row_count: Some(stats.delete_row_count),
         embedded_index: None,
         file_source: Some(0), // FileSource.APPEND
         value_stats_cols: Some(vec![]),

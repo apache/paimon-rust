@@ -29,7 +29,7 @@ use crate::spec::{
     DataType, MergeEngine, RowKind, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
     VALUE_KIND_FIELD_NAME,
 };
-use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
+use crate::table::bucket_assigner::{BatchAssignOutput, BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
 use crate::table::bucket_assigner_cross::CrossPartitionAssigner;
 use crate::table::bucket_assigner_dynamic::DynamicBucketAssigner;
@@ -406,10 +406,19 @@ impl TableWrite {
             BucketAssignerEnum::CrossPartition(Box::new(CrossPartitionAssigner::new(
                 table.clone(),
                 partition_field_indices,
-                primary_key_indices.clone(),
+                schema
+                    .primary_keys()
+                    .iter()
+                    .map(|name| {
+                        fields
+                            .iter()
+                            .position(|field| field.name() == name)
+                            .unwrap()
+                    })
+                    .collect(),
                 target_bucket_row_number,
                 merge_engine,
-            )))
+            )?))
         } else if is_dynamic_bucket {
             BucketAssignerEnum::Dynamic(Box::new(DynamicBucketAssigner::new(
                 table.clone(),
@@ -773,13 +782,11 @@ impl TableWrite {
 
         let fields = self.table.schema().fields().to_vec();
         let output = self.bucket_assigner.assign_batch(batch, &fields).await?;
-
+        if matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_)) {
+            return self.divide_cross_partition_batch(batch, output);
+        }
         let mut groups: HashMap<PartitionBucketKey, Vec<usize>> = HashMap::new();
-        let skip_set: HashSet<usize> = output.skips.into_iter().collect();
         for row_idx in 0..batch.num_rows() {
-            if skip_set.contains(&row_idx) {
-                continue;
-            }
             groups
                 .entry((
                     output.partition_bytes[row_idx].clone(),
@@ -788,52 +795,73 @@ impl TableWrite {
                 .or_default()
                 .push(row_idx);
         }
+        groups
+            .into_iter()
+            .map(|(key, rows)| Ok((key, take_rows(batch, &rows)?)))
+            .collect()
+    }
 
-        let mut result = Vec::with_capacity(groups.len());
-        let batch_has_value_kind = batch
-            .schema()
-            .column_with_name(VALUE_KIND_FIELD_NAME)
-            .is_some();
-        // Cross-partition writers must always include _VALUE_KIND to keep the
-        // Arrow schema stable across batches (some batches may have deletes,
-        // others may not — KeyValueFileWriter's concat_batches requires a
-        // consistent schema).
-        let needs_value_kind = batch_has_value_kind
-            || matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
-            || !output.deletes.is_empty();
-        for (key, row_indices) in groups {
-            let sub_batch = take_rows(batch, &row_indices)?;
-            let sub_batch = if matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
+    /// Preserve Java GlobalIndexAssigner's DELETE-before-input event order
+    /// within each bucket, including migrations back to an earlier partition.
+    fn divide_cross_partition_batch(
+        &self,
+        batch: &RecordBatch,
+        output: BatchAssignOutput,
+    ) -> Result<Vec<(PartitionBucketKey, RecordBatch)>> {
+        let mut groups: HashMap<PartitionBucketKey, (Vec<usize>, Vec<i8>)> = HashMap::new();
+        let skips: HashSet<usize> = output.skips.into_iter().collect();
+        let mut deletes = output.deletes.into_iter().peekable();
+        let kinds = batch.column_by_name(VALUE_KIND_FIELD_NAME).map(|column| {
+            column
+                .as_any()
+                .downcast_ref::<arrow_array::Int8Array>()
+                .unwrap()
+        });
+        for row_idx in 0..batch.num_rows() {
+            if skips.contains(&row_idx) {
+                continue;
+            }
+            if deletes
+                .peek()
+                .is_some_and(|(index, _, _)| *index == row_idx)
             {
-                self.with_partition_values(&sub_batch, &key.0)?
-            } else {
-                sub_batch
-            };
-            let sub_batch = if needs_value_kind && !batch_has_value_kind {
-                Self::add_value_kind_column(&sub_batch, 0)?
-            } else {
-                sub_batch
-            };
-            result.push((key, sub_batch));
-        }
-
-        if !output.deletes.is_empty() {
-            let mut delete_groups: HashMap<PartitionBucketKey, Vec<usize>> = HashMap::new();
-            for (row_idx, old_partition, old_bucket) in &output.deletes {
-                delete_groups
-                    .entry((old_partition.clone(), *old_bucket))
-                    .or_default()
-                    .push(*row_idx);
+                let (_, partition, bucket) = deletes.next().unwrap();
+                let (rows, kinds) = groups.entry((partition, bucket)).or_default();
+                rows.push(row_idx);
+                kinds.push(RowKind::Delete.to_value());
             }
-            for (key, row_indices) in delete_groups {
-                let sub_batch = take_rows(batch, &row_indices)?;
-                let sub_batch = self.with_partition_values(&sub_batch, &key.0)?;
-                let delete_batch = Self::add_value_kind_column(&sub_batch, 3)?;
-                result.push((key, delete_batch));
-            }
+            let key = (
+                output.partition_bytes[row_idx].clone(),
+                output.buckets[row_idx],
+            );
+            let (rows, row_kinds) = groups.entry(key).or_default();
+            rows.push(row_idx);
+            row_kinds.push(kinds.map_or(RowKind::Insert.to_value(), |kinds| kinds.value(row_idx)));
         }
-
-        Ok(result)
+        // Generated row kinds are replaced below; migration DELETEs must not
+        // append a second _VALUE_KIND column to a rowkind.field batch.
+        let data = if let Some((index, _)) = batch.schema().column_with_name(VALUE_KIND_FIELD_NAME)
+        {
+            batch
+                .project(
+                    &(0..batch.num_columns())
+                        .filter(|i| *i != index)
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|error| crate::Error::DataInvalid {
+                    message: format!("Failed to project cross-partition input: {error}"),
+                    source: Some(Box::new(error)),
+                })?
+        } else {
+            batch.clone()
+        };
+        groups
+            .into_iter()
+            .map(|(key, (rows, kinds))| {
+                let routed = self.with_partition_values(&take_rows(&data, &rows)?, &key.0)?;
+                Ok((key, Self::add_per_row_value_kind_column(&routed, kinds)?))
+            })
+            .collect()
     }
 
     /// Keep physical partition columns consistent with the routed partition.
@@ -864,30 +892,6 @@ impl TableWrite {
         RecordBatch::try_new(batch.schema(), columns).map_err(|error| crate::Error::DataInvalid {
             message: format!("Failed to restore routed partition values: {error}"),
             source: Some(Box::new(error)),
-        })
-    }
-
-    /// Add a `_VALUE_KIND` column to a batch with the given value for all rows.
-    fn add_value_kind_column(batch: &RecordBatch, value_kind: i8) -> Result<RecordBatch> {
-        use arrow_array::Int8Array;
-        use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
-
-        let vk_array = Arc::new(Int8Array::from(vec![value_kind; batch.num_rows()]));
-        let vk_field = Arc::new(ArrowField::new(
-            crate::spec::VALUE_KIND_FIELD_NAME,
-            ArrowDataType::Int8,
-            false,
-        ));
-
-        let mut fields = batch.schema().fields().to_vec();
-        let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
-        fields.push(vk_field);
-        columns.push(vk_array);
-
-        let schema = Arc::new(arrow_schema::Schema::new(fields));
-        RecordBatch::try_new(schema, columns).map_err(|e| crate::Error::DataInvalid {
-            message: format!("Failed to add _VALUE_KIND column: {e}"),
-            source: None,
         })
     }
 
@@ -1224,6 +1228,9 @@ impl TableWrite {
                     bucket,
                     schema_id: self.schema_id,
                     target_file_size: self.target_file_size,
+                    target_file_row_num: self.target_file_row_num,
+                    primary_key_indices: self.primary_key_indices.clone(),
+                    value_fields: self.table.schema().fields().to_vec(),
                     file_compression: self.file_compression.clone(),
                     file_compression_zstd_level: self.file_compression_zstd_level,
                     write_buffer_size: self.write_buffer_size,
@@ -4542,9 +4549,21 @@ pub(in crate::table) mod tests {
             "Postpone mode should preserve arrival order"
         );
 
-        // Empty key stats for postpone mode
-        assert_eq!(file.min_key, EMPTY_SERIALIZED_ROW.clone());
-        assert_eq!(file.max_key, EMPTY_SERIALIZED_ROW.clone());
+        // Java records the first and last keys without sorting postpone input.
+        assert_eq!(
+            BinaryRow::from_serialized_bytes(&file.min_key)
+                .unwrap()
+                .get_int(0)
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            BinaryRow::from_serialized_bytes(&file.max_key)
+                .unwrap()
+                .get_int(0)
+                .unwrap(),
+            2
+        );
     }
 
     // -----------------------------------------------------------------------
