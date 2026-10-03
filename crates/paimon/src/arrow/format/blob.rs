@@ -2979,6 +2979,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_index_cache_preserves_io_error_category() {
+        let file_size = load_blob_fixture("blob-basic.blob").len() as u64;
+        for budget in ["64 MiB", "0"] {
+            let path = format!("file:///blob-index-io-error/{budget}/data.blob");
+            let reader = TrackingFileRead::new(Bytes::new())
+                .with_blob_index_cache(&path, blob_index_cache(budget))
+                .with_io_failure();
+
+            let direct = BlobFileIndex::load(&reader, file_size).await.unwrap_err();
+            assert!(matches!(direct, Error::IoUnexpected { .. }));
+            for _ in 0..2 {
+                let cached = IndexedBlobReader::open(
+                    Box::new(reader.clone()),
+                    file_size,
+                    path.clone(),
+                    true,
+                )
+                .await
+                .err()
+                .expect("BLOB index load should fail");
+                assert!(cached.is_io_unexpected(), "budget={budget}: {cached:?}");
+            }
+            assert_eq!(reader.ranges().len(), 3);
+        }
+    }
+
+    #[tokio::test]
     async fn test_blob_index_cache_evicts_by_decoded_bytes() {
         let first_key = "memory:/blob-index-cache-bytes/first.blob";
         let second_key = "memory:/blob-index-cache-bytes/other.blob";
@@ -4866,6 +4893,7 @@ mod tests {
         cache_key: Option<String>,
         blob_index_cache: Option<Arc<BlobIndexCacheContext>>,
         fail: bool,
+        io_fail: bool,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
         ranges: Arc<Mutex<Vec<Range<u64>>>>,
@@ -4878,6 +4906,7 @@ mod tests {
                 cache_key: None,
                 blob_index_cache: None,
                 fail: false,
+                io_fail: false,
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
                 ranges: Arc::new(Mutex::new(Vec::new())),
@@ -4899,6 +4928,11 @@ mod tests {
             self
         }
 
+        fn with_io_failure(mut self) -> Self {
+            self.io_fail = true;
+            self
+        }
+
         fn max_in_flight(&self) -> usize {
             self.max_in_flight.load(Ordering::SeqCst)
         }
@@ -4916,6 +4950,15 @@ mod tests {
             self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(10)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if self.io_fail {
+                return Err(Error::IoUnexpected {
+                    message: "injected BLOB index I/O failure".to_string(),
+                    source: Box::new(opendal::Error::new(
+                        opendal::ErrorKind::Unexpected,
+                        "injected storage failure",
+                    )),
+                });
+            }
             if self.fail {
                 return Err(Error::UnexpectedError {
                     message: "injected BLOB index read failure".to_string(),

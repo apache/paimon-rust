@@ -48,6 +48,7 @@ async-trait = "0.1.81"
 bytes = "1.7.1"
 
 [dev-dependencies]
+opendal = { package = "opendal-core", version = "0.58.0" }
 # Test-only: the vector-search integration tests build a real primary-key vindex
 # IVF-flat ANN segment fixture in-process. Versions match crates/paimon.
 paimon-vindex-core = "0.5.0"
