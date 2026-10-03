@@ -253,21 +253,21 @@ fn apply_variant_projections(
 }
 
 fn supports_variant_target_type(data_type: &ArrowDataType) -> bool {
-    match data_type {
+    matches!(
+        data_type,
         ArrowDataType::Boolean
-        | ArrowDataType::Int8
-        | ArrowDataType::Int16
-        | ArrowDataType::Int32
-        | ArrowDataType::Int64
-        | ArrowDataType::Float32
-        | ArrowDataType::Float64
-        | ArrowDataType::Decimal128(_, _)
-        | ArrowDataType::Utf8
-        | ArrowDataType::Binary
-        | ArrowDataType::Date32
-        | ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => true,
-        _ => false,
-    }
+            | ArrowDataType::Int8
+            | ArrowDataType::Int16
+            | ArrowDataType::Int32
+            | ArrowDataType::Int64
+            | ArrowDataType::Float32
+            | ArrowDataType::Float64
+            | ArrowDataType::Decimal128(_, _)
+            | ArrowDataType::Utf8
+            | ArrowDataType::Binary
+            | ArrowDataType::Date32
+            | ArrowDataType::Timestamp(TimeUnit::Microsecond, _)
+    )
 }
 
 fn extract_variant_projections(
