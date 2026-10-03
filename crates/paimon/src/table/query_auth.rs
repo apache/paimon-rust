@@ -228,6 +228,43 @@ pub(crate) fn reject_noncanonical_fields(
     Ok(())
 }
 
+/// Readers resolve a leaf by `index` or by `column`, so a scope checked by name
+/// holds only if both, and the type, name one field of `fields`.
+pub(crate) fn reject_noncanonical_leaves(
+    predicates: &[crate::spec::Predicate],
+    fields: &[crate::spec::DataField],
+) -> crate::Result<()> {
+    use crate::spec::Predicate;
+    fn check(predicate: &Predicate, fields: &[crate::spec::DataField]) -> crate::Result<()> {
+        match predicate {
+            Predicate::Leaf {
+                column,
+                index,
+                data_type,
+                ..
+            } => {
+                if fields
+                    .get(*index)
+                    .is_some_and(|f| f.name() == column && f.data_type() == data_type)
+                {
+                    Ok(())
+                } else {
+                    Err(unsupported(&format!(
+                        "the filter on '{column}' points at another field by index or type; \
+                         build filters with PredicateBuilder"
+                    )))
+                }
+            }
+            Predicate::And(children) | Predicate::Or(children) => {
+                children.iter().try_for_each(|child| check(child, fields))
+            }
+            Predicate::Not(inner) => check(inner, fields),
+            Predicate::AlwaysTrue | Predicate::AlwaysFalse => Ok(()),
+        }
+    }
+    predicates.iter().try_for_each(|p| check(p, fields))
+}
+
 #[cfg(test)]
 mod tests {
     use super::reject_system_columns;

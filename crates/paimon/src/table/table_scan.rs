@@ -1693,6 +1693,17 @@ impl<'a> PaimonTableScan<'a> {
         if query_auth && touches_row_id {
             super::query_auth::reject_system_columns([ROW_ID_FIELD_NAME])?;
         }
+        // Pruning resolves leaves by index; global indexes and the partition scope by name.
+        if query_auth {
+            let schema = self.table.schema();
+            super::query_auth::reject_noncanonical_leaves(&self.data_predicates, schema.fields())?;
+            if let Some(PartitionFilter::Predicate(predicate)) = &self.partition_filter {
+                super::query_auth::reject_noncanonical_leaves(
+                    std::slice::from_ref(predicate),
+                    &schema.partition_fields(),
+                )?;
+            }
+        }
 
         let grant = self
             .table

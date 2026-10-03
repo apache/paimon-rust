@@ -1001,6 +1001,10 @@ impl<'a> PaimonTableRead<'a> {
             &self.read_type,
             self.table.schema().fields(),
         )?;
+        super::query_auth::reject_noncanonical_leaves(
+            &self.data_predicates,
+            self.table.schema().fields(),
+        )?;
         // Per split, as Java binds one `QueryAuthSplit` each; one read applies one
         // rule set, so a restricted split's grant must cover them all.
         let mut restricted: Option<&Arc<super::query_auth::QueryAuthGrant>> = None;

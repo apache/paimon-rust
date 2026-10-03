@@ -36,7 +36,7 @@ use paimon::catalog::{Catalog, Function, FunctionDefinition, Identifier, RESTCat
 use paimon::common::Options;
 use paimon::spec::{
     BigIntType, BlobType, BlobViewStruct, DataField, DataType, Datum, IntType, PartitionStatistics,
-    PredicateBuilder, Schema, SchemaChange, VarCharType,
+    Predicate, PredicateBuilder, PredicateOperator, Schema, SchemaChange, VarCharType,
 };
 use paimon::{CatalogOptions, FileSystemCatalog, Table};
 
@@ -3459,6 +3459,100 @@ async fn test_query_auth_refuses_a_read_wider_than_its_plan() {
             );
         }
     }
+}
+
+/// A leaf `"id"` built on `score`'s index, or on `id` with another type.
+fn disagreeing_leaves() -> [Predicate; 2] {
+    let leaf = |index: usize, data_type: DataType, literal: Datum| Predicate::Leaf {
+        column: "id".to_string(),
+        index,
+        data_type,
+        op: PredicateOperator::Eq,
+        literals: vec![literal],
+    };
+    [
+        leaf(2, DataType::Int(IntType::new()), Datum::Int(20)),
+        leaf(0, DataType::BigInt(BigIntType::new()), Datum::Long(2)),
+    ]
+}
+
+fn assert_disagreeing_leaf(err: paimon::Error) {
+    assert!(
+        matches!(err, paimon::Error::Unsupported { ref message }
+            if message.contains("query-auth.enabled")
+                && message.contains("another field by index or type")),
+        "{err:?}"
+    );
+}
+
+/// Readers resolve a leaf by its index, so its name must not stand in for it.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_refuses_a_filter_whose_name_and_index_disagree() {
+    let g = scores().await;
+    g.ctx
+        .server
+        .set_column_auth("default", "scores", vec!["id".to_string()]);
+    let mut planned = g.table.new_read_builder();
+    planned.with_projection(&["id"]).unwrap();
+    let plan = planned.new_scan().plan().await.unwrap();
+
+    for leaf in disagreeing_leaves() {
+        let mut filtered = g.table.new_read_builder();
+        filtered.with_projection(&["id"]).unwrap().with_filter(leaf);
+        // Planned clean, read with the leaf.
+        let Err(err) = filtered.new_read().unwrap().to_arrow(plan.splits()) else {
+            panic!("the leaf reads a column no grant covered");
+        };
+        assert_disagreeing_leaf(err);
+        assert_disagreeing_leaf(read_all(&filtered).await.unwrap_err());
+    }
+}
+
+/// A partition-only conjunct prunes by index and never reaches the read.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_refuses_a_partition_filter_whose_name_and_index_disagree() {
+    let day = || DataType::VarChar(VarCharType::new(10).unwrap());
+    let schema = |options: &[(&str, &str)]| {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("dt", day())
+            .partition_keys(["dt"]);
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    };
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", ArrowDataType::Int32, true),
+            ArrowField::new("dt", ArrowDataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        ],
+    )
+    .unwrap();
+    let g = written("by_day", schema, vec![batch]).await;
+    g.ctx
+        .server
+        .set_column_auth("default", "by_day", vec!["id".to_string()]);
+
+    // A range stays a predicate; an equality would pin every partition key.
+    let mut filtered = g.table.new_read_builder();
+    filtered
+        .with_projection(&["id"])
+        .unwrap()
+        .with_filter(Predicate::Leaf {
+            column: "id".to_string(),
+            index: 1,
+            data_type: day(),
+            op: PredicateOperator::Gt,
+            literals: vec![Datum::String("a".to_string())],
+        });
+    assert_disagreeing_leaf(read_all(&filtered).await.unwrap_err());
 }
 
 /// A primary-key table whose second commit updates keys 1 and 2.
