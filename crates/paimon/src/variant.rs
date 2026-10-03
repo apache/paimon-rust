@@ -3370,6 +3370,30 @@ mod tests {
     }
 
     #[test]
+    fn variant_timestamp_extraction_preserves_microseconds() {
+        for micros in [1_700_000_000_123_456, -1_700_000_000_123_456] {
+            for (ntz, target_type) in [
+                (true, DataType::Timestamp(TimestampType::new(6).unwrap())),
+                (
+                    false,
+                    DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap()),
+                ),
+            ] {
+                let variant = timestamp_variant(micros, ntz);
+                assert!(matches!(
+                    cast_variant_to_shredded_value(
+                        variant.as_ref().unwrap(),
+                        &target_type,
+                        true
+                    )
+                    .unwrap(),
+                    Some(ShreddedValue::Timestamp(value)) if value == micros
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn cast_and_rebuild_shredded_timestamp_ntz_preserves_kind() {
         let configured =
             DataType::Timestamp(TimestampType::new(TimestampType::DEFAULT_PRECISION).unwrap());

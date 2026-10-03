@@ -153,6 +153,13 @@ def test_with_projection_variant_fields_keeps_explicit_null():
         pa.map_(pa.string(), pa.int32()),
         pa.struct([pa.field("x", pa.int32())]),
         pa.time32("s"),
+        pa.large_string(),
+        pa.large_binary(),
+        pa.binary(4),
+        pa.dictionary(pa.int8(), pa.string()),
+        pa.timestamp("s"),
+        pa.timestamp("ms"),
+        pa.timestamp("ns"),
     ],
 )
 def test_with_projection_variant_fields_rejects_unsupported_target(target_type):
@@ -165,6 +172,40 @@ def test_with_projection_variant_fields_rejects_unsupported_target(target_type):
                     "payload": {"paths": ["$.age"], "target_type": target_type}
                 },
             )
+
+
+def test_with_projection_variant_fields_rejects_noncanonical_timezone():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        with pytest.raises(ValueError, match="cannot be returned unchanged"):
+            table.new_read_builder().with_projection(
+                ["payload"],
+                variant_fields={
+                    "payload": {
+                        "paths": ["$.age"],
+                        "target_type": pa.timestamp("us", tz="Asia/Shanghai"),
+                    }
+                },
+            )
+
+
+@pytest.mark.parametrize(
+    "target_type", [pa.timestamp("us"), pa.timestamp("us", tz="UTC")]
+)
+def test_with_projection_variant_fields_keeps_microsecond_timestamp_type(target_type):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(
+            ["payload"],
+            variant_fields={
+                "payload": {"paths": ["$.age"], "target_type": target_type}
+            },
+        )
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.field("payload").type == pa.struct(
+            [pa.field("0", target_type)]
+        )
 
 
 def test_with_nested_projection_replaces_variant_fields():

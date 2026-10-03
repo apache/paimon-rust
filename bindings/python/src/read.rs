@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::DataType as ArrowDataType;
+use arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
@@ -263,15 +263,9 @@ fn supports_variant_target_type(data_type: &ArrowDataType) -> bool {
         | ArrowDataType::Float64
         | ArrowDataType::Decimal128(_, _)
         | ArrowDataType::Utf8
-        | ArrowDataType::LargeUtf8
-        | ArrowDataType::Utf8View
         | ArrowDataType::Binary
-        | ArrowDataType::LargeBinary
-        | ArrowDataType::BinaryView
-        | ArrowDataType::FixedSizeBinary(_)
         | ArrowDataType::Date32
-        | ArrowDataType::Timestamp(_, _) => true,
-        ArrowDataType::Dictionary(_, value) => supports_variant_target_type(value),
+        | ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => true,
         _ => false,
     }
 }
@@ -331,6 +325,11 @@ fn extract_variant_projections(
         }
         let data_type =
             paimon::arrow::arrow_to_paimon_type(&arrow_type, true).map_err(to_py_err)?;
+        if paimon::arrow::paimon_type_to_arrow(&data_type).map_err(to_py_err)? != arrow_type {
+            return Err(PyValueError::new_err(format!(
+                "variant_fields['{column}']['target_type'] cannot be returned unchanged: {arrow_type:?}"
+            )));
+        }
         let fail_on_error = options
             .get_item("fail_on_error")?
             .map(|value| value.extract::<bool>())
