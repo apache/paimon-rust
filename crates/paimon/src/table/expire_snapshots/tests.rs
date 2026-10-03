@@ -1218,3 +1218,157 @@ async fn test_legacy_deletion_vector_location_is_expired() {
     assert_files_match_references(&table).await;
     assert_eq!(read_ids(&table).await, vec![3]);
 }
+
+#[tokio::test]
+async fn test_unreadable_branch_index_manifest_changes_nothing() {
+    let table = test_table(
+        "memory:/expire_branch_index_preflight",
+        &[
+            ("row-tracking.enabled", "true"),
+            ("data-evolution.enabled", "true"),
+            ("global-index.enabled", "true"),
+        ],
+        false,
+    );
+    setup_dirs(&table).await;
+    write_schema_file(&table).await;
+    append(&table, &[1, 2]).await; // snapshot 1
+    table
+        .new_btree_global_index_build_builder()
+        .with_index_column("id")
+        .execute()
+        .await
+        .unwrap(); // snapshot 2, indexed
+    let sm = table.snapshot_manager();
+    let indexed = sm.get_snapshot(2).await.unwrap();
+    let index_manifest = indexed.index_manifest().unwrap().to_string();
+    table.tag_manager().create("t2", &indexed).await.unwrap();
+    crate::table::BranchManager::new(table.file_io().clone(), table.location().to_string())
+        .create_branch_from_tag("b2", "t2")
+        .await
+        .unwrap();
+    table.tag_manager().delete("t2").await.unwrap();
+    table
+        .new_global_index_drop_builder()
+        .with_index_column("id")
+        .execute()
+        .await
+        .unwrap(); // snapshot 3
+    overwrite(&table, &[3]).await; // snapshot 4
+    overwrite(&table, &[4]).await; // snapshot 5
+                                   // Only the branch-owned index manifest is unreadable.
+    corrupt_manifest(&table, &index_manifest).await;
+    let data_before = physical_data_files(&table).await;
+    let ids_before = snapshot_ids(&table).await;
+
+    let result = table
+        .new_expire_snapshots()
+        .with_retain_min(1)
+        .with_older_than_millis(i64::MAX)
+        .execute()
+        .await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(snapshot_ids(&table).await, ids_before);
+    assert_eq!(
+        physical_data_files(&table).await,
+        data_before,
+        "a failed run must not have deleted any data file"
+    );
+}
+
+#[tokio::test]
+async fn test_relative_data_directory_is_expired() {
+    let table = test_table(
+        "memory:/expire_relative_data_directory",
+        &[("data-file.path-directory", "data")],
+        false,
+    );
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    overwrite(&table, &[2]).await;
+    let before = physical_data_files(&table).await;
+    assert_eq!(before.len(), 2, "{before:?}");
+    assert!(table
+        .file_io()
+        .exists_dir(&format!("{}/data/bucket-0", table.location()))
+        .await
+        .unwrap());
+
+    assert_eq!(expire_keeping(&table, 1).await, 1);
+    assert_eq!(read_ids(&table).await, vec![2]);
+    assert_eq!(
+        physical_data_files(&table).await.len(),
+        1,
+        "the overwritten file under data/bucket-0 must be deleted"
+    );
+}
+
+#[tokio::test]
+async fn test_absolute_data_directory_is_expired() {
+    let table = test_table(
+        "memory:/expire_absolute_data_directory",
+        &[("data-file.path-directory", "/expire_absolute_data_root")],
+        false,
+    );
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    overwrite(&table, &[2]).await;
+    let data_files = || async {
+        table
+            .file_io()
+            .list_status_recursive("memory:/expire_absolute_data_root")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|status| !status.is_dir)
+            .count()
+    };
+    assert_eq!(
+        data_files().await,
+        2,
+        "both files live outside the table directory"
+    );
+
+    assert_eq!(expire_keeping(&table, 1).await, 1);
+    assert_eq!(data_files().await, 1);
+    assert_eq!(read_ids(&table).await, vec![2]);
+}
+
+#[tokio::test]
+async fn test_unreadable_external_changelog_manifest_changes_nothing() {
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("dt", DataType::VarChar(VarCharType::string_type()))
+        .primary_key(["id"])
+        .option("changelog-producer", "input")
+        .build()
+        .unwrap();
+    let table = table_with_schema("memory:/expire_bad_external_changelog", schema);
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    let sm = table.snapshot_manager();
+    let snapshot_1 = sm.get_snapshot(1).await.unwrap();
+    table
+        .file_io()
+        .new_output(&format!("{}/changelog/changelog-1", table.location()))
+        .unwrap()
+        .write(bytes::Bytes::from(serde_json::to_vec(&snapshot_1).unwrap()))
+        .await
+        .unwrap();
+    append(&table, &[2]).await;
+    append(&table, &[3]).await;
+    corrupt_manifest(&table, snapshot_1.changelog_manifest_list().unwrap()).await;
+    let data_before = physical_data_files(&table).await;
+    let manifests_before = file_names_under(&table, "manifest").await;
+
+    let result = table
+        .new_expire_snapshots()
+        .with_retain_min(1)
+        .with_older_than_millis(i64::MAX)
+        .execute()
+        .await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(snapshot_ids(&table).await, vec![1, 2, 3]);
+    assert_eq!(physical_data_files(&table).await, data_before);
+    assert_eq!(file_names_under(&table, "manifest").await, manifests_before);
+}

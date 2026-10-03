@@ -225,6 +225,12 @@ impl<'a> ExpireSnapshots<'a> {
         // Read everything they reference before deleting anything; if that is
         // impossible, the run stops with nothing changed.
         let external = self.external_owners(&deletion).await?;
+        // Their index and changelog manifests too: nothing may be deleted
+        // before every owner outside main's history has been read.
+        let external_snapshots = external.snapshots.iter().collect::<Vec<_>>();
+        let external_skipping = deletion
+            .manifest_skipping_set(&external_snapshots, true)
+            .await?;
 
         // Data files deleted by a snapshot are unused from that snapshot on,
         // so the range is (begin, end].
@@ -256,23 +262,12 @@ impl<'a> ExpireSnapshots<'a> {
         }
         let mut skipping_snapshots = find_skipping_tags(&tagged, begin_inclusive, end_exclusive);
         skipping_snapshots.push(last);
-        let external_snapshots = external.snapshots.iter().collect::<Vec<_>>();
-        let skipping = match deletion
+        match deletion
             .manifest_skipping_set(&skipping_snapshots, false)
             .await
         {
             Ok(mut skipping) => {
-                skipping.extend(
-                    deletion
-                        .manifest_skipping_set(&external_snapshots, true)
-                        .await?,
-                );
-                Ok(skipping)
-            }
-            Err(error) => Err(error),
-        };
-        match skipping {
-            Ok(mut skipping) => {
+                skipping.extend(external_skipping);
                 let mut manifest_files = Vec::new();
                 for snapshot in &snapshots_excluding_end {
                     manifest_files.extend(

@@ -1240,6 +1240,49 @@ async fn test_expire_snapshots_procedure() {
 }
 
 #[tokio::test]
+async fn test_expire_snapshots_procedure_with_data_directory() {
+    let (tmp, sql_context) = setup_sql_context().await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.exp_dir (id INT, name VARCHAR(100)) WITH (\
+            'data-file.path-directory' = 'data'\
+        )",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.exp_dir VALUES (1, 'a')",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT OVERWRITE paimon.test_db.exp_dir VALUES (2, 'b')",
+    )
+    .await;
+    let bucket = tmp.path().join("test_db.db/exp_dir/data/bucket-0");
+    let files = || std::fs::read_dir(&bucket).unwrap().count();
+    assert_eq!(files(), 2);
+
+    assert_eq!(
+        expire_count(
+            &sql_context,
+            "CALL sys.expire_snapshots(table => 'test_db.exp_dir', retain_min => 1, retain_max => 1)",
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        files(),
+        1,
+        "the overwritten file under data/bucket-0 is deleted"
+    );
+    assert_eq!(
+        collect_id_name(&sql_context, "SELECT id, name FROM paimon.test_db.exp_dir").await,
+        vec![(2, "b".to_string())]
+    );
+}
+
+#[tokio::test]
 async fn test_expire_snapshots_procedure_rejects_bad_arguments() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
     assert_sql_error(
