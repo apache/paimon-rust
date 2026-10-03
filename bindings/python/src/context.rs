@@ -675,6 +675,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_class::<PyPythonScalarUDFObject>()?;
     this.add_class::<PySQLContext>()?;
     this.add_class::<crate::write::PyBatchWriteBuilder>()?;
+    this.add_class::<crate::write::PyPostponeFixedBucketWriteBuilder>()?;
     this.add_class::<crate::write::PyStreamWriteBuilder>()?;
     this.add_class::<crate::write::PyBatchTableWrite>()?;
     this.add_class::<crate::write::PyBatchTableUpdate>()?;

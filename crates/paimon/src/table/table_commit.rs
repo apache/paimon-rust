@@ -2379,7 +2379,6 @@ impl TableCommit {
         all_entries.extend(delta_entries.iter().cloned());
         let merged_entries = merge_active_entries(all_entries);
         self.check_total_bucket_conflicts(&merged_entries)?;
-        self.check_postpone_bucket_mixing(&merged_entries)?;
         self.check_fixed_bucket_ownership_conflicts(
             latest_snapshot,
             delta_entries,
@@ -2457,15 +2456,6 @@ impl TableCommit {
                 if *entry.kind() != FileKind::Add {
                     continue;
                 }
-                if entry.bucket() == POSTPONE_BUCKET && owned_partitions.contains(entry.partition())
-                {
-                    return Err(crate::Error::DataInvalid {
-                        message: format!(
-                            "Postpone fixed-bucket writer conflict: another commit wrote bucket=-2 files for the same partition after snapshot {check_from_snapshot}"
-                        ),
-                        source: None,
-                    });
-                }
                 if owned_buckets.contains(&(entry.partition(), entry.bucket())) {
                     return Err(crate::Error::DataInvalid {
                         message: format!(
@@ -2476,31 +2466,6 @@ impl TableCommit {
                     });
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn check_postpone_bucket_mixing(&self, active_entries: &[ManifestEntry]) -> Result<()> {
-        if self.total_buckets != POSTPONE_BUCKET {
-            return Ok(());
-        }
-        let fixed_partitions = active_entries
-            .iter()
-            .filter(|entry| {
-                *entry.kind() == FileKind::Add && entry.bucket() >= 0 && entry.total_buckets() > 0
-            })
-            .map(|entry| entry.partition())
-            .collect::<HashSet<_>>();
-        if active_entries.iter().any(|entry| {
-            *entry.kind() == FileKind::Add
-                && entry.bucket() == POSTPONE_BUCKET
-                && fixed_partitions.contains(entry.partition())
-        }) {
-            return Err(crate::Error::DataInvalid {
-                message: "Cannot mix bucket=-2 files and fixed buckets in the same partition; use a complete overwrite to migrate the partition"
-                    .to_string(),
-                source: None,
-            });
         }
         Ok(())
     }

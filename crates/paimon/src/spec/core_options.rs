@@ -1417,6 +1417,18 @@ impl<'a> CoreOptions<'a> {
     /// Java leaves `target-file-size` without a default and documents 128 MB for
     /// primary-key tables and 256 MB for append tables; this returns the append
     /// value for both.
+    /// Java's exact default for postpone partitions without an existing layout.
+    /// Unlike inferred counts this is not capped or rounded to a power of two.
+    pub fn postpone_default_bucket_num(&self) -> crate::Result<Option<i32>> {
+        self.options.get("postpone.default-bucket-num").map(|raw| {
+            raw.parse::<i32>().ok().filter(|count| *count > 0).ok_or_else(|| {
+                crate::Error::ConfigInvalid {
+                    message: format!("postpone.default-bucket-num must be a positive 32-bit integer, got '{raw}'"),
+                }
+            })
+        }).transpose()
+    }
+
     pub fn target_file_size(&self) -> i64 {
         self.options
             .get("target-file-size")
