@@ -31,7 +31,7 @@ use crate::api::rest_util::RESTUtil;
 use crate::catalog::Identifier;
 use crate::common::{CatalogOptions, Options};
 use crate::io::cache::LocalCache;
-use crate::io::{FileIO, FileIOCacheContext, FileIOProvider};
+use crate::io::{FileIO, FileIOCacheContext, FileIOProvider, RoutedOperator, IO_CACHE_ENABLED};
 use crate::Result;
 
 use super::rest_token::RESTToken;
@@ -166,6 +166,10 @@ impl RESTTokenFileIO {
                 merged.insert(OSS_ENDPOINT.to_string(), dlf_oss_endpoint.clone());
             }
         }
+        // An explicit client value wins over the token, so users can turn io-cache routing off.
+        if let Some(enabled) = self.catalog_options.get(IO_CACHE_ENABLED) {
+            merged.insert(IO_CACHE_ENABLED.to_string(), enabled.clone());
+        }
         merged
     }
 }
@@ -184,6 +188,13 @@ impl FileIOProvider for RESTTokenFileIO {
         let cache_namespace = file_io.cache_namespace_for_path(path)?;
         let (op, relative_path) = file_io.create_static(path)?;
         Ok((op, relative_path, Some(cache_namespace)))
+    }
+
+    async fn create_routed(&self, path: &str) -> Result<(RoutedOperator, String, Option<String>)> {
+        let file_io = self.current_file_io().await?;
+        let namespace = file_io.cache_namespace_for_path(path)?;
+        let (op, relative_path) = file_io.create_routed_static(path)?;
+        Ok((op, relative_path, Some(namespace)))
     }
 }
 
@@ -375,5 +386,154 @@ mod tests {
         assert_eq!(stream.read(2).await.unwrap(), b"ef");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         server.abort();
+    }
+
+    #[cfg(feature = "storage-oss")]
+    mod io_cache {
+        use super::*;
+        use crate::io::oss_test_server::TestOss;
+
+        async fn fixed_token(
+            State(token): State<Arc<HashMap<String, String>>>,
+        ) -> Json<GetTableTokenResponse> {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            Json(GetTableTokenResponse {
+                token: token.as_ref().clone(),
+                expires_at_millis: Some(now + TOKEN_EXPIRATION_SAFE_TIME_MILLIS * 2),
+            })
+        }
+
+        /// A token FileIO for `oss://bkt/db.db/t` whose token vends io-cache routing.
+        async fn io_cache_file_io(
+            origin: &TestOss,
+            cache: &TestOss,
+            catalog_options: &[(&str, &str)],
+        ) -> (FileIO, tokio::task::JoinHandle<()>) {
+            let token = HashMap::from(
+                [
+                    ("fs.oss.endpoint", cache.endpoint()),
+                    ("fs.oss.accessKeyId", "ak"),
+                    ("fs.oss.accessKeySecret", "sk"),
+                    ("io-cache.enabled", "true"),
+                    ("io-cache.endpoint", cache.endpoint()),
+                    ("io-cache.target.default.path-style-access", "true"),
+                    ("io-cache.origin.endpoint", origin.endpoint()),
+                    ("io-cache.policy", "meta,read"),
+                ]
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+            );
+            let app = Router::new()
+                .route("/v1/databases/db/tables/t/token", get(fixed_token))
+                .with_state(Arc::new(token));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let mut options = Options::new();
+            options.set(CatalogOptions::URI, format!("http://{address}"));
+            options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+            options.set(CatalogOptions::TOKEN, "test-token");
+            options.set("fs.oss.path-style-access", "true");
+            for (key, value) in catalog_options {
+                options.set(*key, *value);
+            }
+            let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+            let file_io_cache = file_io_cache(&options);
+            let token_file_io = Arc::new(RESTTokenFileIO::new(
+                Identifier::new("db", "t"),
+                "oss://bkt/db.db/t".to_string(),
+                options,
+                api,
+                None,
+                file_io_cache,
+            ));
+            (token_file_io.build_file_io().await.unwrap(), server)
+        }
+
+        #[tokio::test]
+        async fn test_token_file_io_routes_table_files_to_io_cache() {
+            let origin = TestOss::start().await;
+            let cache = TestOss::start_sharing(&origin).await;
+            let (file_io, server) = io_cache_file_io(&origin, &cache, &[]).await;
+
+            let data = "oss://bkt/db.db/t/bucket-0/data-1.parquet";
+            file_io
+                .new_output(data)
+                .unwrap()
+                .write(Bytes::from_static(b"data"))
+                .await
+                .unwrap();
+            assert!(file_io.exists(data).await.unwrap());
+            assert_eq!(
+                file_io.new_input(data).unwrap().read().await.unwrap(),
+                "data"
+            );
+            assert_eq!(
+                cache.take_requests(),
+                ["GET bkt/db.db/t/bucket-0/data-1.parquet"]
+            );
+            assert_eq!(
+                origin.take_requests(),
+                [
+                    "PUT bkt/db.db/t/bucket-0/data-1.parquet",
+                    "HEAD bkt/db.db/t/bucket-0/data-1.parquet"
+                ]
+            );
+
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn test_dlf_oss_endpoint_turns_off_io_cache_routing() {
+            let origin = TestOss::start().await;
+            let cache = TestOss::start_sharing(&origin).await;
+            let (file_io, server) = io_cache_file_io(
+                &origin,
+                &cache,
+                &[(CatalogOptions::DLF_OSS_ENDPOINT, origin.endpoint())],
+            )
+            .await;
+
+            let data = "oss://bkt/db.db/t/bucket-0/data-1.parquet";
+            file_io
+                .new_output(data)
+                .unwrap()
+                .write(Bytes::from_static(b"data"))
+                .await
+                .unwrap();
+            assert!(file_io.exists(data).await.unwrap());
+            assert!(cache.take_requests().is_empty());
+            assert_eq!(origin.take_requests().len(), 2);
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn test_client_io_cache_enabled_wins_over_token() {
+            let origin = TestOss::start().await;
+            let cache = TestOss::start_sharing(&origin).await;
+            let (file_io, server) =
+                io_cache_file_io(&origin, &cache, &[("io-cache.enabled", "false")]).await;
+
+            // Like clients without routing, every request uses fs.oss.endpoint.
+            let data = "oss://bkt/db.db/t/bucket-0/data-1.parquet";
+            file_io
+                .new_output(data)
+                .unwrap()
+                .write(Bytes::from_static(b"data"))
+                .await
+                .unwrap();
+            assert_eq!(
+                file_io.new_input(data).unwrap().read().await.unwrap(),
+                "data"
+            );
+            assert_eq!(cache.take_requests().len(), 2);
+            assert!(origin.take_requests().is_empty());
+            server.abort();
+        }
     }
 }

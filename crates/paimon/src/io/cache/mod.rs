@@ -21,7 +21,7 @@ mod memory;
 mod reader;
 mod state;
 
-use self::file_type::FileType;
+pub(crate) use self::file_type::FileType;
 use self::memory::MemoryCache;
 use self::state::{BlockKey, CacheCoordinator, CacheReadToken};
 use crate::common::{CatalogOptions, Options};
