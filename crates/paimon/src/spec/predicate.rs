@@ -1054,6 +1054,7 @@ fn json_to_datum(value: &serde_json::Value, data_type: &DataType) -> Result<Datu
                     .or_else(|_| chrono::NaiveTime::parse_from_str(s, "%H:%M"))
                     .ok()
             })
+            .filter(|time| !is_leap_second(time))
             .map(|time| {
                 use chrono::Timelike;
                 let millis =
@@ -1068,6 +1069,7 @@ fn json_to_datum(value: &serde_json::Value, data_type: &DataType) -> Result<Datu
                     .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M"))
                     .ok()
             })
+            .filter(|datetime| !is_leap_second(datetime))
             .map(|datetime| {
                 let (millis, nanos) = millis_and_nanos(datetime.and_utc());
                 Datum::Timestamp { millis, nanos }
@@ -1097,10 +1099,28 @@ fn parse_instant(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     match text.strip_suffix('Z') {
         Some(local) => chrono::NaiveDateTime::parse_from_str(local, "%Y-%m-%dT%H:%M:%S%.f")
             .ok()
+            .and_then(fold_leap_second)
             .map(|datetime| datetime.and_utc()),
         None => chrono::DateTime::parse_from_rfc3339(text)
             .ok()
+            .and_then(fold_leap_second)
             .map(|instant| instant.to_utc()),
+    }
+}
+
+/// chrono reads second 60 as a leap second; Java's `LocalTime` and `LocalDateTime` refuse it.
+fn is_leap_second(time: &impl chrono::Timelike) -> bool {
+    time.nanosecond() >= 1_000_000_000
+}
+
+/// Java's `Instant.parse` folds `23:59:60` into `23:59:59` and refuses any other leap second.
+fn fold_leap_second<T: chrono::Timelike>(time: T) -> Option<T> {
+    if !is_leap_second(&time) {
+        Some(time)
+    } else if time.hour() == 23 && time.minute() == 59 {
+        time.with_nanosecond(time.nanosecond() - 1_000_000_000)
+    } else {
+        None
     }
 }
 
@@ -3940,6 +3960,7 @@ mod tests {
             (r#""+10000-01-01T00:00:00Z""#, 253_402_300_800_000),
             (r#""-0001-01-01T00:00:00Z""#, -62_198_755_200_000),
             (r#""2024-01-15T18:15:30.5+08:00""#, 1_705_313_730_500),
+            (r#""2016-12-31T23:59:60.5Z""#, 1_483_228_799_500),
         ] {
             assert_eq!(literal(instant(), json).unwrap(), utc(millis), "{json}");
         }
@@ -3967,6 +3988,10 @@ mod tests {
             (date(), "19737"),
             (timestamp(), r#""2024-01-15 10:15:30""#),
             (instant(), r#""2024-01-15T10:15:30""#),
+            (instant(), r#""2016-12-31T23:30:60Z""#),
+            (instant(), r#""2016-12-31T12:59:60+08:00""#),
+            (time(), r#""23:59:60""#),
+            (timestamp(), r#""2016-12-31T23:59:60""#),
             (decimal(), r#""1e3""#),
             (decimal(), "1.5"),
         ] {
