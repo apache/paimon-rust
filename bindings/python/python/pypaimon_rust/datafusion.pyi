@@ -87,7 +87,14 @@ class TableRead:
     def read(self, splits: Sequence[Split]) -> List[pyarrow.RecordBatch]: ...
 
 class ReadBuilder:
-    def with_projection(self, columns: List[str]) -> "ReadBuilder": ...
+    def with_projection(
+        self,
+        columns: List[str],
+        *,
+        variant_fields: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> "ReadBuilder":
+        """Project columns, optionally extracting Variant paths as float32."""
+        ...
     def with_nested_projection(self, paths: List[List[str]]) -> "ReadBuilder":
         """Project top-level fields or nested ROW leaves by exact name paths. A MAP
         path keeps the complete MAP so the caller can extract literal keys."""

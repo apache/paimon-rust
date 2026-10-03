@@ -35,6 +35,22 @@ def _make_table_with_data(warehouse):
     return catalog.get_table("rdb.t")
 
 
+def _make_variant_table_with_data(warehouse):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.vdb")
+    ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+    ctx.sql(
+        """
+        INSERT INTO paimon.vdb.t
+        SELECT 1, parse_json('{"age":27,"ratio":1.25}')
+        UNION ALL
+        SELECT 2, parse_json('{"age":"32","ratio":"invalid"}')
+        """
+    )
+    return PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+
+
 def test_read_builder_chain_exists():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
@@ -57,6 +73,147 @@ def test_with_projection():
         table = _make_table_with_data(warehouse)
         plan = table.new_read_builder().with_projection(["id"]).new_scan().plan()
         assert plan is not None
+
+
+def test_with_projection_extracts_variant_fields():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(
+            ["id", "payload"],
+            variant_fields={
+                "payload": {
+                    "paths": ["$.ratio", "$.age", "$.missing"],
+                    "target_type": pa.float32(),
+                    "fail_on_error": False,
+                }
+            },
+        )
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits())).sort_by("id")
+
+        assert result.schema.names == ["id", "payload"]
+        assert result.field("payload").type == pa.struct(
+            [
+                pa.field("0", pa.float32()),
+                pa.field("1", pa.float32()),
+                pa.field("2", pa.float32()),
+            ]
+        )
+        assert result.column("payload").combine_chunks().to_pylist() == [
+            {"0": 1.25, "1": 27.0, "2": None},
+            {"0": None, "1": 32.0, "2": None},
+        ]
+
+
+def test_with_projection_variant_fields_honors_fail_on_error():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(
+            ["payload"],
+            variant_fields={
+                "payload": {
+                    "paths": ["$.ratio"],
+                    "target_type": pa.float32(),
+                    "fail_on_error": True,
+                }
+            },
+        )
+        plan = builder.new_scan().plan()
+        with pytest.raises(ValueError, match="Cannot cast Variant value to"):
+            builder.new_read().read(plan.splits())
+
+
+def test_with_projection_variant_fields_keeps_explicit_null():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.vdb")
+        ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+        ctx.sql("INSERT INTO paimon.vdb.t SELECT 1, parse_json('{\"x\":null}')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+        builder = table.new_read_builder().with_projection(
+            ["payload"],
+            variant_fields={
+                "payload": {
+                    "paths": ["$.x"],
+                    "target_type": pa.float32(),
+                    "fail_on_error": True,
+                }
+            },
+        )
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.column("payload").combine_chunks().to_pylist() == [{"0": None}]
+
+
+@pytest.mark.parametrize(
+    "target_type",
+    [
+        pa.bool_(),
+        pa.int32(),
+        pa.int64(),
+        pa.float64(),
+        pa.decimal128(10, 2),
+        pa.string(),
+        pa.binary(),
+        pa.date32(),
+        pa.list_(pa.int32()),
+        pa.map_(pa.string(), pa.int32()),
+        pa.struct([pa.field("x", pa.int32())]),
+        pa.time32("s"),
+        pa.large_string(),
+        pa.large_binary(),
+        pa.binary(4),
+        pa.dictionary(pa.int8(), pa.string()),
+        pa.timestamp("s"),
+        pa.timestamp("ms"),
+        pa.timestamp("us"),
+        pa.timestamp("us", tz="UTC"),
+        pa.timestamp("us", tz="Asia/Shanghai"),
+        pa.timestamp("ns"),
+    ],
+)
+def test_with_projection_variant_fields_rejects_unsupported_target(target_type):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        with pytest.raises(ValueError, match="must be float32"):
+            table.new_read_builder().with_projection(
+                ["payload"],
+                variant_fields={
+                    "payload": {"paths": ["$.age"], "target_type": target_type}
+                },
+            )
+
+
+def test_with_nested_projection_replaces_variant_fields():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(
+            ["payload"],
+            variant_fields={
+                "payload": {"paths": ["$.age"], "target_type": pa.float32()}
+            },
+        ).with_nested_projection([["id"]])
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.schema.names == ["id"]
+        assert sorted(result.column("id").to_pylist()) == [1, 2]
+
+
+def test_with_projection_variant_fields_requires_projected_variant_column():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(
+            ["id"],
+            variant_fields={
+                "payload": {
+                    "paths": ["$.age"],
+                    "target_type": pa.float32(),
+                }
+            },
+        )
+        with pytest.raises(ValueError, match="not in the read projection"):
+            builder.new_scan().plan()
 
 
 def test_with_limit():

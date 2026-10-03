@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::variant::{extract_numeric_fields, NumericFieldMode};
 use super::{option_bool, option_f64, option_usize, FieldMetadata, ShreddingWritePlan};
 use crate::arrow::{
     arrow_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields, paimon_type_to_arrow,
@@ -24,9 +25,9 @@ use crate::spec::{
 };
 use crate::variant::{
     build_variant_schema, cast_shredded, cast_variant_to_shredded_value,
-    infer_variant_shredding_schema, rebuild_shredded, variant_shredding_type, GenericVariant,
-    ShreddedRow, ShreddedValue, VariantShreddingInferConfig, VARIANT_METADATA_FIELD_NAME,
-    VARIANT_TYPED_VALUE_FIELD_NAME, VARIANT_VALUE_FIELD_NAME,
+    infer_variant_shredding_schema, rebuild_shredded, top_level_path_key, variant_shredding_type,
+    GenericVariant, ShreddedRow, ShreddedValue, VariantShreddingInferConfig,
+    VARIANT_METADATA_FIELD_NAME, VARIANT_TYPED_VALUE_FIELD_NAME, VARIANT_VALUE_FIELD_NAME,
 };
 use crate::{Error, Result};
 use arrow_array::{
@@ -702,7 +703,11 @@ fn assemble_array_to_logical(
     }
 }
 
-fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> Result<ArrayRef> {
+/// Extract projected fields from a logical Variant column after PK merge.
+pub(crate) fn assemble_variant_extraction_array(
+    array: &dyn Array,
+    row_type: &RowType,
+) -> Result<ArrayRef> {
     let input = array
         .as_any()
         .downcast_ref::<StructArray>()
@@ -723,6 +728,10 @@ fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> R
             parse_variant_metadata(description)
         })
         .collect::<Result<Vec<_>>>()?;
+
+    if let Some(projected) = assemble_plain_variant_projection(input, fields, &metadata)? {
+        return Ok(projected);
+    }
 
     let mut values_by_field = vec![Vec::with_capacity(input.len()); fields.len()];
     let mut validities = Vec::with_capacity(input.len());
@@ -784,6 +793,78 @@ fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> R
             },
         )?,
     ))
+}
+
+fn assemble_plain_variant_projection(
+    input: &StructArray,
+    fields: &[DataField],
+    metadata: &[crate::spec::VariantFieldMetadata],
+) -> Result<Option<ArrayRef>> {
+    if !is_plain_variant_array(input)
+        || fields
+            .iter()
+            .any(|field| !matches!(field.data_type(), DataType::Float(_)))
+    {
+        return Ok(None);
+    }
+
+    let mut keys = Vec::with_capacity(fields.len());
+    let mut fail_on_error = Vec::with_capacity(fields.len());
+    for field_metadata in metadata {
+        let Ok(Some(key)) = top_level_path_key(field_metadata.path()) else {
+            return Ok(None);
+        };
+        keys.push(key);
+        fail_on_error.push(field_metadata.fail_on_error());
+    }
+
+    let projected = extract_numeric_fields(
+        input,
+        &keys,
+        NumericFieldMode::Cast {
+            fail_on_error: &fail_on_error,
+        },
+    )?;
+    let values = projected
+        .values()
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("float32 Variant projection must contain Float32 values");
+    let width = fields.len();
+    let columns = (0..width)
+        .map(|field_index| {
+            Arc::new(Float32Array::from_iter((0..projected.len()).map(
+                |row_index| {
+                    let value_index = row_index * width + field_index;
+                    if values.is_null(value_index) {
+                        None
+                    } else {
+                        Some(values.value(value_index))
+                    }
+                },
+            ))) as ArrayRef
+        })
+        .collect::<Vec<_>>();
+    let arrow_fields: Fields = fields
+        .iter()
+        .map(|field| {
+            ArrowField::new(
+                field.name(),
+                ArrowDataType::Float32,
+                field.data_type().is_nullable(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into();
+
+    Ok(Some(Arc::new(
+        StructArray::try_new(arrow_fields, columns, projected.nulls().cloned()).map_err(|e| {
+            Error::UnexpectedError {
+                message: format!("Failed to build Variant float32 projection: {e}"),
+                source: Some(Box::new(e)),
+            }
+        })?,
+    )))
 }
 
 fn variant_from_storage_row(input: &StructArray, row: usize) -> Result<Option<GenericVariant>> {
@@ -1340,7 +1421,9 @@ fn null_buffer(validities: Vec<bool>) -> NullBuffer {
 mod tests {
     use super::*;
     use crate::arrow::variant_arrow_type;
-    use crate::spec::{variant_extraction_row, BlobType, IntType, VarCharType, VariantType};
+    use crate::spec::{
+        variant_extraction_row, BlobType, FloatType, IntType, VarCharType, VariantType,
+    };
 
     fn variant_array_for_test(values: &[GenericVariant]) -> ArrayRef {
         let value_items = values
@@ -1547,6 +1630,202 @@ mod tests {
         assert!(ages.is_null(1));
         assert_eq!(names.value(0), "Alice");
         assert!(names.is_null(1));
+    }
+
+    #[test]
+    fn variant_extraction_row_batches_top_level_float32_fields() {
+        let variants = vec![
+            Some(
+                GenericVariant::parse_json(
+                    r#"{"age":27,"ratio":1.25,"text":"3.5","enabled":true}"#,
+                )
+                .unwrap(),
+            ),
+            Some(
+                GenericVariant::parse_json(
+                    r#"{"age":32,"ratio":null,"text":"bad","enabled":false}"#,
+                )
+                .unwrap(),
+            ),
+            None,
+        ];
+        let input = variant_array(variants).unwrap();
+        let row_type = variant_extraction_row(
+            true,
+            [
+                ("$.ratio", false),
+                ("$.age", false),
+                ("$.text", false),
+                ("$.enabled", false),
+                ("$.missing", false),
+            ]
+            .into_iter()
+            .map(|(path, fail_on_error)| {
+                (
+                    DataType::Float(FloatType::new()),
+                    path.to_string(),
+                    fail_on_error,
+                    "UTC".to_string(),
+                )
+            }),
+        );
+
+        let projected = assemble_array_to_logical(input.as_ref(), &DataType::Row(row_type))
+            .unwrap()
+            .expect("projected");
+        let projected = projected.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(projected.len(), 3);
+        assert!(projected.is_valid(0));
+        assert!(projected.is_valid(1));
+        assert!(projected.is_null(2));
+        let values = (0..5)
+            .map(|index| {
+                projected
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values[0], vec![Some(1.25), None, None]);
+        assert_eq!(values[1], vec![Some(27.0), Some(32.0), None]);
+        assert_eq!(values[2], vec![Some(3.5), None, None]);
+        assert_eq!(values[3], vec![Some(1.0), Some(0.0), None]);
+        assert_eq!(values[4], vec![None, None, None]);
+    }
+
+    #[test]
+    fn variant_extraction_row_float32_fast_path_honors_fail_on_error() {
+        let variant = GenericVariant::parse_json(r#"{"value":"bad"}"#).unwrap();
+        let input = variant_array(vec![Some(variant)]).unwrap();
+        let row_type = variant_extraction_row(
+            true,
+            [(
+                DataType::Float(FloatType::new()),
+                "$.value".to_string(),
+                true,
+                "UTC".to_string(),
+            )],
+        );
+
+        let error =
+            assemble_array_to_logical(input.as_ref(), &DataType::Row(row_type)).unwrap_err();
+        assert!(matches!(error, Error::DataInvalid { ref message, .. }
+            if message.contains("Cannot cast Variant value to")));
+    }
+
+    #[test]
+    fn variant_extraction_row_preserves_null_with_fail_on_error() {
+        let variant = GenericVariant::parse_json(r#"{"value":null}"#).unwrap();
+        let input = variant_array(vec![Some(variant)]).unwrap();
+        let row_type = variant_extraction_row(
+            true,
+            [(
+                DataType::Float(FloatType::new()),
+                "$.value".to_string(),
+                true,
+                "UTC".to_string(),
+            )],
+        );
+
+        let projected = assemble_array_to_logical(input.as_ref(), &DataType::Row(row_type))
+            .unwrap()
+            .unwrap();
+        let projected = projected.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(projected.is_valid(0));
+        assert!(projected.column(0).is_null(0));
+    }
+
+    #[test]
+    fn invalid_try_path_returns_null_for_plain_and_shredded_variant() {
+        let logical_fields = vec![DataField::new(
+            1,
+            "v".to_string(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([(
+            "variant.shreddingSchema".to_string(),
+            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"age","type":"INT"}]}}]}"#.to_string(),
+        )]);
+        let physical_fields = configured_variant_shredding_fields(&logical_fields, &options)
+            .unwrap()
+            .unwrap();
+        let variant = GenericVariant::parse_json(r#"{"age":27}"#).unwrap();
+        let plain = variant_array_for_test(&[variant]);
+        let row_type = variant_extraction_row(
+            true,
+            [(
+                DataType::Float(FloatType::new()),
+                "$.".to_string(),
+                false,
+                "UTC".to_string(),
+            )],
+        );
+
+        let plain_result =
+            assemble_array_to_logical(plain.as_ref(), &DataType::Row(row_type.clone()))
+                .unwrap()
+                .unwrap();
+        let plain_result = plain_result.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(plain_result.column(0).is_null(0));
+
+        let strict_row_type = variant_extraction_row(
+            true,
+            [(
+                DataType::Float(FloatType::new()),
+                "$.".to_string(),
+                true,
+                "UTC".to_string(),
+            )],
+        );
+        assert!(
+            assemble_array_to_logical(plain.as_ref(), &DataType::Row(strict_row_type)).is_err()
+        );
+
+        let batch = RecordBatch::try_new(
+            build_target_arrow_schema(&logical_fields).unwrap(),
+            vec![plain],
+        )
+        .unwrap();
+        let physical =
+            batch_to_shredded_physical(&batch, &logical_fields, &physical_fields).unwrap();
+        let read_fields = vec![DataField::new(1, "v".to_string(), DataType::Row(row_type))];
+        let shredded_result = assemble_shredded_variant_batch(physical, &read_fields).unwrap();
+        let shredded_result = shredded_result
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(shredded_result.column(0).is_null(0));
+    }
+
+    #[test]
+    fn nested_float32_variant_extraction_keeps_general_path_semantics() {
+        let variant = GenericVariant::parse_json(r#"{"pose":{"x":"1.5"}}"#).unwrap();
+        let input = variant_array(vec![Some(variant)]).unwrap();
+        let row_type = variant_extraction_row(
+            true,
+            [(
+                DataType::Float(FloatType::new()),
+                "$.pose.x".to_string(),
+                true,
+                "UTC".to_string(),
+            )],
+        );
+
+        let projected = assemble_array_to_logical(input.as_ref(), &DataType::Row(row_type))
+            .unwrap()
+            .expect("projected");
+        let projected = projected.as_any().downcast_ref::<StructArray>().unwrap();
+        let values = projected
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 1.5);
     }
 
     #[test]
