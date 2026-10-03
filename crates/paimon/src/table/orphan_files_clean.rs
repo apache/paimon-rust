@@ -32,7 +32,7 @@
 //! look unreferenced and be deleted.
 
 use crate::io::{FileIO, FileStatus};
-use crate::spec::{IndexManifest, Manifest, ManifestList, Snapshot};
+use crate::spec::{CoreOptions, IndexManifest, Manifest, ManifestList, Snapshot, TableType};
 use crate::table::snapshot_deletion::reassign_plan_file;
 use crate::table::{BranchManager, SnapshotManager, Table};
 use crate::{Error, Result};
@@ -108,6 +108,21 @@ impl<'a> RemoveOrphanFiles<'a> {
 
     pub async fn execute(&self) -> Result<OrphanFilesCleanResult> {
         self.table.ensure_not_branch_reference_for_write()?;
+        // Only snapshot-managed tables say which files are live. A Format,
+        // object, Lance or Iceberg table keeps live files nothing references,
+        // so all of them would look orphaned. Java accepts only FileStoreTable.
+        let core_options = CoreOptions::new(self.table.schema().options());
+        match core_options.table_type()? {
+            TableType::Table | TableType::MaterializedTable => {}
+            other => {
+                return Err(Error::Unsupported {
+                    message: format!(
+                        "Orphan file cleanup only supports Paimon tables, but '{}' is a {other}",
+                        self.table.identifier().full_name()
+                    ),
+                })
+            }
+        }
         let now = self.current_time_millis.unwrap_or_else(current_time_millis);
         let older_than = match self.older_than_millis {
             None => now - DEFAULT_OLDER_THAN_MS,
@@ -124,6 +139,8 @@ impl<'a> RemoveOrphanFiles<'a> {
         let clean = Clean {
             file_io: self.table.file_io().clone(),
             table_location: self.table.location().trim_end_matches('/').to_string(),
+            data_location: self.table.data_file_location(),
+            data_directory: core_options.data_file_path_directory().map(str::to_string),
             older_than,
         };
 
@@ -284,7 +301,13 @@ struct MetadataFiles {
 
 struct Clean {
     file_io: FileIO,
+    /// Root of metadata: manifests, index, statistics, snapshots.
     table_location: String,
+    /// Root of bucket directories: the table location, or
+    /// `data-file.path-directory` under it.
+    data_location: String,
+    /// `data-file.path-directory`, which writers also apply under external roots.
+    data_directory: Option<String>,
     older_than: i64,
 }
 
@@ -342,30 +365,38 @@ impl Clean {
             .map(|dir| format!("{}/{dir}", self.table_location))
             .to_vec();
         dirs.extend(
-            self.bucket_dirs(&self.table_location, partition_depth)
+            self.bucket_dirs(&self.data_location, partition_depth)
                 .await?,
         );
+        let mut statuses = Vec::new();
+        for dir in dirs {
+            statuses.extend(self.list(&dir).await?);
+        }
+        // Writers place external files under the same relative bucket path,
+        // and with `entropy-inject` add hash directories below each bucket, so
+        // external buckets are walked recursively.
         for external in external_paths
             .into_iter()
             .flat_map(|paths| paths.split(','))
             .map(str::trim)
             .filter(|path| !path.is_empty())
         {
-            dirs.extend(
-                self.bucket_dirs(external.trim_end_matches('/'), partition_depth)
-                    .await?,
+            let root = crate::spec::data_file_path(
+                external.trim_end_matches('/'),
+                self.data_directory.as_deref(),
             );
+            for bucket in self.bucket_dirs(&root, partition_depth).await? {
+                statuses.extend(self.file_io.list_status_recursive(&bucket).await?);
+            }
         }
 
         let mut candidates = BTreeMap::new();
-        for dir in dirs {
-            for status in self.list(&dir).await? {
-                if !status.is_dir
-                    && !status.path.ends_with(MANAGED_BLOB_SUFFIX)
-                    && self.old_enough(&status)
-                {
-                    candidates.insert(status.path, status.size);
-                }
+        for status in statuses {
+            if !status.is_dir
+                && !status.path.ends_with(MANAGED_BLOB_SUFFIX)
+                && self.old_enough(&status)
+            {
+                candidates.insert(status.path, status.size);
             }
         }
         Ok(candidates)

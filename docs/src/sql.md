@@ -1163,9 +1163,12 @@ It returns `deletedFileCount` and `deletedFileTotalLenInBytes`, like Java.
 | `parallelism` | `16` | Maximum concurrent manifest reads and deletions. |
 | `mode` | `local` | Only `local` is supported. |
 
-Candidates are files in the `manifest`, `index` and `statistics` directories,
-in bucket directories (including `data-file.external-paths`), and non-snapshot
-files in snapshot and changelog directories. Files are matched by name against
+Only Paimon tables are supported; a Format, object, Lance or Iceberg table is
+rejected, since nothing references its live files. Candidates are files in the
+`manifest`, `index` and `statistics` directories, in bucket directories (under
+`data-file.path-directory` when set, and under every `data-file.external-paths`
+root, including the hash directories of the `entropy-inject` strategy), and
+non-snapshot files in snapshot and changelog directories. Files are matched by name against
 everything the snapshots, tags and changelogs of every branch reference. The
 cleanup aborts without deleting anything when a branch has no schema, or when
 a live snapshot references a missing metadata file. Managed BLOB files
