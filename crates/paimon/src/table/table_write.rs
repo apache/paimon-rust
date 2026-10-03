@@ -26,8 +26,8 @@ use crate::resource::ResourceContext;
 use crate::spec::PartitionComputer;
 use crate::spec::{
     first_row_supports_changelog_producer, BinaryRow, ChangelogProducer, CoreOptions, DataField,
-    DataType, MergeEngine, RowKind, RowKindFilter, EMPTY_SERIALIZED_ROW, POSTPONE_BUCKET,
-    VALUE_KIND_FIELD_NAME,
+    DataType, MergeEngine, PartialUpdateConfig, RowKind, RowKindFilter, EMPTY_SERIALIZED_ROW,
+    POSTPONE_BUCKET, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::bucket_assigner::{BucketAssignerEnum, PartitionBucketKey};
 use crate::table::bucket_assigner_constant::ConstantBucketAssigner;
@@ -627,6 +627,32 @@ impl TableWrite {
                 self.table.schema().options(),
             )?;
         }
+        let config = PartialUpdateConfig::new(self.table.schema().options());
+        let batch = if config.is_enabled() && config.remove_record_on_delete() {
+            let batch = if batch
+                .schema()
+                .column_with_name(VALUE_KIND_FIELD_NAME)
+                .is_none()
+            {
+                Self::add_value_kind_column(&batch, RowKind::Insert as i8)?
+            } else {
+                batch
+            };
+            // NULL kinds are Inserts. Every buffered batch must allow them,
+            // including batches with synthesized Insert kinds.
+            let schema = batch.schema();
+            let kind_index = schema.index_of(VALUE_KIND_FIELD_NAME).unwrap();
+            let mut schema = arrow_schema::SchemaBuilder::from(schema.as_ref());
+            Arc::make_mut(schema.field_mut(kind_index)).set_nullable(true);
+            batch
+                .with_schema(Arc::new(schema.finish()))
+                .map_err(|error| crate::Error::DataInvalid {
+                    message: format!("Failed to normalize _VALUE_KIND schema: {error}"),
+                    source: Some(Box::new(error)),
+                })?
+        } else {
+            batch
+        };
         Ok(Some(batch))
     }
 
@@ -798,10 +824,8 @@ impl TableWrite {
             .schema()
             .column_with_name(VALUE_KIND_FIELD_NAME)
             .is_some();
-        // Cross-partition writers must always include _VALUE_KIND to keep the
-        // Arrow schema stable across batches (some batches may have deletes,
-        // others may not — KeyValueFileWriter's concat_batches requires a
-        // consistent schema).
+        // These writers must always include _VALUE_KIND to keep the Arrow
+        // schema stable when a later batch contains deletes.
         let needs_value_kind = batch_has_value_kind
             || matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_))
             || !output.deletes.is_empty();
@@ -1906,6 +1930,55 @@ pub(in crate::table) mod tests {
         let messages = table_write.prepare_commit().await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].new_files[0].row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_partial_update_remove_record_on_delete_with_rowkind_field() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_partial_update_delete_rowkind_field";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .column("op", DataType::VarChar(VarCharType::string_type()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("merge-engine", "partial-update")
+            .option("partial-update.remove-record-on-delete", "true")
+            .option("rowkind.field", "op")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_partial_update_delete_rowkind_field"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", ArrowDataType::Int32, false),
+                ArrowField::new("value", ArrowDataType::Int32, false),
+                ArrowField::new("op", ArrowDataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(Int32Array::from(vec![10, 10])),
+                Arc::new(StringArray::from(vec!["+I", "-D"])),
+            ],
+        )
+        .unwrap();
+        let mut writer = TableWrite::new(&table, "test-user".to_string()).unwrap();
+        writer.write_arrow_batch(&batch).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].new_files.len(), 1);
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
+        TableCommit::new(table.clone(), "test-user".to_string())
+            .commit(messages)
+            .await
+            .unwrap();
+        assert!(read_id_value_rows(&table).await.is_empty());
     }
 
     #[tokio::test]
