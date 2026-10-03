@@ -572,9 +572,11 @@ impl KeyValueFileReader {
                 reorder_map[out_idx] = key_pos;
             } else {
                 // Find position in value_fields
+                // The internal field may use the current table name while the
+                // requested output retains a historical name for the same ID.
                 let val_pos = value_fields
                     .iter()
-                    .position(|vf| vf.name() == field.name())
+                    .position(|vf| vf.id() == field.id())
                     .unwrap();
                 reorder_map[out_idx] = num_keys + val_pos;
             }
@@ -967,6 +969,102 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::DataInvalid { ref message, .. }
             if message.contains("Cannot cast Variant value")));
+    }
+
+    #[tokio::test]
+    async fn kv_variant_projection_preserves_requested_historical_field_name() {
+        let file_io = test_file_io();
+        let table_path = "memory:/kv_variant_projection_renamed_field";
+        setup_dirs(&file_io, table_path).await;
+        let schema = |name: &str| {
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column(name, DataType::Variant(VariantType::new()))
+                .primary_key(["id"])
+                .option("bucket", "1")
+                .build()
+                .unwrap()
+        };
+        let old_schema = TableSchema::new(0, &schema("payload"));
+        let new_schema = TableSchema::new(1, &schema("renamed_payload"));
+        let table = |schema: TableSchema| {
+            Table::new(
+                file_io.clone(),
+                Identifier::new("default", "kv_variant_projection_renamed_field"),
+                table_path.to_string(),
+                schema,
+                None,
+            )
+        };
+        let old_table = table(old_schema.clone());
+        let new_table = table(new_schema.clone());
+        write_schema_file(&old_table, &old_schema).await;
+        write_schema_file(&new_table, &new_schema).await;
+
+        let batch = |table: &Table, json| {
+            let variant = crate::variant::GenericVariant::parse_json(json).unwrap();
+            let ArrowDataType::Struct(fields) = variant_arrow_type() else {
+                unreachable!()
+            };
+            let payload = StructArray::try_new(
+                fields,
+                vec![
+                    Arc::new(BinaryArray::from(vec![Some(variant.value())])),
+                    Arc::new(BinaryArray::from(vec![Some(variant.metadata())])),
+                ],
+                None,
+            )
+            .unwrap();
+            RecordBatch::try_new(
+                build_target_arrow_schema(table.schema().fields()).unwrap(),
+                vec![Arc::new(Int32Array::from(vec![1])), Arc::new(payload)],
+            )
+            .unwrap()
+        };
+        write_commit(&old_table, &batch(&old_table, r#"{"x":"invalid"}"#)).await;
+        write_commit(&new_table, &batch(&new_table, r#"{"x":1.5}"#)).await;
+
+        let mut read_builder = new_table.new_read_builder();
+        read_builder.with_read_type(vec![
+            new_table.schema().fields()[0].clone(),
+            DataField::new(
+                1,
+                "payload".to_string(),
+                DataType::Row(variant_extraction_row(
+                    true,
+                    [(
+                        DataType::Float(FloatType::new()),
+                        "$.x".to_string(),
+                        true,
+                        "UTC".to_string(),
+                    )],
+                )),
+            ),
+        ]);
+        let plan = read_builder.new_scan().plan().await.unwrap();
+        let batches = read_builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(int_column(&batches, "id"), vec![1]);
+        let payload = batches[0]
+            .column_by_name("payload")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let x = payload
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert!(!payload.is_null(0));
+        assert!(!x.is_null(0));
+        assert_eq!(x.value(0), 1.5);
     }
 
     #[test]
