@@ -1193,7 +1193,7 @@ impl ExecutionPlan for PaimonTableScan {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> DFResult<Arc<Statistics>> {
-        // They include the rows the server's rules drop.
+        // Statistics include hidden rows and unmasked values.
         if self.has_query_auth_rules() {
             return Ok(Arc::new(Statistics::new_unknown(&self.schema())));
         }

@@ -1650,7 +1650,10 @@ mod tests {
             Some(Arc::new(crate::table::query_auth::QueryAuthGrant::new(
                 table.query_auth_session().unwrap(),
                 None,
-                crate::table::query_auth::Rules { filters },
+                crate::table::query_auth::Rules {
+                    filters,
+                    masks: Vec::new(),
+                },
             )))
         };
         let s = || split(vec![file("a", 10, None)], true);

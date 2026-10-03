@@ -20,7 +20,7 @@
 mod rules;
 
 use crate::api::AuthTableQueryResponse;
-pub(crate) use rules::{filter_batch, Rules};
+pub(crate) use rules::{filter_batch, mask_batch, mask_inputs, Rules};
 
 /// The server's answer for one user on one table; `session` ties it to the
 /// handle that asked, as the response names no table or user.
