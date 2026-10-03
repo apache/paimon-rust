@@ -48,6 +48,7 @@ mod data_file_writer;
 mod de_vector_read;
 mod de_vector_scan;
 mod dedicated_format_file_writer;
+mod expire_snapshots;
 mod external_path;
 mod format_partition;
 mod format_partition_location;
@@ -86,6 +87,7 @@ pub(crate) mod merge_tree_split_generator;
 #[cfg(test)]
 mod mosaic_table_write_tests;
 mod object_table;
+mod orphan_files_clean;
 mod partition_filter;
 mod partition_row_count;
 mod partition_stat;
@@ -122,6 +124,7 @@ mod row_position_selection;
 mod scan_trace;
 pub(crate) mod schema_manager;
 pub(crate) mod snapshot_commit;
+mod snapshot_deletion;
 mod snapshot_manager;
 mod sort_merge;
 mod sorted_global_index_build_builder;
@@ -163,6 +166,7 @@ pub use consumer_manager::ConsumerManager;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
 pub use de_vector_scan::PreparedVectorSearchFilter;
+pub use expire_snapshots::ExpireSnapshots;
 pub use format_partition::{
     format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
 };
@@ -183,6 +187,7 @@ pub use incremental_scan::{
 };
 pub use lumina_index_build_builder::LuminaIndexBuildBuilder;
 pub use object_table::{ObjectEntry, ObjectTable};
+pub use orphan_files_clean::{OrphanFilesCleanResult, RemoveOrphanFiles};
 pub use partition_row_count::PartitionRowCount;
 pub use partition_stat::PartitionStat;
 pub use pk_vector_bucket_split::{BucketVectorPayload, BucketVectorSearchSplit};
@@ -529,6 +534,20 @@ impl Table {
 
     pub fn new_btree_global_index_build_builder(&self) -> BTreeGlobalIndexBuildBuilder<'_> {
         self.new_sorted_global_index_build_builder()
+    }
+
+    /// Create a snapshot expiration for this table.
+    ///
+    /// Reference: [ExpireSnapshotsImpl](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/table/ExpireSnapshotsImpl.java)
+    pub fn new_expire_snapshots(&self) -> ExpireSnapshots<'_> {
+        ExpireSnapshots::new(self)
+    }
+
+    /// Create an orphan file cleanup for this table.
+    ///
+    /// Reference: [LocalOrphanFilesClean](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/operation/LocalOrphanFilesClean.java)
+    pub fn new_remove_orphan_files(&self) -> RemoveOrphanFiles<'_> {
+        RemoveOrphanFiles::new(self)
     }
 
     pub fn new_global_index_drop_builder(&self) -> GlobalIndexDropBuilder<'_> {
