@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::metadata_cache::FileMetadataCache;
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::build_target_arrow_schema;
-use crate::io::{FileRead, FileWrite};
+use crate::io::{BlobIndexCacheContext, FileRead, FileWrite};
 use crate::spec::{BlobDescriptor, DataField, DataType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
@@ -33,7 +34,6 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use lru::LruCache;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -93,7 +93,7 @@ impl IndexedBlobReader {
         blob_parallelism: usize,
     ) -> crate::Result<Self> {
         debug_assert!(blob_parallelism > 0);
-        let index = BlobFileIndex::load_cached(reader.as_ref(), file_size, &file_path).await?;
+        let index = BlobFileIndex::load_cached(reader.as_ref(), file_size).await?;
         Ok(Self {
             reader,
             index,
@@ -163,20 +163,9 @@ pub(crate) enum BlobReadValue {
 
 const BLOB_FOOTER_SIZE: u64 = 5;
 const BLOB_FORMAT_VERSION: u8 = 1;
-const BLOB_INDEX_CACHE_CAPACITY: usize = 16;
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct BlobIndexCacheKey {
-    namespace: usize,
-    file_path: String,
-}
-
-static BLOB_INDEX_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<LruCache<BlobIndexCacheKey, Arc<BlobFileIndex>>>,
-> = std::sync::LazyLock::new(|| {
-    std::sync::Mutex::new(LruCache::new(
-        std::num::NonZeroUsize::new(BLOB_INDEX_CACHE_CAPACITY).unwrap(),
-    ))
-});
+const BLOB_INDEX_CACHE_CONTAINER_OVERHEAD: usize = std::mem::size_of::<String>()
+    + std::mem::size_of::<Arc<BlobFileIndex>>()
+    + 4 * std::mem::size_of::<usize>();
 const BLOB_MAGIC_NUMBER: i32 = 1481511375;
 const BLOB_MAGIC_NUMBER_BYTES: [u8; 4] = BLOB_MAGIC_NUMBER.to_le_bytes();
 const BLOB_INLINE_HEADER_SIZE: u64 = 4;
@@ -1688,36 +1677,71 @@ async fn read_blob_range(reader: &dyn FileRead, range: Range<u64>) -> crate::Res
     Ok(bytes)
 }
 
-impl BlobFileIndex {
-    async fn load_cached(
-        reader: &dyn FileRead,
-        file_size: u64,
-        file_path: &str,
-    ) -> crate::Result<Arc<Self>> {
-        let cache_key = reader
-            .cache_namespace()
-            .filter(|_| !file_path.is_empty())
-            .map(|namespace| BlobIndexCacheKey {
-                namespace,
-                file_path: file_path.to_string(),
-            });
-        if let Some(cache_key) = &cache_key {
-            let mut cache = BLOB_INDEX_CACHE
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some(index) = cache.get(cache_key) {
-                return Ok(index.clone());
-            }
-        }
+type BlobIndexLoadResult = Result<Arc<BlobFileIndex>, Arc<Error>>;
 
-        let index = Arc::new(Self::load(reader, file_size).await?);
-        if let Some(cache_key) = cache_key {
-            BLOB_INDEX_CACHE
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .put(cache_key, index.clone());
+struct BlobIndexCache {
+    entries: FileMetadataCache<String, BlobIndexLoadResult>,
+}
+
+impl BlobIndexCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: FileMetadataCache::new(max_bytes, usize::MAX),
         }
-        Ok(index)
+    }
+}
+
+impl BlobFileIndex {
+    async fn load_cached(reader: &dyn FileRead, file_size: u64) -> crate::Result<Arc<Self>> {
+        let Some(context) = reader
+            .blob_index_cache()
+            .and_then(|cache| cache.downcast_ref::<BlobIndexCacheContext>())
+        else {
+            return Ok(Arc::new(Self::load(reader, file_size).await?));
+        };
+        if !context.belongs_to_current_process() {
+            return Ok(Arc::new(Self::load(reader, file_size).await?));
+        }
+        let cache = context.get_or_init(BlobIndexCache::new);
+        let cache_key = reader.cache_key().map(ToOwned::to_owned);
+        let key_heap_bytes = cache_key.as_ref().map_or(0, String::capacity);
+        let load = cache
+            .entries
+            .get_or_try_insert_with_admission(
+                cache_key,
+                key_heap_bytes,
+                || async {
+                    Ok::<_, std::convert::Infallible>(Arc::new(
+                        Self::load(reader, file_size)
+                            .await
+                            .map(Arc::new)
+                            .map_err(Arc::new),
+                    ))
+                },
+                |load| {
+                    load.as_ref()
+                        .ok()
+                        .map(|index| index.estimated_cache_bytes())
+                },
+            )
+            .await
+            .unwrap();
+        match load.as_ref() {
+            Ok(index) => Ok(Arc::clone(index)),
+            Err(error) => Err(clone_blob_index_error(error)),
+        }
+    }
+
+    fn estimated_cache_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.entries
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<BlobEntry>()),
+            )
+            // Account for the LRU node, hash slot and Arc allocation which are
+            // not represented by the decoded index itself.
+            .saturating_add(BLOB_INDEX_CACHE_CONTAINER_OVERHEAD)
     }
 
     async fn load(reader: &dyn FileRead, file_size: u64) -> crate::Result<Self> {
@@ -1782,6 +1806,45 @@ impl BlobFileIndex {
 
     fn entry(&self, position: usize) -> Option<&BlobEntry> {
         self.entries.get(position)
+    }
+}
+
+#[derive(Debug)]
+struct SharedBlobIndexError(Arc<Error>);
+
+impl std::fmt::Display for SharedBlobIndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.0.as_ref(), f)
+    }
+}
+
+impl std::error::Error for SharedBlobIndexError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn clone_blob_index_error(error: &Arc<Error>) -> Error {
+    let source = || {
+        Some(Box::new(SharedBlobIndexError(Arc::clone(error)))
+            as Box<dyn std::error::Error + Send + Sync>)
+    };
+    match error.as_ref() {
+        Error::DataInvalid { message, .. } => Error::DataInvalid {
+            message: message.clone(),
+            source: source(),
+        },
+        Error::Unsupported { message } => Error::Unsupported {
+            message: message.clone(),
+        },
+        Error::UnexpectedError { message, .. } => Error::UnexpectedError {
+            message: message.clone(),
+            source: source(),
+        },
+        _ => Error::UnexpectedError {
+            message: error.to_string(),
+            source: source(),
+        },
     }
 }
 
@@ -2333,11 +2396,35 @@ fn encode_varint(value: i64, out: &mut Vec<u8>) {
 mod tests {
     use super::*;
     use crate::btree::test_util::BytesFileRead;
-    use crate::io::{FileIO, FileIOBuilder};
+    use crate::common::CatalogOptions;
+    #[cfg(feature = "storage-oss")]
+    use crate::io::FileIOCacheContext;
+    #[cfg(feature = "storage-oss")]
+    use crate::io::FileIOProvider;
+    use crate::io::{BlobIndexCacheContext, FileIO, FileIOBuilder};
     use crate::spec::{ArrayType, BlobType, MapType, VarCharType};
     use arrow_array::Array;
+    #[cfg(feature = "storage-oss")]
+    use axum::{
+        body::Body,
+        extract::State,
+        http::{
+            header::{CONTENT_LENGTH, CONTENT_RANGE, RANGE},
+            HeaderMap, Response, StatusCode,
+        },
+        routing::get,
+        Router,
+    };
     use bytes::Bytes;
     use futures::TryStreamExt;
+    #[cfg(feature = "storage-oss")]
+    use opendal::{Configurator, HttpTransporter, OperationContext, Operator};
+    #[cfg(feature = "storage-oss")]
+    use opendal_http_transport_reqwest::ReqwestTransport;
+    #[cfg(feature = "storage-oss")]
+    use opendal_service_oss::OssConfig;
+    #[cfg(feature = "storage-oss")]
+    use std::collections::HashMap;
     use std::mem::size_of;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -2385,6 +2472,120 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ForkBoundBlobRead {
+        parent_pid: u32,
+        cache: Arc<BlobIndexCacheContext>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait::async_trait]
+    impl FileRead for ForkBoundBlobRead {
+        async fn read(&self, _range: Range<u64>) -> crate::Result<Bytes> {
+            if std::process::id() != self.parent_pid {
+                return Err(Error::ProcessForkUnsupported {
+                    message: crate::error::JINDO_FORK_ERROR.to_string(),
+                });
+            }
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        fn cache_key(&self) -> Option<&str> {
+            Some("fork-pending-blob")
+        }
+
+        fn blob_index_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+            Some(self.cache.as_ref())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_index_cache_does_not_join_parent_load_after_fork() {
+        let cache = blob_index_cache("64 MiB");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let parent_pid = std::process::id();
+        let parent_reader = ForkBoundBlobRead {
+            parent_pid,
+            cache: Arc::clone(&cache),
+            started: Arc::clone(&started),
+        };
+        let parent_load =
+            tokio::spawn(async move { BlobFileIndex::load_cached(&parent_reader, 5).await });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("parent load did not start");
+
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork failed");
+        if child_pid == 0 {
+            let passed = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let reader = ForkBoundBlobRead {
+                        parent_pid,
+                        cache,
+                        started,
+                    };
+                    matches!(
+                        tokio::time::timeout(
+                            Duration::from_millis(500),
+                            BlobFileIndex::load_cached(&reader, 5),
+                        )
+                        .await,
+                        Ok(Err(Error::ProcessForkUnsupported { .. }))
+                    )
+                })
+            })
+            .join()
+            .unwrap_or(false);
+            unsafe { libc::_exit(i32::from(!passed)) };
+        }
+
+        let (status, timed_out) = tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let mut status = 0;
+                let waited = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+                if waited == child_pid {
+                    return Ok::<_, std::io::Error>((status, false));
+                }
+                if waited < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                    loop {
+                        let waited = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+                        if waited == child_pid {
+                            return Ok((status, true));
+                        }
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        parent_load.abort();
+        assert!(!timed_out, "child hung on inherited BLOB cache state");
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
     #[tokio::test]
@@ -2630,10 +2831,11 @@ mod tests {
     async fn test_blob_reader_reuses_cached_index() {
         let file_path = "file:///blob-index-cache-test/data.blob";
         let file_bytes = load_blob_fixture("blob-basic.blob");
-        let first =
-            TrackingFileRead::new(Bytes::from(file_bytes.clone())).with_cache_namespace(usize::MAX);
-        let second =
-            TrackingFileRead::new(Bytes::from(file_bytes.clone())).with_cache_namespace(usize::MAX);
+        let cache = blob_index_cache("64 MiB");
+        let first = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache.clone());
+        let second = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache);
 
         let first_reader = IndexedBlobReader::open(
             Box::new(first.clone()),
@@ -2655,6 +2857,234 @@ mod tests {
         assert_eq!(first_reader.num_rows(), second_reader.num_rows());
         assert_eq!(first.ranges().len(), 1);
         assert!(second.ranges().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_can_be_disabled() {
+        let file_path = "file:///blob-index-cache-disabled/data.blob";
+        let file_bytes = load_blob_fixture("blob-basic.blob");
+        let cache = blob_index_cache("0");
+        let first = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache.clone());
+        let second = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache);
+
+        for reader in [first.clone(), second.clone()] {
+            IndexedBlobReader::open(
+                Box::new(reader),
+                file_bytes.len() as u64,
+                file_path.to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(first.ranges().len(), 1);
+        assert_eq!(second.ranges().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_coalesces_concurrent_loads() {
+        let file_path = "file:///blob-index-cache-concurrent/data.blob";
+        let file_bytes = load_blob_fixture("blob-basic.blob");
+        let cache = blob_index_cache("64 MiB");
+        let tracking = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache);
+
+        let open = |reader: TrackingFileRead| {
+            IndexedBlobReader::open(
+                Box::new(reader),
+                file_bytes.len() as u64,
+                file_path.to_string(),
+                true,
+            )
+        };
+        let (first, second) = tokio::join!(open(tracking.clone()), open(tracking.clone()));
+
+        assert_eq!(first.unwrap().num_rows(), second.unwrap().num_rows());
+        assert_eq!(tracking.ranges().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_coalesces_failure_then_retries() {
+        let file_path = "file:///blob-index-cache-failure/data.blob";
+        let file_bytes = load_blob_fixture("blob-basic.blob");
+        let cache = blob_index_cache("64 MiB");
+        let failing = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache.clone())
+            .with_failure();
+
+        let open = |reader: TrackingFileRead| {
+            IndexedBlobReader::open(
+                Box::new(reader),
+                file_bytes.len() as u64,
+                file_path.to_string(),
+                true,
+            )
+        };
+        let failures = futures::future::join_all((0..8).map(|_| open(failing.clone()))).await;
+
+        assert!(failures.iter().all(Result::is_err));
+        for failure in failures {
+            let Error::UnexpectedError {
+                source: Some(source),
+                ..
+            } = failure.err().unwrap()
+            else {
+                panic!("cached failure lost its source");
+            };
+            let shared = source.downcast_ref::<SharedBlobIndexError>().unwrap();
+            assert!(std::error::Error::source(shared)
+                .unwrap()
+                .downcast_ref::<Error>()
+                .is_some());
+            assert!(matches!(
+                shared.0.as_ref(),
+                Error::UnexpectedError {
+                    source: Some(_),
+                    ..
+                }
+            ));
+        }
+        assert_eq!(failing.ranges().len(), 1);
+
+        let retry = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(file_path, cache);
+        assert_eq!(open(retry.clone()).await.unwrap().num_rows(), 4);
+        assert_eq!(retry.ranges().len(), 1);
+    }
+
+    #[test]
+    fn test_blob_index_cache_preserves_direct_error_cause() {
+        let original = Arc::new(Error::IoUnexpected {
+            message: "injected storage failure".to_string(),
+            source: Box::new(opendal::Error::new(
+                opendal::ErrorKind::Unsupported,
+                "injected native failure",
+            )),
+        });
+        let Error::UnexpectedError {
+            source: Some(source),
+            ..
+        } = clone_blob_index_error(&original)
+        else {
+            panic!("cached failure lost its cause");
+        };
+        let cause = std::error::Error::source(source.as_ref())
+            .unwrap()
+            .downcast_ref::<Error>()
+            .unwrap();
+        assert!(std::ptr::eq(cause, original.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_preserves_io_error_category() {
+        let file_size = load_blob_fixture("blob-basic.blob").len() as u64;
+        for budget in ["64 MiB", "0"] {
+            let path = format!("file:///blob-index-io-error/{budget}/data.blob");
+            let reader = TrackingFileRead::new(Bytes::new())
+                .with_blob_index_cache(&path, blob_index_cache(budget))
+                .with_io_failure();
+
+            let direct = BlobFileIndex::load(&reader, file_size).await.unwrap_err();
+            assert!(matches!(direct, Error::IoUnexpected { .. }));
+            for _ in 0..2 {
+                let cached = IndexedBlobReader::open(
+                    Box::new(reader.clone()),
+                    file_size,
+                    path.clone(),
+                    true,
+                )
+                .await
+                .err()
+                .expect("BLOB index load should fail");
+                assert!(cached.is_io_unexpected(), "budget={budget}: {cached:?}");
+            }
+            assert_eq!(reader.ranges().len(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_blob_index_cache_evicts_by_decoded_bytes() {
+        let first_key = "memory:/blob-index-cache-bytes/first.blob";
+        let second_key = "memory:/blob-index-cache-bytes/other.blob";
+        assert_eq!(first_key.len(), second_key.len());
+        let file_bytes = blob_test_utils::build_blob_file_bytes(&[None, None]);
+        let max_bytes = blob_index_cache_entry_weight(first_key, 2);
+        let cache = blob_index_cache(&max_bytes.to_string());
+        let first = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(first_key, cache.clone());
+        let second = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(second_key, cache.clone());
+        let first_again = TrackingFileRead::new(Bytes::from(file_bytes.clone()))
+            .with_blob_index_cache(first_key, cache);
+
+        for (reader, key) in [
+            (first.clone(), first_key),
+            (second.clone(), second_key),
+            (first_again.clone(), first_key),
+        ] {
+            IndexedBlobReader::open(
+                Box::new(reader),
+                file_bytes.len() as u64,
+                key.to_string(),
+                true,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(first.ranges().len(), 1);
+        assert_eq!(second.ranges().len(), 1);
+        assert_eq!(first_again.ranges().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_blob_index_does_not_evict_cached_index() {
+        let small_key = "memory:/blob-index-cache-size/small.blob";
+        let large_key = "memory:/blob-index-cache-size/large.blob";
+        assert_eq!(small_key.len(), large_key.len());
+        let small_bytes = blob_test_utils::build_blob_file_bytes(&[None]);
+        let large_values = vec![None; 100];
+        let large_bytes = blob_test_utils::build_blob_file_bytes(&large_values);
+        let max_bytes = blob_index_cache_entry_weight(small_key, 1);
+        let cache = blob_index_cache(&max_bytes.to_string());
+        let small = TrackingFileRead::new(Bytes::from(small_bytes.clone()))
+            .with_blob_index_cache(small_key, cache.clone());
+        let large = TrackingFileRead::new(Bytes::from(large_bytes.clone()))
+            .with_blob_index_cache(large_key, cache.clone());
+        let small_again = TrackingFileRead::new(Bytes::from(small_bytes.clone()))
+            .with_blob_index_cache(small_key, cache);
+
+        IndexedBlobReader::open(
+            Box::new(small.clone()),
+            small_bytes.len() as u64,
+            small_key.to_string(),
+            true,
+        )
+        .await
+        .unwrap();
+        IndexedBlobReader::open(
+            Box::new(large.clone()),
+            large_bytes.len() as u64,
+            large_key.to_string(),
+            true,
+        )
+        .await
+        .unwrap();
+        IndexedBlobReader::open(
+            Box::new(small_again.clone()),
+            small_bytes.len() as u64,
+            small_key.to_string(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(small.ranges().len(), 1);
+        assert_eq!(large.ranges().len(), 1);
+        assert!(small_again.ranges().is_empty());
     }
 
     #[tokio::test]
@@ -2680,21 +3110,10 @@ mod tests {
             .await
             .unwrap();
 
-        let first_namespace = first_io
-            .new_input(path)
-            .unwrap()
-            .reader()
-            .await
-            .unwrap()
-            .cache_namespace();
-        let second_namespace = second_io
-            .new_input(path)
-            .unwrap()
-            .reader()
-            .await
-            .unwrap()
-            .cache_namespace();
-        assert_ne!(first_namespace, second_namespace);
+        assert!(!Arc::ptr_eq(
+            &first_io.blob_index_cache(),
+            &second_io.blob_index_cache()
+        ));
 
         assert_eq!(
             read_scalar_blob_file(&first_io, path).await,
@@ -2704,6 +3123,323 @@ mod tests {
             read_scalar_blob_file(&second_io, path).await,
             vec![Some(value.to_vec()), None]
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "storage-oss")]
+    async fn test_blob_index_cache_isolated_by_storage_endpoint() {
+        let value = b"value";
+        let first_bytes = Bytes::from(blob_test_utils::build_blob_file_bytes(&[
+            None,
+            Some(value.as_slice()),
+        ]));
+        let second_bytes = Bytes::from(blob_test_utils::build_blob_file_bytes(&[
+            Some(value.as_slice()),
+            None,
+        ]));
+        assert_eq!(first_bytes.len(), second_bytes.len());
+        let first_endpoint = serve_blob_file(first_bytes.clone()).await;
+        let second_endpoint = serve_blob_file(second_bytes.clone()).await;
+        let cache_context = FileIOCacheContext::from_props(&HashMap::new()).unwrap();
+
+        let first_io = blob_oss_file_io(&first_endpoint, cache_context.clone());
+        let second_io = blob_oss_file_io(&second_endpoint, cache_context);
+        let path = "/data.blob";
+
+        let first = IndexedBlobReader::open(
+            Box::new(first_io.new_input(path).unwrap().reader().await.unwrap()),
+            first_bytes.len() as u64,
+            path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        let second = IndexedBlobReader::open(
+            Box::new(second_io.new_input(path).unwrap().reader().await.unwrap()),
+            second_bytes.len() as u64,
+            path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(second.num_rows(), 2);
+        assert!(matches!(
+            first.read_positions(&[0]).await.unwrap().as_slice(),
+            [BlobReadValue::Null]
+        ));
+        assert!(matches!(
+            second.read_positions(&[0]).await.unwrap().as_slice(),
+            [BlobReadValue::Value(bytes)] if bytes.as_ref() == value
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "storage-azdls")]
+    async fn test_blob_index_cache_isolated_by_azure_account() {
+        let first_path = "abfss://container@account-a.dfs.core.windows.net/data.blob";
+        let second_path = "abfss://container@account-b.dfs.core.windows.net/data.blob";
+        let file_io = FileIO::from_path(first_path)
+            .unwrap()
+            .with_prop("azure.account-key", "account-key")
+            .build()
+            .unwrap();
+        let first_key = file_io
+            .new_input(first_path)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap()
+            .cache_key()
+            .unwrap()
+            .to_string();
+        let second_key = file_io
+            .new_input(second_path)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap()
+            .cache_key()
+            .unwrap()
+            .to_string();
+        assert_ne!(first_key, second_key);
+
+        let value = b"value";
+        let first_bytes = blob_test_utils::build_blob_file_bytes(&[None, Some(value)]);
+        let second_bytes = blob_test_utils::build_blob_file_bytes(&[Some(value), None]);
+        let cache = blob_index_cache("64 MiB");
+        let first = TrackingFileRead::new(Bytes::from(first_bytes.clone()))
+            .with_blob_index_cache(first_key, cache.clone());
+        let second = TrackingFileRead::new(Bytes::from(second_bytes.clone()))
+            .with_blob_index_cache(second_key, cache);
+        let first = IndexedBlobReader::open(
+            Box::new(first),
+            first_bytes.len() as u64,
+            first_path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        let second = IndexedBlobReader::open(
+            Box::new(second),
+            second_bytes.len() as u64,
+            second_path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            first.read_positions(&[0]).await.unwrap().as_slice(),
+            [BlobReadValue::Null]
+        ));
+        assert!(matches!(
+            second.read_positions(&[0]).await.unwrap().as_slice(),
+            [BlobReadValue::Value(bytes)] if bytes.as_ref() == value
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "storage-hdfs")]
+    async fn test_blob_index_cache_isolated_by_hdfs_name_node() {
+        let path = "hdfs://logical-cluster/table/data.blob";
+        let first_io = FileIO::from_path(path)
+            .unwrap()
+            .with_prop("hdfs.name-node", "hdfs://cluster-a:8020")
+            .build()
+            .unwrap();
+        let second_io = FileIO::from_path(path)
+            .unwrap()
+            .with_prop("hdfs.name-node", "hdfs://cluster-b:8020")
+            .with_cache_context(first_io.cache_context())
+            .build()
+            .unwrap();
+        let first_key = first_io
+            .new_input(path)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap()
+            .cache_key()
+            .unwrap()
+            .to_string();
+        let second_key = second_io
+            .new_input(path)
+            .unwrap()
+            .reader()
+            .await
+            .unwrap()
+            .cache_key()
+            .unwrap()
+            .to_string();
+        assert_ne!(first_key, second_key);
+
+        let value = b"value";
+        let first_bytes = blob_test_utils::build_blob_file_bytes(&[None, Some(value)]);
+        let second_bytes = blob_test_utils::build_blob_file_bytes(&[Some(value), None]);
+        assert_eq!(first_bytes.len(), second_bytes.len());
+        let cache = first_io.blob_index_cache();
+        let first = TrackingFileRead::new(Bytes::from(first_bytes.clone()))
+            .with_blob_index_cache(first_key, cache.clone());
+        let second = TrackingFileRead::new(Bytes::from(second_bytes.clone()))
+            .with_blob_index_cache(second_key, cache);
+        let first = IndexedBlobReader::open(
+            Box::new(first),
+            first_bytes.len() as u64,
+            path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        let second = IndexedBlobReader::open(
+            Box::new(second),
+            second_bytes.len() as u64,
+            path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            first.read_positions(&[0]).await.unwrap().as_slice(),
+            [BlobReadValue::Null]
+        ));
+        assert!(
+            matches!(second.read_positions(&[0]).await.unwrap().as_slice(), [BlobReadValue::Value(bytes)] if bytes.as_ref() == value)
+        );
+    }
+
+    #[derive(Debug)]
+    #[cfg(feature = "storage-oss")]
+    struct FixedBlobProvider(Operator);
+
+    #[async_trait]
+    #[cfg(feature = "storage-oss")]
+    impl FileIOProvider for FixedBlobProvider {
+        async fn create(&self, _path: &str) -> crate::Result<(Operator, String)> {
+            Ok((self.0.clone(), "data.blob".to_string()))
+        }
+    }
+
+    #[derive(Debug)]
+    #[cfg(feature = "storage-oss")]
+    struct RoutedBlobProvider {
+        first: Operator,
+        second: Operator,
+    }
+
+    #[async_trait]
+    #[cfg(feature = "storage-oss")]
+    impl FileIOProvider for RoutedBlobProvider {
+        async fn create(&self, path: &str) -> crate::Result<(Operator, String)> {
+            let op = if path.starts_with("oss://first/") {
+                &self.first
+            } else {
+                &self.second
+            };
+            Ok((op.clone(), "data.blob".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "storage-oss")]
+    async fn test_blob_index_cache_bypassed_for_opaque_provider_routes() {
+        let value = b"value";
+        let first_bytes = Bytes::from(blob_test_utils::build_blob_file_bytes(&[None, Some(value)]));
+        let second_bytes =
+            Bytes::from(blob_test_utils::build_blob_file_bytes(&[Some(value), None]));
+        assert_eq!(first_bytes.len(), second_bytes.len());
+        let first_endpoint = serve_blob_file(first_bytes.clone()).await;
+        let second_endpoint = serve_blob_file(second_bytes.clone()).await;
+        let io = FileIOBuilder::new("fs")
+            .with_provider(Arc::new(RoutedBlobProvider {
+                first: blob_oss_operator(&first_endpoint),
+                second: blob_oss_operator(&second_endpoint),
+            }))
+            .build()
+            .unwrap();
+        let first_path = "oss://first/data.blob";
+        let second_path = "oss://second/data.blob";
+        let first_reader = io.new_input(first_path).unwrap().reader().await.unwrap();
+        let second_reader = io.new_input(second_path).unwrap().reader().await.unwrap();
+        assert_eq!(first_reader.cache_key(), None);
+        assert_eq!(second_reader.cache_key(), None);
+        let first = IndexedBlobReader::open(
+            Box::new(first_reader),
+            first_bytes.len() as u64,
+            first_path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        let second = IndexedBlobReader::open(
+            Box::new(second_reader),
+            second_bytes.len() as u64,
+            second_path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            first.read_positions(&[0]).await.unwrap().as_slice(),
+            [BlobReadValue::Null]
+        ));
+        assert!(
+            matches!(second.read_positions(&[0]).await.unwrap().as_slice(), [BlobReadValue::Value(bytes)] if bytes.as_ref() == value)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "storage-oss")]
+    async fn test_blob_index_cache_isolated_after_provider_replacement() {
+        let value = b"value";
+        let first_bytes = Bytes::from(blob_test_utils::build_blob_file_bytes(&[
+            None,
+            Some(value.as_slice()),
+        ]));
+        let second_bytes = Bytes::from(blob_test_utils::build_blob_file_bytes(&[
+            Some(value.as_slice()),
+            None,
+        ]));
+        let first_endpoint = serve_blob_file(first_bytes.clone()).await;
+        let second_endpoint = serve_blob_file(second_bytes.clone()).await;
+        let cache_context = FileIOCacheContext::from_props(&HashMap::new()).unwrap();
+        let original = FileIOBuilder::new("fs")
+            .with_cache_context(cache_context)
+            .build()
+            .unwrap()
+            .with_provider(Arc::new(FixedBlobProvider(blob_oss_operator(
+                &first_endpoint,
+            ))));
+        let replacement =
+            original
+                .clone()
+                .with_provider(Arc::new(FixedBlobProvider(blob_oss_operator(
+                    &second_endpoint,
+                ))));
+        let path = "oss://bucket/data.blob";
+        let first = IndexedBlobReader::open(
+            Box::new(original.new_input(path).unwrap().reader().await.unwrap()),
+            first_bytes.len() as u64,
+            path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        let second = IndexedBlobReader::open(
+            Box::new(replacement.new_input(path).unwrap().reader().await.unwrap()),
+            second_bytes.len() as u64,
+            path.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            first.read_positions(&[0]).await.unwrap().as_slice(),
+            [BlobReadValue::Null]
+        ));
+        assert!(matches!(
+            second.read_positions(&[0]).await.unwrap().as_slice(),
+            [BlobReadValue::Value(bytes)] if bytes.as_ref() == value
+        ));
     }
 
     #[tokio::test]
@@ -4072,10 +4808,92 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read {path}: {e}"))
     }
 
+    fn blob_index_cache(max_size: &str) -> Arc<BlobIndexCacheContext> {
+        BlobIndexCacheContext::from_props(&std::collections::HashMap::from([(
+            CatalogOptions::BLOB_INDEX_CACHE_MAX_SIZE.to_string(),
+            max_size.to_string(),
+        )]))
+        .unwrap()
+    }
+
+    fn blob_index_cache_entry_weight(key: &str, rows: usize) -> usize {
+        let index = BlobFileIndex {
+            entries: vec![BlobEntry::Null; rows],
+        };
+        FileMetadataCache::<String, BlobFileIndex>::entry_weight(
+            key.len(),
+            index.estimated_cache_bytes(),
+        )
+    }
+
+    #[cfg(feature = "storage-oss")]
+    async fn serve_blob_file(bytes: Bytes) -> String {
+        async fn get_blob(State(bytes): State<Bytes>, headers: HeaderMap) -> Response<Body> {
+            let range = headers
+                .get(RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("bytes="))
+                .and_then(|value| value.split_once('-'))
+                .and_then(|(start, end)| {
+                    Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+                });
+            let Some((start, end)) = range else {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_LENGTH, bytes.len())
+                    .body(Body::from(bytes))
+                    .unwrap();
+            };
+            let body = bytes.slice(start..=end);
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_LENGTH, body.len())
+                .header(
+                    CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{}", bytes.len()),
+                )
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        let app = Router::new().fallback(get(get_blob)).with_state(bytes);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    #[cfg(feature = "storage-oss")]
+    fn blob_oss_file_io(endpoint: &str, cache_context: FileIOCacheContext) -> FileIO {
+        FileIOBuilder::new("fs")
+            .with_prop("fs.oss.endpoint", endpoint)
+            .with_fs_operator(blob_oss_operator(endpoint))
+            .with_cache_context(cache_context)
+            .build()
+            .unwrap()
+    }
+
+    #[cfg(feature = "storage-oss")]
+    fn blob_oss_operator(endpoint: &str) -> Operator {
+        let mut config = OssConfig::default();
+        config.endpoint = Some(endpoint.to_string());
+        config.addressing_style = Some("path".to_string());
+        config.skip_signature = true;
+        Operator::new(config.into_builder().bucket("bucket"))
+            .unwrap()
+            .with_context(
+                OperationContext::new()
+                    .with_http_transport(HttpTransporter::new(ReqwestTransport::default())),
+            )
+    }
+
     #[derive(Clone)]
     struct TrackingFileRead {
         bytes: Bytes,
-        cache_namespace: Option<usize>,
+        cache_key: Option<String>,
+        blob_index_cache: Option<Arc<BlobIndexCacheContext>>,
+        fail: bool,
+        io_fail: bool,
         in_flight: Arc<AtomicUsize>,
         max_in_flight: Arc<AtomicUsize>,
         ranges: Arc<Mutex<Vec<Range<u64>>>>,
@@ -4085,15 +4903,33 @@ mod tests {
         fn new(bytes: Bytes) -> Self {
             Self {
                 bytes,
-                cache_namespace: None,
+                cache_key: None,
+                blob_index_cache: None,
+                fail: false,
+                io_fail: false,
                 in_flight: Arc::new(AtomicUsize::new(0)),
                 max_in_flight: Arc::new(AtomicUsize::new(0)),
                 ranges: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        fn with_cache_namespace(mut self, cache_namespace: usize) -> Self {
-            self.cache_namespace = Some(cache_namespace);
+        fn with_blob_index_cache(
+            mut self,
+            cache_key: impl Into<String>,
+            cache: Arc<BlobIndexCacheContext>,
+        ) -> Self {
+            self.cache_key = Some(cache_key.into());
+            self.blob_index_cache = Some(cache);
+            self
+        }
+
+        fn with_failure(mut self) -> Self {
+            self.fail = true;
+            self
+        }
+
+        fn with_io_failure(mut self) -> Self {
+            self.io_fail = true;
             self
         }
 
@@ -4114,11 +4950,32 @@ mod tests {
             self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(10)).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if self.io_fail {
+                return Err(Error::IoUnexpected {
+                    message: "injected BLOB index I/O failure".to_string(),
+                    source: Box::new(opendal::Error::new(
+                        opendal::ErrorKind::Unexpected,
+                        "injected storage failure",
+                    )),
+                });
+            }
+            if self.fail {
+                return Err(Error::UnexpectedError {
+                    message: "injected BLOB index read failure".to_string(),
+                    source: Some(Box::new(std::io::Error::other("injected source"))),
+                });
+            }
             Ok(self.bytes.slice(range.start as usize..range.end as usize))
         }
 
-        fn cache_namespace(&self) -> Option<usize> {
-            self.cache_namespace
+        fn cache_key(&self) -> Option<&str> {
+            self.cache_key.as_deref()
+        }
+
+        fn blob_index_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+            self.blob_index_cache
+                .as_deref()
+                .map(|cache| cache as &(dyn std::any::Any + Send + Sync))
         }
     }
 

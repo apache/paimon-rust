@@ -179,6 +179,36 @@ impl Error {
             _ => false,
         }
     }
+
+    /// Whether a shared BLOB index failure wraps an I/O error.
+    #[doc(hidden)]
+    pub fn is_io_unexpected(&self) -> bool {
+        match self {
+            Error::IoUnexpected { .. } => true,
+            Error::UnexpectedError {
+                source: Some(source),
+                ..
+            } => error_chain_contains_io_unexpected(source.as_ref()),
+            _ => false,
+        }
+    }
+}
+
+fn error_chain_contains_io_unexpected(error: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(error) = error.downcast_ref::<Error>() {
+        return error.is_io_unexpected();
+    }
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        if error
+            .get_ref()
+            .is_some_and(|source| error_chain_contains_io_unexpected(source))
+        {
+            return true;
+        }
+    }
+    error
+        .source()
+        .is_some_and(error_chain_contains_io_unexpected)
 }
 
 fn is_jindo_fork_error(error: &opendal::Error) -> bool {

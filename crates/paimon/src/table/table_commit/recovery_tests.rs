@@ -546,8 +546,7 @@ async fn rest_delete_writer_pins_catalog_snapshot_and_preserves_vectors() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
     let identifier = Identifier::new("database", "table");
-    let metadata_cache =
-        crate::io::FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
+    let file_io_cache = crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap();
     let env = crate::table::RESTEnv::new(
         identifier.clone(),
         "uuid".into(),
@@ -555,7 +554,7 @@ async fn rest_delete_writer_pins_catalog_snapshot_and_preserves_vectors() {
         options,
         false,
         None,
-        metadata_cache,
+        file_io_cache,
     );
     let table = Table::new(io.clone(), identifier, path.into(), schema, Some(env));
     let mut commit = TableCommit::new(table.clone(), "rest-writer".into());

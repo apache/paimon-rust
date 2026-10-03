@@ -76,23 +76,25 @@ pub(crate) fn hdfs_config_parse(props: HashMap<String, String>) -> Result<HdfsNa
 ///
 /// Example path: "hdfs://namenode:8020/warehouse/db/table"
 pub(crate) fn hdfs_config_build(cfg: &HdfsNativeConfig, path: &str) -> Result<Operator> {
-    let url = Url::parse(path).map_err(|_| Error::ConfigInvalid {
-        message: format!("Invalid HDFS url: {path}"),
-    })?;
-
     let mut cfg = cfg.clone();
-
-    if cfg.name_node.is_none() {
-        let host = url.host_str().ok_or_else(|| Error::ConfigInvalid {
-            message: format!("Invalid HDFS url: {path}, missing name node host"),
-        })?;
-        let port_part = url.port().map(|p| format!(":{p}")).unwrap_or_default();
-        cfg.name_node = Some(format!("hdfs://{host}{port_part}"));
-    }
-
+    cfg.name_node = Some(hdfs_effective_name_node(&cfg, path)?);
     cfg.root = Some("/".to_string());
 
     Ok(Operator::from_config(cfg)?)
+}
+
+pub(crate) fn hdfs_effective_name_node(cfg: &HdfsNativeConfig, path: &str) -> Result<String> {
+    let url = Url::parse(path).map_err(|_| Error::ConfigInvalid {
+        message: format!("Invalid HDFS url: {path}"),
+    })?;
+    if let Some(name_node) = &cfg.name_node {
+        return Ok(name_node.clone());
+    }
+    let host = url.host_str().ok_or_else(|| Error::ConfigInvalid {
+        message: format!("Invalid HDFS url: {path}, missing name node host"),
+    })?;
+    let port_part = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    Ok(format!("hdfs://{host}{port_part}"))
 }
 
 #[cfg(test)]
@@ -145,6 +147,20 @@ mod tests {
         cfg.name_node = Some("hdfs://my-cluster:9000".to_string());
         let op = hdfs_config_build(&cfg, "hdfs://my-cluster:9000/warehouse").unwrap();
         assert_eq!(op.info().scheme().to_string(), "hdfs-native");
+    }
+
+    #[test]
+    fn test_hdfs_effective_name_node() {
+        let mut cfg = HdfsNativeConfig::default();
+        assert_eq!(
+            hdfs_effective_name_node(&cfg, "hdfs://cluster-a:8020/table/data.blob").unwrap(),
+            "hdfs://cluster-a:8020"
+        );
+        cfg.name_node = Some("hdfs://nameservice-b".to_string());
+        assert_eq!(
+            hdfs_effective_name_node(&cfg, "hdfs://logical-name/table/data.blob").unwrap(),
+            "hdfs://nameservice-b"
+        );
     }
 
     #[test]

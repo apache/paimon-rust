@@ -4739,6 +4739,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "opendal-core",
  "paimon",
  "paimon-vindex-core",
  "serde_json",

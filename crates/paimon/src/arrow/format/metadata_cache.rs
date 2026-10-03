@@ -101,6 +101,24 @@ where
         Fut: Future<Output = Result<Arc<V>, E>>,
         W: FnOnce(&V) -> usize,
     {
+        self.get_or_try_insert_with_admission(key, key_heap_bytes, load, |value| {
+            Some(value_weight(value))
+        })
+        .await
+    }
+
+    pub(super) async fn get_or_try_insert_with_admission<E, F, Fut, W>(
+        &self,
+        key: Option<K>,
+        key_heap_bytes: usize,
+        load: F,
+        admitted_weight: W,
+    ) -> Result<Arc<V>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<V>, E>>,
+        W: FnOnce(&V) -> Option<usize>,
+    {
         let Some(key) = key else {
             return load().await;
         };
@@ -133,9 +151,19 @@ where
         if entry.weight.load(Ordering::Relaxed) != entry.base_weight {
             return Ok(value);
         }
-        let loaded_weight = entry
-            .base_weight
-            .saturating_add(value_weight(value.as_ref()).max(1));
+        let Some(value_weight) = admitted_weight(value.as_ref()) else {
+            let mut state = self.state.lock().unwrap();
+            if state
+                .entries
+                .peek(&key)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &entry))
+            {
+                state.entries.pop(&key);
+                state.weight = state.weight.saturating_sub(entry.base_weight);
+            }
+            return Ok(value);
+        };
+        let loaded_weight = entry.base_weight.saturating_add(value_weight.max(1));
         let mut state = self.state.lock().unwrap();
         if state
             .entries
