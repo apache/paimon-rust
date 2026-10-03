@@ -27,6 +27,10 @@ use arrow_array::RecordBatch;
 
 pub struct PostponeFixedBucketTableWrite {
     inner: TableWrite,
+    table: Table,
+    load_existing_buckets: bool,
+    failed: bool,
+    closed: bool,
     router: PostponeFixedBucketRouter,
     overwrite: bool,
     check_from_snapshot: Option<i64>,
@@ -38,6 +42,7 @@ impl PostponeFixedBucketTableWrite {
         table: &Table,
         commit_user: String,
         plan: PostponeBucketPlan,
+        load_existing_buckets: bool,
         overwrite: bool,
         resources: Option<ResourceContext>,
     ) -> Result<Self> {
@@ -47,6 +52,10 @@ impl PostponeFixedBucketTableWrite {
             inner = inner.with_resources(resources);
         }
         Ok(Self {
+            table: table.clone(),
+            load_existing_buckets,
+            failed: false,
+            closed: false,
             inner: if overwrite {
                 inner.with_overwrite()
             } else {
@@ -61,11 +70,27 @@ impl PostponeFixedBucketTableWrite {
 
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.ensure_writable()?;
+        let result = self.write_batch(batch).await;
+        if result.is_err() {
+            // A rejected batch must never leave earlier batches committable.
+            self.failed = true;
+            self.inner.close().await;
+        }
+        result
+    }
+
+    async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let Some(batch) = self.inner.normalize_write_batch(batch)? else {
             return Ok(());
         };
         if self.check_from_snapshot.is_none() {
-            self.check_from_snapshot = Some(self.inner.pin_sequence_snapshot().await?);
+            let snapshot_id = self.inner.pin_sequence_snapshot().await?;
+            if self.load_existing_buckets {
+                self.router
+                    .load_existing_buckets(&self.table, snapshot_id)
+                    .await?;
+            }
+            self.check_from_snapshot = Some(snapshot_id);
         }
         for routed in self.router.route(&batch)? {
             self.inner
@@ -96,7 +121,18 @@ impl PostponeFixedBucketTableWrite {
         Ok(messages)
     }
 
+    /// Discard unprepared files. Prepared messages and their files belong to the caller.
+    pub async fn close(&mut self) {
+        self.closed = true;
+        self.inner.close().await;
+    }
+
     fn ensure_writable(&self) -> Result<()> {
+        if self.closed || self.failed {
+            return Err(data_invalid(
+                "Fixed-bucket postpone TableWrite is closed or failed",
+            ));
+        }
         if self.prepare_started {
             return Err(data_invalid("Fixed-bucket postpone TableWrite only supports one prepare_commit call; create a new writer for the next batch"));
         }
@@ -675,8 +711,38 @@ mod tests {
             .unwrap();
     }
 
+    async fn assert_pending_and_fixed_files(table: &Table, pending_rows: i64, fixed_rows: i64) {
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        let entries = TableScan::new(table, None, vec![], None, None, None)
+            .with_scan_all_files()
+            .plan_manifest_entries(&snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.bucket() == -2)
+                .map(|entry| entry.file().row_count)
+                .sum::<i64>(),
+            pending_rows
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.bucket() >= 0)
+                .map(|entry| entry.file().row_count)
+                .sum::<i64>(),
+            fixed_rows
+        );
+    }
+
     #[tokio::test]
-    async fn test_postpone_rejects_negative_bucket_after_fixed_layout() {
+    async fn test_postpone_preserves_negative_bucket_after_fixed_layout() {
         let file_io = test_file_io();
         let table_path = "memory:/test_postpone_rejects_negative_bucket_after_fixed";
         setup_dirs(&file_io, table_path).await;
@@ -700,17 +766,13 @@ mod tests {
             .unwrap();
         let messages = normal_write.prepare_commit().await.unwrap();
         assert!(messages.iter().all(|message| message.bucket == -2));
-        let error = normal_builder
-            .new_commit()
-            .commit(messages)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Cannot mix bucket=-2 files"));
+        normal_builder.new_commit().commit(messages).await.unwrap();
+        assert_pending_and_fixed_files(&table, 1, 1).await;
         assert_eq!(read_id_value_rows(&table).await, vec![(1, 10)]);
     }
 
     #[tokio::test]
-    async fn test_postpone_fixed_append_rejects_existing_negative_bucket() {
+    async fn test_postpone_fixed_append_preserves_existing_negative_bucket() {
         let file_io = test_file_io();
         let table_path = "memory:/test_postpone_fixed_rejects_existing_negative_bucket";
         setup_dirs(&file_io, table_path).await;
@@ -733,11 +795,12 @@ mod tests {
 
         let fixed_messages =
             write_fixed_batch(&table, "fixed-append", 1, &make_batch(vec![1], vec![100])).await;
-        let error = TableCommit::new(table.clone(), "fixed-append".to_string())
+        TableCommit::new(table.clone(), "fixed-append".to_string())
             .commit(fixed_messages)
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Cannot mix bucket=-2 files"));
+            .unwrap();
+        assert_pending_and_fixed_files(&table, 4, 1).await;
+        assert_eq!(read_id_value_rows(&table).await, vec![(1, 100)]);
 
         let overwrite_builder = table
             .new_postpone_fixed_bucket_write_builder()
@@ -829,7 +892,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_postpone_fixed_commit_rejects_concurrent_negative_bucket() {
+    async fn test_postpone_fixed_commit_preserves_concurrent_negative_bucket() {
         let file_io = test_file_io();
         let table_path = "memory:/test_postpone_fixed_rejects_concurrent_negative_bucket";
         setup_dirs(&file_io, table_path).await;
@@ -863,12 +926,13 @@ mod tests {
             .await
             .unwrap();
 
-        let error = fixed_builder
+        fixed_builder
             .new_commit()
             .commit(fixed_messages)
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Cannot mix bucket=-2 files"));
+            .unwrap();
+        assert_pending_and_fixed_files(&table, 1, 1).await;
+        assert_eq!(read_id_value_rows(&table).await, vec![(1, 10)]);
     }
 
     #[tokio::test]
@@ -1007,5 +1071,255 @@ mod tests {
         assert_eq!(messages[0].new_files.len(), 1);
         assert_eq!(messages[0].new_files[0].row_count, 1);
         assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
+    }
+    fn with_default_count(table: &Table, count: &str) -> Table {
+        table.copy_with_options(std::collections::HashMap::from([(
+            "postpone.default-bucket-num".into(),
+            count.into(),
+        )]))
+    }
+
+    #[tokio::test]
+    async fn default_count_reuses_committed_layout_but_overwrite_replaces_it() {
+        let io = test_file_io();
+        let path = "memory:/fixed_default_reuse";
+        setup_dirs(&io, path).await;
+        let table = with_default_count(&test_postpone_pk_table(&io, path), "3");
+        for (count, overwrite, value, expected_count) in
+            [("3", false, 10, 3), ("5", false, 20, 3), ("5", true, 30, 5)]
+        {
+            let table = with_default_count(&table, count);
+            let mut builder = table.new_postpone_fixed_bucket_write_builder().unwrap();
+            if overwrite {
+                builder = builder.with_overwrite();
+            }
+            let mut writer = builder.new_write().unwrap();
+            writer
+                .write_arrow_batch(&make_batch(vec![1], vec![value]))
+                .await
+                .unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            assert!(messages
+                .iter()
+                .all(|message| message.total_buckets == Some(expected_count)));
+            builder.new_commit().commit(messages).await.unwrap();
+            writer.close().await;
+            assert_eq!(read_id_value_rows(&table).await, vec![(1, value)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_count_uses_one_snapshot_for_all_input_partitions() {
+        let io = test_file_io();
+        let path = "memory:/fixed_default_snapshot";
+        setup_dirs(&io, path).await;
+        let table = with_default_count(&test_postpone_partitioned_table(&io, path), "3");
+        let builder = table.new_postpone_fixed_bucket_write_builder().unwrap();
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["a"], vec![1], vec![10]))
+            .await
+            .unwrap();
+
+        // A newer snapshot must not change the plan of a writer that already started.
+        let changed = with_default_count(&table, "5");
+        let concurrent = changed.new_postpone_fixed_bucket_write_builder().unwrap();
+        let mut concurrent_writer = concurrent.new_write().unwrap();
+        concurrent_writer
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["b"], vec![2], vec![20]))
+            .await
+            .unwrap();
+        concurrent
+            .new_commit()
+            .commit(concurrent_writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+
+        writer
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["b"], vec![3], vec![30]))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert!(messages
+            .iter()
+            .all(|message| message.total_buckets == Some(3)
+                && message.check_from_snapshot == Some(0)));
+        let error = builder
+            .new_commit()
+            .commit(messages.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("different total bucket counts"));
+        builder.new_commit().abort(&messages).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fixed_plan_failure_poisoning_discards_earlier_batches() {
+        let io = test_file_io();
+        let path = "memory:/fixed_plan_failure";
+        setup_dirs(&io, path).await;
+        let table = with_default_count(&test_postpone_partitioned_table(&io, path), "3");
+        let builder = table
+            .new_postpone_fixed_bucket_write_builder()
+            .unwrap()
+            .with_bucket_plan(make_partition_bucket_plan(&table, vec!["a"], vec![2]));
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["a"], vec![1], vec![10]))
+            .await
+            .unwrap();
+        let error = writer
+            .write_arrow_batch(&make_partitioned_batch_3col(
+                vec!["missing"],
+                vec![2],
+                vec![20],
+            ))
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not contain an input partition"));
+        assert!(writer
+            .prepare_commit()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("closed or failed"));
+        assert!(writer
+            .write_arrow_batch(&make_partitioned_batch_3col(vec!["a"], vec![3], vec![30]))
+            .await
+            .is_err());
+        writer.close().await;
+        assert!(table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn fixed_writer_close_preserves_only_prepared_output() {
+        let io = test_file_io();
+        let path = "memory:/fixed_close_ownership";
+        setup_dirs(&io, path).await;
+        let table = with_default_count(&test_postpone_pk_table(&io, path), "1");
+        let builder = table.new_postpone_fixed_bucket_write_builder().unwrap();
+        let mut discarded = builder.new_write().unwrap();
+        discarded
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        discarded.close().await;
+        discarded.close().await;
+        assert!(discarded
+            .prepare_commit()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("closed or failed"));
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![2], vec![20]))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        writer.close().await;
+        builder.new_commit().commit(messages).await.unwrap();
+        assert_eq!(read_id_value_rows(&table).await, vec![(2, 20)]);
+    }
+
+    #[tokio::test]
+    async fn default_count_ignores_pending_files_and_inference_options() {
+        let io = test_file_io();
+        let path = "memory:/fixed_default_pending";
+        setup_dirs(&io, path).await;
+        let table = with_default_count(&test_postpone_pk_table(&io, path), "3").copy_with_options(
+            std::collections::HashMap::from([
+                ("postpone.target-row-num-per-bucket".into(), "0".into()),
+                ("postpone.target-size-per-bucket".into(), "invalid".into()),
+                (
+                    "postpone.batch-write-fixed-bucket.max-parallelism".into(),
+                    "1".into(),
+                ),
+            ]),
+        );
+        let pending_builder = table.new_write_builder();
+        let mut pending_writer = pending_builder.new_write().unwrap();
+        pending_writer
+            .write_arrow_batch(&make_batch(vec![1, 2, 3], vec![10, 20, 30]))
+            .await
+            .unwrap();
+        pending_builder
+            .new_commit()
+            .commit(pending_writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let builder = table.new_postpone_fixed_bucket_write_builder().unwrap();
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![4], vec![40]))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert!(messages
+            .iter()
+            .all(|message| message.total_buckets == Some(3)
+                && message.check_from_snapshot == Some(1)));
+        builder.new_commit().commit(messages).await.unwrap();
+        assert_pending_and_fixed_files(&table, 3, 1).await;
+        assert_eq!(read_id_value_rows(&table).await, vec![(4, 40)]);
+    }
+
+    #[tokio::test]
+    async fn default_count_restores_level_zero_first_row_layout() {
+        let io = test_file_io();
+        let path = "memory:/fixed_default_first_row";
+        setup_dirs(&io, path).await;
+        let table = with_default_count(&test_postpone_pk_table(&io, path), "3").copy_with_options(
+            std::collections::HashMap::from([("merge-engine".into(), "first-row".into())]),
+        );
+        let first = table.new_postpone_fixed_bucket_write_builder().unwrap();
+        let mut writer = first.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        first
+            .new_commit()
+            .commit(writer.prepare_commit().await.unwrap())
+            .await
+            .unwrap();
+        let changed = with_default_count(&table, "5");
+        let builder = changed.new_postpone_fixed_bucket_write_builder().unwrap();
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![2], vec![20]))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert!(messages
+            .iter()
+            .all(|message| message.total_buckets == Some(3)));
+        builder.new_commit().commit(messages).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_count_rejects_invalid_configuration_before_io() {
+        let io = test_file_io();
+        let table = test_postpone_pk_table(&io, "memory:/invalid_default_bucket");
+        for raw in ["0", "-1", "2147483648", "3.5", "abc"] {
+            let changed = with_default_count(&table, raw);
+            let error = changed
+                .new_postpone_fixed_bucket_write_builder()
+                .unwrap()
+                .new_write()
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("postpone.default-bucket-num"),
+                "{error}"
+            );
+        }
     }
 }
