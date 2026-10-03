@@ -88,42 +88,6 @@ pub unsafe extern "C" fn paimon_error_free(err: *mut paimon_error) {
 // Re-use the bytes free from types - but we need it here for the error drop
 use crate::types::paimon_bytes_free;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wrapped_blob_io_failure_keeps_c_io_error_code() {
-        let io_error = || paimon::Error::IoUnexpected {
-            message: "BLOB index read failed".to_string(),
-            source: Box::new(opendal::Error::new(
-                opendal::ErrorKind::Unexpected,
-                "storage failure",
-            )),
-        };
-        let wrapped = paimon::Error::UnexpectedError {
-            message: "shared BLOB index load failed".to_string(),
-            source: Some(Box::new(std::io::Error::other(io_error()))),
-        };
-        for error in [io_error(), wrapped] {
-            let error = paimon_error::from_paimon(error);
-            unsafe {
-                assert_eq!((*error).code, PaimonErrorCode::IoError as i32);
-                paimon_error_free(error);
-            }
-        }
-
-        let other = paimon_error::from_paimon(paimon::Error::UnexpectedError {
-            message: "not an I/O error".to_string(),
-            source: Some(Box::new(std::io::Error::other("unrelated"))),
-        });
-        unsafe {
-            assert_eq!((*other).code, PaimonErrorCode::Unexpected as i32);
-            paimon_error_free(other);
-        }
-    }
-}
-
 /// Validate a C string pointer: checks for null and valid UTF-8.
 ///
 /// Returns `Ok(String)` on success, or `Err(*mut paimon_error)` if the
@@ -158,5 +122,41 @@ pub fn check_non_null<T>(ptr: *const T, name: &str) -> Result<(), *mut paimon_er
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapped_blob_io_failure_keeps_c_io_error_code() {
+        let io_error = || paimon::Error::IoUnexpected {
+            message: "BLOB index read failed".to_string(),
+            source: Box::new(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "storage failure",
+            )),
+        };
+        let wrapped = paimon::Error::UnexpectedError {
+            message: "shared BLOB index load failed".to_string(),
+            source: Some(Box::new(std::io::Error::other(io_error()))),
+        };
+        for error in [io_error(), wrapped] {
+            let error = paimon_error::from_paimon(error);
+            unsafe {
+                assert_eq!((*error).code, PaimonErrorCode::IoError as i32);
+                paimon_error_free(error);
+            }
+        }
+
+        let other = paimon_error::from_paimon(paimon::Error::UnexpectedError {
+            message: "not an I/O error".to_string(),
+            source: Some(Box::new(std::io::Error::other("unrelated"))),
+        });
+        unsafe {
+            assert_eq!((*other).code, PaimonErrorCode::Unexpected as i32);
+            paimon_error_free(other);
+        }
     }
 }
