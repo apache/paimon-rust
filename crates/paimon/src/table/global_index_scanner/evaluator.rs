@@ -82,6 +82,12 @@ impl GlobalIndexScanner {
     /// Evaluate a predicate against the global indexes and return matching row ranges.
     /// Returns `None` if the predicate cannot be evaluated by the global index.
     pub(super) fn evaluate<'a>(&'a self, predicate: &'a Predicate) -> EvaluateFuture<'a> {
+        #[cfg(test)]
+        if let Some(probe) = &self.query_io_probe {
+            probe
+                .evaluate_futures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         Box::pin(async move {
             match predicate {
                 Predicate::Leaf {
@@ -239,8 +245,12 @@ impl GlobalIndexScanner {
                     let mut all_ranges: Vec<RowRange> = Vec::new();
                     let mut evaluated_field_ids = HashSet::new();
                     let mut indexed_coverage: Option<Vec<RowRange>> = None;
-                    for child in children {
-                        match self.evaluate(child).await? {
+                    let stream = futures::stream::iter(0..children.len())
+                        .map(|index| self.evaluate(&children[index]))
+                        .buffered(self.global_index_thread_num);
+                    futures::pin_mut!(stream);
+                    while let Some(result) = stream.try_next().await? {
+                        match result {
                             Some(child_result) => {
                                 all_ranges.extend(child_result.row_ranges);
                                 evaluated_field_ids.extend(child_result.evaluated_field_ids);
@@ -563,6 +573,11 @@ impl GlobalIndexScanner {
         let futures =
             query_plans.into_iter().map(|plan| async move {
                 let entry = &entries[plan.entry_idx];
+                let _file_guard = if matches!(entry.index_type, GlobalIndexFileKind::BTree) {
+                    Some(self.btree_file_lock(entry).lock_owned().await)
+                } else {
+                    None
+                };
                 let _permit = self.query_semaphore.acquire().await.map_err(|error| {
                     Error::UnexpectedError {
                         message: "global-index query concurrency budget was closed".to_string(),
