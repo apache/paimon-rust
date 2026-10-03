@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
+use arrow::datatypes::DataType as ArrowDataType;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
@@ -253,21 +253,7 @@ fn apply_variant_projections(
 }
 
 fn supports_variant_target_type(data_type: &ArrowDataType) -> bool {
-    matches!(
-        data_type,
-        ArrowDataType::Boolean
-            | ArrowDataType::Int8
-            | ArrowDataType::Int16
-            | ArrowDataType::Int32
-            | ArrowDataType::Int64
-            | ArrowDataType::Float32
-            | ArrowDataType::Float64
-            | ArrowDataType::Decimal128(_, _)
-            | ArrowDataType::Utf8
-            | ArrowDataType::Binary
-            | ArrowDataType::Date32
-            | ArrowDataType::Timestamp(TimeUnit::Microsecond, _)
-    )
+    matches!(data_type, ArrowDataType::Float32)
 }
 
 fn extract_variant_projections(
@@ -320,7 +306,7 @@ fn extract_variant_projections(
         let arrow_type = ArrowDataType::from_pyarrow_bound(&target_type)?;
         if !supports_variant_target_type(&arrow_type) {
             return Err(PyValueError::new_err(format!(
-                "variant_fields['{column}']['target_type'] must be a supported scalar type, got {arrow_type:?}"
+                "variant_fields['{column}']['target_type'] must be float32, got {arrow_type:?}"
             )));
         }
         let data_type =

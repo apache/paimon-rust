@@ -188,7 +188,7 @@ impl VariantFloat32Projection {
                     if child.is_null()? {
                         continue;
                     }
-                    let numeric = cast_variant_to_f64(child).map(|value| value as f32);
+                    let numeric = cast_variant_to_f32(child);
                     if numeric.is_none()
                         && projected
                             .outputs

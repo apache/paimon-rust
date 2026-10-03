@@ -149,6 +149,14 @@ def test_with_projection_variant_fields_keeps_explicit_null():
 @pytest.mark.parametrize(
     "target_type",
     [
+        pa.bool_(),
+        pa.int32(),
+        pa.int64(),
+        pa.float64(),
+        pa.decimal128(10, 2),
+        pa.string(),
+        pa.binary(),
+        pa.date32(),
         pa.list_(pa.int32()),
         pa.map_(pa.string(), pa.int32()),
         pa.struct([pa.field("x", pa.int32())]),
@@ -159,99 +167,22 @@ def test_with_projection_variant_fields_keeps_explicit_null():
         pa.dictionary(pa.int8(), pa.string()),
         pa.timestamp("s"),
         pa.timestamp("ms"),
+        pa.timestamp("us"),
+        pa.timestamp("us", tz="UTC"),
+        pa.timestamp("us", tz="Asia/Shanghai"),
         pa.timestamp("ns"),
     ],
 )
 def test_with_projection_variant_fields_rejects_unsupported_target(target_type):
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_variant_table_with_data(warehouse)
-        with pytest.raises(ValueError, match="supported scalar type"):
+        with pytest.raises(ValueError, match="must be float32"):
             table.new_read_builder().with_projection(
                 ["payload"],
                 variant_fields={
                     "payload": {"paths": ["$.age"], "target_type": target_type}
                 },
             )
-
-
-def test_with_projection_variant_fields_rejects_noncanonical_timezone():
-    with tempfile.TemporaryDirectory() as warehouse:
-        table = _make_variant_table_with_data(warehouse)
-        with pytest.raises(ValueError, match="cannot be returned unchanged"):
-            table.new_read_builder().with_projection(
-                ["payload"],
-                variant_fields={
-                    "payload": {
-                        "paths": ["$.age"],
-                        "target_type": pa.timestamp("us", tz="Asia/Shanghai"),
-                    }
-                },
-            )
-
-
-@pytest.mark.parametrize(
-    "target_type", [pa.timestamp("us"), pa.timestamp("us", tz="UTC")]
-)
-def test_with_projection_variant_fields_keeps_microsecond_timestamp_type(target_type):
-    with tempfile.TemporaryDirectory() as warehouse:
-        table = _make_variant_table_with_data(warehouse)
-        builder = table.new_read_builder().with_projection(
-            ["payload"],
-            variant_fields={
-                "payload": {"paths": ["$.age"], "target_type": target_type}
-            },
-        )
-        plan = builder.new_scan().plan()
-        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
-        assert result.field("payload").type == pa.struct(
-            [pa.field("0", target_type)]
-        )
-
-
-def test_with_projection_variant_fields_casts_temporal_values():
-    with tempfile.TemporaryDirectory() as warehouse:
-        ctx = SQLContext()
-        ctx.register_catalog("paimon", {"warehouse": warehouse})
-        ctx.sql("CREATE SCHEMA paimon.vdb")
-        ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
-        ctx.sql(
-            "INSERT INTO paimon.vdb.t SELECT 1, "
-            "parse_json('{\"ts\":\"2023-11-14 22:13:20.123456\",\"day\":\"2023-11-14\"}')"
-        )
-        table = PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
-
-        for target_type in (pa.timestamp("us"), pa.timestamp("us", tz="UTC")):
-            builder = table.new_read_builder().with_projection(
-                ["payload"],
-                variant_fields={
-                    "payload": {
-                        "paths": ["$.ts"],
-                        "target_type": target_type,
-                        "fail_on_error": True,
-                    }
-                },
-            )
-            result = pa.Table.from_batches(
-                builder.new_read().read(builder.new_scan().plan().splits())
-            )
-            values = result["payload"].combine_chunks().field(0)
-            assert values.cast(pa.int64()).to_pylist() == [1_700_000_000_123_456]
-
-        builder = table.new_read_builder().with_projection(
-            ["payload"],
-            variant_fields={
-                "payload": {
-                    "paths": ["$.day"],
-                    "target_type": pa.date32(),
-                    "fail_on_error": True,
-                }
-            },
-        )
-        result = pa.Table.from_batches(
-            builder.new_read().read(builder.new_scan().plan().splits())
-        )
-        dates = result["payload"].combine_chunks().field(0)
-        assert dates.cast(pa.int32()).to_pylist() == [19675]
 
 
 def test_with_nested_projection_replaces_variant_fields():

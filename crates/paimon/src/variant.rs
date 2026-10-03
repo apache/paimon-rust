@@ -2724,9 +2724,7 @@ fn cast_variant_to_extraction_value(
             .and_then(|value| i32::try_from(value).ok())
             .map(ShreddedValue::Int32),
         VariantScalarSchema::Int64 => cast_variant_to_i64(variant).map(ShreddedValue::Int64),
-        VariantScalarSchema::Float32 => {
-            cast_variant_to_f64(variant).map(|value| ShreddedValue::Float32(value as f32))
-        }
+        VariantScalarSchema::Float32 => cast_variant_to_f32(variant).map(ShreddedValue::Float32),
         VariantScalarSchema::Float64 => cast_variant_to_f64(variant).map(ShreddedValue::Float64),
         VariantScalarSchema::Decimal { precision, scale } => {
             cast_variant_to_decimal(variant, *precision, *scale).map(ShreddedValue::Decimal128)
@@ -2818,6 +2816,25 @@ fn cast_variant_to_f64(variant: VariantRef<'_>) -> Option<f64> {
             Some(decimal.unscaled as f64 / 10f64.powi(decimal.scale as i32))
         }
         VariantKind::String => variant.get_string().ok()?.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+pub(crate) fn cast_variant_to_f32(variant: VariantRef<'_>) -> Option<f32> {
+    match variant.kind().ok()? {
+        VariantKind::Boolean => Some(if variant.get_boolean().ok()? {
+            1.0
+        } else {
+            0.0
+        }),
+        VariantKind::Long => Some(variant.get_long().ok()? as f32),
+        VariantKind::Float => variant.get_float().ok(),
+        VariantKind::Double => Some(variant.get_double().ok()? as f32),
+        VariantKind::Decimal => {
+            let decimal = variant.get_decimal().ok()?;
+            Some((decimal.unscaled as f64 / 10f64.powi(decimal.scale as i32)) as f32)
+        }
+        VariantKind::String => variant.get_string().ok()?.trim().parse::<f32>().ok(),
         _ => None,
     }
 }

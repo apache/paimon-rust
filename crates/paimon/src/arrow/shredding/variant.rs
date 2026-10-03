@@ -1651,8 +1651,18 @@ mod tests {
     #[test]
     fn variant_extraction_row_batches_top_level_float32_fields() {
         let variants = vec![
-            Some(GenericVariant::parse_json(r#"{"age":27,"ratio":1.25,"text":"3.5"}"#).unwrap()),
-            Some(GenericVariant::parse_json(r#"{"age":32,"ratio":null,"text":"bad"}"#).unwrap()),
+            Some(
+                GenericVariant::parse_json(
+                    r#"{"age":27,"ratio":1.25,"text":"3.5","enabled":true}"#,
+                )
+                .unwrap(),
+            ),
+            Some(
+                GenericVariant::parse_json(
+                    r#"{"age":32,"ratio":null,"text":"bad","enabled":false}"#,
+                )
+                .unwrap(),
+            ),
             None,
         ];
         let input = variant_array(variants).unwrap();
@@ -1662,6 +1672,7 @@ mod tests {
                 ("$.ratio", false),
                 ("$.age", false),
                 ("$.text", false),
+                ("$.enabled", false),
                 ("$.missing", false),
             ]
             .into_iter()
@@ -1683,7 +1694,7 @@ mod tests {
         assert!(projected.is_valid(0));
         assert!(projected.is_valid(1));
         assert!(projected.is_null(2));
-        let values = (0..4)
+        let values = (0..5)
             .map(|index| {
                 projected
                     .column(index)
@@ -1697,7 +1708,8 @@ mod tests {
         assert_eq!(values[0], vec![Some(1.25), None, None]);
         assert_eq!(values[1], vec![Some(27.0), Some(32.0), None]);
         assert_eq!(values[2], vec![Some(3.5), None, None]);
-        assert_eq!(values[3], vec![None, None, None]);
+        assert_eq!(values[3], vec![Some(1.0), Some(0.0), None]);
+        assert_eq!(values[4], vec![None, None, None]);
     }
 
     #[test]
