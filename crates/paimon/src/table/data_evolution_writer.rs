@@ -783,7 +783,7 @@ impl DataEvolutionDeleteWriter {
             // Only the copy used for reading acquires the legacy physical path.
             layout
                 .location()
-                .resolve_legacy_deletion_vector(self.table.file_io(), &mut entry.index_file)
+                .resolve_legacy_bucket_index(self.table.file_io(), &mut entry.index_file)
                 .await?;
             let Some(ranges) = entry.index_file.deletion_vectors_ranges.as_ref() else {
                 continue;

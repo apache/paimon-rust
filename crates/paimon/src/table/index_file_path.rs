@@ -80,10 +80,10 @@ impl IndexFileLocation<'_> {
         }
     }
 
-    /// Older Python DV writers ignored the bucket-directory option. Resolve
+    /// Older Python DV and HASH writers ignored the bucket-directory option. Resolve
     /// their existing files without changing the manifest or masking missing
     /// canonical files with a path that does not exist either.
-    pub(super) async fn resolve_legacy_deletion_vector(
+    pub(super) async fn resolve_legacy_bucket_index(
         &self,
         file_io: &FileIO,
         file: &mut IndexFileMeta,
@@ -96,7 +96,9 @@ impl IndexFileLocation<'_> {
         else {
             return Ok(());
         };
-        if file.index_type != "DELETION_VECTORS" || file.external_path.is_some() {
+        if !matches!(file.index_type.as_str(), "DELETION_VECTORS" | "HASH")
+            || file.external_path.is_some()
+        {
             return Ok(());
         }
         let canonical_path = self.resolve(&file.file_name, None);
@@ -160,7 +162,7 @@ pub(crate) async fn resolve_legacy_deletion_vector_entries(
             bucket_path: &bucket_path,
             index_file_in_data_file_dir: true,
         }
-        .resolve_legacy_deletion_vector(table.file_io(), &mut entry.index_file)
+        .resolve_legacy_bucket_index(table.file_io(), &mut entry.index_file)
         .await?;
     }
     Ok(())
@@ -449,7 +451,7 @@ mod tests {
         // Missing files retain the canonical path and therefore fail on read.
         let mut missing = original.clone();
         location
-            .resolve_legacy_deletion_vector(&file_io, &mut missing)
+            .resolve_legacy_bucket_index(&file_io, &mut missing)
             .await
             .unwrap();
         assert_eq!(missing.external_path, None);
@@ -457,7 +459,7 @@ mod tests {
         std::fs::write(&legacy_path, b"legacy DV").unwrap();
         let mut legacy = original.clone();
         location
-            .resolve_legacy_deletion_vector(&file_io, &mut legacy)
+            .resolve_legacy_bucket_index(&file_io, &mut legacy)
             .await
             .unwrap();
         assert_eq!(legacy.external_path.as_deref(), Some(legacy_path.as_str()));
@@ -465,7 +467,7 @@ mod tests {
         std::fs::write(&canonical_path, b"canonical DV").unwrap();
         let mut canonical = original.clone();
         location
-            .resolve_legacy_deletion_vector(&file_io, &mut canonical)
+            .resolve_legacy_bucket_index(&file_io, &mut canonical)
             .await
             .unwrap();
         assert_eq!(canonical.external_path, None);
@@ -477,7 +479,7 @@ mod tests {
         // An explicit path is never substituted, even when the target is absent.
         original.external_path = Some(external_path.clone());
         location
-            .resolve_legacy_deletion_vector(&file_io, &mut original)
+            .resolve_legacy_bucket_index(&file_io, &mut original)
             .await
             .unwrap();
         assert_eq!(original.external_path, Some(external_path));
@@ -485,7 +487,7 @@ mod tests {
         std::fs::remove_file(&canonical_path).unwrap();
         let mut other_index = committed_file(None);
         location
-            .resolve_legacy_deletion_vector(&file_io, &mut other_index)
+            .resolve_legacy_bucket_index(&file_io, &mut other_index)
             .await
             .unwrap();
         assert_eq!(other_index.external_path, None);
