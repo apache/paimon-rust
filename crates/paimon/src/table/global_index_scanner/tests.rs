@@ -3183,6 +3183,338 @@ async fn test_or_index_open_error_releases_file_lock_and_budget() {
     );
 }
 
+fn setup_compound_and_scanner(
+    limit: usize,
+) -> (GlobalIndexScanner, Arc<QueryIoProbe>, tempfile::TempDir) {
+    let src = format!(
+        "{}/testdata/btree/btree_int_100_no_compress.bin",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let index_dir = tmp.path().join("index");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    let table_path = format!("file://{}", tmp.path().display());
+    let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+    let fields: Vec<_> = (0..4)
+        .map(|index| {
+            DataField::new(
+                index + 1,
+                format!("field{}", index + 1),
+                DataType::Int(crate::spec::IntType::new()),
+            )
+        })
+        .collect();
+    let entries: Vec<_> = (0..4)
+        .map(|index| {
+            let name = format!("field{}.bin", index + 1);
+            std::fs::copy(&src, index_dir.join(&name)).unwrap();
+            let start = i64::from(index) * 10;
+            make_global_index_entry(&name, index + 1, start, start + 99, &meta)
+        })
+        .collect();
+    let mut scanner = GlobalIndexScanner::create(
+        &file_io,
+        &table_path,
+        limit,
+        i64::MAX,
+        i64::MAX,
+        &entries,
+        &fields,
+    )
+    .unwrap()
+    .unwrap();
+    let probe = Arc::new(QueryIoProbe::default());
+    scanner.query_io_probe = Some(Arc::clone(&probe));
+    (scanner, probe, tmp)
+}
+
+fn compound_and_children() -> Vec<Predicate> {
+    vec![
+        Predicate::or(vec![int_eq("field1", 0, 50), int_eq("field2", 1, 50)]),
+        Predicate::or(vec![int_eq("field3", 2, 30), int_eq("field4", 3, 50)]),
+    ]
+}
+
+fn compound_and_with_leaf_group() -> Predicate {
+    let mut children = compound_and_children();
+    for (op, value) in [
+        (PredicateOperator::GtEq, 40),
+        (PredicateOperator::LtEq, 100),
+    ] {
+        children.push(Predicate::Leaf {
+            column: "field1".to_string(),
+            index: 0,
+            data_type: DataType::Int(crate::spec::IntType::new()),
+            op,
+            literals: vec![Datum::Int(value)],
+        });
+    }
+    Predicate::and(children)
+}
+
+#[tokio::test]
+async fn test_compound_and_preserves_serial_results() {
+    for predicate in [
+        Predicate::and(compound_and_children()),
+        compound_and_with_leaf_group(),
+    ] {
+        for limit in [1, 2, 4] {
+            let (scanner, _probe, _tmp) = setup_compound_and_scanner(limit);
+            let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+            assert_eq!(result.row_ranges, vec![RowRange::new(35, 35)]);
+            assert_eq!(result.indexed_coverage, vec![RowRange::new(30, 99)]);
+            assert_eq!(result.evaluated_field_ids, HashSet::from([1, 2, 3, 4]));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_compound_and_uses_idle_query_budget() {
+    for predicate in [
+        Predicate::and(compound_and_children()),
+        compound_and_with_leaf_group(),
+    ] {
+        for limit in [1, 2, 4] {
+            let (scanner, probe, _tmp) = setup_compound_and_scanner(limit);
+            scanner.evaluate(&predicate).await.unwrap().unwrap();
+            assert_eq!(probe.peak(), limit, "query budget {limit}");
+            assert_eq!(probe.active.load(TestOrdering::SeqCst), 0);
+            assert_eq!(scanner.query_semaphore.available_permits(), limit);
+            assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 4);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_compound_and_finishes_leaf_groups_before_starting_branches() {
+    let (scanner, probe, _tmp) = setup_compound_and_scanner(4);
+    let scanner = Arc::new(scanner);
+    let predicate = compound_and_with_leaf_group();
+    probe.pause_on_enter.store(true, TestOrdering::SeqCst);
+    let entered = probe.entered.notified();
+    let task_scanner = Arc::clone(&scanner);
+    let task = tokio::spawn(async move { task_scanner.evaluate(&predicate).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .unwrap();
+    assert_eq!(probe.active.load(TestOrdering::SeqCst), 1);
+    assert_eq!(probe.evaluate_futures.load(TestOrdering::SeqCst), 1);
+    assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 0);
+    probe.pause_on_enter.store(false, TestOrdering::SeqCst);
+    probe.resume.notify_one();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.row_ranges, vec![RowRange::new(35, 35)]);
+    assert_eq!(result.indexed_coverage, vec![RowRange::new(30, 99)]);
+    assert_eq!(result.evaluated_field_ids, HashSet::from([1, 2, 3, 4]));
+    assert_eq!(probe.range_queries.load(TestOrdering::SeqCst), 1);
+    assert_eq!(probe.predicate_queries.load(TestOrdering::SeqCst), 4);
+    assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 4);
+    assert_eq!(scanner.reader_cache.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn test_compound_and_ignores_unsupported_children_and_keeps_empty_results() {
+    let (scanner, _probe, _tmp) = setup_compound_and_scanner(4);
+    let predicate = Predicate::and(vec![
+        Predicate::or(vec![int_eq("field1", 0, 50), int_eq("missing", 4, 50)]),
+        compound_and_children().remove(1),
+        int_eq("missing", 4, 50),
+    ]);
+    let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+    assert_eq!(
+        result.row_ranges,
+        vec![RowRange::new(35, 35), RowRange::new(55, 55)]
+    );
+    assert_eq!(result.indexed_coverage, vec![RowRange::new(30, 119)]);
+    assert_eq!(result.evaluated_field_ids, HashSet::from([3, 4]));
+    assert!(scanner
+        .evaluate(&Predicate::and(vec![
+            Predicate::or(vec![int_eq("missing", 4, 50), int_eq("unknown", 5, 50),]),
+            int_eq("missing", 4, 50),
+        ]))
+        .await
+        .unwrap()
+        .is_none());
+
+    let (scanner, probe, _tmp) = setup_compound_and_scanner(4);
+    let predicate = Predicate::and(vec![
+        Predicate::or(vec![int_eq("field1", 0, 51), int_eq("field2", 1, 51)]),
+        compound_and_children().remove(1),
+    ]);
+    let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+    assert!(result.row_ranges.is_empty());
+    assert_eq!(result.indexed_coverage, vec![RowRange::new(30, 99)]);
+    assert_eq!(result.evaluated_field_ids, HashSet::from([1, 2, 3, 4]));
+    assert_eq!(probe.predicate_queries.load(TestOrdering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn test_compound_and_reuses_one_reader_for_same_file() {
+    let (io, path, name, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+    let entries = vec![make_global_index_entry(&name, 1, 0, 99, &meta)];
+    let mut scanner = GlobalIndexScanner::create(
+        &io,
+        &path,
+        4,
+        i64::MAX,
+        i64::MAX,
+        &entries,
+        &int_schema_fields(),
+    )
+    .unwrap()
+    .unwrap();
+    let probe = Arc::new(QueryIoProbe::default());
+    scanner.query_io_probe = Some(Arc::clone(&probe));
+    let predicate = Predicate::and(vec![
+        Predicate::or(vec![int_eq("id", 0, 10), int_eq("id", 0, 20)]),
+        Predicate::or(vec![int_eq("id", 0, 20), int_eq("id", 0, 30)]),
+    ]);
+    let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+    assert_eq!(result.row_ranges, vec![RowRange::new(10, 10)]);
+    assert_eq!(result.indexed_coverage, vec![RowRange::new(0, 99)]);
+    assert_eq!(result.evaluated_field_ids, HashSet::from([1]));
+    assert_eq!(probe.peak(), 1);
+    assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 1);
+    assert_eq!(scanner.reader_cache.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_compound_and_reports_errors_in_child_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("index")).unwrap();
+    let path = format!("file://{}", tmp.path().display());
+    let io = crate::io::FileIOBuilder::new("file").build().unwrap();
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+    let entries = vec![
+        make_global_index_entry("first-missing.bin", 1, 0, 99, &meta),
+        make_global_index_entry("second-missing.bin", 2, 0, 99, &meta),
+    ];
+    let mut scanner = GlobalIndexScanner::create(
+        &io,
+        &path,
+        2,
+        i64::MAX,
+        i64::MAX,
+        &entries,
+        &two_field_schema_fields(),
+    )
+    .unwrap()
+    .unwrap();
+    let probe = Arc::new(QueryIoProbe::default());
+    scanner.query_io_probe = Some(Arc::clone(&probe));
+    let scanner = Arc::new(scanner);
+    let first_entry = &scanner
+        .entries_by_field
+        .iter()
+        .find(|(field_id, _)| *field_id == 1)
+        .unwrap()
+        .1[0];
+    let first_lock = scanner.btree_file_lock(first_entry);
+    let first_guard = first_lock.lock_owned().await;
+    let predicate = Predicate::and(vec![
+        Predicate::or(vec![int_eq("id", 0, 50), int_eq("id", 0, 60)]),
+        Predicate::or(vec![int_eq("value", 1, 50), int_eq("value", 1, 60)]),
+    ]);
+    probe.pause_on_enter.store(true, TestOrdering::SeqCst);
+    let entered = probe.entered.notified();
+    let task_scanner = Arc::clone(&scanner);
+    let task = tokio::spawn(async move { task_scanner.evaluate(&predicate).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .unwrap();
+    probe.pause_on_enter.store(false, TestOrdering::SeqCst);
+    probe.resume.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while probe.btree_opens.load(TestOrdering::SeqCst) == 0
+            || probe.active.load(TestOrdering::SeqCst) != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !task.is_finished(),
+        "a later error must wait for the first child"
+    );
+    assert_eq!(scanner.query_semaphore.available_permits(), 2);
+    drop(first_guard);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .err()
+        .expect("the first child must report its missing index file");
+    assert!(error.to_string().contains("first-missing.bin"));
+    assert_eq!(probe.active.load(TestOrdering::SeqCst), 0);
+    assert_eq!(scanner.query_semaphore.available_permits(), 2);
+    for lock in scanner.btree_file_locks.lock().unwrap().values() {
+        assert!(lock.try_lock().is_ok());
+    }
+}
+
+#[tokio::test]
+async fn test_compound_and_bounds_future_creation_and_releases_cancelled_queries() {
+    let (io, path, name, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+    let entries = vec![make_global_index_entry(&name, 1, 0, 99, &meta)];
+    let mut scanner = GlobalIndexScanner::create(
+        &io,
+        &path,
+        2,
+        i64::MAX,
+        i64::MAX,
+        &entries,
+        &int_schema_fields(),
+    )
+    .unwrap()
+    .unwrap();
+    let probe = Arc::new(QueryIoProbe::default());
+    scanner.query_io_probe = Some(Arc::clone(&probe));
+    let scanner = Arc::new(scanner);
+    let branch = Predicate::or(vec![int_eq("id", 0, 50), int_eq("id", 0, 60)]);
+    let predicate = Predicate::and(vec![branch.clone(); 1024]);
+    probe.pause_on_enter.store(true, TestOrdering::SeqCst);
+    let entered = probe.entered.notified();
+    let task_scanner = Arc::clone(&scanner);
+    let task = tokio::spawn(async move { task_scanner.evaluate(&predicate).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .unwrap();
+    // One root, at most two OR branches, and at most two leaves per OR.
+    assert!(probe.evaluate_futures.load(TestOrdering::SeqCst) <= 7);
+    task.abort();
+    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+    probe.pause_on_enter.store(false, TestOrdering::SeqCst);
+    assert_eq!(probe.active.load(TestOrdering::SeqCst), 0);
+    assert_eq!(scanner.query_semaphore.available_permits(), 2);
+    for lock in scanner.btree_file_locks.lock().unwrap().values() {
+        assert!(lock.try_lock().is_ok());
+    }
+    let predicate = Predicate::and(vec![branch.clone(), branch]);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        scanner.evaluate(&predicate),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        result.row_ranges,
+        vec![RowRange::new(25, 25), RowRange::new(30, 30)]
+    );
+    assert_eq!(probe.btree_opens.load(TestOrdering::SeqCst), 1);
+}
+
 /// Regression for the Between+remaining bug in `evaluate_leaf`. When a
 /// native `Between` leaf is paired with another conjunct (e.g. `id >= 0`),
 /// and the file's b-tree key range falls **outside** the Between range
