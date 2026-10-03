@@ -208,6 +208,52 @@ def test_with_projection_variant_fields_keeps_microsecond_timestamp_type(target_
         )
 
 
+def test_with_projection_variant_fields_casts_temporal_values():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.vdb")
+        ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+        ctx.sql(
+            "INSERT INTO paimon.vdb.t SELECT 1, "
+            "parse_json('{\"ts\":\"2023-11-14 22:13:20.123456\",\"day\":\"2023-11-14\"}')"
+        )
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+
+        for target_type in (pa.timestamp("us"), pa.timestamp("us", tz="UTC")):
+            builder = table.new_read_builder().with_projection(
+                ["payload"],
+                variant_fields={
+                    "payload": {
+                        "paths": ["$.ts"],
+                        "target_type": target_type,
+                        "fail_on_error": True,
+                    }
+                },
+            )
+            result = pa.Table.from_batches(
+                builder.new_read().read(builder.new_scan().plan().splits())
+            )
+            values = result["payload"].combine_chunks().field(0)
+            assert values.cast(pa.int64()).to_pylist() == [1_700_000_000_123_456]
+
+        builder = table.new_read_builder().with_projection(
+            ["payload"],
+            variant_fields={
+                "payload": {
+                    "paths": ["$.day"],
+                    "target_type": pa.date32(),
+                    "fail_on_error": True,
+                }
+            },
+        )
+        result = pa.Table.from_batches(
+            builder.new_read().read(builder.new_scan().plan().splits())
+        )
+        dates = result["payload"].combine_chunks().field(0)
+        assert dates.cast(pa.int32()).to_pylist() == [19675]
+
+
 def test_with_nested_projection_replaces_variant_fields():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_variant_table_with_data(warehouse)
