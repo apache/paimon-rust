@@ -204,3 +204,24 @@ def test_expire_snapshots_keeps_branch_files(branch_tables):
     assert ids(main) == [1, 2]
     # The branch shares snapshot 1's files with main; they must survive.
     assert ids(blue) == [1]
+
+
+def test_expire_snapshots_with_data_directory(tmp_path):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": str(tmp_path)})
+    ctx.sql("CREATE SCHEMA paimon.ddb")
+    ctx.sql(
+        "CREATE TABLE paimon.ddb.t (id INT, name STRING) "
+        "WITH ('data-file.path-directory' = 'data')"
+    )
+    ctx.sql("INSERT INTO paimon.ddb.t VALUES (1, 'a')")
+    ctx.sql("INSERT OVERWRITE paimon.ddb.t VALUES (2, 'b')")
+    table = PaimonCatalog({"warehouse": str(tmp_path)}).get_table("ddb.t")
+    bucket = Path(table.location()) / "data" / "bucket-0"
+    assert len(list(bucket.iterdir())) == 2
+
+    assert table.expire_snapshots(retain_min=1, retain_max=1) == 1
+    assert len(list(bucket.iterdir())) == 1
+    builder = table.new_read_builder()
+    batches = builder.new_read().read(builder.new_scan().plan().splits())
+    assert pa.Table.from_batches(batches).column("id").to_pylist() == [2]
