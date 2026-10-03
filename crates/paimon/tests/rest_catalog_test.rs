@@ -3362,6 +3362,58 @@ async fn test_query_auth_row_filter_returns_only_the_rows_it_admits() {
     assert!(limited_ids.iter().all(|id| *id > 6), "{limited_ids:?}");
 }
 
+/// Its filters pick their own columns and run before any rule; an expression
+/// failing on a dropped row would put the value in its error.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_query_auth_refuses_an_engine_decoder_filter() {
+    #[derive(Debug)]
+    struct EngineFilter;
+
+    impl paimon::arrow::RowFilterFactory for EngineFilter {
+        fn create(
+            &self,
+            _context: paimon::arrow::RowFilterContext<'_>,
+        ) -> paimon::Result<Vec<Box<dyn paimon::arrow::RowFilter>>> {
+            Ok(Vec::new())
+        }
+    }
+
+    let g = written("decoded", people, vec![people_rows(1..=10)]).await;
+    let mut id_only = g.table.new_read_builder();
+    id_only.with_projection(&["id"]).unwrap();
+    // Under a row filter, and under a column permission alone.
+    g.ctx.server.set_auth_response(
+        "default",
+        "decoded",
+        rules(&[int_leaf(0, "id", "GREATER_THAN", 6)], &[]),
+    );
+    let under_rules = id_only.new_scan().plan().await.unwrap();
+    g.ctx
+        .server
+        .set_auth_response("default", "decoded", rules(&[], &[]));
+    g.ctx
+        .server
+        .set_column_auth("default", "decoded", vec!["id".to_string()]);
+    let under_permission = id_only.new_scan().plan().await.unwrap();
+
+    for plan in [under_permission, under_rules] {
+        let Err(err) = id_only
+            .new_read()
+            .unwrap()
+            .with_row_filter_factory(Arc::new(EngineFilter))
+            .to_arrow(plan.splits())
+        else {
+            panic!("the decoder filter would run outside the server's grant");
+        };
+        assert!(
+            matches!(err, paimon::Error::Unsupported { ref message }
+                if message.contains("decoder filter would run outside the server's grant")),
+            "{err:?}"
+        );
+    }
+}
+
 #[cfg(not(windows))]
 #[tokio::test]
 async fn test_query_auth_asks_about_the_projection_and_the_columns_filters_read() {

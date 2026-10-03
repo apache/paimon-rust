@@ -1127,9 +1127,12 @@ impl ExecutionPlan for PaimonTableScan {
             .into_iter()
             .map(|result| result.filter)
             .collect::<Vec<_>>();
-        if filters.is_empty() {
+        // A query-auth read refuses a decoder filter; the filter above sees only what it admits.
+        if filters.is_empty()
+            || CoreOptions::new(self.table.schema().options()).query_auth_enabled()
+        {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                Vec::new(),
+                vec![PushedDown::No; filters.len()],
             ));
         }
 

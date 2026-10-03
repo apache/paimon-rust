@@ -209,6 +209,28 @@ async fn test_query_auth_queries_see_only_the_rows_the_filter_admits() {
     );
 }
 
+/// Under the decoder, `10 / (id - 3)` would divide by zero on a row the filter drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_query_auth_where_runs_on_the_admitted_rows_only() {
+    let (_tmp, _server, context) = restricted_people(None).await;
+
+    assert_eq!(
+        id_names(
+            &query(
+                &context,
+                &format!("SELECT id, name FROM {TABLE} WHERE 10 / (id - 3) > 0")
+            )
+            .await
+        ),
+        vec![
+            (7, "grace".to_string()),
+            (8, "heidi".to_string()),
+            (9, "ivan".to_string()),
+            (10, "judy".to_string()),
+        ]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_query_auth_explain_shows_the_restriction_but_not_the_files() {
     let (_tmp, _server, context) = restricted_people(None).await;

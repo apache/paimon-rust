@@ -188,7 +188,7 @@ impl<'a> TableRead<'a> {
     ///
     /// The hook is used only by schema-identical raw reads. Callers must still
     /// enforce the expression after the scan because an individual file may not
-    /// be able to build a decoder filter.
+    /// be able to build a decoder filter. A `query-auth.enabled` read refuses it.
     pub fn with_row_filter_factory(self, factory: Arc<dyn crate::arrow::RowFilterFactory>) -> Self {
         match self.0 {
             TableReadKind::Paimon(read) => {
@@ -980,6 +980,13 @@ impl<'a> PaimonTableRead<'a> {
             || data_splits.iter().any(|s| s.query_auth_required());
         if !required {
             return Ok(None);
+        }
+        // Its filters pick their own columns and run before any rule; an
+        // expression failing on a dropped row would put the value in its error.
+        if self.row_filter_factory.is_some() {
+            return Err(super::query_auth::unsupported(
+                "an engine decoder filter would run outside the server's grant",
+            ));
         }
         // Only the catalog mints a session, so a handle without one holds no grant.
         if self.table.query_auth_session().is_none() {
