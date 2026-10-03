@@ -73,6 +73,9 @@ pub(crate) struct SnapshotDeletion {
     table: Table,
     file_io: FileIO,
     table_location: String,
+    /// Root of bucket directories: the table location, or
+    /// `data-file.path-directory` under it.
+    data_location: String,
     snapshot_manager: SnapshotManager,
     partition_computer: Option<PartitionComputer>,
     index_file_in_data_file_dir: bool,
@@ -96,6 +99,7 @@ impl SnapshotDeletion {
             table: table.clone(),
             file_io: table.file_io().clone(),
             table_location: table.location().trim_end_matches('/').to_string(),
+            data_location: table.data_file_location(),
             snapshot_manager: table.snapshot_manager(),
             partition_computer,
             index_file_in_data_file_dir: core_options.index_file_in_data_file_dir(),
@@ -109,7 +113,7 @@ impl SnapshotDeletion {
             Some(_) => BinaryRow::from_serialized_bytes(partition)?,
         };
         bucket_path(
-            &self.table_location,
+            &self.data_location,
             self.partition_computer.as_ref(),
             &partition,
             bucket,
