@@ -2838,8 +2838,16 @@ fn cast_variant_to_string(variant: VariantRef<'_>, zone: &jiff::tz::TimeZone) ->
                 micros
             };
             let datetime = DateTime::from_timestamp_micros(micros)?;
-            // Java's default timestamp precision is six, including trailing zeros.
-            Some(datetime.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+            // Java's VariantGet omits trailing fractional zeros, including the decimal point
+            // for whole seconds.
+            Some(
+                datetime
+                    .format("%Y-%m-%d %H:%M:%S%.6f")
+                    .to_string()
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_string(),
+            )
         }
         VariantKind::String => variant.get_string().ok(),
         VariantKind::Double => Some(variant.get_double().ok()?.to_string()),
@@ -2868,12 +2876,38 @@ fn cast_variant_to_date(variant: VariantRef<'_>, zone: &jiff::tz::TimeZone) -> O
         }
         VariantKind::String => {
             let value = variant.get_string().ok()?;
-            let date = NaiveDate::parse_from_str(&value, "%Y-%m-%d").ok()?;
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
-            i32::try_from(date.signed_duration_since(epoch).num_days()).ok()
+            parse_variant_date_string(&value)
         }
         _ => None,
     }
+}
+
+// Match BinaryStringUtils.toDate: digit-only strings are epoch days; otherwise accept
+// DateTimeUtils.parseDate's year-month-day forms and optional space-separated time suffix.
+fn parse_variant_date_string(value: &str) -> Option<i32> {
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse().ok();
+    }
+    let date_part = match value.find(' ') {
+        Some(index) if index > 0 => &value[..index],
+        _ => value,
+    };
+    let mut parts = date_part.split('-');
+    let year = parts.next()?.trim().parse::<i32>().ok()?;
+    let month = parts
+        .next()
+        .map(|month| month.trim().parse::<u32>().ok())
+        .unwrap_or(Some(1))?;
+    let day = parts
+        .next()
+        .map(|day| day.trim().parse::<u32>().ok())
+        .unwrap_or(Some(1))?;
+    if parts.next().is_some() || !(0..=9999).contains(&year) {
+        return None;
+    }
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    i32::try_from(date.signed_duration_since(epoch).num_days()).ok()
 }
 
 fn cast_variant_to_timestamp(
@@ -3705,8 +3739,50 @@ mod tests {
                 &zone
             )
             .unwrap(),
-            Some(ShreddedValue::String(value)) if value == "2023-11-15 06:13:20.000000"
+            Some(ShreddedValue::String(value)) if value == "2023-11-15 06:13:20"
         ));
+
+        let trailing_zeros = timestamp_variant(1_700_000_000_120_000, false);
+        assert!(matches!(
+            cast_variant_to_shredded_value(
+                trailing_zeros.as_ref().unwrap(),
+                &string_type,
+                true,
+                &zone
+            )
+            .unwrap(),
+            Some(ShreddedValue::String(value)) if value == "2023-11-15 06:13:20.12"
+        ));
+    }
+
+    #[test]
+    fn variant_date_string_cast_matches_java_forms() {
+        let date_type = DataType::Date(DateType::new());
+        for (input, expected) in [
+            ("2023", Some(2023)),
+            (" 2023", Some(19358)),
+            ("19675", Some(19675)),
+            ("2023-11", Some(19662)),
+            ("2023-11-14", Some(19675)),
+            (" 2023-11-14", Some(19675)),
+            ("2023-11-14 09:30:00", Some(19675)),
+            ("2023-02-29", None),
+            ("not-a-date", None),
+        ] {
+            let variant = GenericVariant::parse_json(&format!("\"{input}\"")).unwrap();
+            let result = cast_variant_to_shredded_value(
+                variant.as_ref().unwrap(),
+                &date_type,
+                false,
+                &jiff::tz::TimeZone::UTC,
+            )
+            .unwrap();
+            assert_eq!(
+                result,
+                expected.map(ShreddedValue::Date32),
+                "date input {input}"
+            );
+        }
     }
 
     #[test]

@@ -731,8 +731,24 @@ fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> R
 
     let mut values_by_field = vec![Vec::with_capacity(input.len()); fields.len()];
     let mut validities = Vec::with_capacity(input.len());
-    // Java's temporal cast executors use the process default time zone.
-    let zone = jiff::tz::TimeZone::system();
+    let parser = jiff::fmt::temporal::DateTimeParser::new();
+    let zones = metadata
+        .iter()
+        .map(|field| {
+            if field.time_zone_id() == "Z" {
+                return Ok(jiff::tz::TimeZone::UTC);
+            }
+            parser
+                .parse_time_zone(field.time_zone_id())
+                .map_err(|e| Error::DataInvalid {
+                    message: format!(
+                        "Invalid Variant extraction time zone '{}'",
+                        field.time_zone_id()
+                    ),
+                    source: Some(Box::new(e)),
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
     for row in 0..input.len() {
         if input.is_null(row) {
             validities.push(false);
@@ -752,7 +768,7 @@ fn assemble_variant_extraction_array(array: &dyn Array, row_type: &RowType) -> R
                         extracted,
                         field.data_type(),
                         field_metadata.fail_on_error(),
-                        &zone,
+                        &zones[field_idx],
                     )?,
                     Ok(None) => None,
                     Err(e) if !field_metadata.fail_on_error() => {
@@ -1826,10 +1842,13 @@ mod tests {
         let physical_fields = configured_variant_shredding_fields(&logical_fields, &options)
             .unwrap()
             .unwrap();
-        let variant =
-            GenericVariant::parse_json(r#"{"ts":"2023-11-14 22:13:20.123456","day":"2023-11-14"}"#)
-                .unwrap();
-        let plain = variant_array_for_test(&[variant]);
+        let variants = [
+            r#"{"ts":"2023-11-14 22:13:20.123456","day":"2023-11-14"}"#,
+            r#"{"ts":"2023-11-14 22:13:20.123456","day":"2023-11"}"#,
+            r#"{"ts":"2023-11-14 22:13:20.123456","day":"19675"}"#,
+        ]
+        .map(|json| GenericVariant::parse_json(json).unwrap());
+        let plain = variant_array_for_test(&variants);
         let row_type = variant_extraction_row(
             true,
             [
@@ -1837,7 +1856,7 @@ mod tests {
                     DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap()),
                     "$.ts".to_string(),
                     true,
-                    "UTC".to_string(),
+                    "Asia/Shanghai".to_string(),
                 ),
                 (
                     DataType::Timestamp(TimestampType::new(6).unwrap()),
@@ -1850,6 +1869,12 @@ mod tests {
                     "$.day".to_string(),
                     true,
                     "UTC".to_string(),
+                ),
+                (
+                    DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap()),
+                    "$.ts".to_string(),
+                    true,
+                    "Z".to_string(),
                 ),
             ],
         );
@@ -1869,25 +1894,34 @@ mod tests {
         let shredded_result = shredded.column_by_name("v").unwrap();
 
         let local_micros = 1_700_000_000_123_456;
-        let expected_ltz =
-            crate::variant::instant_from_local_micros(local_micros, &jiff::tz::TimeZone::system())
-                .unwrap();
+        let expected_ltz = crate::variant::instant_from_local_micros(
+            local_micros,
+            &jiff::tz::db().get("Asia/Shanghai").unwrap(),
+        )
+        .unwrap();
         for result in [plain_result.as_ref(), shredded_result.as_ref()] {
             let result = result.as_any().downcast_ref::<StructArray>().unwrap();
-            for (index, expected) in [(0, expected_ltz), (1, local_micros)] {
+            for (index, expected) in [(0, expected_ltz), (1, local_micros), (3, local_micros)] {
                 let timestamps = result
                     .column(index)
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .unwrap();
-                assert_eq!(timestamps.value(0), expected);
+                for row in 0..variants.len() {
+                    assert_eq!(timestamps.value(row), expected);
+                }
             }
             let dates = result
                 .column(2)
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .unwrap();
-            assert_eq!(dates.value(0), 19675);
+            assert_eq!(
+                (0..variants.len())
+                    .map(|row| dates.value(row))
+                    .collect::<Vec<_>>(),
+                vec![19675, 19662, 19675]
+            );
         }
     }
 
