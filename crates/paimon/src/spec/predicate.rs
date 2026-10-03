@@ -1075,9 +1075,9 @@ fn json_to_datum(value: &serde_json::Value, data_type: &DataType) -> Result<Datu
             .ok_or_else(type_err),
         DataType::LocalZonedTimestamp(_) => value
             .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .and_then(parse_instant)
             .map(|instant| {
-                let (millis, nanos) = millis_and_nanos(instant.to_utc());
+                let (millis, nanos) = millis_and_nanos(instant);
                 Datum::LocalZonedTimestamp { millis, nanos }
             })
             .ok_or_else(type_err),
@@ -1088,6 +1088,19 @@ fn json_to_datum(value: &serde_json::Value, data_type: &DataType) -> Result<Datu
         other => Err(rest_json_err(format!(
             "literal conversion for type {other:?} is not supported"
         ))),
+    }
+}
+
+/// Java `Instant.toString()` is UTC with a signed year outside 0000..=9999,
+/// which RFC 3339 cannot carry.
+fn parse_instant(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    match text.strip_suffix('Z') {
+        Some(local) => chrono::NaiveDateTime::parse_from_str(local, "%Y-%m-%dT%H:%M:%S%.f")
+            .ok()
+            .map(|datetime| datetime.and_utc()),
+        None => chrono::DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|instant| instant.to_utc()),
     }
 }
 
@@ -3885,6 +3898,15 @@ mod tests {
             Datum::Date(19737)
         );
         assert_eq!(literal(date(), r#""1969-12-31""#).unwrap(), Datum::Date(-1));
+        // Java signs a year outside 0000..=9999.
+        assert_eq!(
+            literal(date(), r#""+10000-01-01""#).unwrap(),
+            Datum::Date(2_932_897)
+        );
+        assert_eq!(
+            literal(date(), r#""-0001-01-01""#).unwrap(),
+            Datum::Date(-719_893)
+        );
 
         let time = || DataType::Time(TimeType::new(3).unwrap());
         assert_eq!(
@@ -3907,14 +3929,20 @@ mod tests {
             literal(timestamp(), r#""2024-01-15T10:15:30.123456789""#).unwrap(),
             at(1_705_313_730_123, 456_789)
         );
-        let instant = || DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap());
         assert_eq!(
-            literal(instant(), r#""2024-01-15T10:15:30.5Z""#).unwrap(),
-            Datum::LocalZonedTimestamp {
-                millis: 1_705_313_730_500,
-                nanos: 0
-            }
+            literal(timestamp(), r#""+10000-01-01T00:00""#).unwrap(),
+            at(253_402_300_800_000, 0)
         );
+        let instant = || DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap());
+        let utc = |millis| Datum::LocalZonedTimestamp { millis, nanos: 0 };
+        for (json, millis) in [
+            (r#""2024-01-15T10:15:30.5Z""#, 1_705_313_730_500),
+            (r#""+10000-01-01T00:00:00Z""#, 253_402_300_800_000),
+            (r#""-0001-01-01T00:00:00Z""#, -62_198_755_200_000),
+            (r#""2024-01-15T18:15:30.5+08:00""#, 1_705_313_730_500),
+        ] {
+            assert_eq!(literal(instant(), json).unwrap(), utc(millis), "{json}");
+        }
 
         // Rounded HALF_UP to the column scale, then checked against its precision.
         let decimal = || DataType::Decimal(DecimalType::new(5, 2).unwrap());
