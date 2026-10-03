@@ -229,6 +229,8 @@ options.set("fs.oss.endpoint", "oss-cn-hangzhou.aliyuncs.com");
 // Optional: configure retries for temporary OSS failures.
 options.set("fs.oss.retry.count", "10");
 options.set("fs.oss.retry.interval.millisecond", "500");
+// Optional: path-style URLs (`endpoint/bucket/key`) instead of `bucket.endpoint/key`.
+options.set("fs.oss.path-style-access", "true");
 let catalog = CatalogFactory::create(options).await?;
 
 // Tencent Cloud COS
@@ -367,6 +369,39 @@ worker or process because processes do not share exact LRU or size accounting.
 Decoded `.blob` indexes are cached per catalog. Set
 `cache.blob-index.max-size` to control the budget (default `64 MiB`; `0`
 disables caching). BLOB payloads are not cached.
+
+### OSS Cache Routing
+
+A REST catalog can vend OSS cache targets with a table token. The default
+OpenDAL OSS backend uses the following routing options. These rules do not
+apply when `fs.oss.impl=jindo`.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `io-cache.enabled` | `false` | Master switch. A value set in the catalog options wins over the token, so clients can turn routing off. |
+| `io-cache.origin.endpoint` | `fs.oss.endpoint` | OSS endpoint for requests that do not use a target. |
+| `io-cache.policy` | none | Operations that may use a target: `read`, `meta` (file status), or `none`. |
+| `io-cache.whitelist` | all types | File types that may use a target: `meta`, `global-index`, `bucket-index`, `data`, `file-index`, or `*`. |
+| `io-cache.targets` | none | Comma-separated target names matching `[a-z][a-z0-9-]*`. |
+| `io-cache.target.<name>.endpoint` | none | Target endpoint, such as `http://host:port`; `https` when the scheme is omitted. |
+| `io-cache.target.<name>.path-style-access` | `false` | Path-style URLs (`endpoint/bucket/key`) for the target. |
+| `io-cache.endpoint` | none | A single target named `default`, ignored when `io-cache.targets` is set. |
+| `io-cache.routes` | first target with an endpoint | Ordered rules `types=target;...`, such as `meta=accel;data,file-index=cluster`. The first rule listing the file type picks the target; without a matching rule the request uses origin. |
+
+`io-cache.target.<name>.region` is accepted but ignored, because OpenDAL signs
+OSS requests without a region.
+
+Only reads and file status of files that Paimon writes once under a unique name
+can use a target: manifests, statistics, indexes, and data files named with the
+`data-` or `changelog-` prefix, or with `data-file.prefix` or
+`changelog-file.prefix` when these are in the options. Everything else uses
+origin: existence checks, writes, listing, deletes, renames and copies, files
+rewritten in place (such as `LATEST`, tags and temporary files), sequentially
+numbered metadata (`snapshot-N`, `schema-N`, `changelog/changelog-N`), unknown
+file names. A target is used like any
+other endpoint: requests to it use the same retry settings, and its errors are
+returned rather than retried on origin. Setting `dlf.oss-endpoint` on the
+client turns routing off.
 
 ### Manage Databases
 
