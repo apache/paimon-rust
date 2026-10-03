@@ -838,9 +838,11 @@ fn cache_object_path(namespace: &str, op: &Operator, relative_path: &str) -> Str
     )
 }
 
-fn storage_cache_namespace(scheme: &str, props: &HashMap<String, String>) -> Arc<str> {
+fn storage_cache_namespace(props: &HashMap<String, String>) -> Arc<str> {
     // Credentials may rotate while the storage namespace stays unchanged.
     // Endpoints identify storage without coupling cache reuse to credentials.
+    // The complete cache key already includes the operator's canonical scheme;
+    // hashing the builder scheme here would split equivalent storage aliases.
     let mut endpoints = props
         .iter()
         .filter(|(key, _)| key.to_ascii_lowercase().ends_with("endpoint"))
@@ -848,7 +850,6 @@ fn storage_cache_namespace(scheme: &str, props: &HashMap<String, String>) -> Arc
     endpoints.sort_unstable_by_key(|(key, _)| *key);
 
     let mut digest = Sha256::new();
-    digest.update(scheme.to_ascii_lowercase());
     for (key, value) in endpoints {
         let key = key.to_ascii_lowercase();
         let value = value.trim_end_matches('/');
@@ -959,8 +960,7 @@ impl FileIOBuilder {
 
     pub fn build(mut self) -> crate::Result<FileIO> {
         let cache = self.cache.clone();
-        let cache_namespace =
-            storage_cache_namespace(self.scheme_str.as_deref().unwrap_or_default(), &self.props);
+        let cache_namespace = storage_cache_namespace(&self.props);
         let file_format_metadata_cache = self
             .file_format_metadata_cache
             .clone()
@@ -2091,13 +2091,52 @@ mod input_output_test {
         )]);
 
         assert_eq!(
-            storage_cache_namespace("s3", &first),
-            storage_cache_namespace("s3", &rotated)
+            storage_cache_namespace(&first),
+            storage_cache_namespace(&rotated)
         );
         assert_ne!(
-            storage_cache_namespace("s3", &first),
-            storage_cache_namespace("s3", &second)
+            storage_cache_namespace(&first),
+            storage_cache_namespace(&second)
         );
+    }
+
+    #[cfg(all(feature = "storage-fs", feature = "storage-memory"))]
+    #[test]
+    fn test_cache_object_path_distinguishes_storage_schemes() {
+        let namespace = storage_cache_namespace(&HashMap::new());
+        let (fs_op, _) = setup_fs_file_io()
+            .create_static("file:/snapshot-1")
+            .unwrap();
+        let (memory_op, _) = setup_memory_file_io()
+            .create_static("memory:/snapshot-1")
+            .unwrap();
+        assert_ne!(
+            cache_object_path(&namespace, &fs_op, "snapshot-1"),
+            cache_object_path(&namespace, &memory_op, "snapshot-1")
+        );
+    }
+
+    #[cfg(feature = "storage-s3")]
+    #[test]
+    fn test_storage_cache_keys_match_for_s3_scheme_aliases() {
+        let mut expected_key = None;
+        for scheme in ["s3", "s3a", "S3", "S3A"] {
+            let file_io = FileIOBuilder::new(scheme)
+                .with_prop("s3.endpoint", "https://s3.example")
+                .with_prop("s3.region", "us-east-1")
+                .build()
+                .unwrap();
+            let FileSource::Static { cache_path, .. } =
+                file_io.file_source("s3://bucket/snapshot-1").unwrap()
+            else {
+                panic!("expected built-in storage");
+            };
+            if let Some(expected_key) = &expected_key {
+                assert_eq!(&cache_path, expected_key, "{scheme}");
+            } else {
+                expected_key = Some(cache_path);
+            }
+        }
     }
 
     async fn common_test_output_file_write_and_read(file_io: &FileIO, path: &str) {
@@ -2498,6 +2537,94 @@ mod input_output_test {
                 .unwrap(),
             Bytes::from_static(b"new metadata")
         );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_file_io_external_cache_invalidates_across_local_scheme_aliases() {
+        #[derive(Debug, Default)]
+        struct TestBlockCache(std::sync::Mutex<HashMap<(String, u64), Bytes>>);
+
+        #[async_trait::async_trait]
+        impl FileBlockCache for TestBlockCache {
+            async fn get(&self, path: &str, range: Range<u64>) -> Option<Bytes> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .get(&(path.to_string(), range.start))
+                    .filter(|data| data.len() as u64 == range.end - range.start)
+                    .cloned()
+            }
+
+            async fn put(&self, path: &str, offset: u64, data: Bytes) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert((path.to_string(), offset), data);
+            }
+
+            async fn invalidate_path(&self, path: &str) {
+                self.0.lock().unwrap().retain(|(key, _), _| key != path);
+            }
+
+            async fn invalidate_prefix(&self, prefix: &str) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .retain(|(key, _), _| !key.starts_with(prefix));
+            }
+        }
+
+        for reader_scheme in ["", "file", "fs", "FILE", "FS"] {
+            for writer_scheme in ["", "file", "fs", "FILE", "FS"] {
+                let source_directory = tempfile::tempdir().unwrap();
+                let source_path = source_directory.path().join("snapshot-1");
+                std::fs::write(&source_path, b"old metadata").unwrap();
+                let location = format!("file:{}", source_path.display());
+                let cache = Arc::new(TestBlockCache::default());
+                let reader_io = FileIOBuilder::new(reader_scheme)
+                    .build()
+                    .unwrap()
+                    .with_file_block_cache(cache.clone(), 64, "meta")
+                    .unwrap();
+                let writer_io = FileIOBuilder::new(writer_scheme)
+                    .build()
+                    .unwrap()
+                    .with_file_block_cache(cache.clone(), 64, "meta")
+                    .unwrap();
+                assert_eq!(
+                    reader_io
+                        .new_input(&location)
+                        .unwrap()
+                        .read()
+                        .await
+                        .unwrap(),
+                    Bytes::from_static(b"old metadata")
+                );
+                assert_eq!(cache.0.lock().unwrap().len(), 1);
+                writer_io
+                    .new_output(&location)
+                    .unwrap()
+                    .write(Bytes::from_static(b"new metadata"))
+                    .await
+                    .unwrap();
+                assert!(
+                    cache.0.lock().unwrap().is_empty(),
+                    "reader={reader_scheme:?}, writer={writer_scheme:?}"
+                );
+                assert_eq!(std::fs::read(&source_path).unwrap(), b"new metadata");
+                assert_eq!(
+                    reader_io
+                        .new_input(&location)
+                        .unwrap()
+                        .read()
+                        .await
+                        .unwrap(),
+                    Bytes::from_static(b"new metadata"),
+                    "reader={reader_scheme:?}, writer={writer_scheme:?}"
+                );
+            }
+        }
     }
 
     #[cfg(not(windows))]
