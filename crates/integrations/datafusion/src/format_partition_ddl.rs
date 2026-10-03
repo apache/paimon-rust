@@ -34,7 +34,7 @@ use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 use paimon::catalog::{Catalog, Identifier};
-use paimon::spec::{CoreOptions, DataType as PaimonDataType};
+use paimon::spec::{is_java_whitespace_only, CoreOptions, DataType as PaimonDataType};
 use paimon::table::{
     format_partition_value, parse_format_partition_value, FormatTablePartitionPaths,
 };
@@ -487,10 +487,17 @@ pub(crate) fn parse_format_partition_spec(
             Some(text) => {
                 let text = match data_type {
                     PaimonDataType::Char(_) | PaimonDataType::VarChar(_) => {
-                        // A blank string would address the default partition; Java
-                        // `PaimonFormatTable.requireNameablePartitionValues` refuses it too.
+                        // A value that folds to the default partition would address
+                        // the NULL partition, so Java `PaimonFormatTable.
+                        // requireNameablePartitionValues` refuses it for a mutation.
+                        // Classify with the same Java-whitespace predicate the
+                        // formatter folds by (`is_java_whitespace_only`), not Rust
+                        // `str::trim`, whose set differs (trim keeps U+001C-U+001F,
+                        // which Java folds): a bare `trim().is_empty()` would let
+                        // `DROP PARTITION (c = '<U+001C>')` through and destructively
+                        // address the default partition.
                         if let Some(operation) = mutating_operation {
-                            if text.trim().is_empty() {
+                            if is_java_whitespace_only(&text) {
                                 return Err(DataFusionError::Plan(format!(
                                     "{operation} does not support an empty or whitespace-only \
                                      string for partition column '{column}' of Format Table {}. \

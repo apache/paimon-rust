@@ -137,3 +137,54 @@ async fn test_filter_on_a_partition_column_reads_the_directory_value() {
     }
     assert!(mismatches.is_empty(), "{mismatches:#?}");
 }
+
+/// U+180E (MONGOLIAN VOWEL SEPARATOR) is `Character.isWhitespace` only on legacy
+/// JDK 8 (Unicode 6.2); on the supported modern JVMs (Java 11/17, Unicode >= 6.3)
+/// it is a format character. A modern JVM therefore keeps it as a literal
+/// partition value and writes a `dt=<U+180E>` directory. The reader must format
+/// the query literal the same way; folding it to the default-partition name (the
+/// legacy JDK 8 behavior) prunes to the wrong directory and misses the row.
+#[tokio::test]
+async fn test_u180e_partition_value_is_read_as_a_modern_jvm_literal() {
+    let tmp = TempDir::new().expect("Failed to create temp dir");
+    let mut options = Options::new();
+    options.set(
+        CatalogOptions::WAREHOUSE,
+        format!("file:{}", tmp.path().display()),
+    );
+    let catalog = Arc::new(FileSystemCatalog::new(options).expect("Failed to create catalog"));
+    catalog
+        .create_database(DATABASE, false, Default::default())
+        .await
+        .expect("CREATE DATABASE failed");
+    let schema = Schema::builder()
+        .column("dt", DataType::VarChar(VarCharType::new(32).unwrap()))
+        .column("id", DataType::BigInt(BigIntType::new()))
+        .partition_keys(vec!["dt".to_string()])
+        .option("type", "format-table")
+        .option("file.format", "parquet")
+        .build()
+        .unwrap();
+    catalog
+        .create_table(&Identifier::new(DATABASE, TABLE), schema, false)
+        .await
+        .expect("CREATE TABLE failed");
+    let table_dir = tmp.path().join(format!("{DATABASE}.db")).join(TABLE);
+    // U+180E is not escaped by the Hive path-escaping rules, so a modern JVM
+    // writes the raw code point into the directory name.
+    write_ids(&table_dir.join("dt=\u{180E}"), &[7]);
+
+    let mut context = SQLContext::new();
+    context.register_catalog("paimon", catalog).await.unwrap();
+
+    let got = ids(
+        &context,
+        &format!("SELECT id FROM paimon.{DATABASE}.{TABLE} WHERE dt = '\u{180E}'"),
+    )
+    .await;
+    assert_eq!(
+        got,
+        vec![7],
+        "an equality filter on a U+180E partition value must find the literal modern-JVM directory"
+    );
+}
