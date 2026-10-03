@@ -1611,3 +1611,32 @@ async fn test_commit_expiration_keeps_branch_files() {
     );
     assert_files_match_references(&table).await;
 }
+
+#[tokio::test]
+async fn test_commit_expiration_with_data_directory() {
+    let table = test_table(
+        "memory:/expire_after_commit_data_directory",
+        &[
+            ("data-file.path-directory", "data"),
+            ("snapshot.num-retained.min", "1"),
+            ("snapshot.num-retained.max", "1"),
+        ],
+        false,
+    );
+    setup_dirs(&table).await;
+    append(&table, &[1]).await;
+    // A plain overwrite expires snapshot 1 and its file under data/bucket-0.
+    overwrite(&table, &[2]).await;
+    let bucket = format!("{}/data/bucket-0", table.location());
+    let files = table
+        .file_io()
+        .list_status(&bucket)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|status| !status.is_dir)
+        .count();
+    assert_eq!(files, 1);
+    assert_eq!(snapshot_ids(&table).await, vec![2]);
+    assert_eq!(read_ids(&table).await, vec![2]);
+}
