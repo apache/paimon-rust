@@ -1804,13 +1804,6 @@ impl<'a> PaimonTableScan<'a> {
                 entries.push(entry);
             }
         }
-        if deletion_vectors_needed {
-            super::index_file_path::resolve_legacy_deletion_vector_entries(
-                self.table,
-                &mut entries,
-            )
-            .await?;
-        }
         Ok(Some(entries))
     }
 

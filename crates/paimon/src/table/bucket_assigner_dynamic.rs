@@ -239,25 +239,6 @@ impl HashIndexLayout<'_> {
         self.location(&bucket_path)
             .resolve(file_name, external_path)
     }
-
-    async fn resolve_existing(
-        &self,
-        file_io: &FileIO,
-        bucket: i32,
-        meta: &IndexFileMeta,
-    ) -> Result<String> {
-        let bucket_path = self.bucket_path(bucket);
-        let location = self.location(&bucket_path);
-        let mut resolved = meta.clone();
-        location
-            .resolve_legacy_bucket_index(file_io, &mut resolved)
-            .await?;
-        Ok(self.resolve(
-            bucket,
-            &resolved.file_name,
-            resolved.external_path.as_deref(),
-        ))
-    }
 }
 
 /// Per-partition index that maps key hashes to bucket ids.
@@ -329,9 +310,11 @@ impl PartitionIndex {
                     source: None,
                 });
             }
-            let path = layout
-                .resolve_existing(file_io, bucket, &entry.index_file)
-                .await?;
+            let path = layout.resolve(
+                bucket,
+                &entry.index_file.file_name,
+                entry.index_file.external_path.as_deref(),
+            );
             let hashes = HashIndexFile::read(file_io, &path).await?;
             let count = hashes.len() as i64;
             if count != entry.index_file.row_count {
@@ -1036,7 +1019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dynamic_bucket_legacy_python_index_location() {
+    async fn test_dynamic_bucket_requires_configured_index_location() {
         let tmp = tempfile::tempdir().unwrap();
         let root = format!("file://{}", tmp.path().display());
         let io = FileIO::from_url(&root).unwrap().build().unwrap();
@@ -1049,20 +1032,29 @@ mod tests {
             data_file_path_directory: Some("data"),
             index_file_in_data_file_dir: true,
         };
-        assert_eq!(
-            layout.resolve_existing(&io, 0, &meta).await.unwrap(),
-            format!("{root}/index/{}", meta.file_name)
-        );
         let canonical = layout.resolve(0, &meta.file_name, None);
+        let entry = IndexManifestEntry {
+            version: 1,
+            kind: crate::spec::FileKind::Add,
+            partition: EMPTY_SERIALIZED_ROW.to_vec(),
+            bucket: 0,
+            index_file: meta,
+        };
+        let error = PartitionIndex::load(&io, &layout, std::slice::from_ref(&entry), 1)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains(&entry.index_file.file_name));
         io.new_output(&canonical)
             .unwrap()
             .write(bytes::Bytes::from_static(&[0, 0, 0, 43]))
             .await
             .unwrap();
-        assert_eq!(
-            layout.resolve_existing(&io, 0, &meta).await.unwrap(),
-            canonical
-        );
+        let index = PartitionIndex::load(&io, &layout, &[entry], 1)
+            .await
+            .unwrap();
+        assert_eq!(index.hash_to_bucket.get(&43), Some(&0));
+        assert!(!index.hash_to_bucket.contains_key(&42));
     }
 
     // -- HashIndexFile tests --

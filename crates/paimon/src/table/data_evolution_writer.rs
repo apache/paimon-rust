@@ -770,7 +770,7 @@ impl DataEvolutionDeleteWriter {
         let mut bitmaps = IndexMap::new();
         let mut deleted_index_files = Vec::new();
 
-        for mut entry in index_entries {
+        for entry in index_entries {
             if entry.kind != FileKind::Add
                 || entry.bucket != bucket
                 || entry.partition != partition
@@ -779,12 +779,6 @@ impl DataEvolutionDeleteWriter {
                 continue;
             }
             deleted_index_files.push(entry.index_file.clone());
-            // Preserve the original manifest identity in deleted_index_files.
-            // Only the copy used for reading acquires the legacy physical path.
-            layout
-                .location()
-                .resolve_legacy_bucket_index(self.table.file_io(), &mut entry.index_file)
-                .await?;
             let Some(ranges) = entry.index_file.deletion_vectors_ranges.as_ref() else {
                 continue;
             };
