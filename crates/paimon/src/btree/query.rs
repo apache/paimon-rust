@@ -79,7 +79,7 @@ where
                 let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
                 self.query_in(&key_refs).await
             }
-            PredicateOperator::IsNull => Ok(self.null_bitmap().clone()),
+            PredicateOperator::IsNull => Ok(self.null_bitmap().await?.clone()),
             PredicateOperator::IsNotNull => self.all_non_null_rows().await,
             PredicateOperator::NotEq => {
                 let key = serialize_datum(&literals[0], data_type);
