@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 
 use crate::spec::{
     ArrayType, BigIntType, BooleanType, DataField, DataType, DateType, DecimalType, DoubleType,
@@ -2687,7 +2687,6 @@ pub(crate) fn cast_variant_to_shredded_value(
     variant: VariantRef<'_>,
     data_type: &DataType,
     fail_on_error: bool,
-    zone: &jiff::tz::TimeZone,
 ) -> Result<Option<ShreddedValue>> {
     if variant.is_null()? {
         return Ok(None);
@@ -2697,7 +2696,7 @@ pub(crate) fn cast_variant_to_shredded_value(
             message: format!("Unsupported Variant extraction target type: {data_type:?}"),
         });
     };
-    match cast_variant_to_extraction_value(variant, &scalar, zone) {
+    match cast_variant_to_extraction_value(variant, &scalar) {
         Some(value) => Ok(Some(value)),
         None if fail_on_error => Err(Error::DataInvalid {
             message: format!("Cannot cast Variant value to {data_type:?}"),
@@ -2710,7 +2709,6 @@ pub(crate) fn cast_variant_to_shredded_value(
 fn cast_variant_to_extraction_value(
     variant: VariantRef<'_>,
     scalar: &VariantScalarSchema,
-    zone: &jiff::tz::TimeZone,
 ) -> Option<ShreddedValue> {
     match scalar {
         VariantScalarSchema::Boolean => cast_variant_to_bool(variant).map(ShreddedValue::Boolean),
@@ -2729,17 +2727,10 @@ fn cast_variant_to_extraction_value(
         VariantScalarSchema::Decimal { precision, scale } => {
             cast_variant_to_decimal(variant, *precision, *scale).map(ShreddedValue::Decimal128)
         }
-        VariantScalarSchema::String => {
-            cast_variant_to_string(variant, zone).map(ShreddedValue::String)
-        }
-        VariantScalarSchema::Date32 => {
-            cast_variant_to_date(variant, zone).map(ShreddedValue::Date32)
-        }
-        VariantScalarSchema::Timestamp => {
-            cast_variant_to_timestamp(variant, true, zone).map(ShreddedValue::Timestamp)
-        }
-        VariantScalarSchema::TimestampNtz => {
-            cast_variant_to_timestamp(variant, false, zone).map(ShreddedValue::Timestamp)
+        VariantScalarSchema::String => cast_variant_to_string(variant).map(ShreddedValue::String),
+        VariantScalarSchema::Date32 => cast_variant_to_date(variant).map(ShreddedValue::Date32),
+        VariantScalarSchema::Timestamp | VariantScalarSchema::TimestampNtz => {
+            cast_variant_to_timestamp(variant).map(ShreddedValue::Timestamp)
         }
         VariantScalarSchema::Binary => try_typed_shred(variant, scalar).ok().flatten(),
     }
@@ -2839,7 +2830,7 @@ pub(crate) fn cast_variant_to_f32(variant: VariantRef<'_>) -> Option<f32> {
     }
 }
 
-fn cast_variant_to_string(variant: VariantRef<'_>, zone: &jiff::tz::TimeZone) -> Option<String> {
+fn cast_variant_to_string(variant: VariantRef<'_>) -> Option<String> {
     match variant.kind().ok()? {
         VariantKind::Object | VariantKind::Array => variant.to_json().ok(),
         VariantKind::Boolean => Some(variant.get_boolean().ok()?.to_string()),
@@ -2848,19 +2839,10 @@ fn cast_variant_to_string(variant: VariantRef<'_>, zone: &jiff::tz::TimeZone) ->
             date_from_days(variant.get_long().ok()?).map(|date| date.format("%Y-%m-%d").to_string())
         }
         VariantKind::Timestamp | VariantKind::TimestampNtz => {
-            let micros = variant.get_long().ok()?;
-            let micros = if variant.kind().ok()? == VariantKind::Timestamp {
-                local_timestamp_micros(micros, zone)?
-            } else {
-                micros
-            };
-            let datetime = DateTime::from_timestamp_micros(micros)?;
-            // Java's VariantGet omits trailing fractional zeros, including the decimal point
-            // for whole seconds.
+            let datetime = DateTime::from_timestamp_micros(variant.get_long().ok()?)?;
+            let formatted = datetime.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
             Some(
-                datetime
-                    .format("%Y-%m-%d %H:%M:%S%.6f")
-                    .to_string()
+                formatted
                     .trim_end_matches('0')
                     .trim_end_matches('.')
                     .to_string(),
@@ -2881,146 +2863,53 @@ fn date_from_days(days: i64) -> Option<NaiveDate> {
     NaiveDate::from_num_days_from_ce_opt(days)
 }
 
-fn cast_variant_to_date(variant: VariantRef<'_>, zone: &jiff::tz::TimeZone) -> Option<i32> {
+fn cast_variant_to_date(variant: VariantRef<'_>) -> Option<i32> {
     match variant.kind().ok()? {
         VariantKind::Date => i32::try_from(variant.get_long().ok()?).ok(),
-        VariantKind::Timestamp => i32::try_from(
-            local_timestamp_micros(variant.get_long().ok()?, zone)?.div_euclid(MICROS_PER_DAY),
-        )
-        .ok(),
-        VariantKind::TimestampNtz => {
+        VariantKind::Timestamp | VariantKind::TimestampNtz => {
             i32::try_from(variant.get_long().ok()?.div_euclid(MICROS_PER_DAY)).ok()
         }
         VariantKind::String => {
             let value = variant.get_string().ok()?;
-            parse_variant_date_string(&value)
+            let date = NaiveDate::parse_from_str(&value, "%Y-%m-%d").ok()?;
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+            i32::try_from(date.signed_duration_since(epoch).num_days()).ok()
         }
         _ => None,
     }
 }
 
-// Match BinaryStringUtils.toDate: digit-only strings are epoch days; otherwise accept
-// DateTimeUtils.parseDate's year-month-day forms and optional space-separated time suffix.
-fn parse_variant_date_string(value: &str) -> Option<i32> {
-    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return value.parse().ok();
-    }
-    let date_part = match value.find(' ') {
-        Some(index) if index > 0 => &value[..index],
-        _ => value,
-    };
-    let mut parts = date_part.split('-');
-    let year = parts.next()?.trim().parse::<i32>().ok()?;
-    let month = parts
-        .next()
-        .map(|month| month.trim().parse::<u32>().ok())
-        .unwrap_or(Some(1))?;
-    let day = parts
-        .next()
-        .map(|day| day.trim().parse::<u32>().ok())
-        .unwrap_or(Some(1))?;
-    if parts.next().is_some() || !(0..=9999).contains(&year) {
-        return None;
-    }
-    let date = NaiveDate::from_ymd_opt(year, month, day)?;
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
-    i32::try_from(date.signed_duration_since(epoch).num_days()).ok()
-}
-
-fn cast_variant_to_timestamp(
-    variant: VariantRef<'_>,
-    with_local_zone: bool,
-    zone: &jiff::tz::TimeZone,
-) -> Option<i64> {
+fn cast_variant_to_timestamp(variant: VariantRef<'_>) -> Option<i64> {
     match variant.kind().ok()? {
-        VariantKind::Timestamp => {
-            let micros = variant.get_long().ok()?;
-            if with_local_zone {
-                Some(micros)
-            } else {
-                local_timestamp_micros(micros, zone)
-            }
-        }
-        VariantKind::TimestampNtz => {
-            let micros = variant.get_long().ok()?;
-            if with_local_zone {
-                instant_from_local_micros(micros, zone)
-            } else {
-                Some(micros)
-            }
-        }
-        VariantKind::Date => {
-            let micros = variant.get_long().ok()?.checked_mul(MICROS_PER_DAY)?;
-            if with_local_zone {
-                instant_from_local_micros(micros, zone)
-            } else {
-                Some(micros)
-            }
-        }
-        VariantKind::Long => {
-            let micros = variant.get_long().ok()?.checked_mul(1_000_000)?;
-            if with_local_zone {
-                local_timestamp_micros(micros, zone)
-            } else {
-                Some(micros)
-            }
-        }
+        VariantKind::Timestamp | VariantKind::TimestampNtz => variant.get_long().ok(),
+        VariantKind::Date => variant.get_long().ok()?.checked_mul(MICROS_PER_DAY),
+        VariantKind::Long => variant.get_long().ok()?.checked_mul(1_000_000),
         VariantKind::String => {
             let value = variant.get_string().ok()?;
-            if value.trim() != value {
-                return None;
+            let value = value.trim();
+            if let Ok(micros) = value.parse::<i64>() {
+                return Some(micros);
             }
-            if !with_local_zone
-                && !value.is_empty()
-                && value.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return value.parse::<i64>().ok();
+            if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
+                return Some(datetime.timestamp_micros());
             }
             let datetime = [
                 "%Y-%m-%d %H:%M:%S%.f",
                 "%Y-%m-%dT%H:%M:%S%.f",
+                "%Y-%m-%d %H:%M",
                 "%Y-%m-%dT%H:%M",
             ]
             .iter()
-            .find_map(|format| NaiveDateTime::parse_from_str(&value, format).ok())
+            .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
             .or_else(|| {
-                NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+                NaiveDate::parse_from_str(value, "%Y-%m-%d")
                     .ok()?
                     .and_hms_opt(0, 0, 0)
             })?;
-            let micros = datetime.and_utc().timestamp_micros();
-            if with_local_zone {
-                instant_from_local_micros(micros, zone)
-            } else {
-                Some(micros)
-            }
+            Some(datetime.and_utc().timestamp_micros())
         }
         _ => None,
     }
-}
-
-// Java's TIMESTAMP stores an instant, while TIMESTAMP_NTZ stores a local wall clock.
-fn local_timestamp_micros(micros: i64, zone: &jiff::tz::TimeZone) -> Option<i64> {
-    let instant = jiff::Timestamp::from_microsecond(micros).ok()?;
-    micros.checked_add(i64::from(zone.to_offset(instant).seconds()) * 1_000_000)
-}
-
-pub(crate) fn instant_from_local_micros(micros: i64, zone: &jiff::tz::TimeZone) -> Option<i64> {
-    let datetime = DateTime::from_timestamp_micros(micros)?.naive_utc();
-    let civil = jiff::civil::DateTime::new(
-        i16::try_from(datetime.year()).ok()?,
-        datetime.month() as i8,
-        datetime.day() as i8,
-        datetime.hour() as i8,
-        datetime.minute() as i8,
-        datetime.second() as i8,
-        datetime.nanosecond() as i32,
-    )
-    .ok()?;
-    zone.to_ambiguous_timestamp(civil)
-        .compatible()
-        .ok()
-        .map(|instant| instant.as_microsecond())
 }
 
 fn cast_variant_to_decimal(variant: VariantRef<'_>, precision: u8, scale: i8) -> Option<i128> {
@@ -3581,8 +3470,7 @@ mod tests {
                     cast_variant_to_shredded_value(
                         variant.as_ref().unwrap(),
                         &target_type,
-                        true,
-                        &jiff::tz::TimeZone::UTC,
+                        true
                     )
                     .unwrap(),
                     Some(ShreddedValue::Timestamp(value)) if value == micros
@@ -3602,7 +3490,7 @@ mod tests {
         let string = GenericVariant::parse_json(r#""2023-11-14 22:13:20.123456""#).unwrap();
         for target_type in [&timestamp_type, &ltz_type] {
             assert!(matches!(
-                cast_variant_to_shredded_value(string.as_ref().unwrap(), target_type, true, &jiff::tz::TimeZone::UTC).unwrap(),
+                cast_variant_to_shredded_value(string.as_ref().unwrap(), target_type, true).unwrap(),
                 Some(ShreddedValue::Timestamp(value)) if value == micros
             ));
         }
@@ -3611,252 +3499,50 @@ mod tests {
             let timestamp = timestamp_variant(micros, ntz);
             for target_type in [&timestamp_type, &ltz_type] {
                 assert!(matches!(
-                    cast_variant_to_shredded_value(timestamp.as_ref().unwrap(), target_type, true, &jiff::tz::TimeZone::UTC).unwrap(),
+                    cast_variant_to_shredded_value(timestamp.as_ref().unwrap(), target_type, true).unwrap(),
                     Some(ShreddedValue::Timestamp(value)) if value == micros
                 ));
             }
             assert!(matches!(
-                cast_variant_to_shredded_value(
-                    timestamp.as_ref().unwrap(),
-                    &date_type,
-                    true,
-                    &jiff::tz::TimeZone::UTC
-                )
-                .unwrap(),
+                cast_variant_to_shredded_value(timestamp.as_ref().unwrap(), &date_type, true)
+                    .unwrap(),
                 Some(ShreddedValue::Date32(19675))
             ));
             assert!(matches!(
-                cast_variant_to_shredded_value(timestamp.as_ref().unwrap(), &string_type, true, &jiff::tz::TimeZone::UTC).unwrap(),
+                cast_variant_to_shredded_value(timestamp.as_ref().unwrap(), &string_type, true).unwrap(),
                 Some(ShreddedValue::String(value)) if value == "2023-11-14 22:13:20.123456"
             ));
         }
 
         let date_string = GenericVariant::parse_json(r#""2023-11-14""#).unwrap();
         assert!(matches!(
-            cast_variant_to_shredded_value(
-                date_string.as_ref().unwrap(),
-                &date_type,
-                true,
-                &jiff::tz::TimeZone::UTC
-            )
-            .unwrap(),
+            cast_variant_to_shredded_value(date_string.as_ref().unwrap(), &date_type, true)
+                .unwrap(),
             Some(ShreddedValue::Date32(19675))
         ));
         assert!(matches!(
-            cast_variant_to_shredded_value(
-                date_string.as_ref().unwrap(),
-                &timestamp_type,
-                true,
-                &jiff::tz::TimeZone::UTC
-            )
-            .unwrap(),
+            cast_variant_to_shredded_value(date_string.as_ref().unwrap(), &timestamp_type, true)
+                .unwrap(),
             Some(ShreddedValue::Timestamp(1_699_920_000_000_000))
         ));
 
         let seconds = GenericVariant::parse_json("27").unwrap();
         assert!(matches!(
-            cast_variant_to_shredded_value(
-                seconds.as_ref().unwrap(),
-                &timestamp_type,
-                true,
-                &jiff::tz::TimeZone::UTC
-            )
-            .unwrap(),
+            cast_variant_to_shredded_value(seconds.as_ref().unwrap(), &timestamp_type, true)
+                .unwrap(),
             Some(ShreddedValue::Timestamp(27_000_000))
         ));
 
         let invalid = GenericVariant::parse_json(r#""not-a-date""#).unwrap();
-        assert!(cast_variant_to_shredded_value(
-            invalid.as_ref().unwrap(),
-            &timestamp_type,
-            false,
-            &jiff::tz::TimeZone::UTC
-        )
-        .unwrap()
-        .is_none());
-        assert!(cast_variant_to_shredded_value(
-            invalid.as_ref().unwrap(),
-            &timestamp_type,
-            true,
-            &jiff::tz::TimeZone::UTC
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn variant_timestamp_string_cast_rejects_inputs_java_rejects() {
-        let timestamp_type = DataType::Timestamp(TimestampType::new(6).unwrap());
-        let ltz_type = DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap());
-        for input in [
-            "2023-11-14 22:13", // Space-separated form requires seconds.
-            " 2023-11-14 22:13:20",
-            "2023-11-14 22:13:20 ",
-        ] {
-            let variant = GenericVariant::parse_json(&format!("\"{input}\"")).unwrap();
-            for target_type in [&timestamp_type, &ltz_type] {
-                assert!(
-                    cast_variant_to_shredded_value(
-                        variant.as_ref().unwrap(),
-                        target_type,
-                        false,
-                        &jiff::tz::TimeZone::UTC,
-                    )
-                    .unwrap()
-                    .is_none(),
-                    "unexpectedly cast {input:?} to {target_type:?}"
-                );
-                assert!(cast_variant_to_shredded_value(
-                    variant.as_ref().unwrap(),
-                    target_type,
-                    true,
-                    &jiff::tz::TimeZone::UTC,
-                )
-                .is_err());
-            }
-        }
-        for input in ["+27", "-27", " 27"] {
-            let variant = GenericVariant::parse_json(&format!("\"{input}\"")).unwrap();
-            assert!(cast_variant_to_shredded_value(
-                variant.as_ref().unwrap(),
-                &timestamp_type,
-                false,
-                &jiff::tz::TimeZone::UTC,
-            )
-            .unwrap()
-            .is_none());
-        }
-        let valid = GenericVariant::parse_json(r#""2023-11-14T22:13""#).unwrap();
-        assert!(matches!(
-            cast_variant_to_shredded_value(
-                valid.as_ref().unwrap(),
-                &timestamp_type,
-                true,
-                &jiff::tz::TimeZone::UTC,
-            )
-            .unwrap(),
-            Some(ShreddedValue::Timestamp(1_699_999_980_000_000))
-        ));
-    }
-
-    #[test]
-    fn variant_temporal_extraction_distinguishes_ltz_and_ntz_in_shanghai() {
-        let zone = jiff::tz::db().get("Asia/Shanghai").unwrap();
-        let micros = 1_700_000_000_123_456;
-        let eight_hours = 8 * 60 * 60 * 1_000_000;
-        let timestamp_type = DataType::Timestamp(TimestampType::new(6).unwrap());
-        let ltz_type = DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap());
-        let date_type = DataType::Date(DateType::new());
-        let string_type = DataType::VarChar(VarCharType::string_type());
-
-        let ltz = timestamp_variant(micros, false);
-        assert!(matches!(
-            cast_variant_to_shredded_value(ltz.as_ref().unwrap(), &timestamp_type, true, &zone)
-                .unwrap(),
-            Some(ShreddedValue::Timestamp(value)) if value == micros + eight_hours
-        ));
-        assert!(matches!(
-            cast_variant_to_shredded_value(ltz.as_ref().unwrap(), &date_type, true, &zone).unwrap(),
-            Some(ShreddedValue::Date32(19676))
-        ));
-        assert!(matches!(
-            cast_variant_to_shredded_value(ltz.as_ref().unwrap(), &string_type, true, &zone)
-                .unwrap(),
-            Some(ShreddedValue::String(value)) if value == "2023-11-15 06:13:20.123456"
-        ));
-
-        let ntz = timestamp_variant(micros, true);
-        assert!(matches!(
-            cast_variant_to_shredded_value(ntz.as_ref().unwrap(), &ltz_type, true, &zone).unwrap(),
-            Some(ShreddedValue::Timestamp(value)) if value == micros - eight_hours
-        ));
-        assert!(matches!(
-            cast_variant_to_shredded_value(ntz.as_ref().unwrap(), &date_type, true, &zone).unwrap(),
-            Some(ShreddedValue::Date32(19675))
-        ));
-        assert!(matches!(
-            cast_variant_to_shredded_value(ntz.as_ref().unwrap(), &string_type, true, &zone)
-                .unwrap(),
-            Some(ShreddedValue::String(value)) if value == "2023-11-14 22:13:20.123456"
-        ));
-
-        let text = GenericVariant::parse_json(r#""2023-11-14 22:13:20.123456""#).unwrap();
-        assert!(matches!(
-            cast_variant_to_shredded_value(text.as_ref().unwrap(), &ltz_type, true, &zone).unwrap(),
-            Some(ShreddedValue::Timestamp(value)) if value == micros - eight_hours
-        ));
-        let date = GenericVariant::parse_json(r#""2023-11-14""#).unwrap();
-        assert!(matches!(
-            cast_variant_to_shredded_value(date.as_ref().unwrap(), &ltz_type, true, &zone).unwrap(),
-            Some(ShreddedValue::Timestamp(value)) if value == 1_699_920_000_000_000 - eight_hours
-        ));
-        let seconds = GenericVariant::parse_json("27").unwrap();
-        assert!(matches!(
-            cast_variant_to_shredded_value(seconds.as_ref().unwrap(), &ltz_type, true, &zone)
-                .unwrap(),
-            Some(ShreddedValue::Timestamp(value)) if value == 27_000_000 + eight_hours
-        ));
-
-        // Java's timestamp cast parser accepts local dates/times, not an offset-bearing string.
-        let offset = GenericVariant::parse_json(r#""2023-11-14T22:13:20+08:00""#).unwrap();
         assert!(
-            cast_variant_to_shredded_value(offset.as_ref().unwrap(), &ltz_type, false, &zone)
+            cast_variant_to_shredded_value(invalid.as_ref().unwrap(), &timestamp_type, false)
                 .unwrap()
                 .is_none()
         );
-
-        let whole_second = timestamp_variant(1_700_000_000_000_000, false);
-        assert!(matches!(
-            cast_variant_to_shredded_value(
-                whole_second.as_ref().unwrap(),
-                &string_type,
-                true,
-                &zone
-            )
-            .unwrap(),
-            Some(ShreddedValue::String(value)) if value == "2023-11-15 06:13:20"
-        ));
-
-        let trailing_zeros = timestamp_variant(1_700_000_000_120_000, false);
-        assert!(matches!(
-            cast_variant_to_shredded_value(
-                trailing_zeros.as_ref().unwrap(),
-                &string_type,
-                true,
-                &zone
-            )
-            .unwrap(),
-            Some(ShreddedValue::String(value)) if value == "2023-11-15 06:13:20.12"
-        ));
-    }
-
-    #[test]
-    fn variant_date_string_cast_matches_java_forms() {
-        let date_type = DataType::Date(DateType::new());
-        for (input, expected) in [
-            ("2023", Some(2023)),
-            (" 2023", Some(19358)),
-            ("19675", Some(19675)),
-            ("2023-11", Some(19662)),
-            ("2023-11-14", Some(19675)),
-            (" 2023-11-14", Some(19675)),
-            ("2023-11-14 09:30:00", Some(19675)),
-            ("2023-02-29", None),
-            ("not-a-date", None),
-        ] {
-            let variant = GenericVariant::parse_json(&format!("\"{input}\"")).unwrap();
-            let result = cast_variant_to_shredded_value(
-                variant.as_ref().unwrap(),
-                &date_type,
-                false,
-                &jiff::tz::TimeZone::UTC,
-            )
-            .unwrap();
-            assert_eq!(
-                result,
-                expected.map(ShreddedValue::Date32),
-                "date input {input}"
-            );
-        }
+        assert!(
+            cast_variant_to_shredded_value(invalid.as_ref().unwrap(), &timestamp_type, true)
+                .is_err()
+        );
     }
 
     #[test]
