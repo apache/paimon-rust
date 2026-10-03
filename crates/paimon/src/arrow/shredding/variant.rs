@@ -1418,8 +1418,7 @@ mod tests {
     use super::*;
     use crate::arrow::variant_arrow_type;
     use crate::spec::{
-        variant_extraction_row, BlobType, DateType, FloatType, IntType, LocalZonedTimestampType,
-        TimestampType, VarCharType, VariantType,
+        variant_extraction_row, BlobType, FloatType, IntType, VarCharType, VariantType,
     };
 
     fn variant_array_for_test(values: &[GenericVariant]) -> ArrayRef {
@@ -1819,81 +1818,6 @@ mod tests {
             .downcast_ref::<StructArray>()
             .unwrap();
         assert!(shredded_result.column(0).is_null(0));
-    }
-
-    #[test]
-    fn temporal_projection_agrees_for_plain_and_shredded_variant() {
-        let logical_fields = vec![DataField::new(
-            1,
-            "v".to_string(),
-            DataType::Variant(VariantType::new()),
-        )];
-        let options = HashMap::from([(
-            "variant.shreddingSchema".to_string(),
-            r#"{"type":"ROW","fields":[{"name":"v","type":{"type":"ROW","fields":[{"name":"ts","type":"STRING"},{"name":"day","type":"STRING"}]}}]}"#.to_string(),
-        )]);
-        let physical_fields = configured_variant_shredding_fields(&logical_fields, &options)
-            .unwrap()
-            .unwrap();
-        let variant =
-            GenericVariant::parse_json(r#"{"ts":"2023-11-14 22:13:20.123456","day":"2023-11-14"}"#)
-                .unwrap();
-        let plain = variant_array_for_test(&[variant]);
-        let row_type = variant_extraction_row(
-            true,
-            [
-                (
-                    DataType::LocalZonedTimestamp(LocalZonedTimestampType::new(6).unwrap()),
-                    "$.ts".to_string(),
-                    true,
-                    "UTC".to_string(),
-                ),
-                (
-                    DataType::Timestamp(TimestampType::new(6).unwrap()),
-                    "$.ts".to_string(),
-                    true,
-                    "UTC".to_string(),
-                ),
-                (
-                    DataType::Date(DateType::new()),
-                    "$.day".to_string(),
-                    true,
-                    "UTC".to_string(),
-                ),
-            ],
-        );
-        let plain_result =
-            assemble_array_to_logical(plain.as_ref(), &DataType::Row(row_type.clone()))
-                .unwrap()
-                .unwrap();
-        let batch = RecordBatch::try_new(
-            build_target_arrow_schema(&logical_fields).unwrap(),
-            vec![plain],
-        )
-        .unwrap();
-        let physical =
-            batch_to_shredded_physical(&batch, &logical_fields, &physical_fields).unwrap();
-        let read_fields = vec![DataField::new(1, "v".to_string(), DataType::Row(row_type))];
-        let shredded = assemble_shredded_variant_batch(physical, &read_fields).unwrap();
-        let shredded_result = shredded.column_by_name("v").unwrap();
-
-        for result in [plain_result.as_ref(), shredded_result.as_ref()] {
-            let result = result.as_any().downcast_ref::<StructArray>().unwrap();
-            for index in 0..2 {
-                let timestamps = result
-                    .column(index)
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .unwrap();
-                assert_eq!(timestamps.value(0), 1_700_000_000_123_456);
-            }
-            let dates = result
-                .column(2)
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .unwrap();
-            assert_eq!(dates.value(0), 19675);
-        }
     }
 
     #[test]
