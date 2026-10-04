@@ -173,6 +173,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "rollback_to_timestamp" => &["table", "timestamp"],
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
         "rename_branch" => &["table", "from_branch", "to_branch"],
+        "create_branch" => &["table", "branch", "tag", "ignore_if_exists"],
         "create_global_index" => &["table", "index_column", "index_type", "options"],
         // `partitions`/`dry_run` are declared but not yet implemented; they still reach
         // their own "not supported yet" error rather than being reported as unknown.
@@ -288,6 +289,7 @@ pub async fn execute_call(
             proc_create_tag_from_timestamp(ctx, catalog, catalog_name, &args).await
         }
         "rename_branch" => proc_rename_branch(ctx, catalog, catalog_name, &args).await,
+        "create_branch" => proc_create_branch(ctx, catalog, catalog_name, &args).await,
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
         "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
@@ -484,6 +486,72 @@ async fn proc_rename_branch(
     bm.rename_branch(from_branch, to_branch)
         .await
         .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_create_branch(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table_str = require_arg(args, "table")?;
+    let identifier = resolve_table_identifier(table_str, catalog_name)?;
+    // A branch-qualified source (`t$branch_b1`) selects where the tag / snapshot
+    // / schema are read from; branches are created flat under the base table, so
+    // load the base table and carry the source branch into creation. Resolving
+    // the literal `t$branch_b1` through the catalog would fail TableNotExist and
+    // the advertised "create a branch from a tag on another branch" case (which
+    // Java covers) could never run.
+    let parsed = identifier
+        .parsed_object_name()
+        .map_err(to_datafusion_error)?;
+    let source_branch = parsed.branch().map(str::to_string);
+    let base_identifier = Identifier::new(
+        identifier.database().to_string(),
+        parsed.table().to_string(),
+    );
+    let table = crate::table_loader::get_paimon_table(catalog, &base_identifier).await?;
+
+    // A REST catalog owns branch metadata and the Rust REST catalog has no
+    // branch-create endpoint yet (Java `RESTCatalog.createBranch` POSTs to the
+    // catalog). Writing branch files here would create a directory the catalog
+    // never registers, so a fresh read of the new branch would fail
+    // TableNotExist. Refuse before writing anything, until a catalog-aware path
+    // exists.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "create_branch is not yet supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+
+    let branch_name = require_arg(args, "branch")?;
+    let tag = args.get("tag").map(String::as_str);
+    let ignore_if_exists = args
+        .get("ignore_if_exists")
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    if ignore_if_exists
+        && bm
+            .branch_exists(branch_name)
+            .await
+            .map_err(to_datafusion_error)?
+    {
+        return ok_result(ctx);
+    }
+    let source_branch = source_branch.as_deref();
+    match tag {
+        Some(tag_name) => bm
+            .create_branch_from_tag_on_branch(branch_name, tag_name, source_branch)
+            .await
+            .map_err(to_datafusion_error)?,
+        None => bm
+            .create_branch_on_branch(branch_name, source_branch)
+            .await
+            .map_err(to_datafusion_error)?,
+    }
     ok_result(ctx)
 }
 

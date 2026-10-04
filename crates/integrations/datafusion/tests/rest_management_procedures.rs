@@ -681,6 +681,33 @@ async fn test_rename_branch_rejected_on_rest_catalog() {
 }
 
 #[tokio::test]
+async fn test_create_branch_rejected_on_rest_catalog() {
+    // A REST catalog owns branch metadata and the Rust REST catalog has no
+    // branch-create endpoint yet, so `create_branch` must refuse rather than
+    // write a physical branch directory the catalog never registers (which would
+    // make a fresh read of the new branch fail TableNotExist). Without the guard
+    // the filesystem `BranchManager` runs and reports a schema/latest error
+    // instead, so this assertion is non-vacuous.
+    let (tmp, server, context) = setup().await;
+
+    // `get_table` needs a schema-bearing response; register one so resolution
+    // reaches the REST guard rather than failing earlier on a missing schema.
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
+    server.add_table_with_schema(DATABASE, TABLE, schema, &path);
+
+    common::assert_sql_error(
+        &context,
+        &format!("CALL sys.create_branch(table => '{DATABASE}.{TABLE}', branch => 'b1')"),
+        "REST catalog",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_argument_validation_follows_java() {
     let (_tmp, server, context) = setup().await;
 

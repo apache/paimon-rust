@@ -143,10 +143,24 @@ impl BranchManager {
 
     /// Create a new branch by copying the latest schema to the branch directory.
     pub async fn create_branch(&self, branch_name: &str) -> crate::Result<()> {
+        self.create_branch_on_branch(branch_name, None).await
+    }
+
+    /// Like [`create_branch`](Self::create_branch), but reads the latest schema
+    /// from `source_branch` (`None` = the main branch). Branches are flat, so the
+    /// new branch is still created under the table root; only the schema source
+    /// is scoped. Lets `create_branch(table => 't$branch_b1', branch => 'b2')`
+    /// seed `b2` from `b1`'s schema instead of failing to resolve the base table.
+    pub async fn create_branch_on_branch(
+        &self,
+        branch_name: &str,
+        source_branch: Option<&str>,
+    ) -> crate::Result<()> {
         self.validate_branch(branch_name).await?;
-        let schema_manager = SchemaManager::new(self.file_io.clone(), self.table_path.clone());
-        if let Some(latest) = schema_manager.latest().await? {
-            self.copy_schemas_to_branch(branch_name, latest.id())
+        let source_branch = source_branch.filter(|b| *b != DEFAULT_MAIN_BRANCH);
+        let source_schema_manager = self.scoped_schema_manager(source_branch);
+        if let Some(latest) = source_schema_manager.latest().await? {
+            self.copy_schemas_to_branch(source_branch, branch_name, latest.id())
                 .await?;
         }
         Ok(())
@@ -158,10 +172,29 @@ impl BranchManager {
         branch_name: &str,
         tag_name: &str,
     ) -> crate::Result<()> {
+        self.create_branch_from_tag_on_branch(branch_name, tag_name, None)
+            .await
+    }
+
+    /// Like [`create_branch_from_tag`](Self::create_branch_from_tag), but reads
+    /// the tag (and its snapshot/schema) from `source_branch` (`None` = main).
+    /// Branches are flat: the new branch is created under the table root while
+    /// the sources are scoped to the branch the tag was taken on, matching Java
+    /// `FileSystemBranchManager` (branch-scoped injected managers, root
+    /// `tablePath`). Lets `create_branch(table => 't$branch_b1', tag => 'only_b1')`
+    /// reproduce a tag taken on another branch.
+    pub async fn create_branch_from_tag_on_branch(
+        &self,
+        branch_name: &str,
+        tag_name: &str,
+        source_branch: Option<&str>,
+    ) -> crate::Result<()> {
         self.validate_branch(branch_name).await?;
-        let tag_manager = TagManager::new(self.file_io.clone(), self.table_path.clone());
+        let source_branch = source_branch.filter(|b| *b != DEFAULT_MAIN_BRANCH);
+
+        let source_tag_manager = self.scoped_tag_manager(source_branch);
         let snapshot =
-            tag_manager
+            source_tag_manager
                 .get(tag_name)
                 .await?
                 .ok_or_else(|| crate::Error::DataInvalid {
@@ -169,25 +202,62 @@ impl BranchManager {
                     source: None,
                 })?;
 
-        let snapshot_manager = SnapshotManager::new(self.file_io.clone(), self.table_path.clone());
-
-        // Copy tag file to branch
-        let tag_src = tag_manager.tag_path(tag_name);
-        let tag_dst = tag_manager.with_branch(branch_name).tag_path(tag_name);
+        // Copy the tag file into the new (flat) branch directory.
+        let tag_src = source_tag_manager.tag_path(tag_name);
+        let dst_tag_manager = TagManager::new(self.file_io.clone(), self.table_path.clone());
+        let tag_dst = dst_tag_manager.with_branch(branch_name).tag_path(tag_name);
         self.file_io.copy_file(&tag_src, &tag_dst).await?;
 
-        // Copy snapshot file to branch
-        let snap_src = snapshot_manager.snapshot_path(snapshot.id());
-        let snap_dst = snapshot_manager
-            .with_branch(branch_name)
-            .snapshot_path(snapshot.id());
-        self.file_io.copy_file(&snap_src, &snap_dst).await?;
+        // Copy the snapshot file into the new branch. A tag can outlive its
+        // source snapshot JSON (expiration keeps tagged data but may delete
+        // `snapshot/snapshot-<id>`), so when the live file is gone, materialize
+        // the snapshot already resolved from the tag instead of failing. Mirrors
+        // Java `FileSystemBranchManager.createBranch`.
+        let source_snapshot_manager = self.scoped_snapshot_manager(source_branch);
+        let snap_src = source_snapshot_manager.snapshot_path(snapshot.id());
+        let branch_snapshot_manager =
+            SnapshotManager::new(self.file_io.clone(), self.table_path.clone())
+                .with_branch(branch_name);
+        let snap_dst = branch_snapshot_manager.snapshot_path(snapshot.id());
+        if self.file_io.exists(&snap_src).await? {
+            self.file_io.copy_file(&snap_src, &snap_dst).await?;
+        } else {
+            branch_snapshot_manager.commit_snapshot(&snapshot).await?;
+        }
 
-        // Copy schemas to branch
-        self.copy_schemas_to_branch(branch_name, snapshot.schema_id())
+        self.copy_schemas_to_branch(source_branch, branch_name, snapshot.schema_id())
             .await?;
 
         Ok(())
+    }
+
+    /// A [`TagManager`] reading from `source_branch` (`None` = the table root /
+    /// main branch). `with_branch` nests on an already-branched path, so always
+    /// build from the root and scope exactly once.
+    fn scoped_tag_manager(&self, source_branch: Option<&str>) -> TagManager {
+        let manager = TagManager::new(self.file_io.clone(), self.table_path.clone());
+        match source_branch {
+            Some(branch) => manager.with_branch(branch),
+            None => manager,
+        }
+    }
+
+    /// A [`SnapshotManager`] reading from `source_branch` (`None` = main).
+    fn scoped_snapshot_manager(&self, source_branch: Option<&str>) -> SnapshotManager {
+        let manager = SnapshotManager::new(self.file_io.clone(), self.table_path.clone());
+        match source_branch {
+            Some(branch) => manager.with_branch(branch),
+            None => manager,
+        }
+    }
+
+    /// A [`SchemaManager`] reading from `source_branch` (`None` = main).
+    fn scoped_schema_manager(&self, source_branch: Option<&str>) -> SchemaManager {
+        let manager = SchemaManager::new(self.file_io.clone(), self.table_path.clone());
+        match source_branch {
+            Some(branch) => manager.with_branch(branch),
+            None => manager,
+        }
     }
 
     /// Drop an existing branch.
@@ -269,13 +339,20 @@ impl BranchManager {
     }
 
     /// Copy all schemas with id <= schema_id to the branch directory.
-    async fn copy_schemas_to_branch(&self, branch_name: &str, schema_id: i64) -> crate::Result<()> {
-        let schema_manager = SchemaManager::new(self.file_io.clone(), self.table_path.clone());
-        let ids = schema_manager.list_all_ids().await?;
-        let branch_schema_manager = schema_manager.with_branch(branch_name);
+    async fn copy_schemas_to_branch(
+        &self,
+        source_branch: Option<&str>,
+        branch_name: &str,
+        schema_id: i64,
+    ) -> crate::Result<()> {
+        let source_schema_manager = self.scoped_schema_manager(source_branch);
+        let ids = source_schema_manager.list_all_ids().await?;
+        let branch_schema_manager =
+            SchemaManager::new(self.file_io.clone(), self.table_path.clone())
+                .with_branch(branch_name);
         for id in ids {
             if id <= schema_id {
-                let src = schema_manager.schema_path(id);
+                let src = source_schema_manager.schema_path(id);
                 let dst = branch_schema_manager.schema_path(id);
                 self.file_io.copy_file(&src, &dst).await?;
             }
@@ -502,6 +579,98 @@ mod tests {
         let branch_schema_manager = schema_manager.with_branch("my_branch");
         let schemas = branch_schema_manager.list_all().await.unwrap();
         assert_eq!(schemas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_from_tag_on_source_branch() {
+        // A tag can live only on a non-main branch. Creating a branch from such a
+        // tag must read the tag/snapshot/schema from that source branch, while the
+        // new branch is still created flat under the table root. Mirrors Java
+        // `create_branch(table => 't$branch_b1', branch => 'b2', tag => 'only_b1')`.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_create_branch_from_source_branch".to_string();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+        let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.clone());
+        let tag_manager = TagManager::new(file_io.clone(), table_path.clone());
+
+        // Main branch has schema-0 only; the tag lives exclusively on branch `b1`.
+        write_schema(&file_io, &schema_manager, &test_schema()).await;
+        let snap = test_snapshot(1);
+        write_schema(&file_io, &schema_manager.with_branch("b1"), &test_schema()).await;
+        write_snapshot(&file_io, &snapshot_manager.with_branch("b1"), &snap).await;
+        write_tag(&file_io, &tag_manager.with_branch("b1"), "only_b1", &snap).await;
+
+        let bm = BranchManager::new(file_io.clone(), table_path.clone());
+
+        // Reading from the source branch finds the tag and creates `b2` at the root.
+        bm.create_branch_from_tag_on_branch("b2", "only_b1", Some("b1"))
+            .await
+            .unwrap();
+        assert!(bm.branch_exists("b2").await.unwrap());
+        assert!(
+            tag_manager
+                .with_branch("b2")
+                .get("only_b1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the branch-local tag must be copied into b2"
+        );
+        // b2 is flat under the root, never nested under the source branch.
+        assert!(
+            !file_io
+                .exists(&format!("{table_path}/branch/branch-b1/branch/branch-b2/"))
+                .await
+                .unwrap(),
+            "b2 must not be nested under the source branch"
+        );
+
+        // Non-vacuity: the tag name does not exist on main, so a main-scoped read
+        // (source_branch = None) fails instead of silently creating the branch.
+        let err = bm
+            .create_branch_from_tag_on_branch("b3", "only_b1", None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Tag 'only_b1' does not exist"),
+            "main scope must not see the branch-local tag: {err}"
+        );
+        assert!(!bm.branch_exists("b3").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_from_tag_materializes_missing_live_snapshot() {
+        // A tag can outlive its main snapshot JSON: expiration deletes
+        // `snapshot/snapshot-<id>` but keeps the tag, schema and data. Creating a
+        // branch from such a tag must materialize the tag's snapshot, not fail
+        // copying a missing file.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_create_branch_tag_retained".to_string();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+        let snapshot_manager = SnapshotManager::new(file_io.clone(), table_path.clone());
+        let tag_manager = TagManager::new(file_io.clone(), table_path.clone());
+
+        write_schema(&file_io, &schema_manager, &test_schema()).await;
+        let snap = test_snapshot(1);
+        write_snapshot(&file_io, &snapshot_manager, &snap).await;
+        write_tag(&file_io, &tag_manager, "v1", &snap).await;
+
+        // Expire the live snapshot JSON while keeping the tag.
+        snapshot_manager.delete_snapshot(1).await.unwrap();
+        assert!(
+            !file_io
+                .exists(&snapshot_manager.snapshot_path(1))
+                .await
+                .unwrap(),
+            "live snapshot JSON should be gone"
+        );
+
+        let bm = BranchManager::new(file_io.clone(), table_path.clone());
+        bm.create_branch_from_tag("retained", "v1").await.unwrap();
+
+        // The branch snapshot was materialized from the tag and is readable.
+        let branch_snap_manager = snapshot_manager.with_branch("retained");
+        assert_eq!(branch_snap_manager.get_snapshot(1).await.unwrap().id(), 1);
     }
 
     #[tokio::test]
