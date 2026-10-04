@@ -34,7 +34,7 @@ use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
 use crate::snapshot::PySnapshot;
 use crate::tag::PyTag;
-use crate::write::{PyBatchWriteBuilder, PyStreamWriteBuilder};
+use crate::write::{PyBatchWriteBuilder, PyPostponeFixedBucketWriteBuilder, PyStreamWriteBuilder};
 
 #[pyclass(name = "Table", module = "pypaimon_rust.datafusion")]
 pub struct PyTable {
@@ -173,6 +173,12 @@ impl PyTable {
 
     fn new_batch_write_builder(&self) -> PyBatchWriteBuilder {
         PyBatchWriteBuilder::new(Arc::clone(&self.inner))
+    }
+
+    fn new_postpone_fixed_bucket_write_builder(
+        &self,
+    ) -> PyResult<PyPostponeFixedBucketWriteBuilder> {
+        PyPostponeFixedBucketWriteBuilder::new(Arc::clone(&self.inner))
     }
 
     fn new_stream_write_builder(&self) -> PyStreamWriteBuilder {

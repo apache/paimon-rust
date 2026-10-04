@@ -65,6 +65,14 @@ impl PostponeFixedBucketRouter {
         })
     }
 
+    pub(crate) async fn load_existing_buckets(
+        &mut self,
+        table: &Table,
+        snapshot_id: i64,
+    ) -> Result<()> {
+        self.plan.load_existing_buckets(table, snapshot_id).await
+    }
+
     pub(crate) fn route(&self, batch: &RecordBatch) -> Result<Vec<PostponeBucketBatch>> {
         let mut output = Vec::new();
         for (partition, batch) in
