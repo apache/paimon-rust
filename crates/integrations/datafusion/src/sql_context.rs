@@ -1157,10 +1157,22 @@ impl SQLContext {
         }
         let schema = builder.build().map_err(to_datafusion_error)?;
 
-        catalog
-            .create_table(&identifier, schema, ct.if_not_exists)
-            .await
-            .map_err(to_datafusion_error)?;
+        // Create strictly, even under IF NOT EXISTS: the cleanup below drops the
+        // target on a failed population, so this statement must *own* the table
+        // first. The earlier IF-NOT-EXISTS check can report absence while a
+        // racing client creates and populates the target before this call; a
+        // lenient create would then no-op onto that table and a failed
+        // population would drop another client's data. Mirror Java SparkCatalog
+        // (create with ifNotExists=false, AlreadyExists surfaced before
+        // population): on a raced AlreadyExists, IF NOT EXISTS is a no-op and we
+        // neither populate nor drop a table we did not create.
+        match catalog.create_table(&identifier, schema, false).await {
+            Ok(()) => {}
+            Err(paimon::Error::TableAlreadyExist { .. }) if ct.if_not_exists => {
+                return ok_result(&self.ctx);
+            }
+            Err(e) => return Err(to_datafusion_error(e)),
+        }
 
         // Populate the new table from the same expanded query. Quote every
         // identifier component so a case-sensitive or special target (e.g.
@@ -1175,9 +1187,9 @@ impl SQLContext {
             quote_ident(identifier.object()),
             expanded_query
         );
-        // On failure, drop the table this statement just created (it did not
-        // exist before) and surface the original error, so a corrected retry is
-        // not silently satisfied by an empty leftover.
+        // On failure, drop the table this statement just created (strict
+        // creation above guarantees ownership) and surface the original error,
+        // so a corrected retry is not silently satisfied by an empty leftover.
         let populated: DFResult<Vec<RecordBatch>> =
             async { Box::pin(self.sql(&insert_sql)).await?.collect().await }.await;
         if let Err(populate_err) = populated {
@@ -4027,6 +4039,7 @@ mod tests {
             schema: PaimonSchema,
             ignore_if_exists: bool,
         },
+        DropTable,
         AlterTable {
             identifier: Identifier,
             changes: Vec<SchemaChange>,
@@ -4045,6 +4058,11 @@ mod tests {
         functions: Mutex<HashMap<Identifier, paimon::catalog::Function>>,
         views: Mutex<HashMap<Identifier, paimon::catalog::View>>,
         drop_view_supported: bool,
+        /// When true, the target already exists (e.g. a client created it
+        /// between our absence check and create): a strict create
+        /// (`ignore_if_exists = false`) returns `TableAlreadyExist`, while a
+        /// lenient one is a no-op, matching a real catalog.
+        create_raced_already_exists: bool,
     }
 
     impl MockCatalog {
@@ -4055,6 +4073,7 @@ mod tests {
                 functions: Mutex::new(HashMap::new()),
                 views: Mutex::new(HashMap::new()),
                 drop_view_supported: true,
+                create_raced_already_exists: false,
             }
         }
 
@@ -4130,6 +4149,11 @@ mod tests {
                 schema: creation,
                 ignore_if_exists,
             });
+            if self.create_raced_already_exists && !ignore_if_exists {
+                return Err(paimon::Error::TableAlreadyExist {
+                    full_name: identifier.to_string(),
+                });
+            }
             Ok(())
         }
         async fn drop_table(
@@ -4137,6 +4161,7 @@ mod tests {
             _identifier: &Identifier,
             _ignore_if_not_exists: bool,
         ) -> paimon::Result<()> {
+            self.calls.lock().unwrap().push(CatalogCall::DropTable);
             Ok(())
         }
         async fn rename_table(
@@ -7107,6 +7132,38 @@ mod tests {
             .unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1, "the retry must populate, not no-op on a leftover");
+    }
+
+    #[tokio::test]
+    async fn test_create_table_as_select_if_not_exists_does_not_drop_raced_table() {
+        // Race: the IF NOT EXISTS absence check passes, but another client
+        // creates the target before our create. We must not populate or drop a
+        // table we did not create. The mock reports absence on load, then (since
+        // the table now exists) a strict create returns AlreadyExists; the CTAS
+        // must be a no-op with no drop_table call.
+        let catalog = Arc::new(MockCatalog {
+            create_raced_already_exists: true,
+            ..MockCatalog::new()
+        });
+        let ctx = make_sql_context(catalog.clone()).await;
+
+        ctx.sql(
+            "CREATE TABLE IF NOT EXISTS paimon.default.race_ctas AS SELECT CAST('bad' AS INT) AS id",
+        )
+        .await
+        .unwrap();
+
+        let calls = catalog.take_calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, CatalogCall::CreateTable { .. })),
+            "a create must be attempted"
+        );
+        assert!(
+            !calls.iter().any(|c| matches!(c, CatalogCall::DropTable)),
+            "a raced AlreadyExists must not drop the other client's table"
+        );
     }
 
     #[tokio::test]
