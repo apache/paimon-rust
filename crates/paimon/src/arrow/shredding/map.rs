@@ -20,13 +20,16 @@
 //!
 //! A logical `MAP<STRING, T>` field is stored physically as
 //! `ROW<__field_mapping: ARRAY<INT>, __col_0..__col_{K-1}: T, __overflow: MAP<INT, T>>`:
-//! the first `K` entries of each row (in row order) go to the shared columns,
-//! the rest go to the overflow map keyed by a file-local field id. The field
+//! a plain, sequential or LRU allocator places entries in shared columns,
+//! and the rest go to the overflow map keyed by a file-local field id. The field
 //! dictionary and column statistics are committed into the `ARROW:schema`
 //! footer metadata at close time so readers can rebuild the logical maps.
 
-use super::{option_usize, FieldMetadata, ShreddingReadPlan, ShreddingWritePlan};
+use super::{FieldMetadata, ShreddingReadPlan, ShreddingWritePlan, ShreddingWritePlanFactory};
 use crate::arrow::{build_target_arrow_schema, paimon_type_to_arrow};
+use crate::spec::map_shredding::{
+    column_placement, max_columns, ColumnPlacement, MAX_SHARED_SHREDDING_NUM_COLUMNS,
+};
 use crate::spec::{ArrayType, DataField, DataType, IntType, MapType, RowType};
 use crate::{Error, Result};
 use arrow_array::{
@@ -37,8 +40,8 @@ use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Fields, Schema as ArrowSchema};
 use arrow_select::interleave::interleave;
 use arrow_select::take::take;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Metadata keys (mirroring Java's MapShreddingDefine / MapSharedShreddingDefine)
@@ -74,11 +77,8 @@ fn physical_column_name(index: usize) -> String {
 // ---------------------------------------------------------------------------
 
 const MAP_STORAGE_LAYOUT_OPTION_SUFFIX: &str = "map.storage-layout";
-const MAP_SHARED_SHREDDING_MAX_COLUMNS_OPTION_SUFFIX: &str = "map.shared-shredding.max-columns";
+#[cfg(test)]
 const DEFAULT_MAP_SHARED_SHREDDING_MAX_COLUMNS: usize = 256;
-
-/// Mirrors Java's `MapSharedShreddingWritePlanFactory.INFER_BUFFER_ROW_COUNT`.
-pub(crate) const MAP_SHREDDING_INFER_BUFFER_ROW_COUNT: usize = 1;
 
 /// One top-level field configured for shared-shredding.
 pub(crate) struct MapShreddingFieldConfig {
@@ -86,6 +86,7 @@ pub(crate) struct MapShreddingFieldConfig {
     pub(crate) field_index: usize,
     pub(crate) field_name: String,
     pub(crate) max_columns: usize,
+    pub(crate) placement: ColumnPlacement,
 }
 
 /// Whether the type is a MAP with a VARCHAR key, mirroring Java's
@@ -125,28 +126,12 @@ pub(crate) fn detect_map_shredding_fields(
                 source: None,
             });
         }
-        let max_columns_key = format!(
-            "fields.{}.{}",
-            field.name(),
-            MAP_SHARED_SHREDDING_MAX_COLUMNS_OPTION_SUFFIX
-        );
-        let max_columns = option_usize(
-            options,
-            &max_columns_key,
-            DEFAULT_MAP_SHARED_SHREDDING_MAX_COLUMNS,
-        )?;
-        if max_columns == 0 {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "options {MAP_SHARED_SHREDDING_MAX_COLUMNS_OPTION_SUFFIX} must > 0"
-                ),
-                source: None,
-            });
-        }
+        let max_columns = max_columns(options, field.name())?;
         configs.push(MapShreddingFieldConfig {
             field_index,
             field_name: field.name().to_string(),
             max_columns,
+            placement: column_placement(options, field.name())?,
         });
     }
     Ok(configs)
@@ -195,41 +180,94 @@ struct RowAllocation {
 
 /// Per-row physical column allocator for one shared-shredding MAP column.
 ///
-/// Assigns fields to physical columns by row order, mirroring the (temporary)
-/// simple Java implementation.
+/// Implements Java's plain, sequential and LRU placement policies and tracks
+/// the file-level field locations required by readers.
 struct ColumnAllocator {
     num_columns: usize,
     field_to_columns: BTreeMap<i32, BTreeSet<usize>>,
     overflow_field_set: BTreeSet<i32>,
     max_row_width: usize,
+    placement: ColumnPlacement,
+    residents: Vec<i32>,
+    last_used: Vec<u64>,
+    clock: u64,
 }
 
 impl ColumnAllocator {
-    fn new(num_columns: usize) -> Self {
+    fn new(num_columns: usize, placement: ColumnPlacement) -> Self {
         Self {
             num_columns,
             field_to_columns: BTreeMap::new(),
             overflow_field_set: BTreeSet::new(),
             max_row_width: 0,
+            placement,
+            residents: vec![-1; num_columns],
+            last_used: vec![0; num_columns],
+            clock: 0,
         }
     }
 
     fn allocate_row(&mut self, field_ids: &[i32]) -> RowAllocation {
         self.max_row_width = self.max_row_width.max(field_ids.len());
+        let mut ordered = field_ids.to_vec();
+        if self.placement != ColumnPlacement::Plain {
+            ordered.sort_unstable();
+        }
+        let allocation = if self.placement == ColumnPlacement::Lru {
+            self.allocate_lru(&ordered)
+        } else {
+            let mut col_to_field = vec![-1; self.num_columns];
+            for (column, &id) in ordered.iter().take(self.num_columns).enumerate() {
+                col_to_field[column] = id;
+            }
+            RowAllocation {
+                col_to_field,
+                overflow_fields: ordered.into_iter().skip(self.num_columns).collect(),
+            }
+        };
+        for (column, &id) in allocation.col_to_field.iter().enumerate() {
+            if id >= 0 {
+                self.field_to_columns.entry(id).or_default().insert(column);
+            }
+        }
+        self.overflow_field_set.extend(&allocation.overflow_fields);
+        allocation
+    }
 
+    fn allocate_lru(&mut self, field_ids: &[i32]) -> RowAllocation {
         let mut col_to_field = vec![-1; self.num_columns];
-        let assign_limit = field_ids.len().min(self.num_columns);
-        for (i, &field_id) in field_ids.iter().take(assign_limit).enumerate() {
-            col_to_field[i] = field_id;
-            self.field_to_columns.entry(field_id).or_default().insert(i);
+        let mut next_residents = self.residents.clone();
+        let mut unassigned = Vec::new();
+        for &id in field_ids {
+            if let Some(column) = self.residents.iter().position(|&resident| resident == id) {
+                col_to_field[column] = id;
+            } else {
+                unassigned.push(id);
+            }
         }
-
         let mut overflow_fields = Vec::new();
-        for &field_id in field_ids.iter().skip(assign_limit) {
-            overflow_fields.push(field_id);
-            self.overflow_field_set.insert(field_id);
+        for id in unassigned {
+            let column = (0..self.num_columns)
+                .filter(|&i| col_to_field[i] == -1)
+                .min_by_key(|&i| (next_residents[i] != -1, self.last_used[i], i));
+            if let Some(column) = column {
+                col_to_field[column] = id;
+                next_residents[column] = id;
+            } else {
+                overflow_fields.push(id);
+            }
         }
-
+        let mut touched = false;
+        for (column, &id) in col_to_field.iter().enumerate() {
+            if id != -1 {
+                self.last_used[column] = self.clock;
+                touched = true;
+            }
+        }
+        if touched {
+            self.clock += 1;
+        }
+        self.residents = next_residents;
         RowAllocation {
             col_to_field,
             overflow_fields,
@@ -385,7 +423,6 @@ fn serialize_metadata(
 
 const MAX_FIELD_DICT_SIZE: usize = 16 * 1024 * 1024;
 const MAX_ENCODED_FIELD_DICT_SIZE: usize = 2 * MAX_FIELD_DICT_SIZE;
-const MAX_SHARED_SHREDDING_NUM_COLUMNS: usize = 16 * 1024;
 const MAX_SHARED_SHREDDING_ROW_WIDTH: usize = 1_000_000;
 
 /// Deserialize one field's shredding metadata, mirroring Java's
@@ -632,6 +669,96 @@ fn lz4_decompress(input: &[u8], original_len: usize) -> Result<Vec<u8>> {
 // Write plan (mirroring Java's MapSharedShreddingWritePlan[Factory])
 // ---------------------------------------------------------------------------
 
+/// One factory per rolling writer, as in Java MapSharedShreddingWritePlanFactory.
+/// Plans keep dictionaries/allocators local to each file; only completed-file
+/// widths survive in the factory. The mutex supports background file closes.
+pub(crate) struct MapShreddingWritePlanFactory {
+    logical_fields: Vec<DataField>,
+    configs: Vec<MapShreddingFieldConfig>,
+    context: Mutex<MapShreddingContext>,
+}
+
+impl MapShreddingWritePlanFactory {
+    pub(crate) fn new(
+        logical_fields: Vec<DataField>,
+        configs: Vec<MapShreddingFieldConfig>,
+    ) -> Self {
+        Self {
+            logical_fields,
+            configs,
+            context: Mutex::default(),
+        }
+    }
+}
+
+impl ShreddingWritePlanFactory for MapShreddingWritePlanFactory {
+    fn should_create_write_plan(&self) -> bool {
+        !self.configs.is_empty()
+    }
+
+    fn create_write_plan(&self, _batches: &[RecordBatch]) -> Result<Box<dyn ShreddingWritePlan>> {
+        Ok(Box::new(MapShreddingWritePlan::new(
+            &self.logical_fields,
+            &self.configs,
+            &self.context.lock().unwrap(),
+        )?))
+    }
+
+    fn validate_compression(&self, compression: &str) -> Result<()> {
+        normalize_field_dict_compression(Some(compression)).map(|_| ())
+    }
+
+    fn on_file_completed(&self, plan: &dyn ShreddingWritePlan) -> Result<()> {
+        self.context
+            .lock()
+            .unwrap()
+            .report(&plan.file_max_row_widths());
+        Ok(())
+    }
+
+    fn needs_completed_file_stats(&self) -> bool {
+        true
+    }
+}
+
+/// Recent completed-file widths, matching Java MapSharedShreddingContext.
+#[derive(Default)]
+struct MapShreddingContext {
+    recent_widths: HashMap<String, VecDeque<usize>>,
+}
+
+impl MapShreddingContext {
+    fn next_columns(&self, config: &MapShreddingFieldConfig) -> usize {
+        let Some(widths) = self
+            .recent_widths
+            .get(&config.field_name)
+            .filter(|v| !v.is_empty())
+        else {
+            return config.max_columns;
+        };
+        let mut sorted: Vec<_> = widths.iter().copied().collect();
+        sorted.sort_unstable();
+        let max = *sorted.last().unwrap();
+        let p90 = sorted[(sorted.len() * 9).div_ceil(10) - 1];
+        let width = if max - p90 <= 4 || max <= (p90 * 5).div_ceil(4) {
+            max
+        } else {
+            p90
+        };
+        width.clamp(1, config.max_columns)
+    }
+
+    fn report(&mut self, widths: &HashMap<String, usize>) {
+        for (name, &width) in widths {
+            let recent = self.recent_widths.entry(name.clone()).or_default();
+            recent.push_back(width);
+            if recent.len() > 20 {
+                recent.pop_front();
+            }
+        }
+    }
+}
+
 /// [`ShreddingWritePlan`] for the MAP shared-shredding layout.
 ///
 /// Owns the file-local field dictionary and column allocator for every
@@ -653,12 +780,11 @@ struct MapWriteContext {
 }
 
 impl MapShreddingWritePlan {
-    /// Create a plan, inferring the column count per field from the sampled
-    /// rows (mirroring Java's `MapSharedShreddingWritePlanFactory.createWritePlan`).
-    pub(crate) fn infer(
+    /// Create a file-local plan from completed-file statistics.
+    fn new(
         logical_fields: &[DataField],
         configs: &[MapShreddingFieldConfig],
-        sample_batches: &[RecordBatch],
+        context: &MapShreddingContext,
     ) -> Result<Self> {
         let config_by_index: HashMap<usize, &MapShreddingFieldConfig> = configs
             .iter()
@@ -682,7 +808,7 @@ impl MapShreddingWritePlan {
                     source: None,
                 });
             };
-            let num_columns = infer_num_columns(config, sample_batches)?;
+            let num_columns = context.next_columns(config);
             let physical_type =
                 build_physical_struct_type(map_type.value_type(), num_columns, true)?
                     .copy_with_nullable(field.data_type().is_nullable())?;
@@ -706,7 +832,7 @@ impl MapShreddingWritePlan {
                 MapWriteContext {
                     num_columns,
                     dict: FieldDict::new(),
-                    allocator: ColumnAllocator::new(num_columns),
+                    allocator: ColumnAllocator::new(num_columns, config.placement),
                     struct_fields,
                 },
             );
@@ -720,44 +846,6 @@ impl MapShreddingWritePlan {
             contexts,
         })
     }
-}
-
-/// Infer the physical column count for one field, mirroring Java:
-/// `maxColumns` when no rows were sampled, otherwise
-/// `max(1, min(maxRowWidth, maxColumns))` over the first
-/// [`MAP_SHREDDING_INFER_BUFFER_ROW_COUNT`] rows.
-fn infer_num_columns(
-    config: &MapShreddingFieldConfig,
-    sample_batches: &[RecordBatch],
-) -> Result<usize> {
-    let mut max_row_width = 0usize;
-    let mut sampled = 0usize;
-    'outer: for batch in sample_batches {
-        let map_array = batch
-            .column(config.field_index)
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .ok_or_else(|| Error::DataInvalid {
-                message: format!(
-                    "Shared-shredding MAP column '{}' must be MapArray",
-                    config.field_name
-                ),
-                source: None,
-            })?;
-        for row in 0..map_array.len() {
-            if sampled >= MAP_SHREDDING_INFER_BUFFER_ROW_COUNT {
-                break 'outer;
-            }
-            if !map_array.is_null(row) {
-                max_row_width = max_row_width.max(map_array.value_length(row) as usize);
-            }
-            sampled += 1;
-        }
-    }
-    if sampled == 0 {
-        return Ok(config.max_columns);
-    }
-    Ok(max_row_width.clamp(1, config.max_columns))
 }
 
 impl ShreddingWritePlan for MapShreddingWritePlan {
@@ -789,6 +877,18 @@ impl ShreddingWritePlan for MapShreddingWritePlan {
         })
     }
 
+    fn file_max_row_widths(&self) -> HashMap<String, usize> {
+        self.contexts
+            .iter()
+            .map(|(&index, ctx)| {
+                (
+                    self.logical_fields[index].name().to_string(),
+                    ctx.allocator.max_row_width,
+                )
+            })
+            .collect()
+    }
+
     fn field_metadata(&self, compression: Option<&str>) -> Result<FieldMetadata> {
         let mut metadata = HashMap::new();
         for (&index, ctx) in &self.contexts {
@@ -816,10 +916,9 @@ impl ShreddingWritePlan for MapShreddingWritePlan {
 /// Convert one logical MAP column into the physical struct layout, mirroring
 /// Java's `MapSharedShreddingRowConverter.convertMap`.
 ///
-/// The conversion is type-agnostic: because the allocator assigns columns by
-/// row order, physical column `i` holds the `i`-th map entry of each row, so
-/// column values are gathered with a single `take` over the flattened map
-/// values.
+/// The conversion is type-agnostic: each allocated field id resolves to its
+/// last input value, then a `take` gathers each physical column from the
+/// flattened map values.
 fn map_array_to_physical(
     array: &dyn Array,
     ctx: &mut MapWriteContext,
@@ -878,6 +977,7 @@ fn map_array_to_physical(
         let start = offsets[row] as usize;
         let end = offsets[row + 1] as usize;
         let mut field_ids = Vec::with_capacity(end - start);
+        let mut value_indices = HashMap::new();
         for j in start..end {
             if keys.is_null(j) {
                 return Err(Error::DataInvalid {
@@ -887,7 +987,9 @@ fn map_array_to_physical(
                     source: None,
                 });
             }
-            field_ids.push(ctx.dict.get_or_assign(keys.value(j)));
+            let id = ctx.dict.get_or_assign(keys.value(j));
+            field_ids.push(id);
+            value_indices.insert(id, j as u32);
         }
         let allocation = ctx.allocator.allocate_row(&field_ids);
 
@@ -896,10 +998,10 @@ fn map_array_to_physical(
         mapping_values.extend(allocation.col_to_field.iter().map(|&id| Some(id)));
         mapping_offsets.push(*mapping_offsets.last().unwrap() + k as i32);
 
-        // __col_i holds the i-th entry's value (allocation is by row order).
+        // Look up by field ID: placement may retain or reorder columns.
         for (i, indices) in column_indices.iter_mut().enumerate() {
             indices.push(if allocation.col_to_field[i] >= 0 {
-                Some((start + i) as u32)
+                Some(value_indices[&allocation.col_to_field[i]])
             } else {
                 None
             });
@@ -911,12 +1013,14 @@ fn map_array_to_physical(
             overflow_offsets.push(*overflow_offsets.last().unwrap());
         } else {
             overflow_validity.push(true);
-            for (j, &field_id) in allocation.overflow_fields.iter().enumerate() {
-                overflow_keys.push(field_id);
-                overflow_value_indices.push(Some((start + k + j) as u32));
+            let mut seen = HashSet::new();
+            for &field_id in &allocation.overflow_fields {
+                if seen.insert(field_id) {
+                    overflow_keys.push(field_id);
+                    overflow_value_indices.push(Some(value_indices[&field_id]));
+                }
             }
-            overflow_offsets
-                .push(*overflow_offsets.last().unwrap() + allocation.overflow_fields.len() as i32);
+            overflow_offsets.push(overflow_keys.len() as i32);
         }
     }
 
@@ -2043,38 +2147,38 @@ mod tests {
     #[test]
     fn test_column_allocator() {
         // Basic allocation.
-        let mut allocator = ColumnAllocator::new(3);
+        let mut allocator = ColumnAllocator::new(3, ColumnPlacement::Plain);
         let allocation = allocator.allocate_row(&[10, 20]);
         assert_eq!(allocation.col_to_field, vec![10, 20, -1]);
         assert!(allocation.overflow_fields.is_empty());
 
         // Exactly K fields.
-        let mut allocator = ColumnAllocator::new(3);
+        let mut allocator = ColumnAllocator::new(3, ColumnPlacement::Plain);
         let allocation = allocator.allocate_row(&[0, 1, 2]);
         assert_eq!(allocation.col_to_field, vec![0, 1, 2]);
         assert!(allocation.overflow_fields.is_empty());
 
         // Overflow when exceeding K.
-        let mut allocator = ColumnAllocator::new(2);
+        let mut allocator = ColumnAllocator::new(2, ColumnPlacement::Plain);
         let allocation = allocator.allocate_row(&[10, 20, 30, 40]);
         assert_eq!(allocation.col_to_field, vec![10, 20]);
         assert_eq!(allocation.overflow_fields, vec![30, 40]);
 
         // Empty row.
-        let mut allocator = ColumnAllocator::new(3);
+        let mut allocator = ColumnAllocator::new(3, ColumnPlacement::Plain);
         let allocation = allocator.allocate_row(&[]);
         assert_eq!(allocation.col_to_field, vec![-1, -1, -1]);
         assert!(allocation.overflow_fields.is_empty());
 
         // Max row width tracked.
-        let mut allocator = ColumnAllocator::new(3);
+        let mut allocator = ColumnAllocator::new(3, ColumnPlacement::Plain);
         allocator.allocate_row(&[1, 2]);
         allocator.allocate_row(&[1, 2, 3, 4, 5]);
         allocator.allocate_row(&[1]);
         assert_eq!(allocator.max_row_width, 5);
 
         // field_to_columns accumulated.
-        let mut allocator = ColumnAllocator::new(3);
+        let mut allocator = ColumnAllocator::new(3, ColumnPlacement::Plain);
         allocator.allocate_row(&[10, 20, 30]);
         allocator.allocate_row(&[20, 40]);
         let columns = |id: i32| {
@@ -2092,10 +2196,75 @@ mod tests {
         assert_eq!(columns(40), vec![1]);
 
         // overflow_field_set accumulated.
-        let mut allocator = ColumnAllocator::new(2);
+        let mut allocator = ColumnAllocator::new(2, ColumnPlacement::Plain);
         allocator.allocate_row(&[1, 2, 3]);
         allocator.allocate_row(&[4, 5, 6, 7]);
         assert_eq!(allocator.overflow_field_set, BTreeSet::from([3, 6, 7]));
+    }
+
+    #[test]
+    fn lru_map_placement_matches_java_hit_evict_overflow_and_metadata() {
+        let mut allocator = ColumnAllocator::new(3, ColumnPlacement::Lru);
+        for (ids, columns, overflow) in [
+            (vec![0, 1, 2], vec![0, 1, 2], vec![]),
+            (vec![0, 1], vec![0, 1, -1], vec![]),
+            (vec![3, 4, 5], vec![4, 5, 3], vec![]),
+            (vec![0, 3, 4, 5], vec![4, 5, 3], vec![0]),
+            (vec![], vec![-1, -1, -1], vec![]),
+            (vec![3], vec![-1, -1, 3], vec![]),
+        ] {
+            let row = allocator.allocate_row(&ids);
+            assert_eq!(row.col_to_field, columns);
+            assert_eq!(row.overflow_fields, overflow);
+        }
+        assert_eq!(allocator.max_row_width, 4);
+        assert_eq!(allocator.field_to_columns[&3], BTreeSet::from([2]));
+        assert_eq!(allocator.overflow_field_set, BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn sequential_map_placement_uses_dictionary_order() {
+        let mut allocator = ColumnAllocator::new(3, ColumnPlacement::Sequential);
+        allocator.allocate_row(&[1, 2]);
+        allocator.allocate_row(&[2, 3]);
+        let row = allocator.allocate_row(&[7, 4, 6, 5]);
+        assert_eq!(row.col_to_field, vec![4, 5, 6]);
+        assert_eq!(row.overflow_fields, vec![7]);
+        assert_eq!(allocator.field_to_columns[&2], BTreeSet::from([0, 1]));
+    }
+
+    #[test]
+    fn adaptive_map_width_matches_java_window_and_percentile_boundaries() {
+        let config = MapShreddingFieldConfig {
+            field_index: 0,
+            field_name: "tags".into(),
+            max_columns: 256,
+            placement: ColumnPlacement::Lru,
+        };
+        let mut context = MapShreddingContext::default();
+        assert_eq!(context.next_columns(&config), 256);
+        for (width, expected) in [(0, 1), (7, 7), (1000, 256)] {
+            let mut context = MapShreddingContext::default();
+            context.report(&HashMap::from([("tags".into(), width)]));
+            assert_eq!(context.next_columns(&config), expected);
+        }
+        for (regular, outlier, expected) in
+            [(3, 1000, 3), (3, 7, 7), (100, 125, 125), (100, 130, 100)]
+        {
+            let mut context = MapShreddingContext::default();
+            for _ in 0..19 {
+                context.report(&HashMap::from([("tags".into(), regular)]));
+            }
+            context.report(&HashMap::from([("tags".into(), outlier)]));
+            assert_eq!(context.next_columns(&config), expected);
+        }
+        context.report(&HashMap::from([("tags".into(), 104), ("other".into(), 4)]));
+        for _ in 0..19 {
+            context.report(&HashMap::from([("tags".into(), 100)]));
+        }
+        assert_eq!(context.next_columns(&config), 104);
+        context.report(&HashMap::from([("tags".into(), 100)]));
+        assert_eq!(context.next_columns(&config), 100);
     }
 
     // -- Detection (MapSharedShreddingUtilsTest) --
@@ -2451,37 +2620,47 @@ mod tests {
     // -- Write plan (MapSharedShreddingWritePlanTest / RowConverterTest) --
 
     #[test]
-    fn test_infer_num_columns() {
-        let config = |max_columns: usize| MapShreddingFieldConfig {
-            field_index: 0,
-            field_name: "tags".to_string(),
-            max_columns,
-        };
+    fn test_default_map_policy_preserves_resident_columns() {
         let fields = vec![map_field(0, "tags", bigint_type())];
+        let options = HashMap::from([
+            (
+                "fields.tags.map.storage-layout".to_string(),
+                "shared-shredding".to_string(),
+            ),
+            (
+                "fields.tags.map.shared-shredding.max-columns".to_string(),
+                "3".to_string(),
+            ),
+        ]);
+        let configs = detect_map_shredding_fields(&fields, &options).unwrap();
+        let mut plan =
+            MapShreddingWritePlan::new(&fields, &configs, &MapShreddingContext::default()).unwrap();
         let batch = logical_batch(
             &fields,
-            vec![Arc::new(build_map_array(&[Some(vec![
-                ("a", Some(1)),
-                ("b", Some(2)),
-                ("c", Some(3)),
-            ])]))],
+            vec![Arc::new(build_map_array(&[
+                Some(vec![("a", Some(1)), ("b", Some(2)), ("c", Some(3))]),
+                Some(vec![("b", Some(20)), ("a", Some(10))]),
+            ]))],
         );
-        // Inferred from the first row, capped at max-columns.
-        assert_eq!(
-            infer_num_columns(&config(4), std::slice::from_ref(&batch)).unwrap(),
-            3
-        );
-        assert_eq!(
-            infer_num_columns(&config(2), std::slice::from_ref(&batch)).unwrap(),
-            2
-        );
-        // No rows sampled -> max-columns.
-        assert_eq!(infer_num_columns(&config(4), &[]).unwrap(), 4);
-        let empty_batch = logical_batch(&fields, vec![Arc::new(build_map_array(&[]))]);
-        assert_eq!(infer_num_columns(&config(4), &[empty_batch]).unwrap(), 4);
-        // A null first row still counts as sampled (width 0 -> clamped to 1).
-        let null_batch = logical_batch(&fields, vec![Arc::new(build_map_array(&[None]))]);
-        assert_eq!(infer_num_columns(&config(4), &[null_batch]).unwrap(), 1);
+        let physical = plan.to_physical_batch(&batch).unwrap();
+        let tags = physical
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let mapping = tags.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        let values = mapping
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(values.values().as_ref(), &[0, 1, 2, 0, 1, -1]);
+        let column = tags
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(column.value(1), 10);
     }
 
     #[test]
@@ -2494,9 +2673,12 @@ mod tests {
             field_index: 1,
             field_name: "tags".to_string(),
             max_columns: 4,
+            placement: ColumnPlacement::Plain,
         }];
-        // No sampled rows -> num_columns = max_columns.
-        let mut plan = MapShreddingWritePlan::infer(&logical_fields, &configs, &[]).unwrap();
+        // No completed files -> num_columns = max_columns.
+        let mut plan =
+            MapShreddingWritePlan::new(&logical_fields, &configs, &MapShreddingContext::default())
+                .unwrap();
         assert_eq!(plan.physical_fields().len(), 2);
 
         let batch = logical_batch(
@@ -2591,8 +2773,11 @@ mod tests {
             field_index: 0,
             field_name: "tags".to_string(),
             max_columns: 2,
+            placement: ColumnPlacement::Plain,
         }];
-        let mut plan = MapShreddingWritePlan::infer(&logical_fields, &configs, &[]).unwrap();
+        let mut plan =
+            MapShreddingWritePlan::new(&logical_fields, &configs, &MapShreddingContext::default())
+                .unwrap();
 
         let map_type = DataType::Map(MapType::new(string_type(), bigint_type()));
         let ArrowDataType::Map(entries_field, ordered) = paimon_type_to_arrow(&map_type).unwrap()
@@ -2790,6 +2975,7 @@ mod tests {
             field_index: 0,
             field_name: "tags".to_string(),
             max_columns: 2,
+            placement: ColumnPlacement::Plain,
         }];
         let rows = vec![vec![("a", 10), ("b", 20)], vec![("a", 30)]];
         let batch = logical_batch(
@@ -2797,7 +2983,9 @@ mod tests {
             vec![Arc::new(build_non_nullable_map_array(&rows))],
         );
 
-        let mut plan = MapShreddingWritePlan::infer(&logical_fields, &configs, &[]).unwrap();
+        let mut plan =
+            MapShreddingWritePlan::new(&logical_fields, &configs, &MapShreddingContext::default())
+                .unwrap();
         let physical = plan.to_physical_batch(&batch).unwrap();
         let field_metadata = plan.field_metadata(Some("zstd")).unwrap();
         let file_fields: Vec<ArrowField> = physical
@@ -2843,6 +3031,7 @@ mod tests {
             field_index: 1,
             field_name: "tags".to_string(),
             max_columns: 2,
+            placement: ColumnPlacement::Plain,
         }];
         let rows: Vec<Option<Vec<(&str, Option<i64>)>>> = vec![
             Some(vec![("a", Some(10)), ("b", None), ("c", Some(30))]), // c overflows
@@ -2850,7 +3039,9 @@ mod tests {
             Some(vec![]),                                              // empty map
             Some(vec![("b", Some(40)), ("a", Some(50))]),
         ];
-        let mut plan = MapShreddingWritePlan::infer(&logical_fields, &configs, &[]).unwrap();
+        let mut plan =
+            MapShreddingWritePlan::new(&logical_fields, &configs, &MapShreddingContext::default())
+                .unwrap();
         let batch = logical_batch(
             &logical_fields,
             vec![

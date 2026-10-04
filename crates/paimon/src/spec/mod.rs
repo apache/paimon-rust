@@ -50,6 +50,7 @@ pub(crate) use aggregation::{
 mod data_type_casts;
 pub(crate) use data_type_casts::supports_cast;
 
+pub(crate) mod map_shredding;
 mod schema;
 pub use schema::*;
 

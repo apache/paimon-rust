@@ -25,7 +25,8 @@
 use super::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
 use super::data_file_path_factory::{DataFilePath, DataFilePathFactory};
 use crate::arrow::format::{
-    create_format_writer, with_write_resources, FormatFileWriter, FormatValueStats,
+    create_format_writer_factory, with_write_resources, FormatFileWriter, FormatValueStats,
+    FormatWriterFactory,
 };
 use crate::io::FileIO;
 use crate::resource::ResourceContext;
@@ -59,6 +60,7 @@ pub(crate) struct DataFileWriter {
     data_file_prefix: String,
     write_fields: Vec<DataField>,
     format_options: HashMap<String, String>,
+    format_writer_factory: Option<Arc<dyn FormatWriterFactory>>,
     file_source: Option<i32>,
     first_row_id: Option<i64>,
     write_cols: Option<Vec<String>>,
@@ -107,6 +109,7 @@ impl DataFileWriter {
             .data_file_prefix()
             .to_string();
         Ok(Self {
+            format_writer_factory: None,
             file_io,
             paths,
             schema_id,
@@ -208,6 +211,15 @@ impl DataFileWriter {
     }
 
     async fn open_new_file(&mut self, schema: arrow_schema::SchemaRef) -> Result<()> {
+        // Stateful factories may need the previous close callback before they
+        // create the next file's plan. Stateless factories keep asynchronous rolling.
+        if self
+            .format_writer_factory
+            .as_ref()
+            .is_some_and(|factory| factory.needs_completed_file_stats())
+        {
+            self.drain_closes().await?;
+        }
         let index = self
             .index_options
             .as_ref()
@@ -229,16 +241,25 @@ impl DataFileWriter {
             ));
         }
         let output = self.file_io.new_output(&file_path)?;
-        let writer = create_format_writer(
-            &output,
-            schema,
-            &self.file_compression,
-            self.file_compression_zstd_level,
-            Some(self.file_io.clone()),
-            Some(&self.write_fields),
-            Some(&self.format_options),
-        )
-        .await?;
+        let factory = match &self.format_writer_factory {
+            Some(factory) => factory.clone(),
+            None => {
+                let factory = create_format_writer_factory(
+                    &self.file_format,
+                    schema,
+                    self.file_compression_zstd_level,
+                    Some(self.file_io.clone()),
+                    Some(&self.write_fields),
+                    Some(&self.format_options),
+                    None,
+                )?;
+                self.format_writer_factory = Some(factory.clone());
+                factory
+            }
+        };
+        let writer = factory
+            .create_writer(&output, &self.file_compression)
+            .await?;
         self.current_writer = Some(with_write_resources(writer, self.resources.as_ref()));
         self.current_index = index;
         self.current_file_name = Some(file_name);
@@ -387,8 +408,7 @@ impl DataFileWriter {
         });
     }
 
-    async fn finish(&mut self) -> Result<Vec<DataFileMeta>> {
-        self.close_current_file().await?;
+    async fn drain_closes(&mut self) -> Result<()> {
         while let Some(result) = self.in_flight_closes.join_next().await {
             let file = result.map_err(|e| crate::Error::DataInvalid {
                 message: format!("Background file close task panicked: {e}"),
@@ -396,6 +416,12 @@ impl DataFileWriter {
             })??;
             self.written_files.push(file);
         }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<Vec<DataFileMeta>> {
+        self.close_current_file().await?;
+        self.drain_closes().await?;
         self.created_paths.clear();
         let mut files = std::mem::take(&mut self.written_files);
         files.sort_unstable_by_key(|(ordinal, _)| *ordinal);
@@ -588,6 +614,178 @@ mod tests {
             files.iter().map(|file| file.row_count).collect::<Vec<_>>(),
             vec![2, 3, 1]
         );
+    }
+
+    #[tokio::test]
+    async fn variant_inference_reuses_committed_evidence_only_in_adaptive_mode() {
+        use crate::arrow::{build_target_arrow_schema, variant_arrow_type};
+        use crate::spec::VariantType;
+        use crate::variant::GenericVariant;
+        use arrow_array::{BinaryArray, StructArray};
+        use futures::TryStreamExt;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        for mode in ["per-file", "adaptive"] {
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let path = format!("memory:/variant-rolling-{mode}");
+            let fields = vec![DataField::new(
+                0,
+                "v".into(),
+                DataType::Variant(VariantType::new()),
+            )];
+            let options = HashMap::from([
+                ("variant.inferShreddingSchema".into(), "true".into()),
+                ("variant.shredding.inferenceMode".into(), mode.into()),
+                ("variant.shredding.maxInferBufferRow".into(), "4".into()),
+                (
+                    "variant.shredding.adaptive.maxInferBufferRow".into(),
+                    "1".into(),
+                ),
+            ]);
+            let mut writer = DataFileWriter::new(
+                file_io.clone(),
+                path.clone(),
+                String::new(),
+                0,
+                0,
+                i64::MAX,
+                "zstd".into(),
+                1,
+                i64::MAX,
+                "parquet".into(),
+                fields.clone(),
+                options,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_target_file_row_num(4);
+            let mut expected = Vec::new();
+            for json in [
+                vec![r#"{"legacy":1}"#; 4],
+                vec![
+                    r#"{"emerging":true}"#,
+                    r#"{"late":1}"#,
+                    r#"{"late":2}"#,
+                    r#"{"late":3}"#,
+                ],
+            ] {
+                let variants = json
+                    .iter()
+                    .map(|value| GenericVariant::parse_json(value).unwrap())
+                    .collect::<Vec<_>>();
+                let ArrowDataType::Struct(variant_fields) = variant_arrow_type() else {
+                    unreachable!()
+                };
+                let array = StructArray::new(
+                    variant_fields,
+                    vec![
+                        Arc::new(BinaryArray::from_iter_values(
+                            variants.iter().map(GenericVariant::value),
+                        )),
+                        Arc::new(BinaryArray::from_iter_values(
+                            variants.iter().map(GenericVariant::metadata),
+                        )),
+                    ],
+                    None,
+                );
+                let batch = RecordBatch::try_new(
+                    build_target_arrow_schema(&fields).unwrap(),
+                    vec![Arc::new(array)],
+                )
+                .unwrap();
+                writer.write(&batch).await.unwrap();
+                expected.push(variants);
+            }
+            let files = writer.prepare_commit().await.unwrap();
+            assert_eq!(files.len(), 2);
+            for (index, file) in files.iter().enumerate() {
+                let file_path = format!("{path}/bucket-0/{}", file.file_name);
+                let input = file_io.new_input(&file_path).unwrap();
+                let raw =
+                    ParquetRecordBatchReaderBuilder::try_new(input.read().await.unwrap()).unwrap();
+                let ArrowDataType::Struct(variant_fields) = raw.schema().field(0).data_type()
+                else {
+                    panic!("expected variant struct")
+                };
+                let typed = variant_fields
+                    .iter()
+                    .find(|field| field.name() == "typed_value")
+                    .unwrap();
+                let ArrowDataType::Struct(object) = typed.data_type() else {
+                    panic!("expected object")
+                };
+                let names = object
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    names,
+                    if index == 0 {
+                        vec!["legacy"]
+                    } else if mode == "adaptive" {
+                        vec!["emerging", "legacy"]
+                    } else {
+                        vec!["emerging", "late"]
+                    }
+                );
+                let reader =
+                    crate::arrow::format::create_format_reader(&file_path, false, &fields).unwrap();
+                let batches = reader
+                    .read_batch_stream(
+                        Box::new(input.reader().await.unwrap()),
+                        file.file_size as u64,
+                        &fields,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                let mut actual = Vec::new();
+                for batch in batches {
+                    let array = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .unwrap();
+                    let values = array
+                        .column_by_name("value")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap();
+                    let metadata = array
+                        .column_by_name("metadata")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap();
+                    for row in 0..batch.num_rows() {
+                        actual.push(
+                            GenericVariant::from_parts(
+                                values.value(row).to_vec(),
+                                metadata.value(row).to_vec(),
+                            )
+                            .unwrap()
+                            .to_json()
+                            .unwrap(),
+                        );
+                    }
+                }
+                assert_eq!(
+                    actual,
+                    expected[index]
+                        .iter()
+                        .map(|value| value.to_json().unwrap())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[tokio::test]

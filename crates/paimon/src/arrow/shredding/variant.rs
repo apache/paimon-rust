@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{option_bool, option_f64, option_usize, FieldMetadata, ShreddingWritePlan};
+use super::{
+    option_bool, option_f64, option_usize, FieldMetadata, ShreddingWritePlan,
+    ShreddingWritePlanFactory,
+};
 use crate::arrow::{
     arrow_to_paimon_type, build_target_arrow_schema, is_variant_arrow_fields, paimon_type_to_arrow,
 };
@@ -25,8 +28,8 @@ use crate::spec::{
 use crate::variant::{
     build_variant_schema, cast_shredded, cast_variant_to_shredded_value,
     infer_variant_shredding_schema, rebuild_shredded, variant_shredding_type, GenericVariant,
-    ShreddedRow, ShreddedValue, VariantShreddingInferConfig, VARIANT_METADATA_FIELD_NAME,
-    VARIANT_TYPED_VALUE_FIELD_NAME, VARIANT_VALUE_FIELD_NAME,
+    ShreddedRow, ShreddedValue, VariantShreddingInferConfig, VariantShreddingInferenceSession,
+    VARIANT_METADATA_FIELD_NAME, VARIANT_TYPED_VALUE_FIELD_NAME, VARIANT_VALUE_FIELD_NAME,
 };
 use crate::{Error, Result};
 use arrow_array::{
@@ -38,7 +41,7 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields, TimeUnit};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const VARIANT_SHREDDING_SCHEMA_OPTION: &str = "variant.shreddingSchema";
 const PARQUET_VARIANT_SHREDDING_SCHEMA_OPTION: &str = "parquet.variant.shreddingSchema";
@@ -54,7 +57,7 @@ const DEFAULT_VARIANT_SHREDDING_MAX_SCHEMA_DEPTH: usize = 50;
 const DEFAULT_VARIANT_SHREDDING_MAX_SCHEMA_WIDTH: usize = 300;
 const DEFAULT_VARIANT_SHREDDING_MIN_FIELD_CARDINALITY_RATIO: f64 = 0.1;
 
-pub(crate) fn configured_variant_shredding_fields(
+fn configured_variant_shredding_fields(
     logical_fields: &[DataField],
     options: &HashMap<String, String>,
 ) -> Result<Option<Vec<DataField>>> {
@@ -69,7 +72,7 @@ pub(crate) fn configured_variant_shredding_fields(
     }
 }
 
-pub(crate) fn should_infer_variant_shredding_fields(
+fn should_infer_variant_shredding_fields(
     logical_fields: &[DataField],
     options: &HashMap<String, String>,
 ) -> Result<bool> {
@@ -89,9 +92,7 @@ pub(crate) fn should_infer_variant_shredding_fields(
     Ok(contains_variant_fields(logical_fields))
 }
 
-pub(crate) fn variant_shredding_infer_buffer_row_count(
-    options: &HashMap<String, String>,
-) -> Result<usize> {
+fn variant_shredding_infer_buffer_row_count(options: &HashMap<String, String>) -> Result<usize> {
     option_usize(
         options,
         VARIANT_SHREDDING_MAX_INFER_BUFFER_ROW_OPTION,
@@ -99,7 +100,7 @@ pub(crate) fn variant_shredding_infer_buffer_row_count(
     )
 }
 
-pub(crate) fn infer_variant_shredding_fields(
+fn infer_variant_shredding_fields(
     logical_fields: &[DataField],
     sample_batches: &[RecordBatch],
     options: &HashMap<String, String>,
@@ -109,7 +110,24 @@ pub(crate) fn infer_variant_shredding_fields(
         return Ok(None);
     }
 
-    let config = VariantShreddingInferConfig {
+    let config = variant_infer_config(options)?;
+    let mut max_fields_remaining = option_usize(
+        options,
+        VARIANT_SHREDDING_MAX_SCHEMA_WIDTH_OPTION,
+        DEFAULT_VARIANT_SHREDDING_MAX_SCHEMA_WIDTH,
+    )?;
+    let columns = collect_variant_samples(logical_fields, sample_batches, &paths)?;
+    let selected = columns
+        .iter()
+        .map(|variants| {
+            infer_variant_shredding_schema(variants, &config, &mut max_fields_remaining)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    physical_fields_for_inferred_shredding(logical_fields, paths, selected)
+}
+
+fn variant_infer_config(options: &HashMap<String, String>) -> Result<VariantShreddingInferConfig> {
+    Ok(VariantShreddingInferConfig {
         max_schema_depth: option_usize(
             options,
             VARIANT_SHREDDING_MAX_SCHEMA_DEPTH_OPTION,
@@ -120,27 +138,39 @@ pub(crate) fn infer_variant_shredding_fields(
             VARIANT_SHREDDING_MIN_FIELD_CARDINALITY_RATIO_OPTION,
             DEFAULT_VARIANT_SHREDDING_MIN_FIELD_CARDINALITY_RATIO,
         )?,
-    };
-    let mut max_fields_remaining = option_usize(
-        options,
-        VARIANT_SHREDDING_MAX_SCHEMA_WIDTH_OPTION,
-        DEFAULT_VARIANT_SHREDDING_MAX_SCHEMA_WIDTH,
-    )?;
+    })
+}
 
+fn collect_variant_samples(
+    logical_fields: &[DataField],
+    sample_batches: &[RecordBatch],
+    paths: &[Vec<usize>],
+) -> Result<Vec<Vec<GenericVariant>>> {
     let row_type = RowType::new(logical_fields.to_vec());
-    let mut inferred_types = HashMap::new();
+    let mut columns = Vec::with_capacity(paths.len());
     for path in paths {
         let mut variants = Vec::new();
         for batch in sample_batches {
             for row in 0..batch.num_rows() {
-                if let Some(variant) = variant_at_path(batch, &row_type, &path, row)? {
+                if let Some(variant) = variant_at_path(batch, &row_type, path, row)? {
                     variants.push(variant);
                 }
             }
         }
 
-        let inferred =
-            infer_variant_shredding_schema(&variants, &config, &mut max_fields_remaining)?;
+        columns.push(variants);
+    }
+    Ok(columns)
+}
+
+fn physical_fields_for_inferred_shredding(
+    logical_fields: &[DataField],
+    paths: Vec<Vec<usize>>,
+    selected: Vec<DataType>,
+) -> Result<Option<Vec<DataField>>> {
+    let row_type = RowType::new(logical_fields.to_vec());
+    let mut inferred_types = HashMap::new();
+    for (path, inferred) in paths.into_iter().zip(selected) {
         if !matches!(inferred, DataType::Variant(_)) {
             inferred_types.insert(path, variant_shredding_type(&inferred)?);
         }
@@ -395,26 +425,163 @@ fn data_field_with_type(field: &DataField, data_type: DataType) -> DataField {
         .with_description(field.description().map(ToString::to_string))
 }
 
+/// Java's VariantShreddingWritePlanFactory: configuration and adaptive evidence
+/// belong to the rolling writer; every file receives its own physical plan.
+pub(crate) struct VariantShreddingWritePlanFactory {
+    logical_fields: Vec<DataField>,
+    physical_fields: Option<Vec<DataField>>,
+    options: HashMap<String, String>,
+    infer_buffer_row_count: Option<usize>,
+    adaptive_buffer_row_count: usize,
+    adaptive: Option<Mutex<AdaptiveVariantState>>,
+}
+
+struct AdaptiveVariantState {
+    session: VariantShreddingInferenceSession,
+    pending_plan: Option<Arc<()>>,
+}
+
+impl VariantShreddingWritePlanFactory {
+    pub(crate) fn new(
+        logical_fields: Vec<DataField>,
+        options: HashMap<String, String>,
+    ) -> Result<Self> {
+        let physical_fields = configured_variant_shredding_fields(&logical_fields, &options)?;
+        let infer_buffer_row_count =
+            if should_infer_variant_shredding_fields(&logical_fields, &options)? {
+                Some(variant_shredding_infer_buffer_row_count(&options)?)
+            } else {
+                None
+            };
+        let mode = options
+            .get("variant.shredding.inferenceMode")
+            .map_or("per-file", String::as_str);
+        let adaptive_enabled = match mode.to_ascii_lowercase().as_str() {
+            "per-file" | "per_file" => false,
+            "adaptive" => true,
+            _ => {
+                return Err(Error::DataInvalid {
+                    message: format!("Invalid variant.shredding.inferenceMode: {mode}"),
+                    source: None,
+                })
+            }
+        };
+        let mut adaptive_buffer_row_count = 0;
+        let adaptive = if adaptive_enabled && infer_buffer_row_count.is_some() {
+            adaptive_buffer_row_count = option_usize(
+                &options,
+                "variant.shredding.adaptive.maxInferBufferRow",
+                256,
+            )?;
+            Some(Mutex::new(AdaptiveVariantState {
+                session: VariantShreddingInferenceSession::new(
+                    variant_infer_config(&options)?,
+                    option_usize(
+                        &options,
+                        VARIANT_SHREDDING_MAX_SCHEMA_WIDTH_OPTION,
+                        DEFAULT_VARIANT_SHREDDING_MAX_SCHEMA_WIDTH,
+                    )?,
+                    adaptive_buffer_row_count,
+                    option_f64(&options, "variant.shredding.adaptive.retentionRatio", 0.05)?,
+                )?,
+                pending_plan: None,
+            }))
+        } else {
+            None
+        };
+        Ok(Self {
+            logical_fields,
+            physical_fields,
+            options,
+            infer_buffer_row_count,
+            adaptive_buffer_row_count,
+            adaptive,
+        })
+    }
+}
+
+impl ShreddingWritePlanFactory for VariantShreddingWritePlanFactory {
+    fn should_create_write_plan(&self) -> bool {
+        has_configured_shredding_schema(&self.options) || self.infer_buffer_row_count.is_some()
+    }
+
+    fn infer_buffer_row_count(&self) -> Option<usize> {
+        if self
+            .adaptive
+            .as_ref()
+            .is_some_and(|state| state.lock().unwrap().session.has_prior())
+        {
+            return Some(self.adaptive_buffer_row_count);
+        }
+        self.infer_buffer_row_count
+    }
+
+    fn create_write_plan(&self, batches: &[RecordBatch]) -> Result<Box<dyn ShreddingWritePlan>> {
+        let mut plan_id = None;
+        let physical_fields = if has_configured_shredding_schema(&self.options) {
+            self.physical_fields.clone()
+        } else if let Some(state) = &self.adaptive {
+            let paths = paths_to_variant(&self.logical_fields);
+            let columns = collect_variant_samples(&self.logical_fields, batches, &paths)?;
+            let mut state = state.lock().unwrap();
+            let selected = state.session.infer_schema(&columns)?;
+            let fields =
+                physical_fields_for_inferred_shredding(&self.logical_fields, paths, selected)?;
+            let id = Arc::new(());
+            state.pending_plan = Some(id.clone());
+            plan_id = Some(id);
+            fields
+        } else {
+            infer_variant_shredding_fields(&self.logical_fields, batches, &self.options)?
+        };
+        // Even an unshredded result has a plan: its successful close must commit
+        // the pending evidence, just as in Java.
+        Ok(Box::new(VariantShreddingWritePlan {
+            logical_fields: self.logical_fields.clone(),
+            physical_fields: physical_fields.unwrap_or_else(|| self.logical_fields.clone()),
+            plan_id,
+        }))
+    }
+
+    fn on_file_completed(&self, plan: &dyn ShreddingWritePlan) -> Result<()> {
+        let Some(state) = &self.adaptive else {
+            return Ok(());
+        };
+        let mut state = state.lock().unwrap();
+        let completed = (plan as &dyn std::any::Any)
+            .downcast_ref::<VariantShreddingWritePlan>()
+            .and_then(|plan| plan.plan_id.as_ref());
+        if !completed
+            .zip(state.pending_plan.as_ref())
+            .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+        {
+            return Err(Error::DataInvalid {
+                message: "Completed Variant write plan does not match the pending inference".into(),
+                source: None,
+            });
+        }
+        state.session.commit_pending_inference()?;
+        state.pending_plan = None;
+        Ok(())
+    }
+
+    fn needs_completed_file_stats(&self) -> bool {
+        self.adaptive.is_some()
+    }
+}
+
 /// [`ShreddingWritePlan`] for Variant shredding.
 ///
 /// The physical schema is fully known when the plan is created (from a
 /// configured shredding schema or inferred from sampled rows), so conversion
 /// is stateless and no footer metadata is committed at close.
-pub(crate) struct VariantWritePlan {
+struct VariantShreddingWritePlan {
     logical_fields: Vec<DataField>,
     physical_fields: Vec<DataField>,
+    plan_id: Option<Arc<()>>,
 }
 
-impl VariantWritePlan {
-    pub(crate) fn new(logical_fields: Vec<DataField>, physical_fields: Vec<DataField>) -> Self {
-        Self {
-            logical_fields,
-            physical_fields,
-        }
-    }
-}
-
-impl ShreddingWritePlan for VariantWritePlan {
+impl ShreddingWritePlan for VariantShreddingWritePlan {
     fn logical_fields(&self) -> &[DataField] {
         &self.logical_fields
     }
@@ -1341,6 +1508,80 @@ mod tests {
     use super::*;
     use crate::arrow::variant_arrow_type;
     use crate::spec::{variant_extraction_row, BlobType, IntType, VarCharType, VariantType};
+
+    #[test]
+    fn factory_owns_activation_and_configured_schema_precedence() {
+        let fields = vec![DataField::new(
+            0,
+            "v".into(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let inactive =
+            VariantShreddingWritePlanFactory::new(fields.clone(), HashMap::new()).unwrap();
+        assert!(!inactive.should_create_write_plan());
+        assert_eq!(inactive.infer_buffer_row_count(), None);
+        let options = HashMap::from([
+            ("variant.inferShreddingSchema".into(), "true".into()),
+            ("variant.shredding.inferenceMode".into(), "ADAPTIVE".into()),
+            (
+                "variant.shreddingSchema".into(),
+                r#"{"type":"ROW","fields":[]}"#.into(),
+            ),
+        ]);
+        // Even an empty configured schema activates the plan and disables inference.
+        let configured = VariantShreddingWritePlanFactory::new(fields.clone(), options).unwrap();
+        assert!(configured.should_create_write_plan());
+        assert_eq!(configured.infer_buffer_row_count(), None);
+        assert!(!configured.needs_completed_file_stats());
+        assert_eq!(
+            configured.create_write_plan(&[]).unwrap().physical_fields(),
+            &fields
+        );
+        let no_variant = VariantShreddingWritePlanFactory::new(
+            vec![DataField::new(
+                0,
+                "id".into(),
+                DataType::Int(IntType::new()),
+            )],
+            HashMap::from([("variant.inferShreddingSchema".into(), "true".into())]),
+        )
+        .unwrap();
+        assert!(!no_variant.should_create_write_plan());
+    }
+
+    #[test]
+    fn adaptive_factory_commits_only_its_pending_plan() {
+        let fields = vec![DataField::new(
+            0,
+            "v".into(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let options = HashMap::from([
+            ("variant.inferShreddingSchema".into(), "true".into()),
+            ("variant.shredding.inferenceMode".into(), "adaptive".into()),
+            ("variant.shredding.maxInferBufferRow".into(), "4".into()),
+            (
+                "variant.shredding.adaptive.maxInferBufferRow".into(),
+                "1".into(),
+            ),
+        ]);
+        let factory =
+            VariantShreddingWritePlanFactory::new(fields.clone(), options.clone()).unwrap();
+        assert_eq!(factory.infer_buffer_row_count(), Some(4));
+        assert!(factory.needs_completed_file_stats());
+        let abandoned = factory.create_write_plan(&[]).unwrap();
+        let pending = factory.create_write_plan(&[]).unwrap();
+        assert!(factory.on_file_completed(abandoned.as_ref()).is_err());
+        assert_eq!(factory.infer_buffer_row_count(), Some(4));
+        factory.on_file_completed(pending.as_ref()).unwrap();
+        assert_eq!(factory.infer_buffer_row_count(), Some(1));
+        assert!(factory.on_file_completed(pending.as_ref()).is_err());
+        // An independent rolling writer starts with the full sample budget.
+        let other = VariantShreddingWritePlanFactory::new(fields, options).unwrap();
+        let other_plan = other.create_write_plan(&[]).unwrap();
+        assert!(factory.on_file_completed(other_plan.as_ref()).is_err());
+        assert_eq!(other.infer_buffer_row_count(), Some(4));
+    }
 
     fn variant_array_for_test(values: &[GenericVariant]) -> ArrayRef {
         let value_items = values

@@ -1204,6 +1204,7 @@ impl Schema {
         validate_no_reserved_field_names(fields)?;
         Self::validate_key_field_types(fields, partition_keys, primary_keys, options)?;
         Self::validate_row_tracking(primary_keys, options)?;
+        super::map_shredding::validate(fields, options)?;
         Self::validate_blob_fields(fields, partition_keys, primary_keys, options)?;
         Self::validate_primary_key_blob_configuration(fields, primary_keys, options)?;
         Self::validate_vector_store_fields(fields, partition_keys, options)?;
@@ -4722,7 +4723,9 @@ mod tests {
                 .column(
                     "props",
                     DataType::Map(MapType::new(
-                        DataType::VarChar(VarCharType::string_type()),
+                        DataType::VarChar(VarCharType::string_type())
+                            .copy_with_nullable(false)
+                            .unwrap(),
                         DataType::Int(IntType::new()),
                     )),
                 )

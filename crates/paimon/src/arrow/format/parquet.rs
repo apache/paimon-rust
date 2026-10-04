@@ -19,6 +19,7 @@ use super::metadata_cache::FileMetadataCache;
 use super::shredding::PhysicalFormatWriterFactory;
 use super::{
     timestamp_millis_schema, FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult,
+    FormatWriterFactory,
 };
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
 use crate::arrow::read_budget::ReadPermit;
@@ -289,43 +290,65 @@ pub(crate) struct ParquetFormatWriter {
     stats_dense_store: bool,
 }
 
-pub(crate) struct ParquetPhysicalWriterFactory {
-    output: OutputFile,
-    compression: String,
+pub(crate) struct ParquetWriterFactory {
+    schema: arrow_schema::SchemaRef,
+    write_fields: Option<Vec<DataField>>,
     zstd_level: i32,
     format_options: HashMap<String, String>,
+    stats_fields: Option<Vec<DataField>>,
 }
 
-impl ParquetPhysicalWriterFactory {
+impl ParquetWriterFactory {
     pub(crate) fn new(
-        output: &OutputFile,
-        compression: &str,
+        schema: arrow_schema::SchemaRef,
+        write_fields: Option<Vec<DataField>>,
         zstd_level: i32,
         format_options: HashMap<String, String>,
+        stats_fields: Option<Vec<DataField>>,
     ) -> Self {
         Self {
-            output: output.clone(),
-            compression: compression.to_string(),
+            schema,
+            write_fields,
             zstd_level,
             format_options,
+            stats_fields,
         }
     }
 }
 
 #[async_trait]
-impl PhysicalFormatWriterFactory for ParquetPhysicalWriterFactory {
+impl FormatWriterFactory for ParquetWriterFactory {
     async fn create_writer(
-        &mut self,
+        &self,
+        output: &OutputFile,
+        compression: &str,
+    ) -> crate::Result<Box<dyn FormatFileWriter>> {
+        self.create_physical_writer(
+            output,
+            compression,
+            self.schema.clone(),
+            self.write_fields.as_deref(),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl PhysicalFormatWriterFactory for ParquetWriterFactory {
+    async fn create_physical_writer(
+        &self,
+        output: &OutputFile,
+        compression: &str,
         schema: arrow_schema::SchemaRef,
         write_fields: Option<&[DataField]>,
     ) -> crate::Result<Box<dyn FormatFileWriter>> {
         Ok(Box::new(
             ParquetFormatWriter::new(
-                &self.output,
+                output,
                 schema,
-                &self.compression,
+                compression,
                 self.zstd_level,
-                write_fields,
+                self.stats_fields.as_deref().or(write_fields),
                 &self.format_options,
             )
             .await?,
@@ -380,7 +403,11 @@ fn create_parquet_arrow_writer(
         })
         .set_offset_index_disabled(!page_index_enabled)
         .build();
-    AsyncArrowWriter::try_new(async_write, schema, Some(props)).map_err(|e| {
+    // Commit one final Arrow schema at close, after shredding metadata is known.
+    let options = parquet::arrow::arrow_writer::ArrowWriterOptions::new()
+        .with_properties(props)
+        .with_skip_arrow_metadata(true);
+    AsyncArrowWriter::try_new_with_options(async_write, schema, options).map_err(|e| {
         crate::Error::DataInvalid {
             message: format!("Failed to create parquet writer: {e}"),
             source: None,
@@ -499,13 +526,8 @@ impl FormatFileWriter for ParquetFormatWriter {
         &mut self,
         field_metadata: &crate::arrow::shredding::FieldMetadata,
     ) -> crate::Result<()> {
-        // Re-encode the physical Arrow schema with the shredding metadata
-        // injected into the top-level fields, mirroring Java's
-        // `FormatMetadataUtils.buildArrowSchemaMetadata`: metadata already on
-        // the field (e.g. PARQUET:field_id) wins on key conflict. The updated
-        // schema is appended as a second ARROW:schema entry; readers resolve
-        // duplicate footer keys last-wins (both arrow-rs and parquet-mr), so
-        // it overrides the construction-time schema.
+        // Retain the updated physical schema until close. A second footer key
+        // is ambiguous: PyArrow and arrow-rs resolve duplicate keys differently.
         let fields: Vec<arrow_schema::FieldRef> = self
             .schema
             .fields()
@@ -524,17 +546,18 @@ impl FormatFileWriter for ParquetFormatWriter {
                 Arc::new(field.as_ref().clone().with_metadata(metadata))
             })
             .collect();
-        let new_schema =
-            arrow_schema::Schema::new_with_metadata(fields, self.schema.metadata().clone());
-        let encoded = parquet::arrow::encode_arrow_schema(&new_schema);
-        self.inner.append_key_value_metadata(KeyValue::new(
-            parquet::arrow::ARROW_SCHEMA_META_KEY.to_string(),
-            encoded,
+        self.schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            self.schema.metadata().clone(),
         ));
         Ok(())
     }
 
     async fn close(mut self: Box<Self>) -> crate::Result<FormatWriteResult> {
+        self.inner.append_key_value_metadata(KeyValue::new(
+            parquet::arrow::ARROW_SCHEMA_META_KEY.to_string(),
+            parquet::arrow::encode_arrow_schema(&self.schema),
+        ));
         let metadata = self
             .inner
             .finish()
@@ -4389,17 +4412,18 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         let output = file_io.new_output(&path).unwrap();
-        let mut writer = create_format_writer(
-            &output,
+        let factory = super::super::create_format_writer_factory(
+            "parquet",
             logical_schema.clone(),
-            "zstd",
             1,
             None,
             Some(&fields),
             Some(&options),
+            None,
         )
-        .await
         .unwrap();
+        assert!(!factory.needs_completed_file_stats());
+        let mut writer = factory.create_writer(&output, "zstd").await.unwrap();
         writer
             .write(&make_batch(vec![1, 2], &first_variants))
             .await
@@ -4466,6 +4490,47 @@ mod tests {
             .unwrap();
             assert_eq!(actual.to_json().unwrap(), expected.to_json().unwrap());
         }
+
+        // Reusing the factory must infer each file from that file's rows.
+        // This short file also exercises finalizing inference from close().
+        let second_path = format!("memory:/variant_second_{}.parquet", uuid::Uuid::new_v4());
+        let output = file_io.new_output(&second_path).unwrap();
+        let mut writer = factory.create_writer(&output, "zstd").await.unwrap();
+        writer
+            .write(&make_batch(
+                vec![4],
+                &[GenericVariant::parse_json(r#"{"fresh":42}"#).unwrap()],
+            ))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let bytes = file_io
+            .new_input(&second_path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let raw =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let arrow_schema::DataType::Struct(variant_fields) =
+            raw.schema().field_with_name("v").unwrap().data_type()
+        else {
+            panic!("expected variant struct")
+        };
+        let typed = variant_fields
+            .iter()
+            .find(|field| field.name() == "typed_value")
+            .unwrap();
+        let arrow_schema::DataType::Struct(object_fields) = typed.data_type() else {
+            panic!("expected object")
+        };
+        assert_eq!(
+            object_fields
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["fresh"]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6431,6 +6496,10 @@ mod tests {
         let fields = map_shredding_fields();
         let options = HashMap::from([
             (
+                "fields.tags.map.shared-shredding.column-placement-policy".to_string(),
+                "plain".to_string(),
+            ),
+            (
                 "fields.tags.map.storage-layout".to_string(),
                 "shared-shredding".to_string(),
             ),
@@ -6499,8 +6568,7 @@ mod tests {
             vec!["__field_mapping", "__col_0", "__col_1", "__overflow"]
         );
 
-        // The footer carries two ARROW:schema entries: the construction-time
-        // schema and the one re-encoded at close with the shredding metadata.
+        // A single schema entry is unambiguous for Java, PyArrow and arrow-rs.
         let metadata = load_metadata_with_page_index(&raw_bytes, false);
         let kv = metadata
             .file_metadata()
@@ -6511,8 +6579,8 @@ mod tests {
             .filter(|kv| kv.key == parquet::arrow::ARROW_SCHEMA_META_KEY)
             .count();
         assert_eq!(
-            arrow_schema_entries, 2,
-            "close must append a second ARROW:schema carrying the shredding metadata"
+            arrow_schema_entries, 1,
+            "close must publish exactly one ARROW:schema with shredding metadata"
         );
 
         // The format reader surfaces the logical MAP column back.

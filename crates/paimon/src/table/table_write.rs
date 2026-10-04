@@ -256,6 +256,7 @@ impl TableWrite {
             schema.primary_keys(),
             schema.options(),
         )?;
+        crate::spec::map_shredding::validate(schema.fields(), schema.options())?;
         let write_schema = build_target_arrow_schema(schema.fields())?;
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
