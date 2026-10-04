@@ -248,7 +248,7 @@ async fn test_query_auth_explain_shows_the_restriction_but_not_the_files() {
     assert!(!plan.contains("files="), "{plan}");
 }
 
-/// Rows `(1, {"x":"bad"})` and `(2, {"x":1.5})`, served under the rule `id > 1`.
+/// Rows `(1, {"x":"bad"})` and `(2, {"x":7})`, served under the rule `id > 1`.
 async fn restricted_variants() -> (tempfile::TempDir, RESTServer, SQLContext) {
     let schema = |options: &[(&str, &str)]| {
         let mut builder = Schema::builder()
@@ -283,7 +283,7 @@ async fn restricted_variants() -> (tempfile::TempDir, RESTServer, SQLContext) {
     common::exec(
         &writer,
         r#"INSERT INTO paimon.default.vguard
-           SELECT 1, parse_json('{"x":"bad"}') UNION ALL SELECT 2, parse_json('{"x":1.5}')"#,
+           SELECT 1, parse_json('{"x":"bad"}') UNION ALL SELECT 2, parse_json('{"x":7}')"#,
     )
     .await;
     let location = fs_catalog
@@ -345,12 +345,12 @@ async fn test_query_auth_variant_get_runs_on_the_admitted_rows_only() {
     let value = single(
         &query(
             &context,
-            "SELECT variant_get(payload, '$.x', 'FLOAT') FROM paimon.default.vguard",
+            "SELECT variant_get(payload, '$.x', 'INT') FROM paimon.default.vguard",
         )
         .await,
     );
     assert_eq!(
         datafusion::arrow::util::display::array_value_to_string(&value, 0).unwrap(),
-        "1.5"
+        "7"
     );
 }

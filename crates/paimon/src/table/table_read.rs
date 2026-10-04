@@ -2580,8 +2580,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_restricted_read_refuses_a_variant_extraction_that_can_fail() {
         use crate::spec::{
-            variant_extraction_row, DataField, DataType, FloatType, IntType, Schema, TableSchema,
-            VariantType,
+            variant_extraction_row, DataField, DataType, IntType, Schema, TableSchema, VariantType,
         };
         let schema = Schema::builder()
             .column("id", DataType::Int(IntType::new()))
@@ -2593,12 +2592,12 @@ mod tests {
             schema: TableSchema::new(0, &schema),
             ..crate::table::rest_query_auth_table().await
         };
-        // `variant_get(payload, '$.x', 'FLOAT')` pushed into the read, strict or not.
+        // `variant_get(payload, '$.x', 'INT')` pushed into the read, strict or not.
         let read = |fail_on_error| {
             let extraction = variant_extraction_row(
                 true,
                 [(
-                    DataType::Float(FloatType::new()),
+                    DataType::Int(IntType::new()),
                     "$.x".to_string(),
                     fail_on_error,
                     "UTC".to_string(),
