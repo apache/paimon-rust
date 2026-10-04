@@ -360,6 +360,34 @@ impl TableSchema {
                     let field =
                         DataField::new(id, name.to_string(), data_type).with_description(comment);
                     insert_field_with_move(&mut fields, field, column_move.as_ref(), full_name)?;
+                    // A CSV format table reads existing files positionally (no
+                    // per-column header mapping), so a new column placed before an
+                    // existing physical column shifts every later one: the
+                    // permissive reader would pad/truncate against the wrong
+                    // positions and silently mis-assign old rows. Partition keys
+                    // are excluded from the physical CSV layout (as Java's
+                    // FormatReadBuilder does), so only non-partition fields after
+                    // the new column count. Appending after the last physical
+                    // column is safe. Reject the shifting case, symmetric with the
+                    // DropColumn guard.
+                    {
+                        let core_options = CoreOptions::new(&new_schema.options);
+                        let pos = field_index(&fields, name).unwrap_or(fields.len());
+                        let shifts_physical = fields
+                            .iter()
+                            .skip(pos + 1)
+                            .any(|f| !new_schema.partition_keys.iter().any(|k| k == f.name()));
+                        if core_options.is_format_table()
+                            && core_options.file_format() == "csv"
+                            && shifts_physical
+                        {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Cannot add non-trailing column '{name}' to a CSV format table: it shifts the physical column positions of existing files"
+                                ),
+                            });
+                        }
+                    }
                 }
                 SchemaChange::RenameColumn {
                     field_names,
@@ -453,6 +481,32 @@ impl TableSchema {
                             return Err(crate::Error::Unsupported {
                                 message: format!(
                                     "Cannot drop column '{name}' referenced by '{SEQUENCE_FIELD_OPTION}'"
+                                ),
+                            });
+                        }
+                    }
+                    // A CSV format table reads existing files positionally (no
+                    // per-column header mapping), so dropping a column before an
+                    // existing physical column shifts every later one: the
+                    // permissive reader would truncate the trailing field and
+                    // mis-assign the rest, silently returning wrong values.
+                    // Partition keys are excluded from the physical CSV layout (as
+                    // Java's FormatReadBuilder does), so only non-partition fields
+                    // after the dropped column count. Dropping the last physical
+                    // column is safe. Reject the shifting case.
+                    {
+                        let core_options = CoreOptions::new(&new_schema.options);
+                        let shifts_physical = fields
+                            .iter()
+                            .skip(idx + 1)
+                            .any(|f| !new_schema.partition_keys.iter().any(|k| k == f.name()));
+                        if core_options.is_format_table()
+                            && core_options.file_format() == "csv"
+                            && shifts_physical
+                        {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Cannot drop non-trailing column '{name}' of a CSV format table: it shifts the physical column positions of existing files"
                                 ),
                             });
                         }
@@ -5605,6 +5659,161 @@ mod tests {
             matches!(err, crate::Error::Unsupported { ref message }
                 if message.contains("bucket-key") && message.contains("name")),
             "drop of a bucket-key column should be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_csv_format_table_rejects_dropping_non_trailing_column() {
+        // A CSV format table reads files positionally; dropping a non-trailing
+        // column shifts physical positions and would make the permissive reader
+        // silently mis-decode old rows. The trailing column is safe to drop.
+        let build = || {
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("label", DataType::VarChar(VarCharType::string_type()))
+                    .column("extra", DataType::VarChar(VarCharType::string_type()))
+                    .option("type", "format-table")
+                    .option("file.format", "csv")
+                    .build()
+                    .unwrap(),
+            )
+        };
+
+        let err = build()
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "label".to_string(),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("physical column positions") && message.contains("label")),
+            "dropping a non-trailing CSV column should be rejected, got {err:?}"
+        );
+
+        // Dropping the trailing column keeps positions aligned and is allowed.
+        build()
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "extra".to_string(),
+            )])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_csv_format_table_rejects_adding_non_trailing_column() {
+        // Symmetric with the drop guard: a CSV format table reads files
+        // positionally, so a new column that lands anywhere but last shifts the
+        // physical positions of existing files. The permissive reader would then
+        // mis-assign old rows (e.g. `(1,"old")` read as `(id, extra, label) =
+        // (1,"old",NULL)`). Appending the column at the end is safe.
+        let build = || {
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("label", DataType::VarChar(VarCharType::string_type()))
+                    .option("type", "format-table")
+                    .option("file.format", "csv")
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let varchar = || DataType::VarChar(VarCharType::string_type());
+
+        // Inserting after a non-last column, or first, shifts existing positions.
+        for column_move in [
+            crate::spec::ColumnMove::move_after("extra".to_string(), "id".to_string()),
+            crate::spec::ColumnMove::move_first("extra".to_string()),
+        ] {
+            let err = build()
+                .apply_changes(vec![
+                    crate::spec::SchemaChange::add_column_with_description_and_column_move(
+                        "extra".to_string(),
+                        varchar(),
+                        String::new(),
+                        column_move,
+                    ),
+                ])
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("physical column positions") && message.contains("extra")),
+                "adding a non-trailing CSV column should be rejected, got {err:?}"
+            );
+        }
+
+        // Appending the new column (plain add, or an explicit move to last) keeps
+        // existing positions, so old files just pad it with null.
+        build()
+            .apply_changes(vec![crate::spec::SchemaChange::add_column(
+                "extra".to_string(),
+                varchar(),
+            )])
+            .unwrap();
+        build()
+            .apply_changes(vec![
+                crate::spec::SchemaChange::add_column_with_description_and_column_move(
+                    "extra".to_string(),
+                    varchar(),
+                    String::new(),
+                    crate::spec::ColumnMove::move_last("extra".to_string()),
+                ),
+            ])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_csv_format_table_partition_columns_excluded_from_physical_shift() {
+        // Partition columns are not part of the physical CSV, so the physical
+        // layout of `(id, label, pt)` partitioned by `pt` is `(id, label)`.
+        // Dropping `label` (last physical) and appending `extra` after it are
+        // therefore safe trailing changes and must be accepted.
+        let build = || {
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("label", DataType::VarChar(VarCharType::string_type()))
+                    .column("pt", DataType::VarChar(VarCharType::string_type()))
+                    .partition_keys(vec!["pt".to_string()])
+                    .option("type", "format-table")
+                    .option("file.format", "csv")
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let varchar = || DataType::VarChar(VarCharType::string_type());
+
+        // Dropping the last physical column (pt is partition-excluded) is safe.
+        build()
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "label".to_string(),
+            )])
+            .unwrap();
+
+        // Adding after the last physical column (before only `pt`) is safe.
+        build()
+            .apply_changes(vec![
+                crate::spec::SchemaChange::add_column_with_description_and_column_move(
+                    "extra".to_string(),
+                    varchar(),
+                    String::new(),
+                    crate::spec::ColumnMove::move_after("extra".to_string(), "label".to_string()),
+                ),
+            ])
+            .unwrap();
+
+        // A genuine physical shift (dropping `id`, before `label`) is still rejected.
+        let err = build()
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "id".to_string(),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("physical column positions")),
+            "{err:?}"
         );
     }
 
