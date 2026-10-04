@@ -135,3 +135,163 @@ async fn postpone_delete_counts_reset_after_prepare_commit() {
         assert_eq!(messages[0].new_files[0].delete_row_count, Some(expected));
     }
 }
+
+// Java PostponeBucketWriter validates a retract with the actual merge function,
+// not ReducerMergeFunctionWrapper's singleton shortcut.
+#[tokio::test]
+async fn postpone_retract_validation_matches_all_merge_engines() {
+    type Options<'a> = &'a [(&'a str, &'a str)];
+    let cases: &[(&str, Options<'_>, i8, bool)] = &[
+        ("deduplicate", &[], 3, true),
+        ("first-row", &[], 3, false),
+        ("first-row", &[], 1, false),
+        ("first-row", &[("ignore-delete", "true")], 3, true),
+        ("partial-update", &[], 3, false),
+        (
+            "partial-update",
+            &[("partial-update.remove-record-on-delete", "true")],
+            3,
+            true,
+        ),
+        (
+            "partial-update",
+            &[("partial-update.remove-record-on-delete", "true")],
+            1,
+            true,
+        ),
+        (
+            "aggregation",
+            &[("fields.value.aggregate-function", "sum")],
+            3,
+            true,
+        ),
+        (
+            "aggregation",
+            &[("fields.value.aggregate-function", "min")],
+            3,
+            false,
+        ),
+        (
+            "aggregation",
+            &[
+                ("fields.value.aggregate-function", "min"),
+                ("fields.value.ignore-retract", "true"),
+            ],
+            3,
+            true,
+        ),
+        (
+            "aggregation",
+            &[
+                ("fields.value.aggregate-function", "min"),
+                ("aggregation.remove-record-on-delete", "true"),
+            ],
+            3,
+            true,
+        ),
+    ];
+    for (index, &(engine, extra, kind, accepted)) in cases.iter().enumerate() {
+        let mut options = vec![
+            ("bucket", "-2"),
+            ("merge-engine", engine),
+            ("target-file-row-num", "1"),
+        ];
+        options.extend_from_slice(extra);
+        let (io, table) = memory_table(
+            &format!("memory:/postpone_retract_{index}"),
+            pk_schema(&options),
+        );
+        setup_dirs(&io, table.location()).await;
+        let mut writer = table.new_write_builder().new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch_with_kinds(vec![2], vec![10], vec![0]))
+            .await
+            .unwrap();
+        let result = writer
+            .write_arrow_batch(&make_batch_with_kinds(vec![1], vec![20], vec![kind]))
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{engine}, {extra:?}, {kind}: {result:?}"
+        );
+        if accepted {
+            let messages = writer.prepare_commit().await.unwrap();
+            let expected = if extra.contains(&("ignore-delete", "true")) {
+                1
+            } else {
+                2
+            };
+            assert_eq!(
+                messages[0]
+                    .new_files
+                    .iter()
+                    .map(|f| f.row_count)
+                    .sum::<i64>(),
+                expected
+            );
+        } else {
+            assert!(writer.prepare_commit().await.is_err());
+            assert!(writer
+                .write_arrow_batch(&make_batch_with_kinds(vec![3], vec![30], vec![0]))
+                .await
+                .is_err());
+            let files = io
+                .list_status(&format!("{}/bucket-postpone/", table.location()))
+                .await
+                .unwrap();
+            assert!(files.is_empty(), "failed writer left files: {files:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn postpone_validates_only_the_first_retract_even_across_checkpoints() {
+    let (io, table) = memory_table(
+        "memory:/postpone_retract_once",
+        pk_schema(&[
+            ("bucket", "-2"),
+            ("merge-engine", "aggregation"),
+            ("fields.value.aggregate-function", "min"),
+            ("aggregation.remove-record-on-delete", "true"),
+        ]),
+    );
+    setup_dirs(&io, table.location()).await;
+    let mut writer = table.new_write_builder().new_write().unwrap();
+    // DELETE validates successfully via remove-record-on-delete. A subsequent
+    // UPDATE_BEFORE must be retained without validating min's retract again.
+    for kind in [3, 1] {
+        writer
+            .write_arrow_batch(&make_batch_with_kinds(vec![1], vec![20], vec![kind]))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(messages[0].new_files[0].delete_row_count, Some(1));
+    }
+}
+
+#[tokio::test]
+async fn postpone_preserves_inserts_without_merging_for_all_merge_engines() {
+    for engine in ["deduplicate", "first-row", "partial-update", "aggregation"] {
+        let mut options = vec![("bucket", "-2"), ("merge-engine", engine)];
+        if engine == "aggregation" {
+            options.push(("fields.value.aggregate-function", "sum"));
+        }
+        let (io, table) = memory_table(
+            &format!("memory:/postpone_inserts_{engine}"),
+            pk_schema(&options),
+        );
+        setup_dirs(&io, table.location()).await;
+        let mut writer = table.new_write_builder().new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch_with_kinds(
+                vec![3, 1, 3],
+                vec![10, 20, 30],
+                vec![0, 0, 2],
+            ))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert_eq!(messages[0].new_files[0].row_count, 3, "{engine}");
+    }
+}

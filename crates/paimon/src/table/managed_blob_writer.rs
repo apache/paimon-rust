@@ -23,11 +23,10 @@
 //! Parquet. A separate `.blobref` sidecar records the packs retained by each
 //! physical data file.
 
-use super::kv_file_writer::KeyValueWriteConfig;
 use crate::arrow::format::blob::BlobFormatWriter;
 use crate::arrow::format::FormatFileWriter;
 use crate::io::FileIO;
-use crate::spec::{bucket_path_under, BlobDescriptor, CoreOptions, DataField, DataType, RowKind};
+use crate::spec::{BlobDescriptor, CoreOptions, DataField, DataType, RowKind};
 use crate::Result;
 use arrow_array::builder::LargeBinaryBuilder;
 use arrow_array::{
@@ -98,19 +97,19 @@ pub(crate) struct ManagedBlobWriteState {
 }
 
 impl ManagedBlobWriteState {
-    pub(crate) fn new(file_io: &FileIO, config: &KeyValueWriteConfig) -> Result<Self> {
-        let options = CoreOptions::new(&config.table_options);
+    pub(crate) fn new(
+        file_io: &FileIO,
+        bucket_dir: &str,
+        file_prefix: &str,
+        value_fields: &[DataField],
+        options: &CoreOptions<'_>,
+    ) -> Result<Self> {
         let writer = ManagedBlobWriter::new(
             file_io.clone(),
-            &crate::spec::data_file_path(
-                &config.table_location,
-                options.data_file_path_directory(),
-            ),
-            &config.partition_path,
-            config.bucket,
-            &config.data_file_prefix,
+            bucket_dir.to_string(),
+            file_prefix,
             options.blob_target_file_size(),
-            managed_blob_fields(&config.value_fields, &options),
+            managed_blob_fields(value_fields, options),
         )?;
         Ok(Self {
             writer: writer.map(|writer| tokio::sync::Mutex::new(Box::new(writer))),
@@ -145,9 +144,7 @@ impl ManagedBlobWriteState {
 impl ManagedBlobWriter {
     pub(crate) fn new(
         file_io: FileIO,
-        table_location: &str,
-        partition_path: &str,
-        bucket: i32,
+        bucket_dir: String,
         file_prefix: &str,
         target_file_size: i64,
         fields: Vec<(usize, ManagedBlobKind)>,
@@ -164,7 +161,7 @@ impl ManagedBlobWriter {
             })?;
         Ok(Some(Self {
             file_io,
-            bucket_dir: bucket_path_under(table_location, partition_path, bucket),
+            bucket_dir,
             file_prefix: file_prefix.to_string(),
             target_file_size,
             fields: fields

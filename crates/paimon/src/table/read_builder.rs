@@ -532,12 +532,19 @@ impl<'a> PaimonReadBuilder<'a> {
         let read_type = self.resolve_read_type().unwrap_or(None);
         let scan_predicates =
             super::managed_blob_reader::scan_predicates(self.table, &self.filter.data_predicates);
+        // A payload predicate is evaluated after descriptor resolution. A
+        // scan limit must not count rows which may fail that residual filter.
+        let scan_limit = if scan_predicates.len() == self.filter.data_predicates.len() {
+            self.limit
+        } else {
+            None
+        };
         TableScan::new(
             self.table,
             partition_filter,
             scan_predicates,
             self.filter.bucket_predicate.clone(),
-            self.limit,
+            scan_limit,
             self.effective_row_ranges(),
         )
         .with_projected_read_field_ids(projected_read_field_ids_with_predicates(

@@ -169,12 +169,18 @@ impl KeyValueFileWriter {
             }
         }
 
-        let managed_blob_writer = ManagedBlobWriteState::new(&file_io, &config)?;
         let paths = super::data_file_path_factory::DataFilePathFactory::new(
             &config.table_location,
             &config.partition_path,
             config.bucket,
             &config.table_options,
+        )?;
+        let managed_blob_writer = ManagedBlobWriteState::new(
+            &file_io,
+            paths.bucket_path(),
+            &config.data_file_prefix,
+            &config.value_fields,
+            &core_options,
         )?;
 
         Ok(Self {
