@@ -30,9 +30,7 @@ use crate::spec::{
     bucket_path, BinaryRow, CoreOptions, FileKind, IndexManifest, Manifest, ManifestEntry,
     ManifestFileMeta, ManifestList, PartitionComputer, Snapshot,
 };
-use crate::table::index_file_path::{
-    committed_index_file_path, resolve_legacy_deletion_vector_entries,
-};
+use crate::table::index_file_path::committed_index_file_path;
 use crate::table::{SnapshotManager, Table};
 use crate::Result;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -70,7 +68,6 @@ impl DataFileDeletionPlan {
 }
 
 pub(crate) struct SnapshotDeletion {
-    table: Table,
     file_io: FileIO,
     table_location: String,
     /// Root of bucket directories: the table location, or
@@ -96,7 +93,6 @@ impl SnapshotDeletion {
             )?)
         };
         Ok(Self {
-            table: table.clone(),
             file_io: table.file_io().clone(),
             table_location: table.location().trim_end_matches('/').to_string(),
             data_location: table.data_file_location(),
@@ -344,12 +340,7 @@ impl SnapshotDeletion {
 
         if let Some(index_manifest) = snapshot.index_manifest() {
             match IndexManifest::read(&self.file_io, &self.manifest_path(index_manifest)).await {
-                Ok(mut entries) => {
-                    // Older Python writers left deletion vectors under the
-                    // table `index/` directory even with
-                    // `index-file-in-data-file-dir`; delete them where reads
-                    // find them.
-                    resolve_legacy_deletion_vector_entries(&self.table, &mut entries).await?;
+                Ok(entries) => {
                     for entry in entries {
                         if skipping.insert(entry.index_file.file_name.clone()) {
                             let bucket_path = self.bucket_path(&entry.partition, entry.bucket)?;

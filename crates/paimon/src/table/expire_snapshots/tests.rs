@@ -1170,56 +1170,6 @@ async fn test_long_lived_changelog_keeps_its_files() {
 }
 
 #[tokio::test]
-async fn test_legacy_deletion_vector_location_is_expired() {
-    let table = test_table(
-        "memory:/expire_legacy_dv",
-        &[
-            ("row-tracking.enabled", "true"),
-            ("data-evolution.enabled", "true"),
-            ("deletion-vectors.enabled", "true"),
-            ("index-file-in-data-file-dir", "true"),
-        ],
-        false,
-    );
-    setup_dirs(&table).await;
-    append(&table, &[1, 2, 3]).await;
-    delete_row(&table, 0).await;
-    let sm = table.snapshot_manager();
-    let legacy_dv = index_file_names(&table, &sm.get_snapshot(2).await.unwrap())
-        .await
-        .into_iter()
-        .next()
-        .unwrap();
-    // An older Python writer put the vector under the table `index/` directory.
-    let file_io = table.file_io();
-    let canonical = format!("{}/bucket-0/{legacy_dv}", table.location());
-    let legacy = format!("{}/index/{legacy_dv}", table.location());
-    let bytes = file_io.new_input(&canonical).unwrap().read().await.unwrap();
-    file_io
-        .new_output(&legacy)
-        .unwrap()
-        .write(bytes)
-        .await
-        .unwrap();
-    file_io.delete_file(&canonical).await.unwrap();
-    assert_eq!(
-        read_ids(&table).await,
-        vec![2, 3],
-        "reads find the legacy vector"
-    );
-
-    // Supersede the legacy vector, then expire the snapshots that used it.
-    delete_row(&table, 1).await;
-    assert_eq!(expire_keeping(&table, 1).await, 2);
-    assert!(
-        !file_io.exists(&legacy).await.unwrap(),
-        "the obsolete legacy vector is deleted"
-    );
-    assert_files_match_references(&table).await;
-    assert_eq!(read_ids(&table).await, vec![3]);
-}
-
-#[tokio::test]
 async fn test_unreadable_branch_index_manifest_changes_nothing() {
     let table = test_table(
         "memory:/expire_branch_index_preflight",
