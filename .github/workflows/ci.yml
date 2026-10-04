@@ -240,6 +240,10 @@ jobs:
             needs_docker: false
             needs_lumina: false
             needs_uv: false
+          - suite: oss-cpp
+            needs_docker: false
+            needs_lumina: false
+            needs_uv: false
     env:
       RUST_LOG: DEBUG
       RUST_BACKTRACE: full
@@ -338,3 +342,34 @@ jobs:
       - name: Stop Docker containers
         if: ${{ always() && matrix.needs_docker }}
         run: make docker-down
+
+      - name: Checkout OSS C++ SDK
+        if: matrix.suite == 'oss-cpp'
+        uses: actions/checkout@v7
+        with:
+          repository: aliyun/alibabacloud-oss-cpp-sdk-v2
+          ref: c13a82038b0696f99c32f4e86b623ffcc9e62140
+          path: .oss-cpp-sdk
+
+      - name: Build OSS C++ bridge
+        if: matrix.suite == 'oss-cpp'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libssl-dev
+          cmake -S .oss-cpp-sdk -B build/oss-sdk -DCMAKE_BUILD_TYPE=Release \
+            -DUSE_SYSTEM_CURL=ON -DUSE_SYSTEM_OPENSSL=ON -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_CXX_FLAGS=-Wno-error=maybe-uninitialized \
+            -DCMAKE_INSTALL_PREFIX="$PWD/build/oss-install"
+          cmake --build build/oss-sdk -j 2
+          cmake --install build/oss-sdk
+          cmake -S integrations/oss-cpp -B build/oss-cpp \
+            -DCMAKE_PREFIX_PATH="$PWD/build/oss-install"
+          cmake --build build/oss-cpp -j 2
+          echo "PAIMON_OSS_CPP_LIBRARY=$PWD/build/oss-cpp/libpaimon_oss_cpp.so" >> "$GITHUB_ENV"
+
+      - name: OSS C++ SDK Integration Test
+        if: matrix.suite == 'oss-cpp'
+        run: |
+          cargo test --locked -p paimon --features storage-oss-cpp,storage-jindo --lib \
+            io::storage_oss_cpp -- --include-ignored
+          cargo clippy --locked -p paimon --features storage-oss-cpp --lib --tests -- -D warnings

@@ -42,6 +42,7 @@ storage-all = [
     "storage-gcs",
     "storage-hdfs",
     "storage-jindo",
+    "storage-oss-cpp",
 ]
 fulltext = ["dep:paimon-ftindex-core"]
 vortex = ["dep:vortex"]
@@ -63,6 +64,7 @@ storage-obs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-obs"]
 storage-gcs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-gcs"]
 storage-hdfs = ["dep:opendal-service-hdfs-native"]
 storage-jindo = ["storage-oss"]
+storage-oss-cpp = ["storage-oss"]
 
 [dependencies]
 rand = "0.8.5"
