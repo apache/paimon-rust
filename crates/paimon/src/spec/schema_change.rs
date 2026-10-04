@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Reference: <https://github.com/apache/paimon/blob/master/paimon-api/src/main/java/org/apache/paimon/schema/SchemaChange.java>
 //
-// Note: `dropPrimaryKey` and `updateColumnDefaultValue` from Java are not yet
-// modeled here; they are out of scope for the current alter-table support.
+// Note: `dropPrimaryKey` from Java is not yet modeled here; it is out of scope
+// for the current alter-table support.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "camelCase")]
 pub enum SchemaChange {
@@ -79,6 +79,12 @@ pub enum SchemaChange {
     UpdateColumnComment {
         field_names: Vec<String>,
         new_comment: String,
+    },
+    /// A SchemaChange to update the field's default value.
+    #[serde(rename_all = "camelCase")]
+    UpdateColumnDefaultValue {
+        field_names: Vec<String>,
+        new_default_value: String,
     },
     /// A SchemaChange to update the field's position.
     #[serde(rename_all = "camelCase")]
@@ -201,6 +207,25 @@ impl SchemaChange {
         SchemaChange::UpdateColumnComment {
             field_names,
             new_comment: comment,
+        }
+    }
+
+    /// impl the `update_column_default_value`.
+    pub fn update_column_default_value(field_name: String, new_default_value: String) -> Self {
+        SchemaChange::UpdateColumnDefaultValue {
+            field_names: vec![field_name],
+            new_default_value,
+        }
+    }
+
+    /// impl the `update_columns_default_value`.
+    pub fn update_columns_default_value(
+        field_names: Vec<String>,
+        new_default_value: String,
+    ) -> Self {
+        SchemaChange::UpdateColumnDefaultValue {
+            field_names,
+            new_default_value,
         }
     }
 }
@@ -350,6 +375,11 @@ mod tests {
             "action": "updateColumnComment",
             "fieldNames": ["col5", "f1"],
             "newComment": "col5 f1 field"
+          },
+          {
+            "action": "updateColumnDefaultValue",
+            "fieldNames": ["col5", "f1"],
+            "newDefaultValue": "0"
           }
         ]"#;
 
@@ -397,6 +427,10 @@ mod tests {
                 SchemaChange::UpdateColumnComment {
                     field_names: vec!["col5".to_string(), "f1".to_string()],
                     new_comment: "col5 f1 field".to_string(),
+                },
+                SchemaChange::UpdateColumnDefaultValue {
+                    field_names: vec!["col5".to_string(), "f1".to_string()],
+                    new_default_value: "0".to_string(),
                 },
             ]
         );

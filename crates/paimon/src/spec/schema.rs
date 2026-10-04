@@ -584,6 +584,25 @@ impl TableSchema {
                         })?;
                     fields[idx] = fields[idx].clone().with_description(Some(new_comment));
                 }
+                SchemaChange::UpdateColumnDefaultValue {
+                    field_names,
+                    new_default_value,
+                } => {
+                    let name = top_level_field(&field_names)?;
+                    let idx =
+                        field_index(&fields, name).ok_or_else(|| crate::Error::ColumnNotExist {
+                            full_name: full_name.to_string(),
+                            column: name.to_string(),
+                        })?;
+                    // The default value is recorded on the field as a string and is
+                    // cast/validated where it is consumed (the read path), exactly as
+                    // a default set at create time; this arm only records the new
+                    // spelling. Mirrors Java `SchemaManager` rebuilding the field with
+                    // the new default value.
+                    fields[idx] = fields[idx]
+                        .clone()
+                        .with_default_value(Some(new_default_value));
+                }
                 SchemaChange::UpdateColumnPosition { column_move } => {
                     apply_move(&mut fields, &column_move, full_name)?;
                 }
@@ -3343,6 +3362,55 @@ mod tests {
                 .get("blob-descriptor-field")
                 .map(String::as_str),
             Some("thumb,preview")
+        );
+    }
+
+    #[test]
+    fn test_apply_changes_update_column_default_value() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("label", DataType::VarChar(VarCharType::string_type()))
+            .build()
+            .unwrap();
+
+        // Setting a default on a column that had none records the new spelling;
+        // other fields are untouched.
+        let updated = TableSchema::new(0, &schema)
+            .apply_changes(vec![
+                crate::spec::SchemaChange::update_column_default_value(
+                    "label".to_string(),
+                    "unknown".to_string(),
+                ),
+            ])
+            .unwrap();
+        let label = updated
+            .fields()
+            .iter()
+            .find(|f| f.name() == "label")
+            .unwrap();
+        assert_eq!(label.default_value(), Some("unknown"));
+        assert_eq!(
+            updated
+                .fields()
+                .iter()
+                .find(|f| f.name() == "id")
+                .unwrap()
+                .default_value(),
+            None
+        );
+
+        // Altering the default of an unknown column is rejected.
+        let err = TableSchema::new(0, &schema)
+            .apply_changes(vec![
+                crate::spec::SchemaChange::update_column_default_value(
+                    "ghost".to_string(),
+                    "x".to_string(),
+                ),
+            ])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ColumnNotExist { .. }),
+            "{err:?}"
         );
     }
 
