@@ -994,9 +994,9 @@ impl SQLContext {
             ));
         }
         if ct.query.is_some() {
-            return Err(DataFusionError::Plan(
-                "CREATE TABLE AS SELECT is not yet supported for Paimon tables.".to_string(),
-            ));
+            return self
+                .handle_create_table_as_select(catalog, ct, partition_keys)
+                .await;
         }
 
         let identifier = self.resolve_table_name(&ct.name)?;
@@ -1051,6 +1051,105 @@ impl SQLContext {
             .create_table(&identifier, schema, ct.if_not_exists)
             .await
             .map_err(to_datafusion_error)?;
+
+        ok_result(&self.ctx)
+    }
+
+    /// Handle `CREATE TABLE ... AS SELECT ...` for persistent Paimon tables.
+    ///
+    /// The schema is inferred from the query's output. `PARTITIONED BY`, a
+    /// `PRIMARY KEY` constraint, and `WITH (...)` options still apply; an
+    /// explicit column list is not accepted (the columns come from the query).
+    /// After the table is created it is populated with the same query.
+    async fn handle_create_table_as_select(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        ct: &CreateTable,
+        partition_keys: Vec<String>,
+    ) -> DFResult<DataFrame> {
+        let Some(query) = &ct.query else {
+            return Err(DataFusionError::Internal(
+                "handle_create_table_as_select called without a query".to_string(),
+            ));
+        };
+        if !ct.columns.is_empty() {
+            return Err(DataFusionError::Plan(
+                "CREATE TABLE AS SELECT does not accept an explicit column list; \
+                 the schema is inferred from the query"
+                    .to_string(),
+            ));
+        }
+
+        let (_, catalog_name, identifier) = self.resolve_catalog_and_table(&ct.name)?;
+
+        // IF NOT EXISTS on an existing table is a no-op (no rows appended).
+        if ct.if_not_exists && catalog.get_table(&identifier).await.is_ok() {
+            return ok_result(&self.ctx);
+        }
+
+        // Infer the output schema from the query. Planning (not collecting) is
+        // enough here; the rows are written by the INSERT below, which resolves
+        // the query the same way.
+        let query_sql = query.to_string();
+        let df = self.ctx.sql(&query_sql).await?;
+        let arrow_fields = df
+            .schema()
+            .as_arrow()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        let fields =
+            paimon::arrow::arrow_fields_to_paimon(&arrow_fields).map_err(to_datafusion_error)?;
+
+        // Build the Paimon schema: inferred columns + PRIMARY KEY / PARTITIONED BY / WITH.
+        let enable_ident_normalization = self.ctx.enable_ident_normalization();
+        let mut builder = paimon::spec::Schema::builder();
+        for field in &fields {
+            builder = builder.column(field.name().to_string(), field.data_type().clone());
+        }
+        for constraint in &ct.constraints {
+            if let datafusion::sql::sqlparser::ast::TableConstraint::PrimaryKey(pk) = constraint {
+                let pk_cols: Vec<String> = pk
+                    .columns
+                    .iter()
+                    .map(|c| primary_key_column_name(&c.column.expr, enable_ident_normalization))
+                    .collect();
+                builder = builder.primary_key(pk_cols);
+            }
+        }
+        if !partition_keys.is_empty() {
+            let field_names: Vec<&str> = fields.iter().map(|f| f.name()).collect();
+            for pk in &partition_keys {
+                if !field_names.contains(&pk.as_str()) {
+                    return Err(DataFusionError::Plan(format!(
+                        "PARTITIONED BY column '{pk}' is not produced by the query"
+                    )));
+                }
+            }
+            builder = builder.partition_keys(partition_keys);
+        }
+        for (k, v) in extract_options(&ct.table_options)? {
+            builder = builder.option(k, v);
+        }
+        let schema = builder.build().map_err(to_datafusion_error)?;
+
+        catalog
+            .create_table(&identifier, schema, ct.if_not_exists)
+            .await
+            .map_err(to_datafusion_error)?;
+
+        // Populate the new table from the same query. `Box::pin` breaks the
+        // async recursion through `sql` (CTAS -> INSERT -> dispatch); `collect`
+        // drives the insert plan to completion.
+        let insert_sql = format!(
+            "INSERT INTO {}.{}.{} {}",
+            catalog_name,
+            identifier.database(),
+            identifier.object(),
+            query_sql
+        );
+        Box::pin(self.sql(&insert_sql)).await?.collect().await?;
 
         ok_result(&self.ctx)
     }
@@ -6612,6 +6711,115 @@ mod tests {
         } else {
             panic!("expected CreateTable call");
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_table_as_select() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut options = paimon::Options::new();
+        options.set(
+            paimon::CatalogOptions::WAREHOUSE,
+            temp_dir.path().to_string_lossy(),
+        );
+        let storage_catalog = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", storage_catalog.clone())
+            .await
+            .unwrap();
+
+        ctx.sql("CREATE TABLE paimon.default.ctas_src (id INT, name STRING)")
+            .await
+            .unwrap();
+        ctx.sql("INSERT INTO paimon.default.ctas_src VALUES (1, 'a'), (2, 'b')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // CTAS materializes the (filtered) query into a new persistent table.
+        ctx.sql(
+            "CREATE TABLE paimon.default.ctas_dst \
+             AS SELECT id, name FROM paimon.default.ctas_src WHERE id = 2",
+        )
+        .await
+        .unwrap();
+
+        // Schema is inferred from the query output.
+        let dst = storage_catalog
+            .get_table(&Identifier::new("default", "ctas_dst"))
+            .await
+            .unwrap();
+        let field_names: Vec<&str> = dst.schema().fields().iter().map(|f| f.name()).collect();
+        assert_eq!(field_names, vec!["id", "name"]);
+
+        // Rows are populated from the query.
+        let batches = ctx
+            .sql("SELECT id, name FROM paimon.default.ctas_dst")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1);
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        // String columns may read back as a view type; cast to Utf8 to assert.
+        let name_col = cast(batches[0].column(1), &ArrowDataType::Utf8).unwrap();
+        let names = name_col.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(ids.value(0), 2);
+        assert_eq!(names.value(0), "b");
+    }
+
+    #[tokio::test]
+    async fn test_create_table_as_select_if_not_exists_is_noop() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut options = paimon::Options::new();
+        options.set(
+            paimon::CatalogOptions::WAREHOUSE,
+            temp_dir.path().to_string_lossy(),
+        );
+        let storage_catalog = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", storage_catalog.clone())
+            .await
+            .unwrap();
+
+        ctx.sql("CREATE TABLE paimon.default.src2 (id INT)")
+            .await
+            .unwrap();
+        ctx.sql("INSERT INTO paimon.default.src2 VALUES (1), (2)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        ctx.sql(
+            "CREATE TABLE paimon.default.dst2 AS SELECT id FROM paimon.default.src2 WHERE id = 1",
+        )
+        .await
+        .unwrap();
+        // Second CTAS with IF NOT EXISTS must not append the extra row.
+        ctx.sql(
+            "CREATE TABLE IF NOT EXISTS paimon.default.dst2 AS SELECT id FROM paimon.default.src2",
+        )
+        .await
+        .unwrap();
+
+        let batches = ctx
+            .sql("SELECT id FROM paimon.default.dst2")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1);
     }
 
     #[tokio::test]
