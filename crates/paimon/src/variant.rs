@@ -2823,7 +2823,13 @@ pub(crate) fn cast_variant_to_f32(variant: VariantRef<'_>) -> Option<f32> {
             let decimal = variant.get_decimal().ok()?;
             Some((decimal.unscaled as f64 / 10f64.powi(decimal.scale as i32)) as f32)
         }
-        VariantKind::String => variant.get_string().ok()?.trim().parse::<f32>().ok(),
+        // Java Float.parseFloat removes only leading/trailing characters <= U+0020.
+        VariantKind::String => variant
+            .get_string()
+            .ok()?
+            .trim_matches(|c| c <= '\u{20}')
+            .parse::<f32>()
+            .ok(),
         _ => None,
     }
 }
@@ -3700,5 +3706,32 @@ mod tests {
             cast_variant_to_f32(timestamp.result().unwrap().as_ref().unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn float32_projection_uses_java_string_whitespace_rules() {
+        let variant = GenericVariant::parse_json(
+            r#"{"ascii":" \t1.5\n ","control":"\u00001.5\u001f","nbsp":"\u00a01.5\u00a0"}"#,
+        )
+        .unwrap();
+        let float_type = DataType::Float(crate::spec::FloatType::new());
+
+        for path in ["$.ascii", "$.control"] {
+            let value = variant.get_path(path).unwrap().unwrap();
+            assert_eq!(
+                cast_variant_to_shredded_value(value, &float_type, true).unwrap(),
+                Some(ShreddedValue::Float32(1.5))
+            );
+        }
+
+        let nbsp = variant.get_path("$.nbsp").unwrap().unwrap();
+        assert_eq!(
+            cast_variant_to_shredded_value(nbsp, &float_type, false).unwrap(),
+            None
+        );
+        assert!(matches!(
+            cast_variant_to_shredded_value(nbsp, &float_type, true),
+            Err(Error::DataInvalid { .. })
+        ));
     }
 }

@@ -151,6 +151,37 @@ def test_with_read_type_variant_fields_honors_fail_on_error():
             builder.new_read().read(plan.splits())
 
 
+def test_with_read_type_variant_float_whitespace_matches_java():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.vdb")
+        ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+        ascii_value = json.dumps({"x": " 1.5 "})
+        nbsp_value = json.dumps({"x": "\u00a01.5\u00a0"}, ensure_ascii=False)
+        ctx.sql(
+            "INSERT INTO paimon.vdb.t "
+            "SELECT 1, parse_json('%s') UNION ALL "
+            "SELECT 2, parse_json('%s')" % (ascii_value, nbsp_value)
+        )
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["id", "payload"], ["$.x"]))
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(
+            builder.new_read().read(plan.splits())
+        ).sort_by("id")
+        assert result.column("payload").combine_chunks().to_pylist() == [
+            {"0": 1.5}, {"0": None},
+        ]
+
+        strict = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.x"], fail_on_error=True))
+        with pytest.raises(ValueError, match="Cannot cast Variant value to"):
+            strict.new_read().read(strict.new_scan().plan().splits())
+
+
 def test_with_read_type_variant_fields_keeps_explicit_null():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
