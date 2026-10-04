@@ -85,6 +85,8 @@ const DEFAULT_METADATA_STATS_KEEP_FIRST_N_COLUMNS: i32 = -1;
 const FIELDS_PREFIX: &str = "fields";
 const STATS_MODE_SUFFIX: &str = "stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+const ROW_TRACKING_PARTITION_GROUP_ON_COMMIT_OPTION: &str =
+    "row-tracking.partition-group-on-commit";
 const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
 
@@ -218,6 +220,9 @@ pub enum ChangelogProducer {
 pub enum GlobalIndexColumnUpdateAction {
     ThrowError,
     DropPartitionIndex,
+    /// Preserve existing indexes. As in Java, the caller must refresh affected
+    /// index ranges separately before relying on their updated values.
+    Ignore,
 }
 
 /// Search mode for global index queries.
@@ -1130,6 +1135,7 @@ impl<'a> CoreOptions<'a> {
         {
             "THROW_ERROR" => Ok(GlobalIndexColumnUpdateAction::ThrowError),
             "DROP_PARTITION_INDEX" => Ok(GlobalIndexColumnUpdateAction::DropPartitionIndex),
+            "IGNORE" => Ok(GlobalIndexColumnUpdateAction::Ignore),
             other => Err(crate::Error::ConfigInvalid {
                 message: format!("Unsupported global-index.column-update-action: {other}"),
             }),
@@ -1351,6 +1357,15 @@ impl<'a> CoreOptions<'a> {
             .get(ROW_TRACKING_ENABLED_OPTION)
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    /// Group new file metadata by partition before assigning row IDs. Defaults
+    /// to true, matching Java, so each partition receives contiguous row IDs.
+    pub fn row_tracking_partition_group_on_commit(&self) -> bool {
+        self.options
+            .get(ROW_TRACKING_PARTITION_GROUP_ON_COMMIT_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
     }
 
     /// Whether incremental clustering is enabled. Default is false.

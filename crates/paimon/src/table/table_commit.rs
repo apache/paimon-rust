@@ -47,6 +47,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const BATCH_COMMIT_IDENTIFIER: i64 = i64::MAX;
 /// Java RollingFileWriter.CHECK_ROLLING_RECORD_CNT.
 const CHECK_ROLLING_RECORD_COUNT: usize = 1000;
+
+mod row_tracking;
+
 const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 
 type PartitionBucketKey = (Vec<u8>, i32);
@@ -1208,10 +1211,16 @@ impl TableCommit {
                     .and_then(|s| s.next_row_id())
                     .or(Some(first_row_id_start));
             } else {
-                let (assigned, nrid) = self.assign_row_tracking_meta(
+                let mut entries = std::mem::take(&mut resolved.entries);
+                if CoreOptions::new(self.table.schema().options())
+                    .row_tracking_partition_group_on_commit()
+                {
+                    entries = row_tracking::group_by_partition(entries);
+                }
+                let (assigned, nrid) = row_tracking::assign_row_tracking(
                     new_snapshot_id,
                     first_row_id_start,
-                    std::mem::take(&mut resolved.entries),
+                    entries,
                 )?;
                 resolved.entries = assigned;
                 next_row_id = Some(nrid);
@@ -1998,6 +2007,7 @@ impl TableCommit {
         }
 
         match CoreOptions::new(self.table.schema().options()).global_index_column_update_action()? {
+            GlobalIndexColumnUpdateAction::Ignore => Ok(vec![]),
             GlobalIndexColumnUpdateAction::DropPartitionIndex => Ok(affected
                 .into_iter()
                 .map(|entry| IndexManifestEntry {
@@ -2648,7 +2658,10 @@ impl TableCommit {
 
         let mut existing_index: HashSet<(Vec<u8>, i32, i64, i64)> = HashSet::new();
         let mut existing_ranges: ExistingRowIdRanges = HashMap::new();
-        for base in base_entries {
+        for base in base_entries
+            .iter()
+            .filter(|entry| !is_dedicated_storage_file(entry.file()))
+        {
             if let Some(first_row_id) = base.file().first_row_id {
                 existing_index.insert((
                     base.partition().to_vec(),
@@ -2656,12 +2669,10 @@ impl TableCommit {
                     first_row_id,
                     base.file().row_count,
                 ));
-                if !is_dedicated_storage_file(base.file()) {
-                    existing_ranges
-                        .entry((base.partition().to_vec(), base.bucket()))
-                        .or_default()
-                        .push((first_row_id, first_row_id + base.file().row_count - 1));
-                }
+                existing_ranges
+                    .entry((base.partition().to_vec(), base.bucket()))
+                    .or_default()
+                    .push((first_row_id, first_row_id + base.file().row_count - 1));
             }
         }
 
@@ -2669,14 +2680,14 @@ impl TableCommit {
             let first_row_id = entry.file().first_row_id.unwrap();
             if is_dedicated_storage_file(entry.file()) {
                 if let Some((start, end)) = entry.file().row_id_range() {
-                    let overlaps_existing = existing_ranges
+                    let covered_by_existing = existing_ranges
                         .get(&(entry.partition().to_vec(), entry.bucket()))
                         .is_some_and(|ranges| {
                             ranges.iter().any(|&(base_start, base_end)| {
-                                ranges_overlap(start, end, base_start, base_end)
+                                base_start <= start && end <= base_end
                             })
                         });
-                    if overlaps_existing {
+                    if covered_by_existing {
                         continue;
                     }
                 }
@@ -2746,6 +2757,43 @@ impl TableCommit {
                 }
             }
         }
+        Self::check_dedicated_row_id_ranges(&entries, commit_entries)
+    }
+
+    /// Dedicated files can roll independently, but each must fit in one normal
+    /// file range. Adjacent ranges must not be merged: the DE reader joins one
+    /// normal group at a time, matching Java's RowRangeIndex with mergeAdjacent=false.
+    fn check_dedicated_row_id_ranges(
+        normal_entries: &[&ManifestEntry],
+        entries: &[ManifestEntry],
+    ) -> Result<()> {
+        for entry in entries
+            .iter()
+            .filter(|entry| is_dedicated_storage_file(entry.file()))
+        {
+            let Some((start, end)) = entry.file().row_id_range() else {
+                continue;
+            };
+            let covered = normal_entries.iter().any(|normal| {
+                normal.partition() == entry.partition()
+                    && normal.bucket() == entry.bucket()
+                    && normal
+                        .file()
+                        .row_id_range()
+                        .is_some_and(|(base_start, base_end)| {
+                            base_start <= start && end <= base_end
+                        })
+            });
+            if !covered {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "For Data Evolution table, dedicated file '{}' [{start}, {end}] is not covered by one data file range.",
+                        entry.file().file_name,
+                    ),
+                    source: None,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -2797,9 +2845,8 @@ impl TableCommit {
             for entry in self
                 .read_delta_entries(partition_filter.as_ref(), &snapshot)
                 .await?
-                .into_iter()
-                .filter(|entry| *entry.kind() == FileKind::Add)
             {
+                // Java's DML checker treats deleted column ranges as writes too.
                 let Some((start, end)) = entry.file().row_id_range() else {
                     continue;
                 };
@@ -2829,10 +2876,7 @@ impl TableCommit {
         delta_entries: &[ManifestEntry],
     ) -> Result<Vec<RowIdWriteRange>> {
         let mut ranges = Vec::new();
-        for entry in delta_entries
-            .iter()
-            .filter(|entry| *entry.kind() == FileKind::Add)
-        {
+        for entry in delta_entries {
             let Some((start, end)) = entry.file().row_id_range() else {
                 continue;
             };
@@ -2899,96 +2943,6 @@ impl TableCommit {
             ids.extend(data_fields.iter().map(|field| field.id()));
         }
         Ok(ids)
-    }
-
-    /// Assign row tracking metadata: snapshot ID as sequence number, and
-    /// first_row_id for new APPEND files that don't already have one.
-    /// Normal files advance the main counter. Blob files (identified by file name)
-    /// use per-column counters starting from the same base, since each blob column
-    /// rolls independently.
-    fn assign_row_tracking_meta(
-        &self,
-        snapshot_id: i64,
-        first_row_id_start: i64,
-        entries: Vec<ManifestEntry>,
-    ) -> Result<(Vec<ManifestEntry>, i64)> {
-        let mut result = Vec::with_capacity(entries.len());
-        let mut start = first_row_id_start;
-        let mut blob_start_default = first_row_id_start;
-        let mut blob_starts: HashMap<String, i64> = HashMap::new();
-        let mut vector_store_start = first_row_id_start;
-
-        for entry in entries {
-            let mut entry = entry.with_sequence_number(snapshot_id, snapshot_id);
-            if entry.file().file_source.is_none() {
-                return Err(crate::Error::DataInvalid {
-                    message: format!(
-                        "file_source must be present for row-tracking table, file={}",
-                        entry.file().file_name
-                    ),
-                    source: None,
-                });
-            }
-            let contains_row_id =
-                entry.file().write_cols.as_ref().is_some_and(|cols| {
-                    cols.iter().any(|col| col == crate::spec::ROW_ID_FIELD_NAME)
-                });
-            if *entry.kind() == FileKind::Add
-                && entry.file().file_source == Some(0) // APPEND
-                && entry.file().first_row_id.is_none()
-                && !contains_row_id
-            {
-                if is_blob_data_file(entry.file()) {
-                    let blob_field_name = entry
-                        .file()
-                        .write_cols
-                        .as_ref()
-                        .and_then(|cols| cols.first())
-                        .cloned()
-                        .ok_or_else(|| crate::Error::DataInvalid {
-                            message: format!(
-                                "Blob file '{}' must have write_cols for row-tracking assignment.",
-                                entry.file().file_name
-                            ),
-                            source: None,
-                        })?;
-                    let blob_start = blob_starts
-                        .entry(blob_field_name)
-                        .or_insert(blob_start_default);
-                    if *blob_start >= start {
-                        return Err(crate::Error::DataInvalid {
-                            message: format!(
-                                "This is a bug, blobStart {} should be less than start {} when assigning a blob entry file.",
-                                *blob_start, start
-                            ),
-                            source: None,
-                        });
-                    }
-                    entry = entry.with_first_row_id(*blob_start);
-                    *blob_start += entry.file().row_count;
-                } else if is_vector_store_file(entry.file()) {
-                    if vector_store_start >= start {
-                        return Err(crate::Error::DataInvalid {
-                            message: format!(
-                                "This is a bug, vectorStoreStart {} should be less than start {} when assigning a vector-store entry file.",
-                                vector_store_start, start
-                            ),
-                            source: None,
-                        });
-                    }
-                    entry = entry.with_first_row_id(vector_store_start);
-                    vector_store_start += entry.file().row_count;
-                } else {
-                    entry = entry.with_first_row_id(start);
-                    blob_start_default = start;
-                    blob_starts.clear();
-                    start += entry.file().row_count;
-                }
-            }
-            result.push(entry);
-        }
-
-        Ok((result, start))
     }
 
     /// Validate that files with pre-assigned `first_row_id` (e.g. partial-column
@@ -3651,6 +3605,7 @@ mod tests {
         use super::*;
         include!("table_commit/parity_tests.rs");
         include!("table_commit/recovery_tests.rs");
+        include!("table_commit/row_tracking_tests.rs");
     }
 
     #[tokio::test]
