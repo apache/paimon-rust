@@ -67,7 +67,7 @@ use paimon::catalog::{Catalog, Identifier, RESTCatalog};
 use paimon::lumina::LUMINA_IDENTIFIER;
 use paimon::spec::Snapshot;
 use paimon::table::{
-    normalize_global_index_type_for_drop, SnapshotManager, Table, TagManager,
+    normalize_global_index_type_for_drop, BranchManager, SnapshotManager, Table, TagManager,
     SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
 use paimon::vindex::is_vindex_index_type;
@@ -172,6 +172,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "rollback_to" => &["table", "snapshot_id", "tag"],
         "rollback_to_timestamp" => &["table", "timestamp"],
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
+        "rename_branch" => &["table", "from_branch", "to_branch"],
         "create_global_index" => &["table", "index_column", "index_type", "options"],
         // `partitions`/`dry_run` are declared but not yet implemented; they still reach
         // their own "not supported yet" error rather than being reported as unknown.
@@ -286,6 +287,7 @@ pub async fn execute_call(
         "create_tag_from_timestamp" => {
             proc_create_tag_from_timestamp(ctx, catalog, catalog_name, &args).await
         }
+        "rename_branch" => proc_rename_branch(ctx, catalog, catalog_name, &args).await,
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
         "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
@@ -451,6 +453,35 @@ async fn proc_create_tag(
             .ok_or_else(|| DataFusionError::Plan("No snapshots exist".to_string()))?
     };
     tm.create(tag_name, &snapshot)
+        .await
+        .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_rename_branch(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let from_branch = require_arg(args, "from_branch")?;
+    let to_branch = require_arg(args, "to_branch")?;
+
+    // A REST catalog owns the authoritative snapshot/branch metadata and exposes
+    // no branch-rename endpoint (Java `RESTCatalog.renameBranch` throws
+    // `UnsupportedOperationException`). Renaming here would move the physical
+    // branch directory while the catalog kept pointing at the old name, so later
+    // reads of both the old and new name would fail. Refuse the rename until a
+    // catalog-aware path exists, instead of silently desyncing the table.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "rename_branch is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.rename_branch(from_branch, to_branch)
         .await
         .map_err(to_datafusion_error)?;
     ok_result(ctx)

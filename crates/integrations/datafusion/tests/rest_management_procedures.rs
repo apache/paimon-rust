@@ -26,6 +26,7 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch};
 use paimon::api::ConfigResponse;
 use paimon::catalog::RESTCatalog;
+use paimon::spec::{DataType, IntType, Schema};
 use paimon::{CatalogOptions, Options};
 use paimon_datafusion::SQLContext;
 
@@ -648,6 +649,35 @@ async fn test_non_rest_catalog_is_rejected_by_every_procedure() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn test_rename_branch_rejected_on_rest_catalog() {
+    // A REST catalog is authoritative for branch metadata and has no rename
+    // endpoint, so `rename_branch` must refuse rather than move the physical
+    // branch directory behind the catalog's back (Java `RESTCatalog.renameBranch`
+    // throws `UnsupportedOperationException`). Without the guard the filesystem
+    // `BranchManager` runs against the REST table's location and reports a
+    // "branch ... does not exist" error instead, so this assertion is non-vacuous.
+    let (tmp, server, context) = setup().await;
+
+    // `get_table` needs a schema-bearing response; register one so resolution
+    // reaches the REST guard rather than failing earlier on a missing schema.
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
+    server.add_table_with_schema(DATABASE, TABLE, schema, &path);
+
+    common::assert_sql_error(
+        &context,
+        &format!(
+            "CALL sys.rename_branch(table => '{DATABASE}.{TABLE}', from_branch => 'b1', to_branch => 'b2')"
+        ),
+        "REST catalog",
+    )
+    .await;
 }
 
 #[tokio::test]

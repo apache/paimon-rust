@@ -17,7 +17,13 @@
 
 mod common;
 
-use common::{assert_sql_error, collect_id_name, exec, row_count, setup_sql_context};
+use common::{
+    assert_sql_error, collect_id_name, create_sql_context, create_test_env, exec, row_count,
+    setup_sql_context,
+};
+use paimon::catalog::Identifier;
+use paimon::table::BranchManager;
+use paimon::Catalog;
 
 async fn setup_table_with_snapshots() -> (tempfile::TempDir, paimon_datafusion::SQLContext) {
     let (tmp, sql_context) = setup_sql_context().await;
@@ -83,6 +89,158 @@ async fn test_create_tag_with_snapshot_id() {
     )
     .await;
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn test_rename_branch() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    // Seed a branch through the core manager (create_branch is a separate PR).
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+
+    exec(
+        &sql_context,
+        "CALL sys.rename_branch(table => 'test_db.t1', from_branch => 'b1', to_branch => 'b2')",
+    )
+    .await;
+
+    assert!(!bm.branch_exists("b1").await.unwrap(), "old branch gone");
+    assert!(bm.branch_exists("b2").await.unwrap(), "new branch present");
+    let old = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b1'",
+    )
+    .await;
+    assert_eq!(old, 0);
+    let new = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b2'",
+    )
+    .await;
+    assert_eq!(new, 1);
+
+    // Renaming a branch that does not exist is an error.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.rename_branch(table => 'test_db.t1', from_branch => 'b1', to_branch => 'b3')",
+        "doesn't exist",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_rename_branch_rejects_path_separator() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+
+    // Renaming to `foo/bar` would move the branch under `branch-foo/` and hide it
+    // from `$branches`; it must be rejected and leave `b1` untouched.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.rename_branch(table => 'test_db.t1', from_branch => 'b1', to_branch => 'foo/bar')",
+        "path separator",
+    )
+    .await;
+
+    assert!(bm.branch_exists("b1").await.unwrap(), "b1 must remain");
+    assert!(
+        !bm.branch_exists("foo/bar").await.unwrap(),
+        "foo/bar must not exist"
+    );
+    let visible = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b1'",
+    )
+    .await;
+    assert_eq!(visible, 1);
+}
+
+#[tokio::test]
+async fn test_rename_branch_rejects_unopenable_source_and_target() {
+    let (_tmp, catalog) = create_test_env();
+    let sql_context = create_sql_context(catalog.clone()).await;
+    exec(&sql_context, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &sql_context,
+        "CREATE TABLE paimon.test_db.t1 (id INT, name VARCHAR(100), PRIMARY KEY (id))",
+    )
+    .await;
+    exec(
+        &sql_context,
+        "INSERT INTO paimon.test_db.t1 VALUES (1, 'alice')",
+    )
+    .await;
+
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "t1"))
+        .await
+        .unwrap();
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    bm.create_branch("b1").await.unwrap();
+
+    // A path-separated SOURCE would rename `branch-b1/schema` (an inner directory),
+    // not the branch, orphaning b1's metadata. It must be rejected before any move.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.rename_branch(table => 'test_db.t1', from_branch => 'b1/schema', to_branch => 'stolen')",
+        "path separator",
+    )
+    .await;
+    assert!(bm.branch_exists("b1").await.unwrap(), "b1 must remain");
+    assert!(
+        !bm.branch_exists("stolen").await.unwrap(),
+        "stolen must not exist"
+    );
+
+    // A `..` TARGET is a single directory segment but no reader can open it, so the
+    // rename must be rejected rather than moving b1 to an unopenable name.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.rename_branch(table => 'test_db.t1', from_branch => 'b1', to_branch => '..')",
+        "'.' or '..'",
+    )
+    .await;
+    assert!(
+        bm.branch_exists("b1").await.unwrap(),
+        "b1 must survive a rejected rename"
+    );
+    // b1 is still openable through the table reader.
+    table.copy_with_branch("b1").await.unwrap();
 }
 
 #[tokio::test]
