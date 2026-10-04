@@ -326,12 +326,13 @@ async fn real_sdk_reads_errors_pagination_and_credentials() {
     assert!(file_io.exists_dir("oss://bucket/objects").await.unwrap());
     assert!(!file_io.exists_dir("oss://bucket/missing").await.unwrap());
     assert!(file_io.exists_dir("oss://bucket/denied").await.is_err());
-    let list_requests = state.list_requests.lock().unwrap();
-    assert!(
-        list_requests.contains(&("objects/".to_string(), "1".to_string())),
-        "list requests: {list_requests:?}"
-    );
-    drop(list_requests);
+    {
+        let list_requests = state.list_requests.lock().unwrap();
+        assert!(
+            list_requests.contains(&("objects/".to_string(), "1".to_string())),
+            "list requests: {list_requests:?}"
+        );
+    }
     assert_eq!(op.stat("data").await.unwrap().content_length(), 10);
     let before = state.heads.load(Ordering::SeqCst);
     let reader = op.reader("data").await.unwrap();
