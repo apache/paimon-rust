@@ -1082,25 +1082,36 @@ impl SQLContext {
 
         let (_, catalog_name, identifier) = self.resolve_catalog_and_table(&ct.name)?;
 
-        // IF NOT EXISTS on an existing table is a no-op (no rows appended).
-        if ct.if_not_exists && catalog.get_table(&identifier).await.is_ok() {
-            return ok_result(&self.ctx);
+        // IF NOT EXISTS on an existing table is a no-op, whatever its declared
+        // read engine. Use the load path and treat only TableNotExist as
+        // absence: FileSystemCatalog returns Unsupported for an existing
+        // engine-served table, and mistaking that for "missing" would try to
+        // populate a table that already exists instead of being a no-op.
+        if ct.if_not_exists {
+            match catalog.load_table(&identifier).await {
+                Ok(_) => return ok_result(&self.ctx),
+                Err(paimon::Error::TableNotExist { .. }) => {}
+                Err(e) => return Err(to_datafusion_error(e)),
+            }
         }
 
-        // Expand catalog SQL functions once (so `plus_one(...)` and other
-        // catalog-registered functions resolve exactly as a plain SELECT does
-        // through SQLContext), then reuse the expanded query for both schema
-        // inference and population. Planning (not collecting) is enough for
-        // inference; the INSERT below writes the rows from the same expansion.
+        // Resolve the source query in the session's current namespace — the same
+        // namespace the INSERT below evaluates it in — not the destination's.
+        // Inferring the schema against the target database would read a
+        // differently-shaped `source` there while the session's `source` is
+        // inserted positionally. Expand catalog SQL functions once (so
+        // `plus_one(...)` resolves exactly as a plain SELECT does through
+        // SQLContext) and reuse the expanded query for both inference and
+        // population; planning (not collecting) is enough for inference.
         let query_sql = query.to_string();
-        let mut state = self.ctx.state();
-        state.config_mut().options_mut().catalog.default_catalog = catalog_name.clone();
-        state.config_mut().options_mut().catalog.default_schema = identifier.database().to_string();
+        let state = self.ctx.state();
+        let session_catalog = state.config_options().catalog.default_catalog.clone();
+        let session_schema = state.config_options().catalog.default_schema.clone();
         let expanded_query = crate::sql_function::expand_sql(
             &query_sql,
             &self.catalogs,
-            &catalog_name,
-            identifier.database(),
+            &session_catalog,
+            &session_schema,
         )
         .await?;
         let logical_plan = state.create_logical_plan(&expanded_query).await?;
@@ -1151,17 +1162,28 @@ impl SQLContext {
             .await
             .map_err(to_datafusion_error)?;
 
-        // Populate the new table from the same expanded query. `Box::pin` breaks
-        // the async recursion through `sql` (CTAS -> INSERT -> dispatch);
-        // `collect` drives the insert plan to completion.
+        // Populate the new table from the same expanded query. Quote every
+        // identifier component so a case-sensitive or special target (e.g.
+        // `"Dst"`) is written as created, not a different existing table that
+        // unquoted text would normalize to. `Box::pin` breaks the async
+        // recursion through `sql` (CTAS -> INSERT -> dispatch); `collect` drives
+        // the insert plan to completion.
         let insert_sql = format!(
             "INSERT INTO {}.{}.{} {}",
-            catalog_name,
-            identifier.database(),
-            identifier.object(),
+            quote_ident(&catalog_name),
+            quote_ident(identifier.database()),
+            quote_ident(identifier.object()),
             expanded_query
         );
-        Box::pin(self.sql(&insert_sql)).await?.collect().await?;
+        // On failure, drop the table this statement just created (it did not
+        // exist before) and surface the original error, so a corrected retry is
+        // not silently satisfied by an empty leftover.
+        let populated: DFResult<Vec<RecordBatch>> =
+            async { Box::pin(self.sql(&insert_sql)).await?.collect().await }.await;
+        if let Err(populate_err) = populated {
+            let _ = catalog.drop_table(&identifier, true).await;
+            return Err(populate_err);
+        }
 
         ok_result(&self.ctx)
     }
@@ -3060,6 +3082,14 @@ fn primary_key_column_name(expr: &SqlExpr, enable_ident_normalization: bool) -> 
         }
         _ => expr.to_string(),
     }
+}
+
+/// Quote a resolved identifier component for safe interpolation into generated
+/// SQL, doubling any embedded double quote (DataFusion's quoting rules). Without
+/// this a target like `"Dst"` would be reparsed unquoted and normalized to a
+/// different existing table.
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
 fn character_length_or_default(
@@ -6890,6 +6920,242 @@ mod tests {
             .unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_table_as_select_resolves_source_in_session_namespace() {
+        // The CTAS SELECT must resolve in the session's current namespace, not
+        // the destination database. A differently-shaped `source` in the target
+        // db must not be used to infer the schema while the session's `source`
+        // is inserted positionally.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut options = paimon::Options::new();
+        options.set(
+            paimon::CatalogOptions::WAREHOUSE,
+            temp_dir.path().to_string_lossy(),
+        );
+        let storage = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+        let mut ctx = SQLContext::new();
+        // Current namespace = paimon.default.
+        ctx.register_catalog_with_default_db("paimon", storage.clone(), Some("default"))
+            .await
+            .unwrap();
+        storage
+            .create_database("other_db", true, Default::default())
+            .await
+            .unwrap();
+
+        // Session `source` is (id, value) = (1, 99); a differently-ordered
+        // `source` also exists in the destination database.
+        ctx.sql("CREATE TABLE paimon.default.source (id INT, value INT)")
+            .await
+            .unwrap();
+        ctx.sql("INSERT INTO paimon.default.source VALUES (1, 99)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        ctx.sql("CREATE TABLE paimon.other_db.source (value INT, id INT)")
+            .await
+            .unwrap();
+
+        // Bare `source` resolves in the session namespace (default), so `out`
+        // is inferred as (id, value) and the row stays (1, 99).
+        ctx.sql("CREATE TABLE paimon.other_db.out AS SELECT * FROM source")
+            .await
+            .unwrap();
+
+        let out = storage
+            .get_table(&Identifier::new("other_db", "out"))
+            .await
+            .unwrap();
+        let field_names: Vec<&str> = out.schema().fields().iter().map(|f| f.name()).collect();
+        assert_eq!(field_names, vec!["id", "value"]);
+
+        let batches = ctx
+            .sql("SELECT id, value FROM paimon.other_db.out")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 1, "value for `id` came from the wrong source");
+        assert_eq!(
+            values.value(0),
+            99,
+            "value for `value` came from the wrong source"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_as_select_quotes_target_identifier() {
+        // The generated INSERT must quote the resolved target so a case-sensitive
+        // name is written as created, not normalized onto a different existing
+        // table. Use a memory warehouse: the macOS temp dir is case-insensitive,
+        // which would collapse `dst` and `"Dst"` onto one directory.
+        let mut options = paimon::Options::new();
+        options.set(paimon::CatalogOptions::WAREHOUSE, "memory:/ctas_quote");
+        let storage = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", storage.clone())
+            .await
+            .unwrap();
+
+        // A lowercase `dst` already holds rows.
+        ctx.sql("CREATE TABLE paimon.default.dst (id INT)")
+            .await
+            .unwrap();
+        ctx.sql("INSERT INTO paimon.default.dst VALUES (1), (2)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        // CTAS into the case-sensitive `"Dst"` must create and populate `"Dst"`.
+        ctx.sql(r#"CREATE TABLE paimon.default."Dst" AS SELECT CAST(7 AS INT) AS id"#)
+            .await
+            .unwrap();
+
+        let upper = ctx
+            .sql(r#"SELECT id FROM paimon.default."Dst""#)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let upper_rows: usize = upper.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(upper_rows, 1, "`\"Dst\"` must hold its own CTAS row");
+        let upper_ids = upper[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(upper_ids.value(0), 7);
+
+        // The lowercase `dst` is untouched (not written through an unquoted name).
+        let lower = ctx
+            .sql("SELECT id FROM paimon.default.dst")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let lower_rows: usize = lower.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(lower_rows, 2, "`dst` must not receive the CTAS rows");
+    }
+
+    #[tokio::test]
+    async fn test_create_table_as_select_cleans_up_on_population_failure() {
+        // When population fails after the table is created, the empty target must
+        // be dropped so a corrected retry actually populates it instead of being
+        // satisfied by the leftover.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut options = paimon::Options::new();
+        options.set(
+            paimon::CatalogOptions::WAREHOUSE,
+            temp_dir.path().to_string_lossy(),
+        );
+        let storage = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", storage.clone())
+            .await
+            .unwrap();
+
+        // Population fails evaluating CAST('bad' AS INT) after schema-0 is written.
+        let failed = ctx
+            .sql("CREATE TABLE paimon.default.failed_ctas AS SELECT CAST('bad' AS INT) AS id")
+            .await;
+        let failed = match failed {
+            Ok(df) => df.collect().await,
+            Err(e) => Err(e),
+        };
+        assert!(failed.is_err(), "the failing CTAS must surface an error");
+
+        // The target was cleaned up: it does not exist.
+        assert!(
+            storage
+                .get_table(&Identifier::new("default", "failed_ctas"))
+                .await
+                .is_err(),
+            "the empty target must be dropped after a failed population"
+        );
+
+        // A corrected retry with IF NOT EXISTS actually populates the table.
+        ctx.sql(
+            "CREATE TABLE IF NOT EXISTS paimon.default.failed_ctas AS SELECT CAST(5 AS INT) AS id",
+        )
+        .await
+        .unwrap();
+        let batches = ctx
+            .sql("SELECT id FROM paimon.default.failed_ctas")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "the retry must populate, not no-op on a leftover");
+    }
+
+    #[tokio::test]
+    async fn test_create_table_as_select_if_not_exists_engine_served_table() {
+        // IF NOT EXISTS on an existing engine-served (iceberg) table must be a
+        // no-op. `get_table` returns Unsupported for it, which the old `is_ok()`
+        // check mistook for "missing" and then failed trying to populate it;
+        // the load path recognizes it exists.
+        let mut options = paimon::Options::new();
+        options.set(paimon::CatalogOptions::WAREHOUSE, "memory:/ctas_engine");
+        let storage = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+
+        // An engine-served table the Paimon reader cannot construct.
+        storage
+            .create_database("default", true, Default::default())
+            .await
+            .unwrap();
+        let schema = paimon::spec::Schema::builder()
+            .column("id", PaimonDataType::Int(IntType::new()))
+            .option("type", "iceberg-table")
+            .build()
+            .unwrap();
+        storage
+            .create_table(
+                &Identifier::new("default", "existing_iceberg"),
+                schema,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", storage.clone())
+            .await
+            .unwrap();
+
+        // Must be a no-op, not an attempt to populate the engine-served table.
+        ctx.sql(
+            "CREATE TABLE IF NOT EXISTS paimon.default.existing_iceberg AS SELECT CAST(7 AS INT) AS id",
+        )
+        .await
+        .unwrap();
+
+        // The table is unchanged and still classified as engine-served.
+        let loaded = storage
+            .load_table(&Identifier::new("default", "existing_iceberg"))
+            .await
+            .unwrap();
+        assert!(matches!(loaded, paimon::catalog::LoadedTable::External(_)));
     }
 
     #[tokio::test]
