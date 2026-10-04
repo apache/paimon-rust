@@ -34,8 +34,27 @@ pub fn variant_get_numeric_fields(
     column: &StructArray,
     fields: &[String],
 ) -> Result<FixedSizeListArray> {
+    extract_numeric_fields(column, fields, NumericFieldMode::Numeric)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NumericFieldMode<'a> {
+    Numeric,
+    Cast { fail_on_error: &'a [bool] },
+}
+
+pub(crate) fn extract_numeric_fields(
+    column: &StructArray,
+    fields: &[String],
+    mode: NumericFieldMode<'_>,
+) -> Result<FixedSizeListArray> {
     if fields.is_empty() {
         return data_invalid("Variant numeric field list must not be empty");
+    }
+    if let NumericFieldMode::Cast { fail_on_error } = mode {
+        if fail_on_error.len() != fields.len() {
+            return data_invalid("Variant float32 projection width mismatch");
+        }
     }
 
     let width = i32::try_from(fields.len()).map_err(|_| Error::ResourceExhausted {
@@ -78,12 +97,23 @@ pub fn variant_get_numeric_fields(
             projection = Some(VariantFloat32Projection::new(metadata, fields)?);
             projection_metadata = Some(metadata);
         }
-        projection.as_mut().unwrap().extract_float32(
-            value_column.value(row),
-            metadata,
-            &mut offsets,
-            &mut extracted,
-        )?;
+        match mode {
+            NumericFieldMode::Cast { fail_on_error } => {
+                projection.as_mut().unwrap().extract_float32_cast(
+                    value_column.value(row),
+                    metadata,
+                    fail_on_error,
+                    &mut offsets,
+                    &mut extracted,
+                )?
+            }
+            NumericFieldMode::Numeric => projection.as_mut().unwrap().extract_float32(
+                value_column.value(row),
+                metadata,
+                &mut offsets,
+                &mut extracted,
+            )?,
+        }
         for value in &extracted {
             builder.values().append_option(*value);
         }

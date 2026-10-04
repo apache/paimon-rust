@@ -1524,15 +1524,18 @@ mod row_tests {
         )]));
         let physical_type = variant_shredding_type(&configured).unwrap();
         let data_field = field(1, "v", physical_type);
-        let extraction_type = DataType::Row(variant_extraction_row(
-            true,
-            vec![(
-                DataType::Int(IntType::new()),
-                "$.age".to_string(),
+        let extraction_type = DataType::Row(
+            variant_extraction_row(
                 true,
-                "UTC".to_string(),
-            )],
-        ));
+                vec![(
+                    DataType::Int(IntType::new()),
+                    "$.age".to_string(),
+                    true,
+                    "UTC".to_string(),
+                )],
+            )
+            .unwrap(),
+        );
         let expected_field = field(1, "v", extraction_type.clone());
 
         let read_fields = read_data_fields(&[data_field], &[expected_field], false).unwrap();

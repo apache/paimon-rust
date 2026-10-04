@@ -72,6 +72,10 @@ impl PyDataField {
 
 #[pymethods]
 impl PyDataField {
+    fn id(&self) -> i32 {
+        self.inner.id()
+    }
+
     fn name(&self) -> String {
         self.inner.name().to_string()
     }

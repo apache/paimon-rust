@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use arrow::pyarrow::ToPyArrow;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
-use paimon::spec::{DataField, DataType, Predicate, RowType};
+use paimon::spec::{is_variant_extraction_row, DataField, DataType, Predicate, RowType};
 use paimon::table::{ArrowRecordBatchStream, DataSplit, IncrementalScanMode, RowRange, Table};
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -35,6 +35,11 @@ use crate::predicate::dict_to_table_predicate;
 
 const MAP_SELECTED_KEYS_PREFIX: &str = "__PAIMON_MAP_SELECTED_KEYS:";
 const MAP_SELECTED_KEYS_DELIMITER: char = ';';
+
+struct PyReadProjection<'a> {
+    columns: &'a Option<Vec<String>>,
+    read_type: &'a Option<Vec<DataField>>,
+}
 
 /// Time-travel selector option names, in the core's resolution priority order.
 const TIME_TRAVEL_SELECTORS: [&str; 6] = [
@@ -73,17 +78,16 @@ fn find_time_travel_selector(opts: &HashMap<String, String>) -> Option<(&str, &s
 /// Apply common scan/read config onto a core ReadBuilder.
 fn apply_read_config(
     builder: &mut paimon::table::ReadBuilder<'_>,
-    projection: &Option<Vec<String>>,
-    read_type: &Option<Vec<DataField>>,
+    projection: PyReadProjection<'_>,
     limit: Option<usize>,
     filter: &Option<Predicate>,
     case_sensitive: bool,
 ) -> PyResult<()> {
     builder.with_case_sensitive(case_sensitive);
-    if let Some(read_type) = read_type {
+    if let Some(read_type) = projection.read_type {
         builder.with_read_type(read_type.clone());
-    } else if let Some(projection) = projection {
-        let cols: Vec<&str> = projection.iter().map(String::as_str).collect();
+    } else if let Some(columns) = projection.columns {
+        let cols: Vec<&str> = columns.iter().map(String::as_str).collect();
         builder.with_projection(&cols).map_err(to_py_err)?;
     }
     if let Some(limit) = limit {
@@ -293,10 +297,45 @@ impl PyReadBuilder {
 
 #[pymethods]
 impl PyReadBuilder {
+    /// Project top-level columns by name.
     fn with_projection(mut slf: PyRefMut<'_, Self>, columns: Vec<String>) -> PyRefMut<'_, Self> {
         slf.projection = Some(columns);
         slf.read_type = None;
         slf
+    }
+
+    /// Set the complete Paimon ROW read type, including nested field metadata.
+    /// The JSON representation is the same as RowType in a Paimon schema.
+    fn with_read_type<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        read_type_json: &str,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let read_type: RowType = serde_json::from_str(read_type_json)
+            .map_err(|e| PyValueError::new_err(format!("invalid Paimon read type: {e}")))?;
+        for field in read_type.fields() {
+            let source = slf
+                .table
+                .schema()
+                .fields()
+                .iter()
+                .find(|source| source.id() == field.id());
+            if let (Some(source), DataType::Row(row)) = (source, field.data_type()) {
+                if matches!(source.data_type(), DataType::Variant(_))
+                    && is_variant_extraction_row(row)
+                    && row
+                        .fields()
+                        .iter()
+                        .any(|child| !matches!(child.data_type(), DataType::Float(_)))
+                {
+                    return Err(PyValueError::new_err(
+                        "Variant extraction target type must be float32",
+                    ));
+                }
+            }
+        }
+        slf.read_type = Some(read_type.fields().to_vec());
+        slf.projection = None;
+        Ok(slf)
     }
 
     /// Project top-level fields or nested ROW leaves by their exact name paths.
@@ -551,8 +590,10 @@ impl PyTableScan {
         let mut builder = self.table.new_read_builder();
         apply_read_config(
             &mut builder,
-            &self.projection,
-            &self.read_type,
+            PyReadProjection {
+                columns: &self.projection,
+                read_type: &self.read_type,
+            },
             self.limit,
             &self.filter,
             self.case_sensitive,
@@ -665,8 +706,10 @@ impl PyTableRead {
             let mut builder = self.table.new_read_builder();
             apply_read_config(
                 &mut builder,
-                &self.projection,
-                &self.read_type,
+                PyReadProjection {
+                    columns: &self.projection,
+                    read_type: &self.read_type,
+                },
                 self.limit,
                 &self.filter,
                 self.case_sensitive,
