@@ -1080,3 +1080,50 @@ func TestPredicateBuilderCaseSensitivity(t *testing.T) {
 		})
 	}
 }
+
+// TestPredicateBuilderStringAndRange exercises the string and range predicates
+// (StartsWith / EndsWith / Contains / Like / Between / NotBetween) added for
+// parity with the C and Python bindings. simple_log_table holds
+// (1,'alice'), (2,'bob'), (3,'carol').
+func TestPredicateBuilderStringAndRange(t *testing.T) {
+	table := openTestTable(t)
+	pb := table.PredicateBuilder()
+
+	for _, tc := range []struct {
+		name  string
+		build func() (*paimon.Predicate, error)
+		want  []int32
+	}{
+		{"StartsWith", func() (*paimon.Predicate, error) { return pb.StartsWith("name", "a") }, []int32{1}},
+		{"EndsWith", func() (*paimon.Predicate, error) { return pb.EndsWith("name", "b") }, []int32{2}},
+		{"Contains", func() (*paimon.Predicate, error) { return pb.Contains("name", "ro") }, []int32{3}},
+		{"Like", func() (*paimon.Predicate, error) { return pb.Like("name", "b%") }, []int32{2}},
+		{"Between", func() (*paimon.Predicate, error) { return pb.Between("id", int32(1), int32(2)) }, []int32{1, 2}},
+		{"NotBetween", func() (*paimon.Predicate, error) { return pb.NotBetween("id", int32(1), int32(2)) }, []int32{3}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pred, err := tc.build()
+			if err != nil {
+				t.Fatalf("Failed to create predicate: %v", err)
+			}
+			defer pred.Close()
+
+			rb, err := table.NewReadBuilder()
+			if err != nil {
+				t.Fatalf("Failed to create read builder: %v", err)
+			}
+			defer rb.Close()
+			if err := rb.WithFilter(pred); err != nil {
+				t.Fatalf("WithFilter failed: %v", err)
+			}
+			var ids []int32
+			for _, r := range readRows(t, rb) {
+				ids = append(ids, r.id)
+			}
+			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+			if !reflect.DeepEqual(ids, tc.want) {
+				t.Fatalf("Expected IDs %v, got %v", tc.want, ids)
+			}
+		})
+	}
+}
