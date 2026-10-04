@@ -41,6 +41,8 @@ use std::sync::MutexGuard;
 use super::AzdlsStorageConfig;
 #[cfg(feature = "storage-jindo")]
 use super::JindoStorageConfig;
+#[cfg(feature = "storage-oss-cpp")]
+use super::OssCppStorageConfig;
 #[cfg(feature = "storage-oss")]
 use super::OssStorageConfig;
 use opendal::Operator;
@@ -70,6 +72,11 @@ use super::FileIOBuilder;
 /// The storage carries all supported storage services in paimon
 #[derive(Debug)]
 pub enum Storage {
+    #[cfg(feature = "storage-oss-cpp")]
+    OssCpp {
+        config: Box<OssCppStorageConfig>,
+        operators: Mutex<HashMap<String, Operator>>,
+    },
     /// A caller-provided opendal operator, explicitly scoped to filesystem semantics
     /// (see `FileIOBuilder::with_fs_operator`).
     CustomFs { op: Operator },
@@ -142,6 +149,20 @@ impl Storage {
             }),
             #[cfg(feature = "storage-oss")]
             "oss" => {
+                if props
+                    .get("fs.oss.impl")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("cpp"))
+                {
+                    #[cfg(feature = "storage-oss-cpp")]
+                    return Ok(Self::OssCpp {
+                        config: Box::new(super::oss_cpp_config_parse(props)?),
+                        operators: Mutex::new(HashMap::new()),
+                    });
+                    #[cfg(not(feature = "storage-oss-cpp"))]
+                    return Err(error::Error::IoUnsupported {
+                        message: "OSS C++ SDK requires the storage-oss-cpp feature".to_string(),
+                    });
+                }
                 #[cfg(feature = "storage-jindo")]
                 if super::use_jindo(&props)? {
                     let config = super::jindo_config_parse(props)?;
@@ -258,6 +279,15 @@ impl Storage {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "OSS", &["oss"])?;
                 let op = Self::cached_oss_operator(config, operators, path, &bucket)?;
+                Ok((op, Cow::Borrowed(relative_path)))
+            }
+            #[cfg(feature = "storage-oss-cpp")]
+            Storage::OssCpp { config, operators } => {
+                let (bucket, relative_path) =
+                    Self::bucket_and_relative_path(path, "OSS C++", &["oss"])?;
+                let op = Self::cached_operator(operators, "OSS C++", &bucket, || {
+                    super::oss_cpp_config_build(config, &bucket)
+                })?;
                 Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-jindo")]
@@ -692,6 +722,16 @@ mod fs_relative_path_tests {
 #[cfg(all(test, feature = "storage-memory"))]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "storage-oss", not(feature = "storage-oss-cpp")))]
+    #[test]
+    fn oss_cpp_without_feature_does_not_fall_back() {
+        let result = Storage::build(FileIOBuilder::new("oss").with_props(HashMap::from([(
+            "fs.oss.impl".to_string(),
+            "cpp".to_string(),
+        )])));
+        assert!(matches!(result, Err(error::Error::IoUnsupported { .. })));
+    }
 
     fn memory_operator() -> Operator {
         Operator::from_config(opendal::services::MemoryConfig::default()).unwrap()

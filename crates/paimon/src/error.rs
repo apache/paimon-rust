@@ -19,6 +19,8 @@ use snafu::prelude::*;
 
 pub(crate) const JINDO_FORK_ERROR: &str =
     "Jindo SDK cannot be reused after process fork; use spawn or avoid initializing Jindo in the parent process";
+pub(crate) const OSS_CPP_FORK_ERROR: &str =
+    "OSS C++ SDK cannot be used after fork; use spawn workers";
 
 /// Result type used in paimon.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -150,8 +152,7 @@ impl Error {
         source: opendal::Error,
         message: impl Into<String>,
     ) -> Self {
-        if source.kind() == opendal::ErrorKind::Unsupported && source.message() == JINDO_FORK_ERROR
-        {
+        if is_native_fork_error(&source) {
             return Error::ProcessForkUnsupported {
                 message: source.message().to_string(),
             };
@@ -170,7 +171,7 @@ impl Error {
             Error::DataInvalid { source, .. } | Error::UnexpectedError { source, .. } => source
                 .as_deref()
                 .is_some_and(|source| error_chain_contains_process_fork(source)),
-            Error::IoUnexpected { source, .. } => is_jindo_fork_error(source),
+            Error::IoUnexpected { source, .. } => is_native_fork_error(source),
             Error::DataUnexpected { source, .. } => error_chain_contains_process_fork(source),
             Error::ParquetDataUnexpected { source, .. } => {
                 error_chain_contains_process_fork(source)
@@ -211,8 +212,9 @@ fn error_chain_contains_io_unexpected(error: &(dyn std::error::Error + 'static))
         .is_some_and(error_chain_contains_io_unexpected)
 }
 
-fn is_jindo_fork_error(error: &opendal::Error) -> bool {
-    error.kind() == opendal::ErrorKind::Unsupported && error.message() == JINDO_FORK_ERROR
+fn is_native_fork_error(error: &opendal::Error) -> bool {
+    error.kind() == opendal::ErrorKind::Unsupported
+        && matches!(error.message(), JINDO_FORK_ERROR | OSS_CPP_FORK_ERROR)
 }
 
 fn error_chain_contains_process_fork(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -220,7 +222,7 @@ fn error_chain_contains_process_fork(error: &(dyn std::error::Error + 'static)) 
         return error.is_process_fork_unsupported();
     }
     if let Some(error) = error.downcast_ref::<opendal::Error>() {
-        return is_jindo_fork_error(error);
+        return is_native_fork_error(error);
     }
     if let Some(error) = error.downcast_ref::<std::io::Error>() {
         if error
@@ -280,10 +282,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preserves_jindo_fork_error_kind() {
+    fn preserves_native_fork_error_kind() {
+        for message in [JINDO_FORK_ERROR, OSS_CPP_FORK_ERROR] {
+            let error: Error = opendal::Error::new(opendal::ErrorKind::Unsupported, message).into();
+            assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+        }
         let error: Error =
-            opendal::Error::new(opendal::ErrorKind::Unsupported, JINDO_FORK_ERROR).into();
-        assert!(matches!(error, Error::ProcessForkUnsupported { .. }));
+            opendal::Error::new(opendal::ErrorKind::Unexpected, OSS_CPP_FORK_ERROR).into();
+        assert!(!error.is_process_fork_unsupported());
     }
 
     #[test]
@@ -309,17 +315,19 @@ mod tests {
 
     #[test]
     fn detects_wrapped_process_fork_error() {
-        let error = Error::UnexpectedError {
-            message: "outer context".to_string(),
-            source: Some(Box::new(Error::IoUnexpected {
-                message: "storage context".to_string(),
-                source: Box::new(opendal::Error::new(
-                    opendal::ErrorKind::Unsupported,
-                    JINDO_FORK_ERROR,
-                )),
-            })),
-        };
+        for message in [JINDO_FORK_ERROR, OSS_CPP_FORK_ERROR] {
+            let error = Error::UnexpectedError {
+                message: "outer context".to_string(),
+                source: Some(Box::new(Error::IoUnexpected {
+                    message: "storage context".to_string(),
+                    source: Box::new(opendal::Error::new(
+                        opendal::ErrorKind::Unsupported,
+                        message,
+                    )),
+                })),
+            };
 
-        assert!(error.is_process_fork_unsupported());
+            assert!(error.is_process_fork_unsupported());
+        }
     }
 }

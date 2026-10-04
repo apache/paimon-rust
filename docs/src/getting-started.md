@@ -45,6 +45,7 @@ Available storage features:
 | `storage-s3`     | Amazon S3        |
 | `storage-oss`    | Alibaba Cloud OSS|
 | `storage-jindo`  | Alibaba Cloud OSS through JindoSDK |
+| `storage-oss-cpp` | Alibaba Cloud OSS through C++ SDK v2 (read-only) |
 | `storage-cos`    | Tencent Cloud COS |
 | `storage-azdls`  | Azure Data Lake Storage Gen2 |
 | `storage-obs`    | Huawei Cloud OBS |
@@ -313,6 +314,12 @@ default. Set `fs.jindo.max.concurrent.reads` to a positive integer to tune this
 limit for the available network and JindoSDK connection capacity. JindoSDK state
 initialized before `fork` cannot be reused in the child; use `spawn` or initialize
 Jindo only after worker processes start.
+
+With `storage-oss-cpp`, set `fs.oss.impl=cpp` and
+`fs.oss.cpp.library.path` to the installed bridge library. This experimental
+backend supports stat, reads and listings, with 8 concurrent requests per
+operator by default. OpenDAL remains the default backend.
+See the [build instructions and options](https://github.com/apache/paimon-rust/tree/main/integrations/oss-cpp).
 
 Supported metastore types:
 
