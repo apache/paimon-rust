@@ -228,6 +228,34 @@ pub(crate) fn reject_noncanonical_fields(
     Ok(())
 }
 
+/// A strict `variant_get` in the read type casts every stored row, the ones the
+/// rules drop included; Java Spark keeps it above the scan.
+pub(crate) fn reject_throwing_extractions(
+    read_type: &[crate::spec::DataField],
+) -> crate::Result<()> {
+    use crate::spec::{is_variant_extraction_row, parse_variant_metadata, DataType};
+    fn throws(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Row(row) if is_variant_extraction_row(row) => {
+                row.fields().iter().any(|field| {
+                    field.description().is_none_or(|description| {
+                        parse_variant_metadata(description).map_or(true, |m| m.fail_on_error())
+                    })
+                })
+            }
+            DataType::Row(row) => row.fields().iter().any(|field| throws(field.data_type())),
+            _ => false,
+        }
+    }
+    match read_type.iter().find(|field| throws(field.data_type())) {
+        Some(field) => Err(unsupported(&format!(
+            "a Variant extraction on '{}' that can fail would run before the server's rules",
+            field.name()
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Readers resolve a leaf by `index` or by `column`, so a scope checked by name
 /// holds only if both, and the type, name one field of `fields`.
 pub(crate) fn reject_noncanonical_leaves(

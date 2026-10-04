@@ -30,7 +30,7 @@ use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use paimon::api::{AuthTableQueryResponse, ConfigResponse};
 use paimon::catalog::{Catalog, Identifier, RESTCatalog};
-use paimon::spec::{DataType, IntType, Schema, VarCharType};
+use paimon::spec::{DataType, IntType, Schema, VarCharType, VariantType};
 use paimon::{CatalogOptions, FileSystemCatalog, Options};
 use paimon_datafusion::SQLContext;
 use serde_json::json;
@@ -246,4 +246,111 @@ async fn test_query_auth_explain_shows_the_restriction_but_not_the_files() {
     .to_string();
     assert!(plan.contains("query-auth=restricted"), "{plan}");
     assert!(!plan.contains("files="), "{plan}");
+}
+
+/// Rows `(1, {"x":"bad"})` and `(2, {"x":1.5})`, served under the rule `id > 1`.
+async fn restricted_variants() -> (tempfile::TempDir, RESTServer, SQLContext) {
+    let schema = |options: &[(&str, &str)]| {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Variant(VariantType::new()));
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fs_options = Options::new();
+    fs_options.set(
+        CatalogOptions::WAREHOUSE,
+        format!("file://{}", tmp.path().display()),
+    );
+    let fs_catalog = Arc::new(FileSystemCatalog::new(fs_options).unwrap());
+    fs_catalog
+        .create_database("default", true, HashMap::new())
+        .await
+        .unwrap();
+    let identifier = Identifier::new("default", "vguard");
+    fs_catalog
+        .create_table(&identifier, schema(&[]), false)
+        .await
+        .unwrap();
+    let mut writer = SQLContext::new();
+    writer
+        .register_catalog("paimon", fs_catalog.clone())
+        .await
+        .unwrap();
+    common::exec(
+        &writer,
+        r#"INSERT INTO paimon.default.vguard
+           SELECT 1, parse_json('{"x":"bad"}') UNION ALL SELECT 2, parse_json('{"x":1.5}')"#,
+    )
+    .await;
+    let location = fs_catalog
+        .get_table(&identifier)
+        .await
+        .unwrap()
+        .location()
+        .to_string();
+
+    let server = start_mock_server(
+        "test_warehouse".to_string(),
+        tmp.path().to_string_lossy().into_owned(),
+        ConfigResponse::new(HashMap::from([(
+            CatalogOptions::PREFIX.to_string(),
+            "mock-test".to_string(),
+        )])),
+        vec!["default".to_string()],
+    )
+    .await;
+    server.add_table_with_schema(
+        "default",
+        "vguard",
+        schema(&[("query-auth.enabled", "true")]),
+        &location,
+    );
+    server.set_auth_response(
+        "default",
+        "vguard",
+        AuthTableQueryResponse {
+            filter: Some(vec![json!({
+                "kind": "LEAF",
+                "transform": {
+                    "name": "FIELD_REF",
+                    "fieldRef": {"index": 0, "name": "id", "type": "INT"},
+                },
+                "function": "GREATER_THAN",
+                "literals": [1],
+            })
+            .to_string()]),
+            column_masking: None,
+        },
+    );
+    let mut options = Options::new();
+    options.set(CatalogOptions::URI, server.url().unwrap());
+    options.set(CatalogOptions::WAREHOUSE, "test_warehouse");
+    options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
+    options.set(CatalogOptions::TOKEN, "test-token");
+    let catalog = Arc::new(RESTCatalog::new(options, true).await.unwrap());
+    let mut context = SQLContext::new();
+    context.register_catalog("paimon", catalog).await.unwrap();
+    (tmp, server, context)
+}
+
+/// Pushed into the scan, `variant_get` would cast `{"x":"bad"}`, the row the rule drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_query_auth_variant_get_runs_on_the_admitted_rows_only() {
+    let (_tmp, _server, context) = restricted_variants().await;
+
+    let value = single(
+        &query(
+            &context,
+            "SELECT variant_get(payload, '$.x', 'FLOAT') FROM paimon.default.vguard",
+        )
+        .await,
+    );
+    assert_eq!(
+        datafusion::arrow::util::display::array_value_to_string(&value, 0).unwrap(),
+        "1.5"
+    );
 }

@@ -1080,6 +1080,7 @@ impl<'a> PaimonTableRead<'a> {
 
         let schema_fields = self.table.schema().fields().to_vec();
         let rules = grant.rules();
+        super::query_auth::reject_throwing_extractions(&self.read_type)?;
         let index_of = |field: &DataField| schema_fields.iter().position(|s| s.id() == field.id());
         let needed = rules.filter_columns();
         // A partly projected column would feed the filter a partial value (Java
@@ -2574,6 +2575,46 @@ mod tests {
                 },
             },
         )
+    }
+
+    #[tokio::test]
+    async fn test_a_restricted_read_refuses_a_variant_extraction_that_can_fail() {
+        use crate::spec::{
+            variant_extraction_row, DataField, DataType, FloatType, IntType, Schema, TableSchema,
+            VariantType,
+        };
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("payload", DataType::Variant(VariantType::new()))
+            .option("query-auth.enabled", "true")
+            .build()
+            .unwrap();
+        let table = Table {
+            schema: TableSchema::new(0, &schema),
+            ..crate::table::rest_query_auth_table().await
+        };
+        // `variant_get(payload, '$.x', 'FLOAT')` pushed into the read, strict or not.
+        let read = |fail_on_error| {
+            let extraction = variant_extraction_row(
+                true,
+                [(
+                    DataType::Float(FloatType::new()),
+                    "$.x".to_string(),
+                    fail_on_error,
+                    "UTC".to_string(),
+                )],
+            )
+            .unwrap();
+            let payload = DataField::new(1, "payload".to_string(), DataType::Row(extraction));
+            TableRead::new(&table, vec![payload], Vec::new())
+        };
+        let split = split_with_grant(Some(grant_for(&table, true)));
+        assert!(
+            matches!(read(true).to_arrow(std::slice::from_ref(&split)), Err(crate::Error::Unsupported { ref message })
+                if message.contains("Variant extraction")),
+            "a strict cast would run on the rows the rules drop"
+        );
+        assert!(read(false).to_arrow(&[split]).is_ok());
     }
 
     #[tokio::test]
