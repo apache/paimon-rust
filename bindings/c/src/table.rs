@@ -32,7 +32,8 @@ use crate::file_io::file_io_ref;
 use crate::result::{
     paimon_result_get_table, paimon_result_latest_snapshot, paimon_result_new_read,
     paimon_result_next_batch, paimon_result_plan, paimon_result_predicate,
-    paimon_result_read_builder, paimon_result_record_batch_reader, paimon_result_table_scan,
+    paimon_result_read_builder, paimon_result_record_batch_reader, paimon_result_string_list,
+    paimon_result_table_scan,
 };
 use crate::runtime;
 use crate::types::*;
@@ -367,6 +368,38 @@ pub unsafe extern "C" fn paimon_table_latest_snapshot(
         },
         Err(error) => paimon_result_latest_snapshot {
             snapshot: paimon_bytes::empty(),
+            error: paimon_error::from_paimon(error),
+        },
+    }
+}
+
+/// List the table's tag names in ascending order, honoring the table's branch
+/// scope. Mirrors Python's `Table.list_tags`; the DataFusion `$tags` system
+/// table already exposes this for SQL callers, so only the binding lacked it.
+///
+/// On success `error` is null and `string_list` owns the tag names; free it with
+/// `paimon_string_list_free`. On error `string_list` is empty.
+///
+/// # Safety
+/// `table` must be a valid pointer from a previous paimon C call.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_table_list_tags(
+    table: *const paimon_table,
+) -> paimon_result_string_list {
+    if let Err(error) = check_non_null(table, "table") {
+        return paimon_result_string_list {
+            string_list: paimon_string_list::empty(),
+            error,
+        };
+    }
+    let table = &*((*table).inner as *const Table);
+    match runtime().block_on(table.tag_manager().list_all_names()) {
+        Ok(names) => paimon_result_string_list {
+            string_list: paimon_string_list::from_strings(names),
+            error: std::ptr::null_mut(),
+        },
+        Err(error) => paimon_result_string_list {
+            string_list: paimon_string_list::empty(),
             error: paimon_error::from_paimon(error),
         },
     }

@@ -1062,6 +1062,62 @@ fn test_catalog_list_databases_and_tables() {
 }
 
 #[test]
+fn test_table_list_tags() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut options = Options::new();
+    options.set("warehouse", temp_dir.path().to_string_lossy());
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    let identifier = Identifier::new("default", "test");
+    let table = crate::runtime().block_on(async {
+        catalog
+            .create_database("default", false, HashMap::new())
+            .await
+            .unwrap();
+        catalog
+            .create_table(&identifier, simple_schema(), false)
+            .await
+            .unwrap();
+        catalog.get_table(&identifier).await.unwrap()
+    });
+    // A tag needs a snapshot to point at.
+    write_data_rust(&table, &[make_batch(vec![1], vec!["a"])]);
+
+    unsafe {
+        let catalog = wrap_catalog(Arc::new(catalog));
+        let database = CString::new("default").unwrap();
+        let object = CString::new("test").unwrap();
+        let id = paimon_identifier_new(database.as_ptr(), object.as_ptr());
+        assert!(id.error.is_null());
+        for name in ["v1", "v2"] {
+            let tag = CString::new(name).unwrap();
+            let error =
+                paimon_catalog_create_tag(catalog, id.identifier, tag.as_ptr(), ptr::null(), false);
+            assert!(error.is_null());
+        }
+
+        // Before the fix the C/Go bindings could create and get tags by name but
+        // could not enumerate them; `$tags` exposes this for SQL only.
+        let table = wrap_table(table);
+        let result = paimon_table_list_tags(table);
+        assert!(result.error.is_null());
+        let mut names: Vec<String> = (0..result.string_list.len)
+            .map(|i| {
+                std::ffi::CStr::from_ptr(*result.string_list.items.add(i))
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["v1".to_string(), "v2".to_string()]);
+        paimon_string_list_free(result.string_list);
+        paimon_table_free(table);
+        paimon_identifier_free(id.identifier);
+        paimon_catalog_free(catalog);
+    }
+}
+
+#[test]
 fn test_catalog_tag_lifecycle() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut options = Options::new();

@@ -76,6 +76,16 @@ func (t *Table) NewReadBuilderWithOptions(options map[string]string) (*ReadBuild
 	return &ReadBuilder{ctx: t.ctx, lib: t.lib, inner: inner}, nil
 }
 
+// ListTags returns the table's tag names in ascending order, honoring the
+// table's branch scope. Mirrors Python's Table.list_tags; the DataFusion
+// `$tags` system table already exposes this for SQL callers.
+func (t *Table) ListTags() ([]string, error) {
+	if t.inner == nil {
+		return nil, ErrClosed
+	}
+	return ffiTableListTags.symbol(t.ctx)(t.inner)
+}
+
 var ffiTableFree = newFFI(ffiOpts{
 	sym:    "paimon_table_free",
 	rType:  &ffi.TypeVoid,
@@ -86,6 +96,25 @@ var ffiTableFree = newFFI(ffiOpts{
 			nil,
 			unsafe.Pointer(&table),
 		)
+	}
+})
+
+var ffiTableListTags = newFFI(ffiOpts{
+	sym:    "paimon_table_list_tags",
+	rType:  &typeResultStringList,
+	aTypes: []*ffi.Type{&ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonTable) ([]string, error) {
+	return func(table *paimonTable) ([]string, error) {
+		var result resultStringList
+		ffiCall(
+			unsafe.Pointer(&result),
+			unsafe.Pointer(&table),
+		)
+		if result.error != nil {
+			return nil, parseError(ctx, result.error)
+		}
+		defer ffiStringListFree.symbol(ctx)(result.stringList)
+		return parseStringList(result.stringList), nil
 	}
 })
 

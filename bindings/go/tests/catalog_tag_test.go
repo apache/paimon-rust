@@ -110,6 +110,55 @@ func TestCatalogTagLifecycle(t *testing.T) {
 	}
 }
 
+func TestTableListTags(t *testing.T) {
+	source := filepath.Join("testdata", "map_blob_table")
+	warehouse := t.TempDir()
+	if err := copyDirectory(source, filepath.Join(warehouse, "default.db", "map_blob_table")); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := paimon.NewCatalog(map[string]string{"warehouse": warehouse})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer catalog.Close()
+
+	id := paimon.NewIdentifier("default", "map_blob_table")
+	table, err := catalog.GetTable(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer table.Close()
+
+	// A fresh table has no tags.
+	tags, err := table.ListTags()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tags) != 0 {
+		t.Fatalf("expected no tags, got %v", tags)
+	}
+
+	for _, name := range []string{"v1", "v2"} {
+		if err := catalog.CreateTag(id, name, nil, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tags, err = table.ListTags()
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(tags)
+	if len(tags) != 2 || tags[0] != "v1" || tags[1] != "v2" {
+		t.Fatalf("ListTags = %v, want [v1 v2]", tags)
+	}
+
+	table.Close()
+	if _, err := table.ListTags(); !errors.Is(err, paimon.ErrClosed) {
+		t.Fatalf("closed table error = %v", err)
+	}
+}
+
 func TestCatalogListDatabasesAndTables(t *testing.T) {
 	source := filepath.Join("testdata", "map_blob_table")
 	warehouse := t.TempDir()
