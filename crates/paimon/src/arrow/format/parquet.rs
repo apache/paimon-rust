@@ -50,6 +50,9 @@ use parquet::file::metadata::{
     KeyValue, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
+#[allow(deprecated)] // No projection-aware replacement exists in parquet-rs yet.
+use parquet::file::page_index::index_reader::{read_columns_indexes, read_offset_indexes};
+use parquet::file::page_index::offset_index::OffsetIndexMetaData;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::statistics::Statistics as ParquetStatistics;
 use std::cmp::Ordering;
@@ -115,13 +118,9 @@ pub(crate) async fn parquet_granules(
     column_name: &str,
     page_index_enabled: bool,
 ) -> crate::Result<(Vec<ParquetGranule>, bool)> {
-    let mut options = ArrowReaderOptions::new();
-    if page_index_enabled {
-        options = options.with_offset_index_policy(PageIndexPolicy::Optional);
-    }
     let mut reader = ArrowFileReader::new(file_size, reader.into());
-    let metadata = reader.get_metadata(Some(&options)).await?;
-    let columns = metadata
+    let footer = reader.get_metadata(None).await?;
+    let columns = footer
         .file_metadata()
         .schema_descr()
         .columns()
@@ -142,6 +141,19 @@ pub(crate) async fn parquet_granules(
             source: None,
         });
     }
+    let metadata = if page_index_enabled {
+        reader
+            .get_selected_metadata(
+                footer,
+                &PageIndexColumns {
+                    column: Vec::new(),
+                    offset: columns.clone(),
+                },
+            )
+            .await?
+    } else {
+        footer
+    };
     let Some(offset_index) = metadata
         .offset_index()
         .filter(|index| index.len() == metadata.row_groups().len())
@@ -612,7 +624,7 @@ impl FormatFileReader for ParquetFormatReader {
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
         let shared_reader: Arc<dyn FileRead> = reader.into();
-        let arrow_file_reader = ArrowFileReader::new(file_size, Arc::clone(&shared_reader))
+        let mut metadata_reader = ArrowFileReader::new(file_size, Arc::clone(&shared_reader))
             .with_metadata_cache_enabled(self.metadata_cache_enabled);
 
         let empty_predicates = Vec::new();
@@ -622,20 +634,16 @@ impl FormatFileReader for ParquetFormatReader {
         };
         let row_filter_factory = predicates.and_then(|fp| fp.row_filter_factory.as_deref());
 
-        // Predicates need both indexes for page-stat pruning. Row selection only
-        // needs OffsetIndex so arrow-rs can avoid fetching unselected pages.
-        let mut arrow_options = ArrowReaderOptions::new();
-        if self.page_index_enabled {
-            if !preds.is_empty() {
-                arrow_options = arrow_options.with_column_index_policy(PageIndexPolicy::Optional);
-            }
-            if !preds.is_empty() || row_selection.is_some() {
-                arrow_options = arrow_options.with_offset_index_policy(PageIndexPolicy::Optional);
-            }
-        }
+        // Load the footer first. arrow-rs loads indexes for *every* physical
+        // column during builder creation, before with_projection can be called.
+        // Once the physical and filter projections are known, load only their
+        // page indexes below.
+        let footer = metadata_reader.get_metadata(None).await?;
+        let reader_metadata = ArrowReaderMetadata::try_new(footer, ArrowReaderOptions::new())?;
+        let arrow_file_reader = ArrowFileReader::new(file_size, Arc::clone(&shared_reader))
+            .with_metadata_cache_enabled(self.metadata_cache_enabled);
         let mut batch_stream_builder =
-            ParquetRecordBatchStreamBuilder::new_with_options(arrow_file_reader, arrow_options)
-                .await?;
+            ParquetRecordBatchStreamBuilder::new_with_metadata(arrow_file_reader, reader_metadata);
 
         let parquet_schema = batch_stream_builder.parquet_schema().clone();
 
@@ -747,6 +755,36 @@ impl FormatFileReader for ParquetFormatReader {
         let mut memory_mask = mask.clone();
         for predicate in &decoder_predicates {
             memory_mask.union(predicate.projection());
+        }
+        if self.page_index_enabled && (!preds.is_empty() || row_selection.is_some()) {
+            let index_columns = page_index_columns(
+                batch_stream_builder.metadata(),
+                &parquet_schema,
+                &memory_mask,
+                preds,
+                file_fields,
+            );
+            if !index_columns.is_empty() {
+                let footer = Arc::clone(batch_stream_builder.metadata());
+                let indexed_metadata = metadata_reader
+                    .get_selected_metadata(footer, &index_columns)
+                    .await
+                    .map_err(|error| {
+                        Error::from_parquet_with_context(
+                            error,
+                            "Failed to read Parquet page indexes",
+                        )
+                    })?;
+                let reader_metadata =
+                    ArrowReaderMetadata::try_new(indexed_metadata, ArrowReaderOptions::new())?;
+                let arrow_file_reader = ArrowFileReader::new(file_size, Arc::clone(&shared_reader))
+                    .with_metadata_cache_enabled(self.metadata_cache_enabled);
+                batch_stream_builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
+                    arrow_file_reader,
+                    reader_metadata,
+                );
+                batch_stream_builder = batch_stream_builder.with_projection(mask.clone());
+            }
         }
         // Resource-aware sequential reads build one row-group stream at a time,
         // so admission precedes its data I/O. Preserve stateful decoder filters
@@ -2477,6 +2515,7 @@ struct ParquetMetadataCacheKey {
     size: u64,
     column_index: u8,
     offset_index: u8,
+    selected: Option<PageIndexColumns>,
 }
 
 struct ParquetMetadataCache {
@@ -2507,6 +2546,7 @@ impl ParquetMetadataCache {
                 size: reader.file_size,
                 column_index: page_index_policy_tag(column_index),
                 offset_index: page_index_policy_tag(offset_index),
+                selected: None,
             });
         let key_heap_bytes = key.as_ref().map_or(0, |key| key.file.capacity());
         self.inner
@@ -2514,6 +2554,42 @@ impl ParquetMetadataCache {
                 key,
                 key_heap_bytes,
                 || reader.load_metadata(options),
+                |metadata| {
+                    metadata
+                        .memory_size()
+                        .max(PARQUET_METADATA_CACHE_MIN_ENTRY_BYTES)
+                },
+            )
+            .await
+    }
+
+    async fn load_selected(
+        &self,
+        reader: &mut ArrowFileReader,
+        footer: Arc<ParquetMetaData>,
+        columns: &PageIndexColumns,
+    ) -> parquet::errors::Result<Arc<ParquetMetaData>> {
+        let key = reader
+            .r
+            .cache_key()
+            .filter(|key| !key.is_empty())
+            .map(|file| ParquetMetadataCacheKey {
+                file: file.to_string(),
+                size: reader.file_size,
+                column_index: u8::from(!columns.column.is_empty()),
+                offset_index: u8::from(!columns.offset.is_empty()),
+                selected: Some(columns.clone()),
+            });
+        let key_heap_bytes = key.as_ref().map_or(0, |key| {
+            key.file.capacity()
+                + (columns.column.capacity() + columns.offset.capacity())
+                    * std::mem::size_of::<usize>()
+        });
+        self.inner
+            .get_or_try_insert_with(
+                key,
+                key_heap_bytes,
+                || reader.load_selected_metadata(footer, columns),
                 |metadata| {
                     metadata
                         .memory_size()
@@ -2532,6 +2608,65 @@ fn page_index_policy_tag(policy: PageIndexPolicy) -> u8 {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+struct PageIndexColumns {
+    column: Vec<usize>,
+    offset: Vec<usize>,
+}
+
+impl PageIndexColumns {
+    fn is_empty(&self) -> bool {
+        self.column.is_empty() && self.offset.is_empty()
+    }
+}
+
+fn page_index_columns(
+    metadata: &ParquetMetaData,
+    schema: &parquet::schema::types::SchemaDescriptor,
+    read_mask: &ProjectionMask,
+    predicates: &[Predicate],
+    file_fields: &[DataField],
+) -> PageIndexColumns {
+    let mut columns = PageIndexColumns::default();
+    let Some(row_group) = metadata.row_groups().first() else {
+        return columns;
+    };
+    let lookup = build_row_group_column_indices(row_group.columns(), file_fields);
+    let mut fields = Vec::new();
+    for predicate in predicates {
+        collect_leaf_field_indices(predicate, &mut fields);
+    }
+    for field in fields {
+        if let Some(Some(column)) = lookup.get(field) {
+            columns.column.push(*column);
+            columns.offset.push(*column);
+        }
+    }
+    // Row selection may skip pages in every decoded column, including columns
+    // used by an Arrow row filter but absent from the output projection.
+    columns
+        .offset
+        .extend((0..schema.num_columns()).filter(|column| read_mask.leaf_included(*column)));
+    columns.column.sort_unstable();
+    columns.column.dedup();
+    columns.offset.sort_unstable();
+    columns.offset.dedup();
+    columns
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PageIndexKind {
+    Column,
+    Offset,
+}
+
+struct PageIndexRange {
+    kind: PageIndexKind,
+    row_group: usize,
+    column: usize,
+    range: Range<u64>,
+}
+
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 ///
 /// # TODO
@@ -2546,6 +2681,7 @@ struct ArrowFileReader {
     file_size: u64,
     r: Arc<dyn FileRead>,
     metadata_cache_enabled: bool,
+    metadata_tail: Option<(Range<u64>, Bytes)>,
 }
 
 /// coalesce threshold: 1 MiB.
@@ -2579,6 +2715,7 @@ impl ArrowFileReader {
             file_size,
             r,
             metadata_cache_enabled: true,
+            metadata_tail: None,
         }
     }
 
@@ -2588,11 +2725,32 @@ impl ArrowFileReader {
     }
 
     fn read_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
-        Box::pin(
-            self.r
-                .read(range.start..range.end)
-                .map_err(|error| parquet::errors::ParquetError::External(Box::new(error))),
-        )
+        Box::pin(async move {
+            if let Some((cached, bytes)) = &self.metadata_tail {
+                if range.start >= cached.start && range.end <= cached.end {
+                    let start = usize::try_from(range.start - cached.start)?;
+                    let end = usize::try_from(range.end - cached.start)?;
+                    return Ok(bytes.slice(start..end));
+                }
+            }
+            let bytes = self
+                .r
+                .read(range.clone())
+                .await
+                .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))?;
+            if bytes.len() as u64 != range.end - range.start {
+                return Err(parquet::errors::ParquetError::General(format!(
+                    "Short Parquet metadata read for {}..{}: got {} bytes",
+                    range.start,
+                    range.end,
+                    bytes.len()
+                )));
+            }
+            if range.end == self.file_size && bytes.len() <= METADATA_SIZE_HINT {
+                self.metadata_tail = Some((range, bytes.clone()));
+            }
+            Ok(bytes)
+        })
     }
 
     async fn load_metadata(
@@ -2614,6 +2772,228 @@ impl ArrowFileReader {
         }
         Ok(Arc::new(reader.load_and_finish(self, file_size).await?))
     }
+
+    async fn get_selected_metadata(
+        &mut self,
+        footer: Arc<ParquetMetaData>,
+        columns: &PageIndexColumns,
+    ) -> parquet::errors::Result<Arc<ParquetMetaData>> {
+        if !self.metadata_cache_enabled {
+            return self.load_selected_metadata(footer, columns).await;
+        }
+        let Some(context) = self
+            .r
+            .file_format_metadata_cache()
+            .and_then(|cache| cache.downcast_ref::<crate::io::FileFormatMetadataCacheContext>())
+        else {
+            return self.load_selected_metadata(footer, columns).await;
+        };
+        if context.max_bytes() == 0 {
+            return self.load_selected_metadata(footer, columns).await;
+        }
+        context
+            .get_or_init(ParquetMetadataCache::new)
+            .load_selected(self, footer, columns)
+            .await
+    }
+
+    // arrow-rs has no projection-aware page-index loader. Fetch only the
+    // selected column chunks, then build the same nested metadata shape its
+    // reader expects. This leaves the immutable footer/cache unchanged.
+    #[allow(deprecated)]
+    async fn load_selected_metadata(
+        &mut self,
+        footer: Arc<ParquetMetaData>,
+        columns: &PageIndexColumns,
+    ) -> parquet::errors::Result<Arc<ParquetMetaData>> {
+        let row_groups = footer.row_groups();
+        if row_groups.is_empty() {
+            return Ok(footer);
+        }
+        let mut requests = Vec::new();
+        for (rg_idx, row_group) in row_groups.iter().enumerate() {
+            for &col_idx in &columns.offset {
+                let chunk = row_group.columns().get(col_idx).ok_or_else(|| {
+                    parquet::errors::ParquetError::General(
+                        "Parquet row group has fewer columns than its schema".to_string(),
+                    )
+                })?;
+                let Some(range) = checked_page_index_range(
+                    chunk.offset_index_offset(),
+                    chunk.offset_index_length(),
+                    self.file_size,
+                ) else {
+                    // An optional OffsetIndex is all-or-nothing in arrow-rs.
+                    // Without it, neither page skipping nor page-stat pruning
+                    // is possible; keep the footer and read full chunks.
+                    return Ok(footer);
+                };
+                requests.push(PageIndexRange {
+                    kind: PageIndexKind::Offset,
+                    row_group: rg_idx,
+                    column: col_idx,
+                    range,
+                });
+            }
+            for &col_idx in &columns.column {
+                let chunk = row_group.columns().get(col_idx).ok_or_else(|| {
+                    parquet::errors::ParquetError::General(
+                        "Parquet row group has fewer columns than its schema".to_string(),
+                    )
+                })?;
+                if let Some(range) = checked_page_index_range(
+                    chunk.column_index_offset(),
+                    chunk.column_index_length(),
+                    self.file_size,
+                ) {
+                    requests.push(PageIndexRange {
+                        kind: PageIndexKind::Column,
+                        row_group: rg_idx,
+                        column: col_idx,
+                        range,
+                    });
+                }
+            }
+        }
+        if requests.is_empty() {
+            return Ok(footer);
+        }
+        requests.sort_by_key(|request| request.range.start);
+        for request in &requests {
+            log::trace!(
+                "Parquet page index: kind={:?}, row_group={}, column={}, path={}, bytes={}",
+                request.kind,
+                request.row_group,
+                request.column,
+                row_groups[request.row_group]
+                    .column(request.column)
+                    .column_path()
+                    .string(),
+                request.range.end - request.range.start,
+            );
+        }
+        let mut bytes = vec![None; requests.len()];
+        let mut uncached_ranges = Vec::new();
+        let mut uncached_positions = Vec::new();
+        for (position, request) in requests.iter().enumerate() {
+            if let Some((tail_range, tail)) = &self.metadata_tail {
+                if request.range.start >= tail_range.start && request.range.end <= tail_range.end {
+                    let start = usize::try_from(request.range.start - tail_range.start)?;
+                    let end = usize::try_from(request.range.end - tail_range.start)?;
+                    bytes[position] = Some(tail.slice(start..end));
+                    continue;
+                }
+            }
+            uncached_ranges.push(request.range.clone());
+            uncached_positions.push(position);
+        }
+        if log::log_enabled!(log::Level::Trace) {
+            let fetch_ranges = split_ranges_for_concurrency(
+                merge_byte_ranges(&uncached_ranges, RANGE_COALESCE_BYTES),
+                RANGE_FETCH_CONCURRENCY,
+            );
+            let bytes: u64 = fetch_ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum();
+            log::trace!(
+                "Parquet page indexes: selected={}, footer_prefetch_hits={}, range_requests={}, range_bytes={}",
+                requests.len(),
+                requests.len() - uncached_ranges.len(),
+                fetch_ranges.len(),
+                bytes,
+            );
+        }
+        for (position, data) in uncached_positions
+            .into_iter()
+            .zip(self.get_byte_ranges(uncached_ranges).await?)
+        {
+            bytes[position] = Some(data);
+        }
+        let mut column_index = (!columns.column.is_empty()).then(|| {
+            row_groups
+                .iter()
+                .map(|rg| vec![ColumnIndexMetaData::NONE; rg.num_columns()])
+                .collect::<Vec<_>>()
+        });
+        let mut offset_index = (!columns.offset.is_empty()).then(|| {
+            row_groups
+                .iter()
+                .map(|rg| {
+                    vec![
+                        OffsetIndexMetaData {
+                            page_locations: Vec::new(),
+                            unencoded_byte_array_data_bytes: None,
+                        };
+                        rg.num_columns()
+                    ]
+                })
+                .collect::<Vec<_>>()
+        });
+        for (request, data) in requests.iter().zip(bytes) {
+            let data = data.ok_or_else(|| {
+                parquet::errors::ParquetError::General(
+                    "Missing selected Parquet page-index data".to_string(),
+                )
+            })?;
+            let chunk = row_groups[request.row_group].column(request.column).clone();
+            let size = i32::try_from(data.len())?;
+            match request.kind {
+                PageIndexKind::Column => {
+                    let chunk = chunk
+                        .into_builder()
+                        .set_column_index_offset(Some(0))
+                        .set_column_index_length(Some(size))
+                        .build()?;
+                    let decoded = read_columns_indexes(&data, &[chunk])?
+                        .and_then(|mut entries| entries.pop())
+                        .ok_or_else(|| {
+                            parquet::errors::ParquetError::General(
+                                "Missing selected Parquet ColumnIndex".to_string(),
+                            )
+                        })?;
+                    column_index.as_mut().unwrap()[request.row_group][request.column] = decoded;
+                }
+                PageIndexKind::Offset => {
+                    let chunk = chunk
+                        .into_builder()
+                        .set_offset_index_offset(Some(0))
+                        .set_offset_index_length(Some(size))
+                        .build()?;
+                    let decoded = match read_offset_indexes(&data, &[chunk]) {
+                        Ok(Some(mut entries)) => entries.pop(),
+                        // PageIndexPolicy::Optional in arrow-rs invalidates all
+                        // offset indexes when one cannot be decoded. Preserve
+                        // that fail-open behavior without hiding read errors.
+                        Ok(None) | Err(_) => return Ok(footer),
+                    };
+                    let Some(decoded) = decoded else {
+                        return Ok(footer);
+                    };
+                    offset_index.as_mut().unwrap()[request.row_group][request.column] = decoded;
+                }
+            }
+        }
+        let indexed = footer
+            .as_ref()
+            .clone()
+            .into_builder()
+            .set_column_index(column_index)
+            .set_offset_index(offset_index)
+            .build();
+        Ok(Arc::new(indexed))
+    }
+}
+
+fn checked_page_index_range(
+    offset: Option<i64>,
+    length: Option<i32>,
+    size: u64,
+) -> Option<Range<u64>> {
+    let start = u64::try_from(offset?).ok()?;
+    let length = u64::try_from(length?).ok()?;
+    let end = start.checked_add(length)?;
+    (length > 0 && end <= size).then_some(start..end)
 }
 
 impl MetadataFetch for ArrowFileReader {
@@ -4766,6 +5146,269 @@ mod tests {
             enabled_bytes * 2 < disabled_bytes,
             "page-index read used {enabled_bytes} bytes; disabled read used {disabled_bytes} bytes"
         );
+    }
+
+    async fn write_wide_indexed_parquet() -> Vec<u8> {
+        let fields = std::iter::once(ArrowField::new("id", ArrowDataType::Int32, false))
+            .chain(std::iter::once(ArrowField::new(
+                "key2",
+                ArrowDataType::Int32,
+                false,
+            )))
+            .chain((0..16).map(|index| {
+                ArrowField::new(format!("unused_{index}"), ArrowDataType::Int32, false)
+            }))
+            .collect::<Vec<_>>();
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_offset_index_disabled(false)
+            .set_dictionary_enabled(false)
+            .set_data_page_row_count_limit(16)
+            .set_write_batch_size(16)
+            .set_max_row_group_row_count(Some(128))
+            .build();
+        let mut buf = Vec::new();
+        let mut writer = AsyncArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+        for group in 0..3 {
+            let columns = (0..schema.fields().len())
+                .map(|column| {
+                    Arc::new(Int32Array::from_iter_values((0..128).map(|row| {
+                        let id = group * 128 + row;
+                        if column == 0 {
+                            id
+                        } else if column == 1 {
+                            id * 2
+                        } else {
+                            id + column as i32
+                        }
+                    }))) as arrow_array::ArrayRef
+                })
+                .collect::<Vec<_>>();
+            writer
+                .write(&RecordBatch::try_new(schema.clone(), columns).unwrap())
+                .await
+                .unwrap();
+        }
+        writer.close().await.unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_page_indexes_follow_projection_and_filter_across_row_groups() {
+        let data = Bytes::from(write_wide_indexed_parquet().await);
+        let fields = (0..18)
+            .map(|index| {
+                let name = match index {
+                    0 => "id".to_string(),
+                    1 => "key2".to_string(),
+                    _ => format!("unused_{index_minus_two}", index_minus_two = index - 2),
+                };
+                DataField::new(index, name, DataType::Int(IntType::new()))
+            })
+            .collect::<Vec<_>>();
+        let predicate = id_leaf(
+            PredicateOperator::In,
+            vec![Datum::Int(17), Datum::Int(145), Datum::Int(273)],
+        );
+        let predicates = FilePredicates {
+            predicates: vec![predicate.clone()],
+            row_filter_factory: None,
+            file_fields: fields.clone(),
+        };
+
+        let tracker = TrackingFileRead::new(data.clone());
+        let mut metadata_reader =
+            super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+        let footer = metadata_reader.get_metadata(None).await.unwrap();
+        assert_eq!(footer.row_groups().len(), 3);
+        let schema = footer.file_metadata().schema_descr();
+        let mask = super::ProjectionMask::roots(schema, [0, 1]);
+        let selected = super::page_index_columns(&footer, schema, &mask, &[predicate], &fields);
+        assert_eq!(selected.column, vec![0]);
+        assert_eq!(selected.offset, vec![0, 1]);
+        let indexed = metadata_reader
+            .get_selected_metadata(footer, &selected)
+            .await
+            .unwrap();
+        // All selected index ranges fit in the footer prefetch; don't issue
+        // another physical read merely because decoding is now selective.
+        assert_eq!(tracker.read_count(), 1);
+        for row_group in 0..3 {
+            let column_index = &indexed.column_index().unwrap()[row_group];
+            let offset_index = &indexed.offset_index().unwrap()[row_group];
+            assert!(!matches!(column_index[0], super::ColumnIndexMetaData::NONE));
+            assert!(!offset_index[0].page_locations().is_empty());
+            assert!(!offset_index[1].page_locations().is_empty());
+            for column in 2..18 {
+                assert!(matches!(
+                    column_index[column],
+                    super::ColumnIndexMetaData::NONE
+                ));
+                assert!(offset_index[column].page_locations().is_empty());
+            }
+        }
+
+        let mut results = Vec::new();
+        for projection in [&fields[..2], &fields[..]] {
+            let stream = ParquetFormatReader::default()
+                .read_batch_stream(
+                    Box::new(TrackingFileRead::new(data.clone())),
+                    data.len() as u64,
+                    projection,
+                    Some(&predicates),
+                    Some(64),
+                    None,
+                )
+                .await
+                .unwrap();
+            let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+            let rows = batches
+                .iter()
+                .flat_map(|batch| {
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    let key2 = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap();
+                    (0..batch.num_rows())
+                        .map(|row| (ids.value(row), key2.value(row)))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            results.push(rows);
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0], vec![(17, 34), (145, 290), (273, 546)]);
+
+        let stream = ParquetFormatReader::default()
+            .read_batch_stream(
+                Box::new(TrackingFileRead::new(data.clone())),
+                data.len() as u64,
+                &fields[..2],
+                None,
+                Some(64),
+                Some(vec![
+                    RowRange::new(17, 17),
+                    RowRange::new(145, 145),
+                    RowRange::new(273, 273),
+                ]),
+            )
+            .await
+            .unwrap();
+        let selected_rows = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                (0..batch.num_rows())
+                    .map(|row| ids.value(row))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(selected_rows, vec![17, 145, 273]);
+
+        let (granules, used_pages) = parquet_granules(
+            Box::new(TrackingFileRead::new(data.clone())),
+            data.len() as u64,
+            "id",
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(used_pages);
+        assert_eq!(
+            granules
+                .iter()
+                .map(|granule| granule.row_count)
+                .sum::<i64>(),
+            384
+        );
+    }
+
+    #[tokio::test]
+    async fn test_selected_indexes_fail_open_when_one_offset_index_is_missing() {
+        let data = Bytes::from(write_wide_indexed_parquet().await);
+        let tracker = TrackingFileRead::new(data.clone());
+        let mut reader = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+        let footer = reader.get_metadata(None).await.unwrap();
+        let mut builder = footer.as_ref().clone().into_builder();
+        let mut row_groups = builder.take_row_groups();
+        let mut group = row_groups.remove(1).into_builder();
+        let mut chunks = group.take_columns();
+        chunks[1] = chunks[1]
+            .clone()
+            .into_builder()
+            .set_offset_index_offset(None)
+            .set_offset_index_length(None)
+            .build()
+            .unwrap();
+        row_groups.insert(1, group.set_column_metadata(chunks).build().unwrap());
+        let footer = Arc::new(builder.set_row_groups(row_groups).build());
+        tracker.reset();
+        let metadata = reader
+            .load_selected_metadata(
+                footer,
+                &super::PageIndexColumns {
+                    column: vec![0],
+                    offset: vec![0, 1],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(metadata.column_index().is_none());
+        assert!(metadata.offset_index().is_none());
+        assert_eq!(tracker.read_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_selected_index_cache_keeps_projection_coverage_separate() {
+        let data = Bytes::from(write_wide_indexed_parquet().await);
+        let tracker = TrackingFileRead::new(data.clone()).with_cache_key("wide-indexed.parquet");
+        let mut first = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+        let footer = first.get_metadata(None).await.unwrap();
+        let narrow = super::PageIndexColumns {
+            column: vec![0],
+            offset: vec![0, 1],
+        };
+        first.get_selected_metadata(footer, &narrow).await.unwrap();
+
+        tracker.reset();
+        let mut second = super::ArrowFileReader::new(data.len() as u64, Arc::new(tracker.clone()));
+        let footer = second.get_metadata(None).await.unwrap();
+        second
+            .get_selected_metadata(footer.clone(), &narrow)
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker.read_count(),
+            0,
+            "identical projection must hit cache"
+        );
+
+        let wide = super::PageIndexColumns {
+            column: vec![0],
+            offset: (0..18).collect(),
+        };
+        let metadata = second.get_selected_metadata(footer, &wide).await.unwrap();
+        assert!(
+            tracker.read_count() > 0,
+            "wider projection must not hit narrow entry"
+        );
+        assert!(!metadata.offset_index().unwrap()[0][17]
+            .page_locations()
+            .is_empty());
     }
 
     #[derive(Clone)]
