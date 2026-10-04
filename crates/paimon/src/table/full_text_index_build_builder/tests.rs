@@ -532,7 +532,7 @@ fn test_native_options_strip_prefix_and_meta_is_sorted_flat_json() {
 }
 
 #[tokio::test]
-async fn test_execute_plans_against_the_catalog_snapshot() {
+async fn test_build_search_and_drop_through_the_catalog_snapshot() {
     use crate::api::rest_api::RESTApi;
     use crate::common::Options;
     use crate::spec::Snapshot;
@@ -592,8 +592,7 @@ async fn test_execute_plans_against_the_catalog_snapshot() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
     let identifier = Identifier::new("default", "test_table");
-    let metadata_cache =
-        crate::io::FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
+    let file_io_cache = crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap();
     let env = crate::table::RESTEnv::new(
         identifier.clone(),
         "uuid".into(),
@@ -601,7 +600,7 @@ async fn test_execute_plans_against_the_catalog_snapshot() {
         options,
         false,
         None,
-        metadata_cache,
+        file_io_cache,
     );
     let table = Table::new(
         seed.file_io().clone(),
@@ -618,12 +617,30 @@ async fn test_execute_plans_against_the_catalog_snapshot() {
         .await
         .unwrap();
     assert_eq!(file_count, 1);
-    let published = published
+    let built = published
         .lock()
         .unwrap()
         .clone()
         .expect("committed through the catalog");
-    assert_eq!(published.id(), 8, "planned against catalog snapshot 7");
-    assert!(published.index_manifest().is_some());
+    assert_eq!(built.id(), 8, "planned against catalog snapshot 7");
+    assert!(built.index_manifest().is_some());
+    assert_eq!(search(&table, "paimon").await, vec![RowRange::new(0, 0)]);
+
+    // The drop must also see catalog snapshot 8, not file system snapshot 1.
+    let dropped = table
+        .new_global_index_drop_builder()
+        .with_index_column("name")
+        .with_index_type("full-text")
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(dropped, 1);
+    let after_drop = published.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        after_drop.id(),
+        9,
+        "the drop is published through the catalog"
+    );
+    assert!(search(&table, "paimon").await.is_empty());
     server.abort();
 }

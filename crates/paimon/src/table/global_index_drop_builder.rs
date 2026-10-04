@@ -21,7 +21,7 @@ use super::global_index_types::{
     SUPPORTED_GLOBAL_INDEX_TYPES_FOR_DROP,
 };
 use crate::spec::{FileKind, IndexFileMeta, IndexManifest};
-use crate::table::{CommitMessage, SnapshotManager, Table, TableCommit};
+use crate::table::{CommitMessage, Table, TableCommit};
 use crate::{Error, Result};
 use std::collections::HashMap;
 
@@ -91,10 +91,9 @@ impl<'a> GlobalIndexDropBuilder<'a> {
             .map(|field| field.id())
             .collect::<Vec<_>>();
 
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
+        // The table's manager resolves a REST-managed table's latest snapshot
+        // through the catalog, like reads and commit validation do.
+        let snapshot_manager = self.table.snapshot_manager();
         let Some(snapshot) = snapshot_manager.get_latest_snapshot().await? else {
             return Ok(0);
         };
@@ -346,8 +345,10 @@ mod tests {
     }
 
     async fn latest_index_entries(table: &Table) -> Vec<IndexManifestEntry> {
-        let snapshot_manager =
-            SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+        let snapshot_manager = crate::table::SnapshotManager::new(
+            table.file_io().clone(),
+            table.location().to_string(),
+        );
         let snapshot = snapshot_manager
             .get_latest_snapshot()
             .await
