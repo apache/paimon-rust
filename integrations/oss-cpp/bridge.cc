@@ -30,8 +30,8 @@
 
 namespace oss = alibabacloud::oss2;
 
-static int32_t failure(PaimonOssError *error, const char *code, int status = 0,
-                       const char *request_id = "") noexcept {
+static int32_t failure(OssCppBridgeError *error, const char *code,
+                       int status = 0, const char *request_id = "") noexcept {
   error->status = status;
   std::snprintf(error->code, sizeof(error->code), "%s", code);
   std::snprintf(error->request_id, sizeof(error->request_id), "%s", request_id);
@@ -39,7 +39,7 @@ static int32_t failure(PaimonOssError *error, const char *code, int status = 0,
 }
 
 template <class F>
-static int32_t guarded(PaimonOssError *error, F fn) noexcept {
+static int32_t guarded(OssCppBridgeError *error, F fn) noexcept {
   *error = {};
   try {
     return fn();
@@ -51,15 +51,16 @@ static int32_t guarded(PaimonOssError *error, F fn) noexcept {
 }
 
 template <class E>
-static int32_t sdk_failure(PaimonOssError *error, const E &e) noexcept {
+static int32_t sdk_failure(OssCppBridgeError *error, const E &e) noexcept {
   return failure(error, e.getCode().c_str(), e.getStatusCode(),
                  e.getRequestId().c_str());
 }
 
 extern "C" {
-uint32_t paimon_oss_abi_version() { return 1; }
+uint32_t oss_cpp_bridge_abi_version() { return 1; }
 
-void *paimon_oss_create(const PaimonOssConfig *in, PaimonOssError *error) {
+void *oss_cpp_bridge_create(const OssCppBridgeConfig *in,
+                            OssCppBridgeError *error) {
   void *client = nullptr;
   guarded(error, [&]() {
     oss::ClientConfiguration config;
@@ -79,15 +80,16 @@ void *paimon_oss_create(const PaimonOssConfig *in, PaimonOssError *error) {
   return client;
 }
 
-void paimon_oss_destroy(void *client) {
+void oss_cpp_bridge_destroy(void *client) {
   try {
     delete static_cast<oss::OSSClient *>(client);
   } catch (...) {
   }
 }
 
-int32_t paimon_oss_stat(void *client, const char *bucket, const char *key,
-                        PaimonOssMetadata *out, PaimonOssError *error) {
+int32_t oss_cpp_bridge_stat(void *client, const char *bucket, const char *key,
+                            OssCppBridgeMetadata *out,
+                            OssCppBridgeError *error) {
   return guarded(error, [&]() {
     auto result = static_cast<oss::OSSClient *>(client)->headObject(
         oss::models::HeadObjectRequest().setBucket(bucket).setKey(key));
@@ -103,9 +105,9 @@ int32_t paimon_oss_stat(void *client, const char *bucket, const char *key,
   });
 }
 
-int32_t paimon_oss_read(void *client, const char *bucket, const char *key,
-                        uint64_t offset, size_t length, uint8_t *buffer,
-                        PaimonOssError *error) {
+int32_t oss_cpp_bridge_read(void *client, const char *bucket, const char *key,
+                            uint64_t offset, size_t length, uint8_t *buffer,
+                            OssCppBridgeError *error) {
   return guarded(error, [&]() {
     if (!length)
       return 0;
@@ -144,10 +146,11 @@ int32_t paimon_oss_read(void *client, const char *bucket, const char *key,
   });
 }
 
-int32_t paimon_oss_list(void *client, const char *bucket, const char *prefix,
-                        const char *token, uint8_t recursive,
-                        PaimonOssEntry entry, void *ctx, char **next_token,
-                        PaimonOssError *error) {
+int32_t oss_cpp_bridge_list(void *client, const char *bucket,
+                            const char *prefix, const char *token,
+                            uint8_t recursive, OssCppBridgeEntry entry,
+                            void *ctx, char **next_token,
+                            OssCppBridgeError *error) {
   *next_token = nullptr;
   return guarded(error, [&]() {
     auto request = oss::models::ListObjectsV2Request()
@@ -183,5 +186,5 @@ int32_t paimon_oss_list(void *client, const char *bucket, const char *prefix,
   });
 }
 
-void paimon_oss_free_string(char *s) { delete[] s; }
+void oss_cpp_bridge_free_string(char *s) { delete[] s; }
 }

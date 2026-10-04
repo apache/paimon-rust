@@ -16,10 +16,10 @@
 # under the License.
 
 cmake_minimum_required(VERSION 3.15)
-project(paimon_oss_cpp LANGUAGES CXX)
+project(oss_cpp_bridge LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(alibabacloud_oss_v2 REQUIRED CONFIG)
-add_library(paimon_oss_cpp SHARED bridge.cc)
-target_link_libraries(paimon_oss_cpp PRIVATE alibabacloud_oss_v2::oss)
-install(TARGETS paimon_oss_cpp LIBRARY DESTINATION lib)
+add_library(oss_cpp_bridge SHARED bridge.cc)
+target_link_libraries(oss_cpp_bridge PRIVATE alibabacloud_oss_v2::oss)
+install(TARGETS oss_cpp_bridge LIBRARY DESTINATION lib)

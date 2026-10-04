@@ -365,7 +365,7 @@ jobs:
           cmake -S integrations/oss-cpp -B build/oss-cpp \
             -DCMAKE_PREFIX_PATH="$PWD/build/oss-install"
           cmake --build build/oss-cpp -j 2
-          echo "PAIMON_OSS_CPP_LIBRARY=$PWD/build/oss-cpp/libpaimon_oss_cpp.so" >> "$GITHUB_ENV"
+          echo "OSS_CPP_BRIDGE_LIBRARY=$PWD/build/oss-cpp/liboss_cpp_bridge.so" >> "$GITHUB_ENV"
 
       - name: OSS C++ SDK Integration Test
         if: matrix.suite == 'oss-cpp'

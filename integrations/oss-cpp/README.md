@@ -46,7 +46,7 @@ Pass these options to the native table/catalog FileIO:
 
 ```text
 fs.oss.impl = cpp
-fs.oss.cpp.library.path = /absolute/path/libpaimon_oss_cpp.so
+fs.oss.cpp.library.path = /absolute/path/liboss_cpp_bridge.so
 fs.oss.endpoint = https://oss-cn-shanghai-internal.aliyuncs.com
 fs.oss.region = cn-shanghai
 ```
@@ -88,7 +88,7 @@ switched automatically. No throughput or long-tail improvement is claimed.
 ```bash
 cargo test -p paimon --features storage-oss-cpp --lib io::storage_oss_cpp
 
-PAIMON_OSS_CPP_LIBRARY="$PWD/build/oss-cpp/libpaimon_oss_cpp.so" \
+OSS_CPP_BRIDGE_LIBRARY="$PWD/build/oss-cpp/liboss_cpp_bridge.so" \
   cargo test -p paimon --features storage-oss-cpp --lib io::storage_oss_cpp \
   -- --ignored
 ```

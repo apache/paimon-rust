@@ -497,29 +497,29 @@ impl Api {
             })?;
             let load_error = || Error::new(ErrorKind::ConfigInvalid, "Invalid OSS C++ bridge ABI");
             let version = library
-                .get::<unsafe extern "C" fn() -> u32>(b"paimon_oss_abi_version\0")
+                .get::<unsafe extern "C" fn() -> u32>(b"oss_cpp_bridge_abi_version\0")
                 .map_err(|_| load_error())?;
             if version() != 1 {
                 return Err(load_error());
             }
             Ok(Self {
                 create: *library
-                    .get(b"paimon_oss_create\0")
+                    .get(b"oss_cpp_bridge_create\0")
                     .map_err(|_| load_error())?,
                 destroy: *library
-                    .get(b"paimon_oss_destroy\0")
+                    .get(b"oss_cpp_bridge_destroy\0")
                     .map_err(|_| load_error())?,
                 stat: *library
-                    .get(b"paimon_oss_stat\0")
+                    .get(b"oss_cpp_bridge_stat\0")
                     .map_err(|_| load_error())?,
                 read: *library
-                    .get(b"paimon_oss_read\0")
+                    .get(b"oss_cpp_bridge_read\0")
                     .map_err(|_| load_error())?,
                 list: *library
-                    .get(b"paimon_oss_list\0")
+                    .get(b"oss_cpp_bridge_list\0")
                     .map_err(|_| load_error())?,
                 free_string: *library
-                    .get(b"paimon_oss_free_string\0")
+                    .get(b"oss_cpp_bridge_free_string\0")
                     .map_err(|_| load_error())?,
                 _library: library,
             })

@@ -30,35 +30,35 @@ typedef struct {
   const char *endpoint, *region, *access_key, *secret_key, *token, *user_agent;
   int64_t connect_timeout_ms, request_timeout_ms, retry_attempts;
   uint8_t path_style;
-} PaimonOssConfig;
+} OssCppBridgeConfig;
 
 typedef struct {
   int32_t status;
   char code[128];
   char request_id[256];
-} PaimonOssError;
+} OssCppBridgeError;
 
 typedef struct {
   int64_t size;
   char modified[64];
-} PaimonOssMetadata;
+} OssCppBridgeMetadata;
 
-typedef void (*PaimonOssEntry)(void *, const char *, size_t, int64_t,
-                               const char *, uint8_t);
+typedef void (*OssCppBridgeEntry)(void *, const char *, size_t, int64_t,
+                                  const char *, uint8_t);
 
-uint32_t paimon_oss_abi_version(void);
-void *paimon_oss_create(const PaimonOssConfig *, PaimonOssError *);
-void paimon_oss_destroy(void *);
-int32_t paimon_oss_stat(void *, const char *, const char *, PaimonOssMetadata *,
-                        PaimonOssError *);
-int32_t paimon_oss_read(void *, const char *, const char *, uint64_t, size_t,
-                        uint8_t *, PaimonOssError *);
+uint32_t oss_cpp_bridge_abi_version(void);
+void *oss_cpp_bridge_create(const OssCppBridgeConfig *, OssCppBridgeError *);
+void oss_cpp_bridge_destroy(void *);
+int32_t oss_cpp_bridge_stat(void *, const char *, const char *,
+                            OssCppBridgeMetadata *, OssCppBridgeError *);
+int32_t oss_cpp_bridge_read(void *, const char *, const char *, uint64_t,
+                            size_t, uint8_t *, OssCppBridgeError *);
 // The callback borrows strings until it returns. next_token is owned by
-// the bridge and must be released with paimon_oss_free_string.
-int32_t paimon_oss_list(void *, const char *, const char *, const char *,
-                        uint8_t, PaimonOssEntry, void *, char **,
-                        PaimonOssError *);
-void paimon_oss_free_string(char *);
+// the bridge and must be released with oss_cpp_bridge_free_string.
+int32_t oss_cpp_bridge_list(void *, const char *, const char *, const char *,
+                            uint8_t, OssCppBridgeEntry, void *, char **,
+                            OssCppBridgeError *);
+void oss_cpp_bridge_free_string(char *);
 
 #ifdef __cplusplus
 }

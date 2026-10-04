@@ -264,8 +264,8 @@ async fn fixture(
     tokio::task::JoinHandle<()>,
     HashMap<String, String>,
 ) {
-    let library = std::env::var("PAIMON_OSS_CPP_LIBRARY")
-        .expect("Set PAIMON_OSS_CPP_LIBRARY to the real compiled bridge");
+    let library = std::env::var("OSS_CPP_BRIDGE_LIBRARY")
+        .expect("Set OSS_CPP_BRIDGE_LIBRARY to the real compiled bridge");
     let state = Mock::default();
     let app = Router::new().fallback(mock).with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
