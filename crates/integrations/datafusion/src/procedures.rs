@@ -465,6 +465,18 @@ async fn proc_rename_branch(
     let from_branch = require_arg(args, "from_branch")?;
     let to_branch = require_arg(args, "to_branch")?;
 
+    // A REST catalog owns the authoritative snapshot/branch metadata and exposes
+    // no branch-rename endpoint (Java `RESTCatalog.renameBranch` throws
+    // `UnsupportedOperationException`). Renaming here would move the physical
+    // branch directory while the catalog kept pointing at the old name, so later
+    // reads of both the old and new name would fail. Refuse the rename until a
+    // catalog-aware path exists, instead of silently desyncing the table.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "rename_branch is not supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+
     let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
     bm.rename_branch(from_branch, to_branch)
         .await
