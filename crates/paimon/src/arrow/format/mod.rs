@@ -470,6 +470,37 @@ fn supported_write_formats() -> Vec<&'static str> {
     ]
 }
 
+/// State shared by the physical files of one logical writer. Ordinary formats
+/// allocate no MAP context. PK writers can retain their logical stats schema.
+#[derive(Default)]
+pub(crate) struct FormatWriteContext {
+    map:
+        Option<std::sync::Arc<std::sync::Mutex<crate::arrow::shredding::map::MapShreddingContext>>>,
+    stats_fields: Option<Vec<DataField>>,
+}
+
+impl FormatWriteContext {
+    pub(crate) fn new(
+        fields: &[DataField],
+        options: &HashMap<String, String>,
+    ) -> crate::Result<Self> {
+        let configs = crate::arrow::shredding::map::detect_map_shredding_fields(fields, options)?;
+        Ok(Self {
+            map: (!configs.is_empty()).then(Default::default),
+            stats_fields: None,
+        })
+    }
+
+    pub(crate) fn with_stats_fields(mut self, fields: Vec<DataField>) -> Self {
+        self.stats_fields = Some(fields);
+        self
+    }
+
+    pub(crate) fn needs_completed_file_stats(&self) -> bool {
+        self.map.is_some()
+    }
+}
+
 /// Create a format writer that streams directly to storage.
 pub(crate) async fn create_format_writer(
     output: &OutputFile,
@@ -480,21 +511,53 @@ pub(crate) async fn create_format_writer(
     write_fields: Option<&[DataField]>,
     format_options: Option<&HashMap<String, String>>,
 ) -> crate::Result<Box<dyn FormatFileWriter>> {
+    let context = match (write_fields, format_options) {
+        (Some(fields), Some(options)) => FormatWriteContext::new(fields, options)?,
+        _ => FormatWriteContext::default(),
+    };
+    create_format_writer_with_context(
+        output,
+        schema,
+        compression,
+        zstd_level,
+        file_io,
+        write_fields,
+        format_options,
+        &context,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_format_writer_with_context(
+    output: &OutputFile,
+    schema: SchemaRef,
+    compression: &str,
+    zstd_level: i32,
+    file_io: Option<crate::io::FileIO>,
+    write_fields: Option<&[DataField]>,
+    format_options: Option<&HashMap<String, String>>,
+    context: &FormatWriteContext,
+) -> crate::Result<Box<dyn FormatFileWriter>> {
     let path = output.location();
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".parquet") {
-        let writer_factory = Box::new(parquet::ParquetPhysicalWriterFactory::new(
-            output,
-            compression,
-            zstd_level,
-            format_options.cloned().unwrap_or_default(),
-        ));
+        let writer_factory = Box::new(
+            parquet::ParquetPhysicalWriterFactory::new(
+                output,
+                compression,
+                zstd_level,
+                format_options.cloned().unwrap_or_default(),
+            )
+            .with_stats_fields(context.stats_fields.clone()),
+        );
         shredding::ShreddingFormatWriter::create(
             writer_factory,
             schema,
             write_fields,
             format_options,
             compression,
+            context.map.clone(),
         )
         .await
     } else if lower.ends_with(".blob") {

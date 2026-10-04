@@ -25,7 +25,8 @@
 use super::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
 use super::data_file_path_factory::{DataFilePath, DataFilePathFactory};
 use crate::arrow::format::{
-    create_format_writer, with_write_resources, FormatFileWriter, FormatValueStats,
+    create_format_writer_with_context, with_write_resources, FormatFileWriter, FormatValueStats,
+    FormatWriteContext,
 };
 use crate::io::FileIO;
 use crate::resource::ResourceContext;
@@ -59,6 +60,7 @@ pub(crate) struct DataFileWriter {
     data_file_prefix: String,
     write_fields: Vec<DataField>,
     format_options: HashMap<String, String>,
+    format_context: FormatWriteContext,
     file_source: Option<i32>,
     first_row_id: Option<i64>,
     write_cols: Option<Vec<String>>,
@@ -106,7 +108,9 @@ impl DataFileWriter {
         let data_file_prefix = CoreOptions::new(&format_options)
             .data_file_prefix()
             .to_string();
+        let format_context = FormatWriteContext::new(&write_fields, &format_options)?;
         Ok(Self {
+            format_context,
             file_io,
             paths,
             schema_id,
@@ -208,6 +212,11 @@ impl DataFileWriter {
     }
 
     async fn open_new_file(&mut self, schema: arrow_schema::SchemaRef) -> Result<()> {
+        // Java selects the next MAP width from successfully completed files.
+        // Drain only MAP closes; ordinary writers retain asynchronous rolling.
+        if self.format_context.needs_completed_file_stats() {
+            self.drain_closes().await?;
+        }
         let index = self
             .index_options
             .as_ref()
@@ -229,7 +238,7 @@ impl DataFileWriter {
             ));
         }
         let output = self.file_io.new_output(&file_path)?;
-        let writer = create_format_writer(
+        let writer = create_format_writer_with_context(
             &output,
             schema,
             &self.file_compression,
@@ -237,6 +246,7 @@ impl DataFileWriter {
             Some(self.file_io.clone()),
             Some(&self.write_fields),
             Some(&self.format_options),
+            &self.format_context,
         )
         .await?;
         self.current_writer = Some(with_write_resources(writer, self.resources.as_ref()));
@@ -387,8 +397,7 @@ impl DataFileWriter {
         });
     }
 
-    async fn finish(&mut self) -> Result<Vec<DataFileMeta>> {
-        self.close_current_file().await?;
+    async fn drain_closes(&mut self) -> Result<()> {
         while let Some(result) = self.in_flight_closes.join_next().await {
             let file = result.map_err(|e| crate::Error::DataInvalid {
                 message: format!("Background file close task panicked: {e}"),
@@ -396,6 +405,12 @@ impl DataFileWriter {
             })??;
             self.written_files.push(file);
         }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<Vec<DataFileMeta>> {
+        self.close_current_file().await?;
+        self.drain_closes().await?;
         self.created_paths.clear();
         let mut files = std::mem::take(&mut self.written_files);
         files.sort_unstable_by_key(|(ordinal, _)| *ordinal);

@@ -28,7 +28,7 @@
 
 use crate::arrow::arrow_fields_to_paimon;
 use crate::arrow::format::{
-    create_format_writer, parquet::ParquetFormatWriter, with_write_resources, FormatFileWriter,
+    create_format_writer_with_context, with_write_resources, FormatFileWriter, FormatWriteContext,
 };
 use crate::io::FileIO;
 use crate::resource::{MemoryReservation, ResourceContext};
@@ -116,6 +116,7 @@ pub(crate) struct KeyValueWriteConfig {
 }
 
 struct IndexedFileWrite<'a> {
+    format_context: &'a FormatWriteContext,
     is_changelog: bool,
     file_prefix: &'a str,
     file_ordinal: usize,
@@ -198,6 +199,40 @@ impl KeyValueFileWriter {
             written_changelog_files: Vec::new(),
             managed_blob_writer,
         })
+    }
+
+    fn new_format_context(&self) -> Result<FormatWriteContext> {
+        Ok(
+            FormatWriteContext::new(&self.config.value_fields, &self.config.table_options)?
+                .with_stats_fields(self.config.value_fields.clone()),
+        )
+    }
+
+    /// Preserve value-only statistics while applying shared format conversions
+    /// to the full physical KV schema, including the two system columns.
+    async fn create_data_file_writer(
+        &self,
+        output: &crate::io::OutputFile,
+        schema: arrow_schema::SchemaRef,
+        write: &IndexedFileWrite<'_>,
+    ) -> Result<Box<dyn FormatFileWriter>> {
+        let physical_fields = build_physical_fields(&schema, &self.config.value_fields)?;
+        let mut options = self.config.table_options.clone();
+        let mode = CoreOptions::new(&options)
+            .pk_file_metadata_stats_mode(0, write.is_changelog)?
+            .to_string();
+        options.insert("metadata.stats-mode".to_string(), mode);
+        create_format_writer_with_context(
+            output,
+            schema,
+            write.file_compression,
+            self.config.file_compression_zstd_level,
+            None,
+            Some(&physical_fields),
+            Some(&options),
+            write.format_context,
+        )
+        .await
     }
 
     pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
@@ -350,6 +385,9 @@ impl KeyValueFileWriter {
         // The sorted output is already materialized in FLUSH_CHUNK_ROWS batches.
         // Use the row target as an upper bound for each emitted batch and keep
         // every file's key bounds, sequence bounds, and index local to its rows.
+        // Java creates independent data/changelog format factories for each
+        // buffer flush. Rolled files share history only within that flush.
+        let data_context = self.new_format_context()?;
         let data_sequences = data_seq.as_any().downcast_ref::<Int64Array>().unwrap();
         for offset in (0..data_indices.len()).step_by(self.target_file_row_num) {
             let len = self.target_file_row_num.min(data_indices.len() - offset);
@@ -367,6 +405,7 @@ impl KeyValueFileWriter {
                     data_seq.as_ref(),
                     &file_indices,
                     IndexedFileWrite {
+                        format_context: &data_context,
                         is_changelog: false,
                         file_prefix: &self.config.data_file_prefix,
                         file_ordinal: self.written_files.len(),
@@ -385,6 +424,7 @@ impl KeyValueFileWriter {
         }
 
         if self.config.input_changelog {
+            let changelog_context = self.new_format_context()?;
             let input_sequences = seq_array.as_any().downcast_ref::<Int64Array>().unwrap();
             for offset in (0..sorted_indices.len()).step_by(self.target_file_row_num) {
                 let len = self.target_file_row_num.min(sorted_indices.len() - offset);
@@ -402,6 +442,7 @@ impl KeyValueFileWriter {
                         seq_array.as_ref(),
                         &file_indices,
                         IndexedFileWrite {
+                            format_context: &changelog_context,
                             is_changelog: true,
                             file_prefix: &self.config.changelog_file_prefix,
                             file_ordinal: self.written_changelog_files.len(),
@@ -509,41 +550,9 @@ impl KeyValueFileWriter {
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
         let file_path = location.path.clone();
         let output = self.file_io.new_output(&file_path)?;
-        // The physical KV file also contains sequence and row-kind columns. Give
-        // Parquet only the logical value fields so metadata stats and their dense
-        // column mapping follow Java's value schema (and its stats options).
-        // Keep the existing unshredded KV layout for this writer.
-        let writer: Box<dyn FormatFileWriter> = if write.file_format.eq_ignore_ascii_case("parquet")
-        {
-            let mut stats_options = self.config.table_options.clone();
-            let core_options = CoreOptions::new(&self.config.table_options);
-            let stats_mode = core_options.pk_file_metadata_stats_mode(0, write.is_changelog)?;
-            stats_options.insert("metadata.stats-mode".to_string(), stats_mode.to_string());
-            Box::new(
-                ParquetFormatWriter::new(
-                    &output,
-                    physical_schema.clone(),
-                    write.file_compression,
-                    self.config.file_compression_zstd_level,
-                    Some(&self.config.value_fields),
-                    &stats_options,
-                )
-                .await?,
-            )
-        } else {
-            let physical_fields =
-                build_physical_fields(&physical_schema, &self.config.value_fields)?;
-            create_format_writer(
-                &output,
-                physical_schema.clone(),
-                write.file_compression,
-                self.config.file_compression_zstd_level,
-                None,
-                Some(&physical_fields),
-                Some(&self.config.table_options),
-            )
-            .await?
-        };
+        let writer = self
+            .create_data_file_writer(&output, physical_schema.clone(), &write)
+            .await?;
         let mut writer = with_write_resources(writer, self.resources.as_ref());
 
         let vk_idx = batch
@@ -2528,6 +2537,16 @@ mod tests {
         )
         .unwrap();
         let mut config = test_write_config(MergeEngine::Aggregation);
+        config.value_fields = crate::arrow::arrow_fields_to_paimon(
+            &batch
+                .schema()
+                .fields()
+                .iter()
+                .filter(|field| field.name() != VALUE_KIND_FIELD_NAME)
+                .map(|field| field.as_ref().clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         // Only id participates in within-partition grouping, but p is also a
         // primary key and must not be summed by the default aggregator.
         config.primary_keys = vec!["id".into(), "p".into()];

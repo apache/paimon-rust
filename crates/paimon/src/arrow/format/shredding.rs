@@ -18,8 +18,8 @@
 use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
 use crate::arrow::build_target_arrow_schema;
 use crate::arrow::shredding::map::{
-    detect_map_shredding_fields, normalize_field_dict_compression, MapShreddingFieldConfig,
-    MapShreddingWritePlan, MAP_SHREDDING_INFER_BUFFER_ROW_COUNT,
+    detect_map_shredding_fields, normalize_field_dict_compression, MapShreddingContext,
+    MapShreddingWritePlan,
 };
 use crate::arrow::shredding::variant::{
     assemble_shredded_variant_batch, configured_variant_shredding_fields,
@@ -36,6 +36,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[async_trait]
 pub(crate) trait PhysicalFormatWriterFactory: Send {
@@ -106,6 +107,7 @@ pub(crate) struct ShreddingFormatWriter {
     state: ShreddingWriterState,
     /// File compression codec, used for the MAP field-dict metadata at close.
     compression: String,
+    map_context: Option<Arc<Mutex<MapShreddingContext>>>,
 }
 
 enum ShreddingWriterState {
@@ -131,9 +133,6 @@ enum ShreddingWriterState {
 /// mirroring Java's `ShreddingWritePlanFactory`.
 enum InferPlanBuilder {
     Variant,
-    Map {
-        configs: Vec<MapShreddingFieldConfig>,
-    },
 }
 
 impl ShreddingFormatWriter {
@@ -143,6 +142,7 @@ impl ShreddingFormatWriter {
         write_fields: Option<&[DataField]>,
         format_options: Option<&HashMap<String, String>>,
         compression: &str,
+        map_context: Option<Arc<Mutex<MapShreddingContext>>>,
     ) -> crate::Result<Box<dyn FormatFileWriter>> {
         let Some(fields) = write_fields else {
             return writer_factory.create_writer(schema, write_fields).await;
@@ -184,6 +184,7 @@ impl ShreddingFormatWriter {
                     plan_builder: InferPlanBuilder::Variant,
                 },
                 compression: compression.to_string(),
+                map_context: None,
             }));
         }
 
@@ -191,20 +192,19 @@ impl ShreddingFormatWriter {
             // Validate the field-dict compression eagerly, mirroring Java's
             // SchemaValidation (only none/lz4/zstd are supported).
             normalize_field_dict_compression(Some(compression))?;
+            let context = map_context.unwrap_or_default();
+            let plan = MapShreddingWritePlan::new(fields, &map_configs, &context.lock().unwrap())?;
+            let writer_schema = build_target_arrow_schema(plan.physical_fields())?;
+            let inner = writer_factory
+                .create_writer(writer_schema, Some(plan.physical_fields()))
+                .await?;
             return Ok(Box::new(Self {
-                state: ShreddingWriterState::Infer {
-                    writer_factory: Some(writer_factory),
-                    schema,
-                    logical_write_fields: fields.to_vec(),
-                    format_options: options.clone(),
-                    buffered_batches: Vec::new(),
-                    buffered_row_count: 0,
-                    infer_buffer_row_count: MAP_SHREDDING_INFER_BUFFER_ROW_COUNT,
-                    plan_builder: InferPlanBuilder::Map {
-                        configs: map_configs,
-                    },
+                state: ShreddingWriterState::Ready {
+                    inner,
+                    plan: Some(Box::new(plan)),
                 },
                 compression: compression.to_string(),
+                map_context: Some(context),
             }));
         }
 
@@ -226,6 +226,7 @@ impl ShreddingFormatWriter {
                 plan: Some(plan),
             },
             compression: compression.to_string(),
+            map_context: None,
         }))
     }
 
@@ -275,12 +276,6 @@ impl ShreddingFormatWriter {
                     physical_fields,
                 )) as Box<dyn ShreddingWritePlan>
             }),
-            InferPlanBuilder::Map { configs } => Some(Box::new(MapShreddingWritePlan::infer(
-                &logical_write_fields,
-                configs,
-                &buffered_batches,
-            )?)
-                as Box<dyn ShreddingWritePlan>),
         };
 
         let writer_schema = match &plan {
@@ -384,6 +379,10 @@ impl FormatFileWriter for ShreddingFormatWriter {
         let compression = self.compression.clone();
         match std::mem::replace(&mut self.state, ShreddingWriterState::Closed) {
             ShreddingWriterState::Ready { mut inner, plan } => {
+                let widths = plan
+                    .as_ref()
+                    .map(|plan| plan.file_max_row_widths())
+                    .unwrap_or_default();
                 if let Some(plan) = plan {
                     // Commit the shredding metadata into the file footer before
                     // closing, mirroring Java's ShreddingFormatWriter.close.
@@ -392,7 +391,11 @@ impl FormatFileWriter for ShreddingFormatWriter {
                         inner.commit_field_metadata(&field_metadata)?;
                     }
                 }
-                inner.close().await
+                let result = inner.close().await?;
+                if let Some(context) = &self.map_context {
+                    context.lock().unwrap().report(&widths);
+                }
+                Ok(result)
             }
             ShreddingWriterState::Infer { .. } => unreachable!("infer writer finalized above"),
             ShreddingWriterState::Closed => Ok(FormatWriteResult::new(0)),
@@ -459,6 +462,7 @@ mod tests {
                 plan_builder: InferPlanBuilder::Variant,
             },
             compression: "zstd".to_string(),
+            map_context: None,
         };
         let resources = ResourceContext::builder().build().unwrap();
         let mut writer = with_write_resources(Box::new(writer), Some(&resources));
@@ -494,6 +498,7 @@ mod tests {
             Some(&fields),
             Some(&options),
             "zstd",
+            None,
         )
         .await
         .err()
@@ -520,6 +525,7 @@ mod tests {
             Some(&fields),
             Some(&options),
             "snappy",
+            None,
         )
         .await
         .err()

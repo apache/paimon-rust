@@ -51,6 +51,11 @@ pub(crate) trait ShreddingWritePlan: Send {
     /// Convert one logical batch into the physical layout.
     fn to_physical_batch(&mut self, batch: &RecordBatch) -> Result<RecordBatch>;
 
+    /// Widths reported only after a file closes successfully.
+    fn file_max_row_widths(&self) -> HashMap<String, usize> {
+        HashMap::new()
+    }
+
     /// Per-field metadata to commit into the file footer at close time.
     ///
     /// `compression` is the file compression codec (`none`/`lz4`/`zstd`), used
