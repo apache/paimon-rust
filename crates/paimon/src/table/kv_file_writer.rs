@@ -28,7 +28,7 @@
 
 use crate::arrow::arrow_fields_to_paimon;
 use crate::arrow::format::{
-    create_format_writer_with_context, with_write_resources, FormatFileWriter, FormatWriteContext,
+    create_format_writer_factory, with_write_resources, FormatWriterFactory,
 };
 use crate::io::FileIO;
 use crate::resource::{MemoryReservation, ResourceContext};
@@ -116,7 +116,7 @@ pub(crate) struct KeyValueWriteConfig {
 }
 
 struct IndexedFileWrite<'a> {
-    format_context: &'a FormatWriteContext,
+    format_writer_factory: &'a dyn FormatWriterFactory,
     is_changelog: bool,
     file_prefix: &'a str,
     file_ordinal: usize,
@@ -201,38 +201,33 @@ impl KeyValueFileWriter {
         })
     }
 
-    fn new_format_context(&self) -> Result<FormatWriteContext> {
-        Ok(
-            FormatWriteContext::new(&self.config.value_fields, &self.config.table_options)?
-                .with_stats_fields(self.config.value_fields.clone()),
-        )
-    }
-
-    /// Preserve value-only statistics while applying shared format conversions
-    /// to the full physical KV schema, including the two system columns.
-    async fn create_data_file_writer(
+    /// Construct one reusable factory for this flush's data or changelog output.
+    /// Statistics retain logical value fields independently of the physical KV schema.
+    fn new_format_writer_factory(
         &self,
-        output: &crate::io::OutputFile,
         schema: arrow_schema::SchemaRef,
-        write: &IndexedFileWrite<'_>,
-    ) -> Result<Box<dyn FormatFileWriter>> {
+        is_changelog: bool,
+    ) -> Result<Arc<dyn FormatWriterFactory>> {
         let physical_fields = build_physical_fields(&schema, &self.config.value_fields)?;
         let mut options = self.config.table_options.clone();
         let mode = CoreOptions::new(&options)
-            .pk_file_metadata_stats_mode(0, write.is_changelog)?
+            .pk_file_metadata_stats_mode(0, is_changelog)?
             .to_string();
         options.insert("metadata.stats-mode".to_string(), mode);
-        create_format_writer_with_context(
-            output,
+        let file_format = if is_changelog {
+            &self.config.changelog_file_format
+        } else {
+            &self.config.file_format
+        };
+        create_format_writer_factory(
+            file_format,
             schema,
-            write.file_compression,
             self.config.file_compression_zstd_level,
             None,
             Some(&physical_fields),
             Some(&options),
-            write.format_context,
+            Some(&self.config.value_fields),
         )
-        .await
     }
 
     pub(crate) fn with_resources(mut self, resources: Option<ResourceContext>) -> Self {
@@ -387,7 +382,8 @@ impl KeyValueFileWriter {
         // every file's key bounds, sequence bounds, and index local to its rows.
         // Java creates independent data/changelog format factories for each
         // buffer flush. Rolled files share history only within that flush.
-        let data_context = self.new_format_context()?;
+        let data_factory =
+            self.new_format_writer_factory(build_physical_schema(&data_batch.schema()), false)?;
         let data_sequences = data_seq.as_any().downcast_ref::<Int64Array>().unwrap();
         for offset in (0..data_indices.len()).step_by(self.target_file_row_num) {
             let len = self.target_file_row_num.min(data_indices.len() - offset);
@@ -405,7 +401,7 @@ impl KeyValueFileWriter {
                     data_seq.as_ref(),
                     &file_indices,
                     IndexedFileWrite {
-                        format_context: &data_context,
+                        format_writer_factory: data_factory.as_ref(),
                         is_changelog: false,
                         file_prefix: &self.config.data_file_prefix,
                         file_ordinal: self.written_files.len(),
@@ -424,7 +420,8 @@ impl KeyValueFileWriter {
         }
 
         if self.config.input_changelog {
-            let changelog_context = self.new_format_context()?;
+            let changelog_factory =
+                self.new_format_writer_factory(build_physical_schema(&combined.schema()), true)?;
             let input_sequences = seq_array.as_any().downcast_ref::<Int64Array>().unwrap();
             for offset in (0..sorted_indices.len()).step_by(self.target_file_row_num) {
                 let len = self.target_file_row_num.min(sorted_indices.len() - offset);
@@ -442,7 +439,7 @@ impl KeyValueFileWriter {
                         seq_array.as_ref(),
                         &file_indices,
                         IndexedFileWrite {
-                            format_context: &changelog_context,
+                            format_writer_factory: changelog_factory.as_ref(),
                             is_changelog: true,
                             file_prefix: &self.config.changelog_file_prefix,
                             file_ordinal: self.written_changelog_files.len(),
@@ -550,8 +547,9 @@ impl KeyValueFileWriter {
         self.file_io.mkdirs(&format!("{bucket_dir}/")).await?;
         let file_path = location.path.clone();
         let output = self.file_io.new_output(&file_path)?;
-        let writer = self
-            .create_data_file_writer(&output, physical_schema.clone(), &write)
+        let writer = write
+            .format_writer_factory
+            .create_writer(&output, write.file_compression)
             .await?;
         let mut writer = with_write_resources(writer, self.resources.as_ref());
 
@@ -1394,6 +1392,99 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![(1, 3), (2, 4), (0, 0)]
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn variant_noop_plans_preserve_pk_schema_and_changelog() {
+        use crate::arrow::{build_target_arrow_schema, variant_arrow_type};
+        use crate::spec::VariantType;
+        use crate::variant::GenericVariant;
+        use arrow_array::{BinaryArray, StructArray};
+
+        for mode in ["per-file", "adaptive", "configured"] {
+            for json in [["null", "null"], ["1", "\"text\""]] {
+                let io = FileIOBuilder::new("memory").build().unwrap();
+                let mut config = test_write_config(MergeEngine::Deduplicate);
+                config.input_changelog = true;
+                config.write_buffer_size = i64::MAX;
+                config.value_fields[2] =
+                    DataField::new(2, "value".into(), DataType::Variant(VariantType::new()));
+                config
+                    .table_options
+                    .insert("variant.inferShreddingSchema".into(), "true".into());
+                if mode == "configured" {
+                    config.table_options.insert(
+                        "variant.shreddingSchema".into(),
+                        r#"{"type":"ROW","fields":[]}"#.into(),
+                    );
+                } else {
+                    config
+                        .table_options
+                        .insert("variant.shredding.inferenceMode".into(), mode.into());
+                }
+                let variants = json
+                    .iter()
+                    .map(|value| GenericVariant::parse_json(value).unwrap())
+                    .collect::<Vec<_>>();
+                let ArrowDataType::Struct(fields) = variant_arrow_type() else {
+                    unreachable!()
+                };
+                let values = StructArray::new(
+                    fields,
+                    vec![
+                        Arc::new(BinaryArray::from_iter_values(
+                            variants.iter().map(GenericVariant::value),
+                        )),
+                        Arc::new(BinaryArray::from_iter_values(
+                            variants.iter().map(GenericVariant::metadata),
+                        )),
+                    ],
+                    None,
+                );
+                let batch = RecordBatch::try_new(
+                    build_target_arrow_schema(&config.value_fields).unwrap(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![1, 2])),
+                        Arc::new(Int64Array::from(vec![10, 20])),
+                        Arc::new(values),
+                    ],
+                )
+                .unwrap();
+                let mut writer = KeyValueFileWriter::new(io.clone(), config, 0).unwrap();
+                writer.write(&batch).await.unwrap();
+                let prepared = writer.prepare_commit().await.unwrap();
+                for files in [&prepared.data_files, &prepared.changelog_files] {
+                    assert_eq!(files.len(), 1);
+                    let physical = read_kv_file(&io, &files[0]).await;
+                    assert!(!physical
+                        .schema()
+                        .field_with_name(SEQUENCE_NUMBER_FIELD_NAME)
+                        .unwrap()
+                        .is_nullable());
+                    assert!(!physical
+                        .schema()
+                        .field_with_name(VALUE_KIND_FIELD_NAME)
+                        .unwrap()
+                        .is_nullable());
+                    let array = physical
+                        .column_by_name("value")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .unwrap();
+                    assert!(array.column_by_name("typed_value").is_none());
+                    let bytes = array
+                        .column_by_name("value")
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .unwrap();
+                    for (row, variant) in variants.iter().enumerate() {
+                        assert_eq!(bytes.value(row), variant.value());
+                    }
+                }
+            }
         }
     }
 

@@ -29,6 +29,8 @@ use base64::{engine::general_purpose, Engine as _};
 
 mod numeric;
 pub(crate) use numeric::VariantFloat32Projection;
+mod inference;
+pub(crate) use inference::VariantShreddingInferenceSession;
 
 const BASIC_TYPE_BITS: u8 = 2;
 const BASIC_TYPE_MASK: u8 = 0x3;
@@ -1973,8 +1975,7 @@ pub(crate) fn infer_variant_shredding_schema(
         simple_schema = merge_inferred_schema(simple_schema, schema_of_row)?;
     }
 
-    let min_cardinality =
-        ((variants.len() as f64) * config.min_field_cardinality_ratio).ceil() as u64;
+    let min_cardinality = ((variants.len() as f64) * config.min_field_cardinality_ratio).ceil();
     finalize_inferred_schema(simple_schema, min_cardinality, max_fields_remaining)
 }
 
@@ -2203,23 +2204,23 @@ fn merge_inferred_row_types(left: &RowType, right: &RowType) -> Result<RowType> 
     Ok(RowType::new(new_fields))
 }
 
-fn inferred_field_count(field: &DataField) -> Result<u64> {
+fn inferred_field_count(field: &DataField) -> Result<f64> {
     let Some(description) = field.description() else {
         return data_invalid("Variant inferred field is missing count");
     };
-    description.parse::<u64>().map_err(|e| Error::DataInvalid {
+    description.parse::<f64>().map_err(|e| Error::DataInvalid {
         message: format!("Invalid Variant inferred field count: {description}"),
         source: Some(Box::new(e)),
     })
 }
 
-fn inferred_count_field(id: i32, name: &str, data_type: DataType, count: u64) -> DataField {
+fn inferred_count_field(id: i32, name: &str, data_type: DataType, count: f64) -> DataField {
     DataField::new(id, name.to_string(), data_type).with_description(Some(count.to_string()))
 }
 
 fn finalize_inferred_schema(
     data_type: Option<DataType>,
-    min_cardinality: u64,
+    min_cardinality: f64,
     max_fields_remaining: &mut usize,
 ) -> Result<DataType> {
     if *max_fields_remaining == 0 {

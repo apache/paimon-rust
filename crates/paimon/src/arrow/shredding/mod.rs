@@ -40,9 +40,8 @@ pub(crate) type FieldMetadata = HashMap<String, HashMap<String, String>>;
 /// The plan owns all file-local shredding state (e.g. the MAP field dictionary
 /// and column allocator), so [`Self::to_physical_batch`] takes `&mut self` and
 /// must be called for every written batch in order.
-pub(crate) trait ShreddingWritePlan: Send {
+pub(crate) trait ShreddingWritePlan: Send + std::any::Any {
     /// Logical (table) fields before shredding.
-    #[allow(dead_code)] // Part of the mirrored Java API surface.
     fn logical_fields(&self) -> &[DataField];
 
     /// Physical fields written to the file.
@@ -63,6 +62,33 @@ pub(crate) trait ShreddingWritePlan: Send {
     /// Java's `ShreddingWritePlan.fieldMetadata`.
     fn field_metadata(&self, _compression: Option<&str>) -> Result<FieldMetadata> {
         Ok(HashMap::new())
+    }
+}
+
+/// Creates file-local plans and owns rolling-writer-scoped shredding state,
+/// mirroring Java's `ShreddingWritePlanFactory`.
+pub(crate) trait ShreddingWritePlanFactory: Send + Sync {
+    fn should_create_write_plan(&self) -> bool;
+
+    /// Some(count) defers physical writer creation until inference has input.
+    fn infer_buffer_row_count(&self) -> Option<usize> {
+        None
+    }
+
+    fn create_write_plan(&self, batches: &[RecordBatch]) -> Result<Box<dyn ShreddingWritePlan>>;
+
+    fn validate_compression(&self, _compression: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called only after the underlying file closes successfully.
+    fn on_file_completed(&self, _plan: &dyn ShreddingWritePlan) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether the next plan depends on the previous file's close callback.
+    fn needs_completed_file_stats(&self) -> bool {
+        false
     }
 }
 

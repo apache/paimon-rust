@@ -19,6 +19,7 @@ use super::metadata_cache::FileMetadataCache;
 use super::shredding::PhysicalFormatWriterFactory;
 use super::{
     timestamp_millis_schema, FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult,
+    FormatWriterFactory,
 };
 use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
 use crate::arrow::read_budget::ReadPermit;
@@ -289,47 +290,63 @@ pub(crate) struct ParquetFormatWriter {
     stats_dense_store: bool,
 }
 
-pub(crate) struct ParquetPhysicalWriterFactory {
-    output: OutputFile,
-    compression: String,
+pub(crate) struct ParquetWriterFactory {
+    schema: arrow_schema::SchemaRef,
+    write_fields: Option<Vec<DataField>>,
     zstd_level: i32,
     format_options: HashMap<String, String>,
     stats_fields: Option<Vec<DataField>>,
 }
 
-impl ParquetPhysicalWriterFactory {
+impl ParquetWriterFactory {
     pub(crate) fn new(
-        output: &OutputFile,
-        compression: &str,
+        schema: arrow_schema::SchemaRef,
+        write_fields: Option<Vec<DataField>>,
         zstd_level: i32,
         format_options: HashMap<String, String>,
+        stats_fields: Option<Vec<DataField>>,
     ) -> Self {
         Self {
-            output: output.clone(),
-            compression: compression.to_string(),
+            schema,
+            write_fields,
             zstd_level,
             format_options,
-            stats_fields: None,
+            stats_fields,
         }
-    }
-    pub(crate) fn with_stats_fields(mut self, fields: Option<Vec<DataField>>) -> Self {
-        self.stats_fields = fields;
-        self
     }
 }
 
 #[async_trait]
-impl PhysicalFormatWriterFactory for ParquetPhysicalWriterFactory {
+impl FormatWriterFactory for ParquetWriterFactory {
     async fn create_writer(
-        &mut self,
+        &self,
+        output: &OutputFile,
+        compression: &str,
+    ) -> crate::Result<Box<dyn FormatFileWriter>> {
+        self.create_physical_writer(
+            output,
+            compression,
+            self.schema.clone(),
+            self.write_fields.as_deref(),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl PhysicalFormatWriterFactory for ParquetWriterFactory {
+    async fn create_physical_writer(
+        &self,
+        output: &OutputFile,
+        compression: &str,
         schema: arrow_schema::SchemaRef,
         write_fields: Option<&[DataField]>,
     ) -> crate::Result<Box<dyn FormatFileWriter>> {
         Ok(Box::new(
             ParquetFormatWriter::new(
-                &self.output,
+                output,
                 schema,
-                &self.compression,
+                compression,
                 self.zstd_level,
                 self.stats_fields.as_deref().or(write_fields),
                 &self.format_options,
@@ -4395,17 +4412,18 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         let output = file_io.new_output(&path).unwrap();
-        let mut writer = create_format_writer(
-            &output,
+        let factory = super::super::create_format_writer_factory(
+            "parquet",
             logical_schema.clone(),
-            "zstd",
             1,
             None,
             Some(&fields),
             Some(&options),
+            None,
         )
-        .await
         .unwrap();
+        assert!(!factory.needs_completed_file_stats());
+        let mut writer = factory.create_writer(&output, "zstd").await.unwrap();
         writer
             .write(&make_batch(vec![1, 2], &first_variants))
             .await
@@ -4472,6 +4490,47 @@ mod tests {
             .unwrap();
             assert_eq!(actual.to_json().unwrap(), expected.to_json().unwrap());
         }
+
+        // Reusing the factory must infer each file from that file's rows.
+        // This short file also exercises finalizing inference from close().
+        let second_path = format!("memory:/variant_second_{}.parquet", uuid::Uuid::new_v4());
+        let output = file_io.new_output(&second_path).unwrap();
+        let mut writer = factory.create_writer(&output, "zstd").await.unwrap();
+        writer
+            .write(&make_batch(
+                vec![4],
+                &[GenericVariant::parse_json(r#"{"fresh":42}"#).unwrap()],
+            ))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let bytes = file_io
+            .new_input(&second_path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let raw =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+        let arrow_schema::DataType::Struct(variant_fields) =
+            raw.schema().field_with_name("v").unwrap().data_type()
+        else {
+            panic!("expected variant struct")
+        };
+        let typed = variant_fields
+            .iter()
+            .find(|field| field.name() == "typed_value")
+            .unwrap();
+        let arrow_schema::DataType::Struct(object_fields) = typed.data_type() else {
+            panic!("expected object")
+        };
+        assert_eq!(
+            object_fields
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["fresh"]
+        );
     }
 
     // -----------------------------------------------------------------------

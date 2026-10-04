@@ -25,7 +25,7 @@
 //! dictionary and column statistics are committed into the `ARROW:schema`
 //! footer metadata at close time so readers can rebuild the logical maps.
 
-use super::{FieldMetadata, ShreddingReadPlan, ShreddingWritePlan};
+use super::{FieldMetadata, ShreddingReadPlan, ShreddingWritePlan, ShreddingWritePlanFactory};
 use crate::arrow::{build_target_arrow_schema, paimon_type_to_arrow};
 use crate::spec::map_shredding::{
     column_placement, max_columns, ColumnPlacement, MAX_SHARED_SHREDDING_NUM_COLUMNS,
@@ -41,7 +41,7 @@ use arrow_schema::{DataType as ArrowDataType, Fields, Schema as ArrowSchema};
 use arrow_select::interleave::interleave;
 use arrow_select::take::take;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // Metadata keys (mirroring Java's MapShreddingDefine / MapSharedShreddingDefine)
@@ -669,9 +669,61 @@ fn lz4_decompress(input: &[u8], original_len: usize) -> Result<Vec<u8>> {
 // Write plan (mirroring Java's MapSharedShreddingWritePlan[Factory])
 // ---------------------------------------------------------------------------
 
+/// One factory per rolling writer, as in Java MapSharedShreddingWritePlanFactory.
+/// Plans keep dictionaries/allocators local to each file; only completed-file
+/// widths survive in the factory. The mutex supports background file closes.
+pub(crate) struct MapShreddingWritePlanFactory {
+    logical_fields: Vec<DataField>,
+    configs: Vec<MapShreddingFieldConfig>,
+    context: Mutex<MapShreddingContext>,
+}
+
+impl MapShreddingWritePlanFactory {
+    pub(crate) fn new(
+        logical_fields: Vec<DataField>,
+        configs: Vec<MapShreddingFieldConfig>,
+    ) -> Self {
+        Self {
+            logical_fields,
+            configs,
+            context: Mutex::default(),
+        }
+    }
+}
+
+impl ShreddingWritePlanFactory for MapShreddingWritePlanFactory {
+    fn should_create_write_plan(&self) -> bool {
+        !self.configs.is_empty()
+    }
+
+    fn create_write_plan(&self, _batches: &[RecordBatch]) -> Result<Box<dyn ShreddingWritePlan>> {
+        Ok(Box::new(MapShreddingWritePlan::new(
+            &self.logical_fields,
+            &self.configs,
+            &self.context.lock().unwrap(),
+        )?))
+    }
+
+    fn validate_compression(&self, compression: &str) -> Result<()> {
+        normalize_field_dict_compression(Some(compression)).map(|_| ())
+    }
+
+    fn on_file_completed(&self, plan: &dyn ShreddingWritePlan) -> Result<()> {
+        self.context
+            .lock()
+            .unwrap()
+            .report(&plan.file_max_row_widths());
+        Ok(())
+    }
+
+    fn needs_completed_file_stats(&self) -> bool {
+        true
+    }
+}
+
 /// Recent completed-file widths, matching Java MapSharedShreddingContext.
 #[derive(Default)]
-pub(crate) struct MapShreddingContext {
+struct MapShreddingContext {
     recent_widths: HashMap<String, VecDeque<usize>>,
 }
 
@@ -696,7 +748,7 @@ impl MapShreddingContext {
         width.clamp(1, config.max_columns)
     }
 
-    pub(crate) fn report(&mut self, widths: &HashMap<String, usize>) {
+    fn report(&mut self, widths: &HashMap<String, usize>) {
         for (name, &width) in widths {
             let recent = self.recent_widths.entry(name.clone()).or_default();
             recent.push_back(width);
@@ -729,7 +781,7 @@ struct MapWriteContext {
 
 impl MapShreddingWritePlan {
     /// Create a file-local plan from completed-file statistics.
-    pub(crate) fn new(
+    fn new(
         logical_fields: &[DataField],
         configs: &[MapShreddingFieldConfig],
         context: &MapShreddingContext,

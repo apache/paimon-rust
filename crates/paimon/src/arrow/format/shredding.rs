@@ -15,20 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
+use super::{
+    FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult, FormatWriterFactory,
+};
 use crate::arrow::build_target_arrow_schema;
-use crate::arrow::shredding::map::{
-    detect_map_shredding_fields, normalize_field_dict_compression, MapShreddingContext,
-    MapShreddingWritePlan,
-};
+use crate::arrow::shredding::map::{detect_map_shredding_fields, MapShreddingWritePlanFactory};
 use crate::arrow::shredding::variant::{
-    assemble_shredded_variant_batch, configured_variant_shredding_fields,
-    contains_variant_read_fields, infer_variant_shredding_fields,
-    should_infer_variant_shredding_fields, variant_shredding_infer_buffer_row_count,
-    VariantWritePlan,
+    assemble_shredded_variant_batch, contains_variant_read_fields, VariantShreddingWritePlanFactory,
 };
-use crate::arrow::shredding::ShreddingWritePlan;
-use crate::io::FileRead;
+use crate::arrow::shredding::{ShreddingWritePlan, ShreddingWritePlanFactory};
+use crate::io::{FileRead, OutputFile};
 use crate::spec::DataField;
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use arrow_array::RecordBatch;
@@ -36,15 +32,97 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+/// Raw factories capable of accepting a shredding plan's physical schema,
+/// mirroring Java SupportsShreddingWritePlan.
 #[async_trait]
-pub(crate) trait PhysicalFormatWriterFactory: Send {
-    async fn create_writer(
-        &mut self,
+pub(crate) trait PhysicalFormatWriterFactory: FormatWriterFactory {
+    async fn create_physical_writer(
+        &self,
+        output: &OutputFile,
+        compression: &str,
         schema: SchemaRef,
         write_fields: Option<&[DataField]>,
     ) -> crate::Result<Box<dyn FormatFileWriter>>;
+}
+
+/// Detect a plan once when creating a rolling writer's factory.
+pub(crate) fn wrap_writer_factory(
+    delegate: Arc<dyn PhysicalFormatWriterFactory>,
+    fields: Option<&[DataField]>,
+    options: Option<&HashMap<String, String>>,
+) -> crate::Result<Arc<dyn FormatWriterFactory>> {
+    let (Some(fields), Some(options)) = (fields, options) else {
+        return Ok(delegate);
+    };
+    let variant_factory = VariantShreddingWritePlanFactory::new(fields.to_vec(), options.clone())?;
+    let map_configs = detect_map_shredding_fields(fields, options)?;
+    if variant_factory.should_create_write_plan() && !map_configs.is_empty() {
+        return Err(crate::Error::Unsupported {
+            message:
+                "Variant shredding and MAP shared-shredding cannot be active for the same file"
+                    .to_string(),
+        });
+    }
+    let plan_factory: Arc<dyn ShreddingWritePlanFactory> =
+        if variant_factory.should_create_write_plan() {
+            Arc::new(variant_factory)
+        } else if !map_configs.is_empty() {
+            Arc::new(MapShreddingWritePlanFactory::new(
+                fields.to_vec(),
+                map_configs,
+            ))
+        } else {
+            return Ok(delegate);
+        };
+    Ok(Arc::new(ShreddingWritePlanWriterFactory {
+        delegate,
+        plan_factory,
+    }))
+}
+
+struct ShreddingWritePlanWriterFactory {
+    delegate: Arc<dyn PhysicalFormatWriterFactory>,
+    plan_factory: Arc<dyn ShreddingWritePlanFactory>,
+}
+
+#[async_trait]
+impl FormatWriterFactory for ShreddingWritePlanWriterFactory {
+    async fn create_writer(
+        &self,
+        output: &OutputFile,
+        compression: &str,
+    ) -> crate::Result<Box<dyn FormatFileWriter>> {
+        self.plan_factory.validate_compression(compression)?;
+        let state = if let Some(infer_buffer_row_count) = self.plan_factory.infer_buffer_row_count()
+        {
+            ShreddingWriterState::Infer {
+                writer_factory: self.delegate.clone(),
+                output: Box::new(output.clone()),
+                buffered_batches: Vec::new(),
+                buffered_row_count: 0,
+                infer_buffer_row_count,
+            }
+        } else {
+            ShreddingFormatWriter::create_ready_state(
+                self.delegate.as_ref(),
+                output,
+                compression,
+                self.plan_factory.create_write_plan(&[])?,
+            )
+            .await?
+        };
+        Ok(Box::new(ShreddingFormatWriter {
+            state,
+            compression: compression.to_string(),
+            plan_factory: self.plan_factory.clone(),
+        }))
+    }
+
+    fn needs_completed_file_stats(&self) -> bool {
+        self.plan_factory.needs_completed_file_stats()
+    }
 }
 
 pub(crate) struct ShreddingFormatReader {
@@ -105,191 +183,70 @@ impl FormatFileReader for ShreddingFormatReader {
 
 pub(crate) struct ShreddingFormatWriter {
     state: ShreddingWriterState,
-    /// File compression codec, used for the MAP field-dict metadata at close.
     compression: String,
-    map_context: Option<Arc<Mutex<MapShreddingContext>>>,
+    plan_factory: Arc<dyn ShreddingWritePlanFactory>,
 }
 
 enum ShreddingWriterState {
     Ready {
         inner: Box<dyn FormatFileWriter>,
-        /// `None` when inference decided no shredding is needed (passthrough).
-        plan: Option<Box<dyn ShreddingWritePlan>>,
+        plan: Box<dyn ShreddingWritePlan>,
     },
     Infer {
-        writer_factory: Option<Box<dyn PhysicalFormatWriterFactory>>,
-        schema: SchemaRef,
-        logical_write_fields: Vec<DataField>,
-        format_options: HashMap<String, String>,
+        writer_factory: Arc<dyn PhysicalFormatWriterFactory>,
+        output: Box<OutputFile>,
         buffered_batches: Vec<RecordBatch>,
         buffered_row_count: usize,
         infer_buffer_row_count: usize,
-        plan_builder: InferPlanBuilder,
     },
     Closed,
 }
 
-/// How to build the [`ShreddingWritePlan`] once enough rows are buffered,
-/// mirroring Java's `ShreddingWritePlanFactory`.
-enum InferPlanBuilder {
-    Variant,
-}
-
 impl ShreddingFormatWriter {
-    pub(crate) async fn create(
-        mut writer_factory: Box<dyn PhysicalFormatWriterFactory>,
-        schema: SchemaRef,
-        write_fields: Option<&[DataField]>,
-        format_options: Option<&HashMap<String, String>>,
+    async fn create_ready_state(
+        writer_factory: &dyn PhysicalFormatWriterFactory,
+        output: &OutputFile,
         compression: &str,
-        map_context: Option<Arc<Mutex<MapShreddingContext>>>,
-    ) -> crate::Result<Box<dyn FormatFileWriter>> {
-        let Some(fields) = write_fields else {
-            return writer_factory.create_writer(schema, write_fields).await;
-        };
-        let Some(options) = format_options else {
-            return writer_factory.create_writer(schema, write_fields).await;
-        };
-
-        let variant_configured = configured_variant_shredding_fields(fields, options)?;
-        let variant_infer =
-            variant_configured.is_none() && should_infer_variant_shredding_fields(fields, options)?;
-        let map_configs = detect_map_shredding_fields(fields, options)?;
-
-        // Mirror Java's ShreddingWritePlanWriterFactories: at most one
-        // shredding plan may be active for a file.
-        if (variant_configured.is_some() || variant_infer) && !map_configs.is_empty() {
-            return Err(crate::Error::Unsupported {
-                message: "Variant shredding and MAP shared-shredding cannot be active \
-                          for the same file"
-                    .to_string(),
-            });
-        }
-
-        if let Some(physical_fields) = variant_configured {
-            let plan = VariantWritePlan::new(fields.to_vec(), physical_fields);
-            return Self::create_ready(writer_factory, Box::new(plan), compression).await;
-        }
-
-        if variant_infer {
-            return Ok(Box::new(Self {
-                state: ShreddingWriterState::Infer {
-                    writer_factory: Some(writer_factory),
-                    schema,
-                    logical_write_fields: fields.to_vec(),
-                    format_options: options.clone(),
-                    buffered_batches: Vec::new(),
-                    buffered_row_count: 0,
-                    infer_buffer_row_count: variant_shredding_infer_buffer_row_count(options)?,
-                    plan_builder: InferPlanBuilder::Variant,
-                },
-                compression: compression.to_string(),
-                map_context: None,
-            }));
-        }
-
-        if !map_configs.is_empty() {
-            // Validate the field-dict compression eagerly, mirroring Java's
-            // SchemaValidation (only none/lz4/zstd are supported).
-            normalize_field_dict_compression(Some(compression))?;
-            let context = map_context.unwrap_or_default();
-            let plan = MapShreddingWritePlan::new(fields, &map_configs, &context.lock().unwrap())?;
-            let writer_schema = build_target_arrow_schema(plan.physical_fields())?;
-            let inner = writer_factory
-                .create_writer(writer_schema, Some(plan.physical_fields()))
-                .await?;
-            return Ok(Box::new(Self {
-                state: ShreddingWriterState::Ready {
-                    inner,
-                    plan: Some(Box::new(plan)),
-                },
-                compression: compression.to_string(),
-                map_context: Some(context),
-            }));
-        }
-
-        writer_factory.create_writer(schema, write_fields).await
-    }
-
-    async fn create_ready(
-        mut writer_factory: Box<dyn PhysicalFormatWriterFactory>,
         plan: Box<dyn ShreddingWritePlan>,
-        compression: &str,
-    ) -> crate::Result<Box<dyn FormatFileWriter>> {
-        let writer_schema = build_target_arrow_schema(plan.physical_fields())?;
-        let inner = writer_factory
-            .create_writer(writer_schema, Some(plan.physical_fields()))
-            .await?;
-        Ok(Box::new(Self {
-            state: ShreddingWriterState::Ready {
-                inner,
-                plan: Some(plan),
-            },
-            compression: compression.to_string(),
-            map_context: None,
-        }))
+    ) -> crate::Result<ShreddingWriterState> {
+        // A no-op plan still receives its completion callback, but must
+        // preserve the delegate's Arrow schema (notably PK nullability).
+        let physical = if plan.physical_fields() == plan.logical_fields() {
+            None
+        } else {
+            Some((
+                build_target_arrow_schema(plan.physical_fields())?,
+                plan.physical_fields().to_vec(),
+            ))
+        };
+        let inner = match physical {
+            Some((schema, fields)) => {
+                writer_factory
+                    .create_physical_writer(output, compression, schema, Some(&fields))
+                    .await?
+            }
+            None => writer_factory.create_writer(output, compression).await?,
+        };
+        Ok(ShreddingWriterState::Ready { inner, plan })
     }
 
     async fn finalize_inferred_writer(&mut self) -> crate::Result<()> {
-        let (
-            mut writer_factory,
-            schema,
-            logical_write_fields,
-            format_options,
+        if !matches!(&self.state, ShreddingWriterState::Infer { .. }) {
+            return Ok(());
+        }
+        let ShreddingWriterState::Infer {
+            writer_factory,
+            output,
             buffered_batches,
-            plan_builder,
-        ) = match &mut self.state {
-            ShreddingWriterState::Ready { .. } => return Ok(()),
-            ShreddingWriterState::Closed => return Ok(()),
-            ShreddingWriterState::Infer {
-                writer_factory,
-                schema,
-                logical_write_fields,
-                format_options,
-                buffered_batches,
-                plan_builder,
-                ..
-            } => (
-                writer_factory
-                    .take()
-                    .ok_or_else(|| crate::Error::DataInvalid {
-                        message: "Shredding writer already finalized".to_string(),
-                        source: None,
-                    })?,
-                schema.clone(),
-                logical_write_fields.clone(),
-                format_options.clone(),
-                std::mem::take(buffered_batches),
-                std::mem::replace(plan_builder, InferPlanBuilder::Variant),
-            ),
+            ..
+        } = std::mem::replace(&mut self.state, ShreddingWriterState::Closed)
+        else {
+            unreachable!("inference checked above")
         };
-
-        let plan: Option<Box<dyn ShreddingWritePlan>> = match &plan_builder {
-            InferPlanBuilder::Variant => infer_variant_shredding_fields(
-                &logical_write_fields,
-                &buffered_batches,
-                &format_options,
-            )?
-            .map(|physical_fields| {
-                Box::new(VariantWritePlan::new(
-                    logical_write_fields.clone(),
-                    physical_fields,
-                )) as Box<dyn ShreddingWritePlan>
-            }),
-        };
-
-        let writer_schema = match &plan {
-            Some(plan) => build_target_arrow_schema(plan.physical_fields())?,
-            None => schema,
-        };
-        let inner = writer_factory
-            .create_writer(
-                writer_schema,
-                plan.as_ref().map(|plan| plan.physical_fields()),
-            )
-            .await?;
-        self.state = ShreddingWriterState::Ready { inner, plan };
-
+        let plan = self.plan_factory.create_write_plan(&buffered_batches)?;
+        self.state =
+            Self::create_ready_state(writer_factory.as_ref(), &output, &self.compression, plan)
+                .await?;
         for batch in buffered_batches {
             self.write(&batch).await?;
         }
@@ -301,26 +258,31 @@ impl ShreddingFormatWriter {
 impl FormatFileWriter for ShreddingFormatWriter {
     async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
         match &mut self.state {
-            ShreddingWriterState::Ready { inner, plan } => match plan {
-                Some(plan) => {
-                    let physical_batch = plan.to_physical_batch(batch)?;
-                    inner.write(&physical_batch).await
-                }
-                None => inner.write(batch).await,
-            },
+            ShreddingWriterState::Ready { inner, plan } => {
+                let physical_batch = plan.to_physical_batch(batch)?;
+                inner.write(&physical_batch).await
+            }
             ShreddingWriterState::Infer {
                 buffered_batches,
                 buffered_row_count,
                 infer_buffer_row_count,
                 ..
             } => {
-                let should_finalize = {
-                    buffered_batches.push(batch.clone());
-                    *buffered_row_count += batch.num_rows();
-                    *buffered_row_count >= *infer_buffer_row_count
-                };
-                if should_finalize {
+                // Sample the same prefix as Java, even when one Arrow batch
+                // crosses the inference threshold.
+                let sample_count = batch.num_rows().min(
+                    infer_buffer_row_count
+                        .saturating_sub(*buffered_row_count)
+                        .max(1),
+                );
+                buffered_batches.push(batch.slice(0, sample_count));
+                *buffered_row_count += sample_count;
+                if *buffered_row_count >= *infer_buffer_row_count {
                     self.finalize_inferred_writer().await?;
+                }
+                if sample_count < batch.num_rows() {
+                    self.write(&batch.slice(sample_count, batch.num_rows() - sample_count))
+                        .await?;
                 }
                 Ok(())
             }
@@ -379,22 +341,14 @@ impl FormatFileWriter for ShreddingFormatWriter {
         let compression = self.compression.clone();
         match std::mem::replace(&mut self.state, ShreddingWriterState::Closed) {
             ShreddingWriterState::Ready { mut inner, plan } => {
-                let widths = plan
-                    .as_ref()
-                    .map(|plan| plan.file_max_row_widths())
-                    .unwrap_or_default();
-                if let Some(plan) = plan {
-                    // Commit the shredding metadata into the file footer before
-                    // closing, mirroring Java's ShreddingFormatWriter.close.
-                    let field_metadata = plan.field_metadata(Some(&compression))?;
-                    if !field_metadata.is_empty() {
-                        inner.commit_field_metadata(&field_metadata)?;
-                    }
+                // Commit the shredding metadata into the file footer before
+                // closing, mirroring Java's ShreddingFormatWriter.close.
+                let field_metadata = plan.field_metadata(Some(&compression))?;
+                if !field_metadata.is_empty() {
+                    inner.commit_field_metadata(&field_metadata)?;
                 }
                 let result = inner.close().await?;
-                if let Some(context) = &self.map_context {
-                    context.lock().unwrap().report(&widths);
-                }
+                self.plan_factory.on_file_completed(plan.as_ref())?;
                 Ok(result)
             }
             ShreddingWriterState::Infer { .. } => unreachable!("infer writer finalized above"),
@@ -406,7 +360,6 @@ impl FormatFileWriter for ShreddingFormatWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arrow::build_target_arrow_schema;
     use crate::arrow::format::with_write_resources;
     use crate::resource::ResourceContext;
     use crate::spec::{DataType, IntType, MapType, VarCharType, VariantType};
@@ -419,14 +372,35 @@ mod tests {
     struct NoopWriterFactory;
 
     #[async_trait]
-    impl PhysicalFormatWriterFactory for NoopWriterFactory {
+    impl FormatWriterFactory for NoopWriterFactory {
         async fn create_writer(
-            &mut self,
+            &self,
+            _output: &OutputFile,
+            _compression: &str,
+        ) -> crate::Result<Box<dyn FormatFileWriter>> {
+            unreachable!("no writer should be created")
+        }
+    }
+
+    #[async_trait]
+    impl PhysicalFormatWriterFactory for NoopWriterFactory {
+        async fn create_physical_writer(
+            &self,
+            _output: &OutputFile,
+            _compression: &str,
             _schema: SchemaRef,
             _write_fields: Option<&[DataField]>,
         ) -> crate::Result<Box<dyn FormatFileWriter>> {
             unreachable!("no writer should be created when plan detection fails")
         }
+    }
+
+    fn test_output() -> OutputFile {
+        crate::io::FileIOBuilder::new("memory")
+            .build()
+            .unwrap()
+            .new_output("memory:/shredding.parquet")
+            .unwrap()
     }
 
     fn string_map_field(id: i32, name: &str) -> DataField {
@@ -452,17 +426,16 @@ mod tests {
                 .unwrap();
         let writer = ShreddingFormatWriter {
             state: ShreddingWriterState::Infer {
-                writer_factory: Some(Box::new(NoopWriterFactory)),
-                schema,
-                logical_write_fields: vec![],
-                format_options: HashMap::new(),
+                writer_factory: Arc::new(NoopWriterFactory),
+                output: Box::new(test_output()),
                 buffered_batches: vec![],
                 buffered_row_count: 0,
                 infer_buffer_row_count: 10,
-                plan_builder: InferPlanBuilder::Variant,
             },
             compression: "zstd".to_string(),
-            map_context: None,
+            plan_factory: Arc::new(
+                VariantShreddingWritePlanFactory::new(vec![], HashMap::new()).unwrap(),
+            ),
         };
         let resources = ResourceContext::builder().build().unwrap();
         let mut writer = with_write_resources(Box::new(writer), Some(&resources));
@@ -481,7 +454,6 @@ mod tests {
             DataField::new(0, "v".to_string(), DataType::Variant(VariantType::new())),
             string_map_field(1, "tags"),
         ];
-        let schema = build_target_arrow_schema(&fields).unwrap();
         let options = HashMap::from([
             (
                 "variant.inferShreddingSchema".to_string(),
@@ -492,17 +464,9 @@ mod tests {
                 "shared-shredding".to_string(),
             ),
         ]);
-        let err = ShreddingFormatWriter::create(
-            Box::new(NoopWriterFactory),
-            schema,
-            Some(&fields),
-            Some(&options),
-            "zstd",
-            None,
-        )
-        .await
-        .err()
-        .expect("conflicting shredding plans must be rejected");
+        let err = wrap_writer_factory(Arc::new(NoopWriterFactory), Some(&fields), Some(&options))
+            .err()
+            .expect("conflicting shredding plans must be rejected");
         assert!(
             matches!(err, crate::Error::Unsupported { .. }),
             "unexpected error: {err}"
@@ -514,26 +478,142 @@ mod tests {
     #[tokio::test]
     async fn test_map_shredding_rejects_unsupported_compression() {
         let fields = vec![string_map_field(0, "tags")];
-        let schema = build_target_arrow_schema(&fields).unwrap();
         let options = HashMap::from([(
             "fields.tags.map.storage-layout".to_string(),
             "shared-shredding".to_string(),
         )]);
-        let err = ShreddingFormatWriter::create(
-            Box::new(NoopWriterFactory),
-            schema,
-            Some(&fields),
-            Some(&options),
-            "snappy",
-            None,
-        )
-        .await
-        .err()
-        .expect("unsupported compression must be rejected");
+        let factory =
+            wrap_writer_factory(Arc::new(NoopWriterFactory), Some(&fields), Some(&options))
+                .unwrap();
+        let err = factory
+            .create_writer(&test_output(), "snappy")
+            .await
+            .err()
+            .expect("unsupported compression must be rejected");
         assert!(
             err.to_string()
                 .contains("MAP shared-shredding only supports none/lz4/zstd compression"),
             "unexpected error: {err}"
         );
+    }
+    struct CloseOnlyWriter {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl FormatFileWriter for CloseOnlyWriter {
+        async fn write(&mut self, _batch: &RecordBatch) -> crate::Result<()> {
+            Ok(())
+        }
+        fn num_bytes(&self) -> usize {
+            0
+        }
+        fn in_progress_size(&self) -> usize {
+            0
+        }
+        async fn flush(&mut self) -> crate::Result<()> {
+            Ok(())
+        }
+        fn commit_field_metadata(
+            &mut self,
+            _metadata: &crate::arrow::shredding::FieldMetadata,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn close(self: Box<Self>) -> crate::Result<FormatWriteResult> {
+            if self.fail {
+                Err(crate::Error::DataInvalid {
+                    message: "injected close failure".into(),
+                    source: None,
+                })
+            } else {
+                Ok(FormatWriteResult::new(0))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn adaptive_variant_commits_only_after_successful_file_close() {
+        let fields = vec![DataField::new(
+            0,
+            "v".into(),
+            DataType::Variant(VariantType::new()),
+        )];
+        let factory = Arc::new(
+            VariantShreddingWritePlanFactory::new(
+                fields,
+                HashMap::from([
+                    ("variant.inferShreddingSchema".into(), "true".into()),
+                    ("variant.shredding.inferenceMode".into(), "adaptive".into()),
+                    ("variant.shredding.maxInferBufferRow".into(), "4".into()),
+                    (
+                        "variant.shredding.adaptive.maxInferBufferRow".into(),
+                        "1".into(),
+                    ),
+                ]),
+            )
+            .unwrap(),
+        );
+        for fail in [true, false] {
+            let writer = Box::new(ShreddingFormatWriter {
+                state: ShreddingWriterState::Ready {
+                    inner: Box::new(CloseOnlyWriter { fail }),
+                    plan: factory.create_write_plan(&[]).unwrap(),
+                },
+                compression: "zstd".into(),
+                plan_factory: factory.clone(),
+            });
+            assert_eq!(writer.close().await.is_err(), fail);
+            assert_eq!(
+                factory.infer_buffer_row_count(),
+                Some(if fail { 4 } else { 1 })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn map_factory_advances_only_after_successful_file_close() {
+        use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
+        let fields = vec![string_map_field(0, "tags")];
+        let options = HashMap::from([
+            (
+                "fields.tags.map.storage-layout".into(),
+                "shared-shredding".into(),
+            ),
+            (
+                "fields.tags.map.shared-shredding.max-columns".into(),
+                "4".into(),
+            ),
+        ]);
+        let factory = Arc::new(MapShreddingWritePlanFactory::new(
+            fields.clone(),
+            detect_map_shredding_fields(&fields, &options).unwrap(),
+        ));
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        map.keys().append_value("a");
+        map.values().append_value(1);
+        map.append(true).unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("tags", Arc::new(map.finish()) as arrow_array::ArrayRef)])
+                .unwrap();
+        for fail in [true, false] {
+            let plan = factory.create_write_plan(&[]).unwrap();
+            let mut writer = Box::new(ShreddingFormatWriter {
+                state: ShreddingWriterState::Ready {
+                    inner: Box::new(CloseOnlyWriter { fail }),
+                    plan,
+                },
+                compression: "zstd".into(),
+                plan_factory: factory.clone(),
+            });
+            writer.write(&batch).await.unwrap();
+            assert_eq!(writer.close().await.is_err(), fail);
+            let next = factory.create_write_plan(&[]).unwrap();
+            let DataType::Row(physical) = next.physical_fields()[0].data_type() else {
+                panic!("expected physical MAP struct")
+            };
+            // Failed files must not affect the next physical schema.
+            assert_eq!(physical.fields().len() - 2, if fail { 4 } else { 1 });
+        }
     }
 }
