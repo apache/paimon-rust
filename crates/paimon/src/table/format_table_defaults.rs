@@ -35,6 +35,27 @@ use arrow_schema::{
 use crate::spec::{DataField, DataType};
 use crate::{Error, Result};
 
+/// Reject a schema whose column defaults cannot be cast to their column type,
+/// using the same per-column cast the Format Table writer applies at write time.
+/// Only Format Tables consume defaults, so any other table is a no-op. Call this
+/// before persisting a schema change such as `updateColumnDefaultValue`, so a
+/// default that would otherwise fail every subsequent write is refused up front
+/// and the previous schema stays usable — mirroring Java
+/// `SchemaValidation.validateDefaultValues`, which casts the default before
+/// publishing the change.
+pub(crate) fn ensure_schema_defaults_castable(schema: &crate::spec::TableSchema) -> Result<()> {
+    if !crate::spec::CoreOptions::new(schema.options()).is_format_table() {
+        return Ok(());
+    }
+    if schema.fields().iter().all(|f| f.default_value().is_none()) {
+        return Ok(());
+    }
+    let arrow_schema = crate::arrow::build_target_arrow_schema(schema.fields())?;
+    // `FormatTableDefaults::new` casts each declared default and errors on an
+    // unparseable one, so constructing it is the validation.
+    FormatTableDefaults::new(schema.fields(), &arrow_schema).map(|_| ())
+}
+
 pub(super) struct FormatTableDefaults {
     values: Vec<Option<ArrayRef>>,
 }

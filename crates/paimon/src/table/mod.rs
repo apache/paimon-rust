@@ -56,6 +56,7 @@ mod format_partition_truncate;
 mod format_read_builder;
 mod format_table_commit;
 mod format_table_defaults;
+pub(crate) use format_table_defaults::ensure_schema_defaults_castable;
 mod format_table_read;
 mod format_table_scan;
 #[cfg(test)]

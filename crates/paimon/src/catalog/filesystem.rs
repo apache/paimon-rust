@@ -558,6 +558,12 @@ impl Catalog for FileSystemCatalog {
         let new_schema = current
             .apply_changes(changes)
             .map_err(|e| fill_table_name(e, identifier))?;
+        // Validate column defaults against their type before persisting, so an
+        // alter that sets a default the Format Table writer could never cast
+        // (e.g. an INT default of "bad") is refused here and the previous schema
+        // stays usable, instead of succeeding and disabling every later write.
+        crate::table::ensure_schema_defaults_castable(&new_schema)
+            .map_err(|e| fill_table_name(e, identifier))?;
         self.save_table_schema(&table_path, &new_schema).await
     }
 
@@ -1133,6 +1139,75 @@ mod tests {
                 .unwrap()
                 .default_value(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_rejects_uncastable_format_table_default() {
+        use crate::spec::SchemaChange;
+
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .option("type", "format-table")
+            .option("file.format", "csv")
+            .build()
+            .unwrap();
+        let identifier = Identifier::new("db1", "t");
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+
+        // A castable default is accepted (the guard does not over-reject).
+        catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::update_column_default_value(
+                    "id".to_string(),
+                    Some("7".to_string()),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+
+        // An INT default that cannot be cast is refused before publishing,
+        // instead of succeeding and disabling every later Format Table write.
+        let err = catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::update_column_default_value(
+                    "id".to_string(),
+                    Some("bad".to_string()),
+                )],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("default value"),
+            "unexpected error: {err}"
+        );
+
+        // The previous (valid) default survives, so the schema stays usable.
+        let table = catalog.get_table(&identifier).await.unwrap();
+        assert_eq!(
+            table
+                .schema()
+                .fields()
+                .iter()
+                .find(|f| f.name() == "id")
+                .unwrap()
+                .default_value(),
+            Some("7")
         );
     }
 
