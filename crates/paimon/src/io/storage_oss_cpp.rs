@@ -365,7 +365,7 @@ fn ensure_process() -> Result<()> {
         Err(pid) if pid == current => Ok(()),
         Err(_) => Err(Error::new(
             ErrorKind::Unsupported,
-            "OSS C++ SDK cannot be used after fork; use spawn workers",
+            crate::error::OSS_CPP_FORK_ERROR,
         )),
     }
 }

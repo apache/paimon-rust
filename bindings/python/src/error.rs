@@ -80,6 +80,24 @@ mod tests {
     }
 
     #[test]
+    fn oss_cpp_fork_error_has_distinct_python_type() {
+        Python::attach(|py| {
+            let error = paimon::Error::ProcessForkUnsupported {
+                message: "OSS C++ SDK cannot be used after fork; use spawn workers".to_string(),
+            };
+            assert!(to_py_err(error).is_instance_of::<ForkSafetyError>(py));
+
+            let error = datafusion::error::DataFusionError::External(Box::new(
+                paimon::Error::ProcessForkUnsupported {
+                    message: "OSS C++ SDK cannot be used after fork; use spawn workers".to_string(),
+                },
+            ))
+            .context("SQL planning failed");
+            assert!(df_to_py_err(error).is_instance_of::<ForkSafetyError>(py));
+        });
+    }
+
+    #[test]
     fn wrapped_process_fork_error_has_distinct_python_type() {
         Python::attach(|py| {
             let error = to_py_err(paimon::Error::UnexpectedError {
