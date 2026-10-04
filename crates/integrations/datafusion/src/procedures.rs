@@ -20,6 +20,7 @@
 //! Supported procedures:
 //! - `CALL sys.create_tag(table => '...', tag => '...', snapshot_id => ...)`
 //! - `CALL sys.delete_tag(table => '...', tag => '...')`
+//! - `CALL sys.rename_tag(table => '...', tag => '...', target_tag => '...')`
 //! - `CALL sys.rollback_to(table => '...', snapshot_id => ... | tag => '...')`
 //! - `CALL sys.rollback_to_timestamp(table => '...', timestamp => ...)`
 //! - `CALL sys.create_tag_from_timestamp(table => '...', tag => '...', timestamp => ...)`
@@ -167,6 +168,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
     Some(match proc_name {
         "create_tag" => &["table", "tag", "snapshot_id"],
         "delete_tag" => &["table", "tag"],
+        "rename_tag" => &["table", "tag", "target_tag"],
         "rollback_to" => &["table", "snapshot_id", "tag"],
         "rollback_to_timestamp" => &["table", "timestamp"],
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
@@ -276,6 +278,7 @@ pub async fn execute_call(
     match proc_name.as_str() {
         "create_tag" => proc_create_tag(ctx, catalog, catalog_name, &args).await,
         "delete_tag" => proc_delete_tag(ctx, catalog, catalog_name, &args).await,
+        "rename_tag" => proc_rename_tag(ctx, catalog, catalog_name, &args).await,
         "rollback_to" => proc_rollback_to(ctx, catalog, catalog_name, &args).await,
         "rollback_to_timestamp" => {
             proc_rollback_to_timestamp(ctx, catalog, catalog_name, &args).await
@@ -473,6 +476,23 @@ async fn proc_delete_tag(
         }
         tm.delete(tag_name).await.map_err(to_datafusion_error)?;
     }
+    ok_result(ctx)
+}
+
+async fn proc_rename_tag(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let tag_name = require_arg(args, "tag")?;
+    let target_tag_name = require_arg(args, "target_tag")?;
+
+    let (_, tm) = managers(&table);
+    tm.rename(tag_name, target_tag_name)
+        .await
+        .map_err(to_datafusion_error)?;
     ok_result(ctx)
 }
 
