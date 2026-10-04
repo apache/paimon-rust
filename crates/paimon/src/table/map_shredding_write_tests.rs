@@ -187,6 +187,30 @@ async fn read_rows(table: &Table) -> BTreeMap<i32, BTreeMap<String, Option<i32>>
 }
 
 #[tokio::test]
+async fn existing_orc_map_tables_are_rejected_when_opening_append_and_pk_writers() {
+    for pk in [false, true] {
+        let table = table(pk, false).await;
+        for (key, value) in [
+            ("file.format", "orc"),
+            ("changelog-file.format", "orc"),
+            ("file.format.per.level", "0:parquet,1:orc"),
+        ] {
+            let unsupported = table.copy_with_options(std::collections::HashMap::from([(
+                key.to_string(),
+                value.to_string(),
+            )]));
+            let error = TableWrite::new(&unsupported, "map-test".into())
+                .err()
+                .expect("existing ORC MAP tables must not open a Rust writer");
+            assert!(
+                error.to_string().contains("only supports parquet"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn append_and_pk_map_files_adapt_and_roundtrip() {
     for pk in [false, true] {
         let table = table(pk, false).await;

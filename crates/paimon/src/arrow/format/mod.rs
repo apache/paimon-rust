@@ -508,6 +508,13 @@ pub(crate) fn create_format_writer_factory(
         ));
         return shredding::wrap_writer_factory(raw, write_fields, format_options);
     }
+    // Direct format writers can bypass table-schema validation. Never silently
+    // drop a requested MAP layout when selecting an unsupported format.
+    if let (Some(fields), Some(options)) = (write_fields, format_options) {
+        if !crate::arrow::shredding::map::detect_map_shredding_fields(fields, options)?.is_empty() {
+            crate::spec::map_shredding::validate_format("file.format", file_format)?;
+        }
+    }
     Ok(Arc::new(PlainFormatWriterFactory {
         schema,
         zstd_level,
@@ -727,6 +734,75 @@ mod tests {
             .unwrap();
             assert_eq!(configured.read_fields.as_slice(), expected, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn direct_writer_rejects_unsupported_map_shredding_before_creating_file() {
+        use crate::spec::{MapType, VarCharType};
+        let fields = vec![DataField::new(
+            0,
+            "tags".into(),
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type())
+                    .copy_with_nullable(false)
+                    .unwrap(),
+                DataType::Int(IntType::new()),
+            )),
+        )];
+        let schema = crate::arrow::build_target_arrow_schema(&fields).unwrap();
+        // The actual output format must be checked even when table options
+        // name Parquet (or the caller does not go through TableWrite).
+        let options = HashMap::from([
+            ("file.format".into(), "parquet".into()),
+            (
+                "fields.tags.map.storage-layout".into(),
+                "shared-shredding".into(),
+            ),
+        ]);
+        let io = FileIOBuilder::new("memory").build().unwrap();
+        for format in ["orc", "ORC", "avro", "row"] {
+            let path = format!("memory:/unsupported-map/data.{format}");
+            let output = io.new_output(&path).unwrap();
+            let error = create_format_writer(
+                &output,
+                schema.clone(),
+                "none",
+                0,
+                None,
+                Some(&fields),
+                Some(&options),
+            )
+            .await
+            .err()
+            .expect("unsupported MAP layout must fail before writing");
+            assert!(
+                error.to_string().contains("only supports parquet"),
+                "{error}"
+            );
+            assert!(!io.exists(&path).await.unwrap());
+        }
+        // A default layout still reaches the existing ORC type validation;
+        // it must not be rejected as an unsupported shredding configuration.
+        let options = HashMap::from([("fields.tags.map.storage-layout".into(), "default".into())]);
+        let output = io.new_output("memory:/ordinary-map/data.orc").unwrap();
+        let error = create_format_writer(
+            &output,
+            schema,
+            "none",
+            0,
+            None,
+            Some(&fields),
+            Some(&options),
+        )
+        .await
+        .err()
+        .expect("ORC's existing writer does not support MAP columns");
+        assert!(
+            error
+                .to_string()
+                .contains("ORC writer does not support column"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

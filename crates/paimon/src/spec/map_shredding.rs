@@ -163,10 +163,12 @@ pub(crate) fn validate(fields: &[DataField], options: &HashMap<String, String>) 
     Ok(())
 }
 
-fn validate_format(key: &str, value: &str) -> Result<()> {
-    if !matches!(value, "" | "parquet" | "orc") {
+pub(crate) fn validate_format(key: &str, value: &str) -> Result<()> {
+    // Java also supports ORC, but Rust has neither its shredding writer nor
+    // its MAP assembly reader. Reject it before writing a different layout.
+    if !value.is_empty() && !value.eq_ignore_ascii_case("parquet") {
         return Err(invalid(format!(
-            "MAP shared-shredding only supports parquet/orc file formats, but {key} is {value}"
+            "Rust MAP shared-shredding only supports parquet file format, but {key} is {value}"
         )));
     }
     Ok(())
@@ -286,9 +288,20 @@ mod tests {
                 "supported maximum of 16384",
             ),
             ("bucket", "-2", "postpone"),
-            ("file.format", "avro", "parquet/orc"),
-            ("changelog-file.format", "csv", "parquet/orc"),
-            ("file.format.per.level", "0:parquet,1:avro", "parquet/orc"),
+            ("file.format", "avro", "only supports parquet"),
+            ("file.format", "orc", "only supports parquet"),
+            ("changelog-file.format", "csv", "only supports parquet"),
+            ("changelog-file.format", "orc", "only supports parquet"),
+            (
+                "file.format.per.level",
+                "0:parquet,1:avro",
+                "only supports parquet",
+            ),
+            (
+                "file.format.per.level",
+                "0:parquet,1: ORC",
+                "only supports parquet",
+            ),
             ("file.compression", "snappy", "none/lz4/zstd"),
             ("changelog-file.compression", "gzip", "none/lz4/zstd"),
             (
@@ -381,7 +394,10 @@ mod tests {
             validate(&fields(), &options).unwrap();
         }
         let mut uppercase = options();
-        uppercase.insert("file.format.per.level".into(), "0: PARQUET ,1: ORC".into());
+        uppercase.insert(
+            "file.format.per.level".into(),
+            "0: PARQUET ,1: parquet".into(),
+        );
         uppercase.insert(
             "file.compression.per.level".into(),
             "0: LZ4 ,1: ZSTD".into(),
@@ -394,6 +410,29 @@ mod tests {
         let mut inactive = options();
         inactive.insert("fields.tags.map.storage-layout".into(), "default".into());
         inactive.insert("file.compression".into(), "snappy".into());
+        inactive.insert("file.format".into(), "orc".into());
         validate(&fields(), &inactive).unwrap();
+    }
+
+    #[test]
+    fn schema_builder_rejects_orc_map_shredding() {
+        for (key, value) in [
+            ("file.format", "orc"),
+            ("changelog-file.format", "orc"),
+            ("file.format.per.level", "0:parquet,1:orc"),
+        ] {
+            let mut builder = Schema::builder();
+            for field in fields() {
+                builder = builder.column(field.name(), field.data_type().clone());
+            }
+            for (option, value) in options() {
+                builder = builder.option(option, value);
+            }
+            let error = builder.option(key, value).build().unwrap_err();
+            assert!(
+                error.to_string().contains("only supports parquet"),
+                "{error}"
+            );
+        }
     }
 }
