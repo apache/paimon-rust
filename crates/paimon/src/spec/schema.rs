@@ -597,11 +597,9 @@ impl TableSchema {
                     // The default value is recorded on the field as a string and is
                     // cast/validated where it is consumed (the read path), exactly as
                     // a default set at create time; this arm only records the new
-                    // spelling. Mirrors Java `SchemaManager` rebuilding the field with
-                    // the new default value.
-                    fields[idx] = fields[idx]
-                        .clone()
-                        .with_default_value(Some(new_default_value));
+                    // spelling. `None` clears the default. Mirrors Java `SchemaManager`
+                    // rebuilding the field with the (possibly null) default value.
+                    fields[idx] = fields[idx].clone().with_default_value(new_default_value);
                 }
                 SchemaChange::UpdateColumnPosition { column_move } => {
                     apply_move(&mut fields, &column_move, full_name)?;
@@ -3379,7 +3377,7 @@ mod tests {
             .apply_changes(vec![
                 crate::spec::SchemaChange::update_column_default_value(
                     "label".to_string(),
-                    "unknown".to_string(),
+                    Some("unknown".to_string()),
                 ),
             ])
             .unwrap();
@@ -3399,12 +3397,28 @@ mod tests {
             None
         );
 
+        // Clearing with `None` removes the default (Java's null `newDefaultValue`).
+        let cleared = updated
+            .apply_changes(vec![
+                crate::spec::SchemaChange::update_column_default_value("label".to_string(), None),
+            ])
+            .unwrap();
+        assert_eq!(
+            cleared
+                .fields()
+                .iter()
+                .find(|f| f.name() == "label")
+                .unwrap()
+                .default_value(),
+            None
+        );
+
         // Altering the default of an unknown column is rejected.
         let err = TableSchema::new(0, &schema)
             .apply_changes(vec![
                 crate::spec::SchemaChange::update_column_default_value(
                     "ghost".to_string(),
-                    "x".to_string(),
+                    Some("x".to_string()),
                 ),
             ])
             .unwrap_err();

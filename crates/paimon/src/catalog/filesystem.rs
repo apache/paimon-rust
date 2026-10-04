@@ -1061,6 +1061,81 @@ mod tests {
         catalog.get_table(&identifier).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn test_alter_table_update_column_default_value_set_and_clear() {
+        use crate::spec::SchemaChange;
+
+        let (_temp_dir, catalog) = create_test_catalog();
+        catalog
+            .create_database("db1", false, HashMap::new())
+            .await
+            .unwrap();
+        let schema = Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .column(
+                "label",
+                crate::spec::DataType::VarChar(crate::spec::VarCharType::string_type()),
+            )
+            .build()
+            .unwrap();
+        let identifier = Identifier::new("db1", "t");
+        catalog
+            .create_table(&identifier, schema, false)
+            .await
+            .unwrap();
+
+        // Set a default on `label`.
+        catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::update_column_default_value(
+                    "label".to_string(),
+                    Some("unknown".to_string()),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        let table = catalog.get_table(&identifier).await.unwrap();
+        assert_eq!(
+            table
+                .schema()
+                .fields()
+                .iter()
+                .find(|f| f.name() == "label")
+                .unwrap()
+                .default_value(),
+            Some("unknown")
+        );
+
+        // Clear it with Java's null `newDefaultValue` (`None`).
+        catalog
+            .alter_table(
+                &identifier,
+                vec![SchemaChange::update_column_default_value(
+                    "label".to_string(),
+                    None,
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        let table = catalog.get_table(&identifier).await.unwrap();
+        assert_eq!(
+            table
+                .schema()
+                .fields()
+                .iter()
+                .find(|f| f.name() == "label")
+                .unwrap()
+                .default_value(),
+            None
+        );
+    }
+
     /// Give the table a first snapshot, so a test can assert that a rejection does
     /// not depend on whether one exists.
     async fn give_the_table_a_snapshot(catalog: &FileSystemCatalog, identifier: &Identifier) {

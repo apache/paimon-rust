@@ -80,11 +80,12 @@ pub enum SchemaChange {
         field_names: Vec<String>,
         new_comment: String,
     },
-    /// A SchemaChange to update the field's default value.
+    /// A SchemaChange to update the field's default value. `None` clears the
+    /// existing default, matching Java's nullable `newDefaultValue`.
     #[serde(rename_all = "camelCase")]
     UpdateColumnDefaultValue {
         field_names: Vec<String>,
-        new_default_value: String,
+        new_default_value: Option<String>,
     },
     /// A SchemaChange to update the field's position.
     #[serde(rename_all = "camelCase")]
@@ -210,18 +211,21 @@ impl SchemaChange {
         }
     }
 
-    /// impl the `update_column_default_value`.
-    pub fn update_column_default_value(field_name: String, new_default_value: String) -> Self {
+    /// impl the `update_column_default_value`. `None` clears the default.
+    pub fn update_column_default_value(
+        field_name: String,
+        new_default_value: Option<String>,
+    ) -> Self {
         SchemaChange::UpdateColumnDefaultValue {
             field_names: vec![field_name],
             new_default_value,
         }
     }
 
-    /// impl the `update_columns_default_value`.
+    /// impl the `update_columns_default_value`. `None` clears the default.
     pub fn update_columns_default_value(
         field_names: Vec<String>,
-        new_default_value: String,
+        new_default_value: Option<String>,
     ) -> Self {
         SchemaChange::UpdateColumnDefaultValue {
             field_names,
@@ -430,9 +434,31 @@ mod tests {
                 },
                 SchemaChange::UpdateColumnDefaultValue {
                     field_names: vec!["col5".to_string(), "f1".to_string()],
-                    new_default_value: "0".to_string(),
+                    new_default_value: Some("0".to_string()),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_update_column_default_value_null_clears() {
+        // Java sends `"newDefaultValue": null` to clear an existing default.
+        let json =
+            r#"{"action":"updateColumnDefaultValue","fieldNames":["v"],"newDefaultValue":null}"#;
+        let change: SchemaChange = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            change,
+            SchemaChange::UpdateColumnDefaultValue {
+                field_names: vec!["v".to_string()],
+                new_default_value: None,
+            }
+        );
+        // Round-trips back to an explicit JSON null, and the factory accepts None.
+        let value = serde_json::to_value(&change).unwrap();
+        assert!(value["newDefaultValue"].is_null());
+        assert_eq!(
+            SchemaChange::update_column_default_value("v".to_string(), None),
+            change
         );
     }
 
