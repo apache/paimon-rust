@@ -1005,6 +1005,63 @@ fn test_table_from_schema_json_rejects_invalid_identifier() {
 // =========================================================================
 
 #[test]
+fn test_catalog_list_databases_and_tables() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut options = Options::new();
+    options.set("warehouse", temp_dir.path().to_string_lossy());
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    crate::runtime().block_on(async {
+        catalog
+            .create_database("default", false, HashMap::new())
+            .await
+            .unwrap();
+        catalog
+            .create_database("analytics", false, HashMap::new())
+            .await
+            .unwrap();
+        for table in ["orders", "customers"] {
+            catalog
+                .create_table(&Identifier::new("default", table), simple_schema(), false)
+                .await
+                .unwrap();
+        }
+    });
+    unsafe {
+        let collect = |list: &paimon_string_list| -> Vec<String> {
+            (0..list.len)
+                .map(|i| {
+                    std::ffi::CStr::from_ptr(*list.items.add(i))
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        let catalog = wrap_catalog(Arc::new(catalog));
+
+        let dbs = paimon_catalog_list_databases(catalog);
+        assert!(dbs.error.is_null());
+        let db_names = collect(&dbs.string_list);
+        assert!(db_names.contains(&"default".to_string()));
+        assert!(db_names.contains(&"analytics".to_string()));
+        paimon_string_list_free(dbs.string_list);
+
+        let db = CString::new("default").unwrap();
+        let tables = paimon_catalog_list_tables(catalog, db.as_ptr());
+        assert!(tables.error.is_null());
+        let mut table_names = collect(&tables.string_list);
+        table_names.sort();
+        assert_eq!(
+            table_names,
+            vec!["customers".to_string(), "orders".to_string()]
+        );
+        paimon_string_list_free(tables.string_list);
+
+        paimon_catalog_free(catalog);
+    }
+}
+
+#[test]
 fn test_catalog_tag_lifecycle() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut options = Options::new();

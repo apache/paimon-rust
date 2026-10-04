@@ -92,6 +92,27 @@ var (
 		}[0],
 	}
 
+	// paimon_string_list { items: **c_char, len: usize }
+	typePaimonStringList = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
+	// paimon_result_string_list { string_list: paimon_string_list, error: *paimon_error }
+	typeResultStringList = ffi.Type{
+		Type: ffi.Struct,
+		Elements: &[]*ffi.Type{
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			&ffi.TypePointer,
+			nil,
+		}[0],
+	}
+
 	typeResultReadBlobs = ffi.Type{
 		Type: ffi.Struct,
 		Elements: &[]*ffi.Type{
@@ -426,6 +447,16 @@ type resultGetTag struct {
 	error *paimonError
 }
 
+type paimonStringList struct {
+	items *unsafe.Pointer
+	len   uintptr
+}
+
+type resultStringList struct {
+	stringList paimonStringList
+	error      *paimonError
+}
+
 type resultLatestSnapshot struct {
 	snapshot paimonBytes
 	error    *paimonError
@@ -551,4 +582,30 @@ func parseBytes(b paimonBytes) []byte {
 	data := make([]byte, b.len)
 	copy(data, unsafe.Slice(b.data, b.len))
 	return data
+}
+
+// parseStringList copies a paimon_string_list into a Go slice. It does not free
+// the list; the caller frees it with paimon_string_list_free.
+func parseStringList(list paimonStringList) []string {
+	if list.len == 0 || list.items == nil {
+		return nil
+	}
+	ptrs := unsafe.Slice(list.items, list.len)
+	out := make([]string, len(ptrs))
+	for i, p := range ptrs {
+		out[i] = goStringFromCString((*byte)(p))
+	}
+	return out
+}
+
+// goStringFromCString copies a NUL-terminated C string into a Go string.
+func goStringFromCString(p *byte) string {
+	if p == nil {
+		return ""
+	}
+	var n int
+	for *(*byte)(unsafe.Add(unsafe.Pointer(p), uintptr(n))) != 0 {
+		n++
+	}
+	return string(unsafe.Slice(p, n))
 }
