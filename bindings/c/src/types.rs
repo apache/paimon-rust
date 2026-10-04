@@ -70,6 +70,56 @@ pub unsafe extern "C" fn paimon_bytes_free(bytes: paimon_bytes) {
     }
 }
 
+/// C-compatible list of owned, null-terminated C strings.
+///
+/// `items` points to `len` string pointers. Free the whole list, including
+/// every string, with [`paimon_string_list_free`].
+#[repr(C)]
+pub struct paimon_string_list {
+    pub items: *mut *mut std::ffi::c_char,
+    pub len: usize,
+}
+
+impl paimon_string_list {
+    /// An empty list, used for error returns.
+    pub(crate) fn empty() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
+
+    /// Allocate a `paimon_string_list` from owned Rust strings. A string with an
+    /// interior NUL (impossible for a validated catalog name) becomes empty
+    /// rather than aborting the whole call.
+    pub(crate) fn from_strings(strings: Vec<String>) -> Self {
+        let ptrs: Vec<*mut std::ffi::c_char> = strings
+            .into_iter()
+            .map(|s| std::ffi::CString::new(s).unwrap_or_default().into_raw())
+            .collect();
+        let len = ptrs.len();
+        let items = Box::into_raw(ptrs.into_boxed_slice()) as *mut *mut std::ffi::c_char;
+        Self { items, len }
+    }
+}
+
+/// Free a paimon_string_list and every string it owns.
+///
+/// # Safety
+/// Only call with a list returned from a paimon C function, exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_string_list_free(list: paimon_string_list) {
+    if list.items.is_null() {
+        return;
+    }
+    let boxed = Box::from_raw(std::ptr::slice_from_raw_parts_mut(list.items, list.len));
+    for &ptr in boxed.iter() {
+        if !ptr.is_null() {
+            drop(std::ffi::CString::from_raw(ptr));
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct paimon_byte_slice {

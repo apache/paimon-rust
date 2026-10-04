@@ -22,9 +22,15 @@ use paimon::catalog::Identifier;
 use paimon::{Catalog, CatalogFactory, Options};
 
 use crate::error::{check_non_null, paimon_error, validate_cstr, PaimonErrorCode};
-use crate::result::{paimon_result_catalog_new, paimon_result_get_table, paimon_result_get_tag};
+use crate::result::{
+    paimon_result_catalog_new, paimon_result_get_table, paimon_result_get_tag,
+    paimon_result_string_list,
+};
 use crate::runtime;
-use crate::types::{paimon_bytes, paimon_catalog, paimon_identifier, paimon_option, paimon_table};
+use crate::types::{
+    paimon_bytes, paimon_catalog, paimon_identifier, paimon_option, paimon_string_list,
+    paimon_table,
+};
 
 /// Create a catalog using CatalogFactory with the given options.
 ///
@@ -133,6 +139,77 @@ pub unsafe extern "C" fn paimon_catalog_get_table(
         Err(e) => paimon_result_get_table {
             table: std::ptr::null_mut(),
             error: paimon_error::from_paimon(e),
+        },
+    }
+}
+
+/// List the databases in a catalog.
+///
+/// On success `error` is null and `string_list` owns the database names; free it
+/// with `paimon_string_list_free`. On error `string_list` is empty.
+///
+/// # Safety
+/// `catalog` must be a valid pointer from a previous paimon C call, or null (returns error).
+#[no_mangle]
+pub unsafe extern "C" fn paimon_catalog_list_databases(
+    catalog: *const paimon_catalog,
+) -> paimon_result_string_list {
+    if let Err(error) = check_non_null(catalog, "catalog") {
+        return paimon_result_string_list {
+            string_list: paimon_string_list::empty(),
+            error,
+        };
+    }
+    let catalog = &*((*catalog).inner as *const Arc<dyn Catalog>);
+    match runtime().block_on(catalog.list_databases()) {
+        Ok(names) => paimon_result_string_list {
+            string_list: paimon_string_list::from_strings(names),
+            error: std::ptr::null_mut(),
+        },
+        Err(error) => paimon_result_string_list {
+            string_list: paimon_string_list::empty(),
+            error: paimon_error::from_paimon(error),
+        },
+    }
+}
+
+/// List the tables in a database.
+///
+/// On success `error` is null and `string_list` owns the table names; free it
+/// with `paimon_string_list_free`. On error `string_list` is empty.
+///
+/// # Safety
+/// `catalog` must be a valid pointer from a previous paimon C call, or null (returns error).
+/// `database` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn paimon_catalog_list_tables(
+    catalog: *const paimon_catalog,
+    database: *const c_char,
+) -> paimon_result_string_list {
+    if let Err(error) = check_non_null(catalog, "catalog") {
+        return paimon_result_string_list {
+            string_list: paimon_string_list::empty(),
+            error,
+        };
+    }
+    let database = match validate_cstr(database, "database") {
+        Ok(database) => database,
+        Err(error) => {
+            return paimon_result_string_list {
+                string_list: paimon_string_list::empty(),
+                error,
+            }
+        }
+    };
+    let catalog = &*((*catalog).inner as *const Arc<dyn Catalog>);
+    match runtime().block_on(catalog.list_tables(&database)) {
+        Ok(names) => paimon_result_string_list {
+            string_list: paimon_string_list::from_strings(names),
+            error: std::ptr::null_mut(),
+        },
+        Err(error) => paimon_result_string_list {
+            string_list: paimon_string_list::empty(),
+            error: paimon_error::from_paimon(error),
         },
     }
 }

@@ -21,6 +21,7 @@ package paimon
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"unsafe"
 
@@ -89,6 +90,22 @@ func (c *Catalog) GetTable(id Identifier) (*Table, error) {
 
 func (c *Catalog) newIdentifier(id Identifier) (*paimonIdentifier, error) {
 	return ffiIdentifierNew.symbol(c.ctx)(id.database, id.object)
+}
+
+// ListDatabases returns the names of all databases in the catalog.
+func (c *Catalog) ListDatabases() ([]string, error) {
+	if c.inner == nil {
+		return nil, ErrClosed
+	}
+	return ffiCatalogListDatabases.symbol(c.ctx)(c.inner)
+}
+
+// ListTables returns the names of all tables in the given database.
+func (c *Catalog) ListTables(database string) ([]string, error) {
+	if c.inner == nil {
+		return nil, ErrClosed
+	}
+	return ffiCatalogListTables.symbol(c.ctx)(c.inner, database)
 }
 
 var ffiCatalogCreate = newFFI(ffiOpts{
@@ -203,5 +220,59 @@ var ffiCatalogGetTable = newFFI(ffiOpts{
 			return nil, parseError(ctx, result.error)
 		}
 		return result.table, nil
+	}
+})
+
+var ffiCatalogListDatabases = newFFI(ffiOpts{
+	sym:    "paimon_catalog_list_databases",
+	rType:  &typeResultStringList,
+	aTypes: []*ffi.Type{&ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonCatalog) ([]string, error) {
+	return func(catalog *paimonCatalog) ([]string, error) {
+		var result resultStringList
+		ffiCall(
+			unsafe.Pointer(&result),
+			unsafe.Pointer(&catalog),
+		)
+		if result.error != nil {
+			return nil, parseError(ctx, result.error)
+		}
+		defer ffiStringListFree.symbol(ctx)(result.stringList)
+		return parseStringList(result.stringList), nil
+	}
+})
+
+var ffiCatalogListTables = newFFI(ffiOpts{
+	sym:    "paimon_catalog_list_tables",
+	rType:  &typeResultStringList,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(*paimonCatalog, string) ([]string, error) {
+	return func(catalog *paimonCatalog, database string) ([]string, error) {
+		dbPtr, err := bytePtrFromString(database)
+		if err != nil {
+			return nil, err
+		}
+		var result resultStringList
+		ffiCall(
+			unsafe.Pointer(&result),
+			unsafe.Pointer(&catalog),
+			unsafe.Pointer(&dbPtr),
+		)
+		runtime.KeepAlive(dbPtr)
+		if result.error != nil {
+			return nil, parseError(ctx, result.error)
+		}
+		defer ffiStringListFree.symbol(ctx)(result.stringList)
+		return parseStringList(result.stringList), nil
+	}
+})
+
+var ffiStringListFree = newFFI(ffiOpts{
+	sym:    "paimon_string_list_free",
+	rType:  &ffi.TypeVoid,
+	aTypes: []*ffi.Type{&typePaimonStringList},
+}, func(_ context.Context, ffiCall ffiCall) func(paimonStringList) {
+	return func(list paimonStringList) {
+		ffiCall(nil, unsafe.Pointer(&list))
 	}
 })
