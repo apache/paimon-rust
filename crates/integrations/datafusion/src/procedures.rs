@@ -173,6 +173,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "rollback_to_timestamp" => &["table", "timestamp"],
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
         "rename_branch" => &["table", "from_branch", "to_branch"],
+        "delete_branch" => &["table", "branch"],
         "create_global_index" => &["table", "index_column", "index_type", "options"],
         // `partitions`/`dry_run` are declared but not yet implemented; they still reach
         // their own "not supported yet" error rather than being reported as unknown.
@@ -288,6 +289,7 @@ pub async fn execute_call(
             proc_create_tag_from_timestamp(ctx, catalog, catalog_name, &args).await
         }
         "rename_branch" => proc_rename_branch(ctx, catalog, catalog_name, &args).await,
+        "delete_branch" => proc_delete_branch(ctx, catalog, catalog_name, &args).await,
         "create_global_index" => proc_create_global_index(ctx, catalog, catalog_name, &args).await,
         "drop_global_index" => proc_drop_global_index(ctx, catalog, catalog_name, &args).await,
         "create_lumina_index" => proc_create_lumina_index(ctx, catalog, catalog_name, &args).await,
@@ -484,6 +486,58 @@ async fn proc_rename_branch(
     bm.rename_branch(from_branch, to_branch)
         .await
         .map_err(to_datafusion_error)?;
+    ok_result(ctx)
+}
+
+async fn proc_delete_branch(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let branch_str = require_arg(args, "branch")?;
+
+    // A REST catalog owns branch metadata and the Rust REST catalog has no
+    // branch-drop endpoint yet (Java `RESTCatalog.dropBranch` DELETEs through the
+    // catalog). Dropping the physical branch directory here would leave the
+    // catalog still listing the branch while its data is gone. Refuse before
+    // deleting anything, until a catalog-aware path exists.
+    if table.rest_env().is_some() {
+        return Err(DataFusionError::NotImplemented(
+            "delete_branch is not yet supported for tables managed by a REST catalog".to_string(),
+        ));
+    }
+
+    let bm = BranchManager::new(table.file_io().clone(), table.location().to_string());
+    let options = table.schema().options();
+    // Java `Table.deleteBranches` splits on comma and passes each token through
+    // unchanged. Branch identities keep leading/trailing spaces (the shared
+    // validator and readers treat `" b1"` and `"b1"` as distinct), so the
+    // delete_tag trim convention must not apply here — trimming could delete a
+    // different branch than the one requested.
+    for branch_name in branch_str.split(',') {
+        if branch_name.is_empty() {
+            continue;
+        }
+        // Validate the logical name before any existence check or deletion: a
+        // separator-bearing name like `prod/schema` would otherwise slip past the
+        // configured-branch guard (it is not literally `prod`) and recursively
+        // delete the inner directory of a protected branch.
+        BranchManager::validate_branch_name(branch_name).map_err(to_datafusion_error)?;
+        BranchManager::ensure_branch_deletable(options, branch_name)
+            .map_err(to_datafusion_error)?;
+        if !bm
+            .branch_exists(branch_name)
+            .await
+            .map_err(to_datafusion_error)?
+        {
+            continue;
+        }
+        bm.drop_branch(branch_name)
+            .await
+            .map_err(to_datafusion_error)?;
+    }
     ok_result(ctx)
 }
 

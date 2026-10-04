@@ -681,6 +681,32 @@ async fn test_rename_branch_rejected_on_rest_catalog() {
 }
 
 #[tokio::test]
+async fn test_delete_branch_rejected_on_rest_catalog() {
+    // A REST catalog owns branch metadata and the Rust REST catalog has no
+    // branch-drop endpoint yet, so `delete_branch` must refuse rather than delete
+    // a physical branch directory while the catalog still lists it. Without the
+    // guard the filesystem `BranchManager` runs and reports a different error, so
+    // this assertion is non-vacuous.
+    let (tmp, server, context) = setup().await;
+
+    // `get_table` needs a schema-bearing response; register one so resolution
+    // reaches the REST guard rather than failing earlier on a missing schema.
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .build()
+        .unwrap();
+    let path = format!("file://{}/{DATABASE}.db/{TABLE}", tmp.path().display());
+    server.add_table_with_schema(DATABASE, TABLE, schema, &path);
+
+    common::assert_sql_error(
+        &context,
+        &format!("CALL sys.delete_branch(table => '{DATABASE}.{TABLE}', branch => 'b1')"),
+        "REST catalog",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_argument_validation_follows_java() {
     let (_tmp, server, context) = setup().await;
 
