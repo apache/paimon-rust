@@ -19,13 +19,12 @@ under the License.
 
 # OSS C++ SDK backend (experimental, read-only)
 
-An opt-in FileIO backend using [Alibaba Cloud OSS C++ SDK v2](https://github.com/aliyun/alibabacloud-oss-cpp-sdk-v2).
-OpenDAL remains the default. This integration still uses OpenDAL's operator
-abstraction, but HEAD, Range GET and paginated LIST are executed by the C++ SDK.
+An opt-in, read-only FileIO backend using [Alibaba Cloud OSS C++ SDK v2](https://github.com/aliyun/alibabacloud-oss-cpp-sdk-v2)
+for HEAD, Range GET and paginated LIST. OpenDAL remains the default.
 
 ## Build
 
-Build/install the C++ SDK using its instructions, then build this bridge:
+Install the SDK, then build the bridge and enable the Rust feature:
 
 ```bash
 cmake -S integrations/oss-cpp -B build/oss-cpp \
@@ -34,15 +33,13 @@ cmake --build build/oss-cpp
 cargo build -p paimon --features storage-oss-cpp
 ```
 
-The Python binding enables `storage-all`, which includes this backend.
-Neither the bridge nor the C++ SDK is bundled
-in the wheel. Make their shared-library dependencies available on every worker.
-Only Linux has been tested. Tested SDK commit:
-`c13a82038b0696f99c32f4e86b623ffcc9e62140` (0.2.0).
+The Python binding already includes this feature, but neither the bridge nor
+the SDK is bundled in its wheel. Install both on each worker. Tested on Linux
+with SDK 0.2.0 (`c13a82038b0696f99c32f4e86b623ffcc9e62140`).
 
 ## Configure
 
-Pass these options to the native table/catalog FileIO:
+Set the native table/catalog FileIO options:
 
 ```text
 fs.oss.impl = cpp
@@ -51,10 +48,9 @@ fs.oss.endpoint = https://oss-cn-shanghai-internal.aliyuncs.com
 fs.oss.region = cn-shanghai
 ```
 
-Credentials use existing `fs.oss.accessKeyId`, `fs.oss.accessKeySecret` and
-optional `fs.oss.securityToken` options. REST catalogs continue to supply and
-refresh credentials through RESTTokenFileIO. A directly constructed static
-FileIO does not refresh credentials itself.
+Use the existing `fs.oss.accessKeyId`, `fs.oss.accessKeySecret` and optional
+`fs.oss.securityToken` credentials. REST catalog credentials still refresh;
+static FileIO credentials do not.
 
 | Option | Default |
 |---|---:|
@@ -64,24 +60,11 @@ FileIO does not refresh credentials itself.
 | `fs.oss.cpp.retry.max-attempts` | 3 |
 | `fs.oss.cpp.path-style` | false |
 
-The SDK handles retries; no extra OpenDAL retry layer is added. Timeout values
-are passed to the SDK's connect/read-write timeouts, **not** an end-to-end
-deadline including retries and permit waits. HTTPS certificate verification
-remains enabled; an explicit HTTP endpoint is supported for testing.
-
-One native client and connection pool is reused per bucket per FileIO.
-The gate covers HEAD, GET and LIST. A cancelled async caller retains its
-permit and client until the blocking SDK call completes. This is not a
-process-wide or host-wide rate limiter. Use spawned workers: invoking the
-SDK after a process that initialized it has forked is rejected.
-
-Writes, deletes, copies, renames and presigning are unsupported; there is no
-silent fallback. Range reads validate HTTP 206, Content-Range and exact body
-length. Bounded reads do not issue an extra HEAD. Unbounded/suffix reads use
-HEAD to determine size; returned data is buffered for the requested range.
-
-This changes native FileIO only. Python-side image-body downloads are not
-switched automatically. No throughput or long-tail improvement is claimed.
+The SDK handles retries. Timeouts are per connection/read-write, not
+end-to-end. Concurrency is bounded per FileIO, not per process; cancelled
+calls retain a slot until the SDK returns. Use spawned workers: SDK access
+after fork is rejected. Mutations and presigning are unsupported.
+Python-side image downloads are unaffected.
 
 ## Test
 
@@ -93,7 +76,5 @@ OSS_CPP_BRIDGE_LIBRARY="$PWD/build/oss-cpp/liboss_cpp_bridge.so" \
   -- --ignored
 ```
 
-The ignored tests exercise the real SDK against a local HTTP server, with fake
-credentials: ranges, short/incorrect responses, error mapping, retries, pagination,
-credential replacement and bounded concurrency including cancellation.
-No cloud account or customer data is needed.
+The ignored tests use the real SDK, fake credentials and a local HTTP server;
+no cloud account is needed.
