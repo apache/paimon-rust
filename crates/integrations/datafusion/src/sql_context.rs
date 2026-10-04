@@ -1087,12 +1087,24 @@ impl SQLContext {
             return ok_result(&self.ctx);
         }
 
-        // Infer the output schema from the query. Planning (not collecting) is
-        // enough here; the rows are written by the INSERT below, which resolves
-        // the query the same way.
+        // Expand catalog SQL functions once (so `plus_one(...)` and other
+        // catalog-registered functions resolve exactly as a plain SELECT does
+        // through SQLContext), then reuse the expanded query for both schema
+        // inference and population. Planning (not collecting) is enough for
+        // inference; the INSERT below writes the rows from the same expansion.
         let query_sql = query.to_string();
-        let df = self.ctx.sql(&query_sql).await?;
-        let arrow_fields = df
+        let mut state = self.ctx.state();
+        state.config_mut().options_mut().catalog.default_catalog = catalog_name.clone();
+        state.config_mut().options_mut().catalog.default_schema = identifier.database().to_string();
+        let expanded_query = crate::sql_function::expand_sql(
+            &query_sql,
+            &self.catalogs,
+            &catalog_name,
+            identifier.database(),
+        )
+        .await?;
+        let logical_plan = state.create_logical_plan(&expanded_query).await?;
+        let arrow_fields = logical_plan
             .schema()
             .as_arrow()
             .fields()
@@ -1139,15 +1151,15 @@ impl SQLContext {
             .await
             .map_err(to_datafusion_error)?;
 
-        // Populate the new table from the same query. `Box::pin` breaks the
-        // async recursion through `sql` (CTAS -> INSERT -> dispatch); `collect`
-        // drives the insert plan to completion.
+        // Populate the new table from the same expanded query. `Box::pin` breaks
+        // the async recursion through `sql` (CTAS -> INSERT -> dispatch);
+        // `collect` drives the insert plan to completion.
         let insert_sql = format!(
             "INSERT INTO {}.{}.{} {}",
             catalog_name,
             identifier.database(),
             identifier.object(),
-            query_sql
+            expanded_query
         );
         Box::pin(self.sql(&insert_sql)).await?.collect().await?;
 
@@ -6773,6 +6785,64 @@ mod tests {
         let names = name_col.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(ids.value(0), 2);
         assert_eq!(names.value(0), "b");
+    }
+
+    #[tokio::test]
+    async fn test_create_table_as_select_expands_catalog_functions() {
+        // A CTAS whose SELECT calls a catalog SQL function must expand it the
+        // same way a plain SELECT does; otherwise inference fails with
+        // "Invalid function". The target is backed by a real table so the
+        // INSERT and read-back actually run.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut options = paimon::Options::new();
+        options.set(
+            paimon::CatalogOptions::WAREHOUSE,
+            temp_dir.path().to_string_lossy(),
+        );
+        let storage = Arc::new(paimon::FileSystemCatalog::new(options).unwrap());
+        let mut setup = SQLContext::new();
+        setup
+            .register_catalog("paimon", storage.clone())
+            .await
+            .unwrap();
+        setup
+            .sql("CREATE TABLE paimon.default.fn_answer (answer BIGINT)")
+            .await
+            .unwrap();
+
+        let catalog = Arc::new(MockCatalog::new());
+        *catalog.existing_table.lock().unwrap() = Some(
+            storage
+                .get_table(&Identifier::new("default", "fn_answer"))
+                .await
+                .unwrap(),
+        );
+        add_plus_one_function(&catalog);
+        let ctx = make_sql_context(catalog.clone()).await;
+
+        // Before the fix this failed at inference with `Invalid function 'plus_one'`.
+        ctx.sql("CREATE TABLE paimon.default.fn_answer AS SELECT plus_one(41) AS answer")
+            .await
+            .unwrap();
+        assert!(catalog
+            .take_calls()
+            .iter()
+            .any(|c| matches!(c, CatalogCall::CreateTable { .. })));
+
+        let batches = ctx
+            .sql("SELECT answer FROM paimon.default.fn_answer")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let answers = batches[0]
+            .column_by_name("answer")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(answers.value(0), 42);
     }
 
     #[tokio::test]
