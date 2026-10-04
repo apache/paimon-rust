@@ -1119,3 +1119,241 @@ fn blobref_serialization_matches_java_modified_utf_and_checksum() {
         .windows(6)
         .any(|window| window == [0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80]));
 }
+
+async fn read_pending_values(table: &Table, file: &crate::spec::DataFileMeta) -> RecordBatch {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let path = file
+        .external_path
+        .clone()
+        .unwrap_or_else(|| format!("{}/bucket-postpone/{}", table.location(), file.file_name));
+    let bytes = table
+        .file_io()
+        .new_input(&path)
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    let batches = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .unwrap()
+        .build()
+        .unwrap()
+        .map(|b| b.unwrap())
+        .collect::<Vec<_>>();
+    let batch = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let values = batch
+        .project(&(2..batch.num_columns()).collect::<Vec<_>>())
+        .unwrap();
+    let stream = Box::pin(futures::stream::iter(vec![Ok(values)]));
+    let resolved: Vec<_> = super::managed_blob_reader::resolve_primary_key_blob_stream(
+        stream,
+        table.schema().fields(),
+        &table.schema().core_options(),
+        table.file_io().clone(),
+        2,
+    )
+    .try_collect()
+    .await
+    .unwrap();
+    resolved.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn postpone_scalar_blobs_keep_events_and_reference_packs_for_each_rolled_file() {
+    let io = test_file_io();
+    let path = "memory:/postpone_managed_blob_roll";
+    setup_dirs(&io, path).await;
+    let table = scalar_table(
+        &io,
+        path,
+        &[
+            ("bucket", "-2"),
+            ("target-file-row-num", "2"),
+            ("blob.target-file-size", "1 b"),
+        ],
+    );
+    let mut writer = TableWrite::new(&table, "postpone-blob".into()).unwrap();
+    for batch in [
+        scalar_batch_with_kinds(&[(3, Some(b"one"), 0), (1, Some(b"ignored"), 3)]),
+        scalar_batch_with_kinds(&[(3, Some(b"two"), 2), (2, None, 0)]),
+    ] {
+        writer.write_arrow_batch(&batch).await.unwrap();
+    }
+    let messages = writer.prepare_commit().await.unwrap();
+    let files = &messages[0].new_files;
+    assert_eq!(files.len(), 2);
+    for (index, file) in files.iter().enumerate() {
+        assert_eq!(file.row_count, 2);
+        assert_eq!(file.delete_row_count, Some(if index == 0 { 1 } else { 0 }));
+        assert_eq!(file.extra_files.len(), 1);
+        let reference = io
+            .new_input(&format!("{path}/bucket-postpone/{}", file.extra_files[0]))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(&reference[0..5], &[0x50, 0x42, 0x4c, 0x52, 1]);
+        assert_eq!(i32::from_be_bytes(reference[5..9].try_into().unwrap()), 1);
+        let resolved = read_pending_values(&table, file).await;
+        let payloads = resolved
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(payloads.value(0), if index == 0 { b"one" } else { b"two" });
+        assert!(payloads.is_null(1));
+    }
+    writer.close().await;
+    // Preparing transfers ownership; closing must preserve both Parquet and packs.
+    for file in files {
+        read_pending_values(&table, file).await;
+    }
+}
+
+#[tokio::test]
+async fn postpone_nested_blobs_preserve_nulls_and_duplicate_keys() {
+    let io = test_file_io();
+    let path = "memory:/postpone_nested_blob";
+    setup_dirs(&io, path).await;
+    let table = nested_table(&io, path).copy_with_options(std::collections::HashMap::from([(
+        "bucket".into(),
+        "-2".into(),
+    )]));
+    let batch = nested_batch(&table);
+    let mut writer = TableWrite::new(&table, "postpone-nested".into()).unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    let file = &messages[0].new_files[0];
+    assert_eq!(file.row_count, (2 * batch.num_rows()) as i64);
+    let actual = read_pending_values(&table, file).await;
+    let expected =
+        arrow_select::concat::concat_batches(&batch.schema(), &[batch.clone(), batch]).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn postpone_blob_failure_aborts_all_unprepared_files_and_packs() {
+    let io = test_file_io();
+    let path = "memory:/postpone_blob_failed";
+    setup_dirs(&io, path).await;
+    let table = scalar_table(
+        &io,
+        path,
+        &[
+            ("bucket", "-2"),
+            ("merge-engine", "first-row"),
+            ("target-file-row-num", "1"),
+        ],
+    );
+    let mut writer = TableWrite::new(&table, "postpone-fail".into()).unwrap();
+    writer
+        .write_arrow_batch(&scalar_batch_with_kinds(&[(1, Some(b"one"), 0)]))
+        .await
+        .unwrap();
+    assert!(writer
+        .write_arrow_batch(&scalar_batch_with_kinds(&[(1, Some(b"two"), 3)]))
+        .await
+        .is_err());
+    assert!(writer.prepare_commit().await.is_err());
+    assert!(io
+        .list_status(&format!("{path}/bucket-postpone/"))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn primary_key_blob_payload_limit_keeps_later_buckets() {
+    let file_io = test_file_io();
+    let path = "memory:/managed_blob_payload_limit";
+    setup_dirs(&file_io, path).await;
+    let table = scalar_table(&file_io, path, &[("bucket", "8")]);
+    let payloads: Vec<Vec<u8>> = (0..32)
+        .map(|id| format!("payload-{id}").into_bytes())
+        .collect();
+    let rows: Vec<_> = payloads
+        .iter()
+        .enumerate()
+        .map(|(id, payload)| (id as i32, Some(payload.as_slice())))
+        .collect();
+    let mut writer = TableWrite::new(&table, "limit-test".to_string()).unwrap();
+    writer
+        .write_arrow_batch(&scalar_batch(&rows))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    assert!(messages.len() > 1);
+    TableCommit::new(table.clone(), "limit-test".to_string())
+        .commit(messages)
+        .await
+        .unwrap();
+    for (id, payload) in payloads.into_iter().enumerate() {
+        let predicate = PredicateBuilder::new(table.schema().fields())
+            .equal("payload", Datum::Bytes(payload))
+            .unwrap();
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).unwrap();
+        builder.with_filter(predicate).with_limit(1);
+        let plan = builder.new_scan().plan().await.unwrap();
+        // Each bucket's raw row count includes non-matching payloads.
+        assert!(plan.splits().len() > 1);
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(
+            batches
+                .iter()
+                .find(|batch| batch.num_rows() > 0)
+                .unwrap()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            id as i32
+        );
+    }
+}
+
+#[tokio::test]
+async fn postpone_blob_failed_checkpoint_preserves_prepared_packs() {
+    let file_io = test_file_io();
+    let path = "memory:/postpone_blob_checkpoint_ownership";
+    setup_dirs(&file_io, path).await;
+    let table = scalar_table(
+        &file_io,
+        path,
+        &[("bucket", "-2"), ("merge-engine", "first-row")],
+    );
+    let mut writer = TableWrite::new(&table, "ownership-test".to_string()).unwrap();
+    writer
+        .write_arrow_batch(&scalar_batch(&[(1, Some(b"prepared"))]))
+        .await
+        .unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    writer
+        .write_arrow_batch(&scalar_batch(&[(2, Some(b"unprepared"))]))
+        .await
+        .unwrap();
+    assert!(writer
+        .write_arrow_batch(&scalar_batch_with_kinds(&[(2, Some(b"delete"), 3)]))
+        .await
+        .is_err());
+    let values = read_pending_values(&table, &messages[0].new_files[0]).await;
+    let payload = values
+        .column(1)
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .unwrap();
+    assert_eq!(payload.value(0), b"prepared");
+    let bucket = bucket_path_under(path, "", -2);
+    let paths = file_io.list_status(&format!("{bucket}/")).await.unwrap();
+    // Only the prepared data file, reference sidecar and pack survive.
+    assert_eq!(paths.len(), 3);
+}

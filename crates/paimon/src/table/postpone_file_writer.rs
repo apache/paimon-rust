@@ -22,15 +22,18 @@
 //!
 //! Uses a special file naming prefix: `data--u-{commitUser}-s-{writeId}-w-`.
 //!
-//! Reference: [PostponeBucketWriter](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/sink/PostponeBucketWriter.java)
+//! Reference: [PostponeBucketWriter](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/postpone/PostponeBucketWriter.java)
 
 use super::data_file_path_factory::{DataFilePath, DataFilePathFactory};
+use super::managed_blob_reference::{ManagedBlobReferences, REFERENCE_FILE_SUFFIX};
+use super::managed_blob_writer::ManagedBlobWriteState;
+use super::postpone_retract::PostponeRetractValidator;
 use crate::arrow::format::{create_format_writer, with_write_resources, FormatFileWriter};
 use crate::io::FileIO;
 use crate::resource::ResourceContext;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    data_file_to_file_index_file_name, BinaryRow, DataField, DataFileMeta, RowKind,
+    data_file_to_file_index_file_name, BinaryRow, CoreOptions, DataField, DataFileMeta, RowKind,
     EMPTY_SERIALIZED_ROW, VALUE_KIND_FIELD_NAME,
 };
 use crate::table::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
@@ -43,6 +46,8 @@ use tokio::task::JoinSet;
 
 /// Configuration for [`PostponeFileWriter`].
 pub(crate) struct PostponeWriteConfig {
+    pub table_name: String,
+    pub primary_keys: Vec<String>,
     pub table_options: std::collections::HashMap<String, String>,
     pub table_location: String,
     pub partition_path: String,
@@ -73,6 +78,9 @@ pub(crate) struct PostponeFileWriter {
     next_sequence_number: i64,
     current_writer: Option<Box<dyn FormatFileWriter>>,
     current_index: Option<DataFileIndexWriter>,
+    current_blob_references: Option<ManagedBlobReferences>,
+    managed_blob_writer: ManagedBlobWriteState,
+    retract_validator: PostponeRetractValidator,
     current_file_name: Option<String>,
     current_file_path: Option<DataFilePath>,
     current_stats: PostponeFileStats,
@@ -93,6 +101,14 @@ impl PostponeFileWriter {
             config.bucket,
             &config.table_options,
         )?;
+        let managed_blob_writer = ManagedBlobWriteState::new(
+            &file_io,
+            paths.bucket_path(),
+            &config.data_file_prefix,
+            &config.value_fields,
+            &CoreOptions::new(&config.table_options),
+        )?;
+        let retract_validator = PostponeRetractValidator::new(&config)?;
         Ok(Self {
             paths,
             file_io,
@@ -100,6 +116,9 @@ impl PostponeFileWriter {
             next_sequence_number: 0,
             current_writer: None,
             current_index: None,
+            current_blob_references: None,
+            managed_blob_writer,
+            retract_validator,
             current_file_name: None,
             current_file_path: None,
             current_stats: PostponeFileStats::default(),
@@ -118,7 +137,7 @@ impl PostponeFileWriter {
 
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         let result = self.write_batch(batch).await;
-        if result.is_err() && self.config.file_index_options.is_some() {
+        if result.is_err() {
             self.abort().await;
         }
         result
@@ -129,6 +148,8 @@ impl PostponeFileWriter {
             return Ok(());
         }
 
+        let batch = self.managed_blob_writer.externalize(batch.clone()).await?;
+        self.retract_validator.validate(&batch)?;
         if self.current_writer.is_none() {
             self.open_new_file(batch.schema()).await?;
         }
@@ -168,6 +189,7 @@ impl PostponeFileWriter {
                 }
             })?;
 
+        ManagedBlobReferences::collect(&mut self.current_blob_references, &physical_batch)?;
         self.current_writer
             .as_mut()
             .unwrap()
@@ -188,7 +210,7 @@ impl PostponeFileWriter {
         }
         self.next_sequence_number = end_seq + 1;
         self.current_stats
-            .add_batch(batch, &self.config, start_seq, end_seq)?;
+            .add_batch(&batch, &self.config, start_seq, end_seq)?;
 
         // Roll to a new file if target size is reached — close in background
         if self.current_writer.as_ref().unwrap().num_bytes() as i64 >= self.config.target_file_size
@@ -212,6 +234,7 @@ impl PostponeFileWriter {
             let _ = writer.close().await;
         }
         self.current_index = None;
+        self.current_blob_references = None;
         self.current_file_name = None;
         self.current_file_path = None;
         while self.in_flight_closes.join_next().await.is_some() {}
@@ -219,11 +242,12 @@ impl PostponeFileWriter {
             let _ = self.file_io.delete_file(&path).await;
         }
         self.written_files.clear();
+        self.managed_blob_writer.abort().await;
     }
 
     pub(crate) async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
         let result = self.finish().await;
-        if result.is_err() && self.config.file_index_options.is_some() {
+        if result.is_err() {
             self.abort().await;
         }
         result
@@ -242,6 +266,7 @@ impl PostponeFileWriter {
         // manifest order for ties. Background closes must not reorder arrivals.
         self.written_files
             .sort_by_key(|file| file.min_sequence_number);
+        self.managed_blob_writer.prepare_commit().await?;
         self.created_paths.clear();
         Ok(std::mem::take(&mut self.written_files))
     }
@@ -254,6 +279,7 @@ impl PostponeFileWriter {
         };
         let file_name = self.current_file_name.take().unwrap();
         let index = self.current_index.take();
+        let blob_references = self.current_blob_references.take();
         let file_io = self.file_io.clone();
         let location = self.current_file_path.take().unwrap();
         let bucket_dir = location.parent().to_string();
@@ -271,6 +297,14 @@ impl PostponeFileWriter {
         self.in_flight_closes.spawn(async move {
             let file_size = writer.close().await?.file_size as i64;
             let mut meta = build_meta(file_name, file_size, stats, schema_id, creation_time);
+            ManagedBlobReferences::finish(
+                blob_references,
+                &file_io,
+                &location.path,
+                &bucket_dir,
+                &mut meta,
+            )
+            .await?;
             meta.external_path = location.external_path;
             write_index(index, threshold, &file_io, &bucket_dir, &mut meta).await?;
             Ok(meta)
@@ -303,6 +337,17 @@ impl PostponeFileWriter {
                 data_file_to_file_index_file_name(&file_name)
             ));
         }
+        let blob_references = ManagedBlobReferences::new(
+            &self.config.value_fields,
+            &CoreOptions::new(&self.config.table_options),
+            &physical_schema,
+            self.managed_blob_writer.enabled(),
+            false,
+        )?;
+        if blob_references.is_some() {
+            self.created_paths
+                .push(format!("{file_path}{REFERENCE_FILE_SUFFIX}"));
+        }
         let output = self.file_io.new_output(&file_path)?;
         let writer = create_format_writer(
             &output,
@@ -316,6 +361,7 @@ impl PostponeFileWriter {
         .await?;
         self.current_writer = Some(with_write_resources(writer, self.resources.as_ref()));
         self.current_index = index;
+        self.current_blob_references = blob_references;
         self.current_file_name = Some(file_name);
         self.current_file_path = Some(location);
         self.current_stats = PostponeFileStats::default();
@@ -330,6 +376,7 @@ impl PostponeFileWriter {
         };
         let file_name = self.current_file_name.take().unwrap();
         let index = self.current_index.take();
+        let blob_references = self.current_blob_references.take();
         let stats = std::mem::take(&mut self.current_stats);
         let file_size = writer.close().await?.file_size as i64;
 
@@ -347,6 +394,14 @@ impl PostponeFileWriter {
             .file_index_options
             .as_ref()
             .map(|options| options.in_manifest_threshold);
+        ManagedBlobReferences::finish(
+            blob_references,
+            &self.file_io,
+            &location.path,
+            &bucket_dir,
+            &mut meta,
+        )
+        .await?;
         meta.external_path = location.external_path;
         write_index(index, threshold, &self.file_io, &bucket_dir, &mut meta).await?;
         self.written_files.push(meta);

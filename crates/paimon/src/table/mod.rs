@@ -111,6 +111,7 @@ mod postpone_file_writer;
 mod postpone_fixed_bucket_router;
 mod postpone_fixed_bucket_write;
 mod postpone_fixed_bucket_write_builder;
+mod postpone_retract;
 mod prepared_files;
 mod query_auth;
 mod read_builder;

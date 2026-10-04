@@ -91,7 +91,7 @@ impl FileWriter {
         }
     }
 
-    async fn prepare_commit(mut self) -> Result<PreparedFiles> {
+    async fn prepare_commit(mut self) -> (Result<PreparedFiles>, Option<Self>) {
         let result = match &mut self {
             FileWriter::Append(w) => w.prepare_commit().await.map(PreparedFiles::data),
             FileWriter::AppendDedicated(w) => w.prepare_commit().await.map(PreparedFiles::data),
@@ -101,7 +101,10 @@ impl FileWriter {
         if result.is_err() {
             self.abort().await;
         }
-        result
+        // A pending-bucket writer keeps its first-retract validation and
+        // arrival sequence across stream checkpoints, as Java does.
+        let retain = result.is_ok() && matches!(&self, FileWriter::Postpone(_));
+        (result, retain.then_some(self))
     }
 
     async fn abort(&mut self) {
@@ -1081,7 +1084,11 @@ impl TableWrite {
 
         let mut messages = Vec::new();
         let mut error = None;
-        for (partition_bytes, bucket, result) in results {
+        for (partition_bytes, bucket, (result, retained)) in results {
+            if let Some(writer) = retained {
+                self.partition_writers
+                    .insert((partition_bytes.clone(), bucket), writer);
+            }
             match result {
                 Ok(files) if !files.data_files.is_empty() || !files.changelog_files.is_empty() => {
                     let mut message = CommitMessage::new(partition_bytes, bucket, files.data_files);
@@ -1222,6 +1229,8 @@ impl TableWrite {
             PostponeFileWriter::new(
                 self.table.file_io().clone(),
                 PostponeWriteConfig {
+                    table_name: self.table.identifier().full_name(),
+                    primary_keys: self.table.schema().primary_keys().to_vec(),
                     table_location: self.table.location().to_string(),
                     table_options: self.table.schema().options().clone(),
                     partition_path,
