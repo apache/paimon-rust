@@ -57,7 +57,7 @@ static int32_t sdk_failure(OssCppBridgeError *error, const E &e) noexcept {
 }
 
 extern "C" {
-uint32_t oss_cpp_bridge_abi_version() { return 1; }
+uint32_t oss_cpp_bridge_abi_version() { return 2; }
 
 void *oss_cpp_bridge_create(const OssCppBridgeConfig *in,
                             OssCppBridgeError *error) {
@@ -148,15 +148,15 @@ int32_t oss_cpp_bridge_read(void *client, const char *bucket, const char *key,
 
 int32_t oss_cpp_bridge_list(void *client, const char *bucket,
                             const char *prefix, const char *token,
-                            uint8_t recursive, OssCppBridgeEntry entry,
-                            void *ctx, char **next_token,
-                            OssCppBridgeError *error) {
+                            uint8_t recursive, uint32_t max_keys,
+                            OssCppBridgeEntry entry, void *ctx,
+                            char **next_token, OssCppBridgeError *error) {
   *next_token = nullptr;
   return guarded(error, [&]() {
     auto request = oss::models::ListObjectsV2Request()
                        .setBucket(bucket)
                        .setPrefix(prefix)
-                       .setMaxKeys(1000);
+                       .setMaxKeys(max_keys);
     if (!recursive)
       request.setDelimiter("/");
     if (*token)

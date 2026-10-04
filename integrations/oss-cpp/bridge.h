@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-// ABI v1: all strings are UTF-8; inputs are borrowed for the call.
+// ABI v2: all strings are UTF-8; inputs are borrowed for the call.
 // Clients allow concurrent calls; each call owns its error output.
 // No C++ exception may cross this boundary.
 typedef struct {
@@ -56,8 +56,8 @@ int32_t oss_cpp_bridge_read(void *, const char *, const char *, uint64_t,
 // The callback borrows strings until it returns. next_token is owned by
 // the bridge and must be released with oss_cpp_bridge_free_string.
 int32_t oss_cpp_bridge_list(void *, const char *, const char *, const char *,
-                            uint8_t, OssCppBridgeEntry, void *, char **,
-                            OssCppBridgeError *);
+                            uint8_t, uint32_t, OssCppBridgeEntry, void *,
+                            char **, OssCppBridgeError *);
 void oss_cpp_bridge_free_string(char *);
 
 #ifdef __cplusplus

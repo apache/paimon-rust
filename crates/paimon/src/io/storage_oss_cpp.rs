@@ -30,15 +30,31 @@ use tokio::sync::{OnceCell, Semaphore};
 const PREFIX: &str = "fs.oss.cpp.";
 const DEFAULT_CONCURRENCY: usize = 8;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct OssCppStorageConfig {
     library: String,
     strings: Vec<CString>,
     concurrency: usize,
+    gate: Arc<Semaphore>,
     connect_timeout: i64,
     request_timeout: i64,
     retry_attempts: i64,
     path_style: u8,
+}
+
+impl Default for OssCppStorageConfig {
+    fn default() -> Self {
+        Self {
+            library: String::new(),
+            strings: Vec::new(),
+            concurrency: 0,
+            gate: Arc::new(Semaphore::new(0)),
+            connect_timeout: 0,
+            request_timeout: 0,
+            retry_attempts: 0,
+            path_style: 0,
+        }
+    }
 }
 
 impl Debug for OssCppStorageConfig {
@@ -127,6 +143,7 @@ pub(crate) fn oss_cpp_config_parse(
             library: required("fs.oss.cpp.library.path")?,
             strings,
             concurrency,
+            gate: Arc::new(Semaphore::new(concurrency)),
             connect_timeout: number("connect.timeout-ms", 10_000)?,
             request_timeout: number("request.timeout-ms", 30_000)?,
             retry_attempts: number("retry.max-attempts", 3)?,
@@ -170,7 +187,7 @@ impl Builder for CppBuilder {
         Ok(CppService {
             info: ServiceInfo::new("oss-cpp", "/", &self.bucket),
             client: Arc::new(LazyClient {
-                gate: Arc::new(Semaphore::new(self.config.concurrency)),
+                gate: self.config.gate.clone(),
                 config: self.config,
                 bucket: self.bucket,
                 client: OnceCell::new(),
@@ -229,6 +246,7 @@ impl Service for CppService {
             client: self.client.clone(),
             path: path.to_string(),
             recursive: args.recursive(),
+            max_keys: args.limit().unwrap_or(1000).clamp(1, 1000) as u32,
             token: String::new(),
             done: false,
             entries: Vec::new().into_iter(),
@@ -300,6 +318,7 @@ struct CppLister {
     client: Arc<LazyClient>,
     path: String,
     recursive: bool,
+    max_keys: u32,
     token: String,
     done: bool,
     entries: std::vec::IntoIter<oio::Entry>,
@@ -317,9 +336,10 @@ impl oio::List for CppLister {
             let path = self.path.clone();
             let token = self.token.clone();
             let recursive = self.recursive;
+            let max_keys = self.max_keys;
             let (entries, next) = self
                 .client
-                .call(move |c| c.list(&path, &token, recursive))
+                .call(move |c| c.list(&path, &token, recursive, max_keys))
                 .await?;
             self.done = next.is_empty();
             self.token = next;
@@ -468,6 +488,7 @@ type List = unsafe extern "C" fn(
     *const c_char,
     *const c_char,
     u8,
+    u32,
     EntryCallback,
     *mut c_void,
     *mut *mut c_char,
@@ -499,7 +520,7 @@ impl Api {
             let version = library
                 .get::<unsafe extern "C" fn() -> u32>(b"oss_cpp_bridge_abi_version\0")
                 .map_err(|_| load_error())?;
-            if version() != 1 {
+            if version() != 2 {
                 return Err(load_error());
             }
             Ok(Self {
@@ -569,8 +590,16 @@ impl Client {
         })
     }
     fn stat(&self, key: &str) -> Result<Metadata> {
-        if key.is_empty() || key.ends_with('/') {
+        if key.is_empty() {
             return Ok(Metadata::new(EntryMode::DIR));
+        }
+        if key.ends_with('/') {
+            let (entries, _) = self.list(key, "", true, 1)?;
+            return if entries.is_empty() {
+                Err(Error::new(ErrorKind::NotFound, "OSS directory not found"))
+            } else {
+                Ok(Metadata::new(EntryMode::DIR))
+            };
         }
         let key = cstring(key)?;
         let mut out = NativeMetadata {
@@ -644,6 +673,7 @@ impl Client {
         prefix: &str,
         token: &str,
         recursive: bool,
+        max_keys: u32,
     ) -> Result<(Vec<oio::Entry>, String)> {
         let prefix = cstring(prefix)?;
         let token = cstring(token)?;
@@ -660,6 +690,7 @@ impl Client {
                 prefix.as_ptr(),
                 token.as_ptr(),
                 u8::from(recursive),
+                max_keys,
                 collect_entry,
                 &mut entries as *mut EntryCollector as *mut c_void,
                 &mut next,

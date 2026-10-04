@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::io::FileRead;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -134,6 +135,7 @@ struct Mock {
     heads: Arc<AtomicUsize>,
     tokens: Arc<Mutex<Vec<String>>>,
     ranges: Arc<Mutex<Vec<String>>>,
+    list_requests: Arc<Mutex<Vec<(String, String)>>>,
     user_agents: Arc<Mutex<Vec<String>>>,
 }
 
@@ -181,6 +183,23 @@ async fn mock(
     }
     if query.contains_key("list-type") {
         let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+        state.list_requests.lock().unwrap().push((
+            prefix.to_string(),
+            query.get("max-keys").cloned().unwrap_or_default(),
+        ));
+        if prefix == "denied/" {
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from(
+                    "<Error><Code>AccessDenied</Code><Message>test</Message></Error>",
+                ))
+                .unwrap();
+        }
+        if prefix == "missing/" {
+            return Response::new(Body::from(
+                "<ListBucketResult><Name>bucket</Name><IsTruncated>false</IsTruncated></ListBucketResult>",
+            ));
+        }
         let page = if prefix == "bad/" {
             "<IsTruncated>true</IsTruncated>".to_string()
         } else if query.contains_key("continuation-token") {
@@ -293,6 +312,26 @@ async fn fixture(
 #[ignore = "requires the compiled OSS C++ SDK bridge; no cloud credentials"]
 async fn real_sdk_reads_errors_pagination_and_credentials() {
     let (op, state, server, mut options) = fixture(2).await;
+    assert!(op.stat("").await.unwrap().is_dir());
+    assert!(op.stat("objects/").await.unwrap().is_dir());
+    assert!(!op.exists("missing/").await.unwrap());
+    assert_eq!(
+        op.stat("denied/").await.unwrap_err().kind(),
+        ErrorKind::PermissionDenied
+    );
+    let file_io = crate::io::FileIOBuilder::new("oss")
+        .with_props(options.clone())
+        .build()
+        .unwrap();
+    assert!(file_io.exists_dir("oss://bucket/objects").await.unwrap());
+    assert!(!file_io.exists_dir("oss://bucket/missing").await.unwrap());
+    assert!(file_io.exists_dir("oss://bucket/denied").await.is_err());
+    let list_requests = state.list_requests.lock().unwrap();
+    assert!(
+        list_requests.contains(&("objects/".to_string(), "1".to_string())),
+        "list requests: {list_requests:?}"
+    );
+    drop(list_requests);
     assert_eq!(op.stat("data").await.unwrap().content_length(), 10);
     let before = state.heads.load(Ordering::SeqCst);
     let reader = op.reader("data").await.unwrap();
@@ -421,6 +460,28 @@ async fn real_sdk_request_gate_and_cancelled_future() {
     });
     futures::future::join_all(reads).await;
     assert_eq!(state.peak.load(Ordering::SeqCst), 2);
+    server.abort();
+
+    let (_, state, server, options) = fixture(1).await;
+    let file_io = crate::io::FileIOBuilder::new("oss")
+        .with_props(options)
+        .build()
+        .unwrap();
+    let reads = (0..8).map(|i| {
+        let file_io = file_io.clone();
+        async move {
+            let bucket = if i % 2 == 0 { "bucket-a" } else { "bucket-b" };
+            let path = format!("oss://{bucket}/slow");
+            let reader = file_io.new_input(&path).unwrap().reader().await.unwrap();
+            assert_eq!(reader.read(0..4).await.unwrap(), &b"0123"[..]);
+        }
+    });
+    futures::future::join_all(reads).await;
+    assert_eq!(
+        state.peak.load(Ordering::SeqCst),
+        1,
+        "two buckets in one FileIO must share the request gate"
+    );
     server.abort();
 
     let (op, state, server, _) = fixture(1).await;
