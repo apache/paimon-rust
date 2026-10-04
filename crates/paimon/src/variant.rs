@@ -1297,6 +1297,19 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
     Ok(segments)
 }
 
+/// Return the literal key selected by a one-segment object path.
+///
+/// Variant extraction read types carry SQL-style paths. The vectorized
+/// numeric projection can batch literal top-level keys, while nested paths
+/// continue through the general `variant_get` implementation.
+pub(crate) fn top_level_path_key(path: &str) -> Result<Option<String>> {
+    let segments = parse_path(path)?;
+    Ok(match segments.as_slice() {
+        [PathSegment::Key(key)] => Some(key.clone()),
+        _ => None,
+    })
+}
+
 #[derive(Clone)]
 struct FieldEntry {
     key: String,
@@ -2708,9 +2721,7 @@ fn cast_variant_to_extraction_value(
             .and_then(|value| i32::try_from(value).ok())
             .map(ShreddedValue::Int32),
         VariantScalarSchema::Int64 => cast_variant_to_i64(variant).map(ShreddedValue::Int64),
-        VariantScalarSchema::Float32 => {
-            cast_variant_to_f64(variant).map(|value| ShreddedValue::Float32(value as f32))
-        }
+        VariantScalarSchema::Float32 => cast_variant_to_f32(variant).map(ShreddedValue::Float32),
         VariantScalarSchema::Float64 => cast_variant_to_f64(variant).map(ShreddedValue::Float64),
         VariantScalarSchema::Decimal { precision, scale } => {
             cast_variant_to_decimal(variant, *precision, *scale).map(ShreddedValue::Decimal128)
@@ -2794,6 +2805,31 @@ fn cast_variant_to_f64(variant: VariantRef<'_>) -> Option<f64> {
             Some(decimal.unscaled as f64 / 10f64.powi(decimal.scale as i32))
         }
         VariantKind::String => variant.get_string().ok()?.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+pub(crate) fn cast_variant_to_f32(variant: VariantRef<'_>) -> Option<f32> {
+    match variant.kind().ok()? {
+        VariantKind::Boolean => Some(if variant.get_boolean().ok()? {
+            1.0
+        } else {
+            0.0
+        }),
+        VariantKind::Long => Some(variant.get_long().ok()? as f32),
+        VariantKind::Float => variant.get_float().ok(),
+        VariantKind::Double => Some(variant.get_double().ok()? as f32),
+        VariantKind::Decimal => {
+            let decimal = variant.get_decimal().ok()?;
+            Some((decimal.unscaled as f64 / 10f64.powi(decimal.scale as i32)) as f32)
+        }
+        // Java Float.parseFloat removes only leading/trailing characters <= U+0020.
+        VariantKind::String => variant
+            .get_string()
+            .ok()?
+            .trim_matches(|c| c <= '\u{20}')
+            .parse::<f32>()
+            .ok(),
         _ => None,
     }
 }
@@ -3636,5 +3672,66 @@ mod tests {
             Some(2),
             "2.5 truncates to 2"
         );
+    }
+
+    #[test]
+    fn float32_projection_casts_supported_sources_without_reinterpreting_temporal_values() {
+        let variant = GenericVariant::parse_json(
+            r#"{"boolean":true,"integer":27,"decimal":1.25,"string":"3.5","invalid":"bad"}"#,
+        )
+        .unwrap();
+        for (path, expected) in [
+            ("$.boolean", Some(1.0)),
+            ("$.integer", Some(27.0)),
+            ("$.decimal", Some(1.25)),
+            ("$.string", Some(3.5)),
+            ("$.invalid", None),
+        ] {
+            assert_eq!(
+                cast_variant_to_f32(variant.get_path(path).unwrap().unwrap()),
+                expected
+            );
+        }
+
+        let mut date = VariantBuilder::new();
+        date.append_date(20_000);
+        assert_eq!(
+            cast_variant_to_f32(date.result().unwrap().as_ref().unwrap()),
+            None
+        );
+
+        let mut timestamp = VariantBuilder::new();
+        timestamp.append_timestamp(1_700_000_000_123_456);
+        assert_eq!(
+            cast_variant_to_f32(timestamp.result().unwrap().as_ref().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn float32_projection_uses_java_string_whitespace_rules() {
+        let variant = GenericVariant::parse_json(
+            r#"{"ascii":" \t1.5\n ","control":"\u00001.5\u001f","nbsp":"\u00a01.5\u00a0"}"#,
+        )
+        .unwrap();
+        let float_type = DataType::Float(crate::spec::FloatType::new());
+
+        for path in ["$.ascii", "$.control"] {
+            let value = variant.get_path(path).unwrap().unwrap();
+            assert_eq!(
+                cast_variant_to_shredded_value(value, &float_type, true).unwrap(),
+                Some(ShreddedValue::Float32(1.5))
+            );
+        }
+
+        let nbsp = variant.get_path("$.nbsp").unwrap().unwrap();
+        assert_eq!(
+            cast_variant_to_shredded_value(nbsp, &float_type, false).unwrap(),
+            None
+        );
+        assert!(matches!(
+            cast_variant_to_shredded_value(nbsp, &float_type, true),
+            Err(Error::DataInvalid { .. })
+        ));
     }
 }

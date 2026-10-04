@@ -35,6 +35,48 @@ def _make_table_with_data(warehouse):
     return catalog.get_table("rdb.t")
 
 
+def _make_variant_table_with_data(warehouse):
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", {"warehouse": warehouse})
+    ctx.sql("CREATE SCHEMA paimon.vdb")
+    ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+    ctx.sql(
+        """
+        INSERT INTO paimon.vdb.t
+        SELECT 1, parse_json('{"age":27,"ratio":1.25}')
+        UNION ALL
+        SELECT 2, parse_json('{"age":"32","ratio":"invalid"}')
+        """
+    )
+    return PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+
+
+def _variant_read_type(table, columns, paths, fail_on_error=False):
+    fields = []
+    by_name = {field.name(): field for field in table.schema().fields()}
+    for name in columns:
+        field = by_name[name]
+        data_type = field.field_type()
+        if name == "payload":
+            data_type = {
+                "type": "ROW",
+                "fields": [
+                    {
+                        "id": index,
+                        "name": str(index),
+                        "type": "FLOAT",
+                        "description": (
+                            "__VARIANT_METADATA%s;%s;UTC"
+                            % (path, str(fail_on_error).lower())
+                        ),
+                    }
+                    for index, path in enumerate(paths)
+                ],
+            }
+        fields.append({"id": field.id(), "name": name, "type": data_type})
+    return json.dumps({"type": "ROW", "fields": fields})
+
+
 def test_read_builder_chain_exists():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_table_with_data(warehouse)
@@ -57,6 +99,139 @@ def test_with_projection():
         table = _make_table_with_data(warehouse)
         plan = table.new_read_builder().with_projection(["id"]).new_scan().plan()
         assert plan is not None
+
+
+def test_with_read_type_plain_projection():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        field = next(field for field in table.schema().fields() if field.name() == "id")
+        read_type = json.dumps({
+            "type": "ROW",
+            "fields": [{
+                "id": field.id(), "name": field.name(),
+                "type": field.field_type(),
+            }],
+        })
+        builder = table.new_read_builder().with_read_type(read_type)
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.schema.names == ["id"]
+        assert sorted(result.column("id").to_pylist()) == [1, 2, 3]
+
+
+def test_with_read_type_extracts_variant_fields():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["id", "payload"], ["$.ratio", "$.age", "$.missing"]))
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits())).sort_by("id")
+
+        assert result.schema.names == ["id", "payload"]
+        assert result.field("payload").type == pa.struct(
+            [
+                pa.field("0", pa.float32()),
+                pa.field("1", pa.float32()),
+                pa.field("2", pa.float32()),
+            ]
+        )
+        assert result.column("payload").combine_chunks().to_pylist() == [
+            {"0": 1.25, "1": 27.0, "2": None},
+            {"0": None, "1": 32.0, "2": None},
+        ]
+
+
+def test_with_read_type_variant_fields_honors_fail_on_error():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.ratio"], fail_on_error=True))
+        plan = builder.new_scan().plan()
+        with pytest.raises(ValueError, match="Cannot cast Variant value to"):
+            builder.new_read().read(plan.splits())
+
+
+def test_with_read_type_variant_float_whitespace_matches_java():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.vdb")
+        ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+        ascii_value = json.dumps({"x": " 1.5 "})
+        nbsp_value = json.dumps({"x": "\u00a01.5\u00a0"}, ensure_ascii=False)
+        ctx.sql(
+            "INSERT INTO paimon.vdb.t "
+            "SELECT 1, parse_json('%s') UNION ALL "
+            "SELECT 2, parse_json('%s')" % (ascii_value, nbsp_value)
+        )
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["id", "payload"], ["$.x"]))
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(
+            builder.new_read().read(plan.splits())
+        ).sort_by("id")
+        assert result.column("payload").combine_chunks().to_pylist() == [
+            {"0": 1.5}, {"0": None},
+        ]
+
+        strict = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.x"], fail_on_error=True))
+        with pytest.raises(ValueError, match="Cannot cast Variant value to"):
+            strict.new_read().read(strict.new_scan().plan().splits())
+
+
+def test_with_read_type_variant_fields_keeps_explicit_null():
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.vdb")
+        ctx.sql("CREATE TABLE paimon.vdb.t (id INT, payload VARIANT)")
+        ctx.sql("INSERT INTO paimon.vdb.t SELECT 1, parse_json('{\"x\":null}')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("vdb.t")
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.x"], fail_on_error=True))
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.column("payload").combine_chunks().to_pylist() == [{"0": None}]
+
+
+def test_with_read_type_rejects_invalid_schema():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        with pytest.raises(ValueError, match="invalid Paimon read type"):
+            table.new_read_builder().with_read_type("not JSON")
+
+
+def test_with_read_type_rejects_unsupported_variant_target():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        read_type = json.loads(_variant_read_type(table, ["payload"], ["$.age"]))
+        read_type["fields"][0]["type"]["fields"][0]["type"] = "INT"
+        with pytest.raises(ValueError, match="must be float32"):
+            table.new_read_builder().with_read_type(json.dumps(read_type))
+
+
+def test_with_nested_projection_replaces_read_type():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.age"])).with_nested_projection([["id"]])
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.schema.names == ["id"]
+        assert sorted(result.column("id").to_pylist()) == [1, 2]
+
+
+def test_with_projection_replaces_read_type():
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_variant_table_with_data(warehouse)
+        builder = table.new_read_builder().with_read_type(_variant_read_type(
+            table, ["payload"], ["$.age"])).with_projection(["id"])
+        plan = builder.new_scan().plan()
+        result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
+        assert result.schema.names == ["id"]
 
 
 def test_with_limit():
