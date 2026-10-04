@@ -2845,9 +2845,8 @@ impl TableCommit {
             for entry in self
                 .read_delta_entries(partition_filter.as_ref(), &snapshot)
                 .await?
-                .into_iter()
-                .filter(|entry| *entry.kind() == FileKind::Add)
             {
+                // Java's DML checker treats deleted column ranges as writes too.
                 let Some((start, end)) = entry.file().row_id_range() else {
                     continue;
                 };
@@ -2877,10 +2876,7 @@ impl TableCommit {
         delta_entries: &[ManifestEntry],
     ) -> Result<Vec<RowIdWriteRange>> {
         let mut ranges = Vec::new();
-        for entry in delta_entries
-            .iter()
-            .filter(|entry| *entry.kind() == FileKind::Add)
-        {
+        for entry in delta_entries {
             let Some((start, end)) = entry.file().row_id_range() else {
                 continue;
             };

@@ -446,3 +446,119 @@ async fn row_tracking_ignore_index_update_preserves_index_metadata() {
     assert_eq!(index_entries[0].index_file, index);
     assert_eq!(index_entries[0].kind, FileKind::Add);
 }
+
+async fn row_tracking_partial_delete_setup(io: &FileIO, path: &str) -> (TableCommit, DataFileMeta) {
+    setup_dirs(io, path).await;
+    let commit = setup_data_evolution_commit(io, path);
+    let mut initial = test_data_file("initial.parquet", 10);
+    initial.file_source = Some(0);
+    commit
+        .commit(vec![CommitMessage::new(
+            EMPTY_SERIALIZED_ROW.clone(),
+            0,
+            vec![initial],
+        )])
+        .await
+        .unwrap();
+    let mut partial = test_data_file("partial-name.parquet", 10);
+    partial.file_source = Some(0);
+    partial.first_row_id = Some(0);
+    partial.write_cols = Some(vec!["name".into()]);
+    let mut message = CommitMessage::new(EMPTY_SERIALIZED_ROW.clone(), 0, vec![partial]);
+    message.check_from_snapshot = Some(1);
+    commit.commit(vec![message]).await.unwrap();
+    let snapshot = latest_snapshot(io, path).await.unwrap();
+    let entries = active_entries(io, path, &snapshot).await;
+    let partial = entries
+        .iter()
+        .find(|entry| entry.file().file_name == "partial-name.parquet")
+        .unwrap()
+        .file()
+        .clone();
+    (commit, partial)
+}
+
+#[tokio::test]
+async fn row_tracking_historical_partial_delete_checks_updated_columns() {
+    for column in ["name", "id"] {
+        let io = test_file_io();
+        let path = format!("memory:/historical-partial-delete-{column}");
+        let (commit, partial) = row_tracking_partial_delete_setup(&io, &path).await;
+        let mut deletion = CommitMessage::new(EMPTY_SERIALIZED_ROW.clone(), 0, vec![]);
+        deletion.deleted_files.push(partial);
+        deletion.check_from_snapshot = Some(2);
+        commit.commit(vec![deletion]).await.unwrap();
+        let snapshot = latest_snapshot(&io, &path).await.unwrap();
+        assert_eq!(snapshot.id(), 3);
+        assert_eq!(snapshot.commit_kind(), &CommitKind::OVERWRITE);
+        let changes = commit.read_delta_entries(None, &snapshot).await.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind(), &FileKind::Delete);
+
+        let mut stale = test_data_file("stale-update.parquet", 10);
+        stale.file_source = Some(0);
+        stale.first_row_id = Some(0);
+        stale.write_cols = Some(vec![column.into()]);
+        let mut message = CommitMessage::new(EMPTY_SERIALIZED_ROW.clone(), 0, vec![stale]);
+        message.check_from_snapshot = Some(2);
+        let result = commit.commit(vec![message]).await;
+        let expected_snapshot = if column == "name" {
+            let error = result.expect_err("a historical DELETE must conflict on the same column");
+            assert!(
+                error
+                    .to_string()
+                    .contains("multiple MERGE INTO operations have encountered conflicts"),
+                "{error}"
+            );
+            3
+        } else {
+            result.unwrap();
+            4
+        };
+        let latest = latest_snapshot(&io, &path).await.unwrap();
+        assert_eq!(latest.id(), expected_snapshot);
+        assert_eq!(latest.next_row_id(), Some(10));
+    }
+}
+
+#[tokio::test]
+async fn row_tracking_partial_delete_checks_concurrent_updated_columns() {
+    for column in ["name", "id"] {
+        let io = test_file_io();
+        let path = format!("memory:/current-partial-delete-{column}");
+        let (commit, partial) = row_tracking_partial_delete_setup(&io, &path).await;
+        let mut concurrent = test_data_file("concurrent-update.parquet", 10);
+        concurrent.file_source = Some(0);
+        concurrent.first_row_id = Some(0);
+        concurrent.write_cols = Some(vec![column.into()]);
+        let mut message = CommitMessage::new(EMPTY_SERIALIZED_ROW.clone(), 0, vec![concurrent]);
+        message.check_from_snapshot = Some(2);
+        commit.commit(vec![message]).await.unwrap();
+
+        let mut deletion = CommitMessage::new(EMPTY_SERIALIZED_ROW.clone(), 0, vec![]);
+        deletion.deleted_files.push(partial);
+        deletion.check_from_snapshot = Some(2);
+        let result = commit.commit(vec![deletion]).await;
+        let expected_snapshot = if column == "name" {
+            let error = result.expect_err("a current DELETE must conflict on the same column");
+            assert!(
+                error
+                    .to_string()
+                    .contains("multiple MERGE INTO operations have encountered conflicts"),
+                "{error}"
+            );
+            3
+        } else {
+            result.unwrap();
+            4
+        };
+        let latest = latest_snapshot(&io, &path).await.unwrap();
+        assert_eq!(latest.id(), expected_snapshot);
+        assert_eq!(latest.next_row_id(), Some(10));
+        let partial_still_exists = active_entries(&io, &path, &latest)
+            .await
+            .iter()
+            .any(|entry| entry.file().file_name == "partial-name.parquet");
+        assert_eq!(partial_still_exists, column == "name");
+    }
+}
