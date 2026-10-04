@@ -50,7 +50,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
 use datafusion::arrow::array::{ArrayRef, Int32Array, StringArray};
 use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -1340,32 +1339,17 @@ fn optional_i32_arg(args: &HashMap<String, String>, name: &str) -> DFResult<Opti
         .transpose()
 }
 
-/// `older_than` as epoch milliseconds, or as a timestamp such as
-/// `2024-01-01 12:00:00` in the session's local time zone, which is how Java
-/// (`DateTimeUtils.parseTimestampData` with the default time zone) reads it.
+/// `older_than` as epoch milliseconds, or as a local date or timestamp such
+/// as `2024-01-01 12:00:00`, resolved like Java
+/// (`DateTimeUtils.parseTimestampData` with the default time zone).
 fn parse_older_than(value: &str) -> DFResult<i64> {
     let value = value.trim();
     if let Ok(millis) = value.parse::<i64>() {
         return Ok(millis);
     }
-    let naive = ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"]
-        .iter()
-        .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
-        .or_else(|| {
-            NaiveDate::parse_from_str(value, "%Y-%m-%d")
-                .ok()
-                .and_then(|date| date.and_hms_opt(0, 0, 0))
-        })
-        .ok_or_else(|| DataFusionError::Plan(format!("Invalid older_than timestamp: '{value}'")))?;
-    Local
-        .from_local_datetime(&naive)
-        .earliest()
-        .map(|timestamp| timestamp.timestamp_millis())
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!(
-                "older_than '{value}' does not exist in the local time zone"
-            ))
-        })
+    paimon::spec::parse_local_timestamp_millis(value, "older_than").map_err(|error| {
+        DataFusionError::Plan(format!("Invalid older_than timestamp: '{value}': {error}"))
+    })
 }
 
 fn ok_result(ctx: &SessionContext) -> DFResult<DataFrame> {
@@ -1386,8 +1370,44 @@ mod tests {
     use super::*;
     use paimon::io::FileIOBuilder;
 
+    /// Java resolves `older_than` with `LocalDateTime.atZone`: a local time in
+    /// a DST gap moves forward, one in a fold takes the earlier instant.
+    #[test]
+    fn test_parse_older_than_follows_java_across_dst() {
+        const CHILD: &str = "PAIMON_OLDER_THAN_DST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // 2024-03-10 02:30 does not exist in New York; Java gives 03:30 EDT.
+            assert_eq!(
+                parse_older_than("2024-03-10 02:30:00").unwrap(),
+                1_710_055_800_000
+            );
+            // 2024-11-03 01:30 happens twice; Java takes the earlier (EDT) one.
+            assert_eq!(
+                parse_older_than("2024-11-03 01:30:00").unwrap(),
+                1_730_611_800_000
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "procedures::tests::test_parse_older_than_follows_java_across_dst",
+            ])
+            .env("TZ", "America/New_York")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn test_parse_older_than() {
+        use chrono::{Local, NaiveDate, TimeZone};
         assert_eq!(
             parse_older_than("1700000000000").unwrap(),
             1_700_000_000_000

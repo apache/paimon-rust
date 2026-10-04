@@ -2045,7 +2045,7 @@ impl<'a> CoreOptions<'a> {
 /// Java DateTimeUtils accepts a date, a space-separated timestamp, or an ISO
 /// local timestamp (whose seconds are optional). It truncates to milliseconds
 /// and resolves the date/time in the process's default time zone.
-fn parse_scan_timestamp(value: &str, zone: &jiff::tz::TimeZone) -> crate::Result<i64> {
+fn parse_local_timestamp(value: &str, zone: &jiff::tz::TimeZone, name: &str) -> crate::Result<i64> {
     use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 
     let datetime = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
@@ -2056,7 +2056,7 @@ fn parse_scan_timestamp(value: &str, zone: &jiff::tz::TimeZone) -> crate::Result
                 .map(|date| date.and_hms_opt(0, 0, 0).unwrap())
         })
         .map_err(|error| crate::Error::DataInvalid {
-            message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+            message: format!("Invalid value for {name}: '{value}'"),
             source: Some(Box::new(error)),
         })?;
     // Chrono also accepts leap seconds and fractions longer than nanoseconds;
@@ -2067,7 +2067,7 @@ fn parse_scan_timestamp(value: &str, zone: &jiff::tz::TimeZone) -> crate::Result
             .is_some_and(|(_, fraction)| fraction.len() > 9)
     {
         return Err(crate::Error::DataInvalid {
-            message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+            message: format!("Invalid value for {name}: '{value}'"),
             source: None,
         });
     }
@@ -2075,7 +2075,7 @@ fn parse_scan_timestamp(value: &str, zone: &jiff::tz::TimeZone) -> crate::Result
     // Truncating here also preserves the correct millisecond for instants
     // immediately before the Unix epoch.
     let year = i16::try_from(datetime.year()).map_err(|error| crate::Error::DataInvalid {
-        message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+        message: format!("Invalid value for {name}: '{value}'"),
         source: Some(Box::new(error)),
     })?;
     let civil = jiff::civil::DateTime::new(
@@ -2088,7 +2088,7 @@ fn parse_scan_timestamp(value: &str, zone: &jiff::tz::TimeZone) -> crate::Result
         (datetime.nanosecond() / 1_000_000 * 1_000_000) as i32,
     )
     .map_err(|error| crate::Error::DataInvalid {
-        message: format!("Invalid value for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+        message: format!("Invalid value for {name}: '{value}'"),
         source: Some(Box::new(error)),
     })?;
     // Jiff's compatible disambiguation matches Java LocalDateTime.atZone:
@@ -2097,9 +2097,22 @@ fn parse_scan_timestamp(value: &str, zone: &jiff::tz::TimeZone) -> crate::Result
         .compatible()
         .map(|timestamp| timestamp.as_millisecond())
         .map_err(|error| crate::Error::DataInvalid {
-            message: format!("Invalid local time for {SCAN_TIMESTAMP_OPTION}: '{value}'"),
+            message: format!("Invalid local time for {name}: '{value}'"),
             source: Some(Box::new(error)),
         })
+}
+
+/// [`parse_local_timestamp`] for `scan.timestamp`.
+fn parse_scan_timestamp(value: &str, zone: &jiff::tz::TimeZone) -> crate::Result<i64> {
+    parse_local_timestamp(value, zone, SCAN_TIMESTAMP_OPTION)
+}
+
+/// Parse a local date or timestamp to epoch milliseconds like Java
+/// `DateTimeUtils.parseTimestampData` with the default time zone, as Java
+/// procedures do for arguments such as `older_than`: a time in a DST gap moves
+/// forward and one in a fold takes the earlier instant. `name` labels errors.
+pub fn parse_local_timestamp_millis(value: &str, name: &str) -> crate::Result<i64> {
+    parse_local_timestamp(value, &jiff::tz::TimeZone::system(), name)
 }
 
 /// Parse a memory size string to bytes using binary (1024-based) semantics,
