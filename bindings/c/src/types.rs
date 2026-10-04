@@ -269,12 +269,14 @@ pub(crate) struct ReadBuilderState {
     pub projected_columns: Option<Vec<String>>,
     pub filter: Option<Predicate>,
     pub case_sensitive: bool,
+    pub limit: Option<usize>,
 }
 
 /// Internal state for TableScan that stores table and filter.
 pub(crate) struct TableScanState {
     pub table: Table,
     pub filter: Option<Predicate>,
+    pub limit: Option<usize>,
 }
 
 #[repr(C)]

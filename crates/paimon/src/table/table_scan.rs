@@ -782,7 +782,12 @@ impl LimitPushdownAccumulator {
             self.fallback_splits.push(split.clone());
             self.limited_splits.push(split);
             self.scanned_row_count += merged_count;
-            self.limit_early_stopped = self.scanned_row_count >= self.limit as i64;
+            // Compare without a lossy signed cast: `limit` is `usize`, so
+            // `limit as i64` turns any value above `i64::MAX` (e.g. a C caller
+            // passing `SIZE_MAX`) negative, which would early-stop after the
+            // first counted split. `scanned_row_count` is always >= 0, so an
+            // unsigned comparison keeps a huge limit from truncating the scan.
+            self.limit_early_stopped = self.scanned_row_count as u128 >= self.limit as u128;
         } else {
             self.fallback_splits.push(split);
         }
@@ -3610,6 +3615,28 @@ mod tests {
             split_file_names(&result.splits),
             vec!["a.parquet", "c.parquet"]
         );
+    }
+
+    #[test]
+    fn test_incremental_limit_accumulator_does_not_truncate_on_oversized_limit() {
+        // A limit above i64::MAX (e.g. a C caller passing SIZE_MAX) must not wrap
+        // negative through a signed cast and early-stop after the first counted
+        // split; real row counts can never reach it, so every split is kept.
+        for limit in [usize::MAX, (i64::MAX as usize) + 1] {
+            let mut accumulator = LimitPushdownAccumulator::new(limit);
+            assert!(!accumulator.push(limit_test_split("a.parquet", 2)));
+            assert!(!accumulator.push(limit_test_split("b.parquet", 3)));
+            let result = accumulator.finish();
+            assert!(
+                !result.limit_early_stopped,
+                "limit {limit} must not early-stop"
+            );
+            assert_eq!(
+                split_file_names(&result.splits),
+                vec!["a.parquet", "b.parquet"],
+                "limit {limit} must keep all splits"
+            );
+        }
     }
 
     #[test]
