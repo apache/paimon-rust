@@ -25,7 +25,8 @@ use crate::spec::DataField;
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, LargeBinaryArray, RecordBatch, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, FixedSizeBinaryArray, LargeBinaryArray,
+    RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
@@ -841,20 +842,23 @@ fn decode_text_chunk(
                         message: format!("Invalid UTF-8 in CSV file: {e}"),
                         source: Some(Box::new(e)),
                     })?;
-                    let row = if line.trim().is_empty() {
+                    let mut row = if line.trim().is_empty() {
                         vec![None; schema.fields().len()]
                     } else {
                         parse_csv_line(line, options)?
                     };
-                    if row.len() != schema.fields().len() {
-                        return Err(Error::DataInvalid {
-                            message: format!(
-                                "CSV row has {} fields, expected {}",
-                                row.len(),
-                                schema.fields().len()
-                            ),
-                            source: None,
-                        });
+                    // Read permissively, matching Java `CsvParser` under the default
+                    // `csv.mode=permissive`: a row with fewer fields than the schema
+                    // pads the missing trailing columns with null, and a row with more
+                    // fields drops the extras. Failing the whole scan on a field-count
+                    // mismatch rejected files Java reads fine — e.g. reading a table
+                    // after ADD COLUMN (old files carry one fewer column), or any
+                    // externally produced CSV that omits an optional trailing column.
+                    let field_count = schema.fields().len();
+                    if row.len() < field_count {
+                        row.resize(field_count, None);
+                    } else if row.len() > field_count {
+                        row.truncate(field_count);
                     }
                     Ok(row)
                 })
@@ -1080,6 +1084,22 @@ fn csv_cast_column(column: &ArrayRef, target: &DataType) -> crate::Result<ArrayR
             }
             _ => unreachable!(),
         });
+    }
+    if matches!(target, DataType::Boolean) {
+        // Java `CsvParser` reads BOOLEAN via `Boolean.parseBoolean`: only "true"
+        // (case-insensitive) is true, every other non-null token is false, and
+        // it never yields null. arrow-cast instead maps "1"/"yes"/"t"/"on"/"y"
+        // to true and unrecognized tokens (e.g. "2", "invalid") to null, so the
+        // same CSV file read through Rust would flip boolean values or turn them
+        // null relative to Java. Match Java so a format table reads the same
+        // across engines. (Null fields are already `None` from CSV decoding and
+        // stay null.)
+        let values = column.as_any().downcast_ref::<StringArray>().unwrap();
+        let booleans: BooleanArray = values
+            .iter()
+            .map(|value| value.map(|value| value.eq_ignore_ascii_case("true")))
+            .collect();
+        return Ok(Arc::new(booleans));
     }
     arrow_cast::cast(column, target).map_err(arrow_error)
 }
@@ -1428,6 +1448,75 @@ mod tests {
         assert_eq!(
             value["outer"]["flags"],
             serde_json::json!(["false", null, "true"])
+        );
+    }
+
+    #[test]
+    fn csv_boolean_matches_java_parse_boolean() {
+        // Java `CsvParser` reads BOOLEAN via `Boolean.parseBoolean`: only "true"
+        // (case-insensitive) is true, every other non-null token is false, and
+        // null stays null. arrow-cast would instead read "1"/"yes"/"t" as true
+        // and "invalid" as null, flipping values for the same CSV file.
+        let input: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("true"),
+            Some("TRUE"),
+            Some("1"),
+            Some("yes"),
+            Some("t"),
+            Some("invalid"),
+            Some("false"),
+            Some("0"),
+            None,
+        ]));
+        let result = csv_cast_column(&input, &DataType::Boolean).unwrap();
+        let booleans = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let got: Vec<Option<bool>> = booleans.iter().collect();
+        assert_eq!(
+            got,
+            vec![
+                Some(true),  // "true"
+                Some(true),  // "TRUE"
+                Some(false), // "1"  (arrow-cast would say true)
+                Some(false), // "yes" (arrow-cast would say true)
+                Some(false), // "t"  (arrow-cast would say true)
+                Some(false), // "invalid" (arrow-cast would say null)
+                Some(false), // "false"
+                Some(false), // "0"
+                None,        // null stays null
+            ]
+        );
+    }
+
+    #[test]
+    fn csv_reads_ragged_rows_permissively() {
+        // A 3-column CSV format-table with a short row (missing the trailing
+        // column, e.g. an old file read after ADD COLUMN) and a long row (an
+        // extra trailing field). Java reads both under the default permissive
+        // mode; the reader must pad/truncate rather than fail the whole scan.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("c", DataType::Utf8, true),
+        ]));
+        let options = TextOptions::new(TextKind::Csv, &std::collections::HashMap::new()).unwrap();
+        let lines: Vec<Vec<u8>> = vec![b"x,y".to_vec(), b"p,q,r".to_vec(), b"1,2,3,4".to_vec()];
+        let batches = decode_text_chunk(&lines, TextKind::Csv, &options, &schema).unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+        let c = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 column");
+        assert!(
+            c.is_null(0),
+            "short row must pad the trailing column with null"
+        );
+        assert_eq!(c.value(1), "r");
+        assert_eq!(
+            c.value(2),
+            "3",
+            "long row must drop the extra trailing field"
         );
     }
 }

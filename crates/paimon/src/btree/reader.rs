@@ -20,7 +20,7 @@
 //! Supports:
 //! - Point lookup (equal)
 //! - Range queries (less than, greater than, between, etc.)
-//! - Null bitmap reading
+//! - On-demand null bitmap reading
 //! - IN / NOT IN queries
 
 use crate::btree::block::{BlockHandle, BlockReader};
@@ -64,11 +64,13 @@ fn try_sort_by<T>(
     }
 }
 
-/// BTree index reader with on-demand async data block loading.
+/// BTree index reader with on-demand async block loading.
 pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> {
     reader: Box<dyn FileRead>,
     sst_reader: SstFileReader,
-    null_bitmap: RoaringTreemap,
+    null_bitmap_handle: Option<BlockHandle>,
+    // Keep lazy synchronization state from inflating enums that embed this reader.
+    null_bitmap: Box<OnceCell<RoaringTreemap>>,
     min_key: Option<Vec<u8>>,
     max_key: Option<Vec<u8>>,
     key_comparator: F,
@@ -80,8 +82,8 @@ pub struct BTreeIndexReader<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> {
 
 impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
     /// Open a BTree index reader from a FileRead and file metadata.
-    /// Only reads footer, index block, and null bitmap on open.
-    /// Data blocks are read on demand during queries.
+    /// Only reads the footer and index block on open.
+    /// Data blocks, the Bloom filter, and the null bitmap are read on demand.
     pub async fn open(
         reader: Box<dyn FileRead>,
         file_size: u64,
@@ -136,16 +138,11 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
         let index_block = read_block_from_bytes(&index_bytes, idx.size)?;
         let sst_reader = SstFileReader::from_index_block(index_block);
 
-        // 3. Read null bitmap
-        let null_bitmap = match &footer.null_bitmap_handle {
-            Some(h) => read_null_bitmap(reader.as_ref(), h).await?,
-            None => RoaringTreemap::new(),
-        };
-
         Ok(Self {
             reader,
             sst_reader,
-            null_bitmap,
+            null_bitmap_handle: footer.null_bitmap_handle,
+            null_bitmap: Box::new(OnceCell::new()),
             min_key: meta.first_key.clone(),
             max_key: meta.last_key.clone(),
             key_comparator,
@@ -156,9 +153,20 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
         })
     }
 
-    /// Get the null bitmap (row ids of null keys).
-    pub fn null_bitmap(&self) -> &RoaringTreemap {
-        &self.null_bitmap
+    /// Load the null bitmap (row ids of null keys) on first access.
+    /// Concurrent callers share successful initialization within this reader.
+    /// I/O, CRC, and deserialization errors are returned here rather than on open;
+    /// failed loads are not cached and may be retried. An absent block returns an
+    /// empty bitmap without reading the file.
+    pub async fn null_bitmap(&self) -> io::Result<&RoaringTreemap> {
+        self.null_bitmap
+            .get_or_try_init(|| async {
+                match &self.null_bitmap_handle {
+                    Some(handle) => read_null_bitmap(self.reader.as_ref(), handle).await,
+                    None => Ok(RoaringTreemap::new()),
+                }
+            })
+            .await
     }
 
     /// Compare two keys, reporting a stored key that cannot belong to the column's
@@ -209,6 +217,58 @@ impl<F: Fn(&[u8], &[u8]) -> crate::Result<Ordering>> BTreeIndexReader<F> {
             }
         }
 
+        Ok(result)
+    }
+
+    /// Seek to each virtual tuple boundary; NULLs in individual components are
+    /// ordinary tuple keys and never use the scalar NULL bitmap.
+    pub(crate) async fn query_composite(
+        &self,
+        plan: &super::CompositePlan,
+    ) -> io::Result<RoaringTreemap> {
+        let mut result = RoaringTreemap::new();
+        for interval in &plan.intervals {
+            if let Some(key) = &interval.point_key {
+                result |= self.query_equal(key).await?;
+                continue;
+            }
+            let cmp = |key: &[u8], _: &[u8]| {
+                interval
+                    .lower
+                    .compare_key(key, &plan.codec)
+                    .map_err(key_comparison_io_error)
+            };
+            let (_, mut index_iter) = self.sst_reader.index_block().seek_and_iter(&[], &cmp)?;
+            let mut first = true;
+            while let Some((_, handle_bytes)) = index_iter.next() {
+                let handle = BlockHandle::decode(handle_bytes)?;
+                let block = self.read_data_block(&handle).await?;
+                let mut offset = if first {
+                    first = false;
+                    block.seek_and_iter(&[], &cmp)?.1.offset
+                } else {
+                    0
+                };
+                let mut done = false;
+                while offset < block.data.len() {
+                    let (key, value, next) = block.read_entry_at(offset);
+                    offset = next;
+                    if interval
+                        .upper
+                        .compare_key(key, &plan.codec)
+                        .map_err(key_comparison_io_error)?
+                        != Ordering::Less
+                    {
+                        done = true;
+                        break;
+                    }
+                    posting_list::add_to(value, self.file_version, &mut result)?;
+                }
+                if done {
+                    break;
+                }
+            }
+        }
         Ok(result)
     }
 

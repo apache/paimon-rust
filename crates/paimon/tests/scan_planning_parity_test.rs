@@ -734,9 +734,14 @@ async fn float_primary_key_snapshot_merges_versions_while_delta_keeps_events() {
 }
 
 #[tokio::test]
-async fn python_dv_manifest_layout_resolves_legacy_canonical_and_external_files() {
+async fn python_dv_manifest_resolves_java_index_locations() {
     use paimon::spec::IndexManifest;
-    for layout in ["legacy", "canonical", "external", "missing-external"] {
+    for layout in [
+        "missing-canonical",
+        "canonical",
+        "external",
+        "missing-external",
+    ] {
         let table = evolution_table_with_options(
             "memory:/planning_parity/python_dv",
             &[
@@ -773,7 +778,7 @@ async fn python_dv_manifest_layout_resolves_legacy_canonical_and_external_files(
             .copy_file(&source, &canonical)
             .await
             .unwrap();
-        let legacy = format!(
+        let table_index = format!(
             "{}/index/{}",
             table.location(),
             entries[0].index_file.file_name
@@ -781,22 +786,22 @@ async fn python_dv_manifest_layout_resolves_legacy_canonical_and_external_files(
         let external = format!("{}/external/dv", table.location());
         table
             .file_io()
-            .copy_file(&canonical, &legacy)
+            .copy_file(&canonical, &table_index)
             .await
             .unwrap();
         let expected_path = match layout {
-            "legacy" => {
+            "missing-canonical" => {
                 table.file_io().delete_file(&canonical).await.unwrap();
                 entries[0].index_file.external_path = None;
-                legacy
+                canonical
             }
             "canonical" => {
-                // The canonical file must win even if a stale legacy file exists.
+                // A same-name file in table/index must not affect bucket-local reads.
                 table
                     .file_io()
-                    .new_output(&legacy)
+                    .new_output(&table_index)
                     .unwrap()
-                    .write(bytes::Bytes::from_static(b"stale legacy DV"))
+                    .write(bytes::Bytes::from_static(b"wrong index directory"))
                     .await
                     .unwrap();
                 entries[0].index_file.external_path = None;
@@ -855,11 +860,15 @@ async fn python_dv_manifest_layout_resolves_legacy_canonical_and_external_files(
             .unwrap()
             .try_collect::<Vec<RecordBatch>>()
             .await;
-        if layout == "missing-external" {
+        if matches!(layout, "missing-canonical" | "missing-external") {
+            let error = batches.expect_err("a missing DV must not fall back to another directory");
             assert!(
-                batches.is_err(),
-                "an explicit missing DV must not fall back to a local copy"
+                error
+                    .to_string()
+                    .contains(expected_path.trim_start_matches("memory:/")),
+                "{error}"
             );
+            assert!(table.file_io().exists(&table_index).await.unwrap());
         } else {
             assert!(batches.is_ok(), "layout={layout}: {batches:?}");
             assert_eq!(read_ids(&table, &plan).await, vec![0, 2]);

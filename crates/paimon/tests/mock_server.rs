@@ -34,14 +34,15 @@ use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 use paimon::api::{
-    AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse,
-    CreateFunctionRequest, CreatePartitionsRequest, CreateTagRequest, CreateViewRequest,
-    DataPolicy, DropPartitionsRequest, DropPolicyRequest, ErrorResponse, GetDatabaseResponse,
-    GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse, ListDatabasesResponse,
-    ListFunctionsResponse, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
-    ListPartitionsResponse, ListPermissionsResponse, ListPoliciesResponse, ListTablesResponse,
-    ListViewsResponse, PermissionAssignment, PermissionResource, PolicyRequest, PolicyType,
-    RenameTableRequest, ResourcePaths, ResourceType, RevokePermissionRequest,
+    AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, AuthTableQueryResponse,
+    ConfigResponse, CreateFunctionRequest, CreatePartitionsRequest, CreateTagRequest,
+    CreateViewRequest, DataPolicy, DropPartitionsRequest, DropPolicyRequest, ErrorResponse,
+    GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetTagResponse, GetViewResponse,
+    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsByFilterRequest,
+    ListPartitionsByNamesRequest, ListPartitionsResponse, ListPermissionsResponse,
+    ListPoliciesResponse, ListTablesResponse, ListViewsResponse, PermissionAssignment,
+    PermissionResource, PolicyRequest, PolicyType, RenameTableRequest, ResourcePaths, ResourceType,
+    RevokePermissionRequest,
 };
 use paimon::catalog::{Function, Identifier};
 use paimon::spec::{CommitKind, Partition, Snapshot};
@@ -86,6 +87,10 @@ struct MockState {
     drop_policy_bodies: Vec<serde_json::Value>,
     create_policy_error: Option<ErrorResponse>,
     drop_policy_error: Option<ErrorResponse>,
+    auth_responses: HashMap<String, AuthTableQueryResponse>,
+    column_auth: HashMap<String, Vec<String>>,
+    uuid_after_auth: HashMap<String, String>,
+    uuid_after_calls: HashMap<String, (String, usize)>,
     /// ECS metadata role name (for token loader testing)
     ecs_role_name: Option<String>,
     /// ECS metadata token (for token loader testing)
@@ -813,7 +818,7 @@ impl RESTServer {
         Path((db, table)): Path<(String, String)>,
         Extension(state): Extension<Arc<RESTServer>>,
     ) -> impl IntoResponse {
-        let s = state.inner.lock().unwrap();
+        let mut s = state.inner.lock().unwrap();
 
         let key = format!("{db}.{table}");
         if s.no_permission_tables.contains(&key) {
@@ -824,6 +829,18 @@ impl RESTServer {
                 Some(403),
             );
             return (StatusCode::FORBIDDEN, Json(err)).into_response();
+        }
+
+        if let Some((uuid, remaining)) = s.uuid_after_calls.get_mut(&key) {
+            if *remaining == 0 {
+                let uuid = uuid.clone();
+                s.uuid_after_calls.remove(&key);
+                if let Some(t) = s.tables.get_mut(&key) {
+                    t.id = Some(uuid);
+                }
+            } else {
+                *remaining -= 1;
+            }
         }
 
         if let Some(response) = s.tables.get(&key) {
@@ -847,6 +864,78 @@ impl RESTServer {
             Some(404),
         );
         (StatusCode::NOT_FOUND, Json(err)).into_response()
+    }
+
+    pub async fn auth_table_query(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<paimon::api::AuthTableQueryRequest>,
+    ) -> impl IntoResponse {
+        let s = state.inner.lock().unwrap();
+        let key = format!("{db}.{table}");
+
+        // Mirrors the reference server: a null select means the real schema
+        // fields, and any column outside the grant denies the query.
+        if let Some(allowed) = s.column_auth.get(&key) {
+            let requested = request.select.clone().unwrap_or_else(|| {
+                s.tables
+                    .get(&key)
+                    .and_then(|t| t.schema.as_ref())
+                    .map(|schema| {
+                        schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+            if let Some(denied) = requested.iter().find(|c| !allowed.contains(c)) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(ErrorResponse::new(
+                        Some("table".to_string()),
+                        Some(denied.clone()),
+                        Some(format!("no permission for column '{denied}'")),
+                        Some(403),
+                    )),
+                )
+                    .into_response();
+            }
+        }
+
+        let response = s.auth_responses.get(&key).cloned().unwrap_or_default();
+        drop(s);
+        let mut s = state.inner.lock().unwrap();
+        if let Some(uuid) = s.uuid_after_auth.remove(&key) {
+            if let Some(existing) = s.tables.get_mut(&key) {
+                existing.id = Some(uuid);
+            }
+        }
+        (StatusCode::OK, Json(response)).into_response()
+    }
+
+    pub fn set_table_uuid_after_calls(
+        &self,
+        database: &str,
+        table: &str,
+        uuid: &str,
+        after: usize,
+    ) {
+        let mut s = self.inner.lock().unwrap();
+        s.uuid_after_calls
+            .insert(format!("{database}.{table}"), (uuid.to_string(), after));
+    }
+
+    pub fn set_table_uuid_after_auth(&self, database: &str, table: &str, uuid: &str) {
+        let mut s = self.inner.lock().unwrap();
+        s.uuid_after_auth
+            .insert(format!("{database}.{table}"), uuid.to_string());
+    }
+
+    pub fn set_column_auth(&self, database: &str, table: &str, columns: Vec<String>) {
+        let mut s = self.inner.lock().unwrap();
+        s.column_auth.insert(format!("{database}.{table}"), columns);
     }
 
     /// Handle DELETE /databases/:db/tables/:table - drop a table.
@@ -1843,10 +1932,13 @@ impl RESTServer {
         });
 
         let key = format!("{database}.{table}");
+        // A `t$branch_x` registration reports an id of its own: whether a real
+        // server shares the base table's is not something the client may assume.
+        let uuid = table.to_string();
         s.tables.insert(
             key,
             GetTableResponse::new(
-                Some(table.to_string()),
+                Some(uuid),
                 Some(database.to_string()),
                 Some(table.to_string()),
                 Some(path.to_string()),
@@ -1856,6 +1948,42 @@ impl RESTServer {
                 AuditRESTResponse::new(None, None, None, None, None),
             ),
         );
+    }
+
+    pub fn clear_table_identity(&self, database: &str, table: &str) {
+        let mut s = self.inner.lock().unwrap();
+        if let Some(existing) = s.tables.get_mut(&format!("{database}.{table}")) {
+            existing.id = None;
+            existing.schema_id = None;
+        }
+    }
+
+    pub fn set_table_uuid(&self, database: &str, table: &str, uuid: &str) {
+        let mut s = self.inner.lock().unwrap();
+        if let Some(existing) = s.tables.get_mut(&format!("{database}.{table}")) {
+            existing.id = Some(uuid.to_string());
+        }
+    }
+
+    pub fn set_table_schema_id(
+        &self,
+        database: &str,
+        table: &str,
+        schema: paimon::spec::Schema,
+        schema_id: i64,
+    ) {
+        let mut s = self.inner.lock().unwrap();
+        let key = format!("{database}.{table}");
+        if let Some(existing) = s.tables.get_mut(&key) {
+            existing.schema_id = Some(schema_id);
+            existing.schema = Some(schema);
+        }
+    }
+
+    pub fn set_auth_response(&self, database: &str, table: &str, response: AuthTableQueryResponse) {
+        let mut s = self.inner.lock().unwrap();
+        s.auth_responses
+            .insert(format!("{database}.{table}"), response);
     }
 
     /// Add a no-permission table to the server state.
@@ -2228,6 +2356,10 @@ pub async fn start_mock_server(
         .route(
             &format!("{prefix}/databases/:db/functions/:function"),
             get(RESTServer::get_function),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/auth"),
+            post(RESTServer::auth_table_query),
         )
         .route(
             &format!("{prefix}/tables/rename"),

@@ -22,6 +22,7 @@ package paimon_test
 import (
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	paimon "github.com/apache/paimon-rust/bindings/go"
@@ -106,5 +107,39 @@ func TestCatalogTagLifecycle(t *testing.T) {
 	catalog.Close()
 	if err := catalog.CreateTag(id, "closed", nil, false); !errors.Is(err, paimon.ErrClosed) {
 		t.Fatalf("closed catalog error = %v", err)
+	}
+}
+
+func TestCatalogListDatabasesAndTables(t *testing.T) {
+	source := filepath.Join("testdata", "map_blob_table")
+	warehouse := t.TempDir()
+	if err := copyDirectory(source, filepath.Join(warehouse, "default.db", "map_blob_table")); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := paimon.NewCatalog(map[string]string{"warehouse": warehouse})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer catalog.Close()
+
+	databases, err := catalog.ListDatabases()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(databases, "default") {
+		t.Fatalf("ListDatabases = %v, want it to contain \"default\"", databases)
+	}
+
+	tables, err := catalog.ListTables("default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(tables, "map_blob_table") {
+		t.Fatalf("ListTables(\"default\") = %v, want it to contain \"map_blob_table\"", tables)
+	}
+
+	catalog.Close()
+	if _, err := catalog.ListTables("default"); !errors.Is(err, paimon.ErrClosed) {
+		t.Fatalf("closed catalog ListTables error = %v", err)
 	}
 }

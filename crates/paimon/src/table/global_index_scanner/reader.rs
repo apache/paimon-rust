@@ -205,7 +205,7 @@ impl GlobalIndexScanner {
         })
     }
 
-    fn query_error(entry: &GlobalIndexEntry, error: std::io::Error) -> Error {
+    pub(super) fn query_error(entry: &GlobalIndexEntry, error: std::io::Error) -> Error {
         Error::DataInvalid {
             message: format!(
                 "Global index query failed for {} file '{}'",
@@ -220,7 +220,7 @@ impl GlobalIndexScanner {
     /// cache is keyed by the resolved path (not the bare file name) so two entries
     /// that share a file name but resolve to different locations — e.g. distinct
     /// external paths — never reuse each other's reader.
-    async fn get_or_open_reader(
+    pub(super) async fn get_or_open_reader(
         &self,
         entry: &GlobalIndexEntry,
         meta: &BTreeIndexMeta,
@@ -233,6 +233,11 @@ impl GlobalIndexScanner {
             if let Some(reader) = cache.remove(&resolved_path) {
                 return Ok(OpenedGlobalIndexReader::BTree(reader));
             }
+        }
+
+        #[cfg(test)]
+        if let Some(probe) = &self.query_io_probe {
+            probe.btree_opens.fetch_add(1, super::TestOrdering::SeqCst);
         }
 
         // Open new reader
@@ -416,7 +421,7 @@ impl GlobalIndexScanner {
     }
 
     /// Return a reader to the cache for future reuse.
-    fn return_reader(&self, resolved_path: String, reader: BTreeIndexReader<BoxedCmp>) {
+    pub(super) fn return_reader(&self, resolved_path: String, reader: BTreeIndexReader<BoxedCmp>) {
         let mut cache = self.reader_cache.lock().unwrap();
         cache.insert(resolved_path, reader);
     }

@@ -42,6 +42,11 @@ Key features:
 - Standalone `BlobDescriptor` batch reads and seekable streams, with Go batch and stream APIs and `MAP<STRING, BLOB>` descriptor reads
 - Extensible and cached I/O through caller-provided OpenDAL operators, an in-memory local block cache, and C cache callbacks
 
+API compatibility changes:
+
+- `BTreeIndexReader::null_bitmap()` is now asynchronous and returns `io::Result<&RoaringTreemap>`. Downstream Rust callers must replace `reader.null_bitmap()` with `reader.null_bitmap().await?` and handle load errors.
+- BTree readers load the null bitmap on first access and reuse successful loads within the reader. Null bitmap I/O, CRC, and deserialization errors now surface on first access rather than when opening the reader. Failed loads can be retried.
+
 ## Past Releases
 
 ### [0.3.0](https://github.com/apache/paimon-rust/releases/tag/v0.3.0)

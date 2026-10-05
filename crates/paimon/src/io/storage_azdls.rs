@@ -64,11 +64,15 @@ pub(crate) fn azdls_config_parse(props: HashMap<String, String>) -> Result<Azdls
     Ok(AzdlsStorageConfig { config, normalized })
 }
 
-pub(crate) fn azdls_config_build(cfg: &AzdlsStorageConfig, path: &str) -> Result<Operator> {
+pub(crate) fn azdls_config_build(
+    cfg: &AzdlsStorageConfig,
+    path: &str,
+    user_agent: &str,
+) -> Result<Operator> {
     let (cfg, relative_path) = azdls_config_for_path(cfg, path)?;
 
     let builder = cfg.into_builder();
-    let op = super::with_http_transport(Operator::new(builder)?);
+    let op = super::with_http_transport(Operator::new(builder)?, user_agent);
 
     debug_assert_eq!(
         relative_path,
@@ -394,14 +398,19 @@ mod tests {
     fn test_azdls_config_build_hadoop_form() {
         let cfg = azdls_config_parse(HashMap::new()).unwrap();
 
-        let op = azdls_config_build(&cfg, "abfs://fs@account.dfs.core.windows.net/a/b").unwrap();
+        let op = azdls_config_build(
+            &cfg,
+            "abfs://fs@account.dfs.core.windows.net/a/b",
+            "paimon-rust/test",
+        )
+        .unwrap();
         assert_eq!(op.info().name(), "fs");
     }
 
     #[test]
     fn test_azdls_config_build_fsspec_form_requires_endpoint() {
         let cfg = azdls_config_parse(HashMap::new()).unwrap();
-        let result = azdls_config_build(&cfg, "abfs://fs/a/b");
+        let result = azdls_config_build(&cfg, "abfs://fs/a/b", "paimon-rust/test");
         assert!(result.is_err());
     }
 
@@ -413,7 +422,7 @@ mod tests {
         )]))
         .unwrap();
 
-        let op = azdls_config_build(&cfg, "abfs://fs/a/b").unwrap();
+        let op = azdls_config_build(&cfg, "abfs://fs/a/b", "paimon-rust/test").unwrap();
         assert_eq!(op.info().name(), "fs");
     }
 
@@ -439,7 +448,8 @@ mod tests {
     #[test]
     fn test_azdls_config_build_missing_filesystem() {
         let cfg = azdls_config_parse(HashMap::new()).unwrap();
-        let result = azdls_config_build(&cfg, "abfs:///path/without/filesystem");
+        let result =
+            azdls_config_build(&cfg, "abfs:///path/without/filesystem", "paimon-rust/test");
         assert!(result.is_err());
     }
 }

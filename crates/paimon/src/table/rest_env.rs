@@ -19,11 +19,12 @@
 
 use crate::api::rest_api::RESTApi;
 use crate::api::rest_error::RestError;
+use crate::api::GetTableResponse;
 use crate::catalog::{Identifier, RESTTokenFileIO};
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
-use crate::io::{FileFormatMetadataCacheContext, FileIO};
+use crate::io::{FileIO, FileIOCacheContext};
 use crate::spec::{CoreOptions, TableSchema, PATH_OPTION};
 use crate::table::snapshot_commit::{RESTSnapshotCommit, SnapshotCommit};
 use crate::table::{ObjectTable, Table};
@@ -53,8 +54,7 @@ impl Table {
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let local_cache = create_local_cache_with_namespace(&rest_options, api.options())?;
-        let file_format_metadata_cache =
-            FileFormatMetadataCacheContext::from_props(api.options().to_map())?;
+        let file_io_cache = FileIOCacheContext::from_props(api.options().to_map())?;
         RESTEnv::build_table(
             &identifier,
             response,
@@ -62,7 +62,7 @@ impl Table {
             rest_options,
             data_token_enabled,
             local_cache,
-            file_format_metadata_cache,
+            file_io_cache,
         )
         .await
     }
@@ -78,7 +78,7 @@ pub struct RESTEnv {
     options: Options,
     data_token_enabled: bool,
     local_cache: Option<Arc<LocalCache>>,
-    file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+    file_io_cache: FileIOCacheContext,
 }
 
 impl std::fmt::Debug for RESTEnv {
@@ -99,7 +99,7 @@ impl RESTEnv {
         options: Options,
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
-        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+        file_io_cache: FileIOCacheContext,
     ) -> Self {
         Self {
             identifier,
@@ -108,7 +108,7 @@ impl RESTEnv {
             options,
             data_token_enabled,
             local_cache,
-            file_format_metadata_cache,
+            file_io_cache,
         }
     }
 
@@ -120,6 +120,66 @@ impl RESTEnv {
     /// Get the REST API client.
     pub fn api(&self) -> &Arc<RESTApi> {
         &self.api
+    }
+
+    /// Bracketed by a freshness check: the response names no table, so a
+    /// re-create in between would serve a replacement's grant.
+    pub(crate) async fn table_query_auth(
+        &self,
+        schema_id: i64,
+        fields: &[crate::spec::DataField],
+        select: Option<Vec<String>>,
+    ) -> Result<crate::api::AuthTableQueryResponse> {
+        self.current_table_checked(schema_id, fields).await?;
+        let response = self.api.auth_table_query(&self.identifier, select).await?;
+        self.current_table_checked(schema_id, fields).await?;
+        Ok(response)
+    }
+
+    /// Refused unless the name still resolves to the loaded table, a missing
+    /// identity included. Asserts nothing on its own.
+    pub(crate) async fn current_table_checked(
+        &self,
+        schema_id: i64,
+        fields: &[crate::spec::DataField],
+    ) -> Result<GetTableResponse> {
+        let response = self.api.get_table(&self.identifier).await?;
+        let name = self.identifier.full_name();
+        let same = |what: &str, loaded: String, now: Option<String>| match now {
+            Some(now) if now == loaded => Ok(()),
+            now => Err(crate::Error::DataInvalid {
+                message: format!(
+                    "table '{name}' now resolves to {what} {}, not the {loaded} this handle was \
+                     loaded with; re-load the table before reading it",
+                    now.as_deref().unwrap_or("nothing the server reports")
+                ),
+                source: None,
+            }),
+        };
+        same("uuid", self.uuid.clone(), response.id.clone())?;
+        same(
+            "schema",
+            schema_id.to_string(),
+            response.schema_id.map(|id| id.to_string()),
+        )?;
+        // An id is not the schema: the columns the server rules on are compared too.
+        let key =
+            |f: &crate::spec::DataField| (f.id(), f.name().to_string(), f.data_type().clone());
+        let served: Vec<_> = response
+            .schema
+            .as_ref()
+            .map(|schema| schema.fields().iter().map(key).collect())
+            .unwrap_or_default();
+        if served != fields.iter().map(key).collect::<Vec<_>>() {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "table '{name}' serves other columns than this handle carries under schema \
+                     {schema_id}; re-load the table before reading it"
+                ),
+                source: None,
+            });
+        }
+        Ok(response)
     }
 
     /// Get the table identifier.
@@ -140,7 +200,7 @@ impl RESTEnv {
             self.options.clone(),
             self.data_token_enabled,
             self.local_cache.clone(),
-            self.file_format_metadata_cache.clone(),
+            self.file_io_cache.clone(),
         )
         .await
     }
@@ -152,7 +212,7 @@ impl RESTEnv {
         options: Options,
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
-        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+        file_io_cache: FileIOCacheContext,
     ) -> Result<Table> {
         let response = Self::fetch_table_response(identifier, &api).await?;
         Self::build_table(
@@ -162,7 +222,7 @@ impl RESTEnv {
             options,
             data_token_enabled,
             local_cache,
-            file_format_metadata_cache,
+            file_io_cache,
         )
         .await
     }
@@ -177,8 +237,6 @@ impl RESTEnv {
             .map_err(|e| map_rest_error_for_table(e, identifier))
     }
 
-    /// Build a Table from an already-fetched response, so routing can
-    /// inspect the declared type first.
     pub(crate) async fn build_table(
         identifier: &Identifier,
         response: crate::api::GetTableResponse,
@@ -186,7 +244,7 @@ impl RESTEnv {
         options: Options,
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
-        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+        file_io_cache: FileIOCacheContext,
     ) -> Result<Table> {
         let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
@@ -252,7 +310,7 @@ impl RESTEnv {
             &options,
             data_token_enabled && !is_external,
             local_cache.clone(),
-            file_format_metadata_cache.clone(),
+            file_io_cache.clone(),
         )
         .await?;
 
@@ -263,7 +321,7 @@ impl RESTEnv {
             options,
             data_token_enabled,
             local_cache,
-            file_format_metadata_cache,
+            file_io_cache,
         );
         let parsed_identifier = identifier.parsed_object_name()?;
         let branch = parsed_identifier.branch_or_default().to_string();
@@ -276,9 +334,10 @@ impl RESTEnv {
             Some(rest_env),
         );
 
+        // Minted after the schema-replacing copy, which drops any session.
         let mut table = table.copy_with_resolved_schema(table.schema().clone(), &branch)?;
         table.branch_reference = branch_reference;
-        Ok(table)
+        Ok(table.with_query_auth_session())
     }
 
     pub(crate) async fn build_object_table(
@@ -288,7 +347,7 @@ impl RESTEnv {
         options: Options,
         data_token_enabled: bool,
         local_cache: Option<Arc<LocalCache>>,
-        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+        file_io_cache: FileIOCacheContext,
     ) -> Result<ObjectTable> {
         let identifier = response_identifier(identifier, &response)?;
         let schema = response.schema.ok_or_else(|| Error::DataInvalid {
@@ -332,7 +391,7 @@ impl RESTEnv {
             &options,
             data_token_enabled && !is_external,
             local_cache,
-            file_format_metadata_cache,
+            file_io_cache,
         )
         .await?;
 
@@ -346,7 +405,7 @@ impl RESTEnv {
         options: &Options,
         use_data_token: bool,
         local_cache: Option<Arc<LocalCache>>,
-        file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+        file_io_cache: FileIOCacheContext,
     ) -> Result<FileIO> {
         if use_data_token {
             return Arc::new(RESTTokenFileIO::new(
@@ -355,14 +414,14 @@ impl RESTEnv {
                 options.clone(),
                 api,
                 local_cache,
-                file_format_metadata_cache,
+                file_io_cache,
             ))
             .build_file_io()
             .await;
         }
 
         let mut builder = FileIO::from_path(path)?.with_props(options.to_map());
-        builder = builder.with_file_format_metadata_cache(file_format_metadata_cache);
+        builder = builder.with_cache_context(file_io_cache);
         if let Some(local_cache) = local_cache {
             builder = builder.with_local_cache(local_cache);
         }
@@ -374,15 +433,7 @@ impl RESTEnv {
         &self,
         branch: &str,
     ) -> Result<Option<crate::spec::Snapshot>> {
-        let parsed_identifier = self.identifier.parsed_object_name()?;
-        let object = if parsed_identifier.branch() == Some(branch) {
-            format!("{}$branch_{branch}", parsed_identifier.table())
-        } else if branch == crate::catalog::DEFAULT_MAIN_BRANCH {
-            parsed_identifier.table().to_string()
-        } else {
-            format!("{}$branch_{branch}", parsed_identifier.table())
-        };
-        let identifier = Identifier::new(self.identifier.database(), object);
+        let identifier = self.identifier.with_branch(branch)?;
         match self.api.load_snapshot(&identifier).await {
             Ok(snapshot) => Ok(snapshot.map(|snapshot| snapshot.snapshot)),
             Err(Error::RestApi {
@@ -502,7 +553,7 @@ mod tests {
         );
         let local_cache = create_local_cache(&options).unwrap();
         let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
-        let metadata_cache = FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
+        let file_io_cache = FileIOCacheContext::from_props(options.to_map()).unwrap();
 
         let rest_env = RESTEnv::new(
             Identifier::new("database", "table"),
@@ -511,7 +562,7 @@ mod tests {
             options,
             false,
             local_cache,
-            metadata_cache,
+            file_io_cache,
         );
 
         assert!(rest_env.has_local_cache());
@@ -526,7 +577,7 @@ mod tests {
         options.set(CatalogOptions::TOKEN_PROVIDER, "bear");
         options.set(CatalogOptions::TOKEN, "test-token");
         let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
-        let metadata_cache = FileFormatMetadataCacheContext::from_props(options.to_map()).unwrap();
+        let file_io_cache = FileIOCacheContext::from_props(options.to_map()).unwrap();
         let identifier = Identifier::new("database", "table");
 
         let first = RESTEnv::build_file_io(
@@ -536,7 +587,7 @@ mod tests {
             &options,
             false,
             None,
-            metadata_cache.clone(),
+            file_io_cache.clone(),
         )
         .await
         .unwrap();
@@ -547,7 +598,7 @@ mod tests {
             &options,
             false,
             None,
-            metadata_cache,
+            file_io_cache,
         )
         .await
         .unwrap();
@@ -555,6 +606,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &first.file_format_metadata_cache(),
             &second.file_format_metadata_cache()
+        ));
+        assert!(Arc::ptr_eq(
+            &first.blob_index_cache(),
+            &second.blob_index_cache()
         ));
     }
 }

@@ -139,6 +139,40 @@ committer. Batch empty commits follow `snapshot.ignore-empty-commit` (default
 true). `truncate_table()` shares the batch commit guard; `truncate_partitions`
 accepts a nonempty list of partition specs as in Java.
 
+For fixed-bucket writes to a primary-key table with `bucket=-2`, use the
+specialized builder. Routing, merge functions, sequence initialization and
+failure cleanup all run in the core writer:
+
+```python
+import pyarrow as pa
+
+plan = pa.record_batch(
+    [pa.array(["2026-10-01", "2026-10-02"]), pa.array([3, 5], type=pa.int32())],
+    names=["dt", "total_buckets"],
+)
+builder = table.new_postpone_fixed_bucket_write_builder().with_bucket_plan(plan)
+writer = builder.new_write()
+try:
+    writer.write_arrow(batch)
+    messages = writer.prepare_commit()
+finally:
+    writer.close()
+builder.new_commit().commit(messages)
+```
+
+The plan contains partition columns in table order and an `int32` count.
+Every input partition must be present. Workers may share a plan, but all rows
+for a partition and bucket must have a single writer owner. Both duplicate
+owners in a commit and stale overlapping writers are rejected. Pending files
+(`bucket=-2`) can coexist with real buckets; they remain pending until assigned.
+
+Without an explicit plan, set `postpone.default-bucket-num` to a positive integer.
+The count is used exactly for new partitions, and append reuses existing layouts
+from the same snapshot used to initialize sequence numbers. Overwrite uses the
+configured default for replaced partitions. No staging, automatic rescaling or
+compaction is performed. Deletion-vector tables are rejected by this writer.
+A failed write cannot be prepared, and close deletes only unprepared output.
+
 Configure overwrite on the batch builder:
 
 ```python

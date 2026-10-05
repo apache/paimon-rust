@@ -23,13 +23,13 @@
 //!    |             Footer                |      |
 //!    +-----------------------------------+      |
 //!    |           Index Block             |      +--> Loaded on open
-//!    +-----------------------------------+      |
-//!    |        Bloom Filter Block         |      |
 //!    +-----------------------------------+------+
+//!    |        Bloom Filter Block         |      |
+//!    +-----------------------------------+      |
 //!    |         Null Bitmap Block         |      |
 //!    +-----------------------------------+      |
 //!    |            Data Block             |      |
-//!    +-----------------------------------+      +--> Loaded on requested
+//!    +-----------------------------------+      +--> Loaded on demand
 //!    |              ......               |      |
 //!    +-----------------------------------+      |
 //!    |            Data Block             |      |
@@ -38,6 +38,8 @@
 
 mod block;
 mod bloom_filter;
+mod composite_key;
+mod composite_predicate;
 mod data_block_cache;
 mod footer;
 pub(crate) mod key_serde;
@@ -53,6 +55,9 @@ pub use block::BlockCompressionType;
 pub(crate) use block::{
     compress_block, compress_codec_block, compute_crc32, decompress_block, decompress_codec_block,
 };
+pub use composite_key::serialize_composite_key;
+pub(crate) use composite_key::CompositeKeyCodec;
+pub(crate) use composite_predicate::CompositePlan;
 pub(crate) use data_block_cache::BTreeDataBlockCache;
 pub use footer::BTreeFileFooter;
 pub use key_serde::{make_key_comparator, serialize_datum};
@@ -65,3 +70,6 @@ pub use writer::BTreeIndexWriter;
 pub(crate) mod test_util;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod composite_tests;

@@ -31,13 +31,22 @@ pub use storage::*;
     feature = "storage-oss",
     feature = "storage-s3"
 ))]
-fn with_http_transport(op: opendal::Operator) -> opendal::Operator {
+fn with_http_transport(op: opendal::Operator, user_agent: &str) -> opendal::Operator {
     use opendal::{HttpTransporter, OperationContext};
-    use opendal_http_transport_reqwest::ReqwestTransport;
 
-    let transport = HttpTransporter::new(ReqwestTransport::default());
+    let transport = HttpTransporter::new(user_agent::UserAgentTransport::new(user_agent));
     op.with_context(OperationContext::new().with_http_transport(transport))
 }
+
+#[cfg(any(
+    feature = "storage-azdls",
+    feature = "storage-cos",
+    feature = "storage-gcs",
+    feature = "storage-obs",
+    feature = "storage-oss",
+    feature = "storage-s3"
+))]
+mod user_agent;
 
 #[cfg(any(
     feature = "storage-s3",
@@ -62,6 +71,16 @@ use storage_memory::*;
 pub(crate) mod storage_oss;
 #[cfg(feature = "storage-oss")]
 use storage_oss::*;
+
+#[cfg(feature = "storage-jindo")]
+mod storage_jindo;
+#[cfg(feature = "storage-jindo")]
+use storage_jindo::*;
+
+#[cfg(feature = "storage-oss-cpp")]
+mod storage_oss_cpp;
+#[cfg(feature = "storage-oss-cpp")]
+use storage_oss_cpp::*;
 
 #[cfg(feature = "storage-s3")]
 mod storage_s3;

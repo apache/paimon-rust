@@ -29,6 +29,7 @@ pub mod rest_error;
 pub mod rest_util;
 
 mod api_response;
+mod user_agent;
 
 // Re-export request types
 pub use api_request::{

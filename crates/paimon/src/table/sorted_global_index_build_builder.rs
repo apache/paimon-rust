@@ -28,6 +28,7 @@ use planning::SortedGlobalIndexShard;
 use validation::*;
 
 use super::bitmap_global_index_format::{make_bitmap_key_comparator, serialize_bitmap_datum};
+use super::global_index_build_common::IndexColumns;
 use super::global_index_types::{
     normalize_queryable_global_index_type, BITMAP_GLOBAL_INDEX_TYPE, BTREE_GLOBAL_INDEX_TYPE,
     FM_GLOBAL_INDEX_TYPE,
@@ -64,7 +65,7 @@ fn make_index_key_codec(index_type: &str, data_type: &DataType) -> (KeyComparato
 
 pub struct SortedGlobalIndexBuildBuilder<'a> {
     table: &'a Table,
-    index_column: Option<String>,
+    index_column: Option<IndexColumns>,
     index_type: String,
     options: HashMap<String, String>,
 }
@@ -84,7 +85,15 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
     }
 
     pub fn with_index_column(&mut self, column: &str) -> &mut Self {
-        self.index_column = Some(column.to_string());
+        self.index_column = Some(IndexColumns::Column(column.to_string()));
+        self
+    }
+
+    /// Select BTree columns in physical tuple-key order.
+    pub fn with_index_columns(&mut self, columns: &[&str]) -> &mut Self {
+        self.index_column = Some(IndexColumns::Columns(
+            columns.iter().map(|column| (*column).to_string()).collect(),
+        ));
         self
     }
 
@@ -114,7 +123,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         })?;
         let index_column = self
             .index_column
-            .as_deref()
+            .as_ref()
             .ok_or_else(|| Error::DataInvalid {
                 message: "Sorted global index column is required".to_string(),
                 source: None,
@@ -134,8 +143,21 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             )?)
         };
 
-        let index_field = find_index_field(self.table, index_column)?;
-        index_key_type(index_type, index_field)?;
+        let index_fields = super::global_index_build_common::resolve_index_fields(
+            self.table,
+            index_column,
+            index_type,
+        )?;
+        for field in &index_fields {
+            index_key_type(index_type, field)?;
+        }
+        let index_field = index_fields[0];
+        let extra_field_ids = index_fields
+            .iter()
+            .skip(1)
+            .map(|field| field.id())
+            .collect::<Vec<_>>();
+        let extra_field_ids = (!extra_field_ids.is_empty()).then_some(extra_field_ids);
 
         let snapshot_manager = SnapshotManager::new(
             self.table.file_io().clone(),
@@ -161,7 +183,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             snapshot.index_manifest(),
             index_type,
             index_field.id(),
-            None, // single-column build; no extra fields today
+            extra_field_ids.as_deref(),
         )
         .await?;
 
@@ -184,7 +206,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             snapshot.index_manifest(),
             index_type,
             index_field.id(),
-            None,
+            extra_field_ids.as_deref(),
             &shards
                 .iter()
                 .map(|shard| RowRange::new(shard.row_range_start, shard.row_range_end))
@@ -204,7 +226,7 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
         let mut messages = Vec::with_capacity(shard_count);
         for shard in shards {
             let index_file = match self
-                .build_index_file(&shard, index_field, index_column, &write_options)
+                .build_index_file(&shard, &index_fields, &write_options)
                 .await
             {
                 Ok(index_file) => index_file,

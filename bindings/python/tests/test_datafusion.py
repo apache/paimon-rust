@@ -16,6 +16,7 @@
 # under the License.
 
 import io
+import importlib
 import json
 import os
 import re
@@ -911,6 +912,35 @@ def test_table_functions_registered_with_catalog():
                 pytest.fail(f"expected {fn} to reject a single argument")
             except Exception as e:
                 assert "requires 4 arguments" in str(e), str(e)
+
+
+def test_register_catalog_discovers_pyjindo(monkeypatch, tmp_path):
+    package = tmp_path / "pyjindo"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    library = package / (
+        "libjindosdk_python.dylib"
+        if sys.platform == "darwin"
+        else "libjindosdk_python.so"
+    )
+    library.write_bytes(b"not a shared library")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delenv("JINDOSDK_LIBRARY_PATH", raising=False)
+    monkeypatch.delenv("JINDOSDK_HOME", raising=False)
+    sys.modules.pop("pyjindo", None)
+    importlib.invalidate_caches()
+
+    ctx = SQLContext()
+    with pytest.raises(Exception) as error:
+        ctx.register_catalog(
+            "paimon",
+            {
+                "warehouse": "oss://jindo-test-bucket/warehouse",
+                "fs.oss.impl": "jindo",
+            },
+        )
+
+    assert str(library) in str(error.value)
 
 
 def test_list_databases_and_tables():

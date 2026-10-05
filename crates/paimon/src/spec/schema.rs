@@ -360,6 +360,34 @@ impl TableSchema {
                     let field =
                         DataField::new(id, name.to_string(), data_type).with_description(comment);
                     insert_field_with_move(&mut fields, field, column_move.as_ref(), full_name)?;
+                    // A CSV format table reads existing files positionally (no
+                    // per-column header mapping), so a new column placed before an
+                    // existing physical column shifts every later one: the
+                    // permissive reader would pad/truncate against the wrong
+                    // positions and silently mis-assign old rows. Partition keys
+                    // are excluded from the physical CSV layout (as Java's
+                    // FormatReadBuilder does), so only non-partition fields after
+                    // the new column count. Appending after the last physical
+                    // column is safe. Reject the shifting case, symmetric with the
+                    // DropColumn guard.
+                    {
+                        let core_options = CoreOptions::new(&new_schema.options);
+                        let pos = field_index(&fields, name).unwrap_or(fields.len());
+                        let shifts_physical = fields
+                            .iter()
+                            .skip(pos + 1)
+                            .any(|f| !new_schema.partition_keys.iter().any(|k| k == f.name()));
+                        if core_options.is_format_table()
+                            && core_options.file_format() == "csv"
+                            && shifts_physical
+                        {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Cannot add non-trailing column '{name}' to a CSV format table: it shifts the physical column positions of existing files"
+                                ),
+                            });
+                        }
+                    }
                 }
                 SchemaChange::RenameColumn {
                     field_names,
@@ -453,6 +481,32 @@ impl TableSchema {
                             return Err(crate::Error::Unsupported {
                                 message: format!(
                                     "Cannot drop column '{name}' referenced by '{SEQUENCE_FIELD_OPTION}'"
+                                ),
+                            });
+                        }
+                    }
+                    // A CSV format table reads existing files positionally (no
+                    // per-column header mapping), so dropping a column before an
+                    // existing physical column shifts every later one: the
+                    // permissive reader would truncate the trailing field and
+                    // mis-assign the rest, silently returning wrong values.
+                    // Partition keys are excluded from the physical CSV layout (as
+                    // Java's FormatReadBuilder does), so only non-partition fields
+                    // after the dropped column count. Dropping the last physical
+                    // column is safe. Reject the shifting case.
+                    {
+                        let core_options = CoreOptions::new(&new_schema.options);
+                        let shifts_physical = fields
+                            .iter()
+                            .skip(idx + 1)
+                            .any(|f| !new_schema.partition_keys.iter().any(|k| k == f.name()));
+                        if core_options.is_format_table()
+                            && core_options.file_format() == "csv"
+                            && shifts_physical
+                        {
+                            return Err(crate::Error::Unsupported {
+                                message: format!(
+                                    "Cannot drop non-trailing column '{name}' of a CSV format table: it shifts the physical column positions of existing files"
                                 ),
                             });
                         }
@@ -640,22 +694,27 @@ impl TableSchema {
     }
 }
 
-/// Reject column names reserved for system use, mirroring Java `SpecialFields`:
-/// the five `SYSTEM_FIELD_NAMES` and the `_KEY_` key-field prefix.
+/// Whether `name` is one Paimon reserves for a system column. Java
+/// `SpecialFields.SYSTEM_FIELD_NAMES` plus the `_KEY_` key-field prefix.
+pub(crate) fn is_reserved_system_field_name(name: &str) -> bool {
+    name.starts_with(KEY_FIELD_PREFIX) || SYSTEM_FIELD_NAMES.contains(&name)
+}
+
+// Java SpecialFields.SYSTEM_FIELD_NAMES.
+const SYSTEM_FIELD_NAMES: [&str; 5] = [
+    SEQUENCE_NUMBER_FIELD_NAME,
+    VALUE_KIND_FIELD_NAME,
+    "_LEVEL",
+    ROW_KIND_FIELD_NAME,
+    ROW_ID_FIELD_NAME,
+];
+const KEY_FIELD_PREFIX: &str = "_KEY_";
+
+/// Reject column names reserved for system use, mirroring Java `SpecialFields`.
 ///
 /// A user column colliding with a system field is otherwise excluded from the
 /// physical read and silently filled with the system value.
 fn validate_no_reserved_field_names(fields: &[DataField]) -> crate::Result<()> {
-    // Java SpecialFields.SYSTEM_FIELD_NAMES.
-    const SYSTEM_FIELD_NAMES: [&str; 5] = [
-        SEQUENCE_NUMBER_FIELD_NAME,
-        VALUE_KIND_FIELD_NAME,
-        "_LEVEL",
-        ROW_KIND_FIELD_NAME,
-        ROW_ID_FIELD_NAME,
-    ];
-    const KEY_FIELD_PREFIX: &str = "_KEY_";
-
     for field in fields {
         let name = field.name();
         if name.starts_with(KEY_FIELD_PREFIX) || SYSTEM_FIELD_NAMES.contains(&name) {
@@ -1197,8 +1256,10 @@ impl Schema {
         // Create and alter share this, so an unparsable type never lands.
         CoreOptions::new(options).table_type()?;
         validate_no_reserved_field_names(fields)?;
-        Self::validate_key_field_types(fields, primary_keys, options)?;
+        Self::validate_key_field_types(fields, partition_keys, primary_keys, options)?;
+        Self::validate_bucket_count(options)?;
         Self::validate_row_tracking(primary_keys, options)?;
+        super::map_shredding::validate(fields, options)?;
         Self::validate_blob_fields(fields, partition_keys, primary_keys, options)?;
         Self::validate_primary_key_blob_configuration(fields, primary_keys, options)?;
         Self::validate_vector_store_fields(fields, partition_keys, options)?;
@@ -1222,6 +1283,38 @@ impl Schema {
         }
         Self::validate_primary_key_vector_index(fields, primary_keys, options)?;
         Self::validate_primary_key_full_text_index(fields, primary_keys, options)?;
+        Ok(())
+    }
+
+    /// Reject an out-of-range or non-integer `bucket` option at create/alter time.
+    ///
+    /// `bucket()` parses the option with `unwrap_or(DEFAULT_BUCKET)`, so `bucket='0'`
+    /// is taken verbatim (silently disabling read-side bucket pruning) and a
+    /// non-integer such as `bucket='abc'` silently falls back to dynamic (-1) rather
+    /// than the fixed bucketing the user asked for. Mirror Java `validateBucket`'s
+    /// "number of buckets needs to be greater than 0" check: allow -1 (dynamic),
+    /// -2 (postpone), and any value >= 1. (The Java `bucket=-1` + `bucket-key` arm is
+    /// intentionally not ported here; it is enforced separately by bucket-key
+    /// validation.)
+    fn validate_bucket_count(options: &HashMap<String, String>) -> crate::Result<()> {
+        let Some(raw) = options.get("bucket") else {
+            return Ok(());
+        };
+        // Parse the raw value exactly as `CoreOptions::bucket()` does (no trim):
+        // it uses `v.parse().ok().unwrap_or(-1)`, so a padded value like `" 4 "`
+        // silently runs as dynamic (-1). Validating a trimmed copy would accept
+        // `" 4 "` here yet persist a value the runtime reads as -1, so reject what
+        // the runtime cannot parse.
+        let bucket: i32 = raw.parse().map_err(|_| crate::Error::ConfigInvalid {
+            message: format!("Option 'bucket' must be an integer, got: '{raw}'."),
+        })?;
+        if bucket < 1 && bucket != -1 && bucket != -2 {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "The number of buckets needs to be greater than 0, got: {bucket}."
+                ),
+            });
+        }
         Ok(())
     }
 
@@ -1454,34 +1547,57 @@ impl Schema {
         Ok(())
     }
 
-    /// Reject types that cannot serve as a key (primary key or explicit
-    /// `bucket-key`). Currently only `VECTOR` is rejected here: it is densely
-    /// stored and has no key ordering, so it cannot be used as a key column.
+    /// Reject types that cannot serve as a key. Primary and partition keys mirror
+    /// Java `SchemaValidation.validateOnlyContainPrimitiveType`, which forbids
+    /// nested/complex types (`MAP`, `ARRAY`, `ROW`, `MULTISET`, `VECTOR`,
+    /// `VARIANT`): they have no key ordering, and a partition value is encoded
+    /// into a directory path. A bucket key only hashes a `BinaryRow`, so it allows
+    /// the one extra type that encodes into that row without ordering — `VARIANT`
+    /// — mirroring Java's narrower nested-type bucket check (`ARRAY`/`MULTISET`/
+    /// `MAP`/`ROW`). `VECTOR` stays rejected everywhere.
     fn validate_key_field_types(
         fields: &[DataField],
+        partition_keys: &[String],
         primary_keys: &[String],
         options: &HashMap<String, String>,
     ) -> crate::Result<()> {
-        let reject = |key_kind: &str, name: &str| -> crate::Result<()> {
-            let field = fields.iter().find(|f| f.name() == name);
-            if let Some(field) = field {
-                if matches!(field.data_type(), DataType::Vector(_)) {
-                    return Err(crate::Error::ConfigInvalid {
-                        message: format!(
-                            "The VECTOR type of {key_kind} field '{name}' is unsupported."
-                        ),
-                    });
-                }
+        let reject = |key_kind: &str, name: &str, for_bucket: bool| -> crate::Result<()> {
+            let Some(field) = fields.iter().find(|f| f.name() == name) else {
+                return Ok(());
+            };
+            let unsupported = match field.data_type() {
+                DataType::Map(_) => Some("MAP"),
+                DataType::Array(_) => Some("ARRAY"),
+                DataType::Multiset(_) => Some("MULTISET"),
+                DataType::Row(_) => Some("ROW"),
+                DataType::Vector(_) => Some("VECTOR"),
+                // VARIANT is the one non-primitive allowed as a bucket key: it
+                // encodes into the hashed BinaryRow and needs no ordering, so
+                // only primary/partition keys reject it (Java's bucket check
+                // lists ARRAY/MULTISET/MAP/ROW, not VARIANT; VECTOR stays rejected
+                // everywhere).
+                DataType::Variant(_) if !for_bucket => Some("VARIANT"),
+                _ => None,
+            };
+            if let Some(type_name) = unsupported {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!(
+                        "The {type_name} type of {key_kind} field '{name}' is unsupported."
+                    ),
+                });
             }
             Ok(())
         };
 
         for pk in primary_keys {
-            reject("primary key", pk)?;
+            reject("primary key", pk, false)?;
+        }
+        for partition_key in partition_keys {
+            reject("partition key", partition_key, false)?;
         }
         if let Some(bucket_keys) = CoreOptions::new(options).bucket_key() {
             for bk in &bucket_keys {
-                reject("bucket key", bk)?;
+                reject("bucket key", bk, true)?;
             }
         }
         Ok(())
@@ -2372,7 +2488,9 @@ impl Default for SchemaBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::{BlobType, CharType, FloatType, IntType, VarCharType, VectorType};
+    use crate::spec::{
+        BlobType, CharType, FloatType, IntType, VarCharType, VariantType, VectorType,
+    };
 
     use super::*;
 
@@ -2940,6 +3058,84 @@ mod tests {
         assert!(
             matches!(err, crate::Error::ConfigInvalid { message } if message.contains("can not be part of partition keys")),
             "blob columns should be rejected as partition keys during schema validation"
+        );
+    }
+
+    #[test]
+    fn test_schema_validation_rejects_non_primitive_partition_key() {
+        // A partition value is encoded into a directory path, so a partition key
+        // must be primitive. Java validateOnlyContainPrimitiveType rejects ARRAY;
+        // before this guard the partition-key column type was never checked.
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "tags",
+                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            )
+            .partition_keys(["tags"])
+            .option("bucket", "1")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("ARRAY") && message.contains("partition key")),
+            "ARRAY partition key must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_schema_validation_rejects_non_primitive_primary_key() {
+        // A key has no ordering when its type is a MAP; Java rejects it, and this
+        // guard now covers more than the previous VECTOR-only check.
+        let err = Schema::builder()
+            .column(
+                "k",
+                DataType::Map(MapType::new(
+                    DataType::Int(IntType::new()),
+                    DataType::Int(IntType::new()),
+                )),
+            )
+            .primary_key(["k"])
+            .option("bucket", "1")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("MAP") && message.contains("primary key")),
+            "MAP primary key must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_variant_bucket_key_is_accepted() {
+        // A bucket key only hashes a BinaryRow, which already encodes VARIANT, so
+        // a VARIANT bucket key stays valid (Java's bucket check lists only
+        // ARRAY/MULTISET/MAP/ROW). Primary/partition keys still reject VARIANT.
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("v", DataType::Variant(VariantType::new()))
+            .option("bucket", "2")
+            .option("bucket-key", "v")
+            .build()
+            .unwrap();
+        assert_eq!(schema.fields().len(), 2);
+    }
+
+    #[test]
+    fn test_schema_validation_rejects_non_primitive_bucket_key() {
+        // Nested types still have no hash-key semantics as a bucket key; Java
+        // rejects ARRAY/MULTISET/MAP/ROW there even though VARIANT is allowed.
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column(
+                "tags",
+                DataType::Array(ArrayType::new(DataType::Int(IntType::new()))),
+            )
+            .option("bucket", "2")
+            .option("bucket-key", "tags")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message } if message.contains("ARRAY") && message.contains("bucket key")),
+            "ARRAY bucket key must be rejected, got {err:?}"
         );
     }
 
@@ -4614,7 +4810,9 @@ mod tests {
                 .column(
                     "props",
                     DataType::Map(MapType::new(
-                        DataType::VarChar(VarCharType::string_type()),
+                        DataType::VarChar(VarCharType::string_type())
+                            .copy_with_nullable(false)
+                            .unwrap(),
                         DataType::Int(IntType::new()),
                     )),
                 )
@@ -5498,6 +5696,161 @@ mod tests {
     }
 
     #[test]
+    fn test_csv_format_table_rejects_dropping_non_trailing_column() {
+        // A CSV format table reads files positionally; dropping a non-trailing
+        // column shifts physical positions and would make the permissive reader
+        // silently mis-decode old rows. The trailing column is safe to drop.
+        let build = || {
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("label", DataType::VarChar(VarCharType::string_type()))
+                    .column("extra", DataType::VarChar(VarCharType::string_type()))
+                    .option("type", "format-table")
+                    .option("file.format", "csv")
+                    .build()
+                    .unwrap(),
+            )
+        };
+
+        let err = build()
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "label".to_string(),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("physical column positions") && message.contains("label")),
+            "dropping a non-trailing CSV column should be rejected, got {err:?}"
+        );
+
+        // Dropping the trailing column keeps positions aligned and is allowed.
+        build()
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "extra".to_string(),
+            )])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_csv_format_table_rejects_adding_non_trailing_column() {
+        // Symmetric with the drop guard: a CSV format table reads files
+        // positionally, so a new column that lands anywhere but last shifts the
+        // physical positions of existing files. The permissive reader would then
+        // mis-assign old rows (e.g. `(1,"old")` read as `(id, extra, label) =
+        // (1,"old",NULL)`). Appending the column at the end is safe.
+        let build = || {
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("label", DataType::VarChar(VarCharType::string_type()))
+                    .option("type", "format-table")
+                    .option("file.format", "csv")
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let varchar = || DataType::VarChar(VarCharType::string_type());
+
+        // Inserting after a non-last column, or first, shifts existing positions.
+        for column_move in [
+            crate::spec::ColumnMove::move_after("extra".to_string(), "id".to_string()),
+            crate::spec::ColumnMove::move_first("extra".to_string()),
+        ] {
+            let err = build()
+                .apply_changes(vec![
+                    crate::spec::SchemaChange::add_column_with_description_and_column_move(
+                        "extra".to_string(),
+                        varchar(),
+                        String::new(),
+                        column_move,
+                    ),
+                ])
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::Error::Unsupported { ref message }
+                    if message.contains("physical column positions") && message.contains("extra")),
+                "adding a non-trailing CSV column should be rejected, got {err:?}"
+            );
+        }
+
+        // Appending the new column (plain add, or an explicit move to last) keeps
+        // existing positions, so old files just pad it with null.
+        build()
+            .apply_changes(vec![crate::spec::SchemaChange::add_column(
+                "extra".to_string(),
+                varchar(),
+            )])
+            .unwrap();
+        build()
+            .apply_changes(vec![
+                crate::spec::SchemaChange::add_column_with_description_and_column_move(
+                    "extra".to_string(),
+                    varchar(),
+                    String::new(),
+                    crate::spec::ColumnMove::move_last("extra".to_string()),
+                ),
+            ])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_csv_format_table_partition_columns_excluded_from_physical_shift() {
+        // Partition columns are not part of the physical CSV, so the physical
+        // layout of `(id, label, pt)` partitioned by `pt` is `(id, label)`.
+        // Dropping `label` (last physical) and appending `extra` after it are
+        // therefore safe trailing changes and must be accepted.
+        let build = || {
+            TableSchema::new(
+                0,
+                &Schema::builder()
+                    .column("id", DataType::Int(IntType::new()))
+                    .column("label", DataType::VarChar(VarCharType::string_type()))
+                    .column("pt", DataType::VarChar(VarCharType::string_type()))
+                    .partition_keys(vec!["pt".to_string()])
+                    .option("type", "format-table")
+                    .option("file.format", "csv")
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let varchar = || DataType::VarChar(VarCharType::string_type());
+
+        // Dropping the last physical column (pt is partition-excluded) is safe.
+        build()
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "label".to_string(),
+            )])
+            .unwrap();
+
+        // Adding after the last physical column (before only `pt`) is safe.
+        build()
+            .apply_changes(vec![
+                crate::spec::SchemaChange::add_column_with_description_and_column_move(
+                    "extra".to_string(),
+                    varchar(),
+                    String::new(),
+                    crate::spec::ColumnMove::move_after("extra".to_string(), "label".to_string()),
+                ),
+            ])
+            .unwrap();
+
+        // A genuine physical shift (dropping `id`, before `label`) is still rejected.
+        let err = build()
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column(
+                "id".to_string(),
+            )])
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("physical column positions")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn test_bucket_key_history_rejects_destructive_column_changes() {
         let table_schema = TableSchema::new(
             0,
@@ -5818,6 +6171,77 @@ mod tests {
                 .build()
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn bucket_zero_is_rejected() {
+        // bucket='0' is taken verbatim and silently disables read-side bucket
+        // pruning; Java rejects it as "needs to be greater than 0".
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("bucket", "0")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("greater than 0")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bucket_non_integer_is_rejected() {
+        // A non-integer would silently fall back to dynamic (-1) rather than the
+        // fixed bucketing the user intended.
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("bucket", "abc")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("must be an integer")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bucket_dynamic_and_fixed_values_are_accepted() {
+        // -1 (dynamic), -2 (postpone) and any value >= 1 stay valid.
+        for value in ["-1", "-2", "1", "16"] {
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .option("bucket", value)
+                .build()
+                .unwrap_or_else(|e| panic!("bucket={value} should be accepted, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn bucket_padded_value_is_rejected_matching_runtime() {
+        // `CoreOptions::bucket()` parses the raw value without trimming and falls
+        // back to -1, so a padded `" 4 "` silently runs as dynamic. Validation
+        // must use the same grammar and reject it, not persist a value the runtime
+        // reads as -1.
+        let padded = HashMap::from([("bucket".to_string(), " 4 ".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&padded).bucket(),
+            -1,
+            "runtime reads a padded bucket value as dynamic"
+        );
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .option("bucket", " 4 ")
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("must be an integer")),
+            "got {err:?}"
+        );
+        // The accepted spelling runs as the fixed count the user asked for.
+        let fixed = HashMap::from([("bucket".to_string(), "4".to_string())]);
+        assert_eq!(CoreOptions::new(&fixed).bucket(), 4);
     }
 
     #[test]

@@ -782,7 +782,12 @@ impl LimitPushdownAccumulator {
             self.fallback_splits.push(split.clone());
             self.limited_splits.push(split);
             self.scanned_row_count += merged_count;
-            self.limit_early_stopped = self.scanned_row_count >= self.limit as i64;
+            // Compare without a lossy signed cast: `limit` is `usize`, so
+            // `limit as i64` turns any value above `i64::MAX` (e.g. a C caller
+            // passing `SIZE_MAX`) negative, which would early-stop after the
+            // first counted split. `scanned_row_count` is always >= 0, so an
+            // unsigned comparison keeps a huge limit from truncating the scan.
+            self.limit_early_stopped = self.scanned_row_count as u128 >= self.limit as u128;
         } else {
             self.fallback_splits.push(split);
         }
@@ -1268,15 +1273,16 @@ impl<'a> TableScan<'a> {
     }
 
     pub async fn plan(&self) -> crate::Result<Plan> {
+        // Boxed: engines poll this under deep operator stacks.
         match &self.0 {
-            TableScanKind::Paimon(scan) => scan.plan().await,
+            TableScanKind::Paimon(scan) => Box::pin(scan.plan()).await,
             TableScanKind::Format(scan) => scan.plan().await,
         }
     }
 
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         match &self.0 {
-            TableScanKind::Paimon(scan) => scan.plan_with_trace().await,
+            TableScanKind::Paimon(scan) => Box::pin(scan.plan_with_trace()).await,
             TableScanKind::Format(scan) => scan.plan_with_trace().await,
         }
     }
@@ -1499,45 +1505,111 @@ impl<'a> PaimonTableScan<'a> {
     /// for `scan.version`; the strict selectors mirror Java's typed
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
-        self.validate_read_options()?;
+        let grant = self.authorize_query().await?;
         self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let snapshot = match super::time_travel::resolve_snapshot(self.table).await? {
-            Some(snapshot) => snapshot,
-            None => return Ok(Plan::new(Vec::new())),
+        let plan = match super::time_travel::resolve_snapshot(self.table).await? {
+            Some(snapshot) => {
+                self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
+                    .await?
+            }
+            None => Plan::new(Vec::new()),
         };
-        self.plan_snapshot(snapshot, data_evolution_read_field_ids.as_ref(), None)
-            .await
+        self.check_planned_files(&plan, grant.is_some()).await?;
+        Ok(plan.planned(grant))
     }
 
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
-        self.validate_read_options()?;
+        let grant = self.authorize_query().await?;
         self.validate_shard_strategy()?;
         let mut trace = ScanTrace {
             limit: self.limit,
             ..Default::default()
         };
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
-        let snapshot = match super::time_travel::resolve_snapshot(self.table).await? {
-            Some(snapshot) => snapshot,
-            None => return Ok((Plan::new(Vec::new()), trace)),
+        let plan = match super::time_travel::resolve_snapshot(self.table).await? {
+            Some(snapshot) => {
+                trace.snapshot_id = Some(snapshot.id());
+                let plan = self
+                    .plan_snapshot(
+                        snapshot,
+                        data_evolution_read_field_ids.as_ref(),
+                        Some(&mut trace),
+                    )
+                    .await?;
+                trace.planned_data_file_bytes = plan.planned_data_file_bytes();
+                plan
+            }
+            None => Plan::new(Vec::new()),
         };
-        trace.snapshot_id = Some(snapshot.id());
-        let plan = self
-            .plan_snapshot(
-                snapshot,
-                data_evolution_read_field_ids.as_ref(),
-                Some(&mut trace),
-            )
-            .await?;
-        trace.planned_data_file_bytes = plan.planned_data_file_bytes();
-        Ok((plan, trace))
+        self.check_planned_files(&plan, grant.is_some()).await?;
+        Ok((plan.planned(grant), trace))
     }
 
-    /// Fail closed for a `query-auth.enabled` table: scan planning — including
-    /// `with_scan_all_files`, which read-facing system tables like `files` use —
-    /// exposes file paths, row counts, and stats the client can't authorize.
+    /// The grant predates the manifest read, so the table can have been
+    /// re-created in between. Also refuses stats the schema no longer covers.
+    async fn check_planned_files(&self, plan: &Plan, query_auth: bool) -> crate::Result<()> {
+        if !query_auth {
+            return Ok(());
+        }
+        if let Some(rest_env) = self.table.rest_env() {
+            rest_env
+                .current_table_checked(self.table.schema().id(), self.table.schema().fields())
+                .await?;
+        }
+        super::query_auth::reject_unauthorized_stats(
+            plan,
+            self.table.schema(),
+            self.table.schema_manager(),
+        )
+        .await
+    }
+
+    /// Authorize this scan and return the grant for the caller to stamp.
+    async fn authorize_query(
+        &self,
+    ) -> crate::Result<Option<Arc<super::query_auth::QueryAuthGrant>>> {
+        let core_options = CoreOptions::new(self.table.schema().options());
+        // Unconditional: unrelated to query-auth.
+        core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
+        core_options.validate_data_file_path_directory()?;
+
+        // File paths and stats, not table columns: the endpoint cannot rule on them.
+        let query_auth = CoreOptions::new(self.table.schema().options()).query_auth_enabled();
+        if self.scan_all_files {
+            return if query_auth {
+                Err(super::query_auth::unsupported(
+                    "`$files` and friends are file paths and stats, not table columns, so the \
+                     auth endpoint can never rule on them",
+                ))
+            } else {
+                Ok(None)
+            };
+        }
+        // A predicate or a row-range slice reads `_ROW_ID` unprojected.
+        let touches_row_id = self.row_ranges.is_some()
+            || self
+                .data_predicates
+                .iter()
+                .any(super::row_id_predicate::references_row_id);
+        if query_auth && touches_row_id {
+            super::query_auth::reject_system_columns([ROW_ID_FIELD_NAME])?;
+        }
+
+        let grant = self.table.authorize_read(query_auth).await?;
+        // A plan already answers COUNT/MIN/MAX from row counts and bounds.
+        if grant.as_ref().is_some_and(|g| !g.is_unrestricted()) {
+            return Err(super::query_auth::unsupported(
+                "a plan already carries file paths, row counts and column bounds that a row \
+                 filter or column masking must not expose",
+            ));
+        }
+        Ok(grant)
+    }
+
+    /// Fail closed on planning paths that do not authorize, `with_scan_all_files`
+    /// included.
     fn validate_read_options(&self) -> crate::Result<()> {
         let options = CoreOptions::new(self.table.schema().options());
         options.ensure_read_authorized()?;
@@ -1736,13 +1808,6 @@ impl<'a> PaimonTableScan<'a> {
             )? {
                 entries.push(entry);
             }
-        }
-        if deletion_vectors_needed {
-            super::index_file_path::resolve_legacy_deletion_vector_entries(
-                self.table,
-                &mut entries,
-            )
-            .await?;
         }
         Ok(Some(entries))
     }
@@ -2777,6 +2842,36 @@ mod tests {
     use chrono::{DateTime, Utc};
     use std::collections::{HashMap, HashSet};
 
+    #[tokio::test]
+    async fn test_engine_served_table_is_refused_at_plan() {
+        let schema = crate::spec::Schema::builder()
+            .column(
+                "id",
+                crate::spec::DataType::Int(crate::spec::IntType::new()),
+            )
+            .option("type", "iceberg-table")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            crate::io::FileIOBuilder::new("file").build().unwrap(),
+            crate::catalog::Identifier::new("default", "ice_t"),
+            "/tmp/test-engine-served".to_string(),
+            crate::spec::TableSchema::new(0, &schema),
+            None,
+        );
+        let err = table
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .expect_err("an engine-served table must not plan as Paimon");
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("cannot be served as a Paimon table")),
+            "got {err:?}"
+        );
+    }
+
     /// Helper to build a DataFileMeta with data evolution fields.
     fn make_evo_file(
         name: &str,
@@ -3520,6 +3615,28 @@ mod tests {
             split_file_names(&result.splits),
             vec!["a.parquet", "c.parquet"]
         );
+    }
+
+    #[test]
+    fn test_incremental_limit_accumulator_does_not_truncate_on_oversized_limit() {
+        // A limit above i64::MAX (e.g. a C caller passing SIZE_MAX) must not wrap
+        // negative through a signed cast and early-stop after the first counted
+        // split; real row counts can never reach it, so every split is kept.
+        for limit in [usize::MAX, (i64::MAX as usize) + 1] {
+            let mut accumulator = LimitPushdownAccumulator::new(limit);
+            assert!(!accumulator.push(limit_test_split("a.parquet", 2)));
+            assert!(!accumulator.push(limit_test_split("b.parquet", 3)));
+            let result = accumulator.finish();
+            assert!(
+                !result.limit_early_stopped,
+                "limit {limit} must not early-stop"
+            );
+            assert_eq!(
+                split_file_names(&result.splits),
+                vec!["a.parquet", "b.parquet"],
+                "limit {limit} must keep all splits"
+            );
+        }
     }
 
     #[test]

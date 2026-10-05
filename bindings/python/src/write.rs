@@ -23,8 +23,8 @@ use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
 use paimon::spec::{CoreOptions, DataType, Datum};
 use paimon::table::{
-    CommitMessage, Table, TableCommit, TableUpdate, TableUpdateByRowId, TableWrite,
-    COMMIT_MESSAGE_SERIALIZER_VERSION,
+    CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableWrite, Table, TableCommit,
+    TableUpdate, TableUpdateByRowId, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
 };
 use paimon_datafusion::runtime::runtime;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -61,7 +61,9 @@ impl WriteContext {
             builder
         };
         Ok(WriteState {
-            inner: Some(builder.new_write().map_err(to_py_err)?),
+            inner: Some(WriteTarget::Table(Box::new(
+                builder.new_write().map_err(to_py_err)?,
+            ))),
             table_location: self.table.location().to_string(),
             commit_user: self.commit_user.clone(),
         })
@@ -270,8 +272,131 @@ impl PyStreamWriteBuilder {
     }
 }
 
+/// Keep conversion, ownership and commit-message wrapping shared by both writers.
+/// All routing and validation remain in the Rust core implementations.
+enum WriteTarget {
+    Table(Box<TableWrite>),
+    PostponeFixed(Box<PostponeFixedBucketTableWrite>),
+}
+
+impl WriteTarget {
+    async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> paimon::Result<()> {
+        match self {
+            Self::Table(writer) => writer.write_arrow_batch(batch).await,
+            Self::PostponeFixed(writer) => writer.write_arrow_batch(batch).await,
+        }
+    }
+
+    async fn prepare_commit(&mut self) -> paimon::Result<Vec<CommitMessage>> {
+        match self {
+            Self::Table(writer) => writer.prepare_commit().await,
+            Self::PostponeFixed(writer) => writer.prepare_commit().await,
+        }
+    }
+
+    async fn close(&mut self) {
+        match self {
+            Self::Table(writer) => writer.close().await,
+            Self::PostponeFixed(writer) => writer.close().await,
+        }
+    }
+}
+
+/// The public batch contract is shared with PyPaimon's specialized builder.
+#[pyclass(
+    name = "PostponeFixedBucketWriteBuilder",
+    module = "pypaimon_rust.datafusion"
+)]
+pub struct PyPostponeFixedBucketWriteBuilder {
+    batch: PyBatchWriteBuilder,
+    plan: Option<PostponeBucketPlan>,
+}
+
+impl PyPostponeFixedBucketWriteBuilder {
+    pub fn new(table: Arc<Table>) -> PyResult<Self> {
+        table
+            .new_postpone_fixed_bucket_write_builder()
+            .map_err(to_py_err)?;
+        Ok(Self {
+            batch: PyBatchWriteBuilder::new(table),
+            plan: None,
+        })
+    }
+}
+
+#[pymethods]
+impl PyPostponeFixedBucketWriteBuilder {
+    fn _with_commit_user(
+        mut slf: PyRefMut<'_, Self>,
+        commit_user: String,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.batch
+            .context
+            .table
+            .new_write_builder()
+            .with_commit_user(commit_user.clone())
+            .map_err(to_py_err)?;
+        slf.batch.context.commit_user = commit_user;
+        Ok(slf)
+    }
+
+    /// Partition fields followed by a non-null Int32 total_buckets column.
+    fn with_bucket_plan<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        plan: &Bound<'py, PyAny>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        let plan = RecordBatch::from_pyarrow_bound(plan)?;
+        slf.plan = Some(
+            PostponeBucketPlan::from_arrow(&slf.batch.context.table, &plan).map_err(to_py_err)?,
+        );
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (static_partition=Some(HashMap::new())))]
+    fn with_overwrite<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+        static_partition: Option<PythonPartitionSpec>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.batch.static_partition = static_partition
+            .map(|spec| partition_spec(py, &slf.batch.context.table, spec))
+            .transpose()?;
+        Ok(slf)
+    }
+
+    fn new_write(&self) -> PyResult<PyBatchTableWrite> {
+        let context = &self.batch.context;
+        let mut builder = context
+            .table
+            .new_postpone_fixed_bucket_write_builder()
+            .map_err(to_py_err)?
+            .with_commit_user(context.commit_user.clone())
+            .map_err(to_py_err)?;
+        if let Some(plan) = &self.plan {
+            builder = builder.with_bucket_plan(plan.clone());
+        }
+        if self.batch.static_partition.is_some() {
+            builder = builder.with_overwrite();
+        }
+        Ok(PyBatchTableWrite {
+            state: WriteState {
+                inner: Some(WriteTarget::PostponeFixed(Box::new(
+                    builder.new_write().map_err(to_py_err)?,
+                ))),
+                table_location: context.table.location().to_string(),
+                commit_user: context.commit_user.clone(),
+            },
+            prepared: false,
+        })
+    }
+
+    fn new_commit(&self) -> PyResult<PyBatchTableCommit> {
+        self.batch.new_commit()
+    }
+}
+
 struct WriteState {
-    inner: Option<TableWrite>,
+    inner: Option<WriteTarget>,
     table_location: String,
     commit_user: String,
 }

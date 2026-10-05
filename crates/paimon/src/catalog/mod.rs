@@ -165,6 +165,18 @@ impl Identifier {
             .unwrap_or_else(|| DEFAULT_MAIN_BRANCH.to_string()))
     }
 
+    /// Java's Identifier(database, tableName, branch) for branch-scoped metadata.
+    pub(crate) fn with_branch(&self, branch: &str) -> Result<Self> {
+        validate_branch_name(branch)?;
+        let table = self.parsed_object_name()?.table;
+        let object = if branch == DEFAULT_MAIN_BRANCH {
+            table
+        } else {
+            format!("{table}$branch_{branch}")
+        };
+        Ok(Self::new(self.database(), object))
+    }
+
     pub fn system_table_name(&self) -> Result<Option<String>> {
         Ok(self.parsed_object_name()?.system_table)
     }
@@ -507,6 +519,29 @@ pub trait Catalog: Send + Sync {
     ) -> Result<()> {
         Err(Error::Unsupported {
             message: "tag management is not supported by this catalog".to_string(),
+        })
+    }
+
+    /// Create a tag with an optional retention, such as `"1d"`, `"12h"`, or `"500micro"`.
+    ///
+    /// `None` preserves [`Self::create_tag`] behavior. An explicit retention records the
+    /// creation time and TTL; this method does not run tag expiration.
+    /// Catalogs that do not support retention return [`Error::Unsupported`].
+    async fn create_tag_with_retention(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+        time_retained: Option<&str>,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        if time_retained.is_none() {
+            return self
+                .create_tag(identifier, tag_name, snapshot_id, ignore_if_exists)
+                .await;
+        }
+        Err(Error::Unsupported {
+            message: "tag retention is not supported by this catalog".to_string(),
         })
     }
 

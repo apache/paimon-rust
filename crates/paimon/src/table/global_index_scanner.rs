@@ -21,6 +21,7 @@
 //! Reference: [org.apache.paimon.index.GlobalIndexScanner](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/index/GlobalIndexScanner.java)
 
 mod all_match;
+mod composite;
 mod deletion_vectors;
 mod entry;
 mod evaluator;
@@ -52,7 +53,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize as TestAtomicUsize, Ordering as TestOrdering};
+use std::sync::atomic::{
+    AtomicBool as TestAtomicBool, AtomicUsize as TestAtomicUsize, Ordering as TestOrdering,
+};
 
 type BoxedCmp = Box<dyn Fn(&[u8], &[u8]) -> Result<Ordering> + Send + Sync>;
 
@@ -63,8 +66,13 @@ const DELETION_VECTORS_INDEX_TYPE: &str = "DELETION_VECTORS";
 struct QueryIoProbe {
     active: TestAtomicUsize,
     peak: TestAtomicUsize,
+    evaluate_futures: TestAtomicUsize,
     predicate_queries: TestAtomicUsize,
     range_queries: TestAtomicUsize,
+    btree_opens: TestAtomicUsize,
+    pause_on_enter: TestAtomicBool,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -73,6 +81,10 @@ impl QueryIoProbe {
         let current = self.active.fetch_add(1, TestOrdering::SeqCst) + 1;
         self.peak.fetch_max(current, TestOrdering::SeqCst);
         let guard = QueryIoProbeGuard { probe: self };
+        if self.pause_on_enter.load(TestOrdering::SeqCst) {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
         tokio::task::yield_now().await;
         guard
     }
@@ -113,13 +125,18 @@ pub(crate) struct GlobalIndexScanner {
     fm_read_context: Arc<FMReadContext>,
     /// Global index entries grouped by field_id.
     entries_by_field: Vec<(i32, Vec<GlobalIndexEntry>)>,
+    /// Composite BTree files grouped by the full ordered definition. These
+    /// must never be passed to a scalar reader for their leading column.
+    composite_entries: Vec<(Vec<i32>, Vec<GlobalIndexEntry>)>,
     /// Indexed row-id coverage grouped by field_id.
     #[cfg(test)]
     coverage_by_field: HashMap<i32, Vec<RowRange>>,
     /// Schema fields for field_id lookup.
     schema_fields: Vec<DataField>,
-    /// Cache of opened BTree readers, keyed by file name.
+    /// Cache of opened BTree readers, keyed by resolved path.
     reader_cache: Mutex<HashMap<String, BTreeIndexReader<BoxedCmp>>>,
+    /// Serialize use of each BTree reader across concurrent predicate branches.
+    btree_file_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
     query_io_probe: Option<Arc<QueryIoProbe>>,
 }
@@ -179,6 +196,7 @@ impl GlobalIndexScanner {
         }
         let mut entries_by_field: std::collections::HashMap<i32, Vec<GlobalIndexEntry>> =
             std::collections::HashMap::new();
+        let mut composite_entries: HashMap<Vec<i32>, Vec<GlobalIndexEntry>> = HashMap::new();
         #[cfg(test)]
         let mut coverage_by_field: HashMap<i32, Vec<RowRange>> = HashMap::new();
 
@@ -292,15 +310,26 @@ impl GlobalIndexScanner {
                 }
             }
 
-            entries_by_field
-                .entry(global_meta.index_field_id)
-                .or_default()
-                .push(resolved);
+            if kind == GlobalIndexFileKind::BTree
+                && global_meta
+                    .extra_field_ids
+                    .as_ref()
+                    .is_some_and(|ids| !ids.is_empty())
+            {
+                let mut ids = vec![global_meta.index_field_id];
+                ids.extend(global_meta.extra_field_ids.as_ref().unwrap());
+                composite_entries.entry(ids).or_default().push(resolved);
+            } else {
+                entries_by_field
+                    .entry(global_meta.index_field_id)
+                    .or_default()
+                    .push(resolved);
+            }
         }
 
         validate_fm_file_sets(&entries_by_field)?;
 
-        if entries_by_field.is_empty() {
+        if entries_by_field.is_empty() && composite_entries.is_empty() {
             return Ok(None);
         }
 
@@ -315,13 +344,25 @@ impl GlobalIndexScanner {
             fm_read_options,
             fm_read_context: Arc::new(FMReadContext::new(fm_read_options.cache_size)),
             entries_by_field: entries_by_field.into_iter().collect(),
+            composite_entries: composite_entries.into_iter().collect(),
             #[cfg(test)]
             coverage_by_field,
             schema_fields: schema_fields.to_vec(),
             reader_cache: Mutex::new(HashMap::new()),
+            btree_file_locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             query_io_probe: None,
         }))
+    }
+
+    fn btree_file_lock(&self, entry: &GlobalIndexEntry) -> Arc<tokio::sync::Mutex<()>> {
+        let path = entry.resolved_path(&self.table_path);
+        let mut locks = self.btree_file_locks.lock().unwrap();
+        Arc::clone(
+            locks
+                .entry(path)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 }
 
@@ -362,7 +403,6 @@ pub(crate) async fn evaluate_global_index(
         Some(s) => s,
         None => return Ok(None),
     };
-
     let combined = Predicate::and(evaluation.predicates.to_vec());
 
     let scan_result = match scanner.evaluate(&combined).await? {

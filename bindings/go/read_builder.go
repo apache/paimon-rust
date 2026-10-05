@@ -92,6 +92,26 @@ func (rb *ReadBuilder) WithCaseSensitive(caseSensitive bool) error {
 	return ffiReadBuilderWithCaseSensitive.symbol(rb.ctx)(rb.inner, caseSensitive)
 }
 
+// WithLimit sets a row-count limit hint for scan planning. Planning stops
+// retaining splits once the ones already kept cover the limit, so reading a
+// preview or sample of the first N rows keeps fewer splits. Planning still reads
+// the manifest entries to learn each split's row count, so this bounds how many
+// splits are retained rather than avoiding all planning I/O. It is a hint only:
+// it does not guarantee exactly limit rows are returned, so callers still enforce
+// the final row limit when reading.
+//
+// A negative limit is rejected with ErrNegativeLimit: it would wrap to a huge
+// value through the unsigned C boundary and stop planning after the first split.
+func (rb *ReadBuilder) WithLimit(limit int) error {
+	if limit < 0 {
+		return ErrNegativeLimit
+	}
+	if rb.inner == nil {
+		return ErrClosed
+	}
+	return ffiReadBuilderWithLimit.symbol(rb.ctx)(rb.inner, uintptr(limit))
+}
+
 // WithFilter sets a filter predicate for scan planning and read-side pruning.
 //
 // The predicate is used in two phases:
@@ -239,6 +259,26 @@ var ffiReadBuilderWithCaseSensitive = newFFI(ffiOpts{
 			unsafe.Pointer(&errPtr),
 			unsafe.Pointer(&rb),
 			unsafe.Pointer(&flag),
+		)
+		if errPtr != nil {
+			return parseError(ctx, errPtr)
+		}
+		return nil
+	}
+})
+
+// size_t is passed pointer-width, matching ffiTableReadToArrow's offset/length.
+var ffiReadBuilderWithLimit = newFFI(ffiOpts{
+	sym:    "paimon_read_builder_with_limit",
+	rType:  &ffi.TypePointer,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(rb *paimonReadBuilder, limit uintptr) error {
+	return func(rb *paimonReadBuilder, limit uintptr) error {
+		var errPtr *paimonError
+		ffiCall(
+			unsafe.Pointer(&errPtr),
+			unsafe.Pointer(&rb),
+			unsafe.Pointer(&limit),
 		)
 		if errPtr != nil {
 			return parseError(ctx, errPtr)

@@ -35,6 +35,12 @@ struct ProjectedField {
     outputs: Vec<usize>,
 }
 
+#[derive(Clone, Copy)]
+enum Float32ProjectionMode<'a> {
+    Numeric,
+    Cast { fail_on_error: &'a [bool] },
+}
+
 impl VariantFloat32Projection {
     pub(crate) fn new(metadata: &[u8], fields: &[String]) -> Result<Self> {
         validate_metadata(metadata)?;
@@ -75,6 +81,43 @@ impl VariantFloat32Projection {
         if output.len() != self.output_width {
             return data_invalid("Invalid Variant numeric output width");
         }
+        self.extract_float32_impl(
+            value,
+            metadata,
+            offsets,
+            output,
+            Float32ProjectionMode::Numeric,
+        )
+    }
+
+    pub(crate) fn extract_float32_cast(
+        &mut self,
+        value: &[u8],
+        metadata: &[u8],
+        fail_on_error: &[bool],
+        offsets: &mut Vec<usize>,
+        output: &mut [Option<f32>],
+    ) -> Result<()> {
+        if output.len() != self.output_width || fail_on_error.len() != self.output_width {
+            return data_invalid("Invalid Variant float32 projection width");
+        }
+        self.extract_float32_impl(
+            value,
+            metadata,
+            offsets,
+            output,
+            Float32ProjectionMode::Cast { fail_on_error },
+        )
+    }
+
+    fn extract_float32_impl(
+        &mut self,
+        value: &[u8],
+        metadata: &[u8],
+        offsets: &mut Vec<usize>,
+        output: &mut [Option<f32>],
+        mode: Float32ProjectionMode<'_>,
+    ) -> Result<()> {
         output.fill(None);
         if value_kind(value, 0)? != VariantKind::Object {
             validate_payload(value, metadata)?;
@@ -139,7 +182,27 @@ impl VariantFloat32Projection {
                 return data_invalid("Malformed Variant child size");
             }
             let child = VariantRef::new_at(value, metadata, child_pos)?;
-            let numeric = numeric_to_float32(child, &projected.name)?;
+            let numeric = match mode {
+                Float32ProjectionMode::Numeric => numeric_to_float32(child, &projected.name)?,
+                Float32ProjectionMode::Cast { fail_on_error } => {
+                    if child.is_null()? {
+                        continue;
+                    }
+                    let numeric = cast_variant_to_f32(child);
+                    if numeric.is_none()
+                        && projected
+                            .outputs
+                            .iter()
+                            .any(|output_index| fail_on_error[*output_index])
+                    {
+                        return data_invalid(format!(
+                            "Cannot cast Variant value to {:?}",
+                            DataType::Float(FloatType::new())
+                        ));
+                    }
+                    numeric
+                }
+            };
             for output_index in &projected.outputs {
                 output[*output_index] = numeric;
             }

@@ -81,7 +81,7 @@ pub(crate) fn gcs_config_parse(props: HashMap<String, String>) -> Result<GcsConf
     Ok(cfg)
 }
 
-pub(crate) fn gcs_config_build(cfg: &GcsConfig, path: &str) -> Result<Operator> {
+pub(crate) fn gcs_config_build(cfg: &GcsConfig, path: &str, user_agent: &str) -> Result<Operator> {
     let url = Url::parse(path).map_err(|_| Error::ConfigInvalid {
         message: format!("Invalid GCS url: {path}"),
     })?;
@@ -91,7 +91,10 @@ pub(crate) fn gcs_config_build(cfg: &GcsConfig, path: &str) -> Result<Operator> 
     })?;
 
     let builder = cfg.clone().into_builder().bucket(bucket);
-    Ok(super::with_http_transport(Operator::new(builder)?))
+    Ok(super::with_http_transport(
+        Operator::new(builder)?,
+        user_agent,
+    ))
 }
 
 #[cfg(test)]
@@ -185,14 +188,14 @@ mod tests {
     fn test_gcs_config_build_extracts_bucket() {
         let cfg = GcsConfig::default();
 
-        let op = gcs_config_build(&cfg, "gs://my-bucket/some/path").unwrap();
+        let op = gcs_config_build(&cfg, "gs://my-bucket/some/path", "paimon-rust/test").unwrap();
         assert_eq!(op.info().name(), "my-bucket");
     }
 
     #[test]
     fn test_gcs_config_build_missing_bucket() {
         let cfg = GcsConfig::default();
-        let result = gcs_config_build(&cfg, "gs:///path/without/bucket");
+        let result = gcs_config_build(&cfg, "gs:///path/without/bucket", "paimon-rust/test");
         assert!(result.is_err());
     }
 }

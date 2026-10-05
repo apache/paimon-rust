@@ -263,6 +263,327 @@ fn read_footer(data: &[u8]) -> BTreeFileFooter {
 }
 
 #[tokio::test]
+async fn test_null_bitmap_is_loaded_on_demand() {
+    let data_type = DataType::Int(crate::spec::IntType::new());
+    let key = |value| crate::btree::serialize_datum(&Datum::Int(value), &data_type);
+
+    for version in [1, 2] {
+        for (has_nulls, has_non_nulls) in [(true, true), (false, true), (true, false)] {
+            let buf = VecFileWrite::new();
+            let mut writer = BTreeIndexWriter::with_comparator(
+                Box::new(buf.clone()),
+                256,
+                BlockCompressionType::None,
+                crate::btree::make_key_comparator(&data_type),
+            )
+            .with_file_version(version)
+            .unwrap();
+            if has_nulls {
+                writer.write(None, 10).await.unwrap();
+                writer.write(None, 30).await.unwrap();
+            }
+            if has_non_nulls {
+                writer.write(Some(&key(1)), 20).await.unwrap();
+                writer.write(Some(&key(2)), 40).await.unwrap();
+            }
+            let result = writer.finish().await.unwrap();
+            let data = Bytes::from(buf.to_vec());
+            let footer = read_footer(&data);
+            let null_range = footer
+                .null_bitmap_handle
+                .map(|handle| handle.offset..handle.offset + u64::from(handle.size) + 4);
+            assert_eq!(null_range.is_some(), has_nulls);
+            let ranges = Arc::new(Mutex::new(Vec::new()));
+            let reader = BTreeIndexReader::open(
+                Box::new(RecordingFileRead {
+                    data: data.clone(),
+                    ranges: ranges.clone(),
+                }),
+                data.len() as u64,
+                &result.meta,
+                crate::btree::make_key_comparator(&data_type),
+            )
+            .await
+            .unwrap();
+
+            let index = footer.index_block_handle;
+            let expected_open_ranges = vec![
+                data.len() as u64 - BTREE_FOOTER_ENCODED_LENGTH as u64..data.len() as u64,
+                index.offset..index.offset + index.full_block_size() as u64,
+            ];
+            assert_eq!(*ranges.lock().unwrap(), expected_open_ranges);
+            let null_reads = || {
+                ranges
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|range| null_range.as_ref() == Some(*range))
+                    .count()
+            };
+            assert_eq!(null_reads(), 0);
+
+            let expected_equal = if has_non_nulls { vec![20] } else { vec![] };
+            let expected_non_null = if has_non_nulls { vec![20, 40] } else { vec![] };
+            for (op, literals, expected) in [
+                (PredicateOperator::Eq, vec![Datum::Int(1)], expected_equal),
+                (
+                    PredicateOperator::Between,
+                    vec![Datum::Int(1), Datum::Int(2)],
+                    expected_non_null.clone(),
+                ),
+                (PredicateOperator::IsNotNull, vec![], expected_non_null),
+            ] {
+                let rows = reader.query(op, &literals, &data_type).await.unwrap();
+                assert_eq!(rows.iter().collect::<Vec<_>>(), expected, "{op:?}");
+                assert_eq!(null_reads(), 0, "{op:?}");
+            }
+
+            let mut expected_reads = ranges.lock().unwrap().clone();
+            let expected_null = if has_nulls { vec![10, 30] } else { vec![] };
+            let rows = reader
+                .query(PredicateOperator::IsNull, &[], &data_type)
+                .await
+                .unwrap();
+            assert_eq!(rows.iter().collect::<Vec<_>>(), expected_null);
+            if let Some(range) = &null_range {
+                expected_reads.push(range.clone());
+            }
+            assert_eq!(*ranges.lock().unwrap(), expected_reads);
+            assert_eq!(null_reads(), usize::from(has_nulls));
+            for _ in 0..2 {
+                let rows = reader
+                    .query(PredicateOperator::IsNull, &[], &data_type)
+                    .await
+                    .unwrap();
+                assert_eq!(rows.iter().collect::<Vec<_>>(), expected_null);
+            }
+            let (left, right) = tokio::join!(
+                reader.query(PredicateOperator::IsNull, &[], &data_type),
+                reader.query(PredicateOperator::IsNull, &[], &data_type),
+            );
+            assert_eq!(left.unwrap().iter().collect::<Vec<_>>(), expected_null);
+            assert_eq!(right.unwrap().iter().collect::<Vec<_>>(), expected_null);
+            assert_eq!(*ranges.lock().unwrap(), expected_reads);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_null_bitmap_corruption_is_reported_on_access() {
+    for version in [1, 2] {
+        for corrupt_crc in [true, false] {
+            let buf = VecFileWrite::new();
+            let mut writer =
+                BTreeIndexWriter::new(Box::new(buf.clone()), 256, BlockCompressionType::None)
+                    .with_file_version(version)
+                    .unwrap();
+            writer.write(None, 10).await.unwrap();
+            writer.write(Some(&int_key(1)), 20).await.unwrap();
+            let result = writer.finish().await.unwrap();
+            let mut data = buf.to_vec();
+            let footer = read_footer(&data);
+            let handle = footer.null_bitmap_handle.unwrap();
+            let bitmap_start = handle.offset as usize;
+            let crc_start = bitmap_start + handle.size as usize;
+            if corrupt_crc {
+                data[crc_start] ^= 1;
+            } else {
+                // The first bitmap cookie follows the u64 map count and u32 key.
+                let cookie_start = bitmap_start + 12;
+                data[cookie_start..cookie_start + 4].fill(0);
+                let crc = crc32fast::hash(&data[bitmap_start..crc_start]);
+                data[crc_start..crc_start + 4].copy_from_slice(&crc.to_le_bytes());
+                assert!(
+                    roaring::RoaringTreemap::deserialize_from(&data[bitmap_start..crc_start])
+                        .is_err()
+                );
+            }
+            let data = Bytes::from(data);
+            let ranges = Arc::new(Mutex::new(Vec::new()));
+            let reader = BTreeIndexReader::open(
+                Box::new(RecordingFileRead {
+                    data: data.clone(),
+                    ranges: ranges.clone(),
+                }),
+                data.len() as u64,
+                &result.meta,
+                int_cmp,
+            )
+            .await
+            .expect("null bitmap corruption must not prevent opening the reader");
+            assert_eq!(ranges.lock().unwrap().len(), 2);
+            assert_eq!(
+                reader
+                    .query_equal(&int_key(1))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![20],
+            );
+            let null_range = handle.offset..handle.offset + u64::from(handle.size) + 4;
+            assert!(!ranges.lock().unwrap().contains(&null_range));
+
+            let data_type = DataType::Int(crate::spec::IntType::new());
+            for _ in 0..2 {
+                let error = reader
+                    .query(PredicateOperator::IsNull, &[], &data_type)
+                    .await
+                    .expect_err("null bitmap corruption must not produce an empty result");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                if corrupt_crc {
+                    assert!(error.to_string().contains("Null bitmap CRC mismatch"));
+                } else {
+                    assert!(error.to_string().contains("unknown cookie value"));
+                }
+            }
+            assert_eq!(
+                ranges
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|range| **range == null_range)
+                    .count(),
+                2,
+                "failed initialization must not be cached",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_null_bitmap_read_failure_can_be_retried() {
+    struct FailingNullBitmapRead {
+        inner: RecordingFileRead,
+        null_range: Range<u64>,
+        null_reads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FileRead for FailingNullBitmapRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            if range == self.null_range && self.null_reads.fetch_add(1, AtomicOrdering::SeqCst) == 0
+            {
+                self.inner.ranges.lock().unwrap().push(range);
+                return Err(crate::Error::UnexpectedError {
+                    message: "Injected null bitmap read failure".to_string(),
+                    source: None,
+                });
+            }
+            self.inner.read(range).await
+        }
+    }
+
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::new(Box::new(buf.clone()), 256, BlockCompressionType::None);
+    writer.write(None, 10).await.unwrap();
+    writer.write(Some(&int_key(1)), 20).await.unwrap();
+    let result = writer.finish().await.unwrap();
+    let data = Bytes::from(buf.to_vec());
+    let handle = read_footer(&data).null_bitmap_handle.unwrap();
+    let null_range = handle.offset..handle.offset + u64::from(handle.size) + 4;
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let reader = BTreeIndexReader::open(
+        Box::new(FailingNullBitmapRead {
+            inner: RecordingFileRead {
+                data: data.clone(),
+                ranges: ranges.clone(),
+            },
+            null_range: null_range.clone(),
+            null_reads: AtomicUsize::new(0),
+        }),
+        data.len() as u64,
+        &result.meta,
+        int_cmp,
+    )
+    .await
+    .expect("opening must not read the null bitmap");
+    assert_eq!(ranges.lock().unwrap().len(), 2);
+    let data_type = DataType::Int(crate::spec::IntType::new());
+    let error = reader
+        .query(PredicateOperator::IsNull, &[], &data_type)
+        .await
+        .expect_err("the first null bitmap load must return the injected I/O error");
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert!(error
+        .to_string()
+        .contains("Injected null bitmap read failure"));
+    assert_eq!(ranges.lock().unwrap().len(), 3);
+    assert_eq!(ranges.lock().unwrap().last(), Some(&null_range));
+    assert_eq!(
+        reader
+            .query_equal(&int_key(1))
+            .await
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![20],
+    );
+    let rows = reader
+        .query(PredicateOperator::IsNull, &[], &data_type)
+        .await
+        .expect("a failed load must allow a successful retry");
+    assert_eq!(rows.iter().collect::<Vec<_>>(), vec![10]);
+    assert_eq!(
+        ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|range| **range == null_range)
+            .count(),
+        2,
+    );
+    let reads_after_success = ranges.lock().unwrap().clone();
+    assert_eq!(reader.null_bitmap().await.unwrap(), &rows);
+    assert_eq!(*ranges.lock().unwrap(), reads_after_success);
+}
+
+#[tokio::test]
+async fn test_null_bitmap_concurrent_first_queries_share_one_read() {
+    struct YieldingFileRead(RecordingFileRead);
+
+    #[async_trait::async_trait]
+    impl FileRead for YieldingFileRead {
+        async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+            let bytes = self.0.read(range).await?;
+            tokio::task::yield_now().await;
+            Ok(bytes)
+        }
+    }
+
+    let buf = VecFileWrite::new();
+    let mut writer = BTreeIndexWriter::new(Box::new(buf.clone()), 256, BlockCompressionType::None);
+    writer.write(None, 10).await.unwrap();
+    writer.write(None, 30).await.unwrap();
+    let result = writer.finish().await.unwrap();
+    let data = Bytes::from(buf.to_vec());
+    let handle = read_footer(&data).null_bitmap_handle.unwrap();
+    let null_range = handle.offset..handle.offset + u64::from(handle.size) + 4;
+    let ranges = Arc::new(Mutex::new(Vec::new()));
+    let reader = BTreeIndexReader::open(
+        Box::new(YieldingFileRead(RecordingFileRead {
+            data: data.clone(),
+            ranges: ranges.clone(),
+        })),
+        data.len() as u64,
+        &result.meta,
+        int_cmp,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ranges.lock().unwrap().len(), 2);
+    let data_type = DataType::Int(crate::spec::IntType::new());
+    let (left, right) = tokio::join!(
+        reader.query(PredicateOperator::IsNull, &[], &data_type),
+        reader.query(PredicateOperator::IsNull, &[], &data_type),
+    );
+    assert_eq!(left.unwrap().iter().collect::<Vec<_>>(), vec![10, 30]);
+    assert_eq!(right.unwrap().iter().collect::<Vec<_>>(), vec![10, 30]);
+    assert_eq!(ranges.lock().unwrap().len(), 3);
+    assert_eq!(ranges.lock().unwrap().last(), Some(&null_range));
+}
+
+#[tokio::test]
 async fn test_java_v2_posting_encodings() {
     // Existing low-level tests use arbitrary big-endian keys. Java's INT key
     // serializer uses little-endian bytes, so use the production codec here.
@@ -295,7 +616,12 @@ async fn test_java_v2_posting_encodings() {
             );
         }
         assert_eq!(
-            reader.null_bitmap().iter().collect::<Vec<_>>(),
+            reader
+                .null_bitmap()
+                .await
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
             vec![4, (1u64 << 32) + 20000]
         );
         assert_eq!(
@@ -581,7 +907,7 @@ async fn test_null_keys() {
 
     let reader = write_and_open(&buf, &result, int_cmp).await;
 
-    let null_bm = reader.null_bitmap();
+    let null_bm = reader.null_bitmap().await.unwrap();
     assert!(null_bm.contains(10));
     assert!(null_bm.contains(30));
     assert!(!null_bm.contains(20));
@@ -605,7 +931,7 @@ async fn test_only_nulls() {
     assert!(result.meta.has_nulls);
 
     let reader = write_and_open(&buf, &result, int_cmp).await;
-    let null_bm = reader.null_bitmap();
+    let null_bm = reader.null_bitmap().await.unwrap();
     assert_eq!(null_bm.len(), 3);
 }
 
@@ -1303,7 +1629,7 @@ async fn test_nulls_with_range_query() {
     assert!(!all.contains(0));
     assert!(!all.contains(100));
 
-    let nulls = reader.null_bitmap();
+    let nulls = reader.null_bitmap().await.unwrap();
     assert_eq!(nulls.len(), 2);
     assert!(nulls.contains(0));
     assert!(nulls.contains(100));
@@ -1432,7 +1758,7 @@ async fn test_java_compat_int_with_nulls() {
     let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), true);
     let reader = open_testdata("btree_int_100_with_nulls.bin", &meta, le_int_cmp).await;
 
-    let null_bm = reader.null_bitmap();
+    let null_bm = reader.null_bitmap().await.unwrap();
     assert!(!null_bm.is_empty());
 
     let all = reader.all_non_null_rows().await.unwrap();

@@ -18,6 +18,7 @@
 use super::postpone_bucket_plan::data_invalid;
 use super::postpone_fixed_bucket_router::validate_postpone_fixed_bucket_table;
 use crate::resource::ResourceContext;
+use crate::spec::CoreOptions;
 use crate::table::write_builder::{ensure_table_write_allowed, validate_commit_user};
 use crate::table::{
     PostponeBucketPlan, PostponeFixedBucketTableCommit, PostponeFixedBucketTableWrite, Table,
@@ -76,20 +77,25 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
     }
 
     pub fn try_new_commit(&self) -> Result<PostponeFixedBucketTableCommit> {
-        self.table.ensure_not_branch_reference_for_write()?;
+        ensure_table_write_allowed(self.table)?;
         Ok(self.new_commit())
     }
 
     pub fn new_write(&self) -> Result<PostponeFixedBucketTableWrite> {
         ensure_table_write_allowed(self.table)?;
-        let plan = self
-            .bucket_plan
-            .clone()
-            .ok_or_else(|| data_invalid("A resolved postpone bucket plan is required"))?;
+        let load_existing_buckets = self.bucket_plan.is_none() && !self.overwrite;
+        let plan = match &self.bucket_plan {
+            Some(plan) => plan.clone(),
+            None => PostponeBucketPlan::with_default_bucket_num(
+                CoreOptions::new(self.table.schema().options()).postpone_default_bucket_num()?
+                    .ok_or_else(|| data_invalid("A resolved postpone bucket plan is required unless postpone.default-bucket-num is configured"))?,
+            ),
+        };
         PostponeFixedBucketTableWrite::new(
             self.table,
             self.commit_user.clone(),
             plan,
+            load_existing_buckets,
             self.overwrite,
             self.resources.clone(),
         )
@@ -164,5 +170,27 @@ mod tests {
         assert!(matches!(error, crate::Error::Unsupported { ref message }
                 if message.contains("postpone fixed-bucket writes")
                     && message.contains("deletion-vectors.enabled=true")));
+    }
+
+    #[tokio::test]
+    async fn default_bucket_count_routes_without_an_explicit_plan() {
+        let file_io = test_file_io();
+        let table_path = "memory:/default_postpone_bucket_count";
+        setup_dirs(&file_io, table_path).await;
+        let table = test_postpone_pk_table(&file_io, table_path).copy_with_options(
+            std::collections::HashMap::from([("postpone.default-bucket-num".into(), "3".into())]),
+        );
+        let builder = table.new_postpone_fixed_bucket_write_builder().unwrap();
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![1, 2, 3, 4], vec![10, 20, 30, 40]))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        assert!(!messages.is_empty());
+        assert!(messages
+            .iter()
+            .all(|message| message.total_buckets == Some(3) && (0..3).contains(&message.bucket)));
+        builder.new_commit().commit(messages).await.unwrap();
     }
 }

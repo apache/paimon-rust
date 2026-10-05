@@ -459,14 +459,26 @@ impl MergeFunction for PartialUpdateMergeFunction {
         source_output_col_indices: &[usize],
         output_schema: &SchemaRef,
     ) -> crate::Result<MergeResult> {
+        if let Some(result) = singleton_reducer_result(rows)? {
+            return Ok(result);
+        }
+        self.merge_unreduced(rows, batch_buffer, source_output_col_indices, output_schema)
+    }
+}
+
+impl PartialUpdateMergeFunction {
+    pub(super) fn merge_unreduced(
+        &self,
+        rows: &[MergeRow],
+        batch_buffer: &[BufferedBatch],
+        source_output_col_indices: &[usize],
+        output_schema: &SchemaRef,
+    ) -> crate::Result<MergeResult> {
         if rows.is_empty() {
             return Err(Error::UnexpectedError {
                 message: "merge called with empty rows".to_string(),
                 source: None,
             });
-        }
-        if let Some(result) = singleton_reducer_result(rows)? {
-            return Ok(result);
         }
 
         let mut ordered_row_indices: Vec<usize> = (0..rows.len()).collect();

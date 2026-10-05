@@ -41,6 +41,8 @@ storage-all = [
     "storage-obs",
     "storage-gcs",
     "storage-hdfs",
+    "storage-jindo",
+    "storage-oss-cpp",
 ]
 fulltext = ["dep:paimon-ftindex-core"]
 vortex = ["dep:vortex"]
@@ -61,6 +63,8 @@ storage-azdls = [
 storage-obs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-obs"]
 storage-gcs = ["dep:opendal-http-transport-reqwest", "dep:opendal-service-gcs"]
 storage-hdfs = ["dep:opendal-service-hdfs-native"]
+storage-jindo = ["storage-oss"]
+storage-oss-cpp = ["storage-oss"]
 
 [dependencies]
 rand = "0.8.5"
@@ -129,6 +133,8 @@ parquet = { workspace = true, features = ["async", "zstd", "lz4", "snap"] }
 orc-rust = "0.8.0"
 async-stream = "0.3.6"
 reqwest = { version = "0.12", features = ["json", "gzip", "deflate"] }
+# Already in the tree via `reqwest`; direct dep for the object storage User-Agent transport.
+http = "1"
 # DLF authentication dependencies
 base64 = "0.22"
 hex = "0.4"
@@ -150,5 +156,9 @@ log = "0.4"
 # The 1.13.3 resolver update correlates with Linux Vortex tests hanging.
 unicode-segmentation = "=1.13.2"
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros", "tokio", "http1", "http2"] }
+libc = "0.2"

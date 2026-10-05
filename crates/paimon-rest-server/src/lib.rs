@@ -205,6 +205,8 @@ fn build_router(prefix: &str, state: Arc<AppState>) -> Router {
 const RESOURCE_TYPE_DATABASE: &str = "DATABASE";
 /// Mirrors Java `ErrorResponse.RESOURCE_TYPE_TABLE`.
 const RESOURCE_TYPE_TABLE: &str = "TABLE";
+/// Mirrors Java `ErrorResponse.RESOURCE_TYPE_COLUMN`.
+const RESOURCE_TYPE_COLUMN: &str = "COLUMN";
 
 fn error_response(e: Error) -> Response {
     let (status, resource_type, resource_name) = match &e {
@@ -233,19 +235,18 @@ fn error_response(e: Error) -> Response {
             Some(RESOURCE_TYPE_DATABASE.to_string()),
             Some(database.clone()),
         ),
-        // `column:<table>` and 400 diverge from Java's `RESOURCE_TYPE_COLUMN`
-        // and 404/409, but correcting the status here would make the *Rust*
-        // client report a missing column as `TableNotExist`
-        // (`map_rest_error_for_table` ignores `resourceType`), so the two must
-        // move together in a separate change.
-        Error::ColumnNotExist { full_name, column } => (
-            StatusCode::BAD_REQUEST,
-            Some(format!("column:{full_name}")),
+        // Column errors carry the `COLUMN` resource type and 404/409 (mirroring
+        // Java `ErrorResponse`), so the Rust client's `map_rest_error_for_table`
+        // can restore `ColumnNotExist` / `ColumnAlreadyExist` from `resourceType`
+        // instead of collapsing them into a table error.
+        Error::ColumnNotExist { column, .. } => (
+            StatusCode::NOT_FOUND,
+            Some(RESOURCE_TYPE_COLUMN.to_string()),
             Some(column.clone()),
         ),
-        Error::ColumnAlreadyExist { full_name, column } => (
-            StatusCode::BAD_REQUEST,
-            Some(format!("column:{full_name}")),
+        Error::ColumnAlreadyExist { column, .. } => (
+            StatusCode::CONFLICT,
+            Some(RESOURCE_TYPE_COLUMN.to_string()),
             Some(column.clone()),
         ),
         Error::IdentifierInvalid { .. } | Error::ConfigInvalid { .. } => {

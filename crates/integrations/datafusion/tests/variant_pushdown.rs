@@ -334,7 +334,7 @@ async fn try_variant_get_invalid_path_pushdown_returns_null() {
 }
 
 #[tokio::test]
-async fn variant_get_path_with_semicolon_pushes_extraction() {
+async fn variant_get_path_with_semicolon_falls_back() {
     let (_tmp, sql_context) = setup_shredded_variant_table_with_rows().await;
     let sql = r#"
         SELECT variant_get(payload, '$.a;b', 'int') AS value
@@ -346,8 +346,8 @@ async fn variant_get_path_with_semicolon_pushes_extraction() {
     let plan = df.create_physical_plan().await.unwrap();
     let plan_text = displayable(plan.as_ref()).indent(true).to_string();
     assert!(
-        plan_text.contains("PushedVariants=[payload=[$.a;b]]"),
-        "plan should push semicolon-path variant extraction, got:\n{plan_text}"
+        !plan_text.contains("PushedVariants="),
+        "plan should not push an unencodable semicolon path, got:\n{plan_text}"
     );
 
     let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
@@ -358,5 +358,41 @@ async fn variant_get_path_with_semicolon_pushes_extraction() {
         .as_any()
         .downcast_ref::<Int32Array>()
         .unwrap();
+    assert_eq!(values.values(), &[11, 22]);
+}
+
+#[tokio::test]
+async fn variant_get_mixed_paths_with_semicolon_keep_full_column() {
+    let (_tmp, sql_context) = setup_shredded_variant_table_with_rows().await;
+    let sql = r#"
+        SELECT variant_get(payload, '$.age', 'int') AS age,
+               variant_get(payload, '$.a;b', 'int') AS value
+        FROM paimon.test_db.t
+        ORDER BY id
+    "#;
+
+    let df = sql_context.sql(sql).await.unwrap();
+    let plan = df.create_physical_plan().await.unwrap();
+    let plan_text = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        !plan_text.contains("PushedVariants="),
+        "plan should keep the full Variant column for mixed paths, got:\n{plan_text}"
+    );
+
+    let batches = sql_context.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    let ages = batches[0]
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let values = batches[0]
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ages.values(), &[27, 32]);
     assert_eq!(values.values(), &[11, 22]);
 }

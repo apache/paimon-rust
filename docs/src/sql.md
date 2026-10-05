@@ -1152,6 +1152,48 @@ to use adaptive single-row, delta-list, and Roaring postings; every reader of
 the table must support V2 before enabling it. Existing index files do not need
 to be rebuilt for the reader to handle a mix of versions.
 
+BTree also supports composite indexes. List scalar columns in tuple-key order:
+
+```sql
+CALL sys.create_global_index(
+  table => 'paimon.my_db.my_table',
+  index_column => 'category,item_number',
+  index_type => 'btree'
+);
+
+SELECT * FROM paimon.my_db.my_table
+WHERE category IN ('a', 'b') AND item_number >= 10;
+```
+
+Equality, `IN`, or `IS NULL` on every key column uses tuple point lookups.
+A leading prefix of those conditions may be followed by `>`, `>=`, `<`, `<=`,
+`BETWEEN`, or `IS NOT NULL` on the next column. Predicates after the first range
+column remain data filters; a predicate only on a later key column cannot use
+this index. Repeated `IN` values are deduplicated and intersected with other
+conditions on the same column before expansion, with a maximum of 256 tuple
+intervals. Larger expansions fall back to another index or an ordinary scan.
+Decimal literals are rescaled exactly to the column's scale. If a literal
+cannot be encoded without losing precision (including sub-millisecond bounds
+on compact timestamps), this definition is declined and data filtering retains
+the original literal. Independent indexes on other columns continue to be
+evaluated and intersected for `AND` predicates.
+
+Prefix and range scans honor `btree-index.fallback-scan-max-size` for selected
+files in each source row-ID range group. If any group exceeds the budget, the
+whole definition is declined; tuple point lookups bypass this budget. When
+multiple definitions match, selection prefers more bounded columns, then more
+point-constrained columns, then fewer total key columns. A dedicated BTree or
+bitmap index on the leading column is preferred for a leading-column-only predicate
+when it covers the composite definition's coverage. `full` and `detail` search
+modes retain unindexed rows for data filtering.
+
+The Rust builders accept `.with_index_columns(&["category", "item_number"])`
+or `.with_index_column("category,item_number")`. The list API preserves exact
+column names, including commas and whitespace. The string API first resolves
+an exact column name; otherwise it parses a comma-separated list. Rebuilding
+the same ordered definition fills missing row ranges. Composite, reversed-column, and scalar
+definitions can coexist. Bitmap, multivalue, and FM builds accept one column.
+
 BTree min/max metadata can also avoid index-file reads when every key matches,
 there are no nulls, and the file set's row counts prove complete coverage of
 the same source row-ID range. These all-matching files do not consume the
@@ -1328,6 +1370,10 @@ CALL sys.drop_global_index(
 `multivalue`, `fm`, `lumina` (or `lumina-vector-ann`), and the vindex types
 `ivf-flat`, `ivf-pq`, `ivf-sq`, `ivf-rq`, and `diskann`. It defaults to `btree`, is
 case-insensitive and surrounding whitespace is ignored.
+
+To drop a composite BTree definition, pass the same ordered `index_column`
+list used to build it, such as `'category,item_number'`. Scalar indexes and
+definitions with a different column order remain available.
 
 ### create_lumina_index
 

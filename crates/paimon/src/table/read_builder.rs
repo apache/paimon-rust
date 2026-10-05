@@ -532,12 +532,19 @@ impl<'a> PaimonReadBuilder<'a> {
         let read_type = self.resolve_read_type().unwrap_or(None);
         let scan_predicates =
             super::managed_blob_reader::scan_predicates(self.table, &self.filter.data_predicates);
+        // A payload predicate is evaluated after descriptor resolution. A
+        // scan limit must not count rows which may fail that residual filter.
+        let scan_limit = if scan_predicates.len() == self.filter.data_predicates.len() {
+            self.limit
+        } else {
+            None
+        };
         TableScan::new(
             self.table,
             partition_filter,
             scan_predicates,
             self.filter.bucket_predicate.clone(),
-            self.limit,
+            scan_limit,
             self.effective_row_ranges(),
         )
         .with_projected_read_field_ids(projected_read_field_ids_with_predicates(
@@ -549,11 +556,17 @@ impl<'a> PaimonReadBuilder<'a> {
 
     /// Create a table read for consuming splits (e.g. from a scan plan).
     pub fn new_read(&self) -> Result<TableRead<'a>> {
-        // Fail closed at read construction so bindings that short-circuit before
-        // `to_arrow` (e.g. an empty-splits fast path) can't bypass the guard.
+        // The declared type needs no grant; only query-auth moved to `to_arrow`.
         let core_options = self.table.schema.core_options();
-        core_options.ensure_read_authorized()?;
+        core_options.ensure_type_paimon_served(&self.table.identifier().full_name())?;
         core_options.validate_data_file_path_directory()?;
+        // A handle no catalog loaded holds no grant; refused here too, as bindings
+        // skip `to_arrow` for an empty split list.
+        if core_options.query_auth_enabled() && self.table.query_auth_session().is_none() {
+            return Err(super::query_auth::unsupported(
+                "this table handle was assembled rather than loaded",
+            ));
+        }
         let read_type = match self.resolve_read_type()? {
             None => self.table.schema.fields().to_vec(),
             Some(fields) => fields,
@@ -760,6 +773,19 @@ pub(super) fn is_system_projection_field(field_id: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn test_new_read_refuses_an_assembled_query_auth_handle_but_not_a_loaded_one() {
+        let assembled = crate::table::query_auth_table();
+        let err = assembled.new_read_builder().new_read().unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported { ref message }
+                if message.contains("query-auth.enabled")),
+            "{err:?}"
+        );
+        let loaded = crate::table::rest_query_auth_table().await;
+        assert!(loaded.new_read_builder().new_read().is_ok());
+    }
+
     use super::{PaimonReadBuilder, ReadBuilder, ReadBuilderKind};
     use crate::table::TableRead;
     mod test_utils {
@@ -1003,12 +1029,31 @@ mod tests {
     #[test]
     fn test_read_fails_closed_when_query_auth_enabled() {
         let table = query_auth_table();
-        // `new_read` fails closed, so bindings that short-circuit before `to_arrow` can't bypass.
-        let err = table.new_read_builder().new_read().unwrap_err();
+        // An assembled handle is refused at construction; a loaded one at the read.
+        let err = match table.new_read_builder().new_read() {
+            Err(err) => err,
+            Ok(read) => ungranted_read_error(&read),
+        };
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
-            "building a read for a query-auth.enabled table must fail closed"
+            "reading a query-auth.enabled table without a grant must fail closed"
         );
+    }
+
+    fn ungranted_read_error(read: &crate::table::TableRead<'_>) -> crate::Error {
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path("memory:/t/bucket-0".to_string())
+            .with_total_buckets(1)
+            .with_data_files(Vec::new())
+            .build()
+            .unwrap();
+        match read.to_arrow(&[split]) {
+            Ok(_) => panic!("reading without a grant must fail closed"),
+            Err(err) => err,
+        }
     }
 
     #[test]
@@ -1018,7 +1063,11 @@ mod tests {
             "query-auth.enabled".to_string(),
             "false".to_string(),
         )]));
-        let err = table.new_read_builder().new_read().unwrap_err();
+        // An assembled handle is refused at construction; a loaded one at the read.
+        let err = match table.new_read_builder().new_read() {
+            Err(err) => err,
+            Ok(read) => ungranted_read_error(&read),
+        };
         assert!(
             matches!(err, crate::Error::Unsupported { ref message } if message.contains("query-auth.enabled")),
             "a dynamic override must not disable query-auth"

@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use datafusion::arrow::array::{Array, Int64Array};
 use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::MemTable;
+use datafusion::execution::context::SQLOptions;
 use paimon::catalog::{list_partitions_from_file_system, Identifier};
 use paimon::spec::{
     ArrayType, BinaryType, BlobType, CharType, DataType, FloatType, IntType,
@@ -527,12 +528,22 @@ async fn test_select_branch_table_reads_branch_snapshot() {
 
     let branch_table = table.copy_with_branch("b1").await.unwrap();
     let write_builder = branch_table.new_write_builder();
-    assert!(write_builder.new_write().is_err());
+    // Core branch writes are supported. The SQL layer below still validates
+    // branch-qualified DML targets separately.
+    assert!(write_builder.new_write().is_ok());
+    assert!(write_builder.try_new_commit().is_ok());
     assert!(write_builder
         .new_data_evolution_writer(vec!["name".to_string()])
-        .is_err());
-    assert!(write_builder.new_delete().is_err());
-    assert!(write_builder.try_new_commit().is_err());
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("'data-evolution.enabled' = 'true'"));
+    assert!(write_builder
+        .new_delete()
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("'data-evolution.enabled' = 'true'"));
 
     assert_sql_error_contains(
         &sql_context,
@@ -1521,6 +1532,59 @@ async fn test_ddl_context_delegates_select() {
     // Empty table, but should succeed
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 0, "Empty table should return 0 rows");
+}
+
+#[tokio::test]
+async fn test_sql_with_options_propagates_to_datafusion() {
+    let ctx = SQLContext::new();
+    let options = SQLOptions::new().with_allow_statements(false);
+
+    for sql in [
+        "SET datafusion.execution.batch_size = 1024",
+        "RESET datafusion.execution.batch_size",
+    ] {
+        let error = ctx.sql_with_options(sql, options).await.unwrap_err();
+        assert!(error.to_string().contains("Statement not supported"));
+    }
+}
+
+#[tokio::test]
+async fn test_sql_with_options_propagates_to_copy() {
+    let temp_dir = TempDir::new().unwrap();
+    let destination = temp_dir.path().join("copy.parquet");
+    let ctx = SQLContext::new();
+    let options = SQLOptions::new().with_allow_dml(false);
+    let sql = format!("COPY (VALUES (1)) TO '{}'", destination.display());
+
+    let error = ctx.sql_with_options(&sql, options).await.unwrap_err();
+
+    assert!(
+        error.to_string().contains("DML not supported: COPY"),
+        "unexpected error: {error}"
+    );
+    assert!(!destination.exists());
+}
+
+#[tokio::test]
+async fn test_sql_with_options_propagates_to_explain() {
+    let temp_dir = TempDir::new().unwrap();
+    let ctx = SQLContext::new();
+    let options = SQLOptions::new().with_allow_dml(false);
+
+    for (explain, file_name) in [
+        ("EXPLAIN", "explain-copy.parquet"),
+        ("EXPLAIN ANALYZE", "explain-analyze-copy.parquet"),
+    ] {
+        let destination = temp_dir.path().join(file_name);
+        let sql = format!("{explain} COPY (VALUES (1)) TO '{}'", destination.display());
+        let error = ctx.sql_with_options(&sql, options).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("DML not supported: COPY"),
+            "unexpected error: {error}"
+        );
+        assert!(!destination.exists());
+    }
 }
 
 // ======================= MULTI-CATALOG =======================

@@ -44,6 +44,8 @@ Available storage features:
 | `storage-memory` | In-memory        |
 | `storage-s3`     | Amazon S3        |
 | `storage-oss`    | Alibaba Cloud OSS|
+| `storage-jindo`  | Alibaba Cloud OSS through JindoSDK |
+| `storage-oss-cpp` | Alibaba Cloud OSS through C++ SDK v2 (read-only) |
 | `storage-cos`    | Tencent Cloud COS |
 | `storage-azdls`  | Azure Data Lake Storage Gen2 |
 | `storage-obs`    | Huawei Cloud OBS |
@@ -302,6 +304,23 @@ options.set(CatalogOptions::DLF_TOKEN_PATH, "/path/to/token.json");
 The JSON uses `AccessKeyId`, `AccessKeySecret`, optional `SecurityToken`, and
 optional `Expiration`. Expiring credentials are reloaded before expiration.
 
+With `storage-jindo`, set `fs.oss.impl` to `jindo` to use an installed JindoSDK
+for OSS scan planning. Set `fs.jindo.library.path` unless the library is
+available through `JINDOSDK_HOME` or `JINDOSDK_LIBRARY_PATH`. The Python binding
+also discovers it from an installed `pyjindosdk` package. This initial
+integration supports object stat, reads, and listings, but not writes, deletes,
+or copies. Jindo reads are limited to 8 concurrent requests per OSS operator by
+default. Set `fs.jindo.max.concurrent.reads` to a positive integer to tune this
+limit for the available network and JindoSDK connection capacity. JindoSDK state
+initialized before `fork` cannot be reused in the child; use `spawn` or initialize
+Jindo only after worker processes start.
+
+With `storage-oss-cpp`, set `fs.oss.impl=cpp` and
+`fs.oss.cpp.library.path` to the installed bridge library. This experimental
+backend supports stat, reads and listings, with 8 concurrent requests per
+operator by default. OpenDAL remains the default backend.
+See the [build instructions and options](https://github.com/apache/paimon-rust/tree/main/integrations/oss-cpp).
+
 Supported metastore types:
 
 | Metastore Type | Description                      |
@@ -334,7 +353,7 @@ let catalog = CatalogFactory::create(options).await?;
 | `local-cache.dir` | none | Optional base directory. When set, Paimon uses a persistent disk cache in a private versioned child directory; otherwise it uses memory. |
 | `local-cache.max-size` | unlimited | Maximum cache size. Memory caches count payload bytes; disk caches count encoded bytes. Values accept byte units such as `512 MiB` or `20 GiB`. |
 | `local-cache.block-size` | `1 MiB` | Block size used for cached range reads. |
-| `local-cache.whitelist` | `meta,global-index` | Comma-separated eligible types: `meta`, `global-index`, `bucket-index`, `data`, and `file-index`. |
+| `local-cache.whitelist` | `meta,global-index` | Comma-separated eligible types: `meta`, `global-index`, `bucket-index`, `data`, and `file-index`, or `*` for all of them. |
 
 Each catalog owns its in-memory cache for the catalog's lifetime. Disk caches
 are reused after process restarts. Cache keys include a catalog-configuration
@@ -349,6 +368,12 @@ differ, the smallest `local-cache.max-size` is used. Restart recovery runs on a
 blocking worker, reads only block headers and file metadata, and validates
 payload CRC lazily on the first hit. Use a separate `local-cache.dir` for each
 worker or process because processes do not share exact LRU or size accounting.
+
+### BLOB Index Cache
+
+Decoded `.blob` indexes are cached per catalog. Set
+`cache.blob-index.max-size` to control the budget (default `64 MiB`; `0`
+disables caching). BLOB payloads are not cached.
 
 ### Manage Databases
 

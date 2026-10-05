@@ -33,6 +33,7 @@ use crate::error::to_datafusion_error;
 mod aggregation_fields;
 mod audit_log;
 mod branches;
+mod buckets;
 mod consumers;
 mod files;
 mod manifests;
@@ -55,6 +56,7 @@ const TABLES: &[(&str, Builder)] = &[
     ("aggregation_fields", aggregation_fields::build),
     ("audit_log", audit_log::build),
     ("branches", branches::build),
+    ("buckets", buckets::build),
     ("consumers", consumers::build),
     ("files", files::build),
     ("manifests", manifests::build),
@@ -71,6 +73,7 @@ const SYSTEM_TABLE_NAMES: &[&str] = &[
     "aggregation_fields",
     "audit_log",
     "branches",
+    "buckets",
     "consumers",
     "files",
     "manifests",
@@ -112,6 +115,7 @@ pub(crate) fn is_registered(name: &str) -> bool {
 pub(crate) fn is_system_table_provider(provider: &dyn TableProvider) -> bool {
     provider.is::<aggregation_fields::AggregationFieldsTable>()
         || provider.is::<branches::BranchesTable>()
+        || provider.is::<buckets::BucketsTable>()
         || provider.is::<consumers::ConsumersTable>()
         || provider.is::<files::FilesTable>()
         || provider.is::<manifests::ManifestsTable>()

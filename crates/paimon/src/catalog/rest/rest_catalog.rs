@@ -37,7 +37,7 @@ use crate::catalog::{
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
-use crate::io::FileFormatMetadataCacheContext;
+use crate::io::FileIOCacheContext;
 use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange};
 use crate::table::{RESTEnv, Table};
 use crate::Result;
@@ -61,7 +61,7 @@ pub struct RESTCatalog {
     data_token_enabled: bool,
     /// Catalog-scoped cache shared by all table FileIO instances.
     local_cache: Option<Arc<LocalCache>>,
-    file_format_metadata_cache: Arc<FileFormatMetadataCacheContext>,
+    file_io_cache: FileIOCacheContext,
 }
 
 impl RESTCatalog {
@@ -90,8 +90,7 @@ impl RESTCatalog {
 
         let api_options = api.options().clone();
         let local_cache = create_local_cache_with_namespace(&options, &api_options)?;
-        let file_format_metadata_cache =
-            FileFormatMetadataCacheContext::from_props(api_options.to_map())?;
+        let file_io_cache = FileIOCacheContext::from_props(api_options.to_map())?;
 
         Ok(Self {
             api,
@@ -99,7 +98,7 @@ impl RESTCatalog {
             warehouse,
             data_token_enabled,
             local_cache,
-            file_format_metadata_cache,
+            file_io_cache,
         })
     }
 
@@ -285,7 +284,7 @@ impl Catalog for RESTCatalog {
             self.options.clone(),
             self.data_token_enabled,
             self.local_cache.clone(),
-            self.file_format_metadata_cache.clone(),
+            self.file_io_cache.clone(),
         )
         .await
     }
@@ -303,7 +302,7 @@ impl Catalog for RESTCatalog {
                     self.options.clone(),
                     self.data_token_enabled,
                     self.local_cache.clone(),
-                    self.file_format_metadata_cache.clone(),
+                    self.file_io_cache.clone(),
                 )
                 .await
                 .map(crate::catalog::LoadedTable::Object);
@@ -324,7 +323,7 @@ impl Catalog for RESTCatalog {
             self.options.clone(),
             self.data_token_enabled,
             self.local_cache.clone(),
-            self.file_format_metadata_cache.clone(),
+            self.file_io_cache.clone(),
         )
         .await
         .map(|table| crate::catalog::LoadedTable::Paimon(Box::new(table)))
@@ -399,6 +398,12 @@ impl Catalog for RESTCatalog {
             .await
             .map_err(|e| map_rest_error_for_table(e, identifier));
         ignore_error_if(result, |e| {
+            // `ignore_if_not_exists` is the `ALTER TABLE IF EXISTS` *table* flag,
+            // matching `FileSystemCatalog` and the `Catalog::alter_table`
+            // contract: it swallows only a missing table. A `ColumnNotExist` from
+            // an existing table is a real schema failure (e.g. DROP of an absent
+            // column, or a batch the server rejected atomically) and must surface,
+            // or a caller would believe a column change persisted when it did not.
             ignore_if_not_exists && matches!(e, Error::TableNotExist { .. })
         })
     }
@@ -410,9 +415,21 @@ impl Catalog for RESTCatalog {
         snapshot_id: Option<i64>,
         ignore_if_exists: bool,
     ) -> Result<()> {
+        self.create_tag_with_retention(identifier, tag_name, snapshot_id, None, ignore_if_exists)
+            .await
+    }
+
+    async fn create_tag_with_retention(
+        &self,
+        identifier: &Identifier,
+        tag_name: &str,
+        snapshot_id: Option<i64>,
+        time_retained: Option<&str>,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
         let result = self
             .api
-            .create_tag(identifier, tag_name, snapshot_id)
+            .create_tag_with_retention(identifier, tag_name, snapshot_id, time_retained)
             .await
             .map_err(|error| map_rest_error_for_tag(error, identifier, tag_name, snapshot_id));
         ignore_error_if(result, |error| {
@@ -720,8 +737,45 @@ fn map_rest_error_for_database(err: Error, database_name: &str) -> Error {
 /// Converts `RestError::NoSuchResource` -> `Error::TableNotExist`,
 /// `RestError::AlreadyExists` -> `Error::TableAlreadyExist`,
 /// and passes through other errors via `Error::RestApi`.
+///
+/// Errors carrying a `column` resource type are restored to
+/// `Error::ColumnNotExist` / `Error::ColumnAlreadyExist` so that a missing or
+/// duplicate column is not reported as a table-level error (matching the
+/// filesystem catalog).
 fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
     match err {
+        Error::RestApi {
+            source:
+                RestError::NoSuchResource {
+                    resource_type,
+                    resource_name,
+                    ..
+                },
+        } if resource_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("column")) =>
+        {
+            Error::ColumnNotExist {
+                full_name: identifier.full_name(),
+                column: resource_name.unwrap_or_default(),
+            }
+        }
+        Error::RestApi {
+            source:
+                RestError::AlreadyExists {
+                    resource_type,
+                    resource_name,
+                    ..
+                },
+        } if resource_type
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("column")) =>
+        {
+            Error::ColumnAlreadyExist {
+                full_name: identifier.full_name(),
+                column: resource_name.unwrap_or_default(),
+            }
+        }
         Error::RestApi {
             source: RestError::NoSuchResource { .. },
         } => Error::TableNotExist {
@@ -1015,6 +1069,55 @@ mod tests {
         ));
         assert!(matches!(
             map_rest_error_for_tag(error("table"), &identifier, "release", None),
+            Error::TableNotExist { .. }
+        ));
+    }
+
+    #[test]
+    fn test_column_error_mapping() {
+        let identifier = Identifier::new("db", "table");
+
+        let not_exist = Error::RestApi {
+            source: RestError::NoSuchResource {
+                resource_type: Some("column".to_string()),
+                resource_name: Some("age".to_string()),
+                message: "missing".to_string(),
+            },
+        };
+        match map_rest_error_for_table(not_exist, &identifier) {
+            Error::ColumnNotExist { full_name, column } => {
+                assert_eq!(full_name, "db.table");
+                assert_eq!(column, "age");
+            }
+            other => panic!("expected ColumnNotExist, got {other:?}"),
+        }
+
+        let already_exist = Error::RestApi {
+            source: RestError::AlreadyExists {
+                resource_type: Some("COLUMN".to_string()),
+                resource_name: Some("age".to_string()),
+                message: "exists".to_string(),
+            },
+        };
+        match map_rest_error_for_table(already_exist, &identifier) {
+            Error::ColumnAlreadyExist { full_name, column } => {
+                assert_eq!(full_name, "db.table");
+                assert_eq!(column, "age");
+            }
+            other => panic!("expected ColumnAlreadyExist, got {other:?}"),
+        }
+
+        // A table-level 404 (no `column` resource type) must still map to
+        // `TableNotExist`, not a column error.
+        let table_missing = Error::RestApi {
+            source: RestError::NoSuchResource {
+                resource_type: None,
+                resource_name: None,
+                message: "missing".to_string(),
+            },
+        };
+        assert!(matches!(
+            map_rest_error_for_table(table_missing, &identifier),
             Error::TableNotExist { .. }
         ));
     }

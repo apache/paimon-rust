@@ -85,6 +85,8 @@ const DEFAULT_METADATA_STATS_KEEP_FIRST_N_COLUMNS: i32 = -1;
 const FIELDS_PREFIX: &str = "fields";
 const STATS_MODE_SUFFIX: &str = "stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
+const ROW_TRACKING_PARTITION_GROUP_ON_COMMIT_OPTION: &str =
+    "row-tracking.partition-group-on-commit";
 const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
 
@@ -156,7 +158,9 @@ const DEFAULT_PARQUET_ROW_GROUP_MAX_INFLIGHT_BYTES: i64 = 256 * 1024 * 1024;
 const DEFAULT_MOSAIC_READ_PREFETCH_ROW_GROUPS: usize = 8;
 const DEFAULT_MOSAIC_READ_PREFETCH_MAX_BYTES: i64 = 64 * 1024 * 1024;
 const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-num";
-const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
+const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 2_000_000;
+pub(crate) const MAX_DYNAMIC_BUCKETS: i32 = 32768;
+const DYNAMIC_BUCKET_MAX_BUCKETS_OPTION: &str = "dynamic-bucket.max-buckets";
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const DEFAULT_GLOBAL_INDEX_THREAD_NUM: i64 = 32;
 pub(crate) const DEFAULT_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM: usize = 64;
@@ -216,6 +220,9 @@ pub enum ChangelogProducer {
 pub enum GlobalIndexColumnUpdateAction {
     ThrowError,
     DropPartitionIndex,
+    /// Preserve existing indexes. As in Java, the caller must refresh affected
+    /// index ranges separately before relying on their updated values.
+    Ignore,
 }
 
 /// Search mode for global index queries.
@@ -1128,6 +1135,7 @@ impl<'a> CoreOptions<'a> {
         {
             "THROW_ERROR" => Ok(GlobalIndexColumnUpdateAction::ThrowError),
             "DROP_PARTITION_INDEX" => Ok(GlobalIndexColumnUpdateAction::DropPartitionIndex),
+            "IGNORE" => Ok(GlobalIndexColumnUpdateAction::Ignore),
             other => Err(crate::Error::ConfigInvalid {
                 message: format!("Unsupported global-index.column-update-action: {other}"),
             }),
@@ -1193,7 +1201,7 @@ impl<'a> CoreOptions<'a> {
             .and_then(|v| v.parse().ok())
     }
 
-    fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
+    pub(crate) fn configured_time_travel_selectors(&self) -> Vec<&'static str> {
         let mut selectors = Vec::with_capacity(6);
         if self.options.contains_key(SCAN_TIMESTAMP_MILLIS_OPTION) {
             selectors.push(SCAN_TIMESTAMP_MILLIS_OPTION);
@@ -1351,6 +1359,15 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    /// Group new file metadata by partition before assigning row IDs. Defaults
+    /// to true, matching Java, so each partition receives contiguous row IDs.
+    pub fn row_tracking_partition_group_on_commit(&self) -> bool {
+        self.options
+            .get(ROW_TRACKING_PARTITION_GROUP_ON_COMMIT_OPTION)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(true)
+    }
+
     /// Whether incremental clustering is enabled. Default is false.
     pub fn clustering_incremental_enabled(&self) -> bool {
         self.options
@@ -1415,6 +1432,18 @@ impl<'a> CoreOptions<'a> {
     /// Java leaves `target-file-size` without a default and documents 128 MB for
     /// primary-key tables and 256 MB for append tables; this returns the append
     /// value for both.
+    /// Java's exact default for postpone partitions without an existing layout.
+    /// Unlike inferred counts this is not capped or rounded to a power of two.
+    pub fn postpone_default_bucket_num(&self) -> crate::Result<Option<i32>> {
+        self.options.get("postpone.default-bucket-num").map(|raw| {
+            raw.parse::<i32>().ok().filter(|count| *count > 0).ok_or_else(|| {
+                crate::Error::ConfigInvalid {
+                    message: format!("postpone.default-bucket-num must be a positive 32-bit integer, got '{raw}'"),
+                }
+            })
+        }).transpose()
+    }
+
     pub fn target_file_size(&self) -> i64 {
         self.options
             .get("target-file-size")
@@ -1714,12 +1743,26 @@ impl<'a> CoreOptions<'a> {
 
     /// Target row number per bucket for dynamic bucket mode (bucket=-1).
     /// When a bucket reaches this number, a new bucket is created.
-    /// Default is 200,000. Java Paimon defaults this to 2,000,000.
+    /// Default is 2,000,000, matching Java Paimon.
     pub fn dynamic_bucket_target_row_num(&self) -> i64 {
         self.options
             .get(DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION)
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM)
+    }
+
+    /// Maximum number of dynamic buckets in each partition. `-1` grows up to
+    /// Java's signed-short bucket id limit; an explicit limit reuses full buckets.
+    pub fn dynamic_bucket_max_buckets(&self) -> crate::Result<i32> {
+        let value = self
+            .parse_i64_option(DYNAMIC_BUCKET_MAX_BUCKETS_OPTION)?
+            .unwrap_or(-1);
+        if value != -1 && !(1..=i64::from(MAX_DYNAMIC_BUCKETS)).contains(&value) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("'{DYNAMIC_BUCKET_MAX_BUCKETS_OPTION}' must be -1 or between 1 and {MAX_DYNAMIC_BUCKETS}, but was {value}"),
+            });
+        }
+        Ok(value as i32)
     }
 
     /// When true, blob field reads return serialized BlobDescriptor bytes

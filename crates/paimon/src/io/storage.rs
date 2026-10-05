@@ -39,6 +39,10 @@ use std::sync::MutexGuard;
 
 #[cfg(feature = "storage-azdls")]
 use super::AzdlsStorageConfig;
+#[cfg(feature = "storage-jindo")]
+use super::JindoStorageConfig;
+#[cfg(feature = "storage-oss-cpp")]
+use super::OssCppStorageConfig;
 #[cfg(feature = "storage-oss")]
 use super::OssStorageConfig;
 use opendal::Operator;
@@ -68,6 +72,11 @@ use super::FileIOBuilder;
 /// The storage carries all supported storage services in paimon
 #[derive(Debug)]
 pub enum Storage {
+    #[cfg(feature = "storage-oss-cpp")]
+    OssCpp {
+        config: Box<OssCppStorageConfig>,
+        operators: Mutex<HashMap<String, Operator>>,
+    },
     /// A caller-provided opendal operator, explicitly scoped to filesystem semantics
     /// (see `FileIOBuilder::with_fs_operator`).
     CustomFs { op: Operator },
@@ -80,29 +89,39 @@ pub enum Storage {
         config: Box<OssStorageConfig>,
         operators: Mutex<HashMap<String, Operator>>,
     },
+    #[cfg(feature = "storage-jindo")]
+    Jindo {
+        config: Box<JindoStorageConfig>,
+        operators: Mutex<HashMap<String, Operator>>,
+    },
     #[cfg(feature = "storage-s3")]
     S3 {
         config: Box<S3Config>,
+        user_agent: String,
         operators: Mutex<HashMap<String, Operator>>,
     },
     #[cfg(feature = "storage-cos")]
     Cos {
         config: Box<CosConfig>,
+        user_agent: String,
         operators: Mutex<HashMap<String, Operator>>,
     },
     #[cfg(feature = "storage-azdls")]
     Azdls {
         config: Box<AzdlsStorageConfig>,
+        user_agent: String,
         operators: Mutex<HashMap<String, Operator>>,
     },
     #[cfg(feature = "storage-obs")]
     Obs {
         config: Box<ObsConfig>,
+        user_agent: String,
         operators: Mutex<HashMap<String, Operator>>,
     },
     #[cfg(feature = "storage-gcs")]
     Gcs {
         config: Box<GcsConfig>,
+        user_agent: String,
         operators: Mutex<HashMap<String, Operator>>,
     },
     #[cfg(feature = "storage-hdfs")]
@@ -130,6 +149,37 @@ impl Storage {
             }),
             #[cfg(feature = "storage-oss")]
             "oss" => {
+                if props
+                    .get("fs.oss.impl")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("cpp"))
+                {
+                    #[cfg(feature = "storage-oss-cpp")]
+                    return Ok(Self::OssCpp {
+                        config: Box::new(super::oss_cpp_config_parse(props)?),
+                        operators: Mutex::new(HashMap::new()),
+                    });
+                    #[cfg(not(feature = "storage-oss-cpp"))]
+                    return Err(error::Error::IoUnsupported {
+                        message: "OSS C++ SDK requires the storage-oss-cpp feature".to_string(),
+                    });
+                }
+                #[cfg(feature = "storage-jindo")]
+                if super::use_jindo(&props)? {
+                    let config = super::jindo_config_parse(props)?;
+                    return Ok(Self::Jindo {
+                        config: Box::new(config),
+                        operators: Mutex::new(HashMap::new()),
+                    });
+                }
+                #[cfg(not(feature = "storage-jindo"))]
+                if props
+                    .get("fs.oss.impl")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("jindo"))
+                {
+                    return Err(error::Error::IoUnsupported {
+                        message: "Jindo requires the storage-jindo feature".to_string(),
+                    });
+                }
                 let config = super::oss_config_parse(props)?;
                 Ok(Self::Oss {
                     config: Box::new(config),
@@ -138,41 +188,51 @@ impl Storage {
             }
             #[cfg(feature = "storage-s3")]
             "s3" | "s3a" => {
+                let user_agent = super::user_agent::storage_user_agent(&props);
                 let config = super::s3_config_parse(props)?;
                 Ok(Self::S3 {
                     config: Box::new(config),
+                    user_agent,
                     operators: Mutex::new(HashMap::new()),
                 })
             }
             #[cfg(feature = "storage-cos")]
             "cos" | "cosn" => {
+                let user_agent = super::user_agent::storage_user_agent(&props);
                 let config = super::cos_config_parse(props)?;
                 Ok(Self::Cos {
                     config: Box::new(config),
+                    user_agent,
                     operators: Mutex::new(HashMap::new()),
                 })
             }
             #[cfg(feature = "storage-azdls")]
             "abfs" | "abfss" | "az" | "azdfs" | "azdls" | "azure" => {
+                let user_agent = super::user_agent::storage_user_agent(&props);
                 let config = super::azdls_config_parse(props)?;
                 Ok(Self::Azdls {
                     config: Box::new(config),
+                    user_agent,
                     operators: Mutex::new(HashMap::new()),
                 })
             }
             #[cfg(feature = "storage-obs")]
             "obs" => {
+                let user_agent = super::user_agent::storage_user_agent(&props);
                 let config = super::obs_config_parse(props)?;
                 Ok(Self::Obs {
                     config: Box::new(config),
+                    user_agent,
                     operators: Mutex::new(HashMap::new()),
                 })
             }
             #[cfg(feature = "storage-gcs")]
             "gcs" | "gs" => {
+                let user_agent = super::user_agent::storage_user_agent(&props);
                 let config = super::gcs_config_parse(props)?;
                 Ok(Self::Gcs {
                     config: Box::new(config),
+                    user_agent,
                     operators: Mutex::new(HashMap::new()),
                 })
             }
@@ -221,46 +281,84 @@ impl Storage {
                 let op = Self::cached_oss_operator(config, operators, path, &bucket)?;
                 Ok((op, Cow::Borrowed(relative_path)))
             }
+            #[cfg(feature = "storage-oss-cpp")]
+            Storage::OssCpp { config, operators } => {
+                let (bucket, relative_path) =
+                    Self::bucket_and_relative_path(path, "OSS C++", &["oss"])?;
+                let op = Self::cached_operator(operators, "OSS C++", &bucket, || {
+                    super::oss_cpp_config_build(config, &bucket)
+                })?;
+                Ok((op, Cow::Borrowed(relative_path)))
+            }
+            #[cfg(feature = "storage-jindo")]
+            Storage::Jindo { config, operators } => {
+                let (bucket, relative_path) =
+                    Self::bucket_and_relative_path(path, "Jindo OSS", &["oss"])?;
+                let op = Self::cached_operator(operators, "Jindo OSS", &bucket, || {
+                    super::jindo_config_build(config, &bucket)
+                })?;
+                Ok((op, Cow::Borrowed(relative_path)))
+            }
             #[cfg(feature = "storage-s3")]
-            Storage::S3 { config, operators } => {
+            Storage::S3 {
+                config,
+                user_agent,
+                operators,
+            } => {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "S3", &["s3", "s3a"])?;
-                let op = Self::cached_s3_operator(config, operators, path, &bucket)?;
+                let op = Self::cached_s3_operator(config, user_agent, operators, path, &bucket)?;
                 Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-cos")]
-            Storage::Cos { config, operators } => {
+            Storage::Cos {
+                config,
+                user_agent,
+                operators,
+            } => {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "COS", &["cos", "cosn"])?;
                 let op = Self::cached_operator(operators, "COS", &bucket, || {
-                    super::cos_config_build(config, path)
+                    super::cos_config_build(config, path, user_agent)
                 })?;
                 Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-azdls")]
-            Storage::Azdls { config, operators } => {
+            Storage::Azdls {
+                config,
+                user_agent,
+                operators,
+            } => {
                 let relative_path = super::azdls_relative_path(path)?;
                 let cache_key = super::azdls_operator_cache_key(config, path)?;
                 let op = Self::cached_operator(operators, "Azure", &cache_key, || {
-                    super::azdls_config_build(config, path)
+                    super::azdls_config_build(config, path, user_agent)
                 })?;
                 Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-obs")]
-            Storage::Obs { config, operators } => {
+            Storage::Obs {
+                config,
+                user_agent,
+                operators,
+            } => {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "OBS", &["obs"])?;
                 let op = Self::cached_operator(operators, "OBS", &bucket, || {
-                    super::obs_config_build(config, path)
+                    super::obs_config_build(config, path, user_agent)
                 })?;
                 Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-gcs")]
-            Storage::Gcs { config, operators } => {
+            Storage::Gcs {
+                config,
+                user_agent,
+                operators,
+            } => {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "GCS", &["gcs", "gs"])?;
                 let op = Self::cached_operator(operators, "GCS", &bucket, || {
-                    super::gcs_config_build(config, path)
+                    super::gcs_config_build(config, path, user_agent)
                 })?;
                 Ok((op, Cow::Borrowed(relative_path)))
             }
@@ -333,6 +431,7 @@ impl Storage {
     #[cfg(any(
         feature = "storage-cos",
         feature = "storage-gcs",
+        feature = "storage-jindo",
         feature = "storage-obs",
         feature = "storage-oss",
         feature = "storage-s3"
@@ -372,6 +471,7 @@ impl Storage {
         feature = "storage-azdls",
         feature = "storage-cos",
         feature = "storage-gcs",
+        feature = "storage-jindo",
         feature = "storage-oss",
         feature = "storage-obs",
         feature = "storage-s3"
@@ -425,12 +525,13 @@ impl Storage {
     #[cfg(feature = "storage-s3")]
     fn cached_s3_operator(
         config: &S3Config,
+        user_agent: &str,
         operators: &Mutex<HashMap<String, Operator>>,
         path: &str,
         bucket: &str,
     ) -> crate::Result<Operator> {
         Self::cached_operator(operators, "S3", bucket, || {
-            super::s3_config_build(config, path)
+            super::s3_config_build(config, path, user_agent)
         })
     }
 }
@@ -474,12 +575,42 @@ mod scheme_tests {
         }
     }
 
+    #[cfg(feature = "storage-jindo")]
+    #[test]
+    fn jindo_oss_implementation_is_selected() {
+        let storage =
+            Storage::build(FileIOBuilder::new("oss").with_prop("fs.oss.impl", "jindo")).unwrap();
+        assert!(matches!(storage, Storage::Jindo { .. }));
+    }
+
     #[cfg(feature = "storage-s3")]
     #[test]
     fn s3_scheme_aliases_are_compatible() {
         for scheme in ["s3", "S3", "s3a", "S3A"] {
             assert!(matches!(build(scheme), Storage::S3 { .. }), "{scheme}");
         }
+    }
+
+    #[cfg(feature = "storage-s3")]
+    #[test]
+    fn s3_storage_uses_generic_user_agent_keys() {
+        let storage = Storage::build(FileIOBuilder::new("s3").with_props([
+            ("user-agent.features", "Flink"),
+            ("user-agent.extended", "vvr"),
+            ("dlf.access-tracking.extended-info", "uid/123"),
+        ]))
+        .unwrap();
+        let Storage::S3 { user_agent, .. } = storage else {
+            panic!("expected S3 storage");
+        };
+        assert_eq!(
+            user_agent,
+            format!(
+                "paimon-rust/{}(opendal/{};Flink) vvr uid/123",
+                env!("CARGO_PKG_VERSION"),
+                opendal::raw::VERSION
+            )
+        );
     }
 
     #[cfg(feature = "storage-cos")]
@@ -591,6 +722,16 @@ mod fs_relative_path_tests {
 #[cfg(all(test, feature = "storage-memory"))]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "storage-oss", not(feature = "storage-oss-cpp")))]
+    #[test]
+    fn oss_cpp_without_feature_does_not_fall_back() {
+        let result = Storage::build(FileIOBuilder::new("oss").with_props(HashMap::from([(
+            "fs.oss.impl".to_string(),
+            "cpp".to_string(),
+        )])));
+        assert!(matches!(result, Err(error::Error::IoUnsupported { .. })));
+    }
 
     fn memory_operator() -> Operator {
         Operator::from_config(opendal::services::MemoryConfig::default()).unwrap()

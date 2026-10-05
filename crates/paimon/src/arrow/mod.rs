@@ -31,10 +31,10 @@ pub use row_filter::{RowFilter, RowFilterContext, RowFilterFactory};
 pub use variant::variant_get_numeric_fields;
 
 use crate::spec::{
-    ArrayType, BigIntType, BooleanType, DataField, DataType as PaimonDataType, DateType,
-    DecimalType, DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType, RowType,
-    SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType, VariantType,
-    VectorType,
+    ArrayType, BigIntType, BinaryType, BooleanType, DataField, DataType as PaimonDataType,
+    DateType, DecimalType, DoubleType, FloatType, IntType, LocalZonedTimestampType, MapType,
+    RowType, SmallIntType, TimeType, TimestampType, TinyIntType, VarBinaryType, VarCharType,
+    VariantType, VectorType,
 };
 use arrow_schema::DataType as ArrowDataType;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, TimeUnit};
@@ -267,6 +267,23 @@ pub fn arrow_to_paimon_type(
                 nullable, length, element,
             )?))
         }
+        ArrowDataType::FixedSizeBinary(size) => {
+            // Fixed-length binary maps to Paimon `BINARY(n)`. The size is an
+            // i32; reject non-positive lengths with a clear error rather than
+            // casting a negative into a huge usize.
+            let length = usize::try_from(*size).map_err(|_| crate::Error::DataTypeInvalid {
+                message: format!("Invalid FixedSizeBinary length: {size}"),
+            })?;
+            Ok(PaimonDataType::Binary(BinaryType::with_nullable(
+                nullable, length,
+            )?))
+        }
+        // A dictionary-encoded column has the logical type of its values; the
+        // key (index) type is a physical encoding detail. DataFusion routinely
+        // produces `Dictionary(Int32, Utf8)` for low-cardinality strings, so
+        // resolving to the value type lets schema inference (e.g. CREATE VIEW)
+        // succeed instead of failing as unsupported.
+        ArrowDataType::Dictionary(_, value_type) => arrow_to_paimon_type(value_type, nullable),
         _ => Err(crate::Error::Unsupported {
             message: format!("Unsupported Arrow type for Paimon conversion: {arrow_type:?}"),
         }),
@@ -435,6 +452,59 @@ mod tests {
         ] {
             assert_arrow_to_paimon(arrow, true, &varbinary);
         }
+    }
+
+    #[test]
+    fn test_dictionary_resolves_to_value_type() {
+        // A dictionary-encoded column carries the logical type of its values;
+        // the key/index type is ignored. This is the common DataFusion case
+        // (`arrow_cast(x, 'Dictionary(Int32, Utf8)')`).
+        let varchar = PaimonDataType::VarChar(
+            VarCharType::with_nullable(true, VarCharType::MAX_LENGTH).unwrap(),
+        );
+        assert_arrow_to_paimon(
+            &ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::Int32),
+                Box::new(ArrowDataType::Utf8),
+            ),
+            true,
+            &varchar,
+        );
+
+        // The value type drives the result regardless of the key type.
+        assert_arrow_to_paimon(
+            &ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::Int8),
+                Box::new(ArrowDataType::Int64),
+            ),
+            true,
+            &PaimonDataType::BigInt(BigIntType::with_nullable(true)),
+        );
+
+        // Nullability is carried onto the resolved value type.
+        let non_null_varchar = PaimonDataType::VarChar(
+            VarCharType::with_nullable(false, VarCharType::MAX_LENGTH).unwrap(),
+        );
+        assert_arrow_to_paimon(
+            &ArrowDataType::Dictionary(
+                Box::new(ArrowDataType::Int32),
+                Box::new(ArrowDataType::Utf8),
+            ),
+            false,
+            &non_null_varchar,
+        );
+    }
+
+    #[test]
+    fn test_fixed_size_binary_maps_to_binary() {
+        assert_arrow_to_paimon(
+            &ArrowDataType::FixedSizeBinary(16),
+            true,
+            &PaimonDataType::Binary(BinaryType::with_nullable(true, 16).unwrap()),
+        );
+
+        // A zero (or negative) length is rejected rather than silently wrapping.
+        assert!(arrow_to_paimon_type(&ArrowDataType::FixedSizeBinary(0), true).is_err());
     }
 
     #[test]

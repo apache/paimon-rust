@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::spec::batch_to_serialized_bytes;
-use crate::table::Table;
+use crate::table::{Table, TableScan};
 use crate::Result;
 use arrow_array::{Array, Int32Array, RecordBatch};
 use std::collections::HashMap;
@@ -34,6 +34,7 @@ pub(crate) fn data_invalid(message: impl Into<String>) -> crate::Error {
 #[derive(Debug, Clone, Default)]
 pub struct PostponeBucketPlan {
     bucket_counts: Arc<HashMap<Vec<u8>, i32>>,
+    default_bucket_num: Option<i32>,
 }
 
 impl PostponeBucketPlan {
@@ -113,10 +114,57 @@ impl PostponeBucketPlan {
         }
         Ok(Self {
             bucket_counts: Arc::new(bucket_counts),
+            default_bucket_num: None,
         })
     }
 
+    pub(crate) fn with_default_bucket_num(default_bucket_num: i32) -> Self {
+        Self {
+            default_bucket_num: Some(default_bucket_num),
+            ..Self::default()
+        }
+    }
+
+    /// Read the same baseline used for sequence numbers and commit conflict checks.
+    /// Pending (-2) files have no real layout and never override the configured default.
+    pub(crate) async fn load_existing_buckets(
+        &mut self,
+        table: &Table,
+        snapshot_id: i64,
+    ) -> Result<()> {
+        if snapshot_id == 0 {
+            return Ok(());
+        }
+        let snapshot = table.snapshot_manager().get_snapshot(snapshot_id).await?;
+        let entries = TableScan::new(table, None, vec![], None, None, None)
+            .with_scan_all_files()
+            .plan_manifest_entries(&snapshot)
+            .await?;
+        let mut counts = HashMap::new();
+        for entry in entries {
+            if entry.bucket() < 0 {
+                continue;
+            }
+            let count = entry.total_buckets();
+            if count <= 0 || entry.bucket() >= count {
+                return Err(data_invalid(
+                    "Invalid total bucket count in existing postpone files",
+                ));
+            }
+            if let Some(previous) = counts.insert(entry.partition().to_vec(), count) {
+                if previous != count {
+                    return Err(data_invalid("Existing postpone files contain conflicting total bucket counts for one partition"));
+                }
+            }
+        }
+        self.bucket_counts = Arc::new(counts);
+        Ok(())
+    }
+
     pub(crate) fn total_buckets(&self, partition: &[u8]) -> Option<i32> {
-        self.bucket_counts.get(partition).copied()
+        self.bucket_counts
+            .get(partition)
+            .copied()
+            .or(self.default_bucket_num)
     }
 }

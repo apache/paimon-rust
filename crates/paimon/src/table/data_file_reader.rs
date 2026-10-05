@@ -108,16 +108,16 @@ impl FileRead for TimedFileRead {
         result
     }
 
-    fn cache_namespace(&self) -> Option<usize> {
-        self.inner.cache_namespace()
-    }
-
     fn cache_key(&self) -> Option<&str> {
         self.inner.cache_key()
     }
 
     fn file_format_metadata_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
         self.inner.file_format_metadata_cache()
+    }
+
+    fn blob_index_cache(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        self.inner.blob_index_cache()
     }
 }
 
@@ -1524,15 +1524,18 @@ mod row_tests {
         )]));
         let physical_type = variant_shredding_type(&configured).unwrap();
         let data_field = field(1, "v", physical_type);
-        let extraction_type = DataType::Row(variant_extraction_row(
-            true,
-            vec![(
-                DataType::Int(IntType::new()),
-                "$.age".to_string(),
+        let extraction_type = DataType::Row(
+            variant_extraction_row(
                 true,
-                "UTC".to_string(),
-            )],
-        ));
+                vec![(
+                    DataType::Int(IntType::new()),
+                    "$.age".to_string(),
+                    true,
+                    "UTC".to_string(),
+                )],
+            )
+            .unwrap(),
+        );
         let expected_field = field(1, "v", extraction_type.clone());
 
         let read_fields = read_data_fields(&[data_field], &[expected_field], false).unwrap();
@@ -2083,18 +2086,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_file_read_preserves_cache_namespace() {
+    async fn timed_file_read_preserves_cache_context() {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let input = file_io.new_input("memory:/timed-file").unwrap();
         let reader = input.reader().await.unwrap();
-        let cache_namespace = reader.cache_namespace();
+        let blob_index_cache = file_io.blob_index_cache();
         let timed = TimedFileRead {
             inner: Box::new(reader),
             timing: Arc::new(DataFileReadTiming::default()),
         };
 
-        assert!(cache_namespace.is_some());
-        assert_eq!(timed.cache_namespace(), cache_namespace);
+        assert!(std::ptr::eq(
+            timed
+                .blob_index_cache()
+                .unwrap()
+                .downcast_ref::<crate::io::BlobIndexCacheContext>()
+                .unwrap(),
+            blob_index_cache.as_ref()
+        ));
     }
 
     #[test]
