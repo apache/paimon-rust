@@ -29,7 +29,10 @@ fn complete_options_with(
     mut options: HashMap<String, String>,
     discover: impl FnOnce() -> Option<PathBuf>,
 ) -> HashMap<String, String> {
-    if options.get("fs.oss.impl").is_some_and(|v| v == "cpp") && !options.contains_key(LIBRARY_PATH)
+    if options
+        .get("fs.oss.impl")
+        .is_some_and(|v| v.eq_ignore_ascii_case("cpp"))
+        && !options.contains_key(LIBRARY_PATH)
     {
         if let Some(path) = discover() {
             if let Some(path) = path.to_str() {
@@ -71,11 +74,14 @@ mod tests {
 
     #[test]
     fn fills_only_missing_cpp_path() {
-        let options = HashMap::from([("fs.oss.impl".into(), "cpp".into())]);
-        let result = complete_options_with(options.clone(), || Some("/package/bridge.so".into()));
-        assert_eq!(result[LIBRARY_PATH], "/package/bridge.so");
-        assert_eq!(result["fs.oss.impl"], "cpp");
-        assert_eq!(complete_options_with(options.clone(), || None), options);
+        for backend in ["cpp", "CPP", "Cpp", "cPp"] {
+            let options = HashMap::from([("fs.oss.impl".into(), backend.into())]);
+            let result =
+                complete_options_with(options.clone(), || Some("/package/bridge.so".into()));
+            assert_eq!(result[LIBRARY_PATH], "/package/bridge.so");
+            assert_eq!(result["fs.oss.impl"], backend);
+            assert_eq!(complete_options_with(options.clone(), || None), options);
+        }
     }
 
     #[test]
@@ -94,7 +100,7 @@ mod tests {
 
     #[test]
     fn other_backends_do_not_discover() {
-        for backend in [None, Some("jindo"), Some("legacy"), Some("CPP")] {
+        for backend in [None, Some("jindo"), Some("legacy"), Some(" cpp ")] {
             let options = backend
                 .map(|v| HashMap::from([("fs.oss.impl".into(), v.into())]))
                 .unwrap_or_default();
