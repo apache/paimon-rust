@@ -15,8 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(any(
+    feature = "storage-azdls",
+    feature = "storage-cos",
+    feature = "storage-gcs",
+    feature = "storage-oss",
+    feature = "storage-obs",
+    feature = "storage-s3"
+))]
+use std::borrow::Borrow;
 use std::borrow::Cow;
 use std::collections::HashMap;
+#[cfg(any(
+    feature = "storage-azdls",
+    feature = "storage-cos",
+    feature = "storage-gcs",
+    feature = "storage-oss",
+    feature = "storage-obs",
+    feature = "storage-s3"
+))]
+use std::hash::Hash;
 #[cfg(any(
     feature = "storage-azdls",
     feature = "storage-cos",
@@ -42,7 +60,7 @@ use super::AzdlsStorageConfig;
 #[cfg(feature = "storage-jindo")]
 use super::JindoStorageConfig;
 #[cfg(feature = "storage-oss")]
-use super::OssStorageConfig;
+use super::{OssRoute, OssStorageConfig};
 use opendal::Operator;
 #[cfg(feature = "storage-cos")]
 use opendal_service_cos::CosConfig;
@@ -65,6 +83,7 @@ use url::Url;
 
 use crate::error;
 
+use super::cache_routing::RoutedOperator;
 use super::FileIOBuilder;
 
 /// The storage carries all supported storage services in paimon
@@ -80,7 +99,7 @@ pub enum Storage {
     #[cfg(feature = "storage-oss")]
     Oss {
         config: Box<OssStorageConfig>,
-        operators: Mutex<HashMap<String, Operator>>,
+        operators: Mutex<HashMap<(String, OssRoute), Operator>>,
     },
     #[cfg(feature = "storage-jindo")]
     Jindo {
@@ -257,7 +276,8 @@ impl Storage {
             Storage::Oss { config, operators } => {
                 let (bucket, relative_path) =
                     Self::bucket_and_relative_path(path, "OSS", &["oss"])?;
-                let op = Self::cached_oss_operator(config, operators, path, &bucket)?;
+                let op =
+                    Self::cached_oss_operator(config, operators, path, bucket, OssRoute::Origin)?;
                 Ok((op, Cow::Borrowed(relative_path)))
             }
             #[cfg(feature = "storage-jindo")]
@@ -354,6 +374,31 @@ impl Storage {
         }
     }
 
+    /// Like [`Self::create`], adding the io-cache target when a request on `path` may use one.
+    pub(crate) fn create_routed<'a>(
+        &self,
+        path: &'a str,
+    ) -> crate::Result<(RoutedOperator, Cow<'a, str>)> {
+        #[cfg(feature = "storage-oss")]
+        if let Storage::Oss { config, operators } = self {
+            if let Some(target) = config.target_route(path) {
+                let (bucket, relative_path) =
+                    Self::bucket_and_relative_path(path, "OSS", &["oss"])?;
+                let operator = |route| {
+                    Self::cached_oss_operator(config, operators, path, bucket.clone(), route)
+                };
+                let routed = RoutedOperator::with_target(
+                    operator(OssRoute::Origin)?,
+                    operator(target.route)?,
+                    target.classes,
+                );
+                return Ok((routed, Cow::Borrowed(relative_path)));
+            }
+        }
+        let (op, relative_path) = self.create(path)?;
+        Ok((RoutedOperator::origin(op), relative_path))
+    }
+
     #[cfg(feature = "storage-memory")]
     fn memory_relative_path(path: &str) -> crate::Result<&str> {
         if let Some(stripped) = path.strip_prefix("memory:/") {
@@ -446,10 +491,10 @@ impl Storage {
         feature = "storage-obs",
         feature = "storage-s3"
     ))]
-    fn lock_operator_cache<'a>(
-        operators: &'a Mutex<HashMap<String, Operator>>,
+    fn lock_operator_cache<'a, K>(
+        operators: &'a Mutex<HashMap<K, Operator>>,
         storage_name: &str,
-    ) -> crate::Result<MutexGuard<'a, HashMap<String, Operator>>> {
+    ) -> crate::Result<MutexGuard<'a, HashMap<K, Operator>>> {
         operators.lock().map_err(|_| error::Error::UnexpectedError {
             message: format!("Failed to lock {storage_name} operator cache"),
             source: None,
@@ -464,31 +509,36 @@ impl Storage {
         feature = "storage-obs",
         feature = "storage-s3"
     ))]
-    fn cached_operator(
-        operators: &Mutex<HashMap<String, Operator>>,
+    fn cached_operator<K, Q>(
+        operators: &Mutex<HashMap<K, Operator>>,
         storage_name: &str,
-        cache_key: &str,
+        cache_key: &Q,
         build: impl FnOnce() -> crate::Result<Operator>,
-    ) -> crate::Result<Operator> {
+    ) -> crate::Result<Operator>
+    where
+        K: Borrow<Q> + Eq + Hash,
+        Q: ToOwned<Owned = K> + Eq + Hash + ?Sized,
+    {
         let mut operators = Self::lock_operator_cache(operators, storage_name)?;
         if let Some(op) = operators.get(cache_key) {
             return Ok(op.clone());
         }
 
         let op = build()?;
-        operators.insert(cache_key.to_string(), op.clone());
+        operators.insert(cache_key.to_owned(), op.clone());
         Ok(op)
     }
 
     #[cfg(feature = "storage-oss")]
     fn cached_oss_operator(
         config: &OssStorageConfig,
-        operators: &Mutex<HashMap<String, Operator>>,
+        operators: &Mutex<HashMap<(String, OssRoute), Operator>>,
         path: &str,
-        bucket: &str,
+        bucket: String,
+        route: OssRoute,
     ) -> crate::Result<Operator> {
-        Self::cached_operator(operators, "OSS", bucket, || {
-            super::oss_config_build(config, path)
+        Self::cached_operator(operators, "OSS", &(bucket, route), || {
+            super::oss_config_build(config, path, route)
         })
     }
 
