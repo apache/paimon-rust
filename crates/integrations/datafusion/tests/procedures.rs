@@ -354,6 +354,30 @@ async fn test_create_branch_from_tag_on_source_branch() {
 }
 
 #[tokio::test]
+async fn test_create_branch_on_nonexistent_source_branch_fails() {
+    // Without a tag, a branch-qualified source that does not exist must fail the
+    // CALL rather than report success while creating nothing: Java
+    // `FileSystemBranchManager.createBranch` reads `schemaManager.latest().get()`
+    // from the source and throws when the source branch has no schema.
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.create_branch(table => 'test_db.t1$branch_ghost', branch => 'b2')",
+        "doesn't exist",
+    )
+    .await;
+
+    // The destination branch was never created by the failed CALL.
+    let count = row_count(
+        &sql_context,
+        "SELECT * FROM paimon.test_db.`t1$branches` WHERE branch_name = 'b2'",
+    )
+    .await;
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn test_create_lumina_index_requires_index_column() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 

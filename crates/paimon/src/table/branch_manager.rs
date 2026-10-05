@@ -159,10 +159,24 @@ impl BranchManager {
         self.validate_branch(branch_name).await?;
         let source_branch = source_branch.filter(|b| *b != DEFAULT_MAIN_BRANCH);
         let source_schema_manager = self.scoped_schema_manager(source_branch);
-        if let Some(latest) = source_schema_manager.latest().await? {
-            self.copy_schemas_to_branch(source_branch, branch_name, latest.id())
-                .await?;
-        }
+        // The source must have a schema to copy. Java `FileSystemBranchManager`
+        // reads `schemaManager.latest().get()`, which throws when the source has
+        // no schema -- i.e. the source branch does not exist. Returning `Ok` on an
+        // empty source would report a successful CALL while creating nothing (the
+        // destination branch would still be absent), so reject a missing source.
+        let latest =
+            source_schema_manager
+                .latest()
+                .await?
+                .ok_or_else(|| crate::Error::DataInvalid {
+                    message: match source_branch {
+                        Some(branch) => format!("Branch name '{branch}' doesn't exist."),
+                        None => "Cannot create a branch: the table has no schema.".to_string(),
+                    },
+                    source: None,
+                })?;
+        self.copy_schemas_to_branch(source_branch, branch_name, latest.id())
+            .await?;
         Ok(())
     }
 
@@ -636,6 +650,63 @@ mod tests {
             "main scope must not see the branch-local tag: {err}"
         );
         assert!(!bm.branch_exists("b3").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_on_source_branch() {
+        // The no-tag create path seeds the new branch from the source branch's
+        // schema. Main is left empty on purpose: a successful create therefore
+        // proves the schema was read from `b1`, not main. Mirrors Java
+        // `create_branch(table => 't$branch_b1', branch => 'b2')`.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_create_branch_on_source_branch".to_string();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+
+        // Only branch `b1` has a schema; main has none.
+        write_schema(&file_io, &schema_manager.with_branch("b1"), &test_schema()).await;
+
+        let bm = BranchManager::new(file_io.clone(), table_path.clone());
+        bm.create_branch_on_branch("b2", Some("b1")).await.unwrap();
+
+        assert!(bm.branch_exists("b2").await.unwrap());
+        let b2_schemas = schema_manager.with_branch("b2").list_all().await.unwrap();
+        assert_eq!(b2_schemas.len(), 1);
+        // b2 is flat under the root, never nested under the source branch.
+        assert!(
+            !file_io
+                .exists(&format!("{table_path}/branch/branch-b1/branch/branch-b2/"))
+                .await
+                .unwrap(),
+            "b2 must not be nested under the source branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_branch_on_nonexistent_source_branch_fails() {
+        // Without a tag, a source branch that has no schema does not exist. Java
+        // `FileSystemBranchManager.createBranch` calls `schemaManager.latest().get()`,
+        // which throws in that case. The CALL must fail -- not report success while
+        // creating nothing -- so no destination branch is left absent after an "Ok".
+        let file_io = test_file_io();
+        let table_path = "memory:/test_create_branch_on_missing_source".to_string();
+        let schema_manager = SchemaManager::new(file_io.clone(), table_path.clone());
+
+        // Main has a schema, but the requested source branch `ghost` does not.
+        write_schema(&file_io, &schema_manager, &test_schema()).await;
+
+        let bm = BranchManager::new(file_io.clone(), table_path.clone());
+        let err = bm
+            .create_branch_on_branch("b2", Some("ghost"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("doesn't exist"),
+            "a missing source branch must be rejected: {err}"
+        );
+        assert!(
+            !bm.branch_exists("b2").await.unwrap(),
+            "no destination branch may be created from a missing source"
+        );
     }
 
     #[tokio::test]
