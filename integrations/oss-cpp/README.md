@@ -52,13 +52,10 @@ Use the existing `fs.oss.accessKeyId`, `fs.oss.accessKeySecret` and optional
 `fs.oss.securityToken` credentials. REST catalog credentials still refresh;
 static FileIO credentials do not.
 
-Python bindings can omit `fs.oss.cpp.library.path` when an optional
-`pypaimon_oss_cpp` package contains `liboss_cpp_bridge.so` (Linux) or
-`liboss_cpp_bridge.dylib` (macOS) beside its `__init__.py`. Explicit paths always
-take precedence. This package layout is an integration contract, not a published
-wheel; packaging the bridge and its dependencies remains a separate step.
-Discovery does not load or validate the library; normal backend initialization
-still reports missing dependencies or an incompatible ABI.
+Python bindings also discover `liboss_cpp_bridge.so` (Linux) or
+`liboss_cpp_bridge.dylib` (macOS) beside `pypaimon_oss_cpp/__init__.py`.
+An explicit `fs.oss.cpp.library.path` takes precedence. The companion package
+is not yet published.
 
 | Option | Default |
 |---|---:|
