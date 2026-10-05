@@ -69,7 +69,10 @@ pub struct OssStorageConfig {
 /// Extracts OSS-related configuration keys (endpoint, access key, secret key,
 /// optional security token, retry and User-Agent settings) from the provided properties.
 ///
-/// Returns an error if any required configuration key is missing.
+/// Only the endpoint is required. The access key id and secret are optional so
+/// that anonymous/public buckets, ECS RAM-role credentials and
+/// environment-provided credentials can be used, matching the S3, GCS, OBS and
+/// COS backends. Returns an error if the endpoint is missing.
 pub(crate) fn oss_config_parse(mut props: HashMap<String, String>) -> Result<OssStorageConfig> {
     let mut cfg = OssConfig::default();
     let user_agent = super::user_agent::oss_user_agent(&props);
@@ -81,22 +84,11 @@ pub(crate) fn oss_config_parse(mut props: HashMap<String, String>) -> Result<Oss
                 message: format!("Missing required OSS config: {OSS_ENDPOINT}"),
             })?,
     );
-    cfg.access_key_id =
-        Some(
-            props
-                .remove(OSS_ACCESS_KEY_ID)
-                .ok_or_else(|| Error::ConfigInvalid {
-                    message: format!("Missing required OSS config: {OSS_ACCESS_KEY_ID}"),
-                })?,
-        );
-    cfg.access_key_secret =
-        Some(
-            props
-                .remove(OSS_ACCESS_KEY_SECRET)
-                .ok_or_else(|| Error::ConfigInvalid {
-                    message: format!("Missing required OSS config: {OSS_ACCESS_KEY_SECRET}"),
-                })?,
-        );
+    // Credentials are optional: when absent, OpenDAL falls back to anonymous
+    // access, ECS RAM-role or environment credentials. This mirrors the S3,
+    // GCS, OBS and COS backends.
+    cfg.access_key_id = props.remove(OSS_ACCESS_KEY_ID);
+    cfg.access_key_secret = props.remove(OSS_ACCESS_KEY_SECRET);
 
     cfg.security_token = props.remove(OSS_SECURITY_TOKEN);
     let retry_count = parse_retry_option(&mut props, OSS_RETRY_COUNT, DEFAULT_OSS_RETRY_COUNT)?;
@@ -227,6 +219,32 @@ mod tests {
         assert_eq!(cfg.service.access_key_secret.as_deref(), Some("test-sk"));
         assert_eq!(cfg.retry_count, 7);
         assert_eq!(cfg.retry_interval, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn test_oss_config_parse_no_credentials() {
+        // Only the endpoint, no access key/secret — valid for anonymous/public
+        // buckets, ECS RAM-role or environment credentials, as with the S3,
+        // GCS, OBS and COS backends.
+        let props = HashMap::from([(
+            OSS_ENDPOINT.to_string(),
+            "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+        )]);
+
+        let cfg = oss_config_parse(props).unwrap();
+        assert_eq!(
+            cfg.service.endpoint.as_deref(),
+            Some("https://oss-cn-hangzhou.aliyuncs.com")
+        );
+        assert!(cfg.service.access_key_id.is_none());
+        assert!(cfg.service.access_key_secret.is_none());
+    }
+
+    #[test]
+    fn test_oss_config_parse_missing_endpoint_fails() {
+        // The endpoint stays required even when credentials are omitted.
+        let props = HashMap::from([(OSS_ACCESS_KEY_ID.to_string(), "test-ak".to_string())]);
+        assert!(oss_config_parse(props).is_err());
     }
 
     #[test]
