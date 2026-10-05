@@ -26,6 +26,8 @@ mod bitmap_global_index_reader;
 mod bitmap_global_index_writer;
 mod blob_resolver;
 mod branch_manager;
+#[cfg(test)]
+mod branch_write_tests;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
@@ -284,7 +286,8 @@ impl Table {
     /// invariants are validated — primary-key/partition columns must exist and
     /// field names/ids must be unique — so a malformed external schema is
     /// rejected here instead of panicking or reading the wrong column later. The
-    /// branch only selects the branch-scoped managers used by subsequent reads.
+    /// branch selects the metadata managers for subsequent reads and writes.
+    /// Filesystem writes require the supplied schema to exist in that branch.
     pub fn from_resolved_schema(
         file_io: FileIO,
         identifier: Identifier,
@@ -805,6 +808,30 @@ impl Table {
             validate_branch_name(branch_name)?;
             branch_name.to_string()
         };
+        if let Some(env) = &self.rest_env {
+            // Catalog branches may have no schema directory in the data store.
+            // Load their schema, identity and FileIO through the same catalog.
+            let identifier = env.identifier().with_branch(&branch)?;
+            let mut table = env.get_table(&identifier).await?;
+            if table.location() != self.location()
+                || table
+                    .rest_env
+                    .as_ref()
+                    .is_none_or(|branch_env| branch_env.uuid() != env.uuid())
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Branch '{branch}' no longer belongs to the loaded table '{}'; reload the table before switching branches",
+                        self.identifier.full_name()
+                    ),
+                    source: None,
+                });
+            }
+            let mut options = table.schema.options().clone();
+            options.insert("branch".to_string(), branch);
+            table.schema = table.schema.copy_with_replaced_options(options);
+            return Ok(table);
+        }
         let schema_manager = if branch == DEFAULT_MAIN_BRANCH {
             SchemaManager::new(self.file_io.clone(), self.location.clone())
         } else {

@@ -17,10 +17,10 @@
 
 //! SnapshotCommit abstraction for atomic snapshot commits.
 //!
-//! Reference: [pypaimon snapshot_commit.py](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/snapshot/snapshot_commit.py)
+//! Reference: [Java SnapshotCommit](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/catalog/SnapshotCommit.java)
 
 use crate::api::rest_api::RESTApi;
-use crate::catalog::Identifier;
+use crate::catalog::{validate_branch_name, Identifier};
 use crate::spec::{PartitionStatistics, Snapshot};
 use crate::table::SnapshotManager;
 use crate::Result;
@@ -35,18 +35,20 @@ use std::sync::Arc;
 #[async_trait]
 pub trait SnapshotCommit: Send + Sync {
     /// Commit the given snapshot. Returns true if successful, false if
-    /// another writer won the race.
+    /// another writer won the race. `branch` selects the snapshot namespace;
+    /// data files and manifests remain shared under the table location.
     async fn commit(
         &self,
         base_snapshot_uuid: Option<&str>,
         snapshot: &Snapshot,
+        branch: &str,
         statistics: &[PartitionStatistics],
     ) -> Result<bool>;
 }
 
 /// A SnapshotCommit using file renaming to commit.
 ///
-/// Reference: [pypaimon RenamingSnapshotCommit](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/snapshot/renaming_snapshot_commit.py)
+/// Reference: [Java RenamingSnapshotCommit](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/catalog/RenamingSnapshotCommit.java)
 pub struct RenamingSnapshotCommit {
     snapshot_manager: SnapshotManager,
 }
@@ -63,16 +65,22 @@ impl SnapshotCommit for RenamingSnapshotCommit {
         &self,
         _base_snapshot_uuid: Option<&str>,
         snapshot: &Snapshot,
+        branch: &str,
         _statistics: &[PartitionStatistics],
     ) -> Result<bool> {
-        // statistics are not used in file system mode (same as Python)
-        self.snapshot_manager.commit_snapshot(snapshot).await
+        // Like Java RenamingSnapshotCommit, the argument selects the metadata
+        // namespace even when this publisher was constructed for another branch.
+        validate_branch_name(branch)?;
+        self.snapshot_manager
+            .with_branch(branch)
+            .commit_snapshot(snapshot)
+            .await
     }
 }
 
 /// A SnapshotCommit using REST API to commit (e.g. REST Catalog).
 ///
-/// Reference: [pypaimon RESTSnapshotCommit](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/snapshot/catalog_snapshot_commit.py)
+/// Reference: [Java CatalogSnapshotCommit](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/catalog/CatalogSnapshotCommit.java)
 pub struct RESTSnapshotCommit {
     api: Arc<RESTApi>,
     identifier: Identifier,
@@ -95,11 +103,13 @@ impl SnapshotCommit for RESTSnapshotCommit {
         &self,
         base_snapshot_uuid: Option<&str>,
         snapshot: &Snapshot,
+        branch: &str,
         statistics: &[PartitionStatistics],
     ) -> Result<bool> {
+        let identifier = self.identifier.with_branch(branch)?;
         self.api
             .commit_snapshot(
-                &self.identifier,
+                &identifier,
                 &self.uuid,
                 base_snapshot_uuid,
                 snapshot,

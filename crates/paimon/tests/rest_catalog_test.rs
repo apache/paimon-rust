@@ -3138,3 +3138,96 @@ async fn test_rest_catalog_manages_policies_end_to_end() {
         .unwrap();
     assert!(page.elements.is_empty());
 }
+
+#[tokio::test]
+async fn test_branch_write_copy_loads_catalog_schema_without_schema_files() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let path = "memory:/branch-write";
+    ctx.server
+        .add_table_with_schema("default", "t", test_schema(), path);
+    let branch_schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .option("target-file-row-num", "2")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "t$branch_dev", branch_schema.clone(), path);
+    ctx.server
+        .set_table_schema_id("default", "t$branch_dev", branch_schema, 7);
+    ctx.server.set_table_uuid("default", "t$branch_dev", "t");
+    let main = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "t"))
+        .await
+        .unwrap();
+    let branch = main.copy_with_branch("dev").await.unwrap();
+    assert_eq!(branch.branch(), "dev");
+    assert_eq!(branch.schema().id(), 7);
+    assert_eq!(branch.schema().fields()[1].name(), "value");
+    assert_eq!(branch.location(), main.location());
+    assert!(branch.schema_manager().latest().await.unwrap().is_none());
+    let mut writer = branch.new_write_builder().new_write().unwrap();
+    let data = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
+        ),
+        (
+            "value",
+            Arc::new(Int32Array::from(vec![10])) as arrow_array::ArrayRef,
+        ),
+    ])
+    .unwrap();
+    writer.write_arrow_batch(&data).await.unwrap();
+    let messages = writer.prepare_commit().await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].new_files[0].schema_id, 7);
+    // Branch resolution must retain the REST environment so switching back
+    // loads the catalog's main schema instead of looking for a schema file.
+    let main_again = branch.copy_with_branch("main").await.unwrap();
+    assert_eq!(main_again.branch(), "main");
+    assert_eq!(main_again.schema().id(), 0);
+    assert_eq!(main_again.schema().fields()[1].name(), "name");
+    assert!(main.copy_with_branch("missing").await.is_err());
+}
+
+#[tokio::test]
+async fn test_branch_write_copy_rejects_replaced_identity_or_location() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let path = "memory:/branch-identity";
+    ctx.server
+        .add_table_with_schema("default", "t", test_schema(), path);
+    ctx.server
+        .add_table_with_schema("default", "t$branch_dev", test_schema(), path);
+    ctx.server.set_table_uuid("default", "t$branch_dev", "t");
+    let main = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "t"))
+        .await
+        .unwrap();
+    main.copy_with_branch("dev").await.unwrap();
+    ctx.server
+        .set_table_uuid("default", "t$branch_dev", "recreated-table");
+    let error = main.copy_with_branch("dev").await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("no longer belongs to the loaded table"),
+        "{error}"
+    );
+    ctx.server.add_table_with_schema(
+        "default",
+        "t$branch_dev",
+        test_schema(),
+        "memory:/replacement",
+    );
+    ctx.server.set_table_uuid("default", "t$branch_dev", "t");
+    let error = main.copy_with_branch("dev").await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("no longer belongs to the loaded table"),
+        "{error}"
+    );
+}

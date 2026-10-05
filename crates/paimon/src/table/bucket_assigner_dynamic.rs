@@ -31,7 +31,7 @@ use crate::table::bucket_assigner::{BatchAssignOutput, BucketAssigner, Partition
 use crate::table::data_file_path_factory::{DataFilePath, DataFilePathFactory};
 use crate::table::index_file_path::IndexFileLocation;
 use crate::table::partition_filter::PartitionFilter;
-use crate::table::{Snapshot, SnapshotManager, Table, TableScan};
+use crate::table::{Snapshot, Table, TableScan};
 use crate::Result;
 use arrow_array::RecordBatch;
 use rand::seq::SliceRandom;
@@ -540,10 +540,7 @@ impl DynamicBucketAssigner {
             self.cached_index_entries = Some(Vec::new());
             return Ok(());
         }
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
+        let snapshot_manager = self.table.snapshot_manager();
         let latest_snapshot = snapshot_manager.get_latest_snapshot().await?;
 
         let entries = if let Some(snapshot) = &latest_snapshot {
