@@ -140,7 +140,10 @@ fn complete_jindo_options_with(
     options
 }
 
-pub(crate) fn complete_jindo_options(options: HashMap<String, String>) -> HashMap<String, String> {
+pub(crate) fn complete_storage_options(
+    options: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let options = crate::oss_cpp::complete_options(options);
     let library_path = std::env::var_os(JINDOSDK_LIBRARY_PATH);
     let home = std::env::var_os(JINDOSDK_HOME);
     complete_jindo_options_with(
@@ -152,7 +155,7 @@ pub(crate) fn complete_jindo_options(options: HashMap<String, String>) -> HashMa
 }
 
 fn build_paimon_catalog(catalog_options: HashMap<String, String>) -> PyResult<Arc<dyn Catalog>> {
-    let catalog_options = complete_jindo_options(catalog_options);
+    let catalog_options = complete_storage_options(catalog_options);
     let rt = runtime();
     rt.block_on(async {
         let options = Options::from_map(catalog_options);
@@ -584,7 +587,7 @@ impl PySQLContext {
         catalog_options: HashMap<String, String>,
         default_database: Option<String>,
     ) -> PyResult<()> {
-        let catalog_options = complete_jindo_options(catalog_options);
+        let catalog_options = complete_storage_options(catalog_options);
         let rt = runtime();
         py.detach(move || {
             rt.block_on(async {

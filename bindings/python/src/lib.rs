@@ -20,6 +20,7 @@ use pyo3::prelude::*;
 mod blob;
 mod context;
 mod error;
+mod oss_cpp;
 mod predicate;
 mod read;
 mod schema;
