@@ -26,6 +26,7 @@ pub(crate) mod parquet;
 mod row;
 mod shredding;
 pub(crate) mod text;
+mod variant_projection;
 #[cfg(feature = "vortex")]
 mod vortex;
 

@@ -572,6 +572,8 @@ impl<'a> PaimonReadBuilder<'a> {
             Some(fields) => fields,
         };
 
+        crate::spec::validate_selected_map_fields(self.table.schema.fields(), &read_type)?;
+
         // Pass the FULL data predicate through (including `And`/`Or`/`Not`).
         // Pushdown/stats skip compound nodes; the residual pass enforces the full
         // predicate exactly. Pruning here would drop compound predicates.

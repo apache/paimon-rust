@@ -686,28 +686,18 @@ impl FormatFileReader for ParquetFormatReader {
             crate::arrow::residual::widen_scan_fields(read_fields, predicates)
         };
 
-        let root_schema = parquet_schema.root_schema();
-        let root_indices: Vec<usize> = scan_fields
-            .iter()
-            .filter_map(|f| {
-                root_schema
-                    .get_fields()
-                    .iter()
-                    .position(|pf| pf.name() == f.name())
-            })
-            .collect();
-
         // Build the MAP plan before the projection mask: a selected-key MAP
         // can then decode only __field_mapping plus the direct/overflow
         // children which may contain the requested keys.
         let map_read_plan =
             MapShreddingReadPlan::create(&scan_fields, batch_stream_builder.schema())?
                 .map(Arc::new);
-        let mask = if let Some(plan) = map_read_plan.as_deref() {
-            map_shredding_projection_mask(&parquet_schema, &root_indices, plan)
-        } else {
-            ProjectionMask::roots(&parquet_schema, root_indices)
-        };
+        let mask = read_type_projection_mask(
+            &parquet_schema,
+            &scan_fields,
+            map_read_plan.as_deref(),
+            preds,
+        );
         batch_stream_builder = batch_stream_builder.with_projection(mask.clone());
 
         let mut decoder_predicates = build_parquet_row_filter(&parquet_schema, preds, file_fields)?
@@ -1060,29 +1050,82 @@ impl FormatFileReader for ParquetFormatReader {
     }
 }
 
-fn map_shredding_projection_mask(
+fn read_type_projection_mask(
     parquet_schema: &parquet::schema::types::SchemaDescriptor,
-    selected_roots: &[usize],
-    plan: &MapShreddingReadPlan,
+    read_fields: &[DataField],
+    map_plan: Option<&MapShreddingReadPlan>,
+    predicates: &[Predicate],
 ) -> ProjectionMask {
-    let selected_roots: std::collections::HashSet<usize> = selected_roots.iter().copied().collect();
-    let root_fields = parquet_schema.root_schema().get_fields();
-    let leaves = (0..parquet_schema.num_columns()).filter(|leaf_index| {
-        let root_index = parquet_schema.get_column_root_idx(*leaf_index);
-        if !selected_roots.contains(&root_index) {
-            return false;
+    fn requested_paths(
+        data_type: &DataType,
+        physical: &parquet::schema::types::Type,
+        path: &mut Vec<String>,
+        output: &mut std::collections::HashSet<Vec<String>>,
+    ) {
+        if let DataType::Row(row) = data_type {
+            if crate::spec::is_variant_extraction_row_type(data_type) {
+                output.extend(
+                    super::variant_projection::projected_paths(row, physical)
+                        .into_iter()
+                        .map(|parts| {
+                            let mut full = path.clone();
+                            full.extend(parts);
+                            full
+                        }),
+                );
+                return;
+            }
+            if !physical.is_primitive() {
+                for field in row.fields() {
+                    if let Some(child) = physical
+                        .get_fields()
+                        .iter()
+                        .find(|child| child.name() == field.name())
+                    {
+                        path.push(child.name().to_string());
+                        requested_paths(field.data_type(), child, path, output);
+                        path.pop();
+                    }
+                }
+                return;
+            }
         }
-        let root_name = root_fields[root_index].name();
-        let Some(children) = plan.projected_physical_children(root_name) else {
-            return true;
+        super::variant_projection::all_leaves(physical, path, output);
+    }
+    let mut predicate_refs = Vec::new();
+    for predicate in predicates {
+        crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut predicate_refs);
+    }
+    let roots = parquet_schema.root_schema().get_fields();
+    let mut selected = std::collections::HashSet::new();
+    for field in read_fields {
+        let Some(root) = roots.iter().find(|root| root.name() == field.name()) else {
+            continue;
         };
-        parquet_schema
-            .column(*leaf_index)
-            .path()
-            .parts()
-            .get(1)
-            .is_some_and(|child| children.contains(child))
-    });
+        let mut path = vec![root.name().to_string()];
+        if predicate_refs
+            .iter()
+            .any(|(column, _)| *column == field.name())
+        {
+            super::variant_projection::all_leaves(root, &mut path, &mut selected);
+        } else if let Some(children) =
+            map_plan.and_then(|plan| plan.projected_physical_children(field.name()))
+        {
+            for child in root
+                .get_fields()
+                .iter()
+                .filter(|child| children.contains(child.name()))
+            {
+                path.push(child.name().to_string());
+                super::variant_projection::all_leaves(child, &mut path, &mut selected);
+                path.pop();
+            }
+        } else {
+            requested_paths(field.data_type(), root, &mut path, &mut selected);
+        }
+    }
+    let leaves = (0..parquet_schema.num_columns())
+        .filter(|&leaf| selected.contains(parquet_schema.column(leaf).path().parts()));
     ProjectionMask::leaves(parquet_schema, leaves)
 }
 
@@ -2934,6 +2977,41 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn nested_read_type_masks_physical_leaves_and_keeps_predicate_inputs() {
+        use crate::spec::RowType;
+        let descriptor = SchemaDescriptor::new(Arc::new(parse_message_type(
+            "message schema { optional group profile { optional int32 score; optional binary unused; } optional int32 id; }"
+        ).unwrap()));
+        let fields = vec![
+            DataField::new(
+                10,
+                "profile".into(),
+                DataType::Row(RowType::new(vec![
+                    DataField::new(11, "score".into(), DataType::Int(IntType::new())),
+                    DataField::new(
+                        12,
+                        "unused".into(),
+                        DataType::VarChar(VarCharType::string_type()),
+                    ),
+                ])),
+            ),
+            DataField::new(20, "id".into(), DataType::Int(IntType::new())),
+        ];
+        let selected =
+            crate::spec::project_read_type(&fields, &[vec!["profile".into(), "score".into()]])
+                .unwrap();
+        let mask = super::read_type_projection_mask(&descriptor, &selected, None, &[]);
+        assert!(mask.leaf_included(0));
+        assert!(!mask.leaf_included(1));
+        assert!(!mask.leaf_included(2));
+        let predicate = PredicateBuilder::new(&fields).is_null("profile").unwrap();
+        let widened = super::read_type_projection_mask(&descriptor, &selected, None, &[predicate]);
+        assert!(widened.leaf_included(0));
+        assert!(widened.leaf_included(1));
+        assert!(!widened.leaf_included(2));
+    }
 
     fn test_fields() -> Vec<DataField> {
         vec![

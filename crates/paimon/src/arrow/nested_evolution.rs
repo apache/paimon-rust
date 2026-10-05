@@ -35,12 +35,108 @@ use std::sync::Arc;
 
 use arrow_array::{
     new_null_array, Array, ArrayRef, Int64Array, ListArray, MapArray, StringArray, StructArray,
+    UInt32Array,
 };
 use arrow_cast::cast;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields};
 
 use crate::arrow::paimon_type_to_arrow;
-use crate::spec::{is_variant_extraction_row_type, DataType, MapType, RowType};
+use crate::spec::{
+    is_variant_extraction_row_type, map_selected_keys, DataField, DataType, MapType, RowType,
+};
+
+/// Field-aware projection for synthetic read types and nested schema evolution.
+pub(crate) fn evolve_field(
+    source: &ArrayRef,
+    source_field: &DataField,
+    target: &DataField,
+) -> crate::Result<ArrayRef> {
+    if let (DataType::Map(map_type), DataType::Row(row_type), Some(keys)) = (
+        source_field.data_type(),
+        target.data_type(),
+        map_selected_keys(target)?,
+    ) {
+        return selected_map_to_row(source, map_type, row_type, &keys);
+    }
+    if matches!(source_field.data_type(), DataType::Variant(_)) {
+        if let DataType::Row(row) = target.data_type() {
+            if is_variant_extraction_row_type(target.data_type()) {
+                // A format read plan may already have assembled the synthetic
+                // ROW while its field context still describes the VARIANT.
+                if source.data_type() == &paimon_type_to_arrow(target.data_type())? {
+                    return Ok(source.clone());
+                }
+                return crate::arrow::shredding::variant::assemble_variant_extraction_array(
+                    source.as_ref(),
+                    row,
+                );
+            }
+        }
+    }
+    evolve_column(source, source_field.data_type(), target.data_type())
+}
+
+pub(crate) fn selected_map_to_row(
+    source: &ArrayRef,
+    map_type: &MapType,
+    row_type: &RowType,
+    keys: &[String],
+) -> crate::Result<ArrayRef> {
+    let map =
+        source
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: "Selected MAP input must be a MapArray".into(),
+                source: None,
+            })?;
+    let names = map
+        .keys()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Selected MAP keys must be STRING".into(),
+            source: None,
+        })?;
+    let mut children = Vec::new();
+    for (key, field) in keys.iter().zip(row_type.fields()) {
+        let indices: UInt32Array = (0..map.len())
+            .map(|row| {
+                if map.is_null(row) {
+                    return None;
+                }
+                let offsets = map.value_offsets();
+                (offsets[row] as usize..offsets[row + 1] as usize)
+                    .find(|&index| names.is_valid(index) && names.value(index) == key)
+                    .map(|index| index as u32)
+            })
+            .collect();
+        let values =
+            arrow_select::take::take(map.values().as_ref(), &indices, None).map_err(|e| {
+                crate::Error::UnexpectedError {
+                    message: "Failed to gather selected MAP values".into(),
+                    source: Some(Box::new(e)),
+                }
+            })?;
+        children.push(evolve_column(
+            &values,
+            map_type.value_type(),
+            field.data_type(),
+        )?);
+    }
+    let ArrowDataType::Struct(fields) = paimon_type_to_arrow(&DataType::Row(row_type.clone()))?
+    else {
+        unreachable!()
+    };
+    Ok(Arc::new(
+        StructArray::try_new(fields, children, map.nulls().cloned()).map_err(|e| {
+            crate::Error::DataInvalid {
+                message: format!("Failed to build selected-key ROW: {e}"),
+                source: Some(Box::new(e)),
+            }
+        })?,
+    ))
+}
 
 /// Reconcile `source` (as described by `source_type`, the type the data file
 /// actually holds) with `target_type` (the type the read schema wants).
@@ -351,11 +447,7 @@ fn evolve_struct(
                         ),
                         source: None,
                     })?;
-                arrays.push(evolve_column(
-                    column,
-                    source_field.data_type(),
-                    target_field.data_type(),
-                )?)
+                arrays.push(evolve_field(column, source_field, target_field)?)
             }
         }
     }
@@ -549,6 +641,75 @@ mod tests {
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Fields};
+
+    #[test]
+    fn selected_map_read_type_uses_key_metadata_not_child_names() {
+        use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        for (key, value) in [("key", 7), ("key", 9), ("", 3)] {
+            builder.keys().append_value(key);
+            builder.values().append_value(value);
+        }
+        builder.append(true).unwrap();
+        builder.append(false).unwrap();
+        builder.append(true).unwrap();
+        let source: ArrayRef = Arc::new(builder.finish());
+        let source_field = field(
+            10,
+            "attrs",
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Int(IntType::new()),
+            )),
+        );
+        let requested = crate::spec::map_selected_keys_field(
+            &source_field,
+            &["key".into(), "".into(), "missing".into()],
+        )
+        .unwrap();
+        let DataType::Row(row) = requested.data_type() else {
+            panic!()
+        };
+        let target = DataField::new(
+            requested.id(),
+            requested.name().into(),
+            DataType::Row(RowType::new(
+                row.fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, child)| {
+                        DataField::new(
+                            child.id(),
+                            format!("output_{index}"),
+                            DataType::BigInt(BigIntType::new()),
+                        )
+                    })
+                    .collect(),
+            )),
+        )
+        .with_description(requested.description().map(str::to_string));
+        let output = evolve_field(&source, &source_field, &target).unwrap();
+        let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(output.is_null(1));
+        assert!(output.is_valid(2));
+        let first = output
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(first.iter().collect::<Vec<_>>(), vec![Some(7), None, None]);
+        assert_eq!(
+            output
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(3), None, None]
+        );
+        assert_eq!(output.column(2).null_count(), 3);
+    }
 
     fn field(id: i32, name: &str, dt: DataType) -> DataField {
         DataField::new(id, name.to_string(), dt)

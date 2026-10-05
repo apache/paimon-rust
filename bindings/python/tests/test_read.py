@@ -213,11 +213,12 @@ def test_with_read_type_rejects_unsupported_variant_target():
             table.new_read_builder().with_read_type(json.dumps(read_type))
 
 
-def test_with_nested_projection_replaces_read_type():
+def test_with_read_type_replaces_variant_extraction():
     with tempfile.TemporaryDirectory() as warehouse:
         table = _make_variant_table_with_data(warehouse)
         builder = table.new_read_builder().with_read_type(_variant_read_type(
-            table, ["payload"], ["$.age"])).with_nested_projection([["id"]])
+            table, ["payload"], ["$.age"])).with_read_type(json.dumps({"type": "ROW", "fields": [{
+                "id": table.schema().fields()[0].id(), "name": "id", "type": "INT"}]}))
         plan = builder.new_scan().plan()
         result = pa.Table.from_batches(builder.new_read().read(plan.splits()))
         assert result.schema.names == ["id"]
