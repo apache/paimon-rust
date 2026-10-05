@@ -19,7 +19,7 @@
 
 use crate::spec::{parse_variant_metadata, RowType};
 use crate::variant::{parse_path, PathSegment};
-use parquet::basic::LogicalType;
+use parquet::basic::{LogicalType, Repetition};
 use parquet::schema::types::Type;
 use std::collections::{HashMap, HashSet};
 
@@ -81,6 +81,31 @@ fn keep_child(child: &Type, path: &mut Vec<String>, output: &mut HashSet<Vec<Str
     path.pop();
 }
 
+/// Mirror Java's ParquetListLayoutResolver.isCanonicalList. Other LIST
+/// layouts must stay whole instead of assuming these physical levels.
+fn canonical_list(physical: &Type) -> Option<(&Type, &Type)> {
+    if physical.is_primitive()
+        || !matches!(
+            physical.get_basic_info().logical_type_ref(),
+            Some(LogicalType::List)
+        )
+        || physical.get_fields().len() != 1
+    {
+        return None;
+    }
+    let repeated = &physical.get_fields()[0];
+    if repeated.is_primitive()
+        || repeated.name() != "list"
+        || repeated.get_basic_info().repetition() != Repetition::REPEATED
+        || repeated.get_fields().len() != 1
+    {
+        return None;
+    }
+    let element = &repeated.get_fields()[0];
+    (element.name() == "element" && element.get_basic_info().repetition() != Repetition::REPEATED)
+        .then_some((repeated.as_ref(), element.as_ref()))
+}
+
 fn clip(
     physical: &Type,
     node: &PathNode,
@@ -98,9 +123,8 @@ fn clip(
     };
     let logical = typed.get_basic_info().logical_type_ref();
     let object = !typed.is_primitive() && logical.is_none();
-    let list = !typed.is_primitive()
-        && matches!(logical, Some(LogicalType::List))
-        && node.element.is_some();
+    let list_layout = canonical_list(typed);
+    let list = list_layout.is_some() && node.element.is_some();
     if (!object || node.element.is_some()) && !list {
         all_leaves(physical, path, output);
         return;
@@ -134,14 +158,7 @@ fn clip(
     } else {
         // Canonical Parquet LIST: typed_value / list / element. Array
         // indices cannot prune rows, only fields within every element.
-        let repeated = typed.get_fields().first();
-        let element = repeated
-            .filter(|repeated| !repeated.is_primitive())
-            .and_then(|repeated| repeated.get_fields().first());
-        let (Some(repeated), Some(element)) = (repeated, element) else {
-            all_leaves(physical, path, output);
-            return;
-        };
+        let (repeated, element) = list_layout.expect("canonical layout was checked above");
         if !node.children.is_empty() {
             if let Some(value) = fields.iter().find(|child| child.name() == "value") {
                 keep_child(value, path, output);
@@ -221,6 +238,50 @@ mod tests {
         let wrong_case = paths(&["$.Obj.wanted"]);
         assert!(includes(&wrong_case, "value"));
         assert_eq!(wrong_case.len(), 2);
+    }
+
+    #[test]
+    fn noncanonical_variant_lists_keep_the_whole_shredded_value() {
+        let row = variant_extraction_row(
+            true,
+            [(
+                DataType::Float(FloatType::new()),
+                "$[0].wanted".into(),
+                false,
+                "UTC".into(),
+            )],
+        )
+        .unwrap();
+        for (middle, middle_repetition, element, element_repetition) in [
+            ("array", "repeated", "element", "optional"),
+            ("typed_value_tuple", "repeated", "element", "optional"),
+            ("bag", "repeated", "element", "optional"),
+            ("list", "repeated", "item", "optional"),
+            ("list", "optional", "element", "optional"),
+            ("list", "repeated", "element", "repeated"),
+        ] {
+            let physical = parse_message_type(&format!(r#"message schema {{ optional group v {{
+                optional binary metadata; optional binary value;
+                optional group typed_value (LIST) {{
+                    {middle_repetition} group {middle} {{
+                        {element_repetition} group {element} {{
+                            optional binary value; optional group typed_value {{
+                                optional group wanted {{ optional binary value; optional float typed_value; }}
+                                optional group unused {{ optional binary value; optional float typed_value; }}
+                            }}
+                        }}
+                    }}
+                }}
+            }} }}"#)).unwrap();
+            let variant = &physical.get_fields()[0];
+            let mut complete = HashSet::new();
+            all_leaves(variant, &mut Vec::new(), &mut complete);
+            assert_eq!(
+                projected_paths(&row, variant),
+                complete,
+                "Must keep {middle_repetition} {middle} / {element_repetition} {element} whole",
+            );
+        }
     }
 
     #[test]
