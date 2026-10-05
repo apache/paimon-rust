@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::spec::batch_to_serialized_bytes;
-use crate::table::{SnapshotManager, Table, TableScan};
+use crate::table::{Table, TableScan};
 use crate::Result;
 use arrow_array::{Array, Int32Array, RecordBatch};
 use std::collections::HashMap;
@@ -135,9 +135,7 @@ impl PostponeBucketPlan {
         if snapshot_id == 0 {
             return Ok(());
         }
-        let snapshot = SnapshotManager::new(table.file_io().clone(), table.location().to_string())
-            .get_snapshot(snapshot_id)
-            .await?;
+        let snapshot = table.snapshot_manager().get_snapshot(snapshot_id).await?;
         let entries = TableScan::new(table, None, vec![], None, None, None)
             .with_scan_all_files()
             .plan_manifest_entries(&snapshot)

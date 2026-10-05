@@ -262,7 +262,7 @@ impl TableCommit {
         mut commits: Vec<(i64, Vec<CommitMessage>)>,
     ) -> Result<usize> {
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
         commits.sort_by_key(|(id, _)| *id);
         for pair in commits.windows(2) {
             if pair[0].0 == pair[1].0 {
@@ -360,7 +360,7 @@ impl TableCommit {
         // A refusal here must not clean up: a retry with an identifier that
         // already committed names files a snapshot references.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -408,7 +408,7 @@ impl TableCommit {
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, false)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -504,7 +504,7 @@ impl TableCommit {
     ) -> Result<()> {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
         reject_compact_increment(&commit_messages)?;
         validate_fixed_bucket_commit_mode(&commit_messages, true)?;
         validate_bucket_ownership(&commit_messages)?;
@@ -765,7 +765,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.ensure_not_format_table()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
 
         if partitions.is_empty() {
             return Ok(());
@@ -813,7 +813,7 @@ impl TableCommit {
         partitions: Vec<HashMap<String, Option<Datum>>>,
         commit_identifier: i64,
     ) -> Result<()> {
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
 
         if partitions.is_empty() {
             return Err(crate::Error::DataInvalid {
@@ -847,7 +847,7 @@ impl TableCommit {
         // A commit validates against the existing snapshot.
         CoreOptions::new(self.table.schema().options()).ensure_read_authorized()?;
         self.ensure_not_format_table()?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
 
         self.try_commit(
             CommitEntriesPlan::Overwrite {
@@ -895,7 +895,7 @@ impl TableCommit {
         }
         CoreOptions::new(self.table.schema().options())
             .ensure_type_paimon_served(&self.table.identifier().full_name())?;
-        self.table.ensure_not_branch_reference_for_write()?;
+        super::write_builder::ensure_table_write_allowed(&self.table)?;
 
         let table_path = self.table.location().trim_end_matches('/');
         let index_file_in_data_file_dir =
@@ -1175,7 +1175,12 @@ impl TableCommit {
         let base_snapshot_uuid = latest_snapshot.as_ref().and_then(Snapshot::uuid);
         let publication_error = match self
             .snapshot_commit
-            .commit(base_snapshot_uuid, &snapshot, &statistics)
+            .commit(
+                base_snapshot_uuid,
+                &snapshot,
+                self.table.branch(),
+                &statistics,
+            )
             .await
         {
             Ok(true) => return Ok(CommitAttemptResult::Success),
@@ -1372,7 +1377,7 @@ impl TableCommit {
         if let Some(env) = &self.table.rest_env {
             return env
                 .api()
-                .get_table(env.identifier())
+                .get_table(&env.identifier().with_branch(self.table.branch())?)
                 .await?
                 .schema_id
                 .ok_or_else(|| crate::Error::DataInvalid {
@@ -1380,14 +1385,20 @@ impl TableCommit {
                     source: None,
                 });
         }
-        // Tables constructed directly by callers need not have schema files.
-        Ok(self
-            .table
-            .schema_manager()
-            .latest()
-            .await?
-            .map(|schema| schema.id())
-            .unwrap_or(self.table.schema().id()))
+        let latest = self.table.schema_manager().latest().await?;
+        if let Some(schema) = latest {
+            return Ok(schema.id());
+        }
+        // A resolved schema may open a main table without on-disk metadata.
+        // Selecting a branch must never implicitly create it during publication.
+        if self.table.is_main_branch() {
+            Ok(self.table.schema().id())
+        } else {
+            Err(crate::Error::DataInvalid {
+                message: format!("Branch '{}' does not exist.", self.table.branch()),
+                source: None,
+            })
+        }
     }
 
     async fn inherited_statistics(

@@ -199,7 +199,7 @@ impl<'a> PaimonWriteBuilder<'a> {
 
     /// Try to create a new TableCommit for committing write results.
     pub fn try_new_commit(&self) -> crate::Result<TableCommit> {
-        self.ensure_main_branch_write()?;
+        ensure_table_write_allowed(self.table)?;
         Ok(TableCommit::new(
             self.table.clone(),
             self.commit_user.clone(),
@@ -239,18 +239,14 @@ impl<'a> PaimonWriteBuilder<'a> {
         &self,
         update_columns: Vec<String>,
     ) -> crate::Result<DataEvolutionWriter> {
-        self.ensure_main_branch_write()?;
+        ensure_table_write_allowed(self.table)?;
         DataEvolutionWriter::new(self.table, update_columns)
     }
 
     /// Create a new writer for data-evolution row-id deletes.
     pub fn new_delete(&self) -> crate::Result<DataEvolutionDeleteWriter> {
-        self.ensure_main_branch_write()?;
+        ensure_table_write_allowed(self.table)?;
         DataEvolutionDeleteWriter::new(self.table)
-    }
-
-    fn ensure_main_branch_write(&self) -> crate::Result<()> {
-        self.table.ensure_not_branch_reference_for_write()
     }
 }
 
@@ -265,11 +261,10 @@ pub(super) fn ensure_table_write_allowed(table: &Table) -> crate::Result<()> {
             ),
         });
     }
-    table.ensure_not_branch_reference_for_write()?;
     // A time-travel table may carry a historical schema.
     let selector =
         crate::spec::CoreOptions::new(table.schema().options()).try_time_travel_selector();
-    if !matches!(selector, Ok(None)) {
+    if table.is_time_traveled() || !matches!(selector, Ok(None)) {
         return Err(crate::Error::Unsupported {
             message: "Cannot write to a table with a time-travel option set \
                   (scan.version / scan.timestamp-millis / scan.timestamp / scan.watermark / scan.snapshot-id / scan.tag-name)"
@@ -488,31 +483,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_branch_reference_rejects_write_and_index_builders() {
+    async fn test_branch_reference_write_and_index_capabilities() {
         let table = as_main_branch_reference(test_postpone_pk_table(
             &test_file_io(),
             "memory:/test_branch_reference_writes",
         ));
 
-        let write_err = table.new_write_builder().try_new_commit().err().unwrap();
-        assert!(
-            matches!(write_err, crate::Error::Unsupported { ref message }
-                if message == "Writing to Paimon branch 'main' is not supported"),
-            "Expected branch write rejection, got: {write_err:?}"
-        );
-
-        let commit_err = table
+        table.new_write_builder().new_write().unwrap();
+        table
             .new_write_builder()
-            .new_commit()
+            .try_new_commit()
+            .unwrap()
             .commit(Vec::new())
             .await
-            .err()
             .unwrap();
-        assert!(
-            matches!(commit_err, crate::Error::Unsupported { ref message }
-                if message == "Writing to Paimon branch 'main' is not supported"),
-            "Expected branch commit rejection, got: {commit_err:?}"
-        );
 
         let index_err = table
             .new_btree_global_index_build_builder()

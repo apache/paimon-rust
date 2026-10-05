@@ -77,7 +77,7 @@ impl<'a> PostponeFixedBucketWriteBuilder<'a> {
     }
 
     pub fn try_new_commit(&self) -> Result<PostponeFixedBucketTableCommit> {
-        self.table.ensure_not_branch_reference_for_write()?;
+        ensure_table_write_allowed(self.table)?;
         Ok(self.new_commit())
     }
 

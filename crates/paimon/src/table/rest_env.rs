@@ -433,15 +433,7 @@ impl RESTEnv {
         &self,
         branch: &str,
     ) -> Result<Option<crate::spec::Snapshot>> {
-        let parsed_identifier = self.identifier.parsed_object_name()?;
-        let object = if parsed_identifier.branch() == Some(branch) {
-            format!("{}$branch_{branch}", parsed_identifier.table())
-        } else if branch == crate::catalog::DEFAULT_MAIN_BRANCH {
-            parsed_identifier.table().to_string()
-        } else {
-            format!("{}$branch_{branch}", parsed_identifier.table())
-        };
-        let identifier = Identifier::new(self.identifier.database(), object);
+        let identifier = self.identifier.with_branch(branch)?;
         match self.api.load_snapshot(&identifier).await {
             Ok(snapshot) => Ok(snapshot.map(|snapshot| snapshot.snapshot)),
             Err(Error::RestApi {

@@ -46,7 +46,7 @@ use crate::table::postpone_file_writer::{PostponeFileWriter, PostponeWriteConfig
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::row_kind_generator::RowKindGenerator;
 use crate::table::write_batch_normalize::normalize_write_array;
-use crate::table::{Snapshot, SnapshotManager, Table, TableScan};
+use crate::table::{Snapshot, Table, TableScan};
 use crate::Result;
 use arrow_array::{ArrayRef, RecordBatch};
 use std::collections::{HashMap, HashSet};
@@ -131,6 +131,7 @@ pub struct TableWrite {
     // Keep the Format Table state off ordinary Paimon write futures' stacks.
     format_writer: Option<Box<FormatTableWriter>>,
     table: Table,
+    branch_schema_checked: bool,
     write_schema: Arc<arrow_schema::Schema>,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
     partition_computer: PartitionComputer,
@@ -195,6 +196,7 @@ impl TableWrite {
         Ok(Self {
             format_writer: Some(Box::new(format_writer)),
             table: table.clone(),
+            branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
             write_schema: build_target_arrow_schema(schema.fields())?,
             partition_writers: HashMap::new(),
             partition_computer: PartitionComputer::new(
@@ -473,6 +475,7 @@ impl TableWrite {
         Ok(Self {
             format_writer: None,
             table: table.clone(),
+            branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
             write_schema,
             partition_writers: HashMap::new(),
             partition_computer,
@@ -524,8 +527,7 @@ impl TableWrite {
         let latest_snapshot = match sequence_snapshot {
             Some(snapshot) => snapshot,
             None => {
-                let snapshot_manager =
-                    SnapshotManager::new(table.file_io().clone(), table.location().to_string());
+                let snapshot_manager = table.snapshot_manager();
                 snapshot_manager.get_latest_snapshot().await?
             }
         };
@@ -548,10 +550,7 @@ impl TableWrite {
     }
 
     pub(super) async fn pin_sequence_snapshot(&mut self) -> Result<i64> {
-        let snapshot_manager = SnapshotManager::new(
-            self.table.file_io().clone(),
-            self.table.location().to_string(),
-        );
+        let snapshot_manager = self.table.snapshot_manager();
         let snapshot = snapshot_manager.get_latest_snapshot().await?;
         let snapshot_id = snapshot.as_ref().map_or(0, Snapshot::id);
         self.sequence_snapshot = Some(snapshot);
@@ -1000,6 +999,8 @@ impl TableWrite {
     ) -> Result<()> {
         self.ensure_active()?;
         let result = async {
+            self.ensure_branch_schema_exists().await?;
+
             let key = (partition_bytes, bucket);
             if !self.partition_writers.contains_key(&key) {
                 self.create_writer(key.0.clone(), key.1).await?;
@@ -1015,6 +1016,27 @@ impl TableWrite {
             self.fail_write().await;
         }
         result
+    }
+
+    /// Resolved filesystem handles must name an existing branch schema before
+    /// creating output. Main and REST tables retain their established metadata path.
+    async fn ensure_branch_schema_exists(&mut self) -> Result<()> {
+        if self.branch_schema_checked {
+            return Ok(());
+        }
+        let schema_path = self.table.schema_manager().schema_path(self.schema_id);
+        if !self.table.file_io().exists(&schema_path).await? {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Branch '{}' does not contain schema {}.",
+                    self.table.branch(),
+                    self.schema_id
+                ),
+                source: None,
+            });
+        }
+        self.branch_schema_checked = true;
+        Ok(())
     }
 
     /// Routing can update persistent bucket-index state before it fails, just

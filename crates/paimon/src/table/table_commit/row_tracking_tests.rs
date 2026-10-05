@@ -244,6 +244,7 @@ impl SnapshotCommit for ConcurrentRowTrackingAppend {
         &self,
         _: Option<&str>,
         snapshot: &Snapshot,
+        _: &str,
         _: &[PartitionStatistics],
     ) -> Result<bool> {
         let first = {
