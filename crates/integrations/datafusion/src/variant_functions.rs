@@ -29,7 +29,10 @@ use datafusion::logical_expr::{
     Volatility,
 };
 use datafusion::prelude::SessionContext;
-use paimon::variant::{GenericVariant, VariantDecimal, VariantKind, VariantRef};
+use paimon::variant::{
+    format_variant_date, format_variant_timestamp, GenericVariant, VariantDecimal, VariantKind,
+    VariantRef,
+};
 
 pub fn register_variant_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(ParseJsonFunc::new(false)));
@@ -520,10 +523,18 @@ fn cast_to_string(variant: VariantRef<'_>) -> DFResult<String> {
     match variant.kind().map_err(to_df_error)? {
         VariantKind::Object | VariantKind::Array => variant.to_json().map_err(to_df_error),
         VariantKind::Boolean => Ok(variant.get_boolean().map_err(to_df_error)?.to_string()),
-        VariantKind::Long
-        | VariantKind::Date
-        | VariantKind::Timestamp
-        | VariantKind::TimestampNtz => Ok(variant.get_long().map_err(to_df_error)?.to_string()),
+        VariantKind::Long => Ok(variant.get_long().map_err(to_df_error)?.to_string()),
+        VariantKind::Date => {
+            format_variant_date(variant.get_long().map_err(to_df_error)?).ok_or_else(invalid_cast)
+        }
+        VariantKind::Timestamp => {
+            format_variant_timestamp(variant.get_long().map_err(to_df_error)?, true)
+                .ok_or_else(invalid_cast)
+        }
+        VariantKind::TimestampNtz => {
+            format_variant_timestamp(variant.get_long().map_err(to_df_error)?, false)
+                .ok_or_else(invalid_cast)
+        }
         VariantKind::String => variant.get_string().map_err(to_df_error),
         VariantKind::Double => Ok(variant.get_double().map_err(to_df_error)?.to_string()),
         VariantKind::Decimal => Ok(variant

@@ -1124,6 +1124,48 @@ fn non_finite_json_token(d: f64) -> &'static str {
     }
 }
 
+/// Append `s` to `out` as a quoted, escaped JSON string.
+fn push_json_string(out: &mut String, s: &str) -> Result<()> {
+    out.push_str(&serde_json::to_string(s).map_err(|e| Error::DataInvalid {
+        message: "Failed to stringify Variant value".to_string(),
+        source: Some(Box::new(e)),
+    })?);
+    Ok(())
+}
+
+/// Render a Variant DATE (days since the Unix epoch) as an ISO-8601 date,
+/// matching Java `GenericVariantUtil` (`LocalDate.ofEpochDay(..).toString()`).
+pub fn format_variant_date(days: i64) -> Option<String> {
+    let date = chrono::DateTime::from_timestamp(days.checked_mul(86_400)?, 0)?.date_naive();
+    Some(date.to_string())
+}
+
+/// Render a Variant TIMESTAMP/TIMESTAMP_NTZ (microseconds since the Unix epoch)
+/// as `YYYY-MM-DD HH:MM:SS[.fff[fff]]`, matching Java's `TIMESTAMP_NTZ_FORMATTER`
+/// (`ISO_LOCAL_DATE` + ' ' + `ISO_LOCAL_TIME`) anchored to UTC. The fractional
+/// part uses 0, 3 or 6 digits like Java's ISO time formatter. When `with_offset`
+/// is set the UTC offset `+00:00` is appended, matching `TIMESTAMP_FORMATTER`.
+///
+/// Note: Java renders a local-zoned TIMESTAMP in the caller-supplied zone, but
+/// `GenericVariant::to_json` here takes no `ZoneId`, so local-zoned timestamps
+/// are rendered in UTC. TIMESTAMP_NTZ is UTC in Java too, so it matches exactly.
+pub fn format_variant_timestamp(micros: i64, with_offset: bool) -> Option<String> {
+    let secs = micros.div_euclid(1_000_000);
+    let sub_micros = micros.rem_euclid(1_000_000) as u32;
+    let naive = chrono::DateTime::from_timestamp(secs, sub_micros * 1_000)?.naive_utc();
+    let mut rendered = if sub_micros == 0 {
+        naive.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else if sub_micros.is_multiple_of(1_000) {
+        naive.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    } else {
+        naive.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+    };
+    if with_offset {
+        rendered.push_str("+00:00");
+    }
+    Some(rendered)
+}
+
 fn write_json(value: &[u8], metadata: &[u8], pos: usize, out: &mut String) -> Result<()> {
     match value_kind(value, pos)? {
         VariantKind::Object => {
@@ -1215,15 +1257,31 @@ fn write_json(value: &[u8], metadata: &[u8], pos: usize, out: &mut String) -> Re
                 }
             })?,
         ),
-        VariantKind::Date | VariantKind::Timestamp | VariantKind::TimestampNtz => {
-            out.push_str(
-                &serde_json::to_string(&get_long(value, pos)?.to_string()).map_err(|e| {
-                    Error::DataInvalid {
-                        message: "Failed to stringify Variant value".to_string(),
-                        source: Some(Box::new(e)),
-                    }
-                })?,
-            );
+        VariantKind::Date => {
+            let days = get_long(value, pos)?;
+            let rendered = format_variant_date(days).ok_or_else(|| Error::DataInvalid {
+                message: format!("Variant DATE value out of range: {days}"),
+                source: None,
+            })?;
+            push_json_string(out, &rendered)?;
+        }
+        VariantKind::Timestamp => {
+            let micros = get_long(value, pos)?;
+            let rendered =
+                format_variant_timestamp(micros, true).ok_or_else(|| Error::DataInvalid {
+                    message: format!("Variant TIMESTAMP value out of range: {micros}"),
+                    source: None,
+                })?;
+            push_json_string(out, &rendered)?;
+        }
+        VariantKind::TimestampNtz => {
+            let micros = get_long(value, pos)?;
+            let rendered =
+                format_variant_timestamp(micros, false).ok_or_else(|| Error::DataInvalid {
+                    message: format!("Variant TIMESTAMP_NTZ value out of range: {micros}"),
+                    source: None,
+                })?;
+            push_json_string(out, &rendered)?;
         }
     }
     Ok(())
@@ -2838,10 +2896,10 @@ fn cast_variant_to_string(variant: VariantRef<'_>) -> Option<String> {
     match variant.kind().ok()? {
         VariantKind::Object | VariantKind::Array => variant.to_json().ok(),
         VariantKind::Boolean => Some(variant.get_boolean().ok()?.to_string()),
-        VariantKind::Long
-        | VariantKind::Date
-        | VariantKind::Timestamp
-        | VariantKind::TimestampNtz => Some(variant.get_long().ok()?.to_string()),
+        VariantKind::Long => Some(variant.get_long().ok()?.to_string()),
+        VariantKind::Date => format_variant_date(variant.get_long().ok()?),
+        VariantKind::Timestamp => format_variant_timestamp(variant.get_long().ok()?, true),
+        VariantKind::TimestampNtz => format_variant_timestamp(variant.get_long().ok()?, false),
         VariantKind::String => variant.get_string().ok(),
         VariantKind::Double => Some(variant.get_double().ok()?.to_string()),
         VariantKind::Decimal => Some(variant.get_decimal().ok()?.to_plain_string()),
@@ -3591,6 +3649,66 @@ mod tests {
         // Finite values are unchanged (still bare JSON numbers).
         let finite = GenericVariant::parse_json("1.5").unwrap();
         assert_eq!(finite.to_json().unwrap(), "1.5");
+    }
+
+    #[test]
+    fn to_json_renders_date_and_timestamp_like_java() {
+        // DATE: days since the Unix epoch -> ISO date, like Java
+        // `LocalDate.ofEpochDay(..).toString()` (was emitted as a raw integer).
+        let mut date = VariantBuilder::new();
+        date.append_date(19_723); // 2024-01-01
+        assert_eq!(date.result().unwrap().to_json().unwrap(), r#""2024-01-01""#);
+
+        // TIMESTAMP_NTZ: micros since the epoch, rendered in UTC with no offset,
+        // matching Java `TIMESTAMP_NTZ_FORMATTER`.
+        let mut ntz = VariantBuilder::new();
+        ntz.append_timestamp_ntz(1_704_067_200_000_000); // 2024-01-01 00:00:00 UTC
+        assert_eq!(
+            ntz.result().unwrap().to_json().unwrap(),
+            r#""2024-01-01 00:00:00""#
+        );
+
+        // TIMESTAMP (local-zoned): same instant, UTC offset appended, matching
+        // Java `TIMESTAMP_FORMATTER` (zone defaults to UTC here, see note).
+        let mut ts = VariantBuilder::new();
+        ts.append_timestamp(1_704_067_200_000_000);
+        assert_eq!(
+            ts.result().unwrap().to_json().unwrap(),
+            r#""2024-01-01 00:00:00+00:00""#
+        );
+
+        // Sub-second micros use 3 or 6 fractional digits like Java ISO_LOCAL_TIME.
+        let mut millis = VariantBuilder::new();
+        millis.append_timestamp_ntz(1_704_067_200_123_000);
+        assert_eq!(
+            millis.result().unwrap().to_json().unwrap(),
+            r#""2024-01-01 00:00:00.123""#
+        );
+        let mut micros = VariantBuilder::new();
+        micros.append_timestamp_ntz(1_704_067_200_123_456);
+        assert_eq!(
+            micros.result().unwrap().to_json().unwrap(),
+            r#""2024-01-01 00:00:00.123456""#
+        );
+    }
+
+    #[test]
+    fn cast_variant_to_string_formats_date_and_timestamp() {
+        // variant -> VARCHAR extraction shares the temporal formatting, so a
+        // DATE/TIMESTAMP must not come out as a raw integer either.
+        let mut date = VariantBuilder::new();
+        date.append_date(19_723);
+        assert_eq!(
+            cast_variant_to_string(date.result().unwrap().as_ref().unwrap()).as_deref(),
+            Some("2024-01-01")
+        );
+
+        let mut ntz = VariantBuilder::new();
+        ntz.append_timestamp_ntz(1_704_067_200_000_000);
+        assert_eq!(
+            cast_variant_to_string(ntz.result().unwrap().as_ref().unwrap()).as_deref(),
+            Some("2024-01-01 00:00:00")
+        );
     }
 
     #[test]
