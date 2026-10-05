@@ -896,7 +896,12 @@ impl DataEvolutionReader {
                 Vec::new()
             },
             true,
-            HashSet::new(),
+            // View structs are physically inline even during the unresolved
+            // prescan. They must come from normal Parquet column providers.
+            self.blob_view_fields
+                .union(&self.blob_descriptor_fields)
+                .cloned()
+                .collect(),
             HashSet::new(),
             false,
             None,
@@ -964,7 +969,8 @@ impl DataEvolutionReader {
         // whose values would be transformed by resolution.
         let read_type = self.wide_file_read_type.clone();
         let table_fields = self.table_fields.clone();
-        let blob_descriptor_fields = self.blob_descriptor_fields.clone();
+        let mut blob_inline_fields = self.blob_descriptor_fields.clone();
+        blob_inline_fields.extend(self.blob_view_fields.iter().cloned());
         let blob_as_descriptor = self.blob_as_descriptor;
         let blob_parallelism = self.blob_parallelism;
         let batch_size = self.effective_batch_size();
@@ -994,7 +1000,7 @@ impl DataEvolutionReader {
                 &file_infos,
                 &read_type,
                 &table_fields,
-                &blob_descriptor_fields,
+                &blob_inline_fields,
                 row_ranges.is_some(),
                 nested_enabled,
             )?;

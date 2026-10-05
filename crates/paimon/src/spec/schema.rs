@@ -17,10 +17,10 @@
 
 use crate::spec::core_options::{
     first_row_supports_changelog_producer, ChangelogProducer, CoreOptions, MergeEngine,
-    BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION, BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION,
-    CHANGELOG_PRODUCER_OPTION, INDEX_FILE_IN_DATA_FILE_DIR_OPTION, POSTPONE_BUCKET,
-    QUERY_AUTH_ENABLED_OPTION, SEQUENCE_FIELD_OPTION, TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION,
-    TABLE_TYPE_OPTION,
+    BLOB_DESCRIPTOR_FIELD_FALLBACK, BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION,
+    BLOB_VIEW_FIELD_OPTION, BUCKET_KEY_OPTION, CHANGELOG_PRODUCER_OPTION,
+    INDEX_FILE_IN_DATA_FILE_DIR_OPTION, POSTPONE_BUCKET, QUERY_AUTH_ENABLED_OPTION,
+    SEQUENCE_FIELD_OPTION, TABLE_READ_SEQUENCE_NUMBER_ENABLED_OPTION, TABLE_TYPE_OPTION,
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
 use crate::spec::{
@@ -516,6 +516,9 @@ impl TableSchema {
                             message: "Cannot drop all fields in table".to_string(),
                         });
                     }
+                    if fields[idx].data_type().is_blob_file_field() {
+                        remove_blob_field_options(&mut new_schema.options, name);
+                    }
                     fields.remove(idx);
                     // Drop the column's field-scoped aggregation options so no
                     // orphaned `fields.<col>.*` keys remain (which would otherwise
@@ -978,8 +981,44 @@ fn match_blob_comment_directive(comment: &str) -> Option<(&'static str, &'static
 }
 
 fn append_csv_option(options: &mut HashMap<String, String>, key: &'static str, field_name: &str) {
+    // Java ColumnDirectiveUtils.modifyFieldOptions migrates the fallback
+    // before adding a canonical entry so existing descriptor fields survive.
+    if key == BLOB_DESCRIPTOR_FIELD_OPTION && options.get(key).is_none_or(String::is_empty) {
+        if let Some(value) = options.remove(BLOB_DESCRIPTOR_FIELD_FALLBACK) {
+            options.insert(key.to_string(), value);
+        }
+    }
     let value = append_csv_field(options.get(key).map(String::as_str), field_name);
     options.insert(key.to_string(), value);
+}
+
+fn remove_blob_field_options(options: &mut HashMap<String, String>, field_name: &str) {
+    for key in [
+        BLOB_FIELD_OPTION,
+        BLOB_DESCRIPTOR_FIELD_OPTION,
+        BLOB_DESCRIPTOR_FIELD_FALLBACK,
+        BLOB_VIEW_FIELD_OPTION,
+    ] {
+        let Some(value) = options.get(key) else {
+            continue;
+        };
+        // An exact empty canonical value disables fallback keys in Java.
+        // Dropping an unrelated column must preserve that override.
+        if value.is_empty() {
+            continue;
+        }
+        let retained = value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != field_name)
+            .collect::<Vec<_>>()
+            .join(",");
+        if retained.is_empty() {
+            options.remove(key);
+        } else {
+            options.insert(key.to_string(), retained);
+        }
+    }
 }
 
 fn append_csv_field(existing: Option<&str>, field_name: &str) -> String {
@@ -3258,7 +3297,11 @@ mod tests {
             );
         }
 
-        for option in ["blob-descriptor-field", "blob-view-field"] {
+        for option in [
+            "blob-descriptor-field",
+            "blob.stored-descriptor-fields",
+            "blob-view-field",
+        ] {
             let result = Schema::builder()
                 .column("id", DataType::Int(IntType::new()))
                 .column(
@@ -3432,6 +3475,100 @@ mod tests {
                 .map(String::as_str),
             Some("thumb,preview")
         );
+    }
+
+    #[test]
+    fn blob_descriptor_fallback_survives_column_directives_and_drop() {
+        for canonical in [None, Some(""), Some("thumb")] {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("thumb", DataType::Blob(BlobType::new()))
+                .option("blob.stored-descriptor-fields", "thumb")
+                .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true");
+            if let Some(value) = canonical {
+                builder = builder.option("blob-descriptor-field", value);
+            }
+            let original = TableSchema::new(0, &builder.build().unwrap());
+            let schema = original
+                .apply_changes(vec![crate::spec::SchemaChange::AddColumn {
+                    field_names: vec!["preview".into()],
+                    data_type: DataType::Blob(BlobType::new()),
+                    comment: Some("__BLOB_DESCRIPTOR_FIELD".into()),
+                    column_move: None,
+                }])
+                .unwrap();
+            assert_eq!(
+                schema.core_options().blob_descriptor_fields(),
+                HashSet::from(["thumb".into(), "preview".into()])
+            );
+            if canonical != Some("thumb") {
+                assert!(!schema
+                    .options()
+                    .contains_key("blob.stored-descriptor-fields"));
+            }
+            let schema = schema
+                .apply_changes(vec![crate::spec::SchemaChange::drop_column("thumb".into())])
+                .unwrap();
+            assert_eq!(
+                schema.core_options().blob_descriptor_fields(),
+                HashSet::from(["preview".into()])
+            );
+            assert!(!schema
+                .options()
+                .contains_key("blob.stored-descriptor-fields"));
+            assert_eq!(original.fields()[1].name(), "thumb");
+            assert_eq!(
+                original
+                    .options()
+                    .get("blob.stored-descriptor-fields")
+                    .unwrap(),
+                "thumb"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_descriptor_fallback_promotes_binary_and_rejects_keys() {
+        let builder = || {
+            Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column(
+                    "payload",
+                    DataType::VarBinary(
+                        crate::spec::VarBinaryType::new(crate::spec::VarBinaryType::DEFAULT_LENGTH)
+                            .unwrap(),
+                    ),
+                )
+                .option("blob.stored-descriptor-fields", "payload")
+                .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
+        };
+        assert!(matches!(
+            builder().build().unwrap().fields()[1].data_type(),
+            DataType::Blob(_)
+        ));
+        let error = builder().partition_keys(["payload"]).build().unwrap_err();
+        assert!(error.to_string().contains("partition keys"), "{error}");
+    }
+
+    #[test]
+    fn dropping_unrelated_blob_keeps_empty_descriptor_override() {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("keep", DataType::Blob(BlobType::new()))
+            .column("drop", DataType::Blob(BlobType::new()))
+            .option("blob-descriptor-field", "")
+            .option("blob.stored-descriptor-fields", "keep")
+            .option("data-evolution.enabled", "true")
+            .option("row-tracking.enabled", "true")
+            .build()
+            .unwrap();
+        let changed = TableSchema::new(0, &schema)
+            .apply_changes(vec![crate::spec::SchemaChange::drop_column("drop".into())])
+            .unwrap();
+        assert_eq!(changed.options().get("blob-descriptor-field").unwrap(), "");
+        assert!(changed.core_options().blob_descriptor_fields().is_empty());
     }
 
     #[test]

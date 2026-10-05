@@ -180,6 +180,7 @@ const DEFAULT_BTREE_INDEX_HIGH_PRIORITY_POOL_RATIO: f64 = 0.1;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
 pub(crate) const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
+pub(crate) const BLOB_DESCRIPTOR_FIELD_FALLBACK: &str = "blob.stored-descriptor-fields";
 pub(crate) const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
 pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
 const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
@@ -1788,7 +1789,13 @@ impl<'a> CoreOptions<'a> {
     /// Comma-separated BLOB field names stored as serialized BlobDescriptor
     /// bytes inline in normal data files (no .blob files for these fields).
     pub fn blob_descriptor_fields(&self) -> HashSet<String> {
-        self.parse_csv_set(BLOB_DESCRIPTOR_FIELD_OPTION)
+        // Java ConfigOption.withFallbackKeys: presence of the canonical key,
+        // including an empty value, takes precedence over the fallback key.
+        Self::parse_csv_value(
+            self.options
+                .get(BLOB_DESCRIPTOR_FIELD_OPTION)
+                .or_else(|| self.options.get(BLOB_DESCRIPTOR_FIELD_FALLBACK)),
+        )
     }
 
     /// Comma-separated BLOB field names stored as serialized BlobViewStruct
@@ -1816,8 +1823,11 @@ impl<'a> CoreOptions<'a> {
     }
 
     fn parse_csv_set(&self, option_name: &'static str) -> HashSet<String> {
-        self.options
-            .get(option_name)
+        Self::parse_csv_value(self.options.get(option_name))
+    }
+
+    fn parse_csv_value(value: Option<&String>) -> HashSet<String> {
+        value
             .map(|s| {
                 s.split(',')
                     .map(str::trim)
@@ -3604,6 +3614,34 @@ mod tests {
             "false".to_string(),
         )]);
         assert!(!CoreOptions::new(&disabled).blob_view_resolve_enabled());
+    }
+
+    #[test]
+    fn blob_descriptor_fallback_obeys_canonical_presence() {
+        for (canonical, expected) in [
+            (None, vec!["a", "b"]),
+            (Some("current"), vec!["current"]),
+            (Some(""), vec![]),
+            (Some(" , "), vec![]),
+        ] {
+            let mut options = HashMap::from([
+                ("blob.stored-descriptor-fields".into(), " a, b,a, ".into()),
+                ("blob-view-field".into(), "view".into()),
+            ]);
+            if let Some(value) = canonical {
+                options.insert("blob-descriptor-field".into(), value.into());
+            }
+            let core = CoreOptions::new(&options);
+            let descriptors = expected
+                .into_iter()
+                .map(String::from)
+                .collect::<HashSet<_>>();
+            assert_eq!(core.blob_descriptor_fields(), descriptors);
+            let mut inline = descriptors;
+            inline.insert("view".into());
+            assert_eq!(core.blob_inline_fields(), inline);
+            assert_eq!(core.blob_fields(), inline);
+        }
     }
 
     #[test]

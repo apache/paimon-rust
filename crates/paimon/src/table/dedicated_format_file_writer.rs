@@ -141,7 +141,7 @@ impl AppendDedicatedFormatFileWriter {
         }
 
         let normal_schema = Arc::new(arrow_schema::Schema::new(normal_arrow_fields));
-        let normal_field_names = normal_table_fields
+        let normal_field_names: Vec<String> = normal_table_fields
             .iter()
             .map(|field| field.name().to_string())
             .collect();
@@ -180,15 +180,12 @@ impl AppendDedicatedFormatFileWriter {
         };
 
         let core_options = CoreOptions::new(format_options);
-        // Full append writes include all normal fields in schema order. Partial
-        // column writers must retain their explicit write_cols instead.
-        let normal_write_cols = if core_options.data_evolution_enabled()
-            && core_options.data_evolution_write_cols_optimization_enabled()
-        {
-            None
-        } else {
-            Some(normal_field_names)
-        };
+        let normal_write_cols = (!super::data_evolution_fields::can_omit_normal_write_cols(
+            table_fields,
+            &normal_field_names,
+            &core_options,
+        ))
+        .then_some(normal_field_names);
         let normal_index =
             super::data_file_index_writer::FileIndexOptions::parse(format_options, table_fields)?
                 .and_then(|options| options.project_to_fields(&normal_table_fields))
