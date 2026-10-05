@@ -452,6 +452,82 @@ impl SnapshotManager {
         Ok(result)
     }
 
+    /// Returns the snapshot whose watermark is earlier than or equal to the given
+    /// `watermark`. Snapshots without a watermark — `None`, or `Some(i64::MIN)`,
+    /// Flink's no-watermark sentinel — are skipped. If no snapshot carries a
+    /// watermark at or below the target, returns None.
+    ///
+    /// Uses binary search over the actual snapshot ID list to handle gaps from
+    /// deleted snapshots; watermarks are non-decreasing in snapshot order. The
+    /// latest (highest-id) snapshot whose own effective watermark satisfies the
+    /// predicate is returned — the mirror of `later_or_equal_watermark`.
+    ///
+    /// Reference: [SnapshotManager.earlierOrEqualWatermark](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/SnapshotManager.java).
+    pub async fn earlier_or_equal_watermark(
+        &self,
+        watermark: i64,
+    ) -> crate::Result<Option<Snapshot>> {
+        fn effective_watermark(snapshot: &Snapshot) -> Option<i64> {
+            snapshot.watermark().filter(|w| *w != i64::MIN)
+        }
+
+        let ids = self.list_all_ids().await?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+
+        // Find the first snapshot that carries a watermark.
+        let mut lo: usize = 0;
+        let first_watermark = loop {
+            if lo >= ids.len() {
+                return Ok(None);
+            }
+            let snapshot = self.get_snapshot(ids[lo]).await?;
+            if let Some(w) = effective_watermark(&snapshot) {
+                break w;
+            }
+            lo += 1;
+        };
+        // Even the earliest watermark already exceeds the target: nothing qualifies.
+        if first_watermark > watermark {
+            return Ok(None);
+        }
+
+        let mut hi: usize = ids.len() - 1;
+        let mut result: Option<Snapshot> = None;
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            // A snapshot without a watermark takes the ordering position of the
+            // nearest earlier snapshot that carries one.
+            let mut pos = mid;
+            let mut snapshot = self.get_snapshot(ids[pos]).await?;
+            while effective_watermark(&snapshot).is_none() && pos > lo {
+                pos -= 1;
+                snapshot = self.get_snapshot(ids[pos]).await?;
+            }
+            match effective_watermark(&snapshot) {
+                // No watermark-bearing snapshot in [lo, mid]: skip the range.
+                None => lo = mid + 1,
+                Some(w) if w > watermark => {
+                    if pos == 0 {
+                        break;
+                    }
+                    hi = pos - 1;
+                }
+                Some(w) if w < watermark => {
+                    result = Some(snapshot);
+                    lo = mid + 1;
+                }
+                // Exact match: no later snapshot can be closer to the target.
+                Some(_) => {
+                    result = Some(snapshot);
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Returns the snapshot whose commit time is earlier than or equal to the given
     /// `timestamp_millis`. If no such snapshot exists, returns None.
     ///
@@ -806,6 +882,94 @@ mod tests {
         assert_eq!(pick_watermark(&sm, 150).await, Some(9));
         assert_eq!(pick_watermark(&sm, 300).await, Some(9));
         assert_eq!(pick_watermark(&sm, 301).await, None);
+    }
+
+    async fn pick_earlier_watermark(sm: &SnapshotManager, w: i64) -> Option<i64> {
+        sm.earlier_or_equal_watermark(w)
+            .await
+            .unwrap()
+            .map(|s| s.id())
+    }
+
+    #[tokio::test]
+    async fn test_earlier_or_equal_watermark_empty() {
+        let (_, sm) = setup("memory:/test_earlier_watermark_empty").await;
+        assert!(sm.earlier_or_equal_watermark(100).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_earlier_or_equal_watermark_all_sentinel() {
+        // Snapshots whose watermark is all the no-watermark sentinel never match.
+        let (_, sm) = setup("memory:/test_earlier_watermark_sentinel").await;
+        for id in 1..=3 {
+            sm.commit_snapshot(&test_snapshot_with_watermark(id, Some(i64::MIN)))
+                .await
+                .unwrap();
+        }
+        assert!(sm.earlier_or_equal_watermark(100).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_earlier_or_equal_watermark_picks_latest_match() {
+        let (_, sm) = setup("memory:/test_earlier_watermark_latest").await;
+        for (id, w) in [(1, 100), (2, 200), (3, 200), (4, 300)] {
+            sm.commit_snapshot(&test_snapshot_with_watermark(id, Some(w)))
+                .await
+                .unwrap();
+        }
+
+        // Earlier than every watermark: no match.
+        assert_eq!(pick_earlier_watermark(&sm, 50).await, None);
+        assert_eq!(pick_earlier_watermark(&sm, 100).await, Some(1));
+        assert_eq!(pick_earlier_watermark(&sm, 150).await, Some(1));
+        // Equal watermarks select the first matching snapshot the search lands on.
+        assert_eq!(pick_earlier_watermark(&sm, 200).await, Some(2));
+        assert_eq!(pick_earlier_watermark(&sm, 250).await, Some(3));
+        assert_eq!(pick_earlier_watermark(&sm, 300).await, Some(4));
+        assert_eq!(pick_earlier_watermark(&sm, 301).await, Some(4));
+    }
+
+    #[tokio::test]
+    async fn test_earlier_or_equal_watermark_skips_missing_watermarks() {
+        let (_, sm) = setup("memory:/test_earlier_watermark_skip_none").await;
+        sm.commit_snapshot(&test_snapshot_with_watermark(1, None))
+            .await
+            .unwrap();
+        sm.commit_snapshot(&test_snapshot_with_watermark(2, Some(200)))
+            .await
+            .unwrap();
+        sm.commit_snapshot(&test_snapshot_with_watermark(3, None))
+            .await
+            .unwrap();
+        sm.commit_snapshot(&test_snapshot_with_watermark(4, Some(300)))
+            .await
+            .unwrap();
+
+        assert_eq!(pick_earlier_watermark(&sm, 199).await, None);
+        assert_eq!(pick_earlier_watermark(&sm, 200).await, Some(2));
+        assert_eq!(pick_earlier_watermark(&sm, 250).await, Some(2));
+        assert_eq!(pick_earlier_watermark(&sm, 300).await, Some(4));
+    }
+
+    #[tokio::test]
+    async fn test_earlier_or_equal_watermark_with_id_gaps() {
+        // Deleted snapshots leave holes in the id list; selection must still work.
+        let (_, sm) = setup("memory:/test_earlier_watermark_gaps").await;
+        sm.commit_snapshot(&test_snapshot_with_watermark(2, Some(100)))
+            .await
+            .unwrap();
+        sm.commit_snapshot(&test_snapshot_with_watermark(5, None))
+            .await
+            .unwrap();
+        sm.commit_snapshot(&test_snapshot_with_watermark(9, Some(300)))
+            .await
+            .unwrap();
+
+        assert_eq!(pick_earlier_watermark(&sm, 99).await, None);
+        assert_eq!(pick_earlier_watermark(&sm, 100).await, Some(2));
+        assert_eq!(pick_earlier_watermark(&sm, 150).await, Some(2));
+        assert_eq!(pick_earlier_watermark(&sm, 300).await, Some(9));
+        assert_eq!(pick_earlier_watermark(&sm, 301).await, Some(9));
     }
 
     #[tokio::test]

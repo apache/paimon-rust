@@ -23,6 +23,7 @@
 //! - `CALL sys.rename_tag(table => '...', tag => '...', target_tag => '...')`
 //! - `CALL sys.rollback_to(table => '...', snapshot_id => ... | tag => '...')`
 //! - `CALL sys.rollback_to_timestamp(table => '...', timestamp => ...)`
+//! - `CALL sys.rollback_to_watermark(table => '...', watermark => ...)`
 //! - `CALL sys.create_tag_from_timestamp(table => '...', tag => '...', timestamp => ...)`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'btree')`
 //! - `CALL sys.create_global_index(table => '...', index_column => '...', index_type => 'bitmap')`
@@ -171,6 +172,7 @@ fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
         "rename_tag" => &["table", "tag", "target_tag"],
         "rollback_to" => &["table", "snapshot_id", "tag"],
         "rollback_to_timestamp" => &["table", "timestamp"],
+        "rollback_to_watermark" => &["table", "watermark"],
         "create_tag_from_timestamp" => &["table", "tag", "timestamp"],
         "rename_branch" => &["table", "from_branch", "to_branch"],
         "create_global_index" => &["table", "index_column", "index_type", "options"],
@@ -283,6 +285,9 @@ pub async fn execute_call(
         "rollback_to" => proc_rollback_to(ctx, catalog, catalog_name, &args).await,
         "rollback_to_timestamp" => {
             proc_rollback_to_timestamp(ctx, catalog, catalog_name, &args).await
+        }
+        "rollback_to_watermark" => {
+            proc_rollback_to_watermark(ctx, catalog, catalog_name, &args).await
         }
         "create_tag_from_timestamp" => {
             proc_create_tag_from_timestamp(ctx, catalog, catalog_name, &args).await
@@ -660,6 +665,39 @@ async fn proc_rollback_to_timestamp(
         .await?
         .ok_or_else(|| {
             DataFusionError::Plan(format!("No snapshot found with commit time <= {timestamp}"))
+        })?;
+
+    if let Some(rest_env) = table.rest_env() {
+        rest_env
+            .api()
+            .rollback_to_snapshot(rest_env.identifier(), snapshot.id())
+            .await
+            .map_err(to_datafusion_error)?;
+    } else {
+        clean_larger_than(&sm, &tm, snapshot.id()).await?;
+    }
+    ok_result(ctx)
+}
+
+async fn proc_rollback_to_watermark(
+    ctx: &SessionContext,
+    catalog: &Arc<dyn Catalog>,
+    catalog_name: &str,
+    args: &HashMap<String, String>,
+) -> DFResult<DataFrame> {
+    let table = get_table(catalog, catalog_name, args).await?;
+    let watermark_str = require_arg(args, "watermark")?;
+    let watermark: i64 = watermark_str
+        .parse()
+        .map_err(|_| DataFusionError::Plan(format!("Invalid watermark: '{watermark_str}'")))?;
+
+    let (sm, tm) = managers(&table);
+    let snapshot = sm
+        .earlier_or_equal_watermark(watermark)
+        .await
+        .map_err(to_datafusion_error)?
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("No snapshot found with watermark <= {watermark}"))
         })?;
 
     if let Some(rest_env) = table.rest_env() {

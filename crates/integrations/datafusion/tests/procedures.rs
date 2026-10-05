@@ -1091,6 +1091,25 @@ async fn test_rollback_to_timestamp() {
 }
 
 #[tokio::test]
+async fn test_rollback_to_watermark_without_watermarks() {
+    let (_tmp, sql_context) = setup_table_with_snapshots().await;
+
+    // Snapshots written through the batch path carry no watermark, so no
+    // snapshot qualifies and the procedure surfaces a clear error rather than
+    // silently succeeding.
+    assert_sql_error(
+        &sql_context,
+        "CALL sys.rollback_to_watermark(table => 'test_db.t1', watermark => '100')",
+        "No snapshot found with watermark",
+    )
+    .await;
+
+    // The table is untouched: all three snapshots remain readable.
+    let count = row_count(&sql_context, "SELECT * FROM paimon.test_db.t1").await;
+    assert_eq!(count, 3);
+}
+
+#[tokio::test]
 async fn test_create_tag_from_timestamp() {
     let (_tmp, sql_context) = setup_table_with_snapshots().await;
 
