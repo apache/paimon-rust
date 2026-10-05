@@ -1072,6 +1072,298 @@ async fn test_bounded_range_all_endpoints_and_predicate_orders() {
 }
 
 #[tokio::test]
+async fn test_btree_equality_skips_redundant_not_null() {
+    let (io, path, file, tmp) = setup_testdata_table("btree_int_100_with_nulls.bin");
+    let fields = two_field_schema_fields();
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), true);
+    let data = std::fs::read(tmp.path().join("index").join(&file)).unwrap();
+    let size = data.len() as u64;
+    let reader = crate::btree::BTreeIndexReader::open(
+        Box::new(crate::btree::test_util::BytesFileRead(data.into())),
+        size,
+        &meta,
+        make_key_comparator(fields[0].data_type()),
+    )
+    .await
+    .unwrap();
+    let nulls = reader.null_bitmap().await.unwrap();
+    let non_nulls = reader.all_non_null_rows().await.unwrap();
+    let hits = reader.query_equal(&le_int_key(42)).await.unwrap();
+    assert!(!nulls.is_empty());
+    assert!(!hits.is_empty());
+    assert!(hits.iter().all(|id| !nulls.contains(id)));
+    assert!(reader
+        .query_equal(&le_int_key(43))
+        .await
+        .unwrap()
+        .is_empty());
+    let all_rows = nulls | &non_nulls;
+    let count = all_rows.len() as i64;
+    assert_eq!(all_rows.min(), Some(0));
+    assert_eq!(all_rows.max(), Some(count as u64 - 1));
+    let mut entry = make_global_index_entry(&file, 1, 0, count - 1, &meta);
+    entry.index_file.file_size = size as i64;
+    entry.index_file.row_count = count;
+    let mut other = entry.clone();
+    other
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .index_field_id = 2;
+    // Shift the second field's row mapping so the cross-field filter is observable.
+    other
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .row_range_start = count;
+    other
+        .index_file
+        .global_index_meta
+        .as_mut()
+        .unwrap()
+        .row_range_end = 2 * count - 1;
+    let null_leaf = |column: &str, index, op| Predicate::Leaf {
+        column: column.into(),
+        index,
+        data_type: fields[index].data_type().clone(),
+        op,
+        literals: vec![],
+    };
+    let not_null = null_leaf("id", 0, PredicateOperator::IsNotNull);
+    let hit_ranges = bitmap_to_ranges(&hits);
+    for (name, children, is_or, expected, queries) in [
+        (
+            "hit",
+            vec![int_eq("id", 0, 42), not_null.clone()],
+            false,
+            hit_ranges.clone(),
+            1,
+        ),
+        (
+            "missing_key",
+            vec![int_eq("id", 0, 43), not_null.clone()],
+            false,
+            vec![],
+            1,
+        ),
+        (
+            "outside_metadata",
+            vec![int_eq("id", 0, 999), not_null.clone()],
+            false,
+            vec![],
+            0,
+        ),
+        (
+            "null_contradiction",
+            vec![
+                null_leaf("id", 0, PredicateOperator::IsNull),
+                not_null.clone(),
+            ],
+            false,
+            vec![],
+            2,
+        ),
+        (
+            "different_fields",
+            vec![
+                int_eq("id", 0, 42),
+                null_leaf("value", 1, PredicateOperator::IsNotNull),
+            ],
+            false,
+            vec![],
+            2,
+        ),
+        (
+            "or",
+            vec![int_eq("id", 0, 42), not_null.clone()],
+            true,
+            bitmap_to_ranges(&non_nulls),
+            2,
+        ),
+        (
+            "equality_only",
+            vec![int_eq("id", 0, 42)],
+            false,
+            hit_ranges.clone(),
+            1,
+        ),
+        (
+            "not_equal",
+            vec![
+                Predicate::Leaf {
+                    column: "id".into(),
+                    index: 0,
+                    data_type: fields[0].data_type().clone(),
+                    op: PredicateOperator::NotEq,
+                    literals: vec![Datum::Int(42)],
+                },
+                not_null.clone(),
+            ],
+            false,
+            bitmap_to_ranges(&(&non_nulls - &hits)),
+            2,
+        ),
+    ] {
+        for reverse in [false, true] {
+            let mut children = children.clone();
+            if reverse {
+                children.reverse();
+            }
+            let predicate = if is_or {
+                Predicate::Or(children)
+            } else {
+                Predicate::and(children)
+            };
+            let entries = [entry.clone(), other.clone()];
+            let mut scanner =
+                GlobalIndexScanner::create(&io, &path, 2, i64::MAX, i64::MAX, &entries, &fields)
+                    .unwrap()
+                    .unwrap();
+            let probe = Arc::new(QueryIoProbe::default());
+            scanner.query_io_probe = Some(probe.clone());
+            let result = scanner.evaluate(&predicate).await.unwrap().unwrap();
+            assert_eq!(result.row_ranges, expected, "{name}, reverse={reverse}");
+            assert_eq!(
+                probe.predicate_queries.load(TestOrdering::SeqCst),
+                queries,
+                "{name}, reverse={reverse}"
+            );
+            assert_eq!(probe.range_queries.load(TestOrdering::SeqCst), 0);
+            if name != "different_fields" {
+                assert_eq!(result.indexed_coverage, vec![RowRange::new(0, count - 1)]);
+                assert_eq!(result.evaluated_field_ids, HashSet::from([1]));
+            }
+        }
+    }
+
+    for reverse in [false, true] {
+        let mut children = vec![int_eq("id", 0, 42), not_null.clone()];
+        if reverse {
+            children.reverse();
+        }
+        let predicates = [Predicate::and(children)];
+        let entries = [entry.clone()];
+        let result = super::evaluate_global_index(super::GlobalIndexEvaluation {
+            file_io: &io,
+            table_path: &path,
+            index_entries: &entries,
+            predicates: &predicates,
+            schema_fields: &fields,
+            search_mode: GlobalIndexSearchMode::Full,
+            global_index_thread_num: 2,
+            btree_fallback_scan_max_size: i64::MAX,
+            btree_data_block_cache_size: 0,
+            bitmap_fallback_scan_max_size: i64::MAX,
+            fm_read_options: FMReadOptions::default(),
+            next_row_id: Some(count + 10),
+            data_ranges: &[],
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let mut expected = hit_ranges.clone();
+        expected.push(RowRange::new(count, count + 9));
+        assert_eq!(result, expected);
+    }
+
+    // Simulate INT -> BIGINT evolution against the unchanged INT index keys.
+    let big_type = DataType::BigInt(crate::spec::BigIntType::new());
+    let big_fields = [DataField::new(1, "id".into(), big_type.clone())];
+    for reverse in [false, true] {
+        let mut children = vec![
+            Predicate::Leaf {
+                column: "id".into(),
+                index: 0,
+                data_type: big_type.clone(),
+                op: PredicateOperator::Eq,
+                literals: vec![Datum::Long(42)],
+            },
+            Predicate::Leaf {
+                column: "id".into(),
+                index: 0,
+                data_type: big_type.clone(),
+                op: PredicateOperator::IsNotNull,
+                literals: vec![],
+            },
+        ];
+        if reverse {
+            children.reverse();
+        }
+        let mut scanner = GlobalIndexScanner::create(
+            &io,
+            &path,
+            2,
+            i64::MAX,
+            i64::MAX,
+            std::slice::from_ref(&entry),
+            &big_fields,
+        )
+        .unwrap()
+        .unwrap();
+        let probe = Arc::new(QueryIoProbe::default());
+        scanner.query_io_probe = Some(probe.clone());
+        assert!(scanner
+            .evaluate(&Predicate::and(children))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(probe.predicate_queries.load(TestOrdering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn test_bitmap_equality_keeps_not_null_query() {
+    let (io, path, file, meta, _tmp) = setup_java_bitmap_testdata_table();
+    let fields = string_schema_fields();
+    let entry =
+        make_global_index_entry_with_type(BITMAP_GLOBAL_INDEX_TYPE, &file, 1, 100, 109, &meta);
+    for reverse in [false, true] {
+        let mut children = vec![
+            Predicate::Leaf {
+                column: "name".into(),
+                index: 0,
+                data_type: fields[0].data_type().clone(),
+                op: PredicateOperator::Eq,
+                literals: vec![Datum::String("k2".into())],
+            },
+            Predicate::Leaf {
+                column: "name".into(),
+                index: 0,
+                data_type: fields[0].data_type().clone(),
+                op: PredicateOperator::IsNotNull,
+                literals: vec![],
+            },
+        ];
+        if reverse {
+            children.reverse();
+        }
+        let mut scanner = GlobalIndexScanner::create(
+            &io,
+            &path,
+            2,
+            i64::MAX,
+            i64::MAX,
+            std::slice::from_ref(&entry),
+            &fields,
+        )
+        .unwrap()
+        .unwrap();
+        let probe = Arc::new(QueryIoProbe::default());
+        scanner.query_io_probe = Some(probe.clone());
+        let result = scanner
+            .evaluate(&Predicate::and(children))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.row_ranges, vec![RowRange::new(105, 106)]);
+        assert_eq!(result.indexed_coverage, vec![RowRange::new(100, 109)]);
+        assert_eq!(probe.predicate_queries.load(TestOrdering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
 async fn test_scalar_optimization_query_counts() {
     let (io, path, file, _tmp) = setup_testdata_table("btree_int_100_no_compress.bin");
     let fields = int_schema_fields();
