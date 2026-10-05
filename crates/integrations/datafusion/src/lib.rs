@@ -50,6 +50,7 @@ mod format_table_truncate;
 #[cfg(feature = "fulltext")]
 mod full_text_search;
 mod hybrid_search;
+mod incremental_query;
 mod lateral_vector_search;
 mod memory;
 mod merge_into;

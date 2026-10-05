@@ -3842,6 +3842,11 @@ fn register_table_functions(
     #[cfg(feature = "fulltext")]
     crate::full_text_search::register_full_text_search(ctx, Arc::clone(catalog), default_database);
     crate::hybrid_search::register_hybrid_search(ctx, Arc::clone(catalog), default_database);
+    crate::incremental_query::register_incremental_query(
+        ctx,
+        Arc::clone(catalog),
+        default_database,
+    );
 }
 
 #[cfg(test)]
