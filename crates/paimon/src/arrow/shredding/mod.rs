@@ -120,10 +120,23 @@ pub(crate) fn option_bool(
     let Some(value) = keys.iter().find_map(|key| options.get(*key)) else {
         return Ok(default_value);
     };
-    value.parse::<bool>().map_err(|e| Error::DataInvalid {
-        message: format!("Invalid boolean option value '{value}'"),
-        source: Some(Box::new(e)),
-    })
+    // Match Java's `OptionsUtils.convertToBoolean`: accept "true"/"false"
+    // case-insensitively and reject anything else. Rust's `str::parse::<bool>`
+    // only accepts exact lowercase "true"/"false", so a table property written
+    // by a Java engine such as `variant.inferShreddingSchema=TRUE` would
+    // otherwise fail to parse.
+    if value.eq_ignore_ascii_case("true") {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Ok(false)
+    } else {
+        Err(Error::DataInvalid {
+            message: format!(
+                "Invalid boolean option value '{value}', expected true or false (case insensitive)"
+            ),
+            source: None,
+        })
+    }
 }
 
 pub(crate) fn option_usize(
@@ -152,4 +165,45 @@ pub(crate) fn option_f64(
         message: format!("Invalid double option {key}={value}"),
         source: Some(Box::new(e)),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_option_bool_accepts_case_insensitive_true_false() {
+        for v in ["true", "TRUE", "True", "tRuE"] {
+            let opts = HashMap::from([("k".to_string(), v.to_string())]);
+            assert!(
+                option_bool(&opts, &["k"], false).unwrap(),
+                "value {v} should parse as true"
+            );
+        }
+        for v in ["false", "FALSE", "False"] {
+            let opts = HashMap::from([("k".to_string(), v.to_string())]);
+            assert!(
+                !option_bool(&opts, &["k"], true).unwrap(),
+                "value {v} should parse as false"
+            );
+        }
+    }
+
+    #[test]
+    fn test_option_bool_default_when_absent() {
+        let opts: HashMap<String, String> = HashMap::new();
+        assert!(option_bool(&opts, &["k"], true).unwrap());
+        assert!(!option_bool(&opts, &["k"], false).unwrap());
+    }
+
+    #[test]
+    fn test_option_bool_rejects_non_boolean() {
+        for v in ["yes", "1", "on", ""] {
+            let opts = HashMap::from([("k".to_string(), v.to_string())]);
+            assert!(
+                option_bool(&opts, &["k"], false).is_err(),
+                "value {v:?} should be rejected"
+            );
+        }
+    }
 }
