@@ -74,6 +74,40 @@ def test_branch_snapshots_are_isolated(branch_tables):
     assert empty.list_snapshots() == []
 
 
+@pytest.mark.parametrize("branch", ["blue", "empty"])
+def test_branch_write_commit_keeps_main_history(branch_tables, branch):
+    main, blue, empty = branch_tables
+    table = {"blue": blue, "empty": empty}[branch]
+    root = Path(main.location())
+    main_snapshots = {
+        path.name: path.read_bytes() for path in (root / "snapshot").iterdir()
+    }
+    builder = table.new_batch_write_builder()
+    writer = builder.new_write()
+    writer.write_arrow(pa.record_batch(
+        [[3], ["new"]], schema=pa.schema([("id", pa.int32()), ("dt", pa.string())])
+    ))
+    messages = writer.prepare_commit()
+    assert messages
+    committer = builder.new_commit()
+    committer.commit(messages)
+    writer.close()
+    committer.close()
+
+    assert table.latest_snapshot().id() == (2 if branch == "blue" else 1)
+    for target, expected in ((table, [1, 3] if branch == "blue" else [3]), (main, [1, 2])):
+        reader = target.new_read_builder()
+        batches = reader.new_read().read(reader.new_scan().plan().splits())
+        assert sorted(pa.Table.from_batches(batches).column("id").to_pylist()) == expected
+    assert {
+        path.name: path.read_bytes() for path in (root / "snapshot").iterdir()
+    } == main_snapshots
+    if branch == "blue":
+        assert empty.latest_snapshot() is None
+    else:
+        assert blue.latest_snapshot().id() == 1
+
+
 def test_branch_tags_are_isolated(branch_tables):
     main, blue, empty = branch_tables
     assert [(t.name(), t.snapshot_id()) for t in main.list_tags()] == [("main", 2)]

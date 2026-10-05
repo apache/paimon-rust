@@ -528,12 +528,22 @@ async fn test_select_branch_table_reads_branch_snapshot() {
 
     let branch_table = table.copy_with_branch("b1").await.unwrap();
     let write_builder = branch_table.new_write_builder();
-    assert!(write_builder.new_write().is_err());
+    // Core branch writes are supported. The SQL layer below still validates
+    // branch-qualified DML targets separately.
+    assert!(write_builder.new_write().is_ok());
+    assert!(write_builder.try_new_commit().is_ok());
     assert!(write_builder
         .new_data_evolution_writer(vec!["name".to_string()])
-        .is_err());
-    assert!(write_builder.new_delete().is_err());
-    assert!(write_builder.try_new_commit().is_err());
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("'data-evolution.enabled' = 'true'"));
+    assert!(write_builder
+        .new_delete()
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("'data-evolution.enabled' = 'true'"));
 
     assert_sql_error_contains(
         &sql_context,

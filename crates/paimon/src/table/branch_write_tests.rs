@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use crate::catalog::{Catalog, FileSystemCatalog};
+use crate::io::FileIOBuilder;
 use crate::spec::{DataType, IntType, Schema};
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowType, Field, Schema as ArrowSchema};
@@ -24,12 +24,13 @@ use std::sync::Arc;
 
 async fn table(primary_key: bool, options: &[(&str, &str)]) -> (tempfile::TempDir, Table) {
     let dir = tempfile::tempdir().unwrap();
-    let mut catalog_options = crate::Options::new();
-    catalog_options.set("warehouse", dir.path().to_str().unwrap());
-    let catalog = FileSystemCatalog::new(catalog_options).unwrap();
-    catalog
-        .create_database("db", false, HashMap::new())
-        .await
+    // Scope the real filesystem operator to this temporary directory. OpenDAL's
+    // default root "/" cannot list an absolute path on another Windows drive.
+    let mut config = opendal_service_fs::FsConfig::default();
+    config.root = Some(dir.path().to_str().unwrap().to_string());
+    let file_io = FileIOBuilder::new("file")
+        .with_fs_operator(opendal::Operator::from_config(config).unwrap())
+        .build()
         .unwrap();
     let mut builder = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
@@ -40,12 +41,22 @@ async fn table(primary_key: bool, options: &[(&str, &str)]) -> (tempfile::TempDi
     for (key, value) in options {
         builder = builder.option(*key, *value);
     }
-    let id = Identifier::new("db", "t");
-    catalog
-        .create_table(&id, builder.build().unwrap(), false)
+    let table = Table::new(
+        file_io.clone(),
+        Identifier::new("db", "t"),
+        "file:/db.db/t".into(),
+        TableSchema::new(0, &builder.build().unwrap()),
+        None,
+    );
+    file_io
+        .new_output(&table.schema_manager().schema_path(0))
+        .unwrap()
+        .write(bytes::Bytes::from(
+            serde_json::to_vec(table.schema()).unwrap(),
+        ))
         .await
         .unwrap();
-    (dir, catalog.get_table(&id).await.unwrap())
+    (dir, table)
 }
 
 fn batch(ids: Vec<i32>, values: Vec<i32>) -> RecordBatch {

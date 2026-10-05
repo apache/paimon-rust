@@ -3142,10 +3142,9 @@ async fn test_rest_catalog_manages_policies_end_to_end() {
 #[tokio::test]
 async fn test_branch_write_copy_loads_catalog_schema_without_schema_files() {
     let ctx = setup_catalog(vec!["default"]).await;
-    let tmp = tempfile::tempdir().unwrap();
-    let path = format!("file://{}", tmp.path().display());
+    let path = "memory:/branch-write";
     ctx.server
-        .add_table_with_schema("default", "t", test_schema(), &path);
+        .add_table_with_schema("default", "t", test_schema(), path);
     let branch_schema = Schema::builder()
         .column("id", DataType::Int(IntType::new()))
         .column("value", DataType::Int(IntType::new()))
@@ -3153,7 +3152,7 @@ async fn test_branch_write_copy_loads_catalog_schema_without_schema_files() {
         .build()
         .unwrap();
     ctx.server
-        .add_table_with_schema("default", "t$branch_dev", branch_schema.clone(), &path);
+        .add_table_with_schema("default", "t$branch_dev", branch_schema.clone(), path);
     ctx.server
         .set_table_schema_id("default", "t$branch_dev", branch_schema, 7);
     ctx.server.set_table_uuid("default", "t$branch_dev", "t");
@@ -3196,12 +3195,11 @@ async fn test_branch_write_copy_loads_catalog_schema_without_schema_files() {
 #[tokio::test]
 async fn test_branch_write_copy_rejects_replaced_identity_or_location() {
     let ctx = setup_catalog(vec!["default"]).await;
-    let tmp = tempfile::tempdir().unwrap();
-    let path = format!("file://{}", tmp.path().display());
+    let path = "memory:/branch-identity";
     ctx.server
-        .add_table_with_schema("default", "t", test_schema(), &path);
+        .add_table_with_schema("default", "t", test_schema(), path);
     ctx.server
-        .add_table_with_schema("default", "t$branch_dev", test_schema(), &path);
+        .add_table_with_schema("default", "t$branch_dev", test_schema(), path);
     ctx.server.set_table_uuid("default", "t$branch_dev", "t");
     let main = ctx
         .catalog
