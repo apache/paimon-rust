@@ -89,13 +89,13 @@ class TableRead:
 
 class ReadBuilder:
     def with_read_type(self, read_type_json: str) -> "ReadBuilder":
-        """Set a complete Paimon ROW read type serialized as schema JSON."""
+        """Set the complete structured reader type as Paimon ROW schema JSON.
+        Preserve source field IDs for nested ROW pruning. Field descriptions
+        carry VARIANT extraction and selected-key MAP metadata. Results retain
+        the requested structure; output aliases and flattening belong to callers.
+        """
         ...
     def with_projection(self, columns: List[str]) -> "ReadBuilder": ...
-    def with_nested_projection(self, paths: List[List[str]]) -> "ReadBuilder":
-        """Project top-level fields or nested ROW leaves by exact name paths. A MAP
-        path keeps the complete MAP so the caller can extract literal keys."""
-        ...
     def with_case_sensitive(self, case_sensitive: bool) -> "ReadBuilder":
         """
         Set whether column-name matching (projection and predicate column

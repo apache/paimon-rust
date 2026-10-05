@@ -817,7 +817,6 @@ pub(crate) fn assemble_shredded_variant_batch(
     let mut changed = false;
     let mut columns = Vec::with_capacity(batch.num_columns());
     let mut output_fields = Vec::with_capacity(batch.num_columns());
-    let logical_schema = build_target_arrow_schema(read_fields)?;
 
     for (idx, arrow_field) in schema.fields().iter().enumerate() {
         let column = batch.column(idx);
@@ -829,8 +828,13 @@ pub(crate) fn assemble_shredded_variant_batch(
             if let Some(assembled) =
                 assemble_array_to_logical(column.as_ref(), read_fields[field_idx].data_type())?
             {
+                output_fields.push(
+                    arrow_field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(assembled.data_type().clone()),
+                );
                 columns.push(assembled);
-                output_fields.push(logical_schema.field(field_idx).clone());
                 changed = true;
                 continue;
             }
@@ -901,6 +905,15 @@ pub(crate) fn assemble_variant_extraction_array(
         return Ok(projected);
     }
 
+    let shredded_type = if is_shredded_variant_array(input) {
+        let DataType::Row(row) = arrow_to_paimon_type(input.data_type(), true)? else {
+            unreachable!()
+        };
+        let schema = build_variant_schema(&row)?;
+        Some((row, schema))
+    } else {
+        None
+    };
     let mut values_by_field = vec![Vec::with_capacity(input.len()); fields.len()];
     let mut validities = Vec::with_capacity(input.len());
     for row in 0..input.len() {
@@ -913,24 +926,40 @@ pub(crate) fn assemble_variant_extraction_array(
         }
 
         validities.push(true);
-        let variant = variant_from_storage_row(input, row)?;
+        let shredded = shredded_type
+            .as_ref()
+            .map(|(row_type, _)| struct_row_at(input, row, row_type))
+            .transpose()?
+            .flatten();
+        let variant = if shredded_type.is_none() {
+            variant_from_storage_row(input, row)?
+        } else {
+            None
+        };
         for (field_idx, field) in fields.iter().enumerate() {
             let field_metadata = &metadata[field_idx];
-            let value = match &variant {
-                Some(variant) => match variant.get_path(field_metadata.path()) {
-                    Ok(Some(extracted)) => cast_variant_to_shredded_value(
-                        extracted,
-                        field.data_type(),
-                        field_metadata.fail_on_error(),
-                    )?,
-                    Ok(None) => None,
-                    Err(e) if !field_metadata.fail_on_error() => {
-                        let _ = e;
-                        None
-                    }
-                    Err(e) => return Err(e),
+            let extracted = match (&shredded, &shredded_type) {
+                (Some(shredded), Some((_, schema))) => {
+                    crate::variant::extract_shredded_path(shredded, schema, field_metadata.path())
+                }
+                _ => match &variant {
+                    Some(variant) => variant
+                        .get_path(field_metadata.path())
+                        .and_then(|selected| {
+                            selected.map(|value| value.to_owned_variant()).transpose()
+                        }),
+                    None => Ok(None),
                 },
-                None => None,
+            };
+            let value = match extracted {
+                Ok(Some(extracted)) => cast_variant_to_shredded_value(
+                    extracted.as_ref()?,
+                    field.data_type(),
+                    field_metadata.fail_on_error(),
+                )?,
+                Ok(None) => None,
+                Err(_) if !field_metadata.fail_on_error() => None,
+                Err(error) => return Err(error),
             };
             values_by_field[field_idx].push(value);
         }
@@ -1078,39 +1107,38 @@ fn assemble_row_array_to_logical(
             message: "Variant assembled ROW column must be StructArray".to_string(),
             source: None,
         })?;
-    if input.num_columns() != row_type.fields().len() {
-        return Ok(None);
-    }
-
     let mut changed = false;
     let mut columns = Vec::with_capacity(input.num_columns());
-    for (idx, field) in row_type.fields().iter().enumerate() {
-        if let Some(assembled) =
-            assemble_array_to_logical(input.column(idx).as_ref(), field.data_type())?
-        {
+    let mut fields = Vec::with_capacity(input.num_columns());
+    // Parquet leaf clipping preserves file order. Resolve each logical child
+    // by its physical name and retain that order for field-ID reconciliation.
+    for (physical, column) in input.fields().iter().zip(input.columns()) {
+        let logical = row_type
+            .fields()
+            .iter()
+            .find(|field| field.name() == physical.name());
+        let assembled = logical
+            .map(|field| assemble_array_to_logical(column.as_ref(), field.data_type()))
+            .transpose()?
+            .flatten();
+        if let Some(assembled) = assembled {
+            fields.push(Arc::new(
+                physical
+                    .as_ref()
+                    .clone()
+                    .with_data_type(assembled.data_type().clone()),
+            ));
             columns.push(assembled);
             changed = true;
         } else {
-            columns.push(input.column(idx).clone());
+            fields.push(Arc::clone(physical));
+            columns.push(Arc::clone(column));
         }
     }
-
     if !changed {
         return Ok(None);
     }
-
-    let fields: Fields = row_type
-        .fields()
-        .iter()
-        .map(|field| {
-            Ok(ArrowField::new(
-                field.name(),
-                paimon_type_to_arrow(field.data_type())?,
-                field.data_type().is_nullable(),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into();
+    let fields: Fields = fields.into();
     if fields.is_empty() {
         Ok(Some(Arc::new(StructArray::new_empty_fields(
             input.len(),
@@ -1137,7 +1165,7 @@ fn is_variant_storage_array(array: &dyn Array) -> bool {
             .iter()
             .any(|field| field.name() == name && field.data_type() == &ArrowDataType::Binary)
     };
-    has_binary(VARIANT_VALUE_FIELD_NAME)
+    (has_binary(VARIANT_VALUE_FIELD_NAME) || is_shredded_variant_array(array))
         && has_binary(VARIANT_METADATA_FIELD_NAME)
         && (!is_variant_arrow_fields(fields) || is_shredded_variant_array(array))
 }

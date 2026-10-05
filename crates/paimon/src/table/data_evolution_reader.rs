@@ -1173,6 +1173,15 @@ impl DataEvolutionReader {
                         .unwrap_or_else(|| {
                             arrow_array::new_null_array(target_field.data_type(), rows_to_emit)
                         });
+                    let array = if let Some((source_idx, field_offset)) = provider {
+                        crate::arrow::nested_evolution::evolve_field(
+                            &array,
+                            &source_plan.sources[*source_idx].read_fields()[*field_offset],
+                            &read_type[idx],
+                        )?
+                    } else {
+                        array
+                    };
                     columns.push(array);
                 }
 
@@ -2499,7 +2508,13 @@ fn build_source_plan_with_row_id_pushdown(
                 }
             }
         }
-        let source_idx = if field.data_type().is_blob_file_field()
+        let source_field = table_fields
+            .iter()
+            .find(|source| source.id() == field.id())
+            .filter(|_| crate::spec::is_map_selected_keys_field(field))
+            .filter(|source| source.data_type().is_blob_file_field())
+            .unwrap_or(field);
+        let source_idx = if source_field.data_type().is_blob_file_field()
             && !blob_descriptor_fields.contains(field.name())
         {
             blob_source_indices.get(&field.id()).copied()
@@ -2516,7 +2531,7 @@ fn build_source_plan_with_row_id_pushdown(
         };
 
         if let Some(source_idx) = source_idx {
-            let field_offset = sources[source_idx].add_read_field(field.clone());
+            let field_offset = sources[source_idx].add_read_field(source_field.clone());
             column_plan.push(Some((source_idx, field_offset)));
             nested_plan.push(None);
         } else if !field.data_type().is_nullable() {
@@ -4138,6 +4153,37 @@ mod tests {
         assert!(
             matches!(err, Error::DataInvalid { message, .. } if message.contains("exceeds the expected"))
         );
+    }
+
+    #[test]
+    fn selected_map_blob_uses_the_blob_provider_and_original_map_type() {
+        let map = DataField::new(
+            2,
+            "payload".into(),
+            DataType::Map(crate::spec::MapType::new(
+                DataType::VarChar(crate::spec::VarCharType::string_type()),
+                DataType::Blob(BlobType::new()),
+            )),
+        );
+        let selected = crate::spec::map_selected_keys_field(&map, &["key".into()]).unwrap();
+        let files = vec![
+            data_file("others.parquet", 0, 3, 1, Some(vec!["id"])),
+            data_file("payload.blob", 0, 3, 1, Some(vec!["payload"])),
+        ];
+        let group = PreparedMergeGroup::new(&files).unwrap();
+        let plan = build_source_plan_with_row_id_pushdown(
+            &group,
+            &[resolved_info(vec![1]), resolved_info(vec![2])],
+            &[selected],
+            std::slice::from_ref(&map),
+            &HashSet::new(),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.column_plan, vec![Some((1, 0))]);
+        assert!(matches!(plan.sources[1], FieldSource::BlobBunch { .. }));
+        assert_eq!(plan.sources[1].read_fields(), &[map]);
     }
 
     #[test]

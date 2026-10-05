@@ -38,9 +38,9 @@ use crate::file_index::evaluator::evaluate_file_index;
 use crate::file_index::file_index_result::FileIndexResult;
 use crate::io::FileIO;
 use crate::spec::{
-    is_variant_extraction_row, is_variant_extraction_row_type, BigIntType, CoreOptions, DataField,
-    DataFileMeta, DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate,
-    TinyIntType, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
+    is_variant_extraction_row, BigIntType, CoreOptions, DataField, DataFileMeta,
+    DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate, TinyIntType,
+    SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
     VALUE_KIND_FIELD_NAME,
 };
 use crate::table::schema_manager::SchemaManager;
@@ -124,6 +124,11 @@ pub(super) fn retain_primary_key_conjuncts(
         .iter()
         .filter_map(|p| p.project_field_index_inclusive(&mapping))
         .collect()
+}
+
+fn contains_variant_extraction(field: &DataField) -> bool {
+    crate::spec::is_variant_extraction_row_type(field.data_type())
+        || matches!(field.data_type(), PaimonDataType::Row(row) if row.fields().iter().any(contains_variant_extraction))
 }
 
 fn widen_partial_update_sequence_group_fields(
@@ -397,27 +402,33 @@ impl KeyValueFileReader {
         // File readers run before PK deduplication. Keep Variant values in their
         // logical storage type until the visible row has been selected: a strict
         // extraction must not fail on an older, overwritten version.
+        let aggregate_fields = if self.config.merge_engine == MergeEngine::PartialUpdate {
+            PartialUpdateConfig::new(&self.config.table_options).validated_aggregate_functions(
+                &self.config.table_fields,
+                &self.config.table_primary_keys,
+            )?
+        } else {
+            HashMap::new()
+        };
         let merge_read_type: Vec<DataField> = self
             .config
             .read_type
             .iter()
             .map(|field| {
-                if !is_variant_extraction_row_type(field.data_type()) {
-                    return Ok(field.clone());
-                }
-                self.config
+                let source = self
+                    .config
                     .table_fields
                     .iter()
-                    .find(|source| source.id() == field.id())
-                    .filter(|source| matches!(source.data_type(), PaimonDataType::Variant(_)))
-                    .cloned()
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: format!(
-                            "Variant extraction field '{}' has no matching VARIANT table field",
-                            field.name()
-                        ),
-                        source: None,
-                    })
+                    .find(|source| source.id() == field.id());
+                if let Some(source) = source {
+                    let aggregate = self.config.merge_engine == MergeEngine::Aggregation
+                        || aggregate_fields.contains_key(source.name());
+                    let has_variant = contains_variant_extraction(field);
+                    if field.data_type() != source.data_type() && (has_variant || aggregate) {
+                        return Ok(source.clone());
+                    }
+                }
+                Ok(field.clone())
             })
             .collect::<crate::Result<_>>()?;
 
@@ -818,7 +829,10 @@ impl KeyValueFileReader {
                                     {
                                         assemble_variant_extraction_array(column.as_ref(), row)
                                     }
-                                    _ => Ok(column.clone()),
+                                    _ => {
+                                        let source = merge_read_type.iter().find(|field| field.id() == config.read_type[out_idx].id()).unwrap();
+                                        crate::arrow::nested_evolution::evolve_field(column, source, &config.read_type[out_idx])
+                                    },
                                 }
                             })
                             .collect::<crate::Result<Vec<_>>>()?;

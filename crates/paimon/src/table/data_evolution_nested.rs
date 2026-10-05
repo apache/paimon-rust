@@ -154,7 +154,12 @@ pub(super) fn select_nested_row(
 fn collect_leaf_ids(fields: &[DataField], output: &mut Vec<i32>) {
     for field in fields {
         match field.data_type() {
-            DataType::Row(row) => collect_leaf_ids(row.fields(), output),
+            DataType::Row(row)
+                if !crate::spec::is_variant_extraction_row_type(field.data_type())
+                    && !crate::spec::is_map_selected_keys_field(field) =>
+            {
+                collect_leaf_ids(row.fields(), output)
+            }
             _ => output.push(field.id()),
         }
     }
@@ -223,7 +228,14 @@ pub(super) fn source_read_field(
         .fields()
         .iter()
         .filter(|child| selected_ids.contains(&child.id()))
-        .cloned()
+        .map(|child| {
+            requested_row
+                .fields()
+                .iter()
+                .find(|requested| requested.id() == child.id())
+                .map(|requested| source_child_field(child, requested))
+                .unwrap_or_else(|| child.clone())
+        })
         .collect::<Vec<_>>();
     if children.is_empty() {
         let physical = source_fields
@@ -265,6 +277,38 @@ pub(super) fn source_read_field(
             children,
         )),
     ))
+}
+
+fn source_child_field(current: &DataField, requested: &DataField) -> DataField {
+    if crate::spec::is_variant_extraction_row_type(requested.data_type())
+        || crate::spec::is_map_selected_keys_field(requested)
+    {
+        return requested.clone();
+    }
+    if let (DataType::Row(current_row), DataType::Row(requested_row)) =
+        (current.data_type(), requested.data_type())
+    {
+        let children = current_row
+            .fields()
+            .iter()
+            .map(|child| {
+                requested_row
+                    .fields()
+                    .iter()
+                    .find(|requested| requested.id() == child.id())
+                    .map(|requested| source_child_field(child, requested))
+                    .unwrap_or_else(|| child.clone())
+            })
+            .collect();
+        return super::data_evolution_fields::field_with_type(
+            current,
+            DataType::Row(RowType::with_nullable(
+                current.data_type().is_nullable(),
+                children,
+            )),
+        );
+    }
+    current.clone()
 }
 
 pub(super) fn assemble_nested_row(
@@ -433,6 +477,72 @@ mod tests {
 
     fn row(children: Vec<DataField>) -> DataField {
         field(1, "profile", DataType::Row(RowType::new(children)))
+    }
+
+    #[test]
+    fn synthetic_children_bind_to_the_original_leaf_id_and_keep_metadata() {
+        use crate::spec::{variant_extraction_row, FloatType, MapType, VariantType};
+        let variant = field(30, "payload", DataType::Variant(VariantType::new()));
+        let attrs = field(
+            40,
+            "attrs",
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Int(IntType::new()),
+            )),
+        );
+        let extraction = field(
+            30,
+            "payload",
+            DataType::Row(
+                variant_extraction_row(
+                    true,
+                    [(
+                        DataType::Float(FloatType::new()),
+                        "$.ratio".into(),
+                        true,
+                        "UTC".into(),
+                    )],
+                )
+                .unwrap(),
+            ),
+        );
+        let selected = crate::spec::map_selected_keys_field(&attrs, &["wanted".into()]).unwrap();
+        let current = row(vec![variant.clone(), attrs.clone(), age()]);
+        let requested = row(vec![extraction.clone(), selected.clone()]);
+        let whole = vec![current.clone()];
+        let sources = [PhysicalRowSource {
+            source_index: 0,
+            fields: &whole,
+        }];
+        assert_eq!(
+            select_nested_row(&requested, &sources)
+                .unwrap()
+                .unwrap()
+                .whole_source,
+            Some(0)
+        );
+
+        let newer = vec![row(vec![age()])];
+        let older = vec![row(vec![variant, attrs])];
+        let sources = [
+            PhysicalRowSource {
+                source_index: 0,
+                fields: &newer,
+            },
+            PhysicalRowSource {
+                source_index: 1,
+                fields: &older,
+            },
+        ];
+        let selection = select_nested_row(&requested, &sources).unwrap().unwrap();
+        assert_eq!(selection.children, vec![Some(1), Some(1)]);
+        assert_eq!(selection.whole_source, None);
+        let old_request = source_read_field(&requested, &current, 1, &older, &selection).unwrap();
+        let DataType::Row(old_row) = old_request.data_type() else {
+            panic!()
+        };
+        assert_eq!(old_row.fields(), &[extraction, selected]);
     }
 
     #[test]

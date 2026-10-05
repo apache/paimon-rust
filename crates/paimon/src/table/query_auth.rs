@@ -77,11 +77,10 @@ pub(crate) async fn reject_unauthorized_stats(
             }
             let older = schemas.schema(file.schema_id).await?;
             if let Some(gone) = older.fields().iter().find(|f| {
-                !current.fields().iter().any(|c| {
-                    c.id() == f.id()
-                        && c.name() == f.name()
-                        && contains(c.data_type(), f.data_type())
-                })
+                !current
+                    .fields()
+                    .iter()
+                    .any(|c| c.id() == f.id() && c.name() == f.name() && contains_field(c, f))
             }) {
                 return refuse(gone.name());
             }
@@ -90,17 +89,29 @@ pub(crate) async fn reject_unauthorized_stats(
     Ok(())
 }
 
+fn contains_field(wide: &crate::spec::DataField, narrow: &crate::spec::DataField) -> bool {
+    if let (crate::spec::DataType::Map(map), crate::spec::DataType::Row(row)) =
+        (wide.data_type(), narrow.data_type())
+    {
+        return matches!(map.key_type(), crate::spec::DataType::VarChar(_))
+            && crate::spec::map_selected_keys(narrow).is_ok_and(|keys| keys.is_some())
+            && row
+                .fields()
+                .iter()
+                .all(|child| map.value_type().equals_ignore_nullable(child.data_type()));
+    }
+    contains(wide.data_type(), narrow.data_type())
+}
+
 /// Whether `narrow` reads nothing `wide` lacks: nested children match by id
 /// and name, so a `ROW` projection passes and a re-added child does not.
 fn contains(wide: &crate::spec::DataType, narrow: &crate::spec::DataType) -> bool {
     use crate::spec::DataType;
     match (wide, narrow) {
         (DataType::Row(w), DataType::Row(n)) => n.fields().iter().all(|nf| {
-            w.fields().iter().any(|wf| {
-                wf.id() == nf.id()
-                    && wf.name() == nf.name()
-                    && contains(wf.data_type(), nf.data_type())
-            })
+            w.fields()
+                .iter()
+                .any(|wf| wf.id() == nf.id() && wf.name() == nf.name() && contains_field(wf, nf))
         }),
         (DataType::Array(w), DataType::Array(n)) => contains(w.element_type(), n.element_type()),
         (DataType::Multiset(w), DataType::Multiset(n)) => {
@@ -110,7 +121,9 @@ fn contains(wide: &crate::spec::DataType, narrow: &crate::spec::DataType) -> boo
             contains(w.key_type(), n.key_type()) && contains(w.value_type(), n.value_type())
         }
         // A `variant_get` pushdown reads a `VARIANT` column as a `ROW` of paths.
-        (DataType::Variant(_), DataType::Row(_)) => true,
+        (DataType::Variant(_), DataType::Row(_)) => {
+            crate::spec::is_variant_extraction_row_type(narrow)
+        }
         (w, n) => w == n,
     }
 }
@@ -151,11 +164,9 @@ pub(crate) fn reject_noncanonical_fields(
         }
         // The whole shape: an older field can keep `(id, name)` and carry an
         // extra nested child.
-        let canonical = schema_fields.iter().any(|f| {
-            f.id() == field.id()
-                && f.name() == field.name()
-                && contains(f.data_type(), field.data_type())
-        });
+        let canonical = schema_fields
+            .iter()
+            .any(|f| f.id() == field.id() && f.name() == field.name() && contains_field(f, field));
         if !canonical {
             return Err(unsupported(&format!(
                 "'{}' (field id {}) is not a column of the current schema, which is what the \
@@ -172,6 +183,40 @@ pub(crate) fn reject_noncanonical_fields(
 mod tests {
     use super::reject_system_columns;
     use crate::table::{query_auth_table, rest_query_auth_table};
+
+    #[test]
+    fn authorized_map_allows_only_valid_selected_value_types() {
+        use crate::spec::*;
+        let source = DataField::new(
+            1,
+            "attrs".into(),
+            DataType::Map(MapType::new(
+                DataType::VarChar(VarCharType::string_type()),
+                DataType::Int(IntType::new()),
+            )),
+        );
+        let selected = map_selected_keys_field(&source, &["key".into()]).unwrap();
+        super::reject_noncanonical_fields(
+            std::slice::from_ref(&selected),
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        let forged = selected.clone().with_description(None);
+        assert!(
+            super::reject_noncanonical_fields(&[forged], std::slice::from_ref(&source)).is_err()
+        );
+        let changed = DataField::new(
+            selected.id(),
+            selected.name().into(),
+            DataType::Row(RowType::new(vec![DataField::new(
+                0,
+                "key".into(),
+                DataType::BigInt(BigIntType::new()),
+            )])),
+        )
+        .with_description(selected.description().map(str::to_string));
+        assert!(super::reject_noncanonical_fields(&[changed], &[source]).is_err());
+    }
 
     #[tokio::test]
     async fn test_a_grant_is_pinned_to_the_handle_that_obtained_it() {
@@ -470,7 +515,12 @@ mod tests {
     fn test_a_variant_extraction_is_the_one_shape_change_allowed() {
         use crate::spec::{DataField, DataType, IntType, RowType, VariantType};
         let int = || DataType::Int(IntType::new());
-        let row = || DataType::Row(RowType::new(vec![DataField::new(0, "p".into(), int())]));
+        let row = || {
+            DataType::Row(RowType::new(vec![DataField::new(0, "p".into(), int())
+                .with_description(Some(
+                    crate::spec::build_variant_metadata("$.p", true, "UTC").unwrap(),
+                ))]))
+        };
         let schema = vec![
             DataField::new(1, "v".into(), DataType::Variant(VariantType::new())),
             DataField::new(2, "n".into(), int()),
