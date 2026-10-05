@@ -229,7 +229,7 @@ use crate::spec::{
     SCAN_TIMESTAMP_MILLIS_OPTION, SCAN_TIMESTAMP_OPTION, SCAN_VERSION_OPTION,
     SCAN_WATERMARK_OPTION,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Table represents a table in the catalog.
 #[derive(Debug, Clone)]
@@ -252,6 +252,8 @@ pub struct Table {
     /// options, so scans don't have to resolve the same selector again.
     /// Cleared when [`Table::copy_with_options`] changes the selector.
     travel_snapshot: Option<Snapshot>,
+    /// Explicit options remain overrides across later time-travel copies.
+    applied_dynamic_option_keys: HashSet<String>,
 }
 
 impl Table {
@@ -277,6 +279,7 @@ impl Table {
             rest_env,
             time_traveled: false,
             travel_snapshot: None,
+            applied_dynamic_option_keys: HashSet::new(),
         }
     }
 
@@ -319,6 +322,7 @@ impl Table {
             rest_env: None,
             time_traveled: false,
             travel_snapshot: None,
+            applied_dynamic_option_keys: HashSet::new(),
         })
     }
 
@@ -566,6 +570,8 @@ impl Table {
     /// [`Table::copy_with_time_travel`] when the options may select a
     /// historical snapshot whose schema should be used for reading.
     pub fn copy_with_options(&self, extra: HashMap<String, String>) -> Self {
+        let mut applied_dynamic_option_keys = self.applied_dynamic_option_keys.clone();
+        applied_dynamic_option_keys.extend(extra.keys().cloned());
         // Changing the time-travel selector invalidates the resolved snapshot
         // (a time-travelled schema then has no matching snapshot anymore, and
         // scans of such a copy fail until `copy_with_time_travel` re-resolves
@@ -589,6 +595,7 @@ impl Table {
             query_auth_session: self.query_auth_session,
             rest_env: self.rest_env.clone(),
             time_traveled: self.time_traveled,
+            applied_dynamic_option_keys,
             travel_snapshot: if selector_changed {
                 None
             } else {
@@ -623,6 +630,7 @@ impl Table {
             travel_snapshot: None,
             // Not the schema the catalog loaded, so not a handle it authorizes.
             query_auth_session: None,
+            applied_dynamic_option_keys: HashSet::new(),
             ..self.clone()
         })
     }
@@ -636,11 +644,9 @@ impl Table {
     pub(crate) async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
         let mut table = self.copy_with_pinned_snapshot(snapshot);
         if snapshot.schema_id() != self.schema.id() {
-            table.schema = self
-                .schema_manager
-                .schema(snapshot.schema_id())
-                .await?
-                .copy_with_replaced_options(table.schema.options().clone());
+            let schema = self.schema_manager.schema(snapshot.schema_id()).await?;
+            let options = table.historical_field_options(&schema);
+            table.schema = schema.copy_with_replaced_options(options);
         }
         Ok(table)
     }
@@ -684,7 +690,8 @@ impl Table {
     /// (`scan.version` / `scan.timestamp-millis` / `scan.timestamp` / `scan.watermark` /
     /// `scan.snapshot-id` / `scan.tag-name`) that resolves to a snapshot, the
     /// table's fields and keys come from that snapshot's schema while the
-    /// options stay the merged ones (Java `TableSchema.copy(newOptions)`).
+    /// runtime options stay merged. Column declarations follow the historical
+    /// schema unless explicitly overridden, as in Java.
     /// Like Java, resolution failures fall back silently to the current
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.
@@ -785,13 +792,44 @@ impl Table {
         if let Some(snapshot) = snapshot {
             if snapshot.schema_id() != table.schema.id() {
                 let snapshot_schema = table.schema_manager.schema(snapshot.schema_id()).await?;
-                table.schema =
-                    snapshot_schema.copy_with_replaced_options(table.schema.options().clone());
+                let options = table.historical_field_options(&snapshot_schema);
+                table.schema = snapshot_schema.copy_with_replaced_options(options);
                 table.time_traveled = true;
             }
             table.travel_snapshot = Some(snapshot);
         }
         Ok(table)
+    }
+
+    fn historical_field_options(&self, historical_schema: &TableSchema) -> HashMap<String, String> {
+        use crate::spec::{
+            BLOB_DESCRIPTOR_FIELD_FALLBACK, BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_FIELD_OPTION,
+            BLOB_VIEW_FIELD_OPTION,
+        };
+        let mut options = self.schema.options().clone();
+        // Canonical and fallback keys form one override group in Java
+        // AbstractFileStoreTable.excludeCurrentSchemaFieldOptions.
+        for keys in [
+            &["vector-field"][..],
+            &[BLOB_FIELD_OPTION][..],
+            &[BLOB_DESCRIPTOR_FIELD_OPTION, BLOB_DESCRIPTOR_FIELD_FALLBACK][..],
+            &[BLOB_VIEW_FIELD_OPTION][..],
+        ] {
+            if keys
+                .iter()
+                .any(|key| self.applied_dynamic_option_keys.contains(*key))
+            {
+                continue;
+            }
+            for key in keys {
+                if let Some(value) = historical_schema.options().get(*key) {
+                    options.insert((*key).to_string(), value.clone());
+                } else {
+                    options.remove(*key);
+                }
+            }
+        }
+        options
     }
 
     pub async fn copy_with_branch(&self, branch_name: &str) -> Result<Self> {
@@ -858,6 +896,7 @@ impl Table {
             rest_env: self.rest_env.clone(),
             time_traveled: false,
             travel_snapshot: None,
+            applied_dynamic_option_keys: HashSet::new(),
         })
     }
 

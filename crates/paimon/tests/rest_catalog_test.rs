@@ -1055,6 +1055,70 @@ async fn test_blob_view_limit_only_resolves_selected_references() {
             (3, "Repeated again".to_string(), Some(b"bob".to_vec())),
         ]
     );
+
+    // Partial files force the multi-provider merge and its View prescan.
+    // The invalid, unmatched reference must be copied without resolving it.
+    let replacement = BlobViewStruct::new(source_id, picture_field_id, 0)
+        .serialize()
+        .unwrap();
+    let builder = view.new_write_builder();
+    let update = builder.new_update().unwrap();
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "_ROW_ID",
+            Arc::new(Int64Array::from(vec![0, 1])) as Arc<dyn Array>,
+        ),
+        (
+            "picture",
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(replacement.as_slice()),
+                None,
+            ])) as Arc<dyn Array>,
+        ),
+    ])
+    .unwrap();
+    let messages = update
+        .update_by_arrow_with_row_id(vec![batch])
+        .await
+        .unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "_ROW_ID",
+            Arc::new(Int64Array::from(vec![0])) as Arc<dyn Array>,
+        ),
+        (
+            "name",
+            Arc::new(StringArray::from(vec!["Updated"])) as Arc<dyn Array>,
+        ),
+    ])
+    .unwrap();
+    let messages = update
+        .update_by_arrow_with_row_id(vec![batch])
+        .await
+        .unwrap();
+    builder.new_commit().commit(messages).await.unwrap();
+
+    let mut builder = rest_view.new_read_builder();
+    builder.with_limit(3);
+    let plan = builder.new_scan().plan().await.unwrap();
+    let batches = builder
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_blob_rows(&batches),
+        vec![
+            (1, "Updated".to_string(), Some(b"alice".to_vec())),
+            (2, "Repeated".to_string(), None),
+            (3, "Repeated again".to_string(), Some(b"bob".to_vec())),
+        ]
+    );
 }
 
 #[cfg(not(windows))]

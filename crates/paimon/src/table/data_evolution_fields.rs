@@ -21,7 +21,7 @@
 //! of each selected field. A top-level name takes precedence over splitting at
 //! a dot, because older schemas can contain literal dotted column names.
 
-use crate::spec::{DataField, DataType, RowType};
+use crate::spec::{CoreOptions, DataField, DataType, RowType};
 use crate::{Error, Result};
 use indexmap::IndexMap;
 use std::collections::HashSet;
@@ -30,6 +30,36 @@ use std::collections::HashSet;
 struct PathSelection {
     whole: bool,
     tails: Vec<String>,
+}
+
+/// Java BaseAppendFileStoreWrite.withWriteType omits a full column list.
+/// With the explicit optimization, it can also omit all non-dedicated fields.
+pub(super) fn can_omit_normal_write_cols(
+    fields: &[DataField],
+    written_columns: &[String],
+    options: &CoreOptions<'_>,
+) -> bool {
+    if written_columns
+        .iter()
+        .map(String::as_str)
+        .eq(fields.iter().map(DataField::name))
+    {
+        return true;
+    }
+    if !options.data_evolution_enabled()
+        || !options.data_evolution_write_cols_optimization_enabled()
+    {
+        return false;
+    }
+    let inline = options.blob_inline_fields();
+    let dedicated_vector = options.vector_file_format().is_some();
+    written_columns.iter().map(String::as_str).eq(fields
+        .iter()
+        .filter(|field| {
+            !(field.data_type().is_blob_file_field() && !inline.contains(field.name())
+                || dedicated_vector && matches!(field.data_type(), DataType::Vector(_)))
+        })
+        .map(DataField::name))
 }
 
 pub(super) fn project_by_paths(fields: &[DataField], paths: &[String]) -> Result<Vec<DataField>> {
