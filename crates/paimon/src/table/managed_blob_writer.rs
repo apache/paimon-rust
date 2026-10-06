@@ -357,7 +357,7 @@ impl ManagedBlobWriter {
             );
             let output = self.file_io.new_output(&path)?;
             let writer =
-                Box::new(BlobFormatWriter::new(&output, Some(self.file_io.clone())).await?);
+                Box::new(BlobFormatWriter::new(&output, Some(self.file_io.clone()), None).await?);
             self.uncommitted_paths.push(path.clone());
             self.fields[field_index].current = Some(ManagedBlobPack { path, writer });
         }

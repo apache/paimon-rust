@@ -159,7 +159,9 @@ impl DataEvolutionWriter {
                 });
             }
             if let Some(field) = schema.fields().iter().find(|f| f.name() == top_level) {
-                if field.data_type().is_blob_type() && !updatable_blob_fields.contains(top_level) {
+                if field.data_type().is_blob_file_field()
+                    && !updatable_blob_fields.contains(top_level)
+                {
                     return Err(crate::Error::Unsupported {
                         message: format!(
                             "Cannot update raw-data BLOB column '{col}' in MERGE INTO. \

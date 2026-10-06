@@ -1648,6 +1648,36 @@ impl Schema {
         primary_keys: &[String],
         options: &HashMap<String, String>,
     ) -> crate::Result<()> {
+        let core_options = CoreOptions::new(options);
+        let video_fields = core_options.video_frame_fields();
+        if !video_fields.is_empty() && !primary_keys.is_empty() {
+            return Err(crate::Error::ConfigInvalid {
+                message: "'video-frame-field' only supports append-only tables".into(),
+            });
+        }
+        for name in video_fields {
+            if !fields
+                .iter()
+                .any(|field| field.name() == name && field.data_type().is_blob_type())
+            {
+                return Err(crate::Error::ConfigInvalid { message: format!("Field '{name}' in 'video-frame-field' must be a scalar BLOB field in table schema") });
+            }
+            for (option, names) in [
+                (
+                    "blob-descriptor-field",
+                    core_options.blob_descriptor_fields(),
+                ),
+                ("blob-view-field", core_options.blob_view_fields()),
+            ] {
+                if names.contains(&name) {
+                    return Err(crate::Error::ConfigInvalid {
+                        message: format!(
+                            "Field '{name}' in 'video-frame-field' can not also be in '{option}'"
+                        ),
+                    });
+                }
+            }
+        }
         let blob_field_names = Self::top_level_blob_field_names(fields);
         for field in fields {
             if !Self::is_top_level_blob_file_type(field.data_type())
@@ -1666,7 +1696,6 @@ impl Schema {
             return Ok(());
         }
 
-        let core_options = CoreOptions::new(options);
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
         let blob_view_fields = core_options.blob_view_fields();
         let mut overlapping_fields = blob_view_fields

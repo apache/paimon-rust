@@ -18,6 +18,7 @@
 mod avro;
 mod avro_write;
 pub(crate) mod blob;
+mod delta_varint;
 mod metadata_cache;
 mod mosaic;
 mod mosaic_write;
@@ -27,6 +28,7 @@ mod row;
 mod shredding;
 pub(crate) mod text;
 mod variant_projection;
+pub(crate) mod video;
 #[cfg(feature = "vortex")]
 mod vortex;
 
@@ -396,6 +398,8 @@ pub(crate) fn create_format_reader_with_budget(
             blob::BlobFormatReader::new(path.to_string(), blob_as_descriptor)
                 .with_blob_parallelism(blob_parallelism),
         )
+    } else if lower.ends_with(".video") {
+        Box::new(video::VideoFormatReader::new(path.to_string()))
     } else if lower.ends_with(".orc") {
         Box::new(orc::OrcFormatReader)
     } else if let Some((kind, compression)) = text::TextKind::from_path(path) {
@@ -443,6 +447,7 @@ fn supported_read_formats() -> Vec<&'static str> {
     vec![
         ".parquet",
         ".blob",
+        ".video",
         ".orc",
         ".csv",
         ".json",
@@ -573,7 +578,12 @@ impl FormatWriterFactory for PlainFormatWriterFactory {
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".blob") {
             Ok(Box::new(
-                blob::BlobFormatWriter::new(output, file_io).await?,
+                blob::BlobFormatWriter::new(
+                    output,
+                    file_io,
+                    write_fields.and_then(|fields| fields.first()),
+                )
+                .await?,
             ))
         } else if lower.ends_with(".orc") {
             if !matches!(

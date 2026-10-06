@@ -262,6 +262,11 @@ impl TableWrite {
         let write_schema = build_target_arrow_schema(schema.fields())?;
         let core_options = CoreOptions::new(schema.options());
         let blob_descriptor_fields = core_options.blob_descriptor_fields();
+        if !core_options.video_frame_fields().is_empty() {
+            return Err(crate::Error::Unsupported {
+                message: "Writing packed video files is not supported yet".into(),
+            });
+        }
         let blob_view_fields = core_options.blob_view_fields();
         let blob_inline_fields = core_options.blob_inline_fields();
 
@@ -457,7 +462,7 @@ impl TableWrite {
         let has_blob_fields = schema
             .fields()
             .iter()
-            .any(|f| f.data_type().is_blob_type() && !blob_inline_fields.contains(f.name()));
+            .any(|f| f.data_type().is_blob_file_field() && !blob_inline_fields.contains(f.name()));
         let has_dedicated_vector_fields = vector_file_format.is_some()
             && schema
                 .fields()

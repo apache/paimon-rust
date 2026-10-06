@@ -182,6 +182,7 @@ pub(crate) const BLOB_FIELD_OPTION: &str = "blob-field";
 pub(crate) const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
 pub(crate) const BLOB_DESCRIPTOR_FIELD_FALLBACK: &str = "blob.stored-descriptor-fields";
 pub(crate) const BLOB_VIEW_FIELD_OPTION: &str = "blob-view-field";
+pub(crate) const VIDEO_FRAME_FIELD_OPTION: &str = "video-frame-field";
 pub const BLOB_VIEW_RESOLVE_ENABLED_OPTION: &str = "blob-view.resolve.enabled";
 const PK_VECTOR_INDEX_COLUMNS_OPTION: &str = "pk-vector.index.columns";
 const PK_FULL_TEXT_INDEX_COLUMNS_OPTION: &str = "pk-full-text.index.columns";
@@ -1783,7 +1784,13 @@ impl<'a> CoreOptions<'a> {
         let mut fields = self.parse_csv_set(BLOB_FIELD_OPTION);
         fields.extend(self.blob_descriptor_fields());
         fields.extend(self.blob_view_fields());
+        fields.extend(self.video_frame_fields());
         fields
+    }
+
+    /// Scalar BLOB columns stored as logical frame runs in packed `.video` files.
+    pub fn video_frame_fields(&self) -> HashSet<String> {
+        self.parse_csv_set(VIDEO_FRAME_FIELD_OPTION)
     }
 
     /// Comma-separated BLOB field names stored as serialized BlobDescriptor
