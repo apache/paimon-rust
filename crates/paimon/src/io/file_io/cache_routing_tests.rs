@@ -233,6 +233,25 @@ async fn test_target_errors_are_not_retried_on_origin() {
 }
 
 #[tokio::test]
+async fn test_writes_use_the_target_with_write_policy() {
+    let (origin, cache, file_io) = routed("meta,read,write").await;
+
+    write(&file_io, DATA, b"data").await;
+    write(&file_io, SNAPSHOT, b"{}").await;
+    // A writer checks existence on origin; snapshots are never written through a cache.
+    assert!(file_io.new_output(DATA).unwrap().exists().await.unwrap());
+    assert_eq!(cache.take_requests(), [format!("PUT {DATA_KEY}")]);
+    assert_eq!(
+        origin.take_requests(),
+        [
+            "PUT bkt/db.db/t/snapshot/snapshot-1".to_string(),
+            format!("HEAD {DATA_KEY}")
+        ]
+    );
+    assert_eq!(origin.object(DATA_KEY).unwrap(), "data");
+}
+
+#[tokio::test]
 async fn test_writes_never_use_an_unavailable_target() {
     let (origin, cache, file_io) = routed("meta,read").await;
     cache.set_unavailable(true);

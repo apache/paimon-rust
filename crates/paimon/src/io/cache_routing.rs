@@ -54,13 +54,15 @@ static DATA_FILE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid data file pattern")
 });
 
-/// Operation class of a FileIO request; only `Meta` and `Read` can leave origin.
+/// Operation class of a FileIO request; only `Meta`, `Read` and `Write` can leave origin.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum OpClass {
     /// File status and existence checks, including the size lookup before a cached read.
     Meta,
     Read,
-    /// Writes and their existence checks, listing, deletes, renames, mkdirs, copies.
+    /// Writes of new files, including streaming and multipart writes.
+    Write,
+    /// A writer's existence checks, listing, deletes, renames, mkdirs, copies.
     Origin,
 }
 
@@ -69,6 +71,7 @@ impl OpClass {
         match self {
             Self::Meta => 1,
             Self::Read => 2,
+            Self::Write => 4,
             Self::Origin => 0,
         }
     }
@@ -198,7 +201,7 @@ impl IoCacheRouting {
     pub(crate) fn cache_target(&self, path: &str) -> Option<(usize, OpClasses)> {
         let mut found = None;
         let mut classes = OpClasses::default();
-        for op in [OpClass::Meta, OpClass::Read] {
+        for op in [OpClass::Meta, OpClass::Read, OpClass::Write] {
             if let Target::Cache(index) = self.route(op, path) {
                 found = Some(index);
                 classes.insert(op);
@@ -279,6 +282,7 @@ fn parse_policy(value: Option<&str>) -> OpClasses {
             "none" => return OpClasses::default(),
             "meta" => policy.insert(OpClass::Meta),
             "read" => policy.insert(OpClass::Read),
+            "write" => policy.insert(OpClass::Write),
             _ => {}
         }
     }
@@ -449,8 +453,10 @@ mod tests {
         match name {
             "read" => OpClass::Read,
             "meta" | "exists" => OpClass::Meta,
-            "write" | "list" | "delete" | "rename" | "mkdirs" | "copy" | "atomic-write"
-            | "two-phase-write" | "presign" => OpClass::Origin,
+            "write" | "two-phase-write" => OpClass::Write,
+            "list" | "delete" | "rename" | "mkdirs" | "copy" | "atomic-write" | "presign" => {
+                OpClass::Origin
+            }
             other => panic!("unknown operation {other}"),
         }
     }

@@ -1435,7 +1435,7 @@ impl OutputFile {
     pub async fn writer(&self) -> crate::Result<Box<dyn FileWrite>> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let writer: Box<dyn FileWrite> = Box::new(
-            op.origin_operator()
+            op.operator(OpClass::Write)
                 .writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
                 .await?,
@@ -1454,7 +1454,7 @@ impl OutputFile {
     pub(crate) async fn async_writer(&self) -> crate::Result<Box<dyn AsyncFileWrite>> {
         let (op, relative_path, cache_path) = self.source.resolve(&self.path).await?;
         let writer: Box<dyn AsyncFileWrite> = Box::new(
-            op.origin_operator()
+            op.operator(OpClass::Write)
                 .writer_with(&relative_path)
                 .chunk(8 * 1024 * 1024)
                 .concurrent(1)
