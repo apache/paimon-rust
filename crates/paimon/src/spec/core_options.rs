@@ -773,6 +773,59 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    /// Whether a missing optional read target may fall back to the primary file.
+    pub fn scan_ignore_lost_file(&self) -> bool {
+        self.options
+            .get("scan.ignore-lost-file")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    }
+
+    /// Whether normal Data Evolution files also write an aligned ROW sidecar.
+    pub fn data_evolution_row_sidecar_enabled(&self) -> crate::Result<bool> {
+        match self.options.get("data-evolution.row-sidecar.enabled") {
+            None => Ok(false),
+            Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+            Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+            Some(value) => Err(crate::Error::ConfigInvalid {
+                message: format!(
+                    "data-evolution.row-sidecar.enabled must be true or false, got {value}"
+                ),
+            }),
+        }
+    }
+
+    /// Largest sparse selection served by a ROW sidecar. Java defaults to 4096.
+    pub fn data_evolution_row_sidecar_max_selected_rows(&self) -> crate::Result<i64> {
+        let option = "data-evolution.row-sidecar.max-selected-rows";
+        let rows = self.parse_i64_option(option)?.unwrap_or(4096);
+        if rows <= 0 {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("{option} must be positive, got {rows}"),
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Largest fraction of a file served by a ROW sidecar. Java defaults to 0.05.
+    pub fn data_evolution_row_sidecar_max_selection_ratio(&self) -> crate::Result<f64> {
+        let option = "data-evolution.row-sidecar.max-selection-ratio";
+        let ratio = match self.options.get(option) {
+            Some(raw) => raw
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| crate::Error::ConfigInvalid {
+                    message: format!("Invalid {option}: {raw}"),
+                })?,
+            None => 0.05,
+        };
+        if !(ratio > 0.0 && ratio <= 1.0) {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("{option} must be in (0, 1], got {ratio}"),
+            });
+        }
+        Ok(ratio)
+    }
+
     pub fn data_evolution_write_cols_optimization_enabled(&self) -> bool {
         self.options
             .get("data-evolution.write-cols-optimization.enabled")

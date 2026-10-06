@@ -1572,6 +1572,15 @@ impl DataEvolutionPartialWriter {
                     (!write_set.omit_write_cols).then(|| write_set.write_columns.clone()),
                 )?
                 .with_file_index(write_set.file_index_options.clone());
+                let writer = if self
+                    .write_sets
+                    .iter()
+                    .any(|set| set.kind == PartialFileKind::Vector)
+                {
+                    writer.without_row_sidecar()
+                } else {
+                    writer
+                };
                 self.writers.insert(key.clone(), writer);
             }
 
