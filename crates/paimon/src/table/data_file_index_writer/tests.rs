@@ -432,7 +432,7 @@ async fn test_file_index_threshold_boundary_and_abort() {
         assert_eq!(bytes.len(), size);
         builder.new_commit().abort(&messages).await.unwrap();
         for path in paths {
-            assert!(table.file_io().exists(&path).await.unwrap());
+            assert!(!table.file_io().exists(&path).await.unwrap());
         }
     }
 }
@@ -765,7 +765,7 @@ async fn test_pk_file_index_follows_sorted_deduplicated_rows() {
 }
 
 #[tokio::test]
-async fn test_pk_file_index_abort_preserves_data_and_sidecar() {
+async fn test_pk_file_index_abort_removes_data_and_sidecar() {
     for threshold in ["0 B", "1 MB"] {
         let table = indexed_pk_table(&[
             ("file-index.bitmap.columns", "id,value"),
@@ -787,7 +787,7 @@ async fn test_pk_file_index_abort_preserves_data_and_sidecar() {
         }
         builder.new_commit().abort(&messages).await.unwrap();
         for path in &paths {
-            assert!(table.file_io().exists(path).await.unwrap());
+            assert!(!table.file_io().exists(path).await.unwrap());
         }
     }
 }
@@ -855,7 +855,7 @@ async fn test_postpone_file_index_preserves_arrival_order_and_rolls() {
             builder.new_commit().abort(&messages).await.unwrap();
             for file in &messages[0].new_files {
                 for path in file.collect_files(&bucket_dir) {
-                    assert!(table.file_io().exists(&path).await.unwrap(), "{path}");
+                    assert!(!table.file_io().exists(&path).await.unwrap(), "{path}");
                 }
             }
         }
@@ -1414,7 +1414,7 @@ async fn test_dynamic_bucket_indexed_commit_keeps_hash_and_changelog_indexes() {
 }
 
 #[tokio::test]
-async fn test_postpone_indexed_partition_sidecars_survive_abort() {
+async fn test_postpone_indexed_partition_sidecars_are_aborted() {
     let schema = Schema::builder()
         .column(
             "pt",
@@ -1491,7 +1491,7 @@ async fn test_postpone_indexed_partition_sidecars_survive_abort() {
         let bucket_dir = format!("{}/{partition_path}/bucket-postpone", table.location());
         for file in &message.new_files {
             for path in file.collect_files(&bucket_dir) {
-                assert!(table.file_io().exists(&path).await.unwrap());
+                assert!(!table.file_io().exists(&path).await.unwrap());
             }
         }
     }

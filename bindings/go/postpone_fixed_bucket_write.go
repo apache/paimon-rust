@@ -344,7 +344,8 @@ func (tc *PostponeFixedBucketTableCommit) TruncateTableWithIdentifier(
 	)
 }
 
-// Abort preserves prepared files, including when the commit outcome is unknown.
+// Abort deletes files for an explicitly abandoned, known-uncommitted write.
+// Never call when the commit outcome is unknown.
 func (tc *PostponeFixedBucketTableCommit) Abort(
 	messages *PostponeFixedBucketCommitMessages,
 ) error {

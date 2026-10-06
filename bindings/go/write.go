@@ -304,7 +304,8 @@ func (tc *TableCommit) TruncateTableWithIdentifier(commitIdentifier int64) error
 	return ffiTableCommitTruncateTableWithIdentifier.symbol(tc.ctx)(tc.inner, commitIdentifier)
 }
 
-// Abort preserves prepared files, including when the commit outcome is unknown.
+// Abort deletes files for an explicitly abandoned, known-uncommitted write.
+// Never call when the commit outcome is unknown.
 func (tc *TableCommit) Abort(messages *CommitMessages) error {
 	return tc.withMessages(messages, ffiTableCommitAbort.symbol(tc.ctx))
 }

@@ -1238,9 +1238,10 @@ async fn a_legacy_catalog_refuses_paimon_reads_and_writes_in_core() {
         commit.truncate_table_with_identifier(1).await.is_err(),
         "core truncate must be refused"
     );
-    // Abort preserves files and has no storage side effects, even for a table
-    // whose reads and writes are refused.
-    commit.abort(&[]).await.unwrap();
+    assert!(
+        commit.abort(&[]).await.is_err(),
+        "core abort must be refused"
+    );
 
     let incremental = table
         .new_read_builder()

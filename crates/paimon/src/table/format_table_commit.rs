@@ -72,6 +72,16 @@ impl<'a> FormatTableCommit<'a> {
         self.apply(messages, Some(static_partition)).await
     }
 
+    // Explicit discard only: callers must know these messages will never be committed.
+    pub(crate) async fn abort(&self, messages: &[CommitMessage]) -> Result<()> {
+        for message in messages {
+            if let Some(file) = &message.format_file {
+                self.table.file_io().delete_file(&file.staged_path).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// `None` is append; `Some(None)` is an overwrite without static
     /// partitions; `Some(Some(spec))` selects the leading static prefix.
     async fn apply(

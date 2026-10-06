@@ -206,8 +206,8 @@ def test_commit_different_builder_same_table_raises():
             table.new_batch_write_builder().new_commit().commit(messages)
 
 
-def test_abort_preserves_prepared_data():
-    # Prepared files remain available for retry, but an abort publishes no rows.
+def test_abort_cleans_up_abandoned_data():
+    # Explicitly discard prepared messages that have never been committed.
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = _make_empty_table(warehouse)
         table = _get_table(warehouse)

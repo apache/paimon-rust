@@ -331,7 +331,7 @@ async fn static_partition_overwrite_without_output_clears_partition() {
 }
 
 #[tokio::test]
-async fn prepared_files_are_hidden_until_commit_and_abort_preserves_them() {
+async fn prepared_files_are_hidden_until_commit_and_abort_discards_them() {
     let table = memory_table("format_abort_prepared", true, &[]);
     let builder = table.new_write_builder();
     let mut write = builder.new_write().unwrap();
@@ -353,7 +353,7 @@ async fn prepared_files_are_hidden_until_commit_and_abort_preserves_them() {
         .splits()
         .is_empty());
     builder.new_commit().abort(&messages).await.unwrap();
-    assert!(table.file_io().exists(staged).await.unwrap());
+    assert!(!table.file_io().exists(staged).await.unwrap());
     assert!(visible_files(&table, "dt=a").await.is_empty());
 }
 
@@ -375,7 +375,7 @@ async fn invalid_commit_preserves_staging_for_a_corrected_retry() {
         .unwrap_err()
         .to_string()
         .contains("outside partition"));
-    builder.new_commit().abort(&messages).await.unwrap();
+    // Preserve files after publication errors; explicit abort requires known-uncommitted messages.
     assert!(table.file_io().exists(&file.staged_path).await.unwrap());
     assert!(visible_files(&table, "dt=a").await.is_empty());
     builder.new_commit().commit(messages).await.unwrap();
@@ -442,7 +442,7 @@ async fn partial_publication_failure_preserves_published_and_staged_files() {
         error.to_string().contains("second publish failed"),
         "{error}"
     );
-    builder.new_commit().abort(&messages).await.unwrap();
+    // Preserve files after publication errors; explicit abort requires known-uncommitted messages.
     assert!(table.file_io().exists(&first.target_path).await.unwrap());
     assert!(table.file_io().exists(&second.staged_path).await.unwrap());
     assert_eq!(ids(&table).await, [1]);
@@ -524,7 +524,7 @@ async fn lost_partition_registration_response_preserves_published_data() {
         .clone();
     assert!(builder.new_commit().commit(messages.clone()).await.is_err());
     assert!(registered.load(Ordering::SeqCst));
-    builder.new_commit().abort(&messages).await.unwrap();
+    // Preserve files after publication errors; explicit abort requires known-uncommitted messages.
     assert!(table.file_io().exists(&target).await.unwrap());
     assert_eq!(ids(&table).await, [1]);
     server.abort();
@@ -673,7 +673,7 @@ async fn target_collision_is_rejected_before_any_overwrite_cleanup() {
         .unwrap();
     assert!(error.to_string().contains("target already exists"));
     assert_eq!(visible_files(&table, "dt=a").await, old_files);
-    builder.new_commit().abort(&messages).await.unwrap();
+    // Preserve files after publication errors; explicit abort requires known-uncommitted messages.
     assert_eq!(visible_files(&table, "dt=a").await, old_files);
 }
 
@@ -709,7 +709,7 @@ async fn format_file_message_refuses_snapshot_wire_serialization() {
     let messages = write.prepare_commit().await.unwrap();
     let error = messages[0].serialize().err().unwrap();
     assert!(error.to_string().contains("different Java serializer"));
-    builder.new_commit().abort(&messages).await.unwrap();
+    // Preserve files after publication errors; explicit abort requires known-uncommitted messages.
 }
 
 #[tokio::test]
@@ -815,7 +815,7 @@ async fn output_outside_static_prefix_is_rejected_before_deleting_old_files() {
         .unwrap();
     assert!(error.to_string().contains("outside the static overwrite"));
     assert_eq!(ids(&table).await, [1]);
-    builder.new_commit().abort(&messages).await.unwrap();
+    // Preserve files after publication errors; explicit abort requires known-uncommitted messages.
 }
 
 #[tokio::test]

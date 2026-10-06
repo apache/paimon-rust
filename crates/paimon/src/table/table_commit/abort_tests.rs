@@ -16,9 +16,9 @@
 // under the License.
 
 #[tokio::test]
-async fn abort_preserves_all_prepared_message_files() {
+async fn explicit_abort_deletes_only_new_message_files() {
     let io = test_file_io();
-    let path = "memory:/preserve-all-message-files";
+    let path = "memory:/explicit-abort-new-message-files";
     setup_dirs(&io, path).await;
     let commit = setup_commit(&io, path);
     let mut message = append_message("data.parquet");
@@ -36,10 +36,12 @@ async fn abort_preserves_all_prepared_message_files() {
     hash.global_index_meta = None;
     message.new_index_files = vec![hash, test_deletion_vector_index_file("dv", "data.parquet")];
     message.compact_new_index_files = vec![test_global_index_file("global", 0, 0, 9)];
+    message.deleted_index_files = vec![test_global_index_file("old-index", 0, 0, 9)];
+    message.compact_deleted_index_files = message.deleted_index_files.clone();
     let paths = [
         "bucket-0/data.parquet", "bucket-0/data.parquet.index", "external/payload.blob",
         "bucket-0/changelog.parquet", "bucket-0/old.parquet", "bucket-0/compact.parquet",
-        "bucket-0/compact-changelog.parquet", "index/hash", "index/dv", "index/global",
+        "bucket-0/compact-changelog.parquet", "index/hash", "index/dv", "index/global", "index/old-index",
     ].map(|name| format!("{path}/{name}"));
     for file in &paths {
         io.new_output(file).unwrap().write(bytes::Bytes::from_static(b"keep")).await.unwrap();
@@ -47,14 +49,15 @@ async fn abort_preserves_all_prepared_message_files() {
     for _ in 0..2 {
         commit.abort(std::slice::from_ref(&message)).await.unwrap();
         for file in &paths {
-            assert_eq!(io.new_input(file).unwrap().read().await.unwrap(), bytes::Bytes::from_static(b"keep"), "{file}");
+            let retained_input = file.ends_with("/old.parquet") || file.ends_with("/old-index");
+            assert_eq!(io.exists(file).await.unwrap(), retained_input, "{file}");
         }
     }
     assert!(latest_snapshot(&io, path).await.is_none());
 }
 
 #[tokio::test]
-async fn abort_preserves_files_after_a_lost_commit_response() {
+async fn failed_commit_preserves_files_after_a_lost_response() {
     for publish_first in [false, true] {
         for identifier in [BATCH_COMMIT_IDENTIFIER, 42] {
             let io = test_file_io();
@@ -79,8 +82,7 @@ async fn abort_preserves_files_after_a_lost_commit_response() {
             let error = commit.commit_with_identifier(vec![message.clone()], identifier).await.unwrap_err();
             assert!(error.to_string().contains("outcome may be unknown"), "{error}");
             let manifests = manifest_paths(&io, &path).await;
-            commit.abort(std::slice::from_ref(&message)).await.unwrap();
-            commit.abort(std::slice::from_ref(&message)).await.unwrap();
+            // Never explicitly abort messages with an unknown commit outcome.
             for file in &paths {
                 assert!(io.exists(file).await.unwrap(), "{file}");
             }
@@ -112,7 +114,7 @@ async fn guarded_retry_preserves_already_published_files() {
     let snapshot = latest_snapshot(&io, path).await.unwrap();
     let error = commit.commit_if_latest_snapshot(vec![message.clone()], 1).await.unwrap_err();
     assert!(error.to_string().contains("Snapshot changed"), "{error}");
-    commit.abort(&[message]).await.unwrap();
+    // A refused retry does not make already published files safe to discard.
     assert!(io.exists(&index_path).await.unwrap());
     assert_eq!(latest_snapshot(&io, path).await.unwrap().id(), snapshot.id());
     assert!(snapshot.index_manifest().is_some());

@@ -750,7 +750,7 @@ fn test_temp_file_guard_cleans_up_on_drop() {
 }
 
 #[tokio::test]
-async fn test_abort_preserves_completed_lumina_files() {
+async fn test_explicit_abort_deletes_abandoned_lumina_files() {
     let file_io = FileIOBuilder::new("memory").build().unwrap();
     let table_path = "memory:/test_lumina_abort_cleanup";
     let table = test_table_with_io(
@@ -784,7 +784,7 @@ async fn test_abort_preserves_completed_lumina_files() {
 
     let commit = TableCommit::new(table, "test-lumina-abort".to_string());
     commit.abort(&[message]).await.unwrap();
-    assert!(file_io.get_status(&index_path).await.is_ok());
+    assert!(file_io.get_status(&index_path).await.is_err());
 }
 
 async fn setup_dirs(file_io: &FileIO, table_path: &str) {

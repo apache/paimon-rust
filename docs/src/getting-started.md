@@ -187,9 +187,11 @@ The complete serialized index is embedded in the manifest when its size
 is at most `file-index.in-manifest-threshold` (default `500 B`); larger indexes
 are stored beside the data file as a `.index` sidecar. Indexed write failures
 return an error. Writers may clean outputs they have not handed off, but
-prepared files remain available after commit `abort` or a later preparation
-failure. Never delete files based on commit messages: publication can succeed
-even when its response fails. An abandoned prepared write may leave orphan files.
+prepared files remain available after commit exceptions or a later preparation
+failure. Explicit commit `abort` deletes newly written files only when the caller
+knows those messages are uncommitted and will never be submitted. Never call it
+when the commit outcome is unknown: publication can succeed even when its response
+fails. Internal failures may leave orphan files.
 
 `file-index.read.enabled` controls only reading, independently of index creation.
 Existing files are not backfilled. Index generation is not supported for

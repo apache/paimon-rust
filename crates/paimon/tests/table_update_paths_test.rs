@@ -402,7 +402,7 @@ async fn external_deletion_vectors_repeat_time_travel_and_abort() {
             .abort(&messages)
             .await
             .unwrap();
-        assert!(table.file_io().exists(&staged).await.unwrap());
+        assert!(!table.file_io().exists(&staged).await.unwrap());
         for path in &paths {
             assert!(table.file_io().exists(path).await.unwrap());
         }
