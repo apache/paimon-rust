@@ -1919,6 +1919,15 @@ impl BlobEntry {
             next_offset = entry_end;
         }
 
+        if next_offset != data_region_end {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Corrupt blob file: indexed records use {next_offset} bytes, but data region contains {data_region_end} bytes."
+                ),
+                source: None,
+            });
+        }
+
         Ok(entries)
     }
 }
@@ -2261,11 +2270,11 @@ mod tests {
     #[tokio::test]
     async fn test_index_tail_prefetch_boundaries() {
         for rows in [0, 1, 4090, 4091, 4092, 9000] {
-            let mut data = vec![0; 8192];
             let index = encode_delta_varints_write(&vec![-1; rows]);
             assert_eq!(index.len(), rows);
-            data.extend_from_slice(&index);
-            data.extend_from_slice(&(index.len() as i32).to_le_bytes());
+            // NULL entries have no physical records or padding before the index.
+            let mut data = index;
+            data.extend_from_slice(&(rows as i32).to_le_bytes());
             data.push(BLOB_FORMAT_VERSION);
             let size = data.len() as u64;
             let reader = TrackingFileRead::new(Bytes::from(data));
@@ -2276,9 +2285,9 @@ mod tests {
                 .iter()
                 .all(|entry| matches!(entry, BlobEntry::Null)));
             let mut expected = Vec::with_capacity(2);
-            expected.push(size - 4096..size);
+            expected.push(size.saturating_sub(4096)..size);
             if rows + 5 > 4096 {
-                expected.push(8192..size - BLOB_FOOTER_SIZE);
+                expected.push(0..size - BLOB_FOOTER_SIZE);
             }
             assert_eq!(reader.ranges(), expected);
         }
@@ -2398,16 +2407,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_tail_prefetch_sixteen_cold_files() {
+        use blob_test_utils::BlobFixtureValue::{Null, Value};
+
         let mut requests = 0;
         let mut bytes = 0;
         let mut legacy_bytes = 0;
         let mut legacy_requests = 0;
+        let payload = vec![0; 8192 - BLOB_ENTRY_OVERHEAD as usize];
         for rows in (1526..).take(16) {
-            let index = encode_delta_varints_write(&vec![-1; rows]);
-            let mut data = vec![0; 8192];
-            data.extend_from_slice(&index);
-            data.extend_from_slice(&(index.len() as i32).to_le_bytes());
-            data.push(1);
+            // Retain a data region large enough to fill the prefetched tail,
+            // but account for it with a complete, indexed physical record.
+            let mut values = vec![Null; rows];
+            values[0] = Value(&payload);
+            let data = blob_test_utils::build_blob_file_bytes_with_values(&values);
             let size = data.len() as u64;
             let reader = TrackingFileRead::new(Bytes::from(data.clone()));
             let legacy_reader = TrackingFileRead::new(Bytes::from(data));
@@ -2439,7 +2451,7 @@ mod tests {
                 .sum::<u64>();
         }
         assert_eq!(legacy_requests, 32);
-        assert_eq!((requests, bytes, legacy_bytes), (16, 65536, 24616));
+        assert_eq!((requests, bytes, legacy_bytes), (16, 65536, 24680));
     }
 
     #[tokio::test]
@@ -4129,6 +4141,50 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Unsupported { message }) if message.contains("footer version"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_reader_rejects_unindexed_bytes_before_footer() {
+        use blob_test_utils::BlobFixtureValue::{Null, Placeholder, Value};
+
+        for rows in [
+            vec![Value(b"hello"), Null, Placeholder, Value(b"")],
+            vec![Null, Placeholder],
+            vec![],
+        ] {
+            let valid = blob_test_utils::build_blob_file_bytes_with_values(&rows);
+            let footer_start = valid.len() - BLOB_FOOTER_SIZE as usize;
+            let index_length =
+                i32::from_le_bytes(valid[footer_start..footer_start + 4].try_into().unwrap())
+                    as usize;
+            let index_start = footer_start - index_length;
+            let mut corrupt = valid.clone();
+            // Preserve the complete records (and their CRCs), footer and index.
+            // Only add bytes which no indexed record accounts for.
+            corrupt.splice(index_start..index_start, b"unindexed".iter().copied());
+
+            for descriptor_mode in [false, true] {
+                let reader = IndexedBlobReader::open(
+                    Box::new(BytesFileRead(Bytes::from(valid.clone()))),
+                    valid.len() as u64,
+                    "file:/valid.blob".into(),
+                    descriptor_mode,
+                )
+                .await
+                .unwrap();
+                assert_eq!(reader.num_rows(), rows.len());
+
+                let result = IndexedBlobReader::open(
+                    Box::new(BytesFileRead(Bytes::from(corrupt.clone()))),
+                    corrupt.len() as u64,
+                    "file:/corrupt.blob".into(),
+                    descriptor_mode,
+                )
+                .await;
+                assert!(matches!(result, Err(Error::DataInvalid { message, .. })
+                    if message == format!("Corrupt blob file: indexed records use {index_start} bytes, but data region contains {} bytes.", index_start + b"unindexed".len())));
+            }
+        }
     }
 
     #[tokio::test]
