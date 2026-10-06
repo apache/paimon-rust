@@ -373,6 +373,8 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
+        // Never delete CommitMessage files on failure. A previous attempt may
+        // have published them even when the caller received an exception.
         self.try_commit(
             CommitEntriesPlan::Direct {
                 entries,
@@ -421,28 +423,18 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
-        let result = self
-            .try_commit(
-                CommitEntriesPlan::Direct {
-                    entries,
-                    changelog_entries,
-                    new_index_entries,
-                    check_from_snapshot,
-                },
-                Some(expected_snapshot_id),
-                commit_identifier,
-                false,
-            )
-            .await;
-        if let Err(error) = result {
-            // Storage and REST errors can be indeterminate: the snapshot may
-            // already reference these files even though the response failed.
-            if matches!(&error, crate::Error::DataInvalid { .. }) {
-                let _ = self.abort(&commit_messages).await;
-            }
-            return Err(error);
-        }
-        Ok(())
+        self.try_commit(
+            CommitEntriesPlan::Direct {
+                entries,
+                changelog_entries,
+                new_index_entries,
+                check_from_snapshot,
+            },
+            Some(expected_snapshot_id),
+            commit_identifier,
+            false,
+        )
+        .await
     }
 
     /// Overwrite partitions with new data.
@@ -882,11 +874,16 @@ impl TableCommit {
         Ok(())
     }
 
-    /// Abort a prepared commit by deleting newly written data, changelog and index files.
+    /// Delete new files for an explicitly abandoned, known-uncommitted write.
     ///
-    /// Deletion is best-effort and mirrors Python `FileStoreCommit.abort`: missing
-    /// files or storage errors are ignored so abort cleanup never masks the
-    /// original write failure.
+    /// Mirrors Java `FileStoreCommitImpl.abort`; removed inputs are preserved.
+    /// Call only when these messages will never be submitted. Never call after
+    /// a commit whose outcome is unknown: publication may have succeeded before
+    /// its response failed. File deletion is best-effort.
+    ///
+    /// Format Tables follow Java two-phase cleanup instead: discard staging,
+    /// roll back unregistered append targets and preserve overwrite replacements
+    /// or successfully registered append files.
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
         if self.table.is_format_table() {
             return FormatTableCommit::new(&self.table)
@@ -3617,10 +3614,11 @@ mod tests {
         include!("table_commit/parity_tests.rs");
         include!("table_commit/recovery_tests.rs");
         include!("table_commit/row_tracking_tests.rs");
+        include!("table_commit/abort_tests.rs");
     }
 
     #[tokio::test]
-    async fn abort_still_cleans_up_for_a_query_auth_table() {
+    async fn abort_is_allowed_for_a_query_auth_table() {
         let table = crate::table::query_auth_table();
         let commit = crate::table::WriteBuilder::new(&table).new_commit();
         commit.abort(&[]).await.unwrap();
@@ -4688,7 +4686,7 @@ mod tests {
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
         assert!(snapshot.index_manifest().is_none());
-        assert!(!file_io.exists(&index_path).await.unwrap());
+        assert!(file_io.exists(&index_path).await.unwrap());
     }
 
     #[tokio::test]

@@ -120,6 +120,7 @@ pub(super) async fn abort_on_build_error<T>(
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
+            // This build has not submitted or exposed any prepared shard.
             let _ = commit.abort(messages).await;
             Err(error)
         }

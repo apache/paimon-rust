@@ -16,9 +16,9 @@
 // under the License.
 
 //! Publish prepared Format Table files without creating a Paimon snapshot.
-//! Java's `FormatTableCommit` treats published data and catalog partition
-//! registration as separate side effects, with different rollback rules before
-//! and after a partition becomes visible to readers.
+//! Published data and catalog partition registration are separate side effects.
+//! Follow Java two-phase abort: discard staging, roll back append targets before
+//! registration completes, and protect overwrite replacements and registered files.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,12 +74,32 @@ impl<'a> FormatTableCommit<'a> {
     }
 
     pub(crate) async fn abort(&self, messages: &[CommitMessage]) -> Result<()> {
+        let mut failure = None;
         for message in messages {
-            if let Some(file) = &message.format_file {
-                self.table.file_io().delete_file(&file.staged_path).await?;
+            let Some(file) = &message.format_file else {
+                failure.get_or_insert_with(|| crate::Error::DataInvalid {
+                    message: "Format Table abort requires staged file messages".into(),
+                    source: None,
+                });
+                continue;
+            };
+            // Staging belongs to this write; a preflight failure must never
+            // remove a pre-existing target. Keep processing after cleanup errors.
+            if file
+                .staged_path
+                .starts_with(&format!("{}/_temporary/", self.table_path))
+            {
+                if let Err(error) = self.table.file_io().delete_file(&file.staged_path).await {
+                    failure.get_or_insert(error);
+                }
+            }
+            if !file.should_preserve_published_target_on_abort() {
+                if let Err(error) = self.table.file_io().delete_file(&file.target_path).await {
+                    failure.get_or_insert(error);
+                }
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     /// `None` is append; `Some(None)` is an overwrite without static
@@ -89,9 +109,21 @@ impl<'a> FormatTableCommit<'a> {
         messages: &[CommitMessage],
         overwrite: Option<Option<&HashMap<String, Option<Datum>>>>,
     ) -> Result<()> {
+        // Validation can encounter a target from an earlier attempt or another
+        // writer. Until this attempt starts publishing, only staging is ours.
+        for file in messages
+            .iter()
+            .filter_map(|message| message.format_file.as_ref())
+        {
+            file.preserve_published_target_on_abort();
+        }
         let result = self.apply_inner(messages, overwrite).await;
         if result.is_err() {
-            let _ = self.abort(messages).await;
+            // Java FormatTableCommit rolls back append publication, but retains
+            // overwrite replacements and successfully registered append files.
+            if let Err(error) = self.abort(messages).await {
+                log::warn!("Failed to abort Format Table files after commit failure: {error}");
+            }
         }
         result
     }
@@ -159,24 +191,17 @@ impl<'a> FormatTableCommit<'a> {
             }
         }
 
-        let mut published: Vec<String> = Vec::new();
-        for file in &files {
-            let result = self.publish(file).await;
-            if let Err(error) = result {
-                // An overwrite has already removed old files, so replacement
-                // files must survive an uncertain partial publish. Append can
-                // safely roll back files this attempt uniquely named.
-                if overwrite.is_none() {
-                    for path in published.iter().chain(std::iter::once(&file.target_path)) {
-                        let _ = self.table.file_io().delete_file(path).await;
-                    }
-                }
-                self.discard_staging(&files).await;
-                return Err(error);
+        if overwrite.is_some() {
+            // Old data has been removed. Java protects every replacement target
+            // before publishing, including a later explicit abort instance.
+            for file in &files {
+                file.preserve_published_target_on_abort();
             }
-            published.push(file.target_path.clone());
         }
-        self.discard_staging(&files).await;
+        for file in &files {
+            self.publish(file, overwrite.is_some()).await?;
+        }
+        self.discard_staging(&files).await?;
 
         if managed {
             let stats = self.partition_statistics(&files, &selected, overwrite.is_some());
@@ -212,17 +237,14 @@ impl<'a> FormatTableCommit<'a> {
                         )
                         .await?;
                 } else {
-                    // Java registers first, then preserves visible files even
-                    // if the later additive statistics report fails.
-                    if let Err(error) = env
-                        .api()
+                    // Java registers append partitions before protecting their
+                    // targets. Registration failure rolls back this attempt's
+                    // files, even if registration succeeded before a lost response.
+                    env.api()
                         .create_partitions(env.identifier(), specs.clone(), true)
-                        .await
-                    {
-                        for path in &published {
-                            let _ = self.table.file_io().delete_file(path).await;
-                        }
-                        return Err(error);
+                        .await?;
+                    for file in &files {
+                        file.preserve_published_target_on_abort();
                     }
                     if let Err(error) = env
                         .api()
@@ -375,7 +397,7 @@ impl<'a> FormatTableCommit<'a> {
             })
     }
 
-    async fn publish(&self, file: &FormatFileCommit) -> Result<()> {
+    async fn publish(&self, file: &FormatFileCommit, overwrite: bool) -> Result<()> {
         let directory = self.partition_directory(&file.partition)?;
         self.table
             .file_io()
@@ -390,6 +412,11 @@ impl<'a> FormatTableCommit<'a> {
                 source: None,
             });
         }
+        if !overwrite {
+            // Like Java's overwrite=false two-phase writer, the new UUID target
+            // belongs to this append once publication starts and can be rolled back.
+            file.allow_published_target_cleanup();
+        }
         match self
             .table
             .file_io()
@@ -400,24 +427,25 @@ impl<'a> FormatTableCommit<'a> {
             Err(crate::Error::IoUnexpected { source, .. })
                 if source.kind() == opendal::ErrorKind::Unsupported =>
             {
-                let result = self
-                    .table
+                // Abort uses the message's append/overwrite protection even if
+                // a copy finishes before its response fails.
+                self.table
                     .file_io()
                     .copy_file_streaming(&file.staged_path, &file.target_path)
-                    .await;
-                if result.is_err() {
-                    let _ = self.table.file_io().delete_file(&file.target_path).await;
-                }
-                result
+                    .await
             }
             Err(error) => Err(error),
         }
     }
 
-    async fn discard_staging(&self, files: &[FormatFileCommit]) {
+    async fn discard_staging(&self, files: &[FormatFileCommit]) -> Result<()> {
+        let mut failure = None;
         for file in files {
-            let _ = self.table.file_io().delete_file(&file.staged_path).await;
+            if let Err(error) = self.table.file_io().delete_file(&file.staged_path).await {
+                failure.get_or_insert(error);
+            }
         }
+        failure.map_or(Ok(()), Err)
     }
 
     async fn selected_overwrite_partitions(

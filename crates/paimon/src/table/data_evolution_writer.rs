@@ -659,6 +659,8 @@ impl DataEvolutionDeleteWriter {
                 Ok(Some(message)) => messages.push(message),
                 Ok(None) => {}
                 Err(error) => {
+                    // Earlier outputs are private to this preparation; nothing
+                    // has been returned to a caller or submitted for commit.
                     let _ = self
                         .table
                         .new_write_builder()

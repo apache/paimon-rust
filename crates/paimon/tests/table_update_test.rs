@@ -654,7 +654,7 @@ async fn grouped_updates_allow_disjoint_columns_on_the_same_file() {
 }
 
 #[tokio::test]
-async fn overlapping_groups_abort_previously_prepared_columns() {
+async fn overlapping_groups_preserve_previously_prepared_columns() {
     let table = evolution_table().await;
     seed(&table).await;
     let before = parquet_files(&table).await;
@@ -681,7 +681,9 @@ async fn overlapping_groups_abort_previously_prepared_columns() {
             .contains("overlapping first_row_ids by column"),
         "{error}"
     );
-    assert_eq!(parquet_files(&table).await, before);
+    let after = parquet_files(&table).await;
+    assert!(after.len() > before.len());
+    assert!(before.iter().all(|path| after.contains(path)));
     assert_eq!(
         read_rows(&table).await,
         vec![vec![1, 10, 100], vec![2, 20, 200], vec![3, 30, 300]]
@@ -950,7 +952,61 @@ async fn row_id_factory_shares_snapshot_and_selects_columns_per_call() {
 }
 
 #[tokio::test]
-async fn grouped_input_failure_aborts_files_and_preserves_the_cause() {
+async fn row_id_abort_preserves_prepared_and_published_updates() {
+    for published in [false, true] {
+        let table = evolution_table().await;
+        seed(&table).await;
+        let builder = table.new_write_builder();
+        let update = builder.new_update().unwrap();
+        let mut updater = update.new_update_by_row_id().await.unwrap();
+        let messages = updater
+            .update_columns(
+                vec![matched(vec![0], &[("value", vec![11])])],
+                vec!["value".into()],
+            )
+            .await
+            .unwrap();
+        let prepared_files = parquet_files(&table).await;
+        let snapshot_id = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap()
+            .id();
+        if published {
+            builder.new_commit().commit(messages.clone()).await.unwrap();
+        }
+        updater.abort().await.unwrap();
+        updater.abort().await.unwrap();
+        assert!(updater.commit_messages().is_empty());
+        assert_eq!(parquet_files(&table).await, prepared_files);
+        if !published {
+            assert_eq!(
+                table
+                    .snapshot_manager()
+                    .get_latest_snapshot()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id(),
+                snapshot_id
+            );
+            assert_eq!(
+                read_rows(&table).await,
+                vec![vec![1, 10, 100], vec![2, 20, 200], vec![3, 30, 300]]
+            );
+            builder.new_commit().commit(messages).await.unwrap();
+        }
+        assert_eq!(
+            read_rows(&table).await,
+            vec![vec![1, 11, 100], vec![2, 20, 200], vec![3, 30, 300]]
+        );
+    }
+}
+
+#[tokio::test]
+async fn grouped_input_failure_preserves_files_and_the_cause() {
     let table = evolution_table().await;
     seed(&table).await;
     let before = parquet_files(&table).await;
@@ -966,7 +1022,9 @@ async fn grouped_input_failure_aborts_files_and_preserves_the_cause() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("input generator failed"));
-    assert_eq!(parquet_files(&table).await, before);
+    let after = parquet_files(&table).await;
+    assert!(after.len() > before.len());
+    assert!(before.iter().all(|path| after.contains(path)));
     assert_eq!(
         read_rows(&table).await,
         vec![vec![1, 10, 100], vec![2, 20, 200], vec![3, 30, 300]]
@@ -1146,7 +1204,7 @@ async fn predicate_array_assignments_span_file_groups() {
 }
 
 #[tokio::test]
-async fn predicate_callback_failure_aborts_earlier_group_files() {
+async fn predicate_callback_failure_preserves_earlier_group_files() {
     use paimon::table::UpdateAssignment;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let table = evolution_table().await;
@@ -1182,7 +1240,9 @@ async fn predicate_callback_failure_aborts_earlier_group_files() {
         .unwrap_err();
     assert!(error.to_string().contains("second callback failed"));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert_eq!(parquet_files(&table).await, before);
+    let after = parquet_files(&table).await;
+    assert!(after.len() > before.len());
+    assert!(before.iter().all(|path| after.contains(path)));
 }
 
 #[tokio::test]
@@ -1461,7 +1521,6 @@ async fn row_id_nested_overlap_uses_leaf_identity_across_calls() {
     .unwrap();
     let child = matched(vec![1], &[("profile.a", vec![22])]);
     let update = table.new_write_builder().new_update().unwrap();
-    let original_files = parquet_files(&table).await;
     for reverse in [false, true] {
         let mut updater = update.new_update_by_row_id().await.unwrap();
         let calls = if reverse {
@@ -1483,7 +1542,7 @@ async fn row_id_nested_overlap_uses_leaf_identity_across_calls() {
         assert_eq!(updater.commit_messages().len(), messages);
         assert_eq!(parquet_files(&table).await, staged_files);
         updater.abort().await.unwrap();
-        assert_eq!(parquet_files(&table).await, original_files);
+        assert_eq!(parquet_files(&table).await, staged_files);
     }
     // Disjoint sibling leaves of the same file group remain valid.
     let mut updater = update.new_update_by_row_id().await.unwrap();

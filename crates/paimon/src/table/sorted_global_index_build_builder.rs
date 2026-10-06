@@ -231,6 +231,8 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             {
                 Ok(index_file) => index_file,
                 Err(error) => {
+                    // Earlier outputs are private to this preparation; nothing
+                    // has been returned to a caller or submitted for commit.
                     let _ = commit.abort(&messages).await;
                     return Err(error);
                 }

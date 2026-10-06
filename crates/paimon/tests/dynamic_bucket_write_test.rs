@@ -125,7 +125,7 @@ impl paimon::io::FileIOProvider for FailSecondHash {
     async fn create(&self, path: &str) -> paimon::Result<(opendal::Operator, String)> {
         let path = path.strip_prefix("file://").unwrap_or(path);
         let name = path.rsplit('/').next().unwrap();
-        if name.starts_with("index-") {
+        if name.starts_with("index-") && path.contains("/index/") {
             let mut indexes = self.indexes.lock().unwrap();
             if !indexes.iter().any(|item| item == path) {
                 indexes.push(path.to_string());
@@ -199,4 +199,89 @@ async fn failed_hash_prepare_cleans_indexes_and_data() {
         .unwrap_err()
         .to_string()
         .contains("cannot be reused"));
+}
+
+#[tokio::test]
+async fn failed_later_prepare_preserves_returned_and_committed_files() {
+    use paimon::catalog::Identifier;
+    use paimon::io::FileIOBuilder;
+    use paimon::table::Table;
+    use std::sync::Arc;
+
+    for publish_first in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = opendal_service_fs::FsConfig::default();
+        config.root = Some("/".into());
+        let provider = Arc::new(FailSecondHash {
+            operator: opendal::Operator::from_config(config).unwrap(),
+            indexes: Default::default(),
+            data: Default::default(),
+        });
+        let io = FileIOBuilder::new("file")
+            .with_provider(provider.clone())
+            .build()
+            .unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let table = Table::new(
+            io.clone(),
+            Identifier::new("default", "later_failure"),
+            path.into(),
+            pk_schema(&[("bucket", "-1"), ("dynamic-bucket.target-row-num", "1")]),
+            None,
+        );
+        setup_dirs(&io, path).await;
+        let builder = table.new_write_builder();
+        let mut writer = builder.new_write().unwrap();
+        writer
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let returned = provider
+            .data
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(provider.indexes.lock().unwrap().iter())
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        assert!(!returned.is_empty());
+        if publish_first {
+            builder.new_commit().commit(messages.clone()).await.unwrap();
+        }
+        writer
+            .write_arrow_batch(&make_batch(vec![2], vec![20]))
+            .await
+            .unwrap();
+        assert!(writer
+            .prepare_commit()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("injected HASH write failure"));
+        writer.close().await;
+        for file in provider
+            .data
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(provider.indexes.lock().unwrap().iter())
+        {
+            assert_eq!(
+                std::path::Path::new(file).exists(),
+                returned.contains(file),
+                "{file}"
+            );
+        }
+        if !publish_first {
+            builder.new_commit().commit(messages).await.unwrap();
+        }
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.total_record_count(), Some(1));
+    }
 }

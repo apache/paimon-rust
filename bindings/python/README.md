@@ -197,8 +197,13 @@ mode. `CommitMessage.deserialize(body, version=14)` decodes it without a table
 or builder. Submit decoded messages to their originating table; commit identity
 and overwrite mode come from the configured committer. Messages returned directly
 by local writers retain their table and commit-user checks.
-Only v14 is supported. `abort(messages)` deletes newly written files and must
-only be used for messages known not to have committed. Compact increments remain
+Only v14 is supported. `abort(messages)` deletes newly written files for an
+explicitly abandoned write, matching Java. Call it only for messages known to be
+uncommitted that will never be submitted. A commit exception does not prove failure:
+publication may have succeeded before the response failed. Internal error paths
+preserve submitted files instead of calling `abort`. Preparation failures can clean
+outputs that have not been handed off to the caller.
+Compact increments remain
 unsupported by the Rust committer and are rejected.
 
 ### Tables resolved outside the Rust catalog
