@@ -776,7 +776,7 @@ impl<'a> CoreOptions<'a> {
     /// Whether a missing optional read target may fall back to the primary file.
     pub fn scan_ignore_lost_file(&self) -> bool {
         self.options
-            .get("scan.ignore-lost-file")
+            .get("scan.ignore-lost-files")
             .is_some_and(|value| value.eq_ignore_ascii_case("true"))
     }
 

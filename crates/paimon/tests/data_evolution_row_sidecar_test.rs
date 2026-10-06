@@ -258,12 +258,18 @@ async fn missing_sidecar_only_falls_back_when_ignore_lost_file_is_enabled() {
         &file.extra_files[0],
     );
     table.file_io().delete_file(&sidecar).await.unwrap();
-    let error = read(&table, Some(vec![RowRange::new(5, 5)]))
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains(".row"), "{error}");
+    let strict = table.copy_with_options(HashMap::from([(
+        "scan.ignore-lost-files".into(),
+        "false".into(),
+    )]));
+    for reader_table in [&table, &strict] {
+        let error = read(reader_table, Some(vec![RowRange::new(5, 5)]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(".row"), "{error}");
+    }
     let tolerant = table.copy_with_options(HashMap::from([(
-        "scan.ignore-lost-file".into(),
+        "scan.ignore-lost-files".into(),
         "true".into(),
     )]));
     assert_eq!(
@@ -280,7 +286,7 @@ async fn missing_sidecar_only_falls_back_when_ignore_lost_file_is_enabled() {
 
 #[tokio::test]
 async fn corrupt_sidecar_is_not_hidden_by_ignore_lost_file() {
-    let table = table(&[("scan.ignore-lost-file", "true")]).await;
+    let table = table(&[("scan.ignore-lost-files", "true")]).await;
     let messages = append(&table, 0, 100).await;
     let file = &messages[0].new_files[0];
     let path = file.aligned_file_path(
