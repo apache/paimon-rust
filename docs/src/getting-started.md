@@ -186,9 +186,10 @@ When supported indexes are configured, each data file gets its own index.
 The complete serialized index is embedded in the manifest when its size
 is at most `file-index.in-manifest-threshold` (default `500 B`); larger indexes
 are stored beside the data file as a `.index` sidecar. Indexed write failures
-return an error and clean up newly created files on a best-effort basis.
-Use commit `abort` to clean up files after a successful `prepare_commit`
-when the prepared write will not be committed.
+return an error. Writers may clean outputs they have not handed off, but
+prepared files remain available after commit `abort` or a later preparation
+failure. Never delete files based on commit messages: publication can succeed
+even when its response fails. An abandoned prepared write may leave orphan files.
 
 `file-index.read.enabled` controls only reading, independently of index creation.
 Existing files are not backfilled. Index generation is not supported for

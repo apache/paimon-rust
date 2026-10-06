@@ -402,7 +402,7 @@ async fn external_deletion_vectors_repeat_time_travel_and_abort() {
             .abort(&messages)
             .await
             .unwrap();
-        assert!(!table.file_io().exists(&staged).await.unwrap());
+        assert!(table.file_io().exists(&staged).await.unwrap());
         for path in &paths {
             assert!(table.file_io().exists(path).await.unwrap());
         }
@@ -538,7 +538,7 @@ async fn missing_explicit_deletion_vector_never_falls_back_to_local_decoys() {
 }
 
 #[tokio::test]
-async fn later_bucket_failure_aborts_earlier_external_deletion_vectors() {
+async fn later_bucket_failure_preserves_earlier_external_deletion_vectors() {
     let table = table(&[
         ("index-file-in-data-file-dir", "false"),
         ("global-index.external-path", "memory:/external"),
@@ -559,5 +559,7 @@ async fn later_bucket_failure_aborts_earlier_external_deletion_vectors() {
     let mut writer = table.new_write_builder().new_delete().unwrap();
     writer.add_row_ids(vec![ids[&1], ids[&3]]).unwrap();
     assert!(writer.prepare_commit().await.is_err());
-    assert_eq!(files(&table).await, before);
+    let after = files(&table).await;
+    assert_eq!(after.len(), before.len() + 1);
+    assert!(before.iter().all(|path| after.contains(path)));
 }

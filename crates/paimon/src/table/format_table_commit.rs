@@ -16,9 +16,8 @@
 // under the License.
 
 //! Publish prepared Format Table files without creating a Paimon snapshot.
-//! Java's `FormatTableCommit` treats published data and catalog partition
-//! registration as separate side effects, with different rollback rules before
-//! and after a partition becomes visible to readers.
+//! Published data and catalog partition registration are separate side effects.
+//! Preserve prepared and published files when either side effect fails.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -73,15 +72,6 @@ impl<'a> FormatTableCommit<'a> {
         self.apply(messages, Some(static_partition)).await
     }
 
-    pub(crate) async fn abort(&self, messages: &[CommitMessage]) -> Result<()> {
-        for message in messages {
-            if let Some(file) = &message.format_file {
-                self.table.file_io().delete_file(&file.staged_path).await?;
-            }
-        }
-        Ok(())
-    }
-
     /// `None` is append; `Some(None)` is an overwrite without static
     /// partitions; `Some(Some(spec))` selects the leading static prefix.
     async fn apply(
@@ -89,11 +79,9 @@ impl<'a> FormatTableCommit<'a> {
         messages: &[CommitMessage],
         overwrite: Option<Option<&HashMap<String, Option<Datum>>>>,
     ) -> Result<()> {
-        let result = self.apply_inner(messages, overwrite).await;
-        if result.is_err() {
-            let _ = self.abort(messages).await;
-        }
-        result
+        // Never delete CommitMessage files on failure. Publication can succeed
+        // even when the storage or catalog response raises an exception.
+        self.apply_inner(messages, overwrite).await
     }
 
     async fn apply_inner(
@@ -159,22 +147,10 @@ impl<'a> FormatTableCommit<'a> {
             }
         }
 
-        let mut published: Vec<String> = Vec::new();
         for file in &files {
-            let result = self.publish(file).await;
-            if let Err(error) = result {
-                // An overwrite has already removed old files, so replacement
-                // files must survive an uncertain partial publish. Append can
-                // safely roll back files this attempt uniquely named.
-                if overwrite.is_none() {
-                    for path in published.iter().chain(std::iter::once(&file.target_path)) {
-                        let _ = self.table.file_io().delete_file(path).await;
-                    }
-                }
-                self.discard_staging(&files).await;
-                return Err(error);
-            }
-            published.push(file.target_path.clone());
+            // A failed response does not prove the move failed. Preserve both
+            // previously published outputs and remaining staging files.
+            self.publish(file).await?;
         }
         self.discard_staging(&files).await;
 
@@ -214,16 +190,11 @@ impl<'a> FormatTableCommit<'a> {
                 } else {
                     // Java registers first, then preserves visible files even
                     // if the later additive statistics report fails.
-                    if let Err(error) = env
-                        .api()
+                    // Registration may succeed even if its response is lost.
+                    // Never remove published files after a catalog exception.
+                    env.api()
                         .create_partitions(env.identifier(), specs.clone(), true)
-                        .await
-                    {
-                        for path in &published {
-                            let _ = self.table.file_io().delete_file(path).await;
-                        }
-                        return Err(error);
-                    }
+                        .await?;
                     if let Err(error) = env
                         .api()
                         .create_partitions_with_statistics(
@@ -400,15 +371,12 @@ impl<'a> FormatTableCommit<'a> {
             Err(crate::Error::IoUnexpected { source, .. })
                 if source.kind() == opendal::ErrorKind::Unsupported =>
             {
-                let result = self
-                    .table
+                // Copy may finish before its response fails. Retain the target
+                // instead of deleting a file readers may already observe.
+                self.table
                     .file_io()
                     .copy_file_streaming(&file.staged_path, &file.target_path)
-                    .await;
-                if result.is_err() {
-                    let _ = self.table.file_io().delete_file(&file.target_path).await;
-                }
-                result
+                    .await
             }
             Err(error) => Err(error),
         }

@@ -308,7 +308,7 @@ class BatchTableCommit:
         """Truncate matching partitions. Reject empty input, as Java does."""
         ...
     def abort(self, messages: Sequence[CommitMessage]) -> None:
-        """Best-effort deletion of newly written files; only abort uncommitted messages."""
+        """Preserve prepared files, including when commit publication may have succeeded."""
         ...
 
 class StreamTableCommit:
@@ -321,7 +321,9 @@ class StreamTableCommit:
     ) -> int:
         """Sort identifiers, skip committed groups, and return the number committed."""
         ...
-    def abort(self, messages: Sequence[CommitMessage]) -> None: ...
+    def abort(self, messages: Sequence[CommitMessage]) -> None:
+        """Preserve prepared files, including when commit publication may have succeeded."""
+        ...
 
 class BatchWriteBuilder:
     def _with_commit_user(self, commit_user: str) -> "BatchWriteBuilder":

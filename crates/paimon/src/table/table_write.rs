@@ -1131,8 +1131,8 @@ impl TableWrite {
         }
         if let Some(error) = error {
             self.failed = true;
-            let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
-            let _ = commit.abort(&messages).await;
+            // Preserve files already prepared by other partitions. Never
+            // infer deletion ownership from CommitMessage on an error path.
             return Err(error);
         }
 
@@ -1143,8 +1143,8 @@ impl TableWrite {
             Ok(files) => files,
             Err(error) => {
                 self.failed = true;
-                let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
-                let _ = commit.abort(&messages).await;
+                // Preserve prepared data if HASH index preparation fails.
+                // Never delete files based on CommitMessage.
                 return Err(error);
             }
         };

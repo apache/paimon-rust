@@ -125,7 +125,7 @@ impl TableUpdate {
 
     /// Create a row-ID updater sharing one snapshot across per-call columns.
     pub async fn new_update_by_row_id(&self) -> crate::Result<TableUpdateByRowId> {
-        TableUpdateByRowId::new(&self.table, self.commit_user.clone()).await
+        TableUpdateByRowId::new(&self.table).await
     }
 
     /// Update existing rows from chunks of one Arrow table containing `_ROW_ID`.
@@ -172,11 +172,8 @@ impl TableUpdate {
                 .map_or_else(Vec::new, |writer| writer.commit_messages().to_vec()))
         }
         .await;
-        if result.is_err() {
-            if let Some(writer) = &mut writer {
-                let _ = writer.abort().await;
-            }
-        }
+        // Preserve earlier prepared groups on failure. Never delete files
+        // based on CommitMessage.
         result
     }
 
@@ -189,14 +186,8 @@ impl TableUpdate {
         assignments: Vec<(String, super::UpdateAssignment)>,
         read_columns: Vec<String>,
     ) -> crate::Result<Vec<CommitMessage>> {
-        super::table_update_predicate::update(
-            &self.table,
-            &self.commit_user,
-            predicate,
-            assignments,
-            read_columns,
-        )
-        .await
+        super::table_update_predicate::update(&self.table, predicate, assignments, read_columns)
+            .await
     }
 
     /// Upsert complete Arrow rows by composite key through the core upsert

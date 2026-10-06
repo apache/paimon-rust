@@ -231,7 +231,8 @@ impl<'a> SortedGlobalIndexBuildBuilder<'a> {
             {
                 Ok(index_file) => index_file,
                 Err(error) => {
-                    let _ = commit.abort(&messages).await;
+                    // Preserve completed shards. Never delete files based on
+                    // CommitMessage when a later shard fails.
                     return Err(error);
                 }
             };

@@ -23,7 +23,6 @@ use super::LuminaIndexBuildBuilder;
 use crate::lumina::ffi::LuminaBuilder;
 use crate::lumina::{LuminaIndexMeta, LUMINA_IDENTIFIER};
 use crate::spec::{GlobalIndexMeta, IndexFileMeta};
-use crate::table::{CommitMessage, TableCommit};
 use crate::{Error, Result};
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
@@ -109,20 +108,6 @@ impl LuminaIndexBuildBuilder<'_> {
                 index_meta: Some(index_meta),
             }),
         })
-    }
-}
-
-pub(super) async fn abort_on_build_error<T>(
-    commit: &TableCommit,
-    messages: &[CommitMessage],
-    result: Result<T>,
-) -> Result<T> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            let _ = commit.abort(messages).await;
-            Err(error)
-        }
     }
 }
 

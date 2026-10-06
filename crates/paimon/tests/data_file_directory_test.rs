@@ -206,7 +206,7 @@ async fn relocated_updates_upserts_and_repeated_deletes_share_paths() {
                 .unwrap();
             assert_eq!(values(&table).await, expected);
         }
-        // Abort deletes only newly staged files, leaving the committed DV live.
+        // Abort preserves both prepared and already committed DV files.
         let messages = update.delete_by_row_id(vec![2]).await.unwrap();
         let paths: Vec<String> = messages
             .iter()
@@ -229,14 +229,14 @@ async fn relocated_updates_upserts_and_repeated_deletes_share_paths() {
             .await
             .unwrap();
         for path in paths {
-            assert!(!table.file_io().exists(&path).await.unwrap());
+            assert!(table.file_io().exists(&path).await.unwrap());
         }
         assert_eq!(values(&table).await, vec![30, 40]);
     }
 }
 
 #[tokio::test]
-async fn abort_removes_relocated_data_and_changelog_files() {
+async fn abort_preserves_relocated_data_and_changelog_files() {
     for primary_key in [false, true] {
         let table = table(primary_key, false, "data/nested", false).await;
         let mut writer = table.new_write_builder().new_write().unwrap();
@@ -269,7 +269,7 @@ async fn abort_removes_relocated_data_and_changelog_files() {
             .await
             .unwrap();
         for path in paths {
-            assert!(!table.file_io().exists(&path).await.unwrap());
+            assert!(table.file_io().exists(&path).await.unwrap());
         }
         assert!(table
             .snapshot_manager()

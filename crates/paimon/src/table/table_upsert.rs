@@ -260,15 +260,8 @@ impl TableUpsert {
             Ok(())
         }
         .await;
-        if result.is_err() && !messages.is_empty() {
-            if let Ok(builder) = self
-                .table
-                .new_write_builder()
-                .with_commit_user(self.commit_user)
-            {
-                let _ = builder.new_commit().abort(&messages).await;
-            }
-        }
+        // Preserve earlier prepared groups on failure. Never delete files
+        // based on CommitMessage; a failed response does not prove ownership.
         result.map(|()| messages)
     }
 }

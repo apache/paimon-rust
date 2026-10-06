@@ -172,13 +172,16 @@ def test_grouped_batch_update_checks_input_table_file_overlap(tmp_path):
         'grouped_updates.t')
 
     before = set(tmp_path.rglob('*.parquet'))
+    snapshot_id = table.latest_snapshot().id()
     overlap = table.new_batch_write_builder().new_update()
     with pytest.raises(ValueError, match='overlapping first_row_ids.*0'):
         overlap.update_by_arrow_batches_with_row_id(iter([
             pa.table({'_ROW_ID': [0], 'name': ['A']}),
             pa.table({'_ROW_ID': [1], 'name': ['B']}),
         ]))
-    assert set(tmp_path.rglob('*.parquet')) == before
+    assert set(tmp_path.rglob('*.parquet')) > before
+    assert table.latest_snapshot().id() == snapshot_id
+    before = set(tmp_path.rglob('*.parquet'))
 
     def failing_tables():
         yield pa.table({'_ROW_ID': [0], 'name': ['A']})
@@ -186,7 +189,11 @@ def test_grouped_batch_update_checks_input_table_file_overlap(tmp_path):
 
     with pytest.raises(RuntimeError, match='input failed'):
         overlap.update_by_arrow_batches_with_row_id(failing_tables())
-    assert set(tmp_path.rglob('*.parquet')) == before
+    assert set(tmp_path.rglob('*.parquet')) > before
+    assert table.latest_snapshot().id() == snapshot_id
+    unchanged = pa.Table.from_batches(context.sql(
+        'SELECT id, name FROM paimon.grouped_updates.t')).sort_by('id').to_pydict()
+    assert unchanged == {'id': [1, 2, 3, 4], 'name': ['a', 'b', 'c', 'd']}
 
     builder = table.new_batch_write_builder()
     messages = builder.new_update().update_by_arrow_batches_with_row_id(iter([
@@ -271,7 +278,7 @@ def test_stream_row_id_update_and_factory(tmp_path):
     assert actual == {'id': [1, 2], 'value': [11, 22]}
 
 
-def test_predicate_update_owns_scan_callbacks_and_rollback(tmp_path):
+def test_predicate_update_owns_scan_callbacks_and_preserves_prepared_files(tmp_path):
     assert not hasattr(datafusion, '_MatchedBatchUpdateWriter')
     context = SQLContext()
     context.register_catalog('paimon', {'warehouse': str(tmp_path)})
@@ -303,6 +310,7 @@ def test_predicate_update_owns_scan_callbacks_and_rollback(tmp_path):
                       'score': [100, 999, 999, 999]}
 
     before = set(tmp_path.rglob('*.parquet'))
+    snapshot_id = table.latest_snapshot().id()
     seen.clear()
 
     def fail_second(rows):
@@ -314,7 +322,11 @@ def test_predicate_update_owns_scan_callbacks_and_rollback(tmp_path):
     with pytest.raises(RuntimeError, match='callback failure'):
         update.update_by_predicate(None, {'value': fail_second}, read_columns=['value'])
     assert len(seen) == 2
-    assert set(tmp_path.rglob('*.parquet')) == before
+    assert set(tmp_path.rglob('*.parquet')) > before
+    assert table.latest_snapshot().id() == snapshot_id
+    unchanged = pa.Table.from_batches(context.sql(
+        'SELECT id, value, score FROM paimon.pred_updates.t')).sort_by('id').to_pydict()
+    assert unchanged == actual
     assert update.update_by_predicate(
         {'method': 'equal', 'field': 'id', 'literals': [99]},
         {'value': 'bad-int'}) == []

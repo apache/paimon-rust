@@ -20,7 +20,7 @@ use super::planning::{plan_lumina_shards, LuminaIndexShard};
 use super::validation::{
     checked_i64, effective_lumina_options, find_index_field, validate_vector_field,
 };
-use super::writer::{abort_on_build_error, temp_lumina_path, TempFileGuard};
+use super::writer::{temp_lumina_path, TempFileGuard};
 use crate::catalog::Identifier;
 use crate::io::FileIO;
 use crate::io::FileIOBuilder;
@@ -750,7 +750,7 @@ fn test_temp_file_guard_cleans_up_on_drop() {
 }
 
 #[tokio::test]
-async fn test_abort_on_build_error_removes_completed_index_files() {
+async fn test_abort_preserves_completed_lumina_files() {
     let file_io = FileIOBuilder::new("memory").build().unwrap();
     let table_path = "memory:/test_lumina_abort_cleanup";
     let table = test_table_with_io(
@@ -783,18 +783,8 @@ async fn test_abort_on_build_error_removes_completed_index_files() {
     }];
 
     let commit = TableCommit::new(table, "test-lumina-abort".to_string());
-    let result = abort_on_build_error::<()>(
-        &commit,
-        &[message],
-        Err(Error::UnexpectedError {
-            message: "second shard failed".to_string(),
-            source: None,
-        }),
-    )
-    .await;
-
-    assert!(result.is_err());
-    assert!(file_io.get_status(&index_path).await.is_err());
+    commit.abort(&[message]).await.unwrap();
+    assert!(file_io.get_status(&index_path).await.is_ok());
 }
 
 async fn setup_dirs(file_io: &FileIO, table_path: &str) {

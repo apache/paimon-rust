@@ -170,7 +170,7 @@ async fn external_data_and_sidecars_follow_the_recorded_path() {
 }
 
 #[tokio::test]
-async fn abort_removes_external_data_changelog_and_sidecars() {
+async fn abort_preserves_external_data_changelog_and_sidecars() {
     for mode in ["append", "pk", "evolution", "postpone"] {
         let table = table(mode, "entropy-inject", true).await;
         let builder = table.new_write_builder();
@@ -190,7 +190,7 @@ async fn abort_removes_external_data_changelog_and_sidecars() {
         }
         builder.new_commit().abort(&messages).await.unwrap();
         for path in &paths {
-            assert!(!table.file_io().exists(path).await.unwrap(), "{path}");
+            assert!(table.file_io().exists(path).await.unwrap(), "{path}");
         }
         assert!(table
             .snapshot_manager()

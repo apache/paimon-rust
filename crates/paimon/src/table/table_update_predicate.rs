@@ -101,7 +101,6 @@ fn validate(
 
 pub(super) async fn update(
     table: &Table,
-    commit_user: &str,
     predicate: Option<Predicate>,
     assignments: Vec<(String, UpdateAssignment)>,
     read_columns: Vec<String>,
@@ -135,7 +134,7 @@ pub(super) async fn update(
     let plan = read_builder.new_scan().with_scan_all_files().plan().await?;
     let index = RowIdFileIndex::from_splits(scan_table.clone(), plan.splits())?;
     let groups = ordered_file_groups(plan.splits())?;
-    let mut updater = TableUpdateByRowId::with_index(table, commit_user.into(), index)?;
+    let mut updater = TableUpdateByRowId::with_index(table, index)?;
     let reader = read_builder.new_read()?;
     let schema = crate::arrow::build_target_arrow_schema(table.schema().fields())?;
     let columns: Vec<_> = assignments.iter().map(|(name, _)| name.clone()).collect();
@@ -163,9 +162,8 @@ pub(super) async fn update(
         Ok(updater.commit_messages().to_vec())
     }
     .await;
-    if result.is_err() {
-        let _ = updater.abort().await;
-    }
+    // Preserve earlier prepared groups on failure. Never delete files based
+    // on CommitMessage when a callback or a later update fails.
     result
 }
 

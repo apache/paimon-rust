@@ -26,7 +26,6 @@ use validation::{
     effective_lumina_options, find_index_field, resolve_lumina_options, validate_table_options,
     validate_vector_field,
 };
-use writer::abort_on_build_error;
 
 use crate::lumina::{
     is_lumina_index_type, LuminaIndexMeta, LuminaVectorIndexOptions, LUMINA_IDENTIFIER,
@@ -180,7 +179,9 @@ impl<'a> LuminaIndexBuildBuilder<'a> {
                 .await
             }
             .await;
-            let index_file = abort_on_build_error(&commit, &messages, build_result).await?;
+            // Preserve completed shards. Never delete files based on
+            // CommitMessage when a later shard fails.
+            let index_file = build_result?;
             let mut message = CommitMessage::new(shard.partition_bytes.clone(), 0, vec![]);
             message.new_index_files = vec![index_file];
             messages.push(message);

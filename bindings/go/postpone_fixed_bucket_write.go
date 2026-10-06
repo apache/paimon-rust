@@ -344,7 +344,7 @@ func (tc *PostponeFixedBucketTableCommit) TruncateTableWithIdentifier(
 	)
 }
 
-// Abort performs best-effort cleanup of files in prepared messages.
+// Abort preserves prepared files, including when the commit outcome is unknown.
 func (tc *PostponeFixedBucketTableCommit) Abort(
 	messages *PostponeFixedBucketCommitMessages,
 ) error {

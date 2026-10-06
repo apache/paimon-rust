@@ -373,6 +373,8 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
+        // Never delete CommitMessage files on failure. A previous attempt may
+        // have published them even when the caller received an exception.
         self.try_commit(
             CommitEntriesPlan::Direct {
                 entries,
@@ -421,28 +423,18 @@ impl TableCommit {
         let changelog_entries = self.messages_to_changelog_entries(&commit_messages);
         let new_index_entries = self.messages_to_index_entries(&commit_messages);
         let check_from_snapshot = Self::check_from_snapshot(&commit_messages)?;
-        let result = self
-            .try_commit(
-                CommitEntriesPlan::Direct {
-                    entries,
-                    changelog_entries,
-                    new_index_entries,
-                    check_from_snapshot,
-                },
-                Some(expected_snapshot_id),
-                commit_identifier,
-                false,
-            )
-            .await;
-        if let Err(error) = result {
-            // Storage and REST errors can be indeterminate: the snapshot may
-            // already reference these files even though the response failed.
-            if matches!(&error, crate::Error::DataInvalid { .. }) {
-                let _ = self.abort(&commit_messages).await;
-            }
-            return Err(error);
-        }
-        Ok(())
+        self.try_commit(
+            CommitEntriesPlan::Direct {
+                entries,
+                changelog_entries,
+                new_index_entries,
+                check_from_snapshot,
+            },
+            Some(expected_snapshot_id),
+            commit_identifier,
+            false,
+        )
+        .await
     }
 
     /// Overwrite partitions with new data.
@@ -882,63 +874,10 @@ impl TableCommit {
         Ok(())
     }
 
-    /// Abort a prepared commit by deleting newly written data, changelog and index files.
-    ///
-    /// Deletion is best-effort and mirrors Python `FileStoreCommit.abort`: missing
-    /// files or storage errors are ignored so abort cleanup never masks the
-    /// original write failure.
-    pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
-        if self.table.is_format_table() {
-            return FormatTableCommit::new(&self.table)
-                .abort(commit_messages)
-                .await;
-        }
-        CoreOptions::new(self.table.schema().options())
-            .ensure_type_paimon_served(&self.table.identifier().full_name())?;
-        super::write_builder::ensure_table_write_allowed(&self.table)?;
-
-        let table_path = self.table.location().trim_end_matches('/');
-        let index_file_in_data_file_dir =
-            CoreOptions::new(self.table.schema().options()).index_file_in_data_file_dir();
-
-        for message in commit_messages {
-            let bucket_path = self.bucket_path(&message.partition, message.bucket)?;
-            for file in message
-                .new_files
-                .iter()
-                .chain(message.new_changelog_files.iter())
-                .chain(message.compact_after.iter())
-                .chain(message.compact_changelog_files.iter())
-            {
-                for path in file.collect_files(&bucket_path) {
-                    let _ = self.table.file_io().delete_file(&path).await;
-                }
-            }
-            // An index file must be deleted where it was written: at its external
-            // path when it has one, under the table `index/` directory when it is a
-            // global index file, and beside this bucket's data files when the table
-            // keeps bucket-local index files there. Which of the last two applies
-            // is a property of the file, not of the message — a data-evolution
-            // index build is global while a deletion vector from the same table is
-            // bucket-local — so each file is classified rather than all of them
-            // assumed bucket-local, as Java `FileStoreCommitImpl.abort` does
-            // through `indexFileFactory(partition, bucket)`. Deleting is
-            // best-effort, so a wrong path leaks the file silently instead of
-            // failing.
-            for file in message
-                .new_index_files
-                .iter()
-                .chain(&message.compact_new_index_files)
-            {
-                let path = committed_index_file_path(
-                    table_path,
-                    &bucket_path,
-                    index_file_in_data_file_dir,
-                    file,
-                );
-                let _ = self.table.file_io().delete_file(&path).await;
-            }
-        }
+    /// Preserve prepared files, including when the commit outcome is unknown.
+    pub async fn abort(&self, _commit_messages: &[CommitMessage]) -> Result<()> {
+        // Never add deletion based on CommitMessage here. Publication may have
+        // succeeded even if the caller received a commit exception.
         Ok(())
     }
 
@@ -3617,10 +3556,11 @@ mod tests {
         include!("table_commit/parity_tests.rs");
         include!("table_commit/recovery_tests.rs");
         include!("table_commit/row_tracking_tests.rs");
+        include!("table_commit/abort_tests.rs");
     }
 
     #[tokio::test]
-    async fn abort_still_cleans_up_for_a_query_auth_table() {
+    async fn abort_preserves_files_for_a_query_auth_table() {
         let table = crate::table::query_auth_table();
         let commit = crate::table::WriteBuilder::new(&table).new_commit();
         commit.abort(&[]).await.unwrap();
@@ -4688,7 +4628,7 @@ mod tests {
         let snapshot = snap_manager.get_latest_snapshot().await.unwrap().unwrap();
         assert_eq!(snapshot.id(), 1);
         assert!(snapshot.index_manifest().is_none());
-        assert!(!file_io.exists(&index_path).await.unwrap());
+        assert!(file_io.exists(&index_path).await.unwrap());
     }
 
     #[tokio::test]
@@ -6199,7 +6139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_abort_deletes_new_data_and_changelog_files() {
+    async fn test_abort_preserves_new_data_and_changelog_files() {
         let file_io = test_file_io();
         let table_path = "memory:/test_abort_cleanup";
         setup_dirs(&file_io, table_path).await;
@@ -6224,22 +6164,22 @@ mod tests {
         message.new_changelog_files = vec![changelog_file];
         commit.abort(&[message]).await.unwrap();
 
-        assert!(!file_io
+        assert!(file_io
             .exists(&format!("{bucket_dir}/data.parquet"))
             .await
             .unwrap());
-        assert!(!file_io
+        assert!(file_io
             .exists(&format!("{bucket_dir}/data.parquet.index"))
             .await
             .unwrap());
-        assert!(!file_io
+        assert!(file_io
             .exists(&format!("{bucket_dir}/changelog.parquet"))
             .await
             .unwrap());
     }
 
     #[tokio::test]
-    async fn test_abort_deletes_new_index_files() {
+    async fn test_abort_preserves_new_index_files() {
         let file_io = test_file_io();
         let table_path = "memory:/test_abort_index_cleanup";
         setup_dirs(&file_io, table_path).await;
@@ -6268,8 +6208,8 @@ mod tests {
         commit.abort(&[message]).await.unwrap();
 
         assert!(
-            !file_io.exists(&index_path).await.unwrap(),
-            "abort must remove newly written index files"
+            file_io.exists(&index_path).await.unwrap(),
+            "abort must preserve newly written index files"
         );
     }
 
@@ -6322,10 +6262,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_abort_deletes_index_files_from_the_data_file_directory() {
+    async fn test_abort_preserves_index_files_from_the_data_file_directory() {
         // With `index-file-in-data-file-dir`, a new index file is written beside the
-        // bucket's data files, so abort must delete it there. Deleting is best-effort
-        // (`let _ =`), so a wrong path leaks the file silently.
+        // bucket's data files, so abort must preserve it there.
         let file_io = test_file_io();
         let table_path = "memory:/test_abort_index_in_bucket_dir";
         setup_dirs(&file_io, table_path).await;
@@ -6375,8 +6314,8 @@ mod tests {
         commit.abort(&[message]).await.unwrap();
 
         assert!(
-            !file_io.exists(&index_path).await.unwrap(),
-            "abort must remove an index file written into the bucket data-file directory"
+            file_io.exists(&index_path).await.unwrap(),
+            "abort must preserve an index file written into the bucket data-file directory"
         );
         assert!(
             file_io.exists(&sentinel).await.unwrap(),
@@ -6385,11 +6324,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_abort_deletes_a_global_index_file_when_index_files_live_in_the_bucket_dir() {
+    async fn test_abort_preserves_a_global_index_file_when_index_files_live_in_the_bucket_dir() {
         // A data-evolution index build writes a global index file under
-        // `<table>/index` even when `index-file-in-data-file-dir` is set, so
-        // resolving it as bucket-local leaves it behind — deleting is best-effort
-        // (`let _ =`), so the wrong path fails silently.
+        // `<table>/index` even when `index-file-in-data-file-dir` is set.
+        // Both locations must remain intact after abort.
         let file_io = test_file_io();
         let table_path = "memory:/test_abort_global_index_with_bucket_dir_option";
         setup_dirs(&file_io, table_path).await;
@@ -6431,8 +6369,8 @@ mod tests {
         commit.abort(&[message]).await.unwrap();
 
         assert!(
-            !file_io.exists(&index_path).await.unwrap(),
-            "abort must remove a global index file from the table index directory"
+            file_io.exists(&index_path).await.unwrap(),
+            "abort must preserve a global index file from the table index directory"
         );
         assert!(
             file_io.exists(&sentinel).await.unwrap(),
@@ -6441,7 +6379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_abort_deletes_index_files_at_their_external_path() {
+    async fn test_abort_preserves_index_files_at_their_external_path() {
         let file_io = test_file_io();
         let table_path = "memory:/test_abort_index_external";
         setup_dirs(&file_io, table_path).await;
@@ -6471,8 +6409,8 @@ mod tests {
         commit.abort(&[message]).await.unwrap();
 
         assert!(
-            !file_io.exists(&external_path).await.unwrap(),
-            "abort must remove an index file recorded at an external path"
+            file_io.exists(&external_path).await.unwrap(),
+            "abort must preserve an index file recorded at an external path"
         );
     }
 
