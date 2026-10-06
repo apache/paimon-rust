@@ -211,6 +211,13 @@ impl AppendDedicatedFormatFileWriter {
         .with_path_factory(paths.clone())
         .with_file_index(normal_index)
         .with_target_file_row_num(target_file_row_num);
+        // A view-only schema also uses this adapter to translate references,
+        // but Java treats its physical writer as an ordinary inline writer.
+        let normal_writer = if !blob_writers.is_empty() || vector_writer.is_some() {
+            normal_writer.without_row_sidecar()
+        } else {
+            normal_writer
+        };
 
         Ok(Self {
             written_files: Vec::new(),

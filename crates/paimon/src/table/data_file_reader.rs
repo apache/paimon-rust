@@ -330,6 +330,7 @@ impl DataFileReader {
                         )
                     });
                     split_file_offset += file_meta.row_count;
+                    let sidecar_ranges = split_ranges.clone();
                     let selected_ranges = match file_index_result {
                         FileIndexResult::Remain => split_ranges,
                         FileIndexResult::Skip => Some(Vec::new()),
@@ -360,6 +361,7 @@ impl DataFileReader {
                         data_fields,
                         None,
                         row_selection,
+                        sidecar_ranges,
                     )?;
                     while let Some(batch) = stream.next().await {
                         yield batch?;
@@ -437,6 +439,27 @@ impl DataFileReader {
         dv: Option<Arc<DeletionVector>>,
         row_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_single_file_stream_with_requested_ranges(
+            split,
+            file_meta,
+            data_fields,
+            dv,
+            row_ranges.clone(),
+            row_ranges,
+        )
+    }
+
+    /// Physical selection may be narrowed by file indexes or a LIMIT, while
+    /// Java selects the ROW sidecar from the caller's original row ranges.
+    pub(super) fn read_single_file_stream_with_requested_ranges(
+        &self,
+        split: &DataSplit,
+        file_meta: DataFileMeta,
+        data_fields: Option<Vec<DataField>>,
+        dv: Option<Arc<DeletionVector>>,
+        row_ranges: Option<Vec<RowRange>>,
+        requested_ranges: Option<Vec<RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         let local_ranges = row_ranges.as_ref().map(|ranges| {
             to_local_row_ranges(
                 ranges,
@@ -446,12 +469,20 @@ impl DataFileReader {
         });
         let row_selection =
             merge_row_selection(file_meta.row_count, dv.as_deref(), local_ranges.as_deref());
+        let sidecar_ranges = requested_ranges.as_ref().map(|ranges| {
+            to_local_row_ranges(
+                ranges,
+                file_meta.first_row_id.unwrap_or(0),
+                file_meta.row_count,
+            )
+        });
         self.read_single_file_stream_with_selection(
             split,
             file_meta,
             data_fields,
             None,
             row_selection,
+            sidecar_ranges,
         )
     }
 
@@ -482,6 +513,7 @@ impl DataFileReader {
             data_fields,
             Some(data_schema_fields),
             row_selection,
+            local_ranges,
         )
     }
 
@@ -492,6 +524,7 @@ impl DataFileReader {
         data_fields: Option<Vec<DataField>>,
         data_schema_fields: Option<Vec<DataField>>,
         row_selection: Option<Vec<RowRange>>,
+        sidecar_ranges: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
         if row_selection.as_ref().is_some_and(Vec::is_empty) {
             return Ok(futures::stream::empty().boxed());
@@ -582,23 +615,6 @@ impl DataFileReader {
             blob_parallelism,
             mosaic_prefetch,
         )?;
-        let format_read_fields = configured_reader.read_fields;
-        let format_reader = configured_reader.reader;
-        // The decoded batch is described by `format_read_fields`, so map
-        // `read_type` onto *that* list: its entries carry the types the columns
-        // actually come back as, which is what reconciling them needs.
-        let (index_mapping, source_fields) = if data_fields.is_some()
-            || file_meta.write_cols.is_some()
-            || read_type.iter().any(contains_selected_map)
-        {
-            (
-                create_index_mapping(&read_type, &format_read_fields),
-                Some(format_read_fields.clone()),
-            )
-        } else {
-            (None, None)
-        };
-
         // Remap predicates from table-level to file-level indices.
         let file_predicates = if row_id_residual {
             None
@@ -621,7 +637,40 @@ impl DataFileReader {
 
         Ok(try_stream! {
             let schema_open_start = read_timing.as_ref().map(|_| Instant::now());
-            let input_file = file_io.new_input(&path_to_read)?;
+            let options = crate::spec::CoreOptions::new(&table_options);
+            let sidecar_ranges = super::row_sidecar::supports_read_type(
+                &read_type, blob_as_descriptor || options.blob_as_descriptor(),
+            ).then_some(sidecar_ranges.as_deref()).flatten();
+            let (read_path, read_size) = super::row_sidecar::read_target(
+                &file_io, &file_meta, split.bucket_path(), sidecar_ranges, &options,
+            ).await?;
+            let configured_reader = if read_path == path_to_read {
+                configured_reader
+            } else {
+                create_format_reader_with_budget(
+                    &read_path, blob_as_descriptor,
+                    FormatReadFields { data_schema: &data_schema_fields, projected: &projected_read_fields },
+                    &table_options, None, blob_parallelism, mosaic_prefetch,
+                )?
+            };
+            let format_read_fields = configured_reader.read_fields;
+            let format_reader = configured_reader.reader;
+            // The decoded batch is described by `format_read_fields`, so map
+            // `read_type` onto *that* list: its entries carry the types the columns
+            // actually come back as, which is what reconciling them needs.
+            let (index_mapping, source_fields) = if data_fields.is_some()
+                || file_meta.write_cols.is_some()
+                || read_type.iter().any(contains_selected_map)
+            {
+                (
+                    create_index_mapping(&read_type, &format_read_fields),
+                    Some(format_read_fields.clone()),
+                )
+            } else {
+                (None, None)
+            };
+
+            let input_file = file_io.new_input(&read_path)?;
             let open_start = read_timing.as_ref().map(|_| Instant::now());
             let file_reader = input_file.reader().await?;
             if let (Some(timing), Some(start)) = (read_timing.as_ref(), open_start) {
@@ -634,7 +683,14 @@ impl DataFileReader {
                 }),
                 None => Box::new(file_reader),
             };
-            let is_parquet = path_to_read.to_ascii_lowercase().ends_with(".parquet");
+            let is_parquet = read_path.to_ascii_lowercase().ends_with(".parquet");
+            let target_schema = if read_path != path_to_read && read_path.ends_with(".row") {
+                let names = read_type.iter().filter(|field| matches!(field.data_type(), DataType::Blob(_)))
+                    .map(|field| field.name().to_string()).collect();
+                super::row_sidecar::mark_blob_data(&target_schema, &names)
+            } else {
+                target_schema
+            };
             let selected_row_ids = selected_row_ids_for_read(
                 projects_row_id,
                 file_meta.first_row_id,
@@ -645,7 +701,7 @@ impl DataFileReader {
 
             let mut batch_stream = format_reader.read_batch_stream(
                 file_reader,
-                file_meta.file_size as u64,
+                read_size,
                 &format_read_fields,
                 file_predicates.as_ref(),
                 batch_size,
@@ -1477,7 +1533,8 @@ pub(super) fn insert_column_at(
     if insert_index >= batch.num_columns() {
         columns.push(column);
     }
-    RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| Error::UnexpectedError {
+    let schema = super::row_sidecar::propagate_blob_data(output_schema, &batch);
+    RecordBatch::try_new(schema, columns).map_err(|e| Error::UnexpectedError {
         message: format!("Failed to insert column into RecordBatch: {e}"),
         source: Some(Box::new(e)),
     })

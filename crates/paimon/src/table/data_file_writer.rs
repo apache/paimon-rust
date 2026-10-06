@@ -24,6 +24,7 @@
 
 use super::data_file_index_writer::{DataFileIndexWriter, FileIndexOptions};
 use super::data_file_path_factory::{DataFilePath, DataFilePathFactory};
+use super::row_sidecar::RowSidecarWriter;
 use crate::arrow::format::{
     create_format_writer_factory, with_write_resources, FormatFileWriter, FormatValueStats,
     FormatWriterFactory,
@@ -75,6 +76,8 @@ pub(crate) struct DataFileWriter {
     current_row_count: i64,
     index_options: Option<Arc<FileIndexOptions>>,
     current_index: Option<DataFileIndexWriter>,
+    row_sidecar_enabled: bool,
+    current_row_sidecar: Option<RowSidecarWriter>,
     resources: Option<ResourceContext>,
     /// Paths owned by this write until prepare_commit hands them to the caller.
     created_paths: Vec<String>,
@@ -108,7 +111,14 @@ impl DataFileWriter {
         let data_file_prefix = CoreOptions::new(&format_options)
             .data_file_prefix()
             .to_string();
+        let options = CoreOptions::new(&format_options);
+        let row_sidecar_enabled = options.data_evolution_enabled()
+            && options.data_evolution_row_sidecar_enabled()?
+            && !file_format.eq_ignore_ascii_case("blob")
+            && !file_format.starts_with("vector.");
         Ok(Self {
+            row_sidecar_enabled,
+            current_row_sidecar: None,
             format_writer_factory: None,
             file_io,
             paths,
@@ -149,6 +159,13 @@ impl DataFileWriter {
         self
     }
 
+    /// Java's dedicated-format writer does not create auxiliary ROW files,
+    /// including for its normal columns.
+    pub(super) fn without_row_sidecar(mut self) -> Self {
+        self.row_sidecar_enabled = false;
+        self
+    }
+
     pub(crate) fn with_target_file_row_num(mut self, rows: i64) -> Self {
         debug_assert!(rows > 0);
         self.target_file_row_num = rows;
@@ -167,7 +184,7 @@ impl DataFileWriter {
     /// Write a RecordBatch. Rolls when either target size or row count is reached.
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         let result = self.write_batch(batch).await;
-        if self.index_options.is_some() && result.is_err() {
+        if (self.index_options.is_some() || self.row_sidecar_enabled) && result.is_err() {
             self.abort().await;
         }
         result
@@ -184,6 +201,9 @@ impl DataFileWriter {
         }
 
         self.current_writer.as_mut().unwrap().write(batch).await?;
+        if let Some(sidecar) = self.current_row_sidecar.as_mut() {
+            sidecar.write(batch).await?;
+        }
         if let Some(index) = &mut self.current_index {
             index.write(batch)?;
         }
@@ -246,7 +266,7 @@ impl DataFileWriter {
             None => {
                 let factory = create_format_writer_factory(
                     &self.file_format,
-                    schema,
+                    schema.clone(),
                     self.file_compression_zstd_level,
                     Some(self.file_io.clone()),
                     Some(&self.write_fields),
@@ -262,9 +282,36 @@ impl DataFileWriter {
             .await?;
         self.current_writer = Some(with_write_resources(writer, self.resources.as_ref()));
         self.current_index = index;
-        self.current_file_name = Some(file_name);
+        self.current_file_name = Some(file_name.clone());
         self.current_file_path = Some(location);
         self.current_row_count = 0;
+        self.open_row_sidecar(&file_path, &file_name, schema)
+            .await?;
+        Ok(())
+    }
+
+    async fn open_row_sidecar(
+        &mut self,
+        path: &str,
+        file_name: &str,
+        schema: arrow_schema::SchemaRef,
+    ) -> Result<()> {
+        if self.row_sidecar_enabled {
+            let path = format!("{path}.row");
+            self.created_paths.push(path.clone());
+            self.current_row_sidecar = Some(
+                RowSidecarWriter::new(
+                    &self.file_io,
+                    &path,
+                    file_name,
+                    schema,
+                    &self.write_fields,
+                    &self.format_options,
+                    self.resources.as_ref(),
+                )
+                .await?,
+            );
+        }
         Ok(())
     }
 
@@ -293,6 +340,7 @@ impl DataFileWriter {
     ) -> Option<impl std::future::Future<Output = Result<DataFileMeta>> + Send + 'static> {
         let writer = self.current_writer.take()?;
         let index = self.current_index.take();
+        let row_sidecar = self.current_row_sidecar.take();
         let file_io = self.file_io.clone();
         let location = self.current_file_path.take().unwrap();
         let bucket_dir = location.parent().to_string();
@@ -316,7 +364,19 @@ impl DataFileWriter {
         };
 
         Some(async move {
-            let write_result = writer.close().await?;
+            // Close both outputs even if an auxiliary close fails. All paths
+            // remain producer-owned until the whole prepare succeeds.
+            let sidecar_result = match row_sidecar {
+                Some(sidecar) => sidecar
+                    .writer
+                    .close()
+                    .await
+                    .map(|_| Some(sidecar.file_name)),
+                None => Ok(None),
+            };
+            let write_result = writer.close().await;
+            let sidecar_name = sidecar_result?;
+            let write_result = write_result?;
             let mut meta = Self::build_meta(
                 file_name,
                 write_result.file_size as i64,
@@ -342,6 +402,9 @@ impl DataFileWriter {
                     meta.embedded_index = Some(bytes.to_vec());
                 }
             }
+            if let Some(name) = sidecar_name {
+                meta.extra_files.push(name);
+            }
             Ok(meta)
         })
     }
@@ -349,7 +412,7 @@ impl DataFileWriter {
     /// Close the current writer and return all written file metadata.
     pub(crate) async fn prepare_commit(&mut self) -> Result<Vec<DataFileMeta>> {
         let result = self.finish().await;
-        if result.is_err() && self.index_options.is_some() {
+        if result.is_err() && (self.index_options.is_some() || self.row_sidecar_enabled) {
             self.abort().await;
         }
         result
@@ -429,6 +492,9 @@ impl DataFileWriter {
     }
 
     pub(super) async fn abort(&mut self) {
+        if let Some(sidecar) = self.current_row_sidecar.take() {
+            let _ = sidecar.writer.close().await;
+        }
         if let Some(writer) = self.current_writer.take() {
             let _ = writer.close().await;
         }
@@ -788,9 +854,154 @@ mod tests {
         }
     }
 
+    struct FailingSidecar {
+        inner: Box<dyn FormatFileWriter>,
+        fail_write: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl FormatFileWriter for FailingSidecar {
+        async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+            if self.fail_write {
+                return Err(crate::Error::DataInvalid {
+                    message: "injected sidecar write failure".into(),
+                    source: None,
+                });
+            }
+            self.inner.write(batch).await
+        }
+        fn num_bytes(&self) -> usize {
+            self.inner.num_bytes()
+        }
+        fn in_progress_size(&self) -> usize {
+            self.inner.in_progress_size()
+        }
+        async fn flush(&mut self) -> Result<()> {
+            self.inner.flush().await
+        }
+        async fn close(self: Box<Self>) -> Result<crate::arrow::format::FormatWriteResult> {
+            self.inner.close().await?;
+            Err(crate::Error::DataInvalid {
+                message: "injected sidecar close failure".into(),
+                source: None,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SidecarFailureProvider {
+        operator: Operator,
+        fail_create: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl FileIOProvider for SidecarFailureProvider {
+        async fn create(&self, path: &str) -> Result<(Operator, String)> {
+            if path.ends_with(".row") && self.fail_create.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(crate::Error::DataInvalid {
+                    message: "injected sidecar create failure".into(),
+                    source: None,
+                });
+            }
+            Ok((
+                self.operator.clone(),
+                path.trim_start_matches("memory:")
+                    .trim_start_matches('/')
+                    .into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn sidecar_failures_only_remove_current_producer_outputs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for failure in ["create", "write", "close"] {
+            let provider = Arc::new(SidecarFailureProvider {
+                operator: Operator::from_config(opendal::services::MemoryConfig::default())
+                    .unwrap(),
+                fail_create: AtomicBool::new(false),
+            });
+            let io = FileIOBuilder::new("unused")
+                .with_provider(provider.clone())
+                .build()
+                .unwrap();
+            let fields = vec![DataField::new(
+                0,
+                "id".into(),
+                DataType::Int(IntType::new()),
+            )];
+            let mut writer = DataFileWriter::new(
+                io.clone(),
+                "memory:/sidecar-failure".into(),
+                String::new(),
+                0,
+                0,
+                i64::MAX,
+                "none".into(),
+                0,
+                i64::MAX,
+                "parquet".into(),
+                fields,
+                HashMap::from([
+                    ("data-evolution.enabled".into(), "true".into()),
+                    ("data-evolution.row-sidecar.enabled".into(), "true".into()),
+                ]),
+                Some(0),
+                None,
+                None,
+            )
+            .unwrap();
+            let batch = RecordBatch::try_from_iter([(
+                "id",
+                Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
+            )])
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            let prepared = writer.prepare_commit().await.unwrap();
+            let prior_paths = prepared[0].collect_files(writer.bucket_dir());
+            assert_eq!(prior_paths.len(), 2);
+            let error = if failure == "create" {
+                provider.fail_create.store(true, Ordering::Relaxed);
+                let error = writer.write(&batch).await.unwrap_err();
+                provider.fail_create.store(false, Ordering::Relaxed);
+                error
+            } else {
+                writer.write(&batch).await.unwrap();
+                let sidecar = writer.current_row_sidecar.take().unwrap();
+                let mut sidecar = sidecar;
+                sidecar.writer = Box::new(FailingSidecar {
+                    inner: sidecar.writer,
+                    fail_write: failure == "write",
+                });
+                writer.current_row_sidecar = Some(sidecar);
+                if failure == "write" {
+                    writer.write(&batch).await.unwrap_err()
+                } else {
+                    writer.prepare_commit().await.unwrap_err()
+                }
+            };
+            assert!(error
+                .to_string()
+                .contains(&format!("sidecar {failure} failure")));
+            writer.abort().await;
+            let mut actual: Vec<_> = io
+                .list_status_recursive(writer.bucket_dir())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|status| status.path)
+                .collect();
+            actual.sort();
+            let mut expected = prior_paths;
+            expected.sort();
+            assert_eq!(actual, expected, "{failure}");
+        }
+    }
+
     #[tokio::test]
     async fn grouped_prepare_failure_removes_successful_and_failed_outputs() {
-        for external in [false, true] {
+        for (external, sidecar) in [(false, false), (true, false), (false, true), (true, true)] {
             let file_io = FileIOBuilder::new("memory").build().unwrap();
             let mut writers = Vec::new();
             for first_row_id in [0, 1] {
@@ -829,6 +1040,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
+                writer.row_sidecar_enabled = sidecar;
                 let batch = RecordBatch::try_from_iter([(
                     "id",
                     Arc::new(Int32Array::from(vec![1])) as arrow_array::ArrayRef,
@@ -854,7 +1066,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .all(|entry| !entry.path.ends_with(".parquet")));
+                .all(|entry| !entry.path.ends_with(".parquet") && !entry.path.ends_with(".row")));
         }
     }
 }
