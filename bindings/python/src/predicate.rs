@@ -419,26 +419,35 @@ pub(crate) fn dict_to_predicate(
     }
 }
 
-/// Convert against table fields plus the synthesized `_ROW_ID` field.
+/// Convert against table fields plus the row-tracking metadata fields.
 pub(crate) fn dict_to_table_predicate(
     node: &Bound<'_, PyDict>,
     fields: &[DataField],
     case_sensitive: bool,
 ) -> PyResult<Predicate> {
-    use paimon::spec::{BigIntType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME};
+    use paimon::spec::{
+        BigIntType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID,
+        SEQUENCE_NUMBER_FIELD_NAME,
+    };
     let mut fields = fields.to_vec();
-    let has_row_id = fields.iter().any(|field| {
-        if case_sensitive {
-            field.name() == ROW_ID_FIELD_NAME
-        } else {
-            field.name().eq_ignore_ascii_case(ROW_ID_FIELD_NAME)
-        }
-    });
+    // Reserved fields retain their canonical names. A differently cased user
+    // column must coexist here so insensitive resolution reports ambiguity.
+    let has_row_id = fields.iter().any(|field| field.name() == ROW_ID_FIELD_NAME);
     if !has_row_id {
         fields.push(DataField::new(
             ROW_ID_FIELD_ID,
             ROW_ID_FIELD_NAME.into(),
             DataType::BigInt(BigIntType::with_nullable(true)),
+        ));
+    }
+    if !fields
+        .iter()
+        .any(|field| field.name() == SEQUENCE_NUMBER_FIELD_NAME)
+    {
+        fields.push(DataField::new(
+            SEQUENCE_NUMBER_FIELD_ID,
+            SEQUENCE_NUMBER_FIELD_NAME.into(),
+            DataType::BigInt(BigIntType::with_nullable(false)),
         ));
     }
     dict_to_predicate(node, &fields, case_sensitive)

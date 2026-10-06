@@ -26,7 +26,7 @@
 use crate::error::*;
 use crate::spec::binary_row::BinaryRow;
 use crate::spec::types::DataType;
-use crate::spec::{is_row_id_column, DataField};
+use crate::spec::{is_row_tracking_column, DataField};
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -468,7 +468,7 @@ impl Predicate {
                 op,
                 literals,
             } => {
-                if is_row_id_column(column) {
+                if is_row_tracking_column(column) {
                     return None;
                 }
                 let new_index = (*mapping.get(*index)?)?;
@@ -510,7 +510,7 @@ impl Predicate {
     pub(crate) fn references_only_mapped_fields(&self, mapping: &[Option<usize>]) -> bool {
         match self {
             Predicate::Leaf { column, index, .. } => {
-                !is_row_id_column(column) && mapping.get(*index).is_some_and(Option::is_some)
+                !is_row_tracking_column(column) && mapping.get(*index).is_some_and(Option::is_some)
             }
             Predicate::And(children) | Predicate::Or(children) => children
                 .iter()
@@ -522,7 +522,7 @@ impl Predicate {
 
     /// Project leaf field indices from table schema space into a smaller field space.
     ///
-    /// A `_ROW_ID` leaf never maps — see [`is_row_id_column`].
+    /// A row-tracking metadata leaf never maps — see [`is_row_tracking_column`].
     ///
     /// Unlike [`Self::remap_field_index`], mixed `AND` subtrees keep the children
     /// that can be projected and drop the rest. `OR` and `NOT` still require all
@@ -542,7 +542,7 @@ impl Predicate {
                 op,
                 literals,
             } => {
-                if is_row_id_column(column) {
+                if is_row_tracking_column(column) {
                     return None;
                 }
                 let new_index = (*mapping.get(*index)?)?;

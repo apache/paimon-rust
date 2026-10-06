@@ -632,7 +632,7 @@ pub(super) fn validate_projection_possible(
         .map(|f| f.name().to_ascii_lowercase())
         .collect();
     for name in projection_names {
-        if name == crate::spec::ROW_ID_FIELD_NAME {
+        if crate::spec::is_row_tracking_column(name) {
             continue;
         }
         if !folded_names.contains(&name.to_ascii_lowercase()) {
@@ -693,8 +693,27 @@ pub(super) fn resolve_projected_fields(
             });
         }
 
-        if name == crate::spec::ROW_ID_FIELD_NAME {
+        let is_row_id = name == crate::spec::ROW_ID_FIELD_NAME
+            || (!case_sensitive && name.eq_ignore_ascii_case(crate::spec::ROW_ID_FIELD_NAME));
+        let is_sequence = name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME
+            || (!case_sensitive
+                && name.eq_ignore_ascii_case(crate::spec::SEQUENCE_NUMBER_FIELD_NAME));
+        if !case_sensitive
+            && (is_row_id || is_sequence)
+            && folded_index.contains_key(&name.to_ascii_lowercase())
+        {
+            return Err(Error::ConfigInvalid {
+                message: format!(
+                    "Ambiguous projection column '{name}' for table {full_name}: user and metadata fields match case-insensitively"
+                ),
+            });
+        }
+        if is_row_id {
             resolved.push(crate::spec::row_id_data_field());
+            continue;
+        }
+        if is_sequence {
+            resolved.push(crate::spec::sequence_number_data_field());
             continue;
         }
 
@@ -726,7 +745,10 @@ pub(super) fn resolve_projected_fields(
 pub(super) fn projected_read_field_ids_from_fields(fields: &[DataField]) -> HashSet<i32> {
     fields
         .iter()
-        .filter(|field| !is_system_projection_field(field.id()))
+        .filter(|field| {
+            field.id() == crate::spec::SEQUENCE_NUMBER_FIELD_ID
+                || !is_system_projection_field(field.id())
+        })
         .map(|field| field.id())
         .collect::<HashSet<_>>()
 }
@@ -748,9 +770,14 @@ fn projected_read_field_ids_with_predicates(
         crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
     }
     for (name, index) in refs {
+        if name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME {
+            // The version provider need not write any projected user column.
+            field_ids.insert(crate::spec::SEQUENCE_NUMBER_FIELD_ID);
+            continue;
+        }
         // Not in `table_fields`, and excluded from this set anyway — files never
         // list it in `write_cols`.
-        if crate::spec::is_row_id_column(name) {
+        if crate::spec::is_row_tracking_column(name) {
             continue;
         }
         let Some(field) = table_fields.get(index) else {
@@ -1650,6 +1677,41 @@ mod tests {
             super::resolve_projected_fields("db.t".to_string(), &fields, &["COL".into()], false)
                 .unwrap_err();
         assert!(matches!(err, crate::Error::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn test_metadata_projection_case_insensitive_collision_is_ambiguous() {
+        for (user, metadata) in [
+            ("_sequence_number", "_SEQUENCE_NUMBER"),
+            ("_row_id", "_ROW_ID"),
+        ] {
+            let fields = vec![DataField::new(
+                0,
+                user.into(),
+                DataType::Int(IntType::new()),
+            )];
+            for name in [user, metadata] {
+                let err =
+                    super::resolve_projected_fields("db.t".into(), &fields, &[name.into()], false)
+                        .unwrap_err();
+                assert!(
+                    matches!(err, crate::Error::ConfigInvalid { message } if message.contains("Ambiguous"))
+                );
+                let resolved =
+                    super::resolve_projected_fields("db.t".into(), &[], &[name.into()], false)
+                        .unwrap();
+                assert_eq!(resolved[0].name(), metadata);
+            }
+            let fields = super::resolve_projected_fields(
+                "db.t".into(),
+                &fields,
+                &[user.into(), metadata.into()],
+                true,
+            )
+            .unwrap();
+            assert_eq!(fields[0].id(), 0);
+            assert_ne!(fields[1].id(), 0);
+        }
     }
 
     #[test]

@@ -29,8 +29,8 @@ use crate::arrow::{ReadBudget, RowFilter, RowFilterContext};
 use crate::io::{FileRead, OutputFile};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
-    is_row_id_column, BinaryRowBuilder, CoreOptions, DataField, DataType, Datum, MetadataStatsMode,
-    Predicate, PredicateOperator,
+    is_row_tracking_column, BinaryRowBuilder, CoreOptions, DataField, DataType, Datum,
+    MetadataStatsMode, Predicate, PredicateOperator,
 };
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
@@ -1469,7 +1469,7 @@ fn parquet_leaf_row_filter_accepted(
     }
     // Not in the file, so the decoder cannot evaluate it. Rejecting the leaf
     // rejects any enclosing predicate too, leaving it to the post-scan residual.
-    if is_row_id_column(column) {
+    if is_row_tracking_column(column) {
         return Ok(false);
     }
     let Some(file_field) = file_fields.get(index) else {

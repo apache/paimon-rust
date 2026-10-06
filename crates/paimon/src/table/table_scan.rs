@@ -1012,6 +1012,11 @@ async fn prune_data_evolution_group_by_read_fields(
     } else {
         None
     };
+    let sequence_idx = if read_field_ids.contains(&SEQUENCE_NUMBER_FIELD_ID) {
+        Some(data_evolution_sequence_file_index(&group)?)
+    } else {
+        None
+    };
 
     let mut keep = Vec::with_capacity(group.len());
     for (idx, file) in group.iter().enumerate() {
@@ -1035,6 +1040,11 @@ async fn prune_data_evolution_group_by_read_fields(
             keep.push(anchor_idx);
         }
     }
+    if let Some(sequence_idx) = sequence_idx {
+        if !keep.contains(&sequence_idx) {
+            keep.push(sequence_idx);
+        }
+    }
 
     if keep.is_empty() {
         keep.push(data_evolution_representative_file(&group)?);
@@ -1047,11 +1057,30 @@ async fn prune_data_evolution_group_by_read_fields(
         }
     }
 
+    if sequence_idx.is_some() {
+        // Preserve original order for equal-sequence metadata providers.
+        keep.sort_unstable();
+    }
     let mut files = group.into_iter().map(Some).collect::<Vec<_>>();
     Ok(keep
         .into_iter()
         .filter_map(|idx| files.get_mut(idx).and_then(Option::take))
         .collect())
+}
+
+/// The newest normal file supplies row-tracking sequence metadata. It must
+/// survive user-column pruning even if it only wrote an unprojected column.
+fn data_evolution_sequence_file_index(group: &[DataFileMeta]) -> crate::Result<usize> {
+    group
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| is_normal_data_file(file))
+        .min_by_key(|(idx, file)| (std::cmp::Reverse(file.max_sequence_number), *idx))
+        .map(|(idx, _)| idx)
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Data-evolution sequence metadata requires a normal data file".into(),
+            source: None,
+        })
 }
 
 #[derive(Debug, Clone)]

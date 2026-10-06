@@ -241,14 +241,8 @@ pub(super) async fn read_target(
 ) -> Result<(String, u64)> {
     if let Some(name) = selected_sidecar(file, local_ranges, options)? {
         let path = file.aligned_file_path(bucket_path, name);
-        match io.get_status(&path).await {
-            Ok(status) => return Ok((path, status.size)),
-            Err(error) => {
-                if !options.scan_ignore_lost_file() {
-                    return Err(error);
-                }
-            }
-        }
+        let status = io.get_status(&path).await?;
+        return Ok((path, status.size));
     }
     Ok((file.data_file_path(bucket_path), file.file_size as u64))
 }

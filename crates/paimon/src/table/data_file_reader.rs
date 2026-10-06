@@ -537,27 +537,46 @@ impl DataFileReader {
         let projects_row_id = read_type
             .iter()
             .any(|field| field.name() == ROW_ID_FIELD_NAME);
-        let row_id_residual = projects_row_id
+        let row_tracking_enabled =
+            crate::spec::CoreOptions::new(&self.table_options).row_tracking_enabled();
+        let mut refs = Vec::new();
+        for predicate in &predicates {
+            crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
+        }
+        let metadata_residual = (projects_row_id
             && predicates
                 .iter()
-                .any(|predicate| !matches!(predicate, Predicate::AlwaysTrue));
-        if row_id_residual {
+                .any(|predicate| !matches!(predicate, Predicate::AlwaysTrue)))
+            || (row_tracking_enabled
+                && refs
+                    .iter()
+                    .any(|(name, _)| *name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME));
+        if metadata_residual {
             // Decoder-side filtering can drop rows before positional `_ROW_ID`
             // attachment. Read predicate-only columns without pushing the filter
             // down, attach the original ids, then evaluate the exact predicate.
-            let mut refs = Vec::new();
-            for predicate in &predicates {
-                crate::arrow::residual::collect_predicate_leaf_refs(predicate, &mut refs);
-            }
             for (name, index) in refs {
-                if name != ROW_ID_FIELD_NAME {
+                if name == crate::spec::SEQUENCE_NUMBER_FIELD_NAME {
+                    crate::arrow::residual::push_unique_scan_field(
+                        &mut read_type,
+                        &crate::spec::sequence_number_data_field(),
+                    );
+                } else if name == ROW_ID_FIELD_NAME {
+                    crate::arrow::residual::push_unique_scan_field(
+                        &mut read_type,
+                        &crate::spec::row_id_data_field(),
+                    );
+                } else {
                     if let Some(field) = table_fields.get(index) {
                         crate::arrow::residual::push_unique_scan_field(&mut read_type, field);
                     }
                 }
             }
         }
-        let residual_predicates = row_id_residual.then(|| crate::arrow::format::FilePredicates {
+        let projects_row_id = read_type
+            .iter()
+            .any(|field| field.name() == ROW_ID_FIELD_NAME);
+        let residual_predicates = metadata_residual.then(|| crate::arrow::format::FilePredicates {
             predicates: predicates.clone(),
             row_filter_factory: None,
             file_fields: table_fields.clone(),
@@ -567,7 +586,7 @@ impl DataFileReader {
         // post-filter until expression adaptation is proven for that path.
         // Positional `_ROW_ID` materialization must see the unfiltered row
         // stream, so the engine hook stays disabled for this projection.
-        let row_filter_factory = (data_fields.is_none() && !projects_row_id)
+        let row_filter_factory = (data_fields.is_none() && !projects_row_id && !metadata_residual)
             .then(|| self.row_filter_factory.clone())
             .flatten();
         let file_io = self.file_io.clone();
@@ -581,8 +600,6 @@ impl DataFileReader {
         let read_timing = self.read_timing.clone();
 
         let target_schema = build_target_arrow_schema(&read_type)?;
-        let row_tracking_enabled =
-            crate::spec::CoreOptions::new(&table_options).row_tracking_enabled();
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
         let data_schema_fields = data_schema_fields_for_file(
             &file_fields,
@@ -616,7 +633,7 @@ impl DataFileReader {
             mosaic_prefetch,
         )?;
         // Remap predicates from table-level to file-level indices.
-        let file_predicates = if row_id_residual {
+        let file_predicates = if metadata_residual {
             None
         } else {
             let remapped = crate::arrow::filtering::remap_predicates_to_file(

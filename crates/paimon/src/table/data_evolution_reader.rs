@@ -1343,7 +1343,7 @@ fn predicate_references_any_field(
         Predicate::Leaf { column, index, .. } => {
             // Never a BLOB column; resolving its placeholder index would force
             // every BLOB to be resolved before filtering.
-            if crate::spec::is_row_id_column(column) {
+            if crate::spec::is_row_tracking_column(column) {
                 return false;
             }
             field_names.contains(column)
@@ -2462,6 +2462,13 @@ fn build_source_plan_with_row_id_pushdown(
                 data_fields: info.data_fields.clone(),
                 read_fields: Vec::new(),
             });
+            // Java rowTypeWithRowTracking adds this metadata provider even
+            // when write_cols omits the physical sequence column. The newest
+            // normal file supplies the group version, independently of the
+            // requested data columns.
+            normal_providers
+                .entry(crate::spec::SEQUENCE_NUMBER_FIELD_ID)
+                .or_insert(source_idx);
             for &field_id in &info.field_ids {
                 // first normal file that carries the id wins (preserve existing semantics)
                 normal_providers.entry(field_id).or_insert(source_idx);
