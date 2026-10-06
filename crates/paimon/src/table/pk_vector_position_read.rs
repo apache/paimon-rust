@@ -143,9 +143,13 @@ impl<'a> PkVectorPositionRead<'a> {
             None => sorted.clone(),
         };
 
+        let recovery_state = super::file_read_recovery::FileReadRecoveryState::default();
+        let reader = self
+            .reader
+            .clone()
+            .with_file_read_recovery_state(recovery_state.clone());
         let inner =
-            self.reader
-                .read_single_file_stream_local(split, file_meta, data_fields, dv, sorted)?;
+            reader.read_single_file_stream_local(split, file_meta, data_fields, dv, sorted)?;
 
         let want_score_col = scores.is_some();
 
@@ -173,7 +177,7 @@ impl<'a> PkVectorPositionRead<'a> {
                 cursor = end;
                 yield out;
             }
-            if cursor != effective.len() {
+            if cursor != effective.len() && !recovery_state.skipped() {
                 let mismatch: crate::Result<()> = Err(data_invalid(format!(
                     "PK vector position read returned {cursor} rows but {} positions were selected",
                     effective.len()
@@ -499,6 +503,74 @@ mod tests {
             predicates,
         );
         (reader, split, dv)
+    }
+
+    #[tokio::test]
+    async fn parquet_position_recovery_skips_only_damaged_files() {
+        use parquet::arrow::ArrowWriter;
+        let data = id_batch(vec![10, 11, 12]);
+        let mut writer = ArrowWriter::try_new(Vec::new(), data.schema(), None).unwrap();
+        writer.write(&data).unwrap();
+        let bytes = Bytes::from(writer.into_inner().unwrap());
+        for corrupt in [false, true] {
+            let io = FileIOBuilder::new("memory").build().unwrap();
+            let bucket = "memory:/pk_parquet_recovery/bucket-0";
+            let path = format!("{bucket}/data.parquet");
+            io.new_output(&path)
+                .unwrap()
+                .write(bytes.clone())
+                .await
+                .unwrap();
+            let file = data_file("data.parquet", bytes.len() as i64, 3, 1, None);
+            let split = DataSplitBuilder::new()
+                .with_snapshot(1)
+                .with_partition(crate::spec::BinaryRow::new(0))
+                .with_bucket(0)
+                .with_bucket_path(bucket.to_string())
+                .with_total_buckets(1)
+                .with_data_files(vec![file.clone()])
+                .build()
+                .unwrap();
+            let reader = DataFileReader::new(
+                io.clone(),
+                SchemaManager::new(io.clone(), "memory:/pk_parquet_recovery".to_string()),
+                1,
+                id_fields(),
+                id_fields(),
+                Vec::new(),
+            );
+            if corrupt {
+                io.new_output(&path)
+                    .unwrap()
+                    .write(Bytes::from_static(b"corrupt"))
+                    .await
+                    .unwrap();
+            } else {
+                io.delete_file(&path).await.unwrap();
+            }
+            let raw = PkVectorPositionRead::new(&reader)
+                .read(&split, file.clone(), None, None, vec![0, 2], None)
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await;
+            assert!(raw.is_err());
+            let option = if corrupt {
+                "scan.ignore-corrupt-files"
+            } else {
+                "scan.ignore-lost-files"
+            };
+            let reader = reader.with_table_options(std::collections::HashMap::from([(
+                option.into(),
+                "true".into(),
+            )]));
+            let output = PkVectorPositionRead::new(&reader)
+                .read(&split, file, None, None, vec![0, 2], None)
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert!(output.is_empty());
+        }
     }
 
     fn column_by_name<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Arc<dyn Array>> {

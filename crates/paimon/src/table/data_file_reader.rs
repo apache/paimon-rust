@@ -140,6 +140,7 @@ pub(crate) struct DataFileReader {
     nested_field_enabled: bool,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
+    file_read_recovery_state: Option<super::file_read_recovery::FileReadRecoveryState>,
 }
 
 impl DataFileReader {
@@ -168,6 +169,7 @@ impl DataFileReader {
             nested_field_enabled: false,
             mosaic_prefetch: MosaicPrefetchOptions::default(),
             read_timing: None,
+            file_read_recovery_state: None,
         }
     }
 
@@ -222,6 +224,14 @@ impl DataFileReader {
 
     pub(crate) fn with_read_timing(mut self, read_timing: Option<Arc<DataFileReadTiming>>) -> Self {
         self.read_timing = read_timing;
+        self
+    }
+
+    pub(super) fn with_file_read_recovery_state(
+        mut self,
+        state: super::file_read_recovery::FileReadRecoveryState,
+    ) -> Self {
+        self.file_read_recovery_state = Some(state);
         self
     }
 
@@ -579,6 +589,7 @@ impl DataFileReader {
         let table_options = Arc::clone(&self.table_options);
         let mosaic_prefetch = self.mosaic_prefetch;
         let read_timing = self.read_timing.clone();
+        let recovery_state = self.file_read_recovery_state.clone();
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let row_tracking_enabled =
@@ -670,19 +681,6 @@ impl DataFileReader {
                 (None, None)
             };
 
-            let input_file = file_io.new_input(&read_path)?;
-            let open_start = read_timing.as_ref().map(|_| Instant::now());
-            let file_reader = input_file.reader().await?;
-            if let (Some(timing), Some(start)) = (read_timing.as_ref(), open_start) {
-                timing.add_file_read(start.elapsed());
-            }
-            let file_reader: Box<dyn FileRead> = match read_timing.as_ref() {
-                Some(timing) => Box::new(TimedFileRead {
-                    inner: Box::new(file_reader),
-                    timing: Arc::clone(timing),
-                }),
-                None => Box::new(file_reader),
-            };
             let is_parquet = read_path.to_ascii_lowercase().ends_with(".parquet");
             let target_schema = if read_path != path_to_read && read_path.ends_with(".row") {
                 let names = read_type.iter().filter(|field| matches!(field.data_type(), DataType::Blob(_)))
@@ -699,14 +697,33 @@ impl DataFileReader {
             let mut row_id_cursor = file_meta.first_row_id.unwrap_or(0);
             let mut row_id_offset = 0usize;
 
-            let mut batch_stream = format_reader.read_batch_stream(
-                file_reader,
-                read_size,
-                &format_read_fields,
-                file_predicates.as_ref(),
-                batch_size,
-                row_selection,
-            ).await?;
+            let recovery = super::file_read_recovery::FileReadRecovery::new(&options).with_state(recovery_state);
+            let opened = async {
+                let input_file = file_io.new_input(&read_path)?;
+                let open_start = read_timing.as_ref().map(|_| Instant::now());
+                let file_reader = input_file.reader().await?;
+                if let (Some(timing), Some(start)) = (read_timing.as_ref(), open_start) {
+                    timing.add_file_read(start.elapsed());
+                }
+                let file_reader: Box<dyn FileRead> = match read_timing.as_ref() {
+                    Some(timing) => Box::new(TimedFileRead {
+                        inner: Box::new(file_reader),
+                        timing: Arc::clone(timing),
+                    }),
+                    None => Box::new(file_reader),
+                };
+                format_reader.read_batch_stream(
+                    file_reader,
+                    read_size,
+                    &format_read_fields,
+                    file_predicates.as_ref(),
+                    batch_size,
+                    row_selection,
+                ).await
+            }.await;
+            let Some(mut batch_stream) = recovery.opened(&file_io, &read_path, opened).await? else {
+                return;
+            };
             if let (Some(timing), Some(start)) = (read_timing.as_ref(), schema_open_start) {
                 timing.add_file_schema_open(start.elapsed());
             }
@@ -734,7 +751,11 @@ impl DataFileReader {
                 }
                 let Some(batch) = batch else { break };
                 first_batch = false;
-                let batch = batch?;
+                let batch = match batch {
+                    Ok(batch) => batch,
+                    Err(error) if recovery.skip_batch_error(&read_path, &error) => break,
+                    Err(error) => Err(error)?,
+                };
                 let num_rows = batch.num_rows();
                 let batch_schema = batch.schema();
 
@@ -918,6 +939,7 @@ impl DataFileReader {
         let parquet_read_budget = self.parquet_read_budget.clone();
         let table_options = Arc::clone(&self.table_options);
         let mosaic_prefetch = self.mosaic_prefetch;
+        let recovery_state = self.file_read_recovery_state.clone();
 
         let target_schema = build_target_arrow_schema(&read_type)?;
         let file_fields = data_fields.clone().unwrap_or_else(|| table_fields.clone());
@@ -992,22 +1014,27 @@ impl DataFileReader {
             merge_row_selection(file_meta.row_count, dv.as_deref(), Some(&local_ranges));
 
         Ok(try_stream! {
-            let input_file = file_io.new_input(&path_to_read)?;
-            let file_reader = input_file.reader().await?;
-
-            let mut batch_stream = format_reader
-                .read_batch_stream(
-                    Box::new(file_reader),
-                    file_meta.file_size as u64,
-                    &format_read_fields,
-                    file_predicates.as_ref(),
-                    None,
-                    row_selection,
-                )
-                .await?;
+            let options = crate::spec::CoreOptions::new(&table_options);
+            let recovery = super::file_read_recovery::FileReadRecovery::new(&options)
+                .with_state(recovery_state);
+            let opened = async {
+                let input_file = file_io.new_input(&path_to_read)?;
+                let file_reader = input_file.reader().await?;
+                format_reader.read_batch_stream(
+                    Box::new(file_reader), file_meta.file_size as u64,
+                    &format_read_fields, file_predicates.as_ref(), None, row_selection,
+                ).await
+            }.await;
+            let Some(mut batch_stream) = recovery.opened(&file_io, &path_to_read, opened).await? else {
+                return;
+            };
 
             while let Some(batch) = batch_stream.next().await {
-                let batch = batch?;
+                let batch = match batch {
+                    Ok(batch) => batch,
+                    Err(error) if recovery.skip_batch_error(&path_to_read, &error) => break,
+                    Err(error) => Err(error)?,
+                };
                 let result = project_file_batch(
                     &batch,
                     &target_schema,

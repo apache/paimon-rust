@@ -143,15 +143,20 @@ impl DataFilePkVectorReaderFactory {
         if allowed_rows.is_some_and(|ranges| ranges.is_empty()) {
             return Ok(vec![Vec::new(); queries.len()]);
         }
+        let recovery_state = super::file_read_recovery::FileReadRecoveryState::default();
+        let reader = self
+            .reader
+            .clone()
+            .with_file_read_recovery_state(recovery_state.clone());
         let mut stream = match allowed_rows {
-            Some(ranges) => self.reader.read_single_file_stream_local_ranges(
+            Some(ranges) => reader.read_single_file_stream_local_ranges(
                 &self.data_split,
                 file_meta,
                 data_fields,
                 None,
                 ranges.to_vec(),
             )?,
-            None => self.reader.read_single_file_stream(
+            None => reader.read_single_file_stream(
                 &self.data_split,
                 file_meta,
                 data_fields,
@@ -213,7 +218,7 @@ impl DataFilePkVectorReaderFactory {
         }
 
         // The overrun side is caught above, when the selection runs dry mid-batch.
-        if selected.next().is_some() {
+        if selected.next().is_some() && !recovery_state.skipped() {
             return Err(data_invalid(
                 "data file ended before the selection was exhausted",
             ));

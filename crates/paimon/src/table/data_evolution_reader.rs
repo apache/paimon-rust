@@ -1063,10 +1063,13 @@ impl DataEvolutionReader {
                     .filter(|budget| budget.has_resources())
                     .map(|budget| Arc::new(budget.without_prefetch()))
             };
+            let recovery_states: Vec<_> = source_plan.sources.iter()
+                .map(|_| super::file_read_recovery::FileReadRecoveryState::default()).collect();
             let mut source_streams: Vec<Option<ArrowRecordBatchStream>> = source_plan
                 .sources
                 .iter()
-                .map(|source| {
+                .enumerate()
+                .map(|(source_idx, source)| {
                     if source.read_fields().is_empty() {
                         Ok(None)
                     } else {
@@ -1088,6 +1091,7 @@ impl DataEvolutionReader {
                             mosaic_prefetch,
                             read_timing.clone(),
                             anchor_deletion_vector.as_ref(),
+                            recovery_states[source_idx].clone(),
                         )
                         .map(Some)
                     }
@@ -1126,6 +1130,14 @@ impl DataEvolutionReader {
                     .filter(|&&idx| source_cursors[idx].is_none())
                     .count();
                 if finished_sources > 0 {
+                    // Java DataEvolutionFileReader stops the whole group when
+                    // an active column file is skipped. Keep strict alignment
+                    // checks for normal EOFs and unrelated metadata failures.
+                    if active_source_indices.iter().any(|&idx| {
+                        source_cursors[idx].is_none() && recovery_states[idx].skipped()
+                    }) {
+                        break;
+                    }
                     if finished_sources == active_source_indices.len() {
                         if emitted_rows != expected_output_rows {
                             Err(Error::DataInvalid {
@@ -1659,6 +1671,7 @@ fn open_source_stream(
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
     anchor_deletion_vector: Option<&DeletionVectorContext>,
+    recovery_state: super::file_read_recovery::FileReadRecoveryState,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let mut row_ranges = row_ranges;
     if let FieldSource::BlobBunch { bunch, read_fields } = source {
@@ -1729,7 +1742,8 @@ fn open_source_stream(
     .with_table_options(table_options)
     .with_nested_field_enabled(nested_field_enabled)
     .with_mosaic_prefetch(mosaic_prefetch)
-    .with_read_timing(read_timing);
+    .with_read_timing(read_timing)
+    .with_file_read_recovery_state(recovery_state);
 
     match source {
         FieldSource::DataFile {

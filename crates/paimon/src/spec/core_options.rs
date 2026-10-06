@@ -780,6 +780,13 @@ impl<'a> CoreOptions<'a> {
             .is_some_and(|value| value.eq_ignore_ascii_case("true"))
     }
 
+    /// Whether file I/O / decode failures end the current data file's read.
+    pub fn scan_ignore_corrupt_file(&self) -> bool {
+        self.options
+            .get("scan.ignore-corrupt-files")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    }
+
     /// Whether normal Data Evolution files also write an aligned ROW sidecar.
     pub fn data_evolution_row_sidecar_enabled(&self) -> crate::Result<bool> {
         match self.options.get("data-evolution.row-sidecar.enabled") {
