@@ -464,7 +464,7 @@ impl UpdateContext {
         read_columns: Option<Vec<String>>,
     ) -> PyResult<Vec<PyCommitMessage>> {
         let predicate = predicate
-            .map(|predicate| dict_to_table_predicate(predicate, self.table.schema().fields(), true))
+            .map(|predicate| dict_to_table_predicate(predicate, self.table.schema(), true))
             .transpose()?;
         let callback_error = Arc::new(Mutex::new(None));
         let assignments = crate::update_assignment::from_python(

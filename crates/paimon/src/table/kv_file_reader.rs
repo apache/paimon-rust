@@ -1232,9 +1232,9 @@ mod tests {
             vec![Datum::Long(102)],
         );
         let mut read_builder = table.new_read_builder();
-        read_builder
-            .with_projection(&["id", "value", crate::spec::ROW_ID_FIELD_NAME])
-            .unwrap();
+        // Untracked PK tables do not advertise ROW_ID. A hand-built predicate
+        // must still be rejected rather than binding its placeholder index.
+        read_builder.with_projection(&["id", "value"]).unwrap();
         read_builder.with_filter(row_id);
         let plan = read_builder.new_scan().plan().await.unwrap();
         let err = read_builder

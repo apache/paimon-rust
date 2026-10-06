@@ -99,6 +99,26 @@ impl TableSchema {
         &self.fields
     }
 
+    /// Logical fields followed by the metadata available to table reads.
+    /// Row tracking provides ROW_ID and SEQUENCE_NUMBER; primary-key files
+    /// provide SEQUENCE_NUMBER independently of row tracking. Keeping this
+    /// schema shared makes projection and predicate name resolution agree.
+    pub fn fields_with_read_metadata(&self) -> Vec<DataField> {
+        let mut fields = self.fields.clone();
+        let row_tracking = CoreOptions::new(&self.options).row_tracking_enabled();
+        if row_tracking && !fields.iter().any(|field| field.name() == ROW_ID_FIELD_NAME) {
+            fields.push(row_id_data_field());
+        }
+        if (row_tracking || !self.primary_keys.is_empty())
+            && !fields
+                .iter()
+                .any(|field| field.name() == SEQUENCE_NUMBER_FIELD_NAME)
+        {
+            fields.push(sequence_number_data_field());
+        }
+        fields
+    }
+
     pub fn highest_field_id(&self) -> i32 {
         self.highest_field_id
     }

@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use paimon::spec::{DataField, DataType, Datum, DecimalType, Predicate, PredicateBuilder};
+use paimon::spec::{
+    DataField, DataType, Datum, DecimalType, Predicate, PredicateBuilder, TableSchema,
+};
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyTzInfoAccess;
@@ -419,38 +421,13 @@ pub(crate) fn dict_to_predicate(
     }
 }
 
-/// Convert against table fields plus the row-tracking metadata fields.
+/// Use the core read schema, including only metadata the table provides.
 pub(crate) fn dict_to_table_predicate(
     node: &Bound<'_, PyDict>,
-    fields: &[DataField],
+    schema: &TableSchema,
     case_sensitive: bool,
 ) -> PyResult<Predicate> {
-    use paimon::spec::{
-        BigIntType, ROW_ID_FIELD_ID, ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID,
-        SEQUENCE_NUMBER_FIELD_NAME,
-    };
-    let mut fields = fields.to_vec();
-    // Reserved fields retain their canonical names. A differently cased user
-    // column must coexist here so insensitive resolution reports ambiguity.
-    let has_row_id = fields.iter().any(|field| field.name() == ROW_ID_FIELD_NAME);
-    if !has_row_id {
-        fields.push(DataField::new(
-            ROW_ID_FIELD_ID,
-            ROW_ID_FIELD_NAME.into(),
-            DataType::BigInt(BigIntType::with_nullable(true)),
-        ));
-    }
-    if !fields
-        .iter()
-        .any(|field| field.name() == SEQUENCE_NUMBER_FIELD_NAME)
-    {
-        fields.push(DataField::new(
-            SEQUENCE_NUMBER_FIELD_ID,
-            SEQUENCE_NUMBER_FIELD_NAME.into(),
-            DataType::BigInt(BigIntType::with_nullable(false)),
-        ));
-    }
-    dict_to_predicate(node, &fields, case_sensitive)
+    dict_to_predicate(node, &schema.fields_with_read_metadata(), case_sensitive)
 }
 
 /// Resolve a leaf's field name to its schema [`DataType`] under the given case
