@@ -419,47 +419,25 @@ impl RoutedOperator {
 mod tests {
     use super::*;
 
-    use serde::Deserialize;
+    use std::collections::BTreeMap;
 
-    #[derive(Deserialize)]
-    struct Vectors<T> {
-        cases: Vec<T>,
-    }
+    const TABLE_ROOT: &str = "oss://bkt/db1.db/t1";
+    const UUID: &str = "8b1f7c2e-3a4d-4e5f-9a0b-1c2d3e4f5a6b";
 
-    #[derive(Deserialize)]
-    struct RoutingCase {
-        name: String,
-        options: HashMap<String, String>,
-        op: String,
-        path: String,
-        expect: String,
-    }
+    // paths below are relative to TABLE_ROOT, and {uuid} stands for UUID
+    const DATA_PATH: &str = "dt=1/bucket-0/data-{uuid}-0.parquet";
+    const MANIFEST_PATH: &str = "manifest/manifest-{uuid}-0";
+    const INDEX_PATH: &str = "index/index-{uuid}-0";
+    const GLOBAL_INDEX_PATH: &str = "index/btree-global-index-{uuid}.index";
+    const TEMP_PATH: &str = "dt=1/bucket-0/.data-{uuid}-0.parquet.{uuid}.tmp";
+    const SNAPSHOT_PATH: &str = "snapshot/snapshot-12";
+    const LATEST_PATH: &str = "snapshot/LATEST";
 
-    #[derive(Deserialize)]
-    struct RoutableTypeCase {
-        path: String,
-        options: HashMap<String, String>,
-        #[serde(rename = "type")]
-        file_type: Option<String>,
-    }
-
-    fn load<T: serde::de::DeserializeOwned>(name: &str) -> Vectors<T> {
-        let path = format!("{}/testdata/io_cache/{name}", env!("CARGO_MANIFEST_DIR"));
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
-    }
-
-    /// Maps the operation names of the vectors to classes.
-    fn op_class(name: &str) -> OpClass {
-        match name {
-            "read" => OpClass::Read,
-            "meta" | "exists" => OpClass::Meta,
-            "write" | "two-phase-write" => OpClass::Write,
-            "list" | "delete" | "rename" | "mkdirs" | "copy" | "atomic-write" | "presign" => {
-                OpClass::Origin
-            }
-            other => panic!("unknown operation {other}"),
-        }
-    }
+    const OSS: &str = "https://oss-cn-hangzhou-internal.aliyuncs.com";
+    const CACHE: &str = "http://cache.example.com";
+    const ACCEL: &str = "https://accelerator.example.com";
+    const CLUSTER: &str = "http://cluster.example.com";
+    const WRITE: &str = "io-cache.policy=meta,read,write";
 
     fn routing(options: &[(&str, &str)]) -> IoCacheRouting {
         IoCacheRouting::from_props(
@@ -475,36 +453,363 @@ mod tests {
     }
 
     #[test]
-    fn test_routing_vectors() {
-        let vectors: Vectors<RoutingCase> = load("routing.json");
-        assert!(!vectors.cases.is_empty());
-        for case in vectors.cases {
-            let routing = IoCacheRouting::from_props(&case.options);
-            let target = routing.route(op_class(&case.op), &case.path);
-            assert_eq!(
-                routing.endpoint(target),
-                Some(case.expect.as_str()),
-                "{}",
-                case.name
-            );
-        }
+    fn test_one_cache_target() {
+        let options = single(&[]);
+        assert_endpoint(&options, OpClass::Read, DATA_PATH, CACHE);
+        assert_endpoint(&options, OpClass::Meta, DATA_PATH, CACHE);
+        assert_endpoint(&options, OpClass::Read, MANIFEST_PATH, CACHE);
+        assert_endpoint(
+            &options,
+            OpClass::Read,
+            "manifest/manifest-list-{uuid}-1",
+            CACHE,
+        );
+        let other_bucket = format!("oss://other-bkt/db1.db/t1/{DATA_PATH}");
+        assert_endpoint(&options, OpClass::Read, &other_bucket, CACHE);
+        assert_endpoint(&options, OpClass::Read, SNAPSHOT_PATH, OSS);
+        assert_endpoint(&options, OpClass::Meta, SNAPSHOT_PATH, OSS);
+        assert_endpoint(&options, OpClass::Read, LATEST_PATH, OSS);
+        assert_endpoint(&options, OpClass::Meta, LATEST_PATH, OSS);
+        assert_endpoint(&options, OpClass::Read, TEMP_PATH, OSS);
+        assert_endpoint(&options, OpClass::Read, "dt=1/bucket-0/000000_0", OSS);
+        let dls = format!("dls://bkt/db1.db/t1/{DATA_PATH}");
+        assert_endpoint(&options, OpClass::Read, &dls, OSS);
+        // the whitelist has no index
+        assert_endpoint(&options, OpClass::Read, INDEX_PATH, OSS);
+        assert_endpoint(&options, OpClass::Write, DATA_PATH, OSS);
+        assert_endpoint(&options, OpClass::Origin, DATA_PATH, OSS);
     }
 
     #[test]
-    fn test_routable_type_vectors() {
-        let vectors: Vectors<RoutableTypeCase> = load("routable-types.json");
-        assert!(!vectors.cases.is_empty());
-        for case in vectors.cases {
-            let expected = case
-                .file_type
-                .as_deref()
-                .and_then(|name| FileType::parse_whitelist(name).into_iter().next());
-            assert_eq!(
-                routable_type(&case.path, &data_prefixes(&case.options)),
-                expected,
-                "{}",
-                case.path
-            );
+    fn test_policy_and_whitelist() {
+        assert_endpoint(
+            &single(&["-io-cache.enabled"]),
+            OpClass::Read,
+            DATA_PATH,
+            CACHE,
+        );
+        assert_endpoint(
+            &single(&["io-cache.enabled=false"]),
+            OpClass::Meta,
+            DATA_PATH,
+            CACHE,
+        );
+        assert_endpoint(
+            &single(&["-io-cache.policy"]),
+            OpClass::Meta,
+            DATA_PATH,
+            CACHE,
+        );
+        assert_endpoint(
+            &single(&["io-cache.policy=none"]),
+            OpClass::Meta,
+            DATA_PATH,
+            CACHE,
+        );
+        // policy tokens are trimmed, case-insensitive and whole words
+        let tokens = single(&["io-cache.policy= READ , Meta "]);
+        assert_endpoint(&tokens, OpClass::Meta, DATA_PATH, CACHE);
+        assert_endpoint(
+            &single(&["io-cache.policy=read,NONE"]),
+            OpClass::Meta,
+            DATA_PATH,
+            CACHE,
+        );
+        let words = single(&["io-cache.policy=thread,metadata"]);
+        assert_endpoint(&words, OpClass::Meta, DATA_PATH, CACHE);
+        let unknown = single(&["io-cache.policy=read,nonetheless"]);
+        assert_endpoint(&unknown, OpClass::Meta, DATA_PATH, OSS);
+
+        let read_only = single(&["io-cache.policy=read"]);
+        assert_endpoint(&read_only, OpClass::Read, DATA_PATH, CACHE);
+        assert_endpoint(&read_only, OpClass::Meta, DATA_PATH, OSS);
+        let write_only = single(&["io-cache.policy=write"]);
+        assert_endpoint(&write_only, OpClass::Write, DATA_PATH, CACHE);
+        assert_endpoint(&write_only, OpClass::Meta, DATA_PATH, OSS);
+
+        let any_type = single(&["-io-cache.whitelist"]);
+        assert_endpoint(&any_type, OpClass::Read, INDEX_PATH, CACHE);
+        let star = single(&["io-cache.whitelist=*"]);
+        assert_endpoint(&star, OpClass::Read, GLOBAL_INDEX_PATH, CACHE);
+        let file_index = format!("{DATA_PATH}.index");
+        assert_endpoint(&star, OpClass::Read, &file_index, CACHE);
+    }
+
+    #[test]
+    fn test_endpoints() {
+        let blank = single(&["io-cache.endpoint=  "]);
+        assert_endpoint(&blank, OpClass::Read, DATA_PATH, OSS);
+        let empty = single(&["io-cache.endpoint=", "io-cache.routes=*=default"]);
+        assert_endpoint(&empty, OpClass::Read, DATA_PATH, OSS);
+        // the origin defaults to fs.oss.endpoint
+        let oss = format!("fs.oss.endpoint={OSS}");
+        let without_origin = single(&[oss.as_str(), "-io-cache.origin.endpoint"]);
+        assert_endpoint(&without_origin, OpClass::Origin, DATA_PATH, OSS);
+        let blank_origin = single(&[oss.as_str(), "io-cache.origin.endpoint=  "]);
+        assert_endpoint(&blank_origin, OpClass::Origin, DATA_PATH, OSS);
+        // a client-side endpoint turns routing off
+        let overridden = single(&["dlf.oss-endpoint=https://oss-cn-hangzhou.aliyuncs.com"]);
+        let override_endpoint = "https://oss-cn-hangzhou.aliyuncs.com";
+        assert_endpoint(&overridden, OpClass::Read, DATA_PATH, override_endpoint);
+    }
+
+    #[test]
+    fn test_write_policy() {
+        let options = single(&[WRITE]);
+        assert_endpoint(&options, OpClass::Write, DATA_PATH, CACHE);
+        assert_endpoint(&options, OpClass::Write, MANIFEST_PATH, CACHE);
+        assert_endpoint(&options, OpClass::Write, SNAPSHOT_PATH, OSS);
+        assert_endpoint(&options, OpClass::Write, LATEST_PATH, OSS);
+        assert_endpoint(&options, OpClass::Write, TEMP_PATH, OSS);
+        // atomic writes, copies and the existence check before a write stay at origin
+        assert_endpoint(&options, OpClass::Origin, DATA_PATH, OSS);
+        let meta_only = single(&[WRITE, "io-cache.whitelist=meta"]);
+        assert_endpoint(&meta_only, OpClass::Write, DATA_PATH, OSS);
+
+        assert_endpoint(&multi(&[WRITE]), OpClass::Write, DATA_PATH, CLUSTER);
+        assert_endpoint(&multi(&[WRITE]), OpClass::Write, MANIFEST_PATH, ACCEL);
+    }
+
+    #[test]
+    fn test_two_cache_targets() {
+        let options = multi(&[]);
+        assert_endpoint(&options, OpClass::Read, MANIFEST_PATH, ACCEL);
+        assert_endpoint(&options, OpClass::Meta, MANIFEST_PATH, ACCEL);
+        assert_endpoint(&options, OpClass::Read, DATA_PATH, CLUSTER);
+        assert_endpoint(&options, OpClass::Meta, DATA_PATH, CLUSTER);
+        assert_endpoint(&options, OpClass::Read, INDEX_PATH, CLUSTER);
+        assert_endpoint(&options, OpClass::Read, GLOBAL_INDEX_PATH, CLUSTER);
+        assert_endpoint(&options, OpClass::Read, SNAPSHOT_PATH, OSS);
+        assert_endpoint(&options, OpClass::Write, MANIFEST_PATH, OSS);
+        assert_endpoint(&options, OpClass::Origin, MANIFEST_PATH, OSS);
+        let meta_only = multi(&["io-cache.whitelist=meta"]);
+        assert_endpoint(&meta_only, OpClass::Read, DATA_PATH, OSS);
+    }
+
+    #[test]
+    fn test_targets_and_routes() {
+        // without routes the first target with an endpoint takes every type
+        let no_routes = "-io-cache.routes";
+        assert_endpoint(&multi(&[no_routes]), OpClass::Read, DATA_PATH, ACCEL);
+        let shorthand = format!("io-cache.endpoint={CACHE}");
+        let with_shorthand = multi(&[no_routes, shorthand.as_str()]);
+        assert_endpoint(&with_shorthand, OpClass::Read, DATA_PATH, ACCEL);
+        let without_accel = multi(&[no_routes, "-io-cache.target.accel.endpoint"]);
+        assert_endpoint(&without_accel, OpClass::Read, DATA_PATH, CLUSTER);
+        let blank_accel = multi(&[no_routes, "io-cache.target.accel.endpoint=  "]);
+        assert_endpoint(&blank_accel, OpClass::Read, DATA_PATH, CLUSTER);
+        let bad_name = multi(&[no_routes, "io-cache.targets=Bad_Name,cluster"]);
+        assert_endpoint(&bad_name, OpClass::Read, DATA_PATH, CLUSTER);
+        let padded = format!("io-cache.target.cluster.endpoint=  {CLUSTER}  ");
+        assert_endpoint(
+            &multi(&[padded.as_str()]),
+            OpClass::Read,
+            DATA_PATH,
+            CLUSTER,
+        );
+
+        // a type without a usable route goes to the origin
+        let undeclared = multi(&["io-cache.routes=data=x"]);
+        assert_endpoint(&undeclared, OpClass::Read, DATA_PATH, OSS);
+        let without_cluster = multi(&["-io-cache.target.cluster.endpoint"]);
+        assert_endpoint(&without_cluster, OpClass::Read, DATA_PATH, OSS);
+        let meta_and_data = multi(&["io-cache.routes=meta=accel;data=cluster"]);
+        let file_index = format!("{DATA_PATH}.index");
+        assert_endpoint(&meta_and_data, OpClass::Read, &file_index, OSS);
+
+        let star = multi(&["io-cache.routes=*=cluster"]);
+        assert_endpoint(&star, OpClass::Read, MANIFEST_PATH, CLUSTER);
+        let first_wins = multi(&["io-cache.routes=data=accel;data,meta=cluster"]);
+        assert_endpoint(&first_wins, OpClass::Read, DATA_PATH, ACCEL);
+        let malformed = multi(&["io-cache.routes==cluster;meta=accel;junk"]);
+        assert_endpoint(&malformed, OpClass::Read, MANIFEST_PATH, ACCEL);
+        assert_endpoint(&malformed, OpClass::Read, DATA_PATH, OSS);
+    }
+
+    #[test]
+    fn test_data_files_named_like_metadata() {
+        let manifest = multi(&["data-file.prefix=manifest-"]);
+        let named_like_manifest = "dt=1/bucket-0/manifest-{uuid}-0.orc";
+        assert_endpoint(&manifest, OpClass::Read, named_like_manifest, CLUSTER);
+        let entropy = "dt=1/bucket-0/7f3a/manifest-{uuid}-0.orc";
+        assert_endpoint(&manifest, OpClass::Read, entropy, CLUSTER);
+        assert_endpoint(&manifest, OpClass::Read, MANIFEST_PATH, ACCEL);
+        let sidecar = format!("{MANIFEST_PATH}.avro.sidecar");
+        assert_endpoint(&manifest, OpClass::Read, &sidecar, ACCEL);
+        let snapshot = multi(&["data-file.prefix=snapshot-"]);
+        let named_like_snapshot = "dt=1/bucket-0/snapshot-{uuid}-0.orc";
+        assert_endpoint(&snapshot, OpClass::Read, named_like_snapshot, CLUSTER);
+        let stat = multi(&["data-file.prefix=stat-"]);
+        assert_endpoint(
+            &stat,
+            OpClass::Read,
+            "dt=1/bucket-0/stat-{uuid}-0.orc",
+            CLUSTER,
+        );
+        let index = multi(&[
+            "io-cache.routes=data=cluster;bucket-index=accel",
+            "data-file.prefix=index-",
+        ]);
+        assert_endpoint(
+            &index,
+            OpClass::Read,
+            "dt=1/bucket-0/index-{uuid}-0.orc",
+            CLUSTER,
+        );
+        assert_endpoint(&index, OpClass::Read, INDEX_PATH, ACCEL);
+
+        let custom = "dt=1/bucket-0/custom-{uuid}-0.orc";
+        assert_endpoint(&single(&[]), OpClass::Read, custom, OSS);
+        let custom_prefix = single(&["data-file.prefix=custom-"]);
+        assert_endpoint(&custom_prefix, OpClass::Read, custom, CACHE);
+    }
+
+    #[test]
+    fn test_cacheable_type() {
+        // named by sequence id or rewritten in place
+        for path in [
+            "snapshot/snapshot-12",
+            "snapshot/LATEST",
+            "snapshot/EARLIEST",
+            "branch/branch-dev/snapshot/LATEST",
+            "schema/schema-3",
+            "changelog/changelog-5",
+            "changelog/LATEST",
+            "tag/tag-2026-09-30",
+            "tag/tag-success-file/t1_SUCCESS",
+            "consumer/consumer-job1",
+            "service/service-primary-key-lookup",
+            "dt=1/_SUCCESS",
+            "oss://bkt/bucket-0/db/t/changelog/changelog-5",
+        ] {
+            assert_type(path, None, &[]);
+        }
+        // temporary or not written by Paimon
+        for path in [
+            "snapshot/.snapshot-13.{uuid}.tmp",
+            "dt=1/bucket-0/.data-{uuid}-0.parquet.{uuid}.tmp",
+            "dt=1/bucket-0/data-{uuid}-0.parquet.tmp-{uuid}",
+            "dt=1/bucket-0/data-{uuid}-0.parquet.tmp.{uuid}",
+            "metadata/version-hint.text",
+            "metadata/v3.metadata.json",
+            "dt=1/bucket-0/000000_0",
+            "dt=1/part-00000-1a2b.snappy.parquet",
+            "dt=1/bucket-0/data-1.parquet",
+            "dt=1/bucket-0/custom-{uuid}-0.orc",
+            "README",
+        ] {
+            assert_type(path, None, &[]);
+        }
+
+        assert_type("manifest/manifest-{uuid}-0", Some(FileType::Meta), &[]);
+        assert_type("manifest/manifest-list-{uuid}-1", Some(FileType::Meta), &[]);
+        assert_type(
+            "manifest/index-manifest-{uuid}-0",
+            Some(FileType::Meta),
+            &[],
+        );
+        let sidecar = "manifest/manifest-{uuid}-0.avro.sidecar";
+        assert_type(sidecar, Some(FileType::Meta), &[]);
+        assert_type("statistics/stat-{uuid}-0", Some(FileType::Meta), &[]);
+        assert_type(
+            "dt=1/bucket-0/data-{uuid}-0.parquet",
+            Some(FileType::Data),
+            &[],
+        );
+        assert_type(
+            "dt=1/bucket-0/changelog-{uuid}-0.parquet",
+            Some(FileType::Data),
+            &[],
+        );
+        assert_type(
+            "dt=1/bucket-0/data-{uuid}-0.blob",
+            Some(FileType::Data),
+            &[],
+        );
+        assert_type(
+            "dt=1/8b1f7c2e/data-{uuid}-0.parquet",
+            Some(FileType::Data),
+            &[],
+        );
+        let file_index = "dt=1/bucket-0/data-{uuid}-0.parquet.index";
+        assert_type(file_index, Some(FileType::FileIndex), &[]);
+        assert_type("index/index-{uuid}-0", Some(FileType::BucketIndex), &[]);
+        let btree = "index/btree-global-index-{uuid}.index";
+        assert_type(btree, Some(FileType::GlobalIndex), &[]);
+        let lumina = "index/lumina-global-index-{uuid}.index";
+        assert_type(lumina, Some(FileType::GlobalIndex), &[]);
+    }
+
+    #[test]
+    fn test_cacheable_type_with_file_prefixes() {
+        let data = Some(FileType::Data);
+        let custom = &["data-file.prefix=custom-"];
+        assert_type("dt=1/bucket-0/custom-{uuid}-0.orc", data, custom);
+        assert_type("dt=1/bucket-0/data-{uuid}-0.orc", data, custom);
+        let changelog = &["changelog-file.prefix=cl-"];
+        assert_type("dt=1/bucket-0/cl-{uuid}-0.orc", data, changelog);
+        assert_type(
+            "dt=1/bucket-0/  unknown.parquet",
+            None,
+            &["data-file.prefix=  "],
+        );
+
+        // the name decides, so data files may be named like metadata
+        let manifest = &["data-file.prefix=manifest-"];
+        assert_type("dt=1/bucket-0/manifest-{uuid}-0.orc", data, manifest);
+        assert_type("dt=1/bucket-0/7f3a/manifest-{uuid}-0.orc", data, manifest);
+        let file_index = Some(FileType::FileIndex);
+        assert_type(
+            "dt=1/bucket-0/manifest-{uuid}-0.orc.index",
+            file_index,
+            manifest,
+        );
+        let meta = Some(FileType::Meta);
+        assert_type("manifest/manifest-{uuid}-0", meta, manifest);
+        assert_type("manifest/manifest-{uuid}-0.avro.sidecar", meta, manifest);
+        let index = &["data-file.prefix=index-"];
+        let bucket_index = Some(FileType::BucketIndex);
+        assert_type("dt=1/bucket-0/index-{uuid}-0.orc", data, index);
+        assert_type("bucket-postpone/index-{uuid}-0.orc", data, index);
+        assert_type("index/index-{uuid}-0", bucket_index, index);
+        assert_type("dt=1/bucket-0/index-{uuid}-0", bucket_index, index);
+        let stat = &["data-file.prefix=stat-"];
+        assert_type("dt=1/bucket-0/stat-{uuid}-0.orc", data, stat);
+        assert_type("postpone/stat-{uuid}-0.orc", data, stat);
+        assert_type("statistics/stat-{uuid}-0", meta, stat);
+        let snapshot = &["data-file.prefix=snapshot-"];
+        assert_type("dt=1/bucket-0/snapshot-{uuid}-0.orc", data, snapshot);
+        assert_type(
+            "dt=1/bucket-0/snapshot-{uuid}-0.orc.index",
+            file_index,
+            snapshot,
+        );
+        let schema = &["data-file.prefix=schema-"];
+        assert_type("dt=1/bucket-0/schema-{uuid}-0.orc", data, schema);
+        let global_index = &["data-file.prefix=global-index-"];
+        assert_type(
+            "dt=1/bucket-0/global-index-{uuid}-0.orc.index",
+            file_index,
+            global_index,
+        );
+
+        // names rewritten in place never use a cache, whatever the prefix
+        assert_type(
+            "dt=1/bucket-0/tag-{uuid}-0.orc",
+            None,
+            &["data-file.prefix=tag-"],
+        );
+        let consumer = &["data-file.prefix=consumer-"];
+        assert_type("dt=1/bucket-0/consumer-{uuid}-0.orc", None, consumer);
+        for (name, prefix) in [
+            ("tag/tag-file", "data-file.prefix=tag-"),
+            ("consumer/consumer-file", "data-file.prefix=consumer-"),
+            ("service/service-file", "data-file.prefix=service-"),
+            ("metadata/version-hint.text", "data-file.prefix=version-"),
+            ("branch/branch-feature", "data-file.prefix=branch-"),
+        ] {
+            let path = format!("oss://bkt/warehouse/bucket-0/db/t1/{name}");
+            assert_type(&path, None, &[prefix]);
         }
     }
 
@@ -630,5 +935,86 @@ mod tests {
         assert!(!overridden.enabled());
         assert_eq!(route(&overridden, OpClass::Read, data).unwrap(), "override");
         assert_eq!(overridden.origin(), Some("override"));
+    }
+
+    /// One cache target, which older clients also get as fs.oss.endpoint.
+    fn single(changes: &[&str]) -> HashMap<String, String> {
+        let base = [
+            (OSS_ENDPOINT, CACHE),
+            (IO_CACHE_ENABLED, "true"),
+            (IO_CACHE_ENDPOINT, CACHE),
+            (IO_CACHE_ORIGIN_ENDPOINT, OSS),
+            (IO_CACHE_POLICY, "meta,read"),
+            (IO_CACHE_WHITELIST, "meta,data"),
+        ];
+        with(&base, changes)
+    }
+
+    /// Metadata on an accelerator, data and indexes on a cache cluster.
+    fn multi(changes: &[&str]) -> HashMap<String, String> {
+        let base = [
+            (OSS_ENDPOINT, ACCEL),
+            (IO_CACHE_ENABLED, "true"),
+            (IO_CACHE_ORIGIN_ENDPOINT, OSS),
+            (IO_CACHE_TARGETS, "accel,cluster"),
+            ("io-cache.target.accel.endpoint", ACCEL),
+            ("io-cache.target.accel.region", "cn-hangzhou"),
+            ("io-cache.target.cluster.endpoint", CLUSTER),
+            ("io-cache.target.cluster.path-style-access", "true"),
+            (IO_CACHE_POLICY, "meta,read"),
+            (IO_CACHE_WHITELIST, "*"),
+            (
+                IO_CACHE_ROUTES,
+                "meta=accel;data,bucket-index,global-index,file-index=cluster",
+            ),
+        ];
+        with(&base, changes)
+    }
+
+    // "key=value" sets an option and "-key" removes it
+    fn with(base: &[(&str, &str)], changes: &[&str]) -> HashMap<String, String> {
+        let mut options: HashMap<String, String> = base
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        for change in changes {
+            if let Some(key) = change.strip_prefix('-') {
+                options.remove(key);
+            } else {
+                let (key, value) = change.split_once('=').unwrap();
+                options.insert(key.to_string(), value.to_string());
+            }
+        }
+        options
+    }
+
+    fn resolve(path: &str) -> String {
+        let path = path.replace("{uuid}", UUID);
+        if path.contains("://") {
+            path
+        } else {
+            format!("{TABLE_ROOT}/{path}")
+        }
+    }
+
+    #[track_caller]
+    fn assert_endpoint(options: &HashMap<String, String>, op: OpClass, path: &str, expect: &str) {
+        let routing = IoCacheRouting::from_props(options);
+        let sorted: BTreeMap<_, _> = options.iter().collect();
+        assert_eq!(
+            routing.endpoint(routing.route(op, &resolve(path))),
+            Some(expect),
+            "{op:?} {path} with {sorted:?}"
+        );
+    }
+
+    #[track_caller]
+    fn assert_type(path: &str, expect: Option<FileType>, changes: &[&str]) {
+        let prefixes = data_prefixes(&with(&[], changes));
+        assert_eq!(
+            routable_type(&resolve(path), &prefixes),
+            expect,
+            "{path} with {changes:?}"
+        );
     }
 }
