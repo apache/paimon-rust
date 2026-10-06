@@ -15,17 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::delta_varint::{
+    decode_delta_varints, encode_delta_varints as encode_delta_varints_write,
+};
+#[cfg(test)]
+use super::delta_varint::{decode_varint, encode_varint};
 use super::metadata_cache::FileMetadataCache;
-use super::{FilePredicates, FormatFileReader, FormatFileWriter, FormatWriteResult};
+use super::{FilePredicates, FormatFileReader};
 use crate::arrow::build_target_arrow_schema;
-use crate::io::{BlobIndexCacheContext, FileRead, FileWrite};
+use crate::io::{BlobIndexCacheContext, FileRead};
 use crate::spec::{BlobDescriptor, DataField, DataType};
 use crate::table::{ArrowRecordBatchStream, RowRange};
 use crate::Error;
 use arrow_array::builder::{LargeBinaryBuilder, ListBuilder};
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, LargeBinaryArray, MapArray, RecordBatch, RecordBatchOptions,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, LargeBinaryArray, MapArray, RecordBatch, RecordBatchOptions,
     StringArray, StructArray, Time32MillisecondArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -36,6 +41,9 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use std::ops::Range;
 use std::sync::Arc;
+
+mod writer;
+pub(crate) use writer::BlobFormatWriter;
 
 pub(crate) struct BlobFormatReader {
     descriptor_mode: bool,
@@ -1911,6 +1919,15 @@ impl BlobEntry {
             next_offset = entry_end;
         }
 
+        if next_offset != data_region_end {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Corrupt blob file: indexed records use {next_offset} bytes, but data region contains {data_region_end} bytes."
+                ),
+                source: None,
+            });
+        }
+
         Ok(entries)
     }
 }
@@ -2037,138 +2054,6 @@ impl RowSelectionCursor {
     }
 }
 
-fn decode_delta_varints(bytes: &[u8]) -> crate::Result<Vec<i64>> {
-    let mut values = Vec::new();
-    let mut cursor = 0usize;
-    let mut previous = 0_i64;
-
-    while cursor < bytes.len() {
-        let (delta, consumed) = decode_varint(&bytes[cursor..])?;
-        cursor += consumed;
-
-        let value = if values.is_empty() {
-            delta
-        } else {
-            previous
-                .checked_add(delta)
-                .ok_or_else(|| Error::DataInvalid {
-                    message: format!(
-                        "Blob delta-varint index overflow after previous value {previous}"
-                    ),
-                    source: None,
-                })?
-        };
-        values.push(value);
-        previous = value;
-    }
-
-    Ok(values)
-}
-
-fn decode_varint(bytes: &[u8]) -> crate::Result<(i64, usize)> {
-    let mut value = 0_u64;
-    let mut shift = 0_u32;
-
-    for (idx, byte) in bytes.iter().copied().enumerate() {
-        value |= u64::from(byte & 0x7f) << shift;
-        if (byte & 0x80) == 0 {
-            let decoded = ((value >> 1) as i64) ^ (-((value & 1) as i64));
-            return Ok((decoded, idx + 1));
-        }
-
-        shift += 7;
-        if shift > 63 {
-            return Err(Error::DataInvalid {
-                message: "Blob delta-varint index overflow".to_string(),
-                source: None,
-            });
-        }
-    }
-
-    Err(Error::DataInvalid {
-        message: "Unexpected end of blob delta-varint index".to_string(),
-        source: None,
-    })
-}
-
-// --- Blob Format Writer ---
-
-pub(crate) struct BlobFormatWriter {
-    writer: Box<dyn FileWrite>,
-    file_io: Option<crate::io::FileIO>,
-    bytes_written: u64,
-    lengths: Vec<i64>,
-}
-
-impl BlobFormatWriter {
-    pub(crate) async fn new(
-        output: &crate::io::OutputFile,
-        file_io: Option<crate::io::FileIO>,
-    ) -> crate::Result<Self> {
-        let writer = output.writer().await?;
-        Ok(Self {
-            writer,
-            file_io,
-            bytes_written: 0,
-            lengths: Vec::new(),
-        })
-    }
-
-    /// Append one managed BLOB and return the payload range in this pack.
-    /// The range excludes the four-byte entry magic and twelve-byte trailer,
-    /// matching Java `BlobFormatWriter`'s descriptor callback.
-    pub(crate) async fn write_managed_value(&mut self, value: &[u8]) -> crate::Result<(i64, i64)> {
-        let start = self.bytes_written;
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "blob",
-            ArrowDataType::LargeBinary,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(LargeBinaryArray::from(vec![Some(value)]))],
-        )
-        .map_err(|error| Error::DataInvalid {
-            message: format!("Failed to build managed BLOB input: {error}"),
-            source: Some(Box::new(error)),
-        })?;
-        self.write(&batch).await?;
-        let entry_len =
-            self.bytes_written
-                .checked_sub(start)
-                .ok_or_else(|| Error::DataInvalid {
-                    message: "Managed BLOB writer position moved backwards".to_string(),
-                    source: None,
-                })?;
-        let payload_len =
-            entry_len
-                .checked_sub(BLOB_ENTRY_OVERHEAD)
-                .ok_or_else(|| Error::DataInvalid {
-                    message: "Managed BLOB entry is shorter than its framing".to_string(),
-                    source: None,
-                })?;
-        let offset =
-            start
-                .checked_add(BLOB_INLINE_HEADER_SIZE)
-                .ok_or_else(|| Error::DataInvalid {
-                    message: "Managed BLOB payload offset overflows u64".to_string(),
-                    source: None,
-                })?;
-        Ok((
-            i64::try_from(offset).map_err(|error| Error::DataInvalid {
-                message: "Managed BLOB payload offset exceeds i64".to_string(),
-                source: Some(Box::new(error)),
-            })?,
-            i64::try_from(payload_len).map_err(|error| Error::DataInvalid {
-                message: "Managed BLOB payload length exceeds i64".to_string(),
-                source: Some(Box::new(error)),
-            })?,
-        ))
-    }
-}
-
-const BLOB_WRITE_BUFFER_SIZE: u64 = 8 * 1024 * 1024; // 8 MB
-
 fn checked_blob_entry_length(payload_len: u64) -> crate::Result<i64> {
     let entry_length = payload_len
         .checked_add(BLOB_ENTRY_OVERHEAD)
@@ -2184,212 +2069,6 @@ fn checked_blob_entry_length(payload_len: u64) -> crate::Result<i64> {
         ),
         source: Some(Box::new(e)),
     })
-}
-
-#[async_trait]
-impl FormatFileWriter for BlobFormatWriter {
-    async fn write(&mut self, batch: &RecordBatch) -> crate::Result<()> {
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-
-        let col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::LargeBinaryArray>()
-            .ok_or_else(|| Error::DataInvalid {
-                message: "BlobFormatWriter expects a single LargeBinary column".to_string(),
-                source: None,
-            })?;
-
-        for row_idx in 0..col.len() {
-            if col.is_null(row_idx) {
-                self.lengths.push(-1);
-                continue;
-            }
-
-            let value = col.value(row_idx);
-
-            if BlobDescriptor::is_blob_descriptor(value) {
-                let desc = BlobDescriptor::deserialize(value)?;
-                let range = desc.range_spec()?;
-
-                let file_io = self.file_io.as_ref().ok_or_else(|| Error::DataInvalid {
-                    message:
-                        "BlobFormatWriter received a BlobDescriptor but has no FileIO to resolve it"
-                            .to_string(),
-                    source: None,
-                })?;
-                let input = crate::io::uri_reader::UriInput::new(file_io, desc.uri())?;
-                let offset = range.offset();
-                let payload_len = match range.length() {
-                    Some(length) => length,
-                    None => input
-                        .size()
-                        .await
-                        .map_err(|e| Error::UnexpectedError {
-                            message: format!(
-                                "Failed to read metadata for BlobDescriptor '{}': {e}",
-                                crate::io::uri_reader::sanitize_blob_uri(desc.uri())
-                            ),
-                            source: Some(Box::new(e)),
-                        })?
-                        .saturating_sub(offset),
-                };
-                let end = offset
-                    .checked_add(payload_len)
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: format!(
-                            "BlobDescriptor range overflows u64: offset={offset}, length={payload_len}"
-                        ),
-                        source: None,
-                    })?;
-                let entry_length = checked_blob_entry_length(payload_len)?;
-                let entry_length_u64 = entry_length as u64;
-                let bytes_written = self
-                    .bytes_written
-                    .checked_add(entry_length_u64)
-                    .ok_or_else(|| Error::DataInvalid {
-                        message: format!(
-                            "Blob file size overflows u64: current_size={}, entry_length={entry_length_u64}",
-                            self.bytes_written
-                        ),
-                        source: None,
-                    })?;
-                let reader = if payload_len == 0 {
-                    None
-                } else {
-                    Some(input.reader_for_range(offset..end).await?)
-                };
-
-                let mut hasher = crc32fast::Hasher::new();
-
-                hasher.update(&BLOB_MAGIC_NUMBER_BYTES);
-                self.writer
-                    .write(Bytes::copy_from_slice(&BLOB_MAGIC_NUMBER_BYTES))
-                    .await?;
-
-                // Stream payload in chunks to avoid loading entire blob into memory
-                if let Some(reader) = reader.as_ref() {
-                    let mut pos = offset;
-                    while pos < end {
-                        let chunk_end = pos.saturating_add(BLOB_WRITE_BUFFER_SIZE).min(end);
-                        let chunk = reader.read(pos..chunk_end).await.map_err(|e| {
-                            Error::UnexpectedError {
-                                message: format!(
-                                    "Failed to read BlobDescriptor '{}' range {pos}..{chunk_end}: {e}",
-                                    crate::io::uri_reader::sanitize_blob_uri(desc.uri())
-                                ),
-                                source: Some(Box::new(e)),
-                            }
-                        })?;
-                        let actual_len = chunk.len() as u64;
-                        let expected_len = chunk_end - pos;
-                        if actual_len != expected_len {
-                            return Err(Error::DataInvalid {
-                                message: format!(
-                                    "Failed to read BlobDescriptor '{}': short read for range {pos}..{chunk_end}, expected={expected_len} bytes, actual={actual_len} bytes",
-                                    crate::io::uri_reader::sanitize_blob_uri(desc.uri())
-                                ),
-                                source: None,
-                            });
-                        }
-                        hasher.update(&chunk);
-                        self.writer.write(chunk).await?;
-                        pos = chunk_end;
-                    }
-                }
-
-                let entry_length_bytes = entry_length.to_le_bytes();
-                hasher.update(&entry_length_bytes);
-                self.writer
-                    .write(Bytes::copy_from_slice(&entry_length_bytes))
-                    .await?;
-
-                self.writer
-                    .write(Bytes::copy_from_slice(&hasher.finalize().to_le_bytes()))
-                    .await?;
-
-                self.lengths.push(entry_length);
-                self.bytes_written = bytes_written;
-            } else {
-                let entry_length = (value.len() + BLOB_ENTRY_OVERHEAD as usize) as i64;
-                self.lengths.push(entry_length);
-
-                let mut buf = Vec::with_capacity(entry_length as usize);
-                let mut hasher = crc32fast::Hasher::new();
-
-                hasher.update(&BLOB_MAGIC_NUMBER_BYTES);
-                buf.extend_from_slice(&BLOB_MAGIC_NUMBER_BYTES);
-
-                hasher.update(value);
-                buf.extend_from_slice(value);
-
-                let entry_length_bytes = entry_length.to_le_bytes();
-                hasher.update(&entry_length_bytes);
-                buf.extend_from_slice(&entry_length_bytes);
-
-                buf.extend_from_slice(&hasher.finalize().to_le_bytes());
-
-                self.writer.write(Bytes::from(buf)).await?;
-                self.bytes_written += entry_length as u64;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn num_bytes(&self) -> usize {
-        self.bytes_written as usize
-    }
-
-    fn in_progress_size(&self) -> usize {
-        0
-    }
-
-    async fn flush(&mut self) -> crate::Result<()> {
-        Ok(())
-    }
-
-    async fn close(mut self: Box<Self>) -> crate::Result<FormatWriteResult> {
-        let index_bytes = encode_delta_varints_write(&self.lengths);
-        let index_length = index_bytes.len() as i32;
-
-        self.writer.write(Bytes::from(index_bytes)).await?;
-        self.writer
-            .write(Bytes::copy_from_slice(&index_length.to_le_bytes()))
-            .await?;
-        self.writer
-            .write(Bytes::from_static(&[BLOB_FORMAT_VERSION]))
-            .await?;
-
-        let total = self.bytes_written + index_length as u64 + BLOB_FOOTER_SIZE;
-        self.writer.close().await?;
-        Ok(FormatWriteResult::new(total))
-    }
-}
-
-fn encode_delta_varints_write(values: &[i64]) -> Vec<u8> {
-    if values.is_empty() {
-        return Vec::new();
-    }
-    let mut encoded = Vec::new();
-    let mut previous = 0_i64;
-    for (idx, &value) in values.iter().enumerate() {
-        let delta = if idx == 0 { value } else { value - previous };
-        previous = value;
-        encode_varint(delta, &mut encoded);
-    }
-    encoded
-}
-
-fn encode_varint(value: i64, out: &mut Vec<u8>) {
-    let mut remaining = ((value << 1) ^ (value >> 63)) as u64;
-    while (remaining & !0x7f) != 0 {
-        out.push(((remaining & 0x7f) as u8) | 0x80);
-        remaining >>= 7;
-    }
-    out.push(remaining as u8);
 }
 
 #[cfg(test)]
@@ -2591,11 +2270,11 @@ mod tests {
     #[tokio::test]
     async fn test_index_tail_prefetch_boundaries() {
         for rows in [0, 1, 4090, 4091, 4092, 9000] {
-            let mut data = vec![0; 8192];
             let index = encode_delta_varints_write(&vec![-1; rows]);
             assert_eq!(index.len(), rows);
-            data.extend_from_slice(&index);
-            data.extend_from_slice(&(index.len() as i32).to_le_bytes());
+            // NULL entries have no physical records or padding before the index.
+            let mut data = index;
+            data.extend_from_slice(&(rows as i32).to_le_bytes());
             data.push(BLOB_FORMAT_VERSION);
             let size = data.len() as u64;
             let reader = TrackingFileRead::new(Bytes::from(data));
@@ -2606,9 +2285,9 @@ mod tests {
                 .iter()
                 .all(|entry| matches!(entry, BlobEntry::Null)));
             let mut expected = Vec::with_capacity(2);
-            expected.push(size - 4096..size);
+            expected.push(size.saturating_sub(4096)..size);
             if rows + 5 > 4096 {
-                expected.push(8192..size - BLOB_FOOTER_SIZE);
+                expected.push(0..size - BLOB_FOOTER_SIZE);
             }
             assert_eq!(reader.ranges(), expected);
         }
@@ -2728,16 +2407,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_index_tail_prefetch_sixteen_cold_files() {
+        use blob_test_utils::BlobFixtureValue::{Null, Value};
+
         let mut requests = 0;
         let mut bytes = 0;
         let mut legacy_bytes = 0;
         let mut legacy_requests = 0;
+        let payload = vec![0; 8192 - BLOB_ENTRY_OVERHEAD as usize];
         for rows in (1526..).take(16) {
-            let index = encode_delta_varints_write(&vec![-1; rows]);
-            let mut data = vec![0; 8192];
-            data.extend_from_slice(&index);
-            data.extend_from_slice(&(index.len() as i32).to_le_bytes());
-            data.push(1);
+            // Retain a data region large enough to fill the prefetched tail,
+            // but account for it with a complete, indexed physical record.
+            let mut values = vec![Null; rows];
+            values[0] = Value(&payload);
+            let data = blob_test_utils::build_blob_file_bytes_with_values(&values);
             let size = data.len() as u64;
             let reader = TrackingFileRead::new(Bytes::from(data.clone()));
             let legacy_reader = TrackingFileRead::new(Bytes::from(data));
@@ -2769,7 +2451,7 @@ mod tests {
                 .sum::<u64>();
         }
         assert_eq!(legacy_requests, 32);
-        assert_eq!((requests, bytes, legacy_bytes), (16, 65536, 24616));
+        assert_eq!((requests, bytes, legacy_bytes), (16, 65536, 24680));
     }
 
     #[tokio::test]
@@ -4459,6 +4141,50 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Unsupported { message }) if message.contains("footer version"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_reader_rejects_unindexed_bytes_before_footer() {
+        use blob_test_utils::BlobFixtureValue::{Null, Placeholder, Value};
+
+        for rows in [
+            vec![Value(b"hello"), Null, Placeholder, Value(b"")],
+            vec![Null, Placeholder],
+            vec![],
+        ] {
+            let valid = blob_test_utils::build_blob_file_bytes_with_values(&rows);
+            let footer_start = valid.len() - BLOB_FOOTER_SIZE as usize;
+            let index_length =
+                i32::from_le_bytes(valid[footer_start..footer_start + 4].try_into().unwrap())
+                    as usize;
+            let index_start = footer_start - index_length;
+            let mut corrupt = valid.clone();
+            // Preserve the complete records (and their CRCs), footer and index.
+            // Only add bytes which no indexed record accounts for.
+            corrupt.splice(index_start..index_start, b"unindexed".iter().copied());
+
+            for descriptor_mode in [false, true] {
+                let reader = IndexedBlobReader::open(
+                    Box::new(BytesFileRead(Bytes::from(valid.clone()))),
+                    valid.len() as u64,
+                    "file:/valid.blob".into(),
+                    descriptor_mode,
+                )
+                .await
+                .unwrap();
+                assert_eq!(reader.num_rows(), rows.len());
+
+                let result = IndexedBlobReader::open(
+                    Box::new(BytesFileRead(Bytes::from(corrupt.clone()))),
+                    corrupt.len() as u64,
+                    "file:/corrupt.blob".into(),
+                    descriptor_mode,
+                )
+                .await;
+                assert!(matches!(result, Err(Error::DataInvalid { message, .. })
+                    if message == format!("Corrupt blob file: indexed records use {index_start} bytes, but data region contains {} bytes.", index_start + b"unindexed".len())));
+            }
+        }
     }
 
     #[tokio::test]

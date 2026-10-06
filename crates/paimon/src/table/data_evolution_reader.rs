@@ -34,7 +34,7 @@ use crate::spec::{
     BlobDescriptor, BlobViewStruct, CoreOptions, DataField, DataFileMeta, DataType, Predicate,
     ROW_ID_FIELD_NAME,
 };
-use crate::table::dedicated_format_file_writer::is_blob_file_name;
+use crate::table::dedicated_format_file_writer::is_blob_or_video_file_name;
 use crate::table::schema_manager::SchemaManager;
 use crate::table::source::any_range_overlaps_file;
 use crate::table::stats_filter::group_by_overlapping_row_id;
@@ -280,7 +280,7 @@ impl DataEvolutionReader {
                 split
                     .data_files()
                     .iter()
-                    .any(|file| is_blob_file_name(&file.file_name))
+                    .any(|file| is_blob_or_video_file_name(&file.file_name))
             })
             // A legacy raw file without first_row_id cannot be addressed by
             // the preselection's global row ranges. Keep its existing read
@@ -2148,7 +2148,8 @@ impl PreparedMergeGroup {
         let data_files: Vec<&DataFileMeta> = files
             .iter()
             .filter(|file| {
-                !is_blob_file_name(&file.file_name) && !is_vector_store_file_name(&file.file_name)
+                !is_blob_or_video_file_name(&file.file_name)
+                    && !is_vector_store_file_name(&file.file_name)
             })
             .collect();
         if data_files.is_empty() {
@@ -2336,7 +2337,7 @@ fn build_source_plan_with_row_id_pushdown(
 
     for (file_idx, file) in prepared_group.files.iter().enumerate() {
         let info = &file_infos[file_idx];
-        if is_blob_file_name(&file.file_name) {
+        if is_blob_or_video_file_name(&file.file_name) {
             let field_id = resolve_blob_field_id(file, info)?;
             let expected_row_count = expected_blob_row_count.ok_or_else(|| Error::DataInvalid {
                 message: format!(
@@ -2688,7 +2689,7 @@ impl BlobBunch {
             self.logical_ranges.is_none(),
             "Cannot add files to a finalized blob bunch"
         );
-        if !is_blob_file_name(&file.file_name) {
+        if !is_blob_or_video_file_name(&file.file_name) {
             return Err(Error::DataInvalid {
                 message: "Only blob file can be added to a blob bunch.".to_string(),
                 source: None,
@@ -3065,7 +3066,7 @@ fn normalize_merge_group(files: Vec<DataFileMeta>) -> crate::Result<Vec<DataFile
     let mut blob_files = Vec::new();
 
     for file in files {
-        if is_blob_file_name(&file.file_name) {
+        if is_blob_or_video_file_name(&file.file_name) {
             blob_files.push(file);
         } else if is_vector_store_file_name(&file.file_name) {
             vector_files.push(file);
@@ -4008,7 +4009,7 @@ mod tests {
             .files
             .iter()
             .map(|file| {
-                if is_blob_file_name(&file.file_name) {
+                if is_blob_or_video_file_name(&file.file_name) {
                     resolved_info(vec![2])
                 } else {
                     resolved_info(vec![1])

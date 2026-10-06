@@ -25,6 +25,9 @@ pub use binary_row::*;
 mod blob_descriptor;
 pub use blob_descriptor::BlobDescriptor;
 
+mod video_frame_descriptor;
+pub use video_frame_descriptor::VideoFrameDescriptor;
+
 mod blob_view_struct;
 pub use blob_view_struct::BlobViewStruct;
 

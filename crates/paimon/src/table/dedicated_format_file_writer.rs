@@ -24,8 +24,9 @@ use arrow_array::RecordBatch;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-pub(crate) fn is_blob_file_name(file_name: &str) -> bool {
-    file_name.to_ascii_lowercase().ends_with(".blob")
+pub(crate) fn is_blob_or_video_file_name(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.ends_with(".blob") || lower.ends_with(".video")
 }
 
 struct BlobFieldWriter {
@@ -99,7 +100,7 @@ impl AppendDedicatedFormatFileWriter {
         let mut vector_field_names = Vec::new();
 
         for (idx, field) in table_fields.iter().enumerate() {
-            let is_blob = field.data_type().is_blob_type();
+            let is_blob = field.data_type().is_blob_file_field();
             let is_inline = blob_inline_fields.contains(field.name());
             let is_dedicated_vector =
                 vector_file_format.is_some() && matches!(field.data_type(), DataType::Vector(_));
