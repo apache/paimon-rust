@@ -201,7 +201,8 @@ Only v14 is supported. `abort(messages)` deletes newly written files for an
 explicitly abandoned write, matching Java. Call it only for messages known to be
 uncommitted that will never be submitted. A commit exception does not prove failure:
 publication may have succeeded before the response failed. Internal error paths
-preserve prepared files instead of calling `abort`.
+preserve submitted files instead of calling `abort`. Preparation failures can clean
+outputs that have not been handed off to the caller.
 Compact increments remain
 unsupported by the Rust committer and are rejected.
 

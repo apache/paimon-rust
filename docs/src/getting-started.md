@@ -186,12 +186,19 @@ When supported indexes are configured, each data file gets its own index.
 The complete serialized index is embedded in the manifest when its size
 is at most `file-index.in-manifest-threshold` (default `500 B`); larger indexes
 are stored beside the data file as a `.index` sidecar. Indexed write failures
-return an error. Writers may clean outputs they have not handed off, but
-prepared files remain available after commit exceptions or a later preparation
-failure. Explicit commit `abort` deletes newly written files only when the caller
+return an error. Failed preparation discards outputs from that invocation before
+returning any messages. Files handed off by an earlier successful preparation
+remain available, including after a later preparation or Paimon Table commit
+exception. Explicit commit `abort` deletes newly written files only when the caller
 knows those messages are uncommitted and will never be submitted. Never call it
-when the commit outcome is unknown: publication can succeed even when its response
-fails. Internal failures may leave orphan files.
+when the Paimon Table commit outcome is unknown: publication can succeed even when
+its response fails.
+
+Format Tables follow Java's two-phase publication: validation failures discard
+staging only; append publication or partition-registration failures roll back new
+targets; overwrite failures retain replacement targets after old data is removed.
+Successfully registered append targets also survive a later abort. Cleanup attempts
+every file, and a cleanup failure does not replace the original commit error.
 
 `file-index.read.enabled` controls only reading, independently of index creation.
 Existing files are not backfilled. Index generation is not supported for

@@ -1169,7 +1169,7 @@ async fn test_execute_writes_and_queries_fm_index() {
 }
 
 #[tokio::test]
-async fn test_failed_fm_build_preserves_completed_shards() {
+async fn test_failed_fm_build_removes_partial_index_file() {
     let table_path = "memory:/test_failed_fm_build_cleanup";
     let table = test_table_with_path(table_path, table_options("3"));
     setup_dirs(&table).await;
@@ -1206,20 +1206,12 @@ async fn test_failed_fm_build_preserves_completed_shards() {
         .list_status(&format!("{table_path}/index"))
         .await
         .unwrap();
-    assert_eq!(
-        files.len(),
-        1,
-        "the first complete shard must survive: {files:?}"
+    assert!(
+        files
+            .iter()
+            .all(|file| !file.path.contains("fm-global-index-")),
+        "failed FM build left a partial index file: {files:?}"
     );
-    assert!(files[0].path.contains("fm-global-index-"));
-    assert!(files[0].size > 0);
-    let snapshot = table
-        .snapshot_manager()
-        .get_latest_snapshot()
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(snapshot.index_manifest().is_none());
 }
 
 #[tokio::test]

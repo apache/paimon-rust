@@ -1130,9 +1130,7 @@ impl TableWrite {
             }
         }
         if let Some(error) = error {
-            self.failed = true;
-            // Preserve files already prepared by other partitions. Never
-            // infer deletion ownership from CommitMessage on an error path.
+            self.fail_prepare(&messages).await;
             return Err(error);
         }
 
@@ -1142,9 +1140,7 @@ impl TableWrite {
         {
             Ok(files) => files,
             Err(error) => {
-                self.failed = true;
-                // Preserve prepared data if HASH index preparation fails.
-                // Never delete files based on CommitMessage.
+                self.fail_prepare(&messages).await;
                 return Err(error);
             }
         };
@@ -1163,6 +1159,17 @@ impl TableWrite {
             }
         }
         Ok(messages)
+    }
+
+    async fn fail_prepare(&mut self, messages: &[CommitMessage]) {
+        self.failed = true;
+        self.close().await;
+        // Only this failed invocation's outputs: no message has been returned
+        // or submitted. Earlier successful prepare calls belong to the caller.
+        let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
+        if let Err(error) = commit.abort(messages).await {
+            log::warn!("Failed to discard unreturned prepared files: {error}");
+        }
     }
 
     async fn create_writer(&mut self, partition_bytes: Vec<u8>, bucket: i32) -> Result<()> {

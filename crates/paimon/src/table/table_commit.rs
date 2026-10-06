@@ -880,6 +880,10 @@ impl TableCommit {
     /// Call only when these messages will never be submitted. Never call after
     /// a commit whose outcome is unknown: publication may have succeeded before
     /// its response failed. File deletion is best-effort.
+    ///
+    /// Format Tables follow Java two-phase cleanup instead: discard staging,
+    /// roll back unregistered append targets and preserve overwrite replacements
+    /// or successfully registered append files.
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
         if self.table.is_format_table() {
             return FormatTableCommit::new(&self.table)

@@ -358,49 +358,67 @@ async fn prepared_files_are_hidden_until_commit_and_abort_discards_them() {
 }
 
 #[tokio::test]
-async fn invalid_commit_preserves_staging_for_a_corrected_retry() {
-    let table = memory_table("format_invalid_commit_retry", true, &[]);
+async fn invalid_commit_discards_staging_without_deleting_foreign_targets() {
+    let table = memory_table("format_invalid_commit_cleanup", true, &[]);
     let builder = table.new_write_builder();
     let mut writer = builder.new_write().unwrap();
     writer.write_arrow_batch(&batch(&[("a", 1)])).await.unwrap();
     let messages = writer.prepare_commit().await.unwrap();
     let file = messages[0].format_file.as_ref().unwrap();
+    let outside = "memory:/outside-table/file.parquet";
+    table
+        .file_io()
+        .new_output(outside)
+        .unwrap()
+        .write(bytes::Bytes::from_static(b"foreign"))
+        .await
+        .unwrap();
     let mut invalid = messages.clone();
-    invalid[0].format_file.as_mut().unwrap().target_path =
-        "memory:/outside-table/file.parquet".into();
+    invalid[0].format_file.as_mut().unwrap().target_path = outside.into();
     assert!(builder
         .new_commit()
-        .commit(invalid)
+        .commit(invalid.clone())
         .await
         .unwrap_err()
         .to_string()
         .contains("outside partition"));
-    // Preserve files after publication errors; explicit abort requires known-uncommitted messages.
-    assert!(table.file_io().exists(&file.staged_path).await.unwrap());
+    assert!(!table.file_io().exists(&file.staged_path).await.unwrap());
     assert!(visible_files(&table, "dt=a").await.is_empty());
-    builder.new_commit().commit(messages).await.unwrap();
-    assert_eq!(ids(&table).await, [1]);
+    builder.new_commit().abort(&invalid).await.unwrap();
+    assert_eq!(
+        table
+            .file_io()
+            .new_input(outside)
+            .unwrap()
+            .read()
+            .await
+            .unwrap(),
+        bytes::Bytes::from_static(b"foreign")
+    );
+    append(&table, &batch(&[("a", 2)])).await;
+    assert_eq!(ids(&table).await, [2]);
 }
 
 #[derive(Debug)]
-struct FailSecondPublish {
+struct FailStagedAccess {
     operator: opendal::Operator,
     staged_path: std::sync::Mutex<String>,
     accesses: std::sync::atomic::AtomicUsize,
+    fail_at: usize,
 }
 
 #[async_trait::async_trait]
-impl crate::io::FileIOProvider for FailSecondPublish {
+impl crate::io::FileIOProvider for FailStagedAccess {
     async fn create(&self, path: &str) -> crate::Result<(opendal::Operator, String)> {
         // The first access validates staging; the second starts publication.
         if path == *self.staged_path.lock().unwrap()
             && self
                 .accesses
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                == 1
+                == self.fail_at
         {
             return Err(crate::Error::IoUnsupported {
-                message: "second publish failed".into(),
+                message: "staged I/O failed".into(),
             });
         }
         Ok((
@@ -411,123 +429,295 @@ impl crate::io::FileIOProvider for FailSecondPublish {
 }
 
 #[tokio::test]
-async fn partial_publication_failure_preserves_published_and_staged_files() {
-    let provider = Arc::new(FailSecondPublish {
+async fn publication_and_staging_cleanup_failures_follow_java_abort() {
+    for overwrite in [false, true] {
+        for fail_at in [1, 2] {
+            // Use a rename-capable backend so access 2 is staging cleanup,
+            // independently of the streaming-copy fallback's extra reads.
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = opendal_service_fs::FsConfig::default();
+            config.root = Some(temp.path().display().to_string());
+            let provider = Arc::new(FailStagedAccess {
+                operator: opendal::Operator::from_config(config).unwrap(),
+                staged_path: std::sync::Mutex::new(String::new()),
+                accesses: std::sync::atomic::AtomicUsize::new(0),
+                fail_at,
+            });
+            let io = FileIOBuilder::new("memory")
+                .with_provider(provider.clone())
+                .build()
+                .unwrap();
+            let table = table(io, "memory:/format_failed_publish", true, &[]);
+            append(&table, &batch(&[("a", 9), ("b", 10)])).await;
+            let mut builder = table.new_write_builder();
+            if overwrite {
+                builder = builder.with_overwrite();
+            }
+            let mut writer = builder.new_write().unwrap();
+            writer
+                .write_arrow_batch(&batch(&[("a", 1), ("b", 2)]))
+                .await
+                .unwrap();
+            let mut messages = writer.prepare_commit().await.unwrap();
+            messages.sort_by_key(|message| {
+                message.format_file.as_ref().unwrap().partition["dt"].clone()
+            });
+            let first = messages[0].format_file.as_ref().unwrap().clone();
+            let second = messages[1].format_file.as_ref().unwrap().clone();
+            *provider.staged_path.lock().unwrap() = second.staged_path.clone();
+            let commit = builder.new_commit();
+            let result = if overwrite {
+                commit.overwrite(messages.clone(), None).await
+            } else {
+                commit.commit(messages.clone()).await
+            };
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("staged I/O failed"), "{error}");
+            assert_eq!(
+                table.file_io().exists(&first.target_path).await.unwrap(),
+                overwrite
+            );
+            assert_eq!(
+                table.file_io().exists(&second.target_path).await.unwrap(),
+                overwrite && fail_at == 2
+            );
+            for file in [&first, &second] {
+                assert!(!table.file_io().exists(&file.staged_path).await.unwrap());
+            }
+            // A new committer sees protection through cloned messages, as in Java.
+            builder.new_commit().abort(&messages).await.unwrap();
+            let expected = if !overwrite {
+                vec![9, 10]
+            } else if fail_at == 1 {
+                vec![1]
+            } else {
+                vec![1, 2]
+            };
+            assert_eq!(ids(&table).await, expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn catalog_registration_controls_append_rollback_and_overwrite_protection() {
+    use crate::{Options, RESTApi};
+    use axum::http::{Method, StatusCode, Uri};
+    use axum::response::IntoResponse;
+    use axum::{Json, Router};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    for overwrite in [false, true] {
+        for (fail_registration, fail_statistics) in [(true, false), (false, false), (false, true)] {
+            let registered = Arc::new(AtomicBool::new(false));
+            let server_registered = registered.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let app = Router::new().fallback(move |method: Method, uri: Uri| {
+                let registered = server_registered.clone();
+                let calls = calls.clone();
+                async move {
+                    if method == Method::POST && uri.path().ends_with("/partitions") {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        registered.store(true, Ordering::SeqCst);
+                        // Registration/statistics took effect but the response is undecodable.
+                        if (call == 0 && fail_registration) || (call > 0 && fail_statistics) {
+                            return (StatusCode::OK, "lost catalog response").into_response();
+                        }
+                        return Json(serde_json::json!({})).into_response();
+                    }
+                    let partitions = if registered.load(Ordering::SeqCst) {
+                        serde_json::json!([{"spec": {"dt": "a"}}])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    Json(serde_json::json!({"partitions": partitions})).into_response()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut options = Options::new();
+            options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
+            options.set("prefix", "test");
+            options.set("token.provider", "bear");
+            options.set("token", "test-token");
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
+            let identifier = Identifier::new("default", "format_abort");
+            let cache = crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap();
+            let env = super::RESTEnv::new(
+                identifier.clone(),
+                "uuid".into(),
+                api,
+                options,
+                false,
+                None,
+                cache,
+            );
+            let base = memory_table(
+                "format_catalog_abort",
+                true,
+                &[("metastore.partitioned-table", "true")],
+            );
+            let table = Table::new(
+                base.file_io().clone(),
+                identifier,
+                base.location().into(),
+                base.schema().clone(),
+                Some(env),
+            );
+            let mut builder = table.new_write_builder();
+            if overwrite {
+                builder = builder.with_overwrite();
+            }
+            let mut writer = builder.new_write().unwrap();
+            writer.write_arrow_batch(&batch(&[("a", 1)])).await.unwrap();
+            let messages = writer.prepare_commit().await.unwrap();
+            let file = messages[0].format_file.as_ref().unwrap().clone();
+            let commit = builder.new_commit();
+            let result = if overwrite {
+                commit.overwrite(messages.clone(), None).await
+            } else {
+                commit.commit(messages.clone()).await
+            };
+            assert_eq!(result.is_err(), fail_registration, "{result:?}");
+            assert!(registered.load(Ordering::SeqCst));
+            let retain = overwrite || !fail_registration;
+            assert_eq!(
+                table.file_io().exists(&file.target_path).await.unwrap(),
+                retain
+            );
+            assert!(!table.file_io().exists(&file.staged_path).await.unwrap());
+            builder.new_commit().abort(&messages).await.unwrap();
+            assert_eq!(
+                table.file_io().exists(&file.target_path).await.unwrap(),
+                retain
+            );
+            assert_eq!(ids(&table).await, if retain { vec![1] } else { vec![] });
+            server.abort();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LosePublicationResponse {
+    operator: opendal::Operator,
+    paths: std::sync::Mutex<(String, String)>,
+    accesses: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::io::FileIOProvider for LosePublicationResponse {
+    async fn create(&self, path: &str) -> crate::Result<(opendal::Operator, String)> {
+        let (staged, target) = self.paths.lock().unwrap().clone();
+        if path == staged
+            && self
+                .accesses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 1
+        {
+            // The target became visible, but the caller receives an exception.
+            let data = self
+                .operator
+                .read(staged.trim_start_matches("memory:/"))
+                .await
+                .map_err(|error| crate::Error::from_opendal_with_context(error, "read staging"))?;
+            self.operator
+                .write(target.trim_start_matches("memory:/"), data)
+                .await
+                .map_err(|error| {
+                    crate::Error::from_opendal_with_context(error, "publish target")
+                })?;
+            return Err(crate::Error::IoUnsupported {
+                message: "lost publication response".into(),
+            });
+        }
+        Ok((
+            self.operator.clone(),
+            path.trim_start_matches("memory:/").into(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn lost_file_publication_response_rolls_back_append_and_preserves_overwrite() {
+    for overwrite in [false, true] {
+        let provider = Arc::new(LosePublicationResponse {
+            operator: opendal::Operator::new(opendal::services::Memory::default()).unwrap(),
+            paths: std::sync::Mutex::new((String::new(), String::new())),
+            accesses: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let io = FileIOBuilder::new("memory")
+            .with_provider(provider.clone())
+            .build()
+            .unwrap();
+        let table = table(io, "memory:/format_lost_file_response", true, &[]);
+        append(&table, &batch(&[("a", 9)])).await;
+        let mut builder = table.new_write_builder();
+        if overwrite {
+            builder = builder.with_overwrite();
+        }
+        let mut writer = builder.new_write().unwrap();
+        writer.write_arrow_batch(&batch(&[("a", 1)])).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        let file = messages[0].format_file.as_ref().unwrap();
+        *provider.paths.lock().unwrap() = (file.staged_path.clone(), file.target_path.clone());
+        let commit = builder.new_commit();
+        let result = if overwrite {
+            commit.overwrite(messages.clone(), None).await
+        } else {
+            commit.commit(messages.clone()).await
+        };
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("lost publication response"));
+        assert_eq!(
+            table.file_io().exists(&file.target_path).await.unwrap(),
+            overwrite
+        );
+        assert!(!table.file_io().exists(&file.staged_path).await.unwrap());
+        builder.new_commit().abort(&messages).await.unwrap();
+        assert_eq!(ids(&table).await, if overwrite { vec![1] } else { vec![9] });
+    }
+}
+
+#[tokio::test]
+async fn abort_attempts_every_staged_file_after_cleanup_failure() {
+    let provider = Arc::new(FailStagedAccess {
         operator: opendal::Operator::new(opendal::services::Memory::default()).unwrap(),
         staged_path: std::sync::Mutex::new(String::new()),
         accesses: std::sync::atomic::AtomicUsize::new(0),
+        fail_at: 0,
     });
     let io = FileIOBuilder::new("memory")
         .with_provider(provider.clone())
         .build()
         .unwrap();
-    let table = table(io, "memory:/format_partial_publish", true, &[]);
+    let table = table(io, "memory:/format_abort_failure", true, &[]);
     let builder = table.new_write_builder();
     let mut writer = builder.new_write().unwrap();
     writer
         .write_arrow_batch(&batch(&[("a", 1), ("b", 2)]))
         .await
         .unwrap();
-    let mut messages = writer.prepare_commit().await.unwrap();
-    messages.sort_by_key(|message| message.format_file.as_ref().unwrap().partition["dt"].clone());
-    let first = messages[0].format_file.as_ref().unwrap().clone();
-    let second = messages[1].format_file.as_ref().unwrap().clone();
-    *provider.staged_path.lock().unwrap() = second.staged_path.clone();
-    let error = builder
-        .new_commit()
-        .commit(messages.clone())
-        .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("second publish failed"),
-        "{error}"
-    );
-    // Preserve files after publication errors; explicit abort requires known-uncommitted messages.
-    assert!(table.file_io().exists(&first.target_path).await.unwrap());
-    assert!(table.file_io().exists(&second.staged_path).await.unwrap());
-    assert_eq!(ids(&table).await, [1]);
-    builder
-        .new_commit()
-        .commit(vec![messages[1].clone()])
-        .await
-        .unwrap();
-    assert_eq!(ids(&table).await, [1, 2]);
-}
-
-#[tokio::test]
-async fn lost_partition_registration_response_preserves_published_data() {
-    use crate::{Options, RESTApi};
-    use axum::http::{Method, StatusCode, Uri};
-    use axum::response::IntoResponse;
-    use axum::{Json, Router};
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let registered = Arc::new(AtomicBool::new(false));
-    let server_registered = registered.clone();
-    let app = Router::new().fallback(move |method: Method, uri: Uri| {
-        let registered = server_registered.clone();
-        async move {
-            if method == Method::POST && uri.path().ends_with("/partitions") {
-                registered.store(true, Ordering::SeqCst);
-                // Catalog registration succeeded, but the client cannot decode
-                // the response. Deleting published data would corrupt this partition.
-                return (StatusCode::OK, "lost partition registration response").into_response();
-            }
-            let partitions = if registered.load(Ordering::SeqCst) {
-                serde_json::json!([{"spec": {"dt": "a"}}])
-            } else {
-                serde_json::json!([])
-            };
-            Json(serde_json::json!({"partitions": partitions})).into_response()
-        }
-    });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut options = Options::new();
-    options.set("uri", format!("http://{}", listener.local_addr().unwrap()));
-    options.set("prefix", "test");
-    options.set("token.provider", "bear");
-    options.set("token", "test-token");
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let api = Arc::new(RESTApi::new(options.clone(), false).await.unwrap());
-    let identifier = Identifier::new("default", "format_retention");
-    let cache = crate::io::FileIOCacheContext::from_props(options.to_map()).unwrap();
-    let env = super::RESTEnv::new(
-        identifier.clone(),
-        "uuid".into(),
-        api,
-        options,
-        false,
-        None,
-        cache,
-    );
-    let base = memory_table(
-        "format_lost_registration",
-        true,
-        &[("metastore.partitioned-table", "true")],
-    );
-    let table = Table::new(
-        base.file_io().clone(),
-        identifier,
-        base.location().into(),
-        base.schema().clone(),
-        Some(env),
-    );
-    let builder = table.new_write_builder();
-    let mut writer = builder.new_write().unwrap();
-    writer.write_arrow_batch(&batch(&[("a", 1)])).await.unwrap();
     let messages = writer.prepare_commit().await.unwrap();
-    let target = messages[0]
-        .format_file
-        .as_ref()
-        .unwrap()
-        .target_path
-        .clone();
-    assert!(builder.new_commit().commit(messages.clone()).await.is_err());
-    assert!(registered.load(Ordering::SeqCst));
-    // Preserve files after publication errors; explicit abort requires known-uncommitted messages.
-    assert!(table.file_io().exists(&target).await.unwrap());
-    assert_eq!(ids(&table).await, [1]);
-    server.abort();
+    let first = messages[0].format_file.as_ref().unwrap();
+    let second = messages[1].format_file.as_ref().unwrap();
+    for file in [first, second] {
+        table
+            .file_io()
+            .copy_file_streaming(&file.staged_path, &file.target_path)
+            .await
+            .unwrap();
+    }
+    *provider.staged_path.lock().unwrap() = first.staged_path.clone();
+    let error = builder.new_commit().abort(&messages).await.unwrap_err();
+    assert!(error.to_string().contains("staged I/O failed"));
+    assert!(table.file_io().exists(&first.staged_path).await.unwrap());
+    assert!(!table.file_io().exists(&second.staged_path).await.unwrap());
+    builder.new_commit().abort(&messages).await.unwrap();
+    for file in [first, second] {
+        assert!(!table.file_io().exists(&file.staged_path).await.unwrap());
+        assert!(table.file_io().exists(&file.target_path).await.unwrap());
+    }
 }
 
 #[tokio::test]
@@ -673,7 +863,8 @@ async fn target_collision_is_rejected_before_any_overwrite_cleanup() {
         .unwrap();
     assert!(error.to_string().contains("target already exists"));
     assert_eq!(visible_files(&table, "dt=a").await, old_files);
-    // Preserve files after publication errors; explicit abort requires known-uncommitted messages.
+    assert!(!table.file_io().exists(&file.staged_path).await.unwrap());
+    builder.new_commit().abort(&messages).await.unwrap();
     assert_eq!(visible_files(&table, "dt=a").await, old_files);
 }
 

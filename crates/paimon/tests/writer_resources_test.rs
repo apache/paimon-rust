@@ -327,7 +327,7 @@ async fn key_value_prepare_rejection_cleans_uncommitted_file() {
 }
 
 #[tokio::test]
-async fn one_partition_prepare_failure_preserves_prepared_outputs() {
+async fn one_partition_prepare_failure_cleans_other_partition_outputs() {
     let path = "memory:/writer_resources_multi_partition_prepare";
     let (io, table) = memory_table(path, partitioned_pk_schema("1"));
     setup_dirs(&io, path).await;
@@ -355,26 +355,5 @@ async fn one_partition_prepare_failure_preserves_prepared_outputs() {
         Err(Error::ResourceExhausted { .. })
     ));
     assert_eq!(resources.metrics().reserved_memory_bytes, 0);
-    let files = io
-        .list_status_recursive(path)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|file| file.path.ends_with(".parquet"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        files.len(),
-        1,
-        "the successful partition must survive: {files:?}"
-    );
-    assert!(files[0].size > 0);
-    write.close().await;
-    assert!(io.exists(&files[0].path).await.unwrap());
-    assert_eq!(resources.metrics().reserved_memory_bytes, 0);
-    assert!(table
-        .snapshot_manager()
-        .get_latest_snapshot()
-        .await
-        .unwrap()
-        .is_none());
+    assert_no_data_files(&io, path).await;
 }

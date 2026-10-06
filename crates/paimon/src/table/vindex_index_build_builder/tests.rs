@@ -1021,7 +1021,7 @@ async fn vindex_granule_training_sees_one_oversized_row_group() {
 }
 
 #[tokio::test]
-async fn vindex_build_preserves_written_shards_when_later_shard_fails() {
+async fn vindex_build_cleans_written_shards_when_later_shard_fails() {
     let table_path = "memory:/test_vindex_abort_written_shard";
     let table = vindex_e2e_table(table_path, "2");
     setup_dirs(table.file_io(), table_path).await;
@@ -1040,24 +1040,12 @@ async fn vindex_build_preserves_written_shards_when_later_shard_fails() {
         .expect_err("the second shard has an invalid vector dimension");
 
     assert!(error.to_string().contains("dimension mismatch"));
-    let files = table
+    assert!(table
         .file_io()
         .list_status(&format!("{table_path}/{INDEX_DIR}/"))
         .await
-        .unwrap();
-    assert_eq!(
-        files.len(),
-        1,
-        "the first complete shard must survive: {files:?}"
-    );
-    assert!(files[0].size > 0);
-    let snapshot = table
-        .snapshot_manager()
-        .get_latest_snapshot()
-        .await
         .unwrap()
-        .unwrap();
-    assert!(snapshot.index_manifest().is_none());
+        .is_empty());
 }
 
 /// A field that already carries a DIFFERENT index type (`lumina`) over an

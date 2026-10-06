@@ -1682,7 +1682,7 @@ async fn test_file_index_bloom_false_positive_keeps_residual_filter() {
 }
 
 #[tokio::test]
-async fn test_file_index_sidecar_failure_preserves_prepared_partitions() {
+async fn test_file_index_sidecar_failure_cleans_all_partitions_and_rolled_files() {
     for partitioned in [false, true] {
         let storage = StorageProbe::new(2);
         let mut schema = schema(&[
@@ -1716,31 +1716,12 @@ async fn test_file_index_sidecar_failure_preserves_prepared_partitions() {
             .list_status_recursive(table.location())
             .await
             .unwrap();
-        let data_files = files
-            .iter()
-            .filter(|file| file.path.ends_with(".parquet"))
-            .count();
-        let sidecars = files
-            .iter()
-            .filter(|file| file.path.ends_with(".index"))
-            .count();
-        // Whole successful partitions have handed off their files. Within a
-        // failed rolling writer all outputs remain owned and can be cleaned.
-        assert_eq!(data_files, if partitioned { 2 } else { 0 }, "{files:?}");
-        assert_eq!(sidecars, data_files, "{files:?}");
-        writer.close().await;
-        let mut before = files.into_iter().map(|file| file.path).collect::<Vec<_>>();
-        let mut after = table
-            .file_io()
-            .list_status_recursive(table.location())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|file| file.path)
-            .collect::<Vec<_>>();
-        before.sort();
-        after.sort();
-        assert_eq!(after, before);
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.path.ends_with(".parquet") || f.path.ends_with(".index")),
+            "{files:?}"
+        );
     }
 }
 

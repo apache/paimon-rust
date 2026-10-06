@@ -659,8 +659,14 @@ impl DataEvolutionDeleteWriter {
                 Ok(Some(message)) => messages.push(message),
                 Ok(None) => {}
                 Err(error) => {
-                    // Preserve prepared outputs from earlier buckets. Never
-                    // infer deletion ownership from CommitMessage.
+                    // Earlier outputs are private to this preparation; nothing
+                    // has been returned to a caller or submitted for commit.
+                    let _ = self
+                        .table
+                        .new_write_builder()
+                        .new_commit()
+                        .abort(&messages)
+                        .await;
                     return Err(error);
                 }
             }
