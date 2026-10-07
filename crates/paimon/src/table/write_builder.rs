@@ -78,6 +78,39 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
+    /// Restore dynamic-bucket write state from the coordinator's snapshot.
+    /// Zero denotes an empty base; without this option the writer restores
+    /// latest. Data-file sequence numbers and HASH indexes share this base,
+    /// as in Java FileSystemWriteRestore. Overwrite writers start empty.
+    pub fn with_restore_snapshot(self, snapshot_id: i64) -> crate::Result<Self> {
+        if snapshot_id < 0 {
+            return Err(crate::Error::DataInvalid {
+                message: "Restore snapshot id must not be negative".into(),
+                source: None,
+            });
+        }
+        match self.0 {
+            WriteBuilderKind::Paimon(mut builder)
+                if crate::spec::CoreOptions::new(builder.table.schema().options()).bucket()
+                    == -1
+                    && !builder.table.schema().primary_keys().is_empty()
+                    && builder
+                        .table
+                        .schema()
+                        .partition_keys()
+                        .iter()
+                        .all(|key| builder.table.schema().primary_keys().contains(key)) =>
+            {
+                builder.restore_snapshot_id = Some(snapshot_id);
+                Ok(Self(WriteBuilderKind::Paimon(builder)))
+            }
+            _ => Err(crate::Error::DataInvalid {
+                message: "Restore snapshots are only valid for HASH_DYNAMIC tables".into(),
+                source: None,
+            }),
+        }
+    }
+
     /// Share a memory budget across table writers created by `new_write`.
     pub fn with_resources(self, resources: ResourceContext) -> Self {
         match self.0 {
@@ -147,6 +180,7 @@ struct PaimonWriteBuilder<'a> {
     commit_user: String,
     overwrite: bool,
     resources: Option<ResourceContext>,
+    restore_snapshot_id: Option<i64>,
 }
 
 impl<'a> PaimonWriteBuilder<'a> {
@@ -156,6 +190,7 @@ impl<'a> PaimonWriteBuilder<'a> {
             commit_user: Uuid::new_v4().to_string(),
             overwrite: false,
             resources: None,
+            restore_snapshot_id: None,
         }
     }
 
@@ -216,11 +251,13 @@ impl<'a> PaimonWriteBuilder<'a> {
         if let Some(resources) = &self.resources {
             write = write.with_resources(resources.clone());
         }
-        Ok(if self.overwrite {
-            write.with_overwrite()
-        } else {
-            write
-        })
+        if self.overwrite {
+            write = write.with_overwrite();
+        }
+        if let Some(snapshot_id) = self.restore_snapshot_id {
+            write.set_restore_snapshot(snapshot_id);
+        }
+        Ok(write)
     }
 
     /// Create a configured table update object.

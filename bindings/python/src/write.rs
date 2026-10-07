@@ -41,12 +41,26 @@ type PythonPartitionSpec = HashMap<String, Py<PyAny>>;
 struct WriteContext {
     table: Arc<Table>,
     commit_user: String,
+    restore_snapshot_id: Option<i64>,
 }
 
 impl WriteContext {
     fn new(table: Arc<Table>) -> Self {
         let commit_user = table.new_write_builder().commit_user().to_string();
-        Self { table, commit_user }
+        Self {
+            table,
+            commit_user,
+            restore_snapshot_id: None,
+        }
+    }
+
+    fn with_restore_snapshot(&mut self, snapshot_id: i64) -> PyResult<()> {
+        self.table
+            .new_write_builder()
+            .with_restore_snapshot(snapshot_id)
+            .map_err(to_py_err)?;
+        self.restore_snapshot_id = Some(snapshot_id);
+        Ok(())
     }
 
     fn new_write(&self, overwrite: bool) -> PyResult<WriteState> {
@@ -59,6 +73,10 @@ impl WriteContext {
             builder.with_overwrite()
         } else {
             builder
+        };
+        let builder = match self.restore_snapshot_id {
+            Some(id) => builder.with_restore_snapshot(id).map_err(to_py_err)?,
+            None => builder,
         };
         Ok(WriteState {
             inner: Some(WriteTarget::Table(Box::new(
@@ -184,6 +202,14 @@ impl PyBatchWriteBuilder {
         Ok(slf)
     }
 
+    fn with_restore_snapshot(
+        mut slf: PyRefMut<'_, Self>,
+        snapshot_id: i64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.context.with_restore_snapshot(snapshot_id)?;
+        Ok(slf)
+    }
+
     fn new_write(&self) -> PyResult<PyBatchTableWrite> {
         Ok(PyBatchTableWrite {
             state: self.context.new_write(self.static_partition.is_some())?,
@@ -253,6 +279,14 @@ impl PyStreamWriteBuilder {
         Ok(slf)
     }
 
+    fn with_restore_snapshot(
+        mut slf: PyRefMut<'_, Self>,
+        snapshot_id: i64,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.context.with_restore_snapshot(snapshot_id)?;
+        Ok(slf)
+    }
+
     fn new_write(&self) -> PyResult<PyStreamTableWrite> {
         Ok(PyStreamTableWrite {
             state: self.context.new_write(false)?,
@@ -292,10 +326,23 @@ impl WriteTarget {
         }
     }
 
-    async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> paimon::Result<()> {
-        match self {
-            Self::Table(writer) => writer.write_arrow_batch(batch).await,
-            Self::PostponeFixed(writer) => writer.write_arrow_batch(batch).await,
+    async fn write_arrow(
+        &mut self,
+        batch: &RecordBatch,
+        bucket: Option<i32>,
+    ) -> paimon::Result<()> {
+        match (self, bucket) {
+            (Self::Table(writer), bucket) => {
+                writer
+                    .write_arrow(std::slice::from_ref(batch), bucket)
+                    .await
+            }
+            (Self::PostponeFixed(writer), None) => writer.write_arrow_batch(batch).await,
+            (Self::PostponeFixed(_), Some(_)) => Err(paimon::Error::DataInvalid {
+                message: "Precomputed bucket writes require HASH_FIXED or HASH_DYNAMIC tables"
+                    .into(),
+                source: None,
+            }),
         }
     }
 
@@ -610,13 +657,18 @@ impl WriteState {
             .map_err(to_py_err)
     }
 
-    fn write_arrow(&mut self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn write_arrow(
+        &mut self,
+        py: Python<'_>,
+        batch: &Bound<'_, PyAny>,
+        bucket: Option<i32>,
+    ) -> PyResult<()> {
         let batch = RecordBatch::from_pyarrow_bound(batch)?;
         let inner = self
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
-        py.detach(|| runtime().block_on(inner.write_arrow_batch(&batch)))
+        py.detach(|| runtime().block_on(inner.write_arrow(&batch, bucket)))
             .map_err(to_py_err)
     }
 
@@ -848,8 +900,14 @@ impl PyBatchTableWrite {
         }
     }
 
-    fn write_arrow(&mut self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.state.write_arrow(py, batch)
+    #[pyo3(signature = (batch, bucket=None))]
+    fn write_arrow(
+        &mut self,
+        py: Python<'_>,
+        batch: &Bound<'_, PyAny>,
+        bucket: Option<i32>,
+    ) -> PyResult<()> {
+        self.state.write_arrow(py, batch, bucket)
     }
 
     fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
@@ -888,8 +946,14 @@ impl PyStreamTableWrite {
         }
     }
 
-    fn write_arrow(&mut self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.state.write_arrow(py, batch)
+    #[pyo3(signature = (batch, bucket=None))]
+    fn write_arrow(
+        &mut self,
+        py: Python<'_>,
+        batch: &Bound<'_, PyAny>,
+        bucket: Option<i32>,
+    ) -> PyResult<()> {
+        self.state.write_arrow(py, batch, bucket)
     }
 
     /// Rust currently flushes synchronously and has no background compaction.
