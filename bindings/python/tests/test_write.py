@@ -100,19 +100,16 @@ def test_precomputed_bucket_api_roundtrip_and_closed_writer(tmp_path, streaming,
             "WITH ('bucket' = '{}')".format(bucket))
     table = _get_table(str(tmp_path))
     builder = table.new_stream_write_builder() if streaming else table.new_batch_write_builder()
+    if dynamic:
+        assert builder.with_index_restore_snapshot(0) is builder
+    else:
+        with pytest.raises(ValueError, match="HASH_DYNAMIC"):
+            builder.with_index_restore_snapshot(0)
     writer = builder.new_write()
     try:
-        if dynamic:
-            assert writer.with_dynamic_bucket_index(base_snapshot_id=0) is writer
-        else:
-            with pytest.raises(ValueError, match="HASH_DYNAMIC"):
-                writer.with_dynamic_bucket_index()
-        writer.write_arrow_batch_to_bucket(_batch([1, 1, 2], ["old", "new", "other"]), 3)
+        writer.write_arrow(_batch([1, 1, 2], ["old", "new", "other"]), bucket=3)
         with pytest.raises(ValueError, match="Bucket id"):
-            writer.write_arrow_batch_to_bucket(_batch([3], ["wrong"]), -1)
-        if dynamic:
-            with pytest.raises(ValueError, match="32-bit"):
-                writer.write_arrow_batch_to_bucket(_batch([3], ["wrong"]), 3, [2 ** 32])
+            writer.write_arrow(_batch([3], ["wrong"]), bucket=-1)
         messages = writer.prepare_commit(True, 1) if streaming else writer.prepare_commit()
         commit = builder.new_commit()
         commit.commit(1, messages) if streaming else commit.commit(messages)
@@ -120,9 +117,7 @@ def test_precomputed_bucket_api_roundtrip_and_closed_writer(tmp_path, streaming,
     finally:
         writer.close()
     with pytest.raises(RuntimeError, match="closed"):
-        writer.write_arrow_batch_to_bucket(_batch([4], ["closed"]), 3)
-    with pytest.raises(RuntimeError, match="closed"):
-        writer.with_dynamic_bucket_index()
+        writer.write_arrow(_batch([4], ["closed"]), bucket=3)
     assert pa.Table.from_batches(ctx.sql("SELECT id, name FROM paimon.wdb.t ORDER BY id")).to_pydict() == {
         "id": [1, 2], "name": ["new", "other"]}
 

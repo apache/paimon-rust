@@ -548,7 +548,7 @@ pub(crate) struct DynamicBucketAssigner {
     table: Table,
     max_buckets: i32,
     snapshot: Option<Snapshot>,
-    snapshot_pinned: bool,
+    index_restore_snapshot_id: Option<i64>,
     /// Cached index manifest entries from the latest snapshot (loaded once).
     cached_index_entries: Option<Vec<IndexManifestEntry>>,
     /// Overwrite mode: skip loading existing index entries.
@@ -584,7 +584,7 @@ impl DynamicBucketAssigner {
             target_bucket_row_number: options.dynamic_bucket_target_row_num(),
             max_buckets: options.dynamic_bucket_max_buckets()?,
             snapshot: None,
-            snapshot_pinned: false,
+            index_restore_snapshot_id: None,
             cached_index_entries: None,
             is_overwrite,
             partition_computer,
@@ -597,14 +597,9 @@ impl DynamicBucketAssigner {
         self.is_overwrite = is_overwrite;
     }
 
-    /// Called before writes so all worker-side restoration uses the driver's base.
-    pub fn configure_index(&mut self, ignore_existing: bool, snapshot: Option<Snapshot>) {
-        self.is_overwrite = ignore_existing;
-        self.snapshot = snapshot;
-        self.snapshot_pinned = true;
-        self.cached_index_entries = None;
-        self.partition_indexes.clear();
-        self.precomputed_indexes.clear();
+    /// Set by the builder before any index state is loaded.
+    pub fn set_index_restore_snapshot(&mut self, snapshot_id: i64) {
+        self.index_restore_snapshot_id = Some(snapshot_id);
     }
 
     /// Java's DynamicBucketIndexMaintainer sees keys after bucket assignment.
@@ -614,18 +609,10 @@ impl DynamicBucketAssigner {
         batch: &RecordBatch,
         partition: &[u8],
         bucket: i32,
-        key_hashes: Option<&[i32]>,
     ) -> Result<()> {
-        let computed;
-        let hashes = match key_hashes {
-            Some(hashes) => hashes,
-            None => {
-                computed = batch_hash_codes(batch, &self.primary_key_indices, &self.fields)?;
-                &computed
-            }
-        };
+        let hashes = batch_hash_codes(batch, &self.primary_key_indices, &self.fields)?;
         if let Some(index) = self.partition_indexes.get_mut(partition) {
-            return index.notify_precomputed(bucket, hashes);
+            return index.notify_precomputed(bucket, &hashes);
         }
         let loaded = self
             .precomputed_indexes
@@ -660,7 +647,7 @@ impl DynamicBucketAssigner {
         self.precomputed_indexes
             .get_mut(partition)
             .unwrap()
-            .notify_precomputed(bucket, hashes)
+            .notify_precomputed(bucket, &hashes)
     }
 
     /// Load all index manifest entries from the latest snapshot (cached).
@@ -674,10 +661,10 @@ impl DynamicBucketAssigner {
             return Ok(());
         }
         let snapshot_manager = self.table.snapshot_manager();
-        let latest_snapshot = if self.snapshot_pinned {
-            self.snapshot.clone()
-        } else {
-            snapshot_manager.get_latest_snapshot().await?
+        let latest_snapshot = match self.index_restore_snapshot_id {
+            Some(0) => None,
+            Some(id) => Some(snapshot_manager.get_snapshot(id).await?),
+            None => snapshot_manager.get_latest_snapshot().await?,
         };
 
         let entries = if let Some(snapshot) = &latest_snapshot {

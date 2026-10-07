@@ -28,54 +28,17 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 }
 
 impl TableWrite {
-    /// Pin HASH-index restoration to the coordinator's base snapshot. Zero
-    /// denotes an empty table; None resolves the latest snapshot now. Configure
-    /// this before writing, including when the coordinator overwrites old data.
-    /// Normal dynamic writes already maintain HASH indexes without this call.
-    pub async fn with_dynamic_bucket_index(
-        &mut self,
-        ignore_existing: bool,
-        base_snapshot_id: Option<i64>,
-    ) -> Result<&mut Self> {
-        self.ensure_active()?;
-        if self.written {
-            return Err(invalid(
-                "Dynamic bucket index maintenance must be enabled before writing",
-            ));
-        }
-        if !matches!(self.bucket_assigner, BucketAssignerEnum::Dynamic(_)) {
-            return Err(invalid(
-                "Dynamic bucket index maintenance is only valid for HASH_DYNAMIC tables",
-            ));
-        }
-        let manager = self.table.snapshot_manager();
-        let snapshot = match base_snapshot_id {
-            Some(id) if id < 0 => return Err(invalid("Base snapshot id must not be negative")),
-            Some(0) => None,
-            Some(id) => Some(manager.get_snapshot(id).await?),
-            None => manager.get_latest_snapshot().await?,
-        };
+    pub(in crate::table) fn set_index_restore_snapshot(&mut self, snapshot_id: i64) {
         if let BucketAssignerEnum::Dynamic(assigner) = &mut self.bucket_assigner {
-            assigner.configure_index(ignore_existing || self.is_overwrite, snapshot);
+            assigner.set_index_restore_snapshot(snapshot_id);
         }
-        // Java restores sequence numbers from current data files when a writer
-        // is created. The coordinator's base pins only HASH-index restoration.
-        Ok(self)
+        // Sequences still restore from current files, independently of this base.
     }
 
-    /// Write one complete partition/bucket group without assigning buckets
-    /// again. This is the batch counterpart of Java TableWrite.write(row, bucket).
-    /// HASH_DYNAMIC groups maintain the bucket's complete HASH index. Optional
-    /// hashes are Java BinaryRow key hashes carried through the shuffle. Flags
-    /// are upstream hints: every surviving key is notified, as in Java. Filtering
-    /// can discard the row which first created a mapping. Metadata follows input
-    /// row order, before any RowKind filtering.
-    pub async fn write_arrow_batch_to_bucket(
+    pub(super) async fn write_precomputed_bucket(
         &mut self,
         batch: &RecordBatch,
         bucket: i32,
-        key_hashes: Option<&[i32]>,
-        new_mappings: Option<&[bool]>,
     ) -> Result<()> {
         self.ensure_active()?;
         let dynamic = matches!(self.bucket_assigner, BucketAssignerEnum::Dynamic(_));
@@ -99,28 +62,7 @@ impl TableWrite {
                 upper_bound - 1,
             )));
         }
-        if !dynamic && (key_hashes.is_some() || new_mappings.is_some()) {
-            return Err(invalid(
-                "Precomputed key hashes and new-mapping flags are only valid for HASH_DYNAMIC tables",
-            ));
-        }
-        if new_mappings.is_some() && key_hashes.is_none() {
-            return Err(invalid("Precomputed new-mapping flags require key hashes"));
-        }
-        for (kind, len) in [
-            ("key hash", key_hashes.map(<[i32]>::len)),
-            ("new-mapping", new_mappings.map(<[bool]>::len)),
-        ] {
-            if let Some(len) = len {
-                if len != batch.num_rows() {
-                    return Err(invalid(format!(
-                        "Precomputed {kind} count {len} does not match row count {}",
-                        batch.num_rows(),
-                    )));
-                }
-            }
-        }
-        let Some((batch, selection)) = self.normalize_write_batch_with_selection(batch)? else {
+        let Some(batch) = self.normalize_write_batch(batch)? else {
             return Ok(());
         };
         let partition_indices = self
@@ -144,18 +86,10 @@ impl TableWrite {
                 "A precomputed bucket group contained multiple partitions",
             ));
         }
-        let selected_hashes = selection.as_ref().and_then(|rows| {
-            key_hashes.map(|hashes| rows.iter().map(|&row| hashes[row]).collect::<Vec<_>>())
-        });
         self.written = true;
         if let BucketAssignerEnum::Dynamic(assigner) = &mut self.bucket_assigner {
             if let Err(error) = assigner
-                .notify_precomputed_batch(
-                    &batch,
-                    partition,
-                    bucket,
-                    selected_hashes.as_deref().or(key_hashes),
-                )
+                .notify_precomputed_batch(&batch, partition, bucket)
                 .await
             {
                 self.fail_write().await;

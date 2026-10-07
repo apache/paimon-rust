@@ -130,11 +130,17 @@ async fn fixed_bucket_write_uses_upstream_bucket_and_shared_sequence() {
     let table = table(&[("bucket", "4"), ("changelog-producer", "input")]).await;
     let mut writer = table.new_write_builder().new_write().unwrap();
     writer
-        .write_arrow_batch_to_bucket(&make_batch(vec![1], vec![10]), 3, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1], vec![10])),
+            Some(3),
+        )
         .await
         .unwrap();
     writer
-        .write_arrow_batch_to_bucket(&make_batch(vec![1, 2], vec![20, 30]), 3, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1, 2], vec![20, 30])),
+            Some(3),
+        )
         .await
         .unwrap();
     let messages = writer.prepare_commit().await.unwrap();
@@ -148,7 +154,10 @@ async fn fixed_bucket_write_uses_upstream_bucket_and_shared_sequence() {
     commit(&table, messages).await;
     let mut writer = table.new_write_builder().new_write().unwrap();
     writer
-        .write_arrow_batch_to_bucket(&make_batch(vec![1], vec![40]), 3, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1], vec![40])),
+            Some(3),
+        )
         .await
         .unwrap();
     let messages = writer.prepare_commit().await.unwrap();
@@ -160,15 +169,16 @@ async fn fixed_bucket_write_uses_upstream_bucket_and_shared_sequence() {
 #[tokio::test]
 async fn dynamic_upstream_bucket_survives_mixed_writes_and_checkpoints() {
     let table = table(&[("bucket", "-1"), ("dynamic-bucket.target-row-num", "1")]).await;
-    let mut writer = table.new_write_builder().new_write().unwrap();
-    writer
-        .with_dynamic_bucket_index(false, Some(0))
-        .await
+    let mut writer = table
+        .new_write_builder()
+        .with_index_restore_snapshot(0)
+        .unwrap()
+        .new_write()
         .unwrap();
     let first = make_batch(vec![1], vec![10]);
     let first_hashes = hashes(&table, &first);
     writer
-        .write_arrow_batch_to_bucket(&first, 17, None, None)
+        .write_arrow(std::slice::from_ref(&first), Some(17))
         .await
         .unwrap();
     // Ordinary assignment must recognize a mapping notified by an upstream group.
@@ -184,7 +194,7 @@ async fn dynamic_upstream_bucket_survives_mixed_writes_and_checkpoints() {
     let second = make_batch(vec![1, 2], vec![30, 40]);
     let second_hashes = hashes(&table, &second);
     writer
-        .write_arrow_batch_to_bucket(&second, 17, Some(&second_hashes), Some(&[false, true]))
+        .write_arrow(std::slice::from_ref(&second), Some(17))
         .await
         .unwrap();
     let messages = writer.prepare_commit().await.unwrap();
@@ -212,14 +222,13 @@ async fn repeated_hashes_do_not_rewrite_unchanged_index() {
     let key_hashes = hashes(&table, &batch);
     let mut writer = table.new_write_builder().new_write().unwrap();
     writer
-        .write_arrow_batch_to_bucket(&batch, 7, Some(&key_hashes), Some(&[true]))
+        .write_arrow(std::slice::from_ref(&batch), Some(7))
         .await
         .unwrap();
     commit(&table, writer.prepare_commit().await.unwrap()).await;
     let mut writer = table.new_write_builder().new_write().unwrap();
-    writer.with_dynamic_bucket_index(false, None).await.unwrap();
     writer
-        .write_arrow_batch_to_bucket(&batch, 7, Some(&key_hashes), Some(&[false]))
+        .write_arrow(std::slice::from_ref(&batch), Some(7))
         .await
         .unwrap();
     let messages = writer.prepare_commit().await.unwrap();
@@ -229,24 +238,19 @@ async fn repeated_hashes_do_not_rewrite_unchanged_index() {
 }
 
 #[tokio::test]
-async fn row_kind_filter_keeps_upstream_hashes_aligned() {
+async fn row_kind_filter_precedes_index_hash_computation() {
     let table = table(&[
         ("bucket", "-1"),
         ("ignore-delete", "true"),
         ("changelog-producer", "input"),
     ])
     .await;
-    // The true new-mapping flags belong to ignored deletes of surviving keys.
+    // Ignored deletes must not suppress index notification for surviving inserts.
     let batch = make_batch_with_kinds(vec![1, 1, 2, 2], vec![0, 10, 0, 20], vec![3, 0, 3, 0]);
     let key_hashes = hashes(&table, &batch);
     let mut writer = table.new_write_builder().new_write().unwrap();
     writer
-        .write_arrow_batch_to_bucket(
-            &batch,
-            9,
-            Some(&key_hashes),
-            Some(&[true, false, true, false]),
-        )
+        .write_arrow(std::slice::from_ref(&batch), Some(9))
         .await
         .unwrap();
     let messages = writer.prepare_commit().await.unwrap();
@@ -283,7 +287,7 @@ async fn partition_group_and_projected_write_type_are_validated_before_staging()
     ])
     .unwrap();
     let error = writer
-        .write_arrow_batch_to_bucket(&batch, 2, None, None)
+        .write_arrow(std::slice::from_ref(&batch), Some(2))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("multiple partitions"));
@@ -292,7 +296,7 @@ async fn partition_group_and_projected_write_type_are_validated_before_staging()
         .with_write_type(vec!["pt".into(), "id".into()])
         .unwrap();
     writer
-        .write_arrow_batch_to_bucket(&batch.slice(0, 1), 2, None, None)
+        .write_arrow(std::slice::from_ref(&batch.slice(0, 1)), Some(2))
         .await
         .unwrap();
     let messages = writer.prepare_commit().await.unwrap();
@@ -306,7 +310,7 @@ async fn partition_group_and_projected_write_type_are_validated_before_staging()
 }
 
 #[tokio::test]
-async fn configuration_and_metadata_errors_do_not_stage_data() {
+async fn configuration_and_bucket_errors_do_not_stage_data() {
     for bucket in ["1", "4", "-1"] {
         let table = table(&[("bucket", bucket)]).await;
         let mut writer = table.new_write_builder().new_write().unwrap();
@@ -320,74 +324,70 @@ async fn configuration_and_metadata_errors_do_not_stage_data() {
             },
         ] {
             assert!(writer
-                .write_arrow_batch_to_bucket(&batch, invalid, None, None)
+                .write_arrow(std::slice::from_ref(&batch), Some(invalid))
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("Bucket id"));
         }
-        assert!(writer
-            .write_arrow_batch_to_bucket(&batch, 0, Some(&[1]), None)
-            .await
-            .is_err());
-        assert!(writer
-            .write_arrow_batch_to_bucket(&batch, 0, None, Some(&[true, true]))
-            .await
-            .is_err());
-        assert!(writer
-            .write_arrow_batch_to_bucket(&batch, 0, Some(&[1, 2]), Some(&[true]))
-            .await
-            .is_err());
         if bucket != "-1" {
-            assert!(writer
-                .with_dynamic_bucket_index(false, None)
-                .await
+            assert!(table
+                .new_write_builder()
+                .with_index_restore_snapshot(0)
                 .err()
                 .unwrap()
                 .to_string()
                 .contains("HASH_DYNAMIC"));
         } else {
-            assert!(writer
-                .with_dynamic_bucket_index(false, Some(-1))
-                .await
+            assert!(table
+                .new_write_builder()
+                .with_index_restore_snapshot(-1)
                 .is_err());
-            assert!(writer
-                .with_dynamic_bucket_index(false, Some(99))
-                .await
-                .is_err());
-            writer
-                .with_dynamic_bucket_index(false, Some(0))
-                .await
+            let mut missing = table
+                .new_write_builder()
+                .with_index_restore_snapshot(99)
+                .unwrap()
+                .new_write()
                 .unwrap();
+            assert!(missing
+                .write_arrow(std::slice::from_ref(&batch), Some(0))
+                .await
+                .is_err());
+            missing.close().await;
         }
         assert!(writer.prepare_commit().await.unwrap().is_empty());
     }
 }
 
 #[tokio::test]
-async fn configuration_freezes_only_after_nonempty_input() {
+async fn builder_configuration_is_copied_to_created_writers() {
     let table = table(&[("bucket", "-1")]).await;
-    let mut writer = table.new_write_builder().new_write().unwrap();
+    let builder = table
+        .new_write_builder()
+        .with_index_restore_snapshot(0)
+        .unwrap();
+    let mut writer = builder.new_write().unwrap();
+    let builder = builder.with_index_restore_snapshot(99).unwrap();
     writer
-        .write_arrow_batch_to_bucket(&make_batch(vec![], vec![]), 0, Some(&[]), Some(&[]))
+        .write_arrow(std::slice::from_ref(&make_batch(vec![], vec![])), Some(0))
         .await
         .unwrap();
     writer
-        .with_dynamic_bucket_index(false, Some(0))
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1], vec![10])),
+            Some(0),
+        )
         .await
         .unwrap();
-    writer
-        .write_arrow_batch_to_bucket(&make_batch(vec![1], vec![10]), 0, None, None)
-        .await
-        .unwrap();
-    assert!(writer
-        .with_dynamic_bucket_index(false, None)
-        .await
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("before writing"));
     assert_eq!(writer.prepare_commit().await.unwrap().len(), 1);
+    let mut missing = builder.new_write().unwrap();
+    assert!(missing
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![2], vec![20])),
+            Some(0)
+        )
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -395,20 +395,30 @@ async fn pinned_base_does_not_silently_follow_later_snapshots() {
     let table = table(&[("bucket", "-1")]).await;
     let mut writer = table.new_write_builder().new_write().unwrap();
     writer
-        .write_arrow_batch_to_bucket(&make_batch(vec![1], vec![10]), 0, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1], vec![10])),
+            Some(0),
+        )
         .await
         .unwrap();
     commit(&table, writer.prepare_commit().await.unwrap()).await;
-    let mut pinned = table.new_write_builder().new_write().unwrap();
-    pinned.with_dynamic_bucket_index(false, None).await.unwrap();
+    let mut pinned = table
+        .new_write_builder()
+        .with_index_restore_snapshot(1)
+        .unwrap()
+        .new_write()
+        .unwrap();
     let second = make_batch(vec![2], vec![20]);
     writer
-        .write_arrow_batch_to_bucket(&second, 0, None, None)
+        .write_arrow(std::slice::from_ref(&second), Some(0))
         .await
         .unwrap();
     commit(&table, writer.prepare_commit().await.unwrap()).await;
     pinned
-        .write_arrow_batch_to_bucket(&make_batch(vec![3], vec![30]), 0, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![3], vec![30])),
+            Some(0),
+        )
         .await
         .unwrap();
     let messages = pinned.prepare_commit().await.unwrap();
@@ -429,22 +439,32 @@ async fn first_sequence_restoration_uses_current_files_not_index_base() {
     let table = table(&[("bucket", "-1")]).await;
     let mut first = table.new_write_builder().new_write().unwrap();
     first
-        .write_arrow_batch_to_bucket(&make_batch(vec![1], vec![10]), 7, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1], vec![10])),
+            Some(7),
+        )
         .await
         .unwrap();
     commit(&table, first.prepare_commit().await.unwrap()).await;
-    let mut pinned = table.new_write_builder().new_write().unwrap();
-    pinned
-        .with_dynamic_bucket_index(false, Some(1))
-        .await
+    let mut pinned = table
+        .new_write_builder()
+        .with_index_restore_snapshot(1)
+        .unwrap()
+        .new_write()
         .unwrap();
     first
-        .write_arrow_batch_to_bucket(&make_batch(vec![1, 1, 1], vec![20, 30, 40]), 7, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1, 1, 1], vec![20, 30, 40])),
+            Some(7),
+        )
         .await
         .unwrap();
     commit(&table, first.prepare_commit().await.unwrap()).await;
     pinned
-        .write_arrow_batch_to_bucket(&make_batch(vec![1], vec![50]), 7, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1], vec![50])),
+            Some(7),
+        )
         .await
         .unwrap();
     let messages = pinned.prepare_commit().await.unwrap();
@@ -459,11 +479,11 @@ async fn conflicting_upstream_mapping_never_publishes_a_second_bucket() {
     let mut writer = table.new_write_builder().new_write().unwrap();
     let batch = make_batch(vec![1], vec![10]);
     writer
-        .write_arrow_batch_to_bucket(&batch, 7, None, None)
+        .write_arrow(std::slice::from_ref(&batch), Some(7))
         .await
         .unwrap();
     let error = writer
-        .write_arrow_batch_to_bucket(&batch, 8, None, None)
+        .write_arrow(std::slice::from_ref(&batch), Some(8))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("belongs to bucket 7"));
@@ -481,20 +501,23 @@ async fn overwrite_ignores_old_hashes_and_sequence_numbers() {
     let table = table(&[("bucket", "-1")]).await;
     let mut first = table.new_write_builder().new_write().unwrap();
     first
-        .write_arrow_batch_to_bucket(&make_batch(vec![1, 2], vec![10, 20]), 5, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1, 2], vec![10, 20])),
+            Some(5),
+        )
         .await
         .unwrap();
     commit(&table, first.prepare_commit().await.unwrap()).await;
-    let builder = table.new_write_builder().with_overwrite();
-    let mut writer = builder.new_write().unwrap();
-    writer
-        .with_dynamic_bucket_index(true, Some(1))
-        .await
+    let builder = table
+        .new_write_builder()
+        .with_overwrite()
+        .with_index_restore_snapshot(1)
         .unwrap();
+    let mut writer = builder.new_write().unwrap();
     let batch = make_batch(vec![3], vec![30]);
     let key_hashes = hashes(&table, &batch);
     writer
-        .write_arrow_batch_to_bucket(&batch, 5, Some(&key_hashes), Some(&[true]))
+        .write_arrow(std::slice::from_ref(&batch), Some(5))
         .await
         .unwrap();
     let messages = writer.prepare_commit().await.unwrap();
@@ -512,19 +535,24 @@ async fn overwrite_ignores_old_hashes_and_sequence_numbers() {
 #[tokio::test]
 async fn prepared_checkpoints_keep_sequence_progress_before_publication() {
     let table = table(&[("bucket", "-1")]).await;
-    let builder = table.new_write_builder();
+    let builder = table
+        .new_write_builder()
+        .with_index_restore_snapshot(0)
+        .unwrap();
     let mut writer = builder.new_write().unwrap();
     writer
-        .with_dynamic_bucket_index(false, Some(0))
-        .await
-        .unwrap();
-    writer
-        .write_arrow_batch_to_bucket(&make_batch(vec![2, 1], vec![20, 10]), 7, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![2, 1], vec![20, 10])),
+            Some(7),
+        )
         .await
         .unwrap();
     let first = writer.prepare_commit().await.unwrap();
     writer
-        .write_arrow_batch_to_bucket(&make_batch(vec![1], vec![30]), 7, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1], vec![30])),
+            Some(7),
+        )
         .await
         .unwrap();
     let second = writer.prepare_commit().await.unwrap();
@@ -552,18 +580,21 @@ async fn configured_overwrite_can_use_ordinary_and_direct_assignment() {
         .await
         .unwrap();
     commit(&table, first.prepare_commit().await.unwrap()).await;
-    let builder = table.new_write_builder().with_overwrite();
-    let mut writer = builder.new_write().unwrap();
-    writer
-        .with_dynamic_bucket_index(true, Some(1))
-        .await
+    let builder = table
+        .new_write_builder()
+        .with_overwrite()
+        .with_index_restore_snapshot(1)
         .unwrap();
+    let mut writer = builder.new_write().unwrap();
     writer
         .write_arrow_batch(&make_batch(vec![3], vec![30]))
         .await
         .unwrap();
     writer
-        .write_arrow_batch_to_bucket(&make_batch(vec![3, 4], vec![40, 50]), 0, None, None)
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![3, 4], vec![40, 50])),
+            Some(0),
+        )
         .await
         .unwrap();
     builder
@@ -580,7 +611,10 @@ async fn precomputed_writer_restores_only_its_bucket() {
     let mut writer = table.new_write_builder().new_write().unwrap();
     for (id, bucket) in [(1, 7), (2, 8)] {
         writer
-            .write_arrow_batch_to_bucket(&make_batch(vec![id], vec![id * 10]), bucket, None, None)
+            .write_arrow(
+                std::slice::from_ref(&make_batch(vec![id], vec![id * 10])),
+                Some(bucket),
+            )
             .await
             .unwrap();
     }
@@ -605,7 +639,7 @@ async fn precomputed_writer_restores_only_its_bucket() {
     let mut direct = table.new_write_builder().new_write().unwrap();
     let batch = make_batch(vec![1, 3], vec![100, 30]);
     direct
-        .write_arrow_batch_to_bucket(&batch, 7, None, None)
+        .write_arrow(std::slice::from_ref(&batch), Some(7))
         .await
         .unwrap();
     let messages = direct.prepare_commit().await.unwrap();
@@ -636,7 +670,10 @@ async fn bucket_local_index_paths_survive_precomputed_writer_restart() {
     for ids in [vec![1, 2], vec![2, 3]] {
         let mut writer = table.new_write_builder().new_write().unwrap();
         writer
-            .write_arrow_batch_to_bucket(&make_batch(ids.clone(), ids), 19, None, None)
+            .write_arrow(
+                std::slice::from_ref(&make_batch(ids.clone(), ids)),
+                Some(19),
+            )
             .await
             .unwrap();
         let messages = writer.prepare_commit().await.unwrap();
@@ -660,4 +697,24 @@ async fn bucket_local_index_paths_survive_precomputed_writer_restart() {
     assert!(messages[0].new_index_files.is_empty());
     commit(&table, messages).await;
     assert_eq!(rows(&table).await, vec![(1, 10), (2, 20), (3, 30)]);
+}
+
+#[tokio::test]
+async fn unified_arrow_writes_multiple_batches_with_or_without_bucket() {
+    for bucket in [None, Some(0)] {
+        let table = table(&[("bucket", "4")]).await;
+        let mut writer = table.new_write_builder().new_write().unwrap();
+        let batches = vec![
+            make_batch(vec![1, 2], vec![10, 20]),
+            make_batch(vec![1], vec![30]),
+        ];
+        writer.write_arrow(&batches, bucket).await.unwrap();
+        let messages = writer.prepare_commit().await.unwrap();
+        if let Some(bucket) = bucket {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].bucket, bucket);
+        }
+        commit(&table, messages).await;
+        assert_eq!(rows(&table).await, vec![(1, 30), (2, 20)]);
+    }
 }

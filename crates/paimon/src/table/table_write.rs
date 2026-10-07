@@ -730,16 +730,6 @@ impl TableWrite {
     }
 
     pub(super) fn normalize_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
-        Ok(self
-            .normalize_write_batch_with_selection(batch)?
-            .map(|(batch, _)| batch))
-    }
-
-    /// Keep upstream metadata aligned when Java's RowKindFilter removes rows.
-    fn normalize_write_batch_with_selection(
-        &self,
-        batch: &RecordBatch,
-    ) -> Result<Option<(RecordBatch, Option<Vec<usize>>)>> {
         let batch = self.validate_write_batch_schema(batch)?;
         // Java filters row kinds before extracting Blob values. Ignored rows
         // need neither valid descriptor bytes nor physical files.
@@ -758,7 +748,7 @@ impl TableWrite {
                 self.table.schema().options(),
             )?;
         }
-        Ok(Some((batch, selection)))
+        Ok(Some(batch))
     }
 
     pub(super) async fn write_partition_bucket_batch(
@@ -1178,10 +1168,19 @@ impl TableWrite {
         Ok(())
     }
 
-    /// Write multiple Arrow RecordBatches.
-    pub async fn write_arrow(&mut self, batches: &[RecordBatch]) -> Result<()> {
+    /// Write Arrow batches, optionally using a bucket assigned upstream, as
+    /// in Java TableWrite.write(row, bucket). Dynamic HASH indexes observe every
+    /// surviving key after RowKind filtering.
+    pub async fn write_arrow(
+        &mut self,
+        batches: &[RecordBatch],
+        bucket: Option<i32>,
+    ) -> Result<()> {
         for batch in batches {
-            self.write_arrow_batch(batch).await?;
+            match bucket {
+                Some(bucket) => self.write_precomputed_bucket(batch, bucket).await?,
+                None => self.write_arrow_batch(batch).await?,
+            }
         }
         Ok(())
     }
