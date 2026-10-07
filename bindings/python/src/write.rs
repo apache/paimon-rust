@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::pyarrow::FromPyArrow;
 use arrow::record_batch::RecordBatch;
-use paimon::spec::{CoreOptions, DataType, Datum};
+use paimon::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataType, Datum};
 use paimon::table::{
     CommitMessage, PostponeBucketPlan, PostponeFixedBucketTableWrite, Table, TableCommit,
     TableUpdate, TableUpdateByRowId, TableWrite, COMMIT_MESSAGE_SERIALIZER_VERSION,
@@ -84,6 +84,7 @@ impl WriteContext {
             ))),
             table_location: self.table.location().to_string(),
             commit_user: self.commit_user.clone(),
+            blob_consumer: None,
         })
     }
 }
@@ -314,6 +315,20 @@ enum WriteTarget {
 }
 
 impl WriteTarget {
+    fn with_blob_consumer(
+        &mut self,
+        consumer: Option<Arc<dyn BlobConsumer>>,
+    ) -> paimon::Result<()> {
+        match self {
+            Self::Table(writer) => {
+                writer.with_blob_consumer(consumer)?;
+                Ok(())
+            }
+            // Like Java AbstractFileStoreWrite, PK-only writers ignore it.
+            Self::PostponeFixed(_) => Ok(()),
+        }
+    }
+
     fn with_write_type(&mut self, columns: Vec<String>) -> paimon::Result<()> {
         match self {
             Self::Table(writer) => {
@@ -444,6 +459,7 @@ impl PyPostponeFixedBucketWriteBuilder {
                 ))),
                 table_location: context.table.location().to_string(),
                 commit_user: context.commit_user.clone(),
+                blob_consumer: None,
             },
             prepared: false,
         })
@@ -458,6 +474,40 @@ struct WriteState {
     inner: Option<WriteTarget>,
     table_location: String,
     commit_user: String,
+    blob_consumer: Option<Arc<PythonBlobConsumer>>,
+}
+
+/// Descriptor serialization and exception transport only; record boundaries,
+/// callback timing and requested flushes belong to Rust core.
+struct PythonBlobConsumer {
+    callback: Py<PyAny>,
+    error: Mutex<Option<PyErr>>,
+}
+
+impl BlobConsumer for PythonBlobConsumer {
+    fn accept(
+        &self,
+        field_name: &str,
+        descriptor: Option<&BlobDescriptor>,
+    ) -> paimon::Result<bool> {
+        let result = tokio::task::block_in_place(|| {
+            Python::attach(|py| {
+                let encoded =
+                    descriptor.map(|descriptor| PyBytes::new(py, &descriptor.serialize()));
+                self.callback
+                    .bind(py)
+                    .call1((field_name, encoded))?
+                    .is_truthy()
+            })
+        });
+        result.map_err(|error| {
+            *self.error.lock().unwrap() = Some(error);
+            paimon::Error::DataInvalid {
+                message: "BLOB consumer failed".into(),
+                source: None,
+            }
+        })
+    }
 }
 
 fn wrap_messages(
@@ -661,6 +711,40 @@ impl UpdateContext {
 }
 
 impl WriteState {
+    fn with_blob_consumer(&mut self, callback: Option<Py<PyAny>>, py: Python<'_>) -> PyResult<()> {
+        let consumer = callback
+            .map(|callback| {
+                if !callback.bind(py).is_callable() {
+                    return Err(PyTypeError::new_err("blob_consumer must be callable"));
+                }
+                Ok(Arc::new(PythonBlobConsumer {
+                    callback,
+                    error: Mutex::new(None),
+                }))
+            })
+            .transpose()?;
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?
+            .with_blob_consumer(
+                consumer
+                    .clone()
+                    .map(|consumer| consumer as Arc<dyn BlobConsumer>),
+            )
+            .map_err(to_py_err)?;
+        self.blob_consumer = consumer;
+        Ok(())
+    }
+
+    fn write_result(&self, result: paimon::Result<()>) -> PyResult<()> {
+        if let Some(consumer) = &self.blob_consumer {
+            if let Some(error) = consumer.error.lock().unwrap().take() {
+                return Err(error);
+            }
+        }
+        result.map_err(to_py_err)
+    }
+
     fn with_write_type(&mut self, columns: Vec<String>) -> PyResult<()> {
         self.inner
             .as_mut()
@@ -680,8 +764,8 @@ impl WriteState {
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?;
-        py.detach(|| runtime().block_on(inner.write_arrow(&batch, bucket)))
-            .map_err(to_py_err)
+        let result = py.detach(|| runtime().block_on(inner.write_arrow(&batch, bucket)));
+        self.write_result(result)
     }
 
     fn prepare_commit(&mut self, py: Python<'_>) -> PyResult<Vec<PyCommitMessage>> {
@@ -898,6 +982,16 @@ impl PyBatchTableUpdate {
 
 #[pymethods]
 impl PyBatchTableWrite {
+    #[pyo3(signature = (callback))]
+    fn with_blob_consumer(
+        mut slf: PyRefMut<'_, Self>,
+        callback: Option<Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.state.with_blob_consumer(callback, py)?;
+        Ok(slf)
+    }
+
     fn with_write_type(
         mut slf: PyRefMut<'_, Self>,
         columns: Vec<String>,
@@ -944,6 +1038,16 @@ pub struct PyStreamTableWrite {
 
 #[pymethods]
 impl PyStreamTableWrite {
+    #[pyo3(signature = (callback))]
+    fn with_blob_consumer(
+        mut slf: PyRefMut<'_, Self>,
+        callback: Option<Py<PyAny>>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let py = slf.py();
+        slf.state.with_blob_consumer(callback, py)?;
+        Ok(slf)
+    }
+
     fn with_write_type(
         mut slf: PyRefMut<'_, Self>,
         columns: Vec<String>,

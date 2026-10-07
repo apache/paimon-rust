@@ -87,6 +87,7 @@ pub(crate) struct ManagedBlobWriter {
     bucket_dir: String,
     file_prefix: String,
     target_file_size: u64,
+    copy_buffer_size: usize,
     fields: Vec<ManagedBlobField>,
     uncommitted_paths: Vec<String>,
 }
@@ -104,13 +105,16 @@ impl ManagedBlobWriteState {
         value_fields: &[DataField],
         options: &CoreOptions<'_>,
     ) -> Result<Self> {
-        let writer = ManagedBlobWriter::new(
+        let mut writer = ManagedBlobWriter::new(
             file_io.clone(),
             bucket_dir.to_string(),
             file_prefix,
             options.blob_target_file_size(),
             managed_blob_fields(value_fields, options),
         )?;
+        if let Some(writer) = &mut writer {
+            writer.copy_buffer_size = options.blob_copy_buffer_size()?;
+        }
         Ok(Self {
             writer: writer.map(|writer| tokio::sync::Mutex::new(Box::new(writer))),
         })
@@ -164,6 +168,7 @@ impl ManagedBlobWriter {
             bucket_dir,
             file_prefix: file_prefix.to_string(),
             target_file_size,
+            copy_buffer_size: 4 * 1024,
             fields: fields
                 .into_iter()
                 .map(|(index, kind)| ManagedBlobField {
@@ -356,8 +361,11 @@ impl ManagedBlobWriter {
                 uuid::Uuid::new_v4()
             );
             let output = self.file_io.new_output(&path)?;
-            let writer =
-                Box::new(BlobFormatWriter::new(&output, Some(self.file_io.clone()), None).await?);
+            let writer = Box::new(
+                BlobFormatWriter::new(&output, Some(self.file_io.clone()), None)
+                    .await?
+                    .with_copy_buffer_size(self.copy_buffer_size),
+            );
             self.uncommitted_paths.push(path.clone());
             self.fields[field_index].current = Some(ManagedBlobPack { path, writer });
         }

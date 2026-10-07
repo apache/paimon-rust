@@ -24,6 +24,8 @@ pub(crate) mod bin_pack;
 mod bitmap_global_index_format;
 mod bitmap_global_index_reader;
 mod bitmap_global_index_writer;
+#[cfg(test)]
+mod blob_consumer_tests;
 mod blob_resolver;
 mod branch_manager;
 #[cfg(test)]

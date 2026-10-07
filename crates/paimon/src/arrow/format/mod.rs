@@ -521,10 +521,16 @@ pub(crate) fn create_format_writer_factory(
             crate::spec::map_shredding::validate_format("file.format", file_format)?;
         }
     }
+    if file_format.eq_ignore_ascii_case("blob") {
+        return Ok(Arc::new(blob::BlobWriterFactory::new(
+            file_io,
+            write_fields.and_then(|fields| fields.first()),
+            format_options,
+        )?));
+    }
     Ok(Arc::new(PlainFormatWriterFactory {
         schema,
         zstd_level,
-        file_io,
         write_fields: write_fields.map(<[_]>::to_vec),
         format_options: format_options.cloned(),
     }))
@@ -557,7 +563,6 @@ pub(crate) async fn create_format_writer(
 struct PlainFormatWriterFactory {
     schema: SchemaRef,
     zstd_level: i32,
-    file_io: Option<FileIO>,
     write_fields: Option<Vec<DataField>>,
     format_options: Option<HashMap<String, String>>,
 }
@@ -571,21 +576,11 @@ impl FormatWriterFactory for PlainFormatWriterFactory {
     ) -> crate::Result<Box<dyn FormatFileWriter>> {
         let schema = self.schema.clone();
         let zstd_level = self.zstd_level;
-        let file_io = self.file_io.clone();
         let write_fields = self.write_fields.as_deref();
         let format_options = self.format_options.as_ref();
         let path = output.location();
         let lower = path.to_ascii_lowercase();
-        if lower.ends_with(".blob") {
-            Ok(Box::new(
-                blob::BlobFormatWriter::new(
-                    output,
-                    file_io,
-                    write_fields.and_then(|fields| fields.first()),
-                )
-                .await?,
-            ))
-        } else if lower.ends_with(".orc") {
+        if lower.ends_with(".orc") {
             if !matches!(
                 compression.to_ascii_lowercase().as_str(),
                 "" | "none" | "uncompressed"
