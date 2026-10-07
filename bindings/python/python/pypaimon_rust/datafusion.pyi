@@ -256,9 +256,10 @@ class BatchTableUpdate:
     def with_update_type(self, update_cols: List[str]) -> "BatchTableUpdate": ...
     def delete_by_row_id(self, row_ids: Sequence[int]) -> List[CommitMessage]: ...
     def upsert_by_arrow_with_key(
-        self, table: pyarrow.Table, upsert_keys: List[str]
+        self, table: Union[pyarrow.Table, Sequence[pyarrow.RecordBatch]], upsert_keys: List[str]
     ) -> List[CommitMessage]:
-        """Prepare one key upsert; commit the returned messages separately."""
+        """Prepare one key upsert. Batches may have different non-key fields;
+        appended rows in each partition must share a field set."""
         ...
 
 class TableUpdateByRowId:
@@ -283,7 +284,8 @@ class StreamTableUpdate:
         self, row_ids: Sequence[int], commit_identifier: int
     ) -> List[CommitMessage]: ...
     def upsert_by_arrow_with_key(
-        self, table: pyarrow.Table, upsert_keys: List[str], commit_identifier: int
+        self, table: Union[pyarrow.Table, Sequence[pyarrow.RecordBatch]],
+        upsert_keys: List[str], commit_identifier: int
     ) -> List[CommitMessage]:
         """Prepare one stream upsert; commit with the same identifier."""
         ...
