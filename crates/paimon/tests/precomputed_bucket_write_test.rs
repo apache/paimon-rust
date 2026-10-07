@@ -171,7 +171,7 @@ async fn dynamic_upstream_bucket_survives_mixed_writes_and_checkpoints() {
     let table = table(&[("bucket", "-1"), ("dynamic-bucket.target-row-num", "1")]).await;
     let mut writer = table
         .new_write_builder()
-        .with_index_restore_snapshot(0)
+        .with_restore_snapshot(0)
         .unwrap()
         .new_write()
         .unwrap();
@@ -333,19 +333,16 @@ async fn configuration_and_bucket_errors_do_not_stage_data() {
         if bucket != "-1" {
             assert!(table
                 .new_write_builder()
-                .with_index_restore_snapshot(0)
+                .with_restore_snapshot(0)
                 .err()
                 .unwrap()
                 .to_string()
                 .contains("HASH_DYNAMIC"));
         } else {
-            assert!(table
-                .new_write_builder()
-                .with_index_restore_snapshot(-1)
-                .is_err());
+            assert!(table.new_write_builder().with_restore_snapshot(-1).is_err());
             let mut missing = table
                 .new_write_builder()
-                .with_index_restore_snapshot(99)
+                .with_restore_snapshot(99)
                 .unwrap()
                 .new_write()
                 .unwrap();
@@ -362,12 +359,9 @@ async fn configuration_and_bucket_errors_do_not_stage_data() {
 #[tokio::test]
 async fn builder_configuration_is_copied_to_created_writers() {
     let table = table(&[("bucket", "-1")]).await;
-    let builder = table
-        .new_write_builder()
-        .with_index_restore_snapshot(0)
-        .unwrap();
+    let builder = table.new_write_builder().with_restore_snapshot(0).unwrap();
     let mut writer = builder.new_write().unwrap();
-    let builder = builder.with_index_restore_snapshot(99).unwrap();
+    let builder = builder.with_restore_snapshot(99).unwrap();
     writer
         .write_arrow(std::slice::from_ref(&make_batch(vec![], vec![])), Some(0))
         .await
@@ -404,7 +398,7 @@ async fn pinned_base_does_not_silently_follow_later_snapshots() {
     commit(&table, writer.prepare_commit().await.unwrap()).await;
     let mut pinned = table
         .new_write_builder()
-        .with_index_restore_snapshot(1)
+        .with_restore_snapshot(1)
         .unwrap()
         .new_write()
         .unwrap();
@@ -422,9 +416,9 @@ async fn pinned_base_does_not_silently_follow_later_snapshots() {
         .await
         .unwrap();
     let messages = pinned.prepare_commit().await.unwrap();
-    // Index restoration uses snapshot 1, while sequences use current files.
+    // Java restores both data-file sequences and HASH indexes from snapshot 1.
     assert_eq!(messages[0].new_index_files[0].row_count, 2);
-    assert_eq!(messages[0].new_files[0].min_sequence_number, 2);
+    assert_eq!(messages[0].new_files[0].min_sequence_number, 1);
     table
         .new_write_builder()
         .new_commit()
@@ -435,7 +429,7 @@ async fn pinned_base_does_not_silently_follow_later_snapshots() {
 }
 
 #[tokio::test]
-async fn first_sequence_restoration_uses_current_files_not_index_base() {
+async fn restore_snapshot_pins_data_file_sequences_and_default_restores_latest() {
     let table = table(&[("bucket", "-1")]).await;
     let mut first = table.new_write_builder().new_write().unwrap();
     first
@@ -448,7 +442,7 @@ async fn first_sequence_restoration_uses_current_files_not_index_base() {
     commit(&table, first.prepare_commit().await.unwrap()).await;
     let mut pinned = table
         .new_write_builder()
-        .with_index_restore_snapshot(1)
+        .with_restore_snapshot(1)
         .unwrap()
         .new_write()
         .unwrap();
@@ -468,6 +462,26 @@ async fn first_sequence_restoration_uses_current_files_not_index_base() {
         .await
         .unwrap();
     let messages = pinned.prepare_commit().await.unwrap();
+    assert_eq!(messages[0].new_files[0].min_sequence_number, 1);
+    // The supplied historical base is a coordinated restore, not permission to
+    // overwrite another owner's newer writes. Inspect and abort these messages.
+    table
+        .new_write_builder()
+        .new_commit()
+        .abort(&messages)
+        .await
+        .unwrap();
+    pinned.close().await;
+    assert_eq!(rows(&table).await, vec![(1, 40)]);
+    let mut current = table.new_write_builder().new_write().unwrap();
+    current
+        .write_arrow(
+            std::slice::from_ref(&make_batch(vec![1], vec![50])),
+            Some(7),
+        )
+        .await
+        .unwrap();
+    let messages = current.prepare_commit().await.unwrap();
     assert_eq!(messages[0].new_files[0].min_sequence_number, 4);
     commit(&table, messages).await;
     assert_eq!(rows(&table).await, vec![(1, 50)]);
@@ -511,7 +525,7 @@ async fn overwrite_ignores_old_hashes_and_sequence_numbers() {
     let builder = table
         .new_write_builder()
         .with_overwrite()
-        .with_index_restore_snapshot(1)
+        .with_restore_snapshot(1)
         .unwrap();
     let mut writer = builder.new_write().unwrap();
     let batch = make_batch(vec![3], vec![30]);
@@ -535,10 +549,7 @@ async fn overwrite_ignores_old_hashes_and_sequence_numbers() {
 #[tokio::test]
 async fn prepared_checkpoints_keep_sequence_progress_before_publication() {
     let table = table(&[("bucket", "-1")]).await;
-    let builder = table
-        .new_write_builder()
-        .with_index_restore_snapshot(0)
-        .unwrap();
+    let builder = table.new_write_builder().with_restore_snapshot(0).unwrap();
     let mut writer = builder.new_write().unwrap();
     writer
         .write_arrow(
@@ -583,7 +594,7 @@ async fn configured_overwrite_can_use_ordinary_and_direct_assignment() {
     let builder = table
         .new_write_builder()
         .with_overwrite()
-        .with_index_restore_snapshot(1)
+        .with_restore_snapshot(1)
         .unwrap();
     let mut writer = builder.new_write().unwrap();
     writer

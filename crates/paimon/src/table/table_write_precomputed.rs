@@ -28,11 +28,12 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 }
 
 impl TableWrite {
-    pub(in crate::table) fn set_index_restore_snapshot(&mut self, snapshot_id: i64) {
+    pub(in crate::table) fn set_restore_snapshot(&mut self, snapshot_id: i64) {
+        self.restore_snapshot_id = Some(snapshot_id);
         if let BucketAssignerEnum::Dynamic(assigner) = &mut self.bucket_assigner {
-            assigner.set_index_restore_snapshot(snapshot_id);
+            assigner.set_restore_snapshot(snapshot_id);
         }
-        // Sequences still restore from current files, independently of this base.
+        // Java WriteRestore restores data files and indexes from the same snapshot.
     }
 
     pub(super) async fn write_precomputed_bucket(

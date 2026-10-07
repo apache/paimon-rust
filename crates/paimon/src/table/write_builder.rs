@@ -78,14 +78,14 @@ impl<'a> WriteBuilder<'a> {
         }
     }
 
-    /// Restore dynamic HASH indexes from the coordinator's snapshot. Zero
-    /// denotes an empty base; without this option the writer restores latest.
-    /// Sequence numbers always restore from current files. Overwrite writers
-    /// automatically start with empty indexes.
-    pub fn with_index_restore_snapshot(self, snapshot_id: i64) -> crate::Result<Self> {
+    /// Restore dynamic-bucket write state from the coordinator's snapshot.
+    /// Zero denotes an empty base; without this option the writer restores
+    /// latest. Data-file sequence numbers and HASH indexes share this base,
+    /// as in Java FileSystemWriteRestore. Overwrite writers start empty.
+    pub fn with_restore_snapshot(self, snapshot_id: i64) -> crate::Result<Self> {
         if snapshot_id < 0 {
             return Err(crate::Error::DataInvalid {
-                message: "Index restore snapshot id must not be negative".into(),
+                message: "Restore snapshot id must not be negative".into(),
                 source: None,
             });
         }
@@ -101,11 +101,11 @@ impl<'a> WriteBuilder<'a> {
                         .iter()
                         .all(|key| builder.table.schema().primary_keys().contains(key)) =>
             {
-                builder.index_restore_snapshot_id = Some(snapshot_id);
+                builder.restore_snapshot_id = Some(snapshot_id);
                 Ok(Self(WriteBuilderKind::Paimon(builder)))
             }
             _ => Err(crate::Error::DataInvalid {
-                message: "Index restore snapshots are only valid for HASH_DYNAMIC tables".into(),
+                message: "Restore snapshots are only valid for HASH_DYNAMIC tables".into(),
                 source: None,
             }),
         }
@@ -180,7 +180,7 @@ struct PaimonWriteBuilder<'a> {
     commit_user: String,
     overwrite: bool,
     resources: Option<ResourceContext>,
-    index_restore_snapshot_id: Option<i64>,
+    restore_snapshot_id: Option<i64>,
 }
 
 impl<'a> PaimonWriteBuilder<'a> {
@@ -190,7 +190,7 @@ impl<'a> PaimonWriteBuilder<'a> {
             commit_user: Uuid::new_v4().to_string(),
             overwrite: false,
             resources: None,
-            index_restore_snapshot_id: None,
+            restore_snapshot_id: None,
         }
     }
 
@@ -254,8 +254,8 @@ impl<'a> PaimonWriteBuilder<'a> {
         if self.overwrite {
             write = write.with_overwrite();
         }
-        if let Some(snapshot_id) = self.index_restore_snapshot_id {
-            write.set_index_restore_snapshot(snapshot_id);
+        if let Some(snapshot_id) = self.restore_snapshot_id {
+            write.set_restore_snapshot(snapshot_id);
         }
         Ok(write)
     }

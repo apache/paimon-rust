@@ -163,6 +163,7 @@ pub struct TableWrite {
     changelog_file_compression: String,
     partition_seq_cache: HashMap<Vec<u8>, HashMap<i32, i64>>,
     sequence_snapshot: Option<Option<Snapshot>>,
+    restore_snapshot_id: Option<i64>,
     commit_user: String,
     /// Shared by this writer's postpone files, as in Java's per-writer writeId.
     postpone_write_id: i32,
@@ -235,6 +236,7 @@ impl TableWrite {
             changelog_file_compression: String::new(),
             partition_seq_cache: HashMap::new(),
             sequence_snapshot: None,
+            restore_snapshot_id: None,
             commit_user,
             postpone_write_id: 0,
             bucket_assigner: BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
@@ -516,6 +518,7 @@ impl TableWrite {
             changelog_file_compression,
             partition_seq_cache: HashMap::new(),
             sequence_snapshot: None,
+            restore_snapshot_id: None,
             commit_user,
             postpone_write_id: (uuid::Uuid::new_v4().as_u128() % i32::MAX as u128) as i32,
             bucket_assigner,
@@ -1425,6 +1428,15 @@ impl TableWrite {
         bucket: i32,
         partition_bytes: &[u8],
     ) -> Result<FileWriter> {
+        if !self.is_overwrite && self.sequence_snapshot.is_none() {
+            if let Some(id) = self.restore_snapshot_id {
+                self.sequence_snapshot = Some(if id == 0 {
+                    None
+                } else {
+                    Some(self.table.snapshot_manager().get_snapshot(id).await?)
+                });
+            }
+        }
         // Lazily scan partition sequence numbers on first writer creation per partition.
         // Overwrite mode skips this — old data will be replaced, so seq starts at 0.
         if !self.is_overwrite && !self.partition_seq_cache.contains_key(partition_bytes) {

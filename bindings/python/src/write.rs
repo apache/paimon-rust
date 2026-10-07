@@ -41,7 +41,7 @@ type PythonPartitionSpec = HashMap<String, Py<PyAny>>;
 struct WriteContext {
     table: Arc<Table>,
     commit_user: String,
-    index_restore_snapshot_id: Option<i64>,
+    restore_snapshot_id: Option<i64>,
 }
 
 impl WriteContext {
@@ -50,16 +50,16 @@ impl WriteContext {
         Self {
             table,
             commit_user,
-            index_restore_snapshot_id: None,
+            restore_snapshot_id: None,
         }
     }
 
-    fn with_index_restore_snapshot(&mut self, snapshot_id: i64) -> PyResult<()> {
+    fn with_restore_snapshot(&mut self, snapshot_id: i64) -> PyResult<()> {
         self.table
             .new_write_builder()
-            .with_index_restore_snapshot(snapshot_id)
+            .with_restore_snapshot(snapshot_id)
             .map_err(to_py_err)?;
-        self.index_restore_snapshot_id = Some(snapshot_id);
+        self.restore_snapshot_id = Some(snapshot_id);
         Ok(())
     }
 
@@ -74,8 +74,8 @@ impl WriteContext {
         } else {
             builder
         };
-        let builder = match self.index_restore_snapshot_id {
-            Some(id) => builder.with_index_restore_snapshot(id).map_err(to_py_err)?,
+        let builder = match self.restore_snapshot_id {
+            Some(id) => builder.with_restore_snapshot(id).map_err(to_py_err)?,
             None => builder,
         };
         Ok(WriteState {
@@ -202,11 +202,11 @@ impl PyBatchWriteBuilder {
         Ok(slf)
     }
 
-    fn with_index_restore_snapshot(
+    fn with_restore_snapshot(
         mut slf: PyRefMut<'_, Self>,
         snapshot_id: i64,
     ) -> PyResult<PyRefMut<'_, Self>> {
-        slf.context.with_index_restore_snapshot(snapshot_id)?;
+        slf.context.with_restore_snapshot(snapshot_id)?;
         Ok(slf)
     }
 
@@ -279,11 +279,11 @@ impl PyStreamWriteBuilder {
         Ok(slf)
     }
 
-    fn with_index_restore_snapshot(
+    fn with_restore_snapshot(
         mut slf: PyRefMut<'_, Self>,
         snapshot_id: i64,
     ) -> PyResult<PyRefMut<'_, Self>> {
-        slf.context.with_index_restore_snapshot(snapshot_id)?;
+        slf.context.with_restore_snapshot(snapshot_id)?;
         Ok(slf)
     }
 

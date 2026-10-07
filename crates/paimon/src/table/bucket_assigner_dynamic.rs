@@ -548,7 +548,7 @@ pub(crate) struct DynamicBucketAssigner {
     table: Table,
     max_buckets: i32,
     snapshot: Option<Snapshot>,
-    index_restore_snapshot_id: Option<i64>,
+    restore_snapshot_id: Option<i64>,
     /// Cached index manifest entries from the latest snapshot (loaded once).
     cached_index_entries: Option<Vec<IndexManifestEntry>>,
     /// Overwrite mode: skip loading existing index entries.
@@ -584,7 +584,7 @@ impl DynamicBucketAssigner {
             target_bucket_row_number: options.dynamic_bucket_target_row_num(),
             max_buckets: options.dynamic_bucket_max_buckets()?,
             snapshot: None,
-            index_restore_snapshot_id: None,
+            restore_snapshot_id: None,
             cached_index_entries: None,
             is_overwrite,
             partition_computer,
@@ -598,8 +598,8 @@ impl DynamicBucketAssigner {
     }
 
     /// Set by the builder before any index state is loaded.
-    pub fn set_index_restore_snapshot(&mut self, snapshot_id: i64) {
-        self.index_restore_snapshot_id = Some(snapshot_id);
+    pub fn set_restore_snapshot(&mut self, snapshot_id: i64) {
+        self.restore_snapshot_id = Some(snapshot_id);
     }
 
     /// Java's DynamicBucketIndexMaintainer sees keys after bucket assignment.
@@ -661,7 +661,7 @@ impl DynamicBucketAssigner {
             return Ok(());
         }
         let snapshot_manager = self.table.snapshot_manager();
-        let latest_snapshot = match self.index_restore_snapshot_id {
+        let latest_snapshot = match self.restore_snapshot_id {
             Some(0) => None,
             Some(id) => Some(snapshot_manager.get_snapshot(id).await?),
             None => snapshot_manager.get_latest_snapshot().await?,

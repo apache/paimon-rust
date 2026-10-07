@@ -101,10 +101,10 @@ def test_precomputed_bucket_api_roundtrip_and_closed_writer(tmp_path, streaming,
     table = _get_table(str(tmp_path))
     builder = table.new_stream_write_builder() if streaming else table.new_batch_write_builder()
     if dynamic:
-        assert builder.with_index_restore_snapshot(0) is builder
+        assert builder.with_restore_snapshot(0) is builder
     else:
         with pytest.raises(ValueError, match="HASH_DYNAMIC"):
-            builder.with_index_restore_snapshot(0)
+            builder.with_restore_snapshot(0)
     writer = builder.new_write()
     try:
         writer.write_arrow(_batch([1, 1, 2], ["old", "new", "other"]), bucket=3)
