@@ -636,7 +636,10 @@ impl TableWrite {
             )?;
         }
         let config = PartialUpdateConfig::new(self.table.schema().options());
-        let batch = if config.is_enabled() && config.remove_record_on_delete() {
+        let batch = if !self.primary_key_indices.is_empty()
+            && config.is_enabled()
+            && config.remove_record_on_delete()
+        {
             let batch = if batch
                 .schema()
                 .column_with_name(VALUE_KIND_FIELD_NAME)
@@ -2549,6 +2552,31 @@ pub(in crate::table) mod tests {
 
         assert_eq!(collect_i32(&batches, 0), vec![1, 2, 3]);
         assert_eq!(collect_i32(&batches, 1), vec![10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn test_append_row_format_ignores_partial_update_options() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_append_row_partial_update_options";
+        setup_dirs(&file_io, table_path).await;
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .option("merge-engine", "partial-update")
+            .option("partial-update.remove-record-on-delete", "true")
+            .option("file.format", "row")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io,
+            Identifier::new("default", "test_append_row_partial_update_options"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+
+        commit_one_batch(&table, vec![1], vec![10]).await;
+        assert_eq!(read_id_value_rows(&table).await, vec![(1, 10)]);
     }
 
     #[tokio::test]
