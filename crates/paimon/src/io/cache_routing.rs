@@ -49,12 +49,27 @@ const DEFAULT_DATA_PREFIXES: [&str; 2] = ["data-", "changelog-"];
 const MANIFEST_SIDECAR_SUFFIX: &str = ".avro.sidecar";
 
 // Data files are named {prefix}{uuid}-{count}.{extension}; this matches what follows the prefix.
+const UUID: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 static DATA_FILE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9]+\..+$")
-        .expect("valid data file pattern")
+    Regex::new(&format!(r"^{UUID}-[0-9]+\..+$")).expect("valid data file pattern")
+});
+// Other types are routed only under the names Paimon writes; Format Table files may be replaced
+// in place.
+static META_FILE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"^(?:(?:manifest|manifest-list|index-manifest|stat)-{UUID}-[0-9]+|manifest-{UUID}-[0-9]+\.avro\.sidecar)$"
+    ))
+    .expect("valid metadata file pattern")
+});
+static BUCKET_INDEX_FILE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"^index-{UUID}-[0-9]+$")).expect("valid bucket index file pattern")
+});
+static GLOBAL_INDEX_FILE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"^[a-z0-9_-]+-global-index-{UUID}\.index$"))
+        .expect("valid global index file pattern")
 });
 
-/// Operation class of a FileIO request; only `Meta`, `Read` and `Write` can leave origin.
+/// Operation class of a FileIO request; only `Meta`, `Exists`, `Read` and `Write` can leave origin.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum OpClass {
     /// File status lookups, including the size lookup before a cached read.
@@ -252,10 +267,15 @@ pub(crate) fn routable_type(path: &str, data_prefixes: &[String]) -> Option<File
     if is_sequential(path) {
         return None;
     }
-    match FileType::classify(path) {
-        FileType::Data => None,
-        file_type => Some(file_type),
-    }
+    let file_type = FileType::classify(path);
+    let paimon_name = match file_type {
+        FileType::Meta => META_FILE.is_match(name),
+        FileType::BucketIndex => BUCKET_INDEX_FILE.is_match(name),
+        FileType::GlobalIndex => GLOBAL_INDEX_FILE.is_match(name),
+        // Data files and their file indexes are recognized by `is_data_file_name`.
+        _ => false,
+    };
+    paimon_name.then_some(file_type)
 }
 
 // Manifests, indexes and statistics share the uuid-count shape but have no extension.
@@ -490,6 +510,10 @@ mod tests {
         assert_endpoint(&options, OpClass::Read, &dls, OSS);
         // the whitelist has no index
         assert_endpoint(&options, OpClass::Read, INDEX_PATH, OSS);
+        // a Format Table file named like a manifest may be replaced in place
+        let external = "review_external/manifest.parquet";
+        assert_endpoint(&options, OpClass::Read, external, OSS);
+        assert_endpoint(&options, OpClass::Meta, external, OSS);
         assert_endpoint(&options, OpClass::Write, DATA_PATH, OSS);
         assert_endpoint(&options, OpClass::Origin, DATA_PATH, OSS);
     }
@@ -720,6 +744,23 @@ mod tests {
         ] {
             assert_type(path, None, &[]);
         }
+        // Format Table files named like metadata or indexes, which may be replaced in place
+        for path in [
+            "dt=1/manifest.parquet",
+            "dt=1/stat-2024.parquet",
+            "dt=1/index-a.csv",
+            "dt=1/foo.index",
+            "review_external/manifest.parquet",
+            "manifest/manifest-old",
+            "manifest/manifest-old.avro.sidecar",
+            "manifest/manifest-list-{uuid}-1.avro.sidecar",
+            "statistics/stat-old",
+            "index/index-old",
+            "index/my-global-index.index",
+            "index/btree-global-index-{uuid}-0.index",
+        ] {
+            assert_type(path, None, &[]);
+        }
 
         assert_type("manifest/manifest-{uuid}-0", Some(FileType::Meta), &[]);
         assert_type("manifest/manifest-list-{uuid}-1", Some(FileType::Meta), &[]);
@@ -884,7 +925,8 @@ mod tests {
         ]);
         let both = OpClasses(OpClass::Meta.bit() | OpClass::Read.bit());
         assert_eq!(
-            routing.cache_target("oss://b/t/manifest/manifest-1"),
+            routing
+                .cache_target("oss://b/t/manifest/manifest-123e4567-e89b-12d3-a456-426614174000-1"),
             Some((0, both))
         );
         assert_eq!(

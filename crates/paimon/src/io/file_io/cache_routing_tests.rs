@@ -20,9 +20,9 @@ use crate::io::oss_test_server::TestOss;
 
 const DATA: &str = "oss://bkt/db.db/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet";
 const DATA_KEY: &str = "bkt/db.db/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet";
-const MANIFEST: &str = "oss://bkt/db.db/t/manifest/manifest-1";
-const MANIFEST_KEY: &str = "bkt/db.db/t/manifest/manifest-1";
-const INDEX: &str = "oss://bkt/db.db/t/index/index-1";
+const MANIFEST: &str = "oss://bkt/db.db/t/manifest/manifest-123e4567-e89b-12d3-a456-426614174000-1";
+const MANIFEST_KEY: &str = "bkt/db.db/t/manifest/manifest-123e4567-e89b-12d3-a456-426614174000-1";
+const INDEX: &str = "oss://bkt/db.db/t/index/index-123e4567-e89b-12d3-a456-426614174000-1";
 const LATEST: &str = "oss://bkt/db.db/t/snapshot/LATEST";
 const SNAPSHOT: &str = "oss://bkt/db.db/t/snapshot/snapshot-1";
 const UNREACHABLE: &str = "http://127.0.0.1:1";
@@ -306,9 +306,48 @@ async fn test_targets_serve_the_file_types_of_their_routes() {
     assert_eq!(
         origin.take_requests(),
         [
-            "GET bkt/db.db/t/index/index-1".to_string(),
+            "GET bkt/db.db/t/index/index-123e4567-e89b-12d3-a456-426614174000-1".to_string(),
             format!("HEAD {MANIFEST_KEY}")
         ]
+    );
+}
+
+#[tokio::test]
+async fn test_format_table_file_named_like_a_manifest_uses_origin() {
+    let origin = TestOss::start().await;
+    // Its own storage stands in for a cache that kept the file before it was replaced.
+    let cache = TestOss::start().await;
+    let path = "oss://bkt/db.db/review_external/manifest.parquet";
+    let key = "bkt/db.db/review_external/manifest.parquet";
+    write(
+        &oss_file_io(&[("fs.oss.endpoint", cache.endpoint())]),
+        path,
+        b"id=1",
+    )
+    .await;
+    write(
+        &oss_file_io(&[("fs.oss.endpoint", origin.endpoint())]),
+        path,
+        b"id=2",
+    )
+    .await;
+    cache.take_requests();
+    origin.take_requests();
+    let file_io = oss_file_io(&[
+        ("fs.oss.endpoint", cache.endpoint()),
+        ("io-cache.enabled", "true"),
+        ("io-cache.endpoint", cache.endpoint()),
+        ("io-cache.target.default.path-style-access", "true"),
+        ("io-cache.origin.endpoint", origin.endpoint()),
+        ("io-cache.policy", "meta,read"),
+    ]);
+
+    assert_eq!(read(&file_io, path).await, "id=2");
+    assert_eq!(file_io.get_status(path).await.unwrap().size, 4);
+    assert!(cache.take_requests().is_empty());
+    assert_eq!(
+        origin.take_requests(),
+        [format!("GET {key}"), format!("HEAD {key}")]
     );
 }
 
