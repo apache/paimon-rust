@@ -513,7 +513,7 @@ impl PyTableScan {
         Ok(slf)
     }
 
-    /// Select one balanced worker shard for a distributed scan.
+    /// Select a Java file-name or bucket shard, or balanced shuffled chunks.
     fn with_shard(
         mut slf: PyRefMut<'_, Self>,
         index: usize,

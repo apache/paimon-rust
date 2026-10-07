@@ -1195,10 +1195,13 @@ impl<'a> TableScan<'a> {
         }
     }
 
-    /// Select one balanced worker shard for a distributed scan.
+    /// Select one worker shard using Java `SnapshotReaderImpl.withShard` rules.
     ///
-    /// Sharding is scan-level state, independent of the selected planning
-    /// strategy, so callers may configure it before or after chunk shuffling.
+    /// Append tables and primary-key tables with deletion vectors or first-row
+    /// use `abs(String.hashCode(file_name) % count)`. Other tables use
+    /// `bucket % count`, keeping all versions of a key or row-id group together.
+    /// Chunk shuffling instead distributes balanced ranges of shuffled chunks;
+    /// callers may configure the shard before or after chunk shuffling.
     pub fn with_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
         if count == 0 || index >= count {
             return Err(crate::Error::DataInvalid {
@@ -1535,7 +1538,6 @@ impl<'a> PaimonTableScan<'a> {
     /// `scan.snapshot-id` / `scan.tag-name` handling.
     pub async fn plan(&self) -> crate::Result<Plan> {
         let grant = self.authorize_query().await?;
-        self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let plan = match super::time_travel::resolve_snapshot(self.table).await? {
             Some(snapshot) => {
@@ -1551,7 +1553,6 @@ impl<'a> PaimonTableScan<'a> {
     /// Plan the full scan and return metadata-pruning trace counters.
     pub async fn plan_with_trace(&self) -> crate::Result<(Plan, ScanTrace)> {
         let grant = self.authorize_query().await?;
-        self.validate_shard_strategy()?;
         let mut trace = ScanTrace {
             limit: self.limit,
             ..Default::default()
@@ -1645,12 +1646,39 @@ impl<'a> PaimonTableScan<'a> {
         options.validate_data_file_path_directory()
     }
 
-    fn validate_shard_strategy(&self) -> crate::Result<()> {
-        if self.shard().is_some() && self.chunk_shuffle().is_none() {
-            return Err(crate::Error::Unsupported {
-                message: "with_shard currently requires chunk_shuffle".to_string(),
-            });
-        }
+    /// Filter before split grouping and LIMIT. In particular, file-name shards
+    /// cannot be selected from packed splits: one split can contain files owned
+    /// by several workers. Keep chunk-shuffle input complete until shuffling.
+    fn retain_shard_entries(&self, entries: &mut Vec<ManifestEntry>) -> crate::Result<()> {
+        let Some((index, count)) = self.shard().filter(|_| self.chunk_shuffle().is_none()) else {
+            return Ok(());
+        };
+        let options = self.table.schema().core_options();
+        let has_primary_keys = !self.table.schema().primary_keys().is_empty();
+        // Match SplitGenerator.alwaysRawConvertible, independent of whether a
+        // particular split is raw-convertible or the scan includes level zero.
+        let by_file_name = if has_primary_keys {
+            options.deletion_vectors_enabled()
+                || options.merge_engine()? == crate::spec::MergeEngine::FirstRow
+        } else {
+            !options.data_evolution_enabled()
+        };
+        entries.retain(|entry| {
+            if by_file_name {
+                let hash = entry
+                    .file()
+                    .file_name
+                    .encode_utf16()
+                    .fold(0i32, |hash, unit| {
+                        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+                    });
+                // Take the signed remainder before abs, as Java does. Widening
+                // also handles Integer.MIN_VALUE without overflow.
+                ((i128::from(hash) % count as i128).unsigned_abs() as usize) == index
+            } else {
+                i128::from(entry.bucket()) % count as i128 == index as i128
+            }
+        });
         Ok(())
     }
 
@@ -2005,7 +2033,6 @@ impl<'a> PaimonTableScan<'a> {
         end_snapshot: &Snapshot,
     ) -> crate::Result<Plan> {
         self.validate_read_options()?;
-        self.validate_shard_strategy()?;
         let data_evolution_read_field_ids = self.projected_read_field_ids()?;
         let mut scan = self.clone();
         scan.incremental_split_mode = Some(IncrementalSplitMode::Batch);
@@ -2400,7 +2427,7 @@ impl<'a> PaimonTableScan<'a> {
     async fn plan_snapshot_from_entries(
         &self,
         snapshot: Snapshot,
-        entries: Vec<ManifestEntry>,
+        mut entries: Vec<ManifestEntry>,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
         index_entries: Option<Vec<IndexManifestEntry>>,
         effective_row_ranges: Option<Vec<RowRange>>,
@@ -2417,6 +2444,8 @@ impl<'a> PaimonTableScan<'a> {
         let target_split_size = core_options.source_split_target_size();
         let open_file_cost = core_options.source_split_open_file_cost();
         let partition_keys = self.table.schema().partition_keys();
+
+        self.retain_shard_entries(&mut entries)?;
 
         let row_position_selection = self.row_position_selection();
         let append_row_position_selection = (!data_evolution_enabled)
@@ -3449,6 +3478,269 @@ mod tests {
             ("source.split.target-size".to_string(), "1b".to_string()),
             ("source.split.open-file-cost".to_string(), "1b".to_string()),
         ]))
+    }
+
+    #[tokio::test]
+    async fn test_plain_shard_uses_java_file_names_before_limit() {
+        let table = scan_trace_small_split_table("memory:/plain_file_shards");
+        setup_scan_trace_dirs(&table).await;
+        // Java String.hashCode fixtures: Aa and BB collide at 2112;
+        // polygenelubricants hashes to Integer.MIN_VALUE.
+        let names = ["Aa", "BB", "polygenelubricants", "😀", "a"];
+        let files = names
+            .iter()
+            .map(|name| stats_trace_file(name, 0, 1))
+            .collect();
+        TableCommit::new(table.clone(), "file-shards".into())
+            .commit(vec![CommitMessage::new(
+                BinaryRowBuilder::new(0).build_serialized(),
+                0,
+                files,
+            )])
+            .await
+            .unwrap();
+
+        // abs(hash % 3), rather than abs(hash) % 3 or floorMod(hash, 3).
+        let expected = [
+            vec!["Aa", "BB"],
+            vec!["a", "😀"],
+            vec!["polygenelubricants"],
+        ];
+        for (index, expected) in expected.iter().enumerate() {
+            let scan = table
+                .new_read_builder()
+                .new_scan()
+                .with_shard(index, 3)
+                .unwrap();
+            let plan = scan.plan().await.unwrap();
+            let mut actual = plan
+                .splits()
+                .iter()
+                .flat_map(|s| s.data_files())
+                .map(|f| f.file_name.as_str())
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(&actual, expected);
+            assert_eq!(plan.snapshot_id(), Some(1));
+            let limited = table
+                .new_read_builder()
+                .with_limit(1)
+                .new_scan()
+                .with_shard(index, 3)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            assert_eq!(limited.splits().len(), 1);
+            assert!(expected.contains(&limited.splits()[0].data_files()[0].file_name.as_str()));
+        }
+        let empty = table
+            .new_read_builder()
+            .new_scan()
+            .with_shard(5, 100)
+            .unwrap()
+            .plan()
+            .await
+            .unwrap();
+        assert!(empty.splits().is_empty());
+        assert_eq!(empty.snapshot_id(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_plain_pk_shards_keep_every_version_in_the_bucket() {
+        for engine in ["deduplicate", "partial-update", "aggregation"] {
+            let table = pk_stats_gate_table(&format!("memory:/bucket_shards_{engine}"))
+                .copy_with_options(HashMap::from([
+                    ("bucket".into(), "4".into()),
+                    ("merge-engine".into(), engine.into()),
+                    ("source.split.target-size".into(), "1b".into()),
+                ]));
+            setup_scan_trace_dirs(&table).await;
+            let commit = TableCommit::new(table.clone(), "bucket-shards".into());
+            for version in 0..2 {
+                let messages = (0..4)
+                    .map(|bucket| {
+                        let mut file =
+                            pk_stats_file(&format!("b{bucket}-v{version}"), (1, 2), (1, 2));
+                        file.min_key = int_stats_row(Some(1));
+                        file.max_key = int_stats_row(Some(2));
+                        file.level = 0;
+                        CommitMessage::new(
+                            BinaryRowBuilder::new(0).build_serialized(),
+                            bucket,
+                            vec![file],
+                        )
+                    })
+                    .collect();
+                commit.commit(messages).await.unwrap();
+            }
+            for index in 0..6 {
+                let mut builder = table.new_read_builder();
+                builder.with_limit(1);
+                let (plan, trace) = builder
+                    .new_scan()
+                    .with_shard(index, 6)
+                    .unwrap()
+                    .plan_with_trace()
+                    .await
+                    .unwrap();
+                assert_eq!(plan.snapshot_id(), Some(2));
+                assert_eq!(trace.final_splits, plan.splits().len());
+                if index < 4 {
+                    assert_eq!(plan.splits().len(), 1);
+                    let split = &plan.splits()[0];
+                    assert_eq!(split.bucket(), index as i32);
+                    assert!(!split.raw_convertible());
+                    assert_eq!(split.data_files().len(), 2);
+                    let names = split
+                        .data_files()
+                        .iter()
+                        .map(|f| f.file_name.as_str())
+                        .collect::<HashSet<_>>();
+                    assert_eq!(
+                        names,
+                        HashSet::from([
+                            format!("b{index}-v0").as_str(),
+                            format!("b{index}-v1").as_str()
+                        ])
+                    );
+                } else {
+                    assert!(plan.splits().is_empty());
+                }
+            }
+            // Time travel and incremental batches use the same shard before
+            // splitting. Neither may accidentally consult the newest state.
+            let old =
+                table.copy_with_options(HashMap::from([("scan.snapshot-id".into(), "1".into())]));
+            let old_plan = old
+                .new_read_builder()
+                .new_scan()
+                .with_shard(3, 4)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            assert_eq!(old_plan.snapshot_id(), Some(1));
+            assert_eq!(old_plan.splits()[0].data_files()[0].file_name, "b3-v0");
+            let delta = table
+                .new_read_builder()
+                .new_incremental_scan(crate::table::IncrementalScanMode::Delta, 1, 2)
+                .with_shard(3, 4)
+                .unwrap()
+                .plan_combined_delta()
+                .await
+                .unwrap();
+            assert_eq!(delta.snapshot_id(), Some(2));
+            assert_eq!(delta.splits().len(), 1);
+            assert!(delta.splits()[0].is_streaming());
+            assert_eq!(delta.splits()[0].data_files()[0].file_name, "b3-v1");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plain_raw_pk_shards_use_file_names_instead_of_buckets() {
+        for (engine, dv) in [("first-row", false), ("deduplicate", true)] {
+            for all_files in [false, true] {
+                let table =
+                    pk_stats_gate_table(&format!("memory:/raw_shards_{engine}_{all_files}"))
+                        .copy_with_options(HashMap::from([
+                            ("merge-engine".into(), engine.into()),
+                            ("deletion-vectors.enabled".into(), dv.to_string()),
+                            ("source.split.target-size".into(), "1b".into()),
+                        ]));
+                setup_scan_trace_dirs(&table).await;
+                let files = ["Aa", "BB", "polygenelubricants", "😀", "a"]
+                    .iter()
+                    .map(|name| pk_stats_file(name, (1, 2), (1, 2)))
+                    .collect();
+                TableCommit::new(table.clone(), "raw-shards".into())
+                    .commit(vec![CommitMessage::new(
+                        BinaryRowBuilder::new(0).build_serialized(),
+                        0,
+                        files,
+                    )])
+                    .await
+                    .unwrap();
+                let expected = [
+                    vec!["Aa", "BB"],
+                    vec!["a", "😀"],
+                    vec!["polygenelubricants"],
+                ];
+                for (index, expected) in expected.iter().enumerate() {
+                    let scan = table.new_read_builder().new_scan();
+                    let scan = if all_files {
+                        scan.with_scan_all_files()
+                    } else {
+                        scan
+                    };
+                    let plan = scan.with_shard(index, 3).unwrap().plan().await.unwrap();
+                    let mut names = plan
+                        .splits()
+                        .iter()
+                        .flat_map(|split| split.data_files())
+                        .map(|file| file.file_name.as_str())
+                        .collect::<Vec<_>>();
+                    names.sort_unstable();
+                    assert_eq!(&names, expected, "{engine}, all_files={all_files}");
+                    assert!(plan.splits().iter().all(|split| split.bucket() == 0));
+                }
+                // Streaming reads retain L0 and still select by file name.
+                let delta = table
+                    .new_read_builder()
+                    .new_incremental_scan(crate::table::IncrementalScanMode::Delta, 0, 1)
+                    .with_shard(2, 3)
+                    .unwrap()
+                    .plan_combined_delta()
+                    .await
+                    .unwrap();
+                assert_eq!(delta.splits().len(), 1);
+                assert_eq!(
+                    delta.splits()[0].data_files()[0].file_name,
+                    "polygenelubricants"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plain_data_evolution_shards_keep_column_groups_in_the_bucket() {
+        let table = data_evolution_test_table(
+            "memory:/de_bucket_shards",
+            two_column_schema(0, "id", "name"),
+        )
+        .copy_with_options(HashMap::from([("bucket".into(), "-1".into())]));
+        setup_scan_trace_dirs(&table).await;
+        let messages = vec![CommitMessage::new(
+            BinaryRowBuilder::new(0).build_serialized(),
+            0,
+            vec![
+                make_evo_file_with_cols("id", 2, 1, 0, &["id"]),
+                make_evo_file_with_cols("name", 2, 2, 0, &["name"]),
+            ],
+        )];
+        TableCommit::new(table.clone(), "de-shards".into())
+            .commit(messages)
+            .await
+            .unwrap();
+        for index in 0..3 {
+            let plan = table
+                .new_read_builder()
+                .new_scan()
+                .with_shard(index, 3)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            assert_eq!(plan.snapshot_id(), Some(1));
+            if index == 0 {
+                assert_eq!(plan.splits().len(), 1);
+                assert_eq!(plan.splits()[0].bucket(), index as i32);
+                assert_eq!(plan.splits()[0].data_files().len(), 2);
+                assert!(!plan.splits()[0].raw_convertible());
+            } else {
+                assert!(plan.splits().is_empty());
+            }
+        }
     }
 
     pub(super) async fn setup_scan_trace_dirs(table: &Table) {
