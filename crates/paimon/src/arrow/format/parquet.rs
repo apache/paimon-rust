@@ -369,11 +369,11 @@ impl ParquetFormatWriter {
         let codec = parse_compression(compression, zstd_level)?;
         let core_options = CoreOptions::new(format_options);
         let page_index_enabled = core_options.parquet_write_page_index_enabled()?;
+        let props = parquet_writer_properties(codec, page_index_enabled, format_options)?;
         let async_write = output.async_writer().await?;
         let input_schema = schema;
         let schema = timestamp_millis_schema(&input_schema);
-        let inner =
-            create_parquet_arrow_writer(async_write, schema.clone(), codec, page_index_enabled)?;
+        let inner = create_parquet_arrow_writer(async_write, schema.clone(), props)?;
         let stats_modes = write_fields
             .map(|fields| core_options.metadata_stats_modes(fields.iter().map(DataField::name)))
             .transpose()?;
@@ -391,18 +391,8 @@ impl ParquetFormatWriter {
 fn create_parquet_arrow_writer(
     async_write: Box<dyn crate::io::AsyncFileWrite>,
     schema: arrow_schema::SchemaRef,
-    codec: Compression,
-    page_index_enabled: bool,
+    props: WriterProperties,
 ) -> crate::Result<AsyncArrowWriter<Box<dyn crate::io::AsyncFileWrite>>> {
-    let props = WriterProperties::builder()
-        .set_compression(codec)
-        .set_statistics_enabled(if page_index_enabled {
-            EnabledStatistics::Page
-        } else {
-            EnabledStatistics::Chunk
-        })
-        .set_offset_index_disabled(!page_index_enabled)
-        .build();
     // Commit one final Arrow schema at close, after shredding metadata is known.
     let options = parquet::arrow::arrow_writer::ArrowWriterOptions::new()
         .with_properties(props)
@@ -413,6 +403,49 @@ fn create_parquet_arrow_writer(
             source: None,
         }
     })
+}
+
+fn parquet_writer_properties(
+    codec: Compression,
+    page_index_enabled: bool,
+    options: &HashMap<String, String>,
+) -> crate::Result<WriterProperties> {
+    const DICTIONARY: &str = "parquet.enable.dictionary";
+    const COLUMN_PREFIX: &str = "parquet.enable.dictionary#";
+    let mut props = WriterProperties::builder()
+        .set_compression(codec)
+        .set_statistics_enabled(if page_index_enabled {
+            EnabledStatistics::Page
+        } else {
+            EnabledStatistics::Chunk
+        })
+        .set_offset_index_disabled(!page_index_enabled);
+    let parse = |key: &str, value: &str| match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(crate::Error::ConfigInvalid {
+            message: format!("Option '{key}' must be true or false, got: {value}"),
+        }),
+    };
+    if let Some(value) = options.get(DICTIONARY) {
+        props = props.set_dictionary_enabled(parse(DICTIONARY, value)?);
+    }
+    for (key, value) in options {
+        if let Some(path) = key.strip_prefix(COLUMN_PREFIX) {
+            if path.split('.').any(str::is_empty) {
+                return Err(crate::Error::ConfigInvalid {
+                    message: format!("Option '{key}' requires a nonempty Parquet column path"),
+                });
+            }
+            props = props.set_column_dictionary_enabled(
+                parquet::schema::types::ColumnPath::new(
+                    path.split('.').map(str::to_owned).collect(),
+                ),
+                parse(key, value)?,
+            );
+        }
+    }
+    Ok(props.build())
 }
 
 /// Every `file.compression` value a parquet write accepts.
@@ -2945,7 +2978,7 @@ fn split_ranges_for_concurrency(merged: Vec<Range<u64>>, concurrency: usize) -> 
 #[cfg(test)]
 #[allow(clippy::type_complexity)] // test row literals use nested Option<Vec<(&str, Option<i64>)>>
 mod tests {
-    use super::build_parquet_row_filter;
+    use super::{build_parquet_row_filter, parquet_writer_properties};
     use super::{
         forward_row_group_batches, parquet_granules, parse_compression, supported_compressions,
         FilePredicates, ParquetFormatReader, ParquetFormatWriter, ParquetRowGroupMessage,
@@ -4086,6 +4119,141 @@ mod tests {
             .map(|batch| batch.unwrap().num_rows())
             .sum();
         assert_eq!(total_rows, 9);
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_dictionary_options() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::schema::types::ColumnPath;
+
+        for global in [true, false] {
+            let options = HashMap::from([
+                ("parquet.enable.dictionary".to_owned(), global.to_string()),
+                (
+                    "parquet.enable.dictionary#value".to_owned(),
+                    (!global).to_string(),
+                ),
+                (
+                    "parquet.enable.dictionary#nested.value".to_owned(),
+                    "false".to_owned(),
+                ),
+            ]);
+            let props =
+                parquet_writer_properties(Compression::UNCOMPRESSED, true, &options).unwrap();
+            assert_eq!(props.dictionary_enabled(&ColumnPath::from("id")), global);
+            assert_eq!(
+                props.dictionary_enabled(&ColumnPath::from("value")),
+                !global
+            );
+            assert!(
+                !props.dictionary_enabled(&ColumnPath::new(vec!["nested".into(), "value".into()]))
+            );
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let path = "memory:/dictionary_options.parquet";
+            let schema = writer_arrow_schema();
+            let batch = writer_test_batch(&schema, vec![1, 1, 1], vec![10, 10, 10]);
+            let mut writer = ParquetFormatWriter::new(
+                &file_io.new_output(path).unwrap(),
+                schema,
+                "zstd",
+                1,
+                None,
+                &options,
+            )
+            .await
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            Box::new(writer).close().await.unwrap();
+            let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+            let columns = reader.metadata().row_group(0).columns();
+            assert_eq!(columns[0].dictionary_page_offset().is_some(), global);
+            assert_eq!(columns[1].dictionary_page_offset().is_some(), !global);
+            let actual = reader.build().unwrap().next().unwrap().unwrap();
+            assert_eq!(actual, batch);
+        }
+        let props =
+            parquet_writer_properties(Compression::UNCOMPRESSED, true, &HashMap::new()).unwrap();
+        assert!(props.dictionary_enabled(&ColumnPath::from("id")));
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_nested_dictionary_option() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let child = Arc::new(ArrowField::new("value", ArrowDataType::Int32, false));
+        let fields: arrow_schema::Fields = vec![child].into();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "nested",
+            ArrowDataType::Struct(fields.clone()),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::new(
+                fields,
+                vec![Arc::new(Int32Array::from(vec![7, 7, 7]))],
+                None,
+            ))],
+        )
+        .unwrap();
+        for enabled in [true, false] {
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let path = "memory:/nested_dictionary.parquet";
+            let options = HashMap::from([(
+                "parquet.enable.dictionary#nested.value".to_owned(),
+                enabled.to_string(),
+            )]);
+            let mut writer = ParquetFormatWriter::new(
+                &file_io.new_output(path).unwrap(),
+                schema.clone(),
+                "zstd",
+                1,
+                None,
+                &options,
+            )
+            .await
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            Box::new(writer).close().await.unwrap();
+            let bytes = file_io.new_input(path).unwrap().read().await.unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+            assert_eq!(
+                reader
+                    .metadata()
+                    .row_group(0)
+                    .column(0)
+                    .dictionary_page_offset()
+                    .is_some(),
+                enabled
+            );
+            assert_eq!(reader.build().unwrap().next().unwrap().unwrap(), batch);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parquet_writer_invalid_dictionary_options_create_no_file() {
+        for (key, value) in [
+            ("parquet.enable.dictionary", "invalid"),
+            ("parquet.enable.dictionary#value", "invalid"),
+            ("parquet.enable.dictionary#", "false"),
+            ("parquet.enable.dictionary#a..b", "false"),
+        ] {
+            let file_io = FileIOBuilder::new("memory").build().unwrap();
+            let path = "memory:/invalid_dictionary.parquet";
+            let options = HashMap::from([(key.to_owned(), value.to_owned())]);
+            let result = ParquetFormatWriter::new(
+                &file_io.new_output(path).unwrap(),
+                writer_arrow_schema(),
+                "zstd",
+                1,
+                None,
+                &options,
+            )
+            .await;
+            assert!(matches!(result, Err(crate::Error::ConfigInvalid { .. })));
+            assert!(!file_io.exists(path).await.unwrap());
+        }
     }
 
     #[tokio::test]

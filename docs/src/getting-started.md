@@ -124,6 +124,14 @@ cross-backend rename is rejected.
 with `with_provider` on the same builder. Without a provider, property-based
 storage configuration behaves as before.
 
+## Parquet Dictionary Encoding
+
+Dictionary encoding is enabled by default. Disable it for all columns with
+`parquet.enable.dictionary=false`, or override one column with
+`parquet.enable.dictionary#event_time=false` (Java-compatible syntax).
+Paths use dot-separated physical Parquet leaves, not logical MAP keys.
+These options affect new writes only.
+
 ## Parquet Page Pruning
 
 Parquet Page Index pruning is enabled by default. Set
