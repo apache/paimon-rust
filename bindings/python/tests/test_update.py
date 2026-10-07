@@ -22,6 +22,49 @@ import pypaimon_rust.datafusion as datafusion
 from pypaimon_rust.datafusion import PaimonCatalog, SQLContext
 
 
+def test_upsert_batches_preserve_missing_fields_nulls_and_stream_updates(tmp_path):
+    context = SQLContext()
+    context.register_catalog('paimon', {'warehouse': str(tmp_path)})
+    context.sql('CREATE SCHEMA paimon.shapes')
+    context.sql("""CREATE TABLE paimon.shapes.t (id INT, name STRING, score INT) WITH (
+        'row-tracking.enabled' = 'true', 'data-evolution.enabled' = 'true')""")
+    context.sql("INSERT INTO paimon.shapes.t (id, name, score) VALUES (1, 'a', 10), (1, 'b', 11), (2, 'c', 20)")
+    table = PaimonCatalog({'warehouse': str(tmp_path)}).get_table('shapes.t')
+
+    def batch(values):
+        schema = pa.schema([(name, pa.string() if name == 'name' else pa.int32()) for name in values])
+        return pa.RecordBatch.from_pydict(values, schema=schema)
+
+    builder = table.new_batch_write_builder()
+    update = builder.new_update().with_update_type(['name'])
+    messages = update.upsert_by_arrow_with_key([
+        batch({'id': [1], 'score': [999]}),
+        batch({'id': [3], 'score': [30]}),
+        batch({'name': [None], 'id': [1]}),
+        batch({'id': [2], 'name': ['new'], 'score': [999]}),
+    ], ['id'])
+    builder.new_commit().commit(messages)
+    assert pa.Table.from_batches(context.sql(
+        'SELECT id, name, score FROM paimon.shapes.t ORDER BY id, score')).to_pylist() == [
+        {'id': 1, 'name': None, 'score': 10},
+        {'id': 1, 'name': None, 'score': 11},
+        {'id': 2, 'name': 'new', 'score': 20},
+        {'id': 3, 'name': None, 'score': 30},
+    ]
+    stream = table.new_stream_write_builder().with_commit_user('shape-stream')
+    messages = stream.new_update().with_update_type(['score']).upsert_by_arrow_with_key(
+        [batch({'id': [1], 'score': [100]}), batch({'id': [3], 'score': [300], 'name': ['ignored']})],
+        ['id'], 101)
+    stream.new_commit().commit(101, messages)
+    assert pa.Table.from_batches(context.sql(
+        'SELECT id, name, score FROM paimon.shapes.t ORDER BY id, score')).to_pylist() == [
+        {'id': 1, 'name': None, 'score': 100},
+        {'id': 1, 'name': None, 'score': 100},
+        {'id': 2, 'name': 'new', 'score': 20},
+        {'id': 3, 'name': None, 'score': 300},
+    ]
+
+
 def test_table_upsert_updates_duplicate_targets_and_appends(tmp_path):
     assert not hasattr(datafusion, '_match_upsert_keys')
     assert not hasattr(datafusion, 'UpsertKeyMatcher')

@@ -825,6 +825,78 @@ async fn partial_upsert_updates_matches_and_appends_only_input_columns() {
 }
 
 #[tokio::test]
+async fn heterogeneous_upsert_deduplicates_before_matched_column_validation() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![
+                // Missing update columns on a superseded source row are irrelevant.
+                batch(&[("id", vec![1]), ("score", vec![999])]),
+                // New rows need not contain the matched-row update projection.
+                batch(&[("id", vec![4]), ("score", vec![400])]),
+                batch(&[("id", vec![1]), ("value", vec![111])]),
+            ],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    let appended = messages
+        .iter()
+        .flat_map(|message| &message.new_files)
+        .filter(|file| {
+            file.write_cols
+                .as_ref()
+                .is_some_and(|cols| cols.contains(&"id".into()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(appended.len(), 1);
+    assert_eq!(
+        appended[0].write_cols,
+        Some(vec!["id".into(), "score".into()])
+    );
+    commit(&table, messages).await;
+    let reader = table.new_read_builder();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = reader
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        use arrow_array::Array;
+        let cols = batch
+            .columns()
+            .iter()
+            .map(|array| array.as_any().downcast_ref::<Int32Array>().unwrap())
+            .collect::<Vec<_>>();
+        for row in 0..batch.num_rows() {
+            rows.push(
+                cols.iter()
+                    .map(|col| col.is_valid(row).then(|| col.value(row)))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some(1), Some(111), Some(100)],
+            vec![Some(2), Some(20), Some(200)],
+            vec![Some(3), Some(30), Some(300)],
+            vec![Some(4), None, Some(400)],
+        ]
+    );
+}
+
+#[tokio::test]
 async fn partial_upsert_requires_update_columns_only_for_matches() {
     let table = evolution_table().await;
     seed(&table).await;
@@ -851,6 +923,150 @@ async fn partial_upsert_requires_update_columns_only_for_matches() {
     assert_eq!(
         messages[0].new_files[0].write_cols,
         Some(vec!["id".into(), "value".into()])
+    );
+    commit(&table, messages).await;
+}
+
+#[tokio::test]
+async fn heterogeneous_upsert_keeps_append_shapes_separate_by_partition() {
+    let path = "memory:/upsert_partition_shapes";
+    let schema = Schema::builder()
+        .column("id", DataType::Int(IntType::new()))
+        .column("value", DataType::Int(IntType::new()))
+        .column("score", DataType::Int(IntType::new()))
+        .column("region", DataType::Int(IntType::new()))
+        .partition_keys(["region"])
+        .option("row-tracking.enabled", "true")
+        .option("data-evolution.enabled", "true")
+        .build()
+        .unwrap();
+    let (io, table) = memory_table(path, TableSchema::new(0, &schema));
+    setup_dirs(&io, path).await;
+    persist_table_schema(&io, path, table.schema()).await;
+    write_batch(
+        &table,
+        &batch(&[
+            ("id", vec![1, 1]),
+            ("value", vec![10, 20]),
+            ("score", vec![100, 200]),
+            ("region", vec![1, 2]),
+        ]),
+    )
+    .await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![
+                batch(&[
+                    ("region", vec![1, 1]),
+                    ("value", vec![111, 40]),
+                    ("id", vec![1, 4]),
+                ]),
+                batch(&[("id", vec![4]), ("score", vec![400]), ("region", vec![2])]),
+                batch(&[
+                    ("id", vec![1]),
+                    ("value", vec![222]),
+                    ("score", vec![999]),
+                    ("region", vec![2]),
+                ]),
+                batch(&[("id", vec![4]), ("value", vec![41]), ("region", vec![1])]),
+            ],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    let shapes = messages
+        .iter()
+        .flat_map(|message| &message.new_files)
+        .filter_map(|file| file.write_cols.as_ref())
+        .filter(|columns| columns.contains(&"id".into()))
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        shapes,
+        std::collections::HashSet::from([
+            vec!["id".into(), "value".into(), "region".into()],
+            vec!["id".into(), "score".into(), "region".into()],
+        ])
+    );
+    commit(&table, messages).await;
+    let reader = table.new_read_builder();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = reader
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        use arrow_array::Array;
+        let cols = batch
+            .columns()
+            .iter()
+            .map(|array| array.as_any().downcast_ref::<Int32Array>().unwrap())
+            .collect::<Vec<_>>();
+        for row in 0..batch.num_rows() {
+            rows.push(
+                cols.iter()
+                    .map(|col| col.is_valid(row).then(|| col.value(row)))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some(1), Some(111), Some(100), Some(1)],
+            vec![Some(1), Some(222), Some(200), Some(2)],
+            vec![Some(4), None, Some(400), Some(2)],
+            vec![Some(4), Some(41), None, Some(1)],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn heterogeneous_upsert_validates_only_surviving_shapes_before_staging() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let before = parquet_files(&table).await;
+    for batches in [
+        // The winning matched row must supply the requested update columns.
+        vec![
+            batch(&[("id", vec![1]), ("value", vec![111])]),
+            batch(&[("id", vec![2]), ("score", vec![222])]),
+        ],
+        // Appended rows in one partition cannot silently acquire NULL padding.
+        vec![
+            batch(&[("id", vec![4]), ("value", vec![40])]),
+            batch(&[("id", vec![5]), ("score", vec![500])]),
+        ],
+    ] {
+        assert!(update
+            .upsert_by_arrow_with_key(batches, vec!["id".into()])
+            .await
+            .is_err());
+        assert_eq!(parquet_files(&table).await, before);
+    }
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![
+                batch(&[("id", vec![4]), ("value", vec![40])]),
+                batch(&[("id", vec![4]), ("score", vec![400])]),
+            ],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        messages[0].new_files[0].write_cols,
+        Some(vec!["id".into(), "score".into()])
     );
     commit(&table, messages).await;
 }

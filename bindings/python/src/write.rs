@@ -492,6 +492,18 @@ fn arrow_table_batches(table: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
     Ok(batches)
 }
 
+/// Preserve each batch's supplied fields; core owns matching, deduplication
+/// and the distinction between missing columns and explicit NULL values.
+fn arrow_upsert_batches(input: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    if input.hasattr("to_batches")? {
+        return arrow_table_batches(input);
+    }
+    input
+        .try_iter()?
+        .map(|batch| RecordBatch::from_pyarrow_bound(&batch?))
+        .collect()
+}
+
 struct UpdateContext {
     inner: TableUpdate,
     table: Arc<Table>,
@@ -621,7 +633,7 @@ impl UpdateContext {
         input: &Bound<'_, PyAny>,
         keys: Vec<String>,
     ) -> PyResult<Vec<PyCommitMessage>> {
-        let batches = arrow_table_batches(input)?;
+        let batches = arrow_upsert_batches(input)?;
         let messages = py
             .detach(|| runtime().block_on(self.inner.upsert_by_arrow_with_key(batches, keys)))
             .map_err(to_py_err)?;
