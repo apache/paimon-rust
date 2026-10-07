@@ -201,6 +201,14 @@ impl KeyValueFileWriter {
         })
     }
 
+    pub(super) fn with_blob_uri_reader_factory(
+        mut self,
+        factory: Option<Arc<dyn crate::io::UriReaderFactory>>,
+    ) -> Self {
+        self.managed_blob_writer.set_uri_reader_factory(factory);
+        self
+    }
+
     /// Construct one reusable factory for this flush's data or changelog output.
     /// Statistics retain logical value fields independently of the physical KV schema.
     fn new_format_writer_factory(

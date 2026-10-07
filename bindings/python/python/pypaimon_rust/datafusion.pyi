@@ -17,7 +17,7 @@
 
 from os import PathLike
 from typing import (
-    Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Tuple,
+    Any, BinaryIO, Callable, Dict, Iterable, List, Literal, Optional, Protocol, Sequence, Tuple,
     TypeAlias, Union,
 )
 
@@ -26,6 +26,12 @@ import pyarrow
 ArrowTypeLike: TypeAlias = Union[pyarrow.DataType, pyarrow.Field, str]
 InputFieldsLike: TypeAlias = Union[ArrowTypeLike, Sequence[ArrowTypeLike]]
 VolatilityLike: TypeAlias = Union[str, Any]
+
+class _UriReader(Protocol):
+    def new_input_stream(self, uri: str) -> BinaryIO: ...
+
+class _UriReaderFactory(Protocol):
+    def create(self, uri: str) -> _UriReader: ...
 
 class DataField:
     def id(self) -> int: ...
@@ -236,6 +242,12 @@ class CommitMessage:
         ...
 
 class BatchTableWrite:
+    def with_blob_uri_reader_factory(
+        self, factory: Optional[_UriReaderFactory]
+    ) -> "BatchTableWrite":
+        """Use custom source streams for Blob references; Rust copies bounded
+        ranges, reuses consecutive sources and closes them on completion."""
+        ...
     def with_write_type(self, columns: List[str]) -> "BatchTableWrite": ...
     def with_blob_consumer(
         self, callback: Optional[Callable[[str, Optional[bytes]], bool]]
@@ -297,6 +309,9 @@ class StreamTableUpdate:
         ...
 
 class StreamTableWrite:
+    def with_blob_uri_reader_factory(
+        self, factory: Optional[_UriReaderFactory]
+    ) -> "StreamTableWrite": ...
     def with_write_type(self, columns: List[str]) -> "StreamTableWrite": ...
     def with_blob_consumer(
         self, callback: Optional[Callable[[str, Optional[bytes]], bool]]

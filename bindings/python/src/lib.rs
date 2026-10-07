@@ -18,6 +18,7 @@
 use pyo3::prelude::*;
 
 mod blob;
+mod blob_uri_reader;
 mod context;
 mod error;
 mod oss_cpp;

@@ -38,6 +38,15 @@ pub struct PostponeFixedBucketTableWrite {
 }
 
 impl PostponeFixedBucketTableWrite {
+    pub fn with_blob_uri_reader_factory(
+        &mut self,
+        factory: Option<std::sync::Arc<dyn crate::io::UriReaderFactory>>,
+    ) -> Result<&mut Self> {
+        self.ensure_writable()?;
+        self.inner.with_blob_uri_reader_factory(factory)?;
+        Ok(self)
+    }
+
     pub(crate) fn new(
         table: &Table,
         commit_user: String,
