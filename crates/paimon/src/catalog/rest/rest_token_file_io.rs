@@ -476,14 +476,15 @@ mod tests {
             );
             assert_eq!(
                 cache.take_requests(),
-                [
-                    "HEAD bkt/db.db/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet",
-                    "GET bkt/db.db/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet"
-                ]
+                ["GET bkt/db.db/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet"]
             );
+            // The token's policy has no exists, so the existence check stays on origin.
             assert_eq!(
                 origin.take_requests(),
-                ["PUT bkt/db.db/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet"]
+                [
+                    "PUT bkt/db.db/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet",
+                    "HEAD bkt/db.db/t/bucket-0/data-123e4567-e89b-12d3-a456-426614174000-1.parquet"
+                ]
             );
 
             server.abort();

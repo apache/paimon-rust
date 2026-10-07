@@ -660,7 +660,7 @@ impl FileIO {
     pub async fn exists(&self, path: &str) -> Result<bool> {
         let (op, relative_path) = self.create_routed(path).await?;
 
-        op.operator(OpClass::Meta)
+        op.operator(OpClass::Exists)
             .exists(relative_path.as_ref())
             .await
             .map_err(|error| {
@@ -1314,7 +1314,7 @@ impl InputFile {
 
     pub async fn exists(&self) -> crate::Result<bool> {
         let (op, relative_path, _) = self.source.resolve(&self.path).await?;
-        Ok(op.operator(OpClass::Meta).exists(&relative_path).await?)
+        Ok(op.operator(OpClass::Exists).exists(&relative_path).await?)
     }
 
     pub async fn metadata(&self) -> crate::Result<FileStatus> {

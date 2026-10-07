@@ -101,19 +101,21 @@ async fn test_only_reads_and_status_use_the_target() {
     let (origin, cache, file_io) = routed("meta,read").await;
 
     write(&file_io, DATA, b"0123456789").await;
-    // A writer checks existence on origin; readers check it like file status.
+    // A writer checks existence on origin, and so does exists without the exists token.
     assert!(file_io.new_output(DATA).unwrap().exists().await.unwrap());
-    assert_eq!(
-        origin.take_requests(),
-        [format!("PUT {DATA_KEY}"), format!("HEAD {DATA_KEY}")]
-    );
     assert!(file_io.exists(DATA).await.unwrap());
     let input = file_io.new_input(DATA).unwrap();
     assert!(input.exists().await.unwrap());
     assert_eq!(
-        cache.take_requests(),
-        [format!("HEAD {DATA_KEY}"), format!("HEAD {DATA_KEY}")]
+        origin.take_requests(),
+        [
+            format!("PUT {DATA_KEY}"),
+            format!("HEAD {DATA_KEY}"),
+            format!("HEAD {DATA_KEY}"),
+            format!("HEAD {DATA_KEY}")
+        ]
     );
+    assert!(cache.take_requests().is_empty());
 
     assert_eq!(file_io.get_status(DATA).await.unwrap().size, 10);
     assert_eq!(input.metadata().await.unwrap().size, 10);
@@ -287,14 +289,13 @@ async fn test_targets_serve_the_file_types_of_their_routes() {
     assert_eq!(file_io.get_status(MANIFEST).await.unwrap().size, 8);
     assert_eq!(read(&file_io, DATA).await, "data");
     assert_eq!(file_io.get_status(DATA).await.unwrap().size, 4);
-    // No route names bucket indexes; existence checks follow the routes like file status.
+    // No route names bucket indexes; without the exists token existence checks use origin.
     assert_eq!(read(&file_io, INDEX).await, "index");
     assert!(file_io.exists(MANIFEST).await.unwrap());
     assert_eq!(
         accel.take_requests(),
         [
             format!("GET {MANIFEST_KEY}"),
-            format!("HEAD {MANIFEST_KEY}"),
             format!("HEAD {MANIFEST_KEY}")
         ]
     );
@@ -304,8 +305,59 @@ async fn test_targets_serve_the_file_types_of_their_routes() {
     );
     assert_eq!(
         origin.take_requests(),
-        ["GET bkt/db.db/t/index/index-1".to_string()]
+        [
+            "GET bkt/db.db/t/index/index-1".to_string(),
+            format!("HEAD {MANIFEST_KEY}")
+        ]
     );
+}
+
+#[tokio::test]
+async fn test_exists_ignores_a_cache_that_kept_a_deleted_file() {
+    let origin = TestOss::start().await;
+    // Its own storage stands in for a cache that kept a file after origin deleted it.
+    let cache = TestOss::start().await;
+    write(
+        &oss_file_io(&[("fs.oss.endpoint", cache.endpoint())]),
+        DATA,
+        b"stale",
+    )
+    .await;
+    let routed = |policy| {
+        oss_file_io(&[
+            ("fs.oss.endpoint", cache.endpoint()),
+            ("io-cache.enabled", "true"),
+            ("io-cache.endpoint", cache.endpoint()),
+            ("io-cache.target.default.path-style-access", "true"),
+            ("io-cache.origin.endpoint", origin.endpoint()),
+            ("io-cache.policy", policy),
+        ])
+    };
+
+    let file_io = routed("meta,read");
+    assert!(!file_io.exists(DATA).await.unwrap());
+    assert!(!file_io.new_input(DATA).unwrap().exists().await.unwrap());
+    // With exists in the policy the target answers, so it is vended only for consistent targets.
+    assert!(routed("meta,read,exists").exists(DATA).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_exists_uses_the_target_with_the_exists_token() {
+    let (origin, cache, file_io) = routed("meta,read,exists").await;
+
+    write(&file_io, DATA, b"data").await;
+    assert!(file_io.new_output(DATA).unwrap().exists().await.unwrap());
+    assert_eq!(
+        origin.take_requests(),
+        [format!("PUT {DATA_KEY}"), format!("HEAD {DATA_KEY}")]
+    );
+    assert!(file_io.exists(DATA).await.unwrap());
+    assert!(file_io.new_input(DATA).unwrap().exists().await.unwrap());
+    assert_eq!(
+        cache.take_requests(),
+        [format!("HEAD {DATA_KEY}"), format!("HEAD {DATA_KEY}")]
+    );
+    assert!(origin.take_requests().is_empty());
 }
 
 #[tokio::test]

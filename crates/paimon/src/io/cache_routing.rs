@@ -57,8 +57,10 @@ static DATA_FILE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
 /// Operation class of a FileIO request; only `Meta`, `Read` and `Write` can leave origin.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum OpClass {
-    /// File status and existence checks, including the size lookup before a cached read.
+    /// File status lookups, including the size lookup before a cached read.
     Meta,
+    /// Existence checks, which ask whether a file is still there.
+    Exists,
     Read,
     /// Writes of new files, including streaming and multipart writes.
     Write,
@@ -72,6 +74,7 @@ impl OpClass {
             Self::Meta => 1,
             Self::Read => 2,
             Self::Write => 4,
+            Self::Exists => 8,
             Self::Origin => 0,
         }
     }
@@ -201,7 +204,12 @@ impl IoCacheRouting {
     pub(crate) fn cache_target(&self, path: &str) -> Option<(usize, OpClasses)> {
         let mut found = None;
         let mut classes = OpClasses::default();
-        for op in [OpClass::Meta, OpClass::Read, OpClass::Write] {
+        for op in [
+            OpClass::Meta,
+            OpClass::Exists,
+            OpClass::Read,
+            OpClass::Write,
+        ] {
             if let Target::Cache(index) = self.route(op, path) {
                 found = Some(index);
                 classes.insert(op);
@@ -281,6 +289,7 @@ fn parse_policy(value: Option<&str>) -> OpClasses {
         match token.trim().to_ascii_lowercase().as_str() {
             "none" => return OpClasses::default(),
             "meta" => policy.insert(OpClass::Meta),
+            "exists" => policy.insert(OpClass::Exists),
             "read" => policy.insert(OpClass::Read),
             "write" => policy.insert(OpClass::Write),
             _ => {}
@@ -438,6 +447,7 @@ mod tests {
     const ACCEL: &str = "https://accelerator.example.com";
     const CLUSTER: &str = "http://cluster.example.com";
     const WRITE: &str = "io-cache.policy=meta,read,write";
+    const EXISTS: &str = "io-cache.policy=meta,read,exists";
 
     fn routing(options: &[(&str, &str)]) -> IoCacheRouting {
         IoCacheRouting::from_props(
@@ -457,6 +467,10 @@ mod tests {
         let options = single(&[]);
         assert_endpoint(&options, OpClass::Read, DATA_PATH, CACHE);
         assert_endpoint(&options, OpClass::Meta, DATA_PATH, CACHE);
+        // exists asks whether a file is still there, so it needs its own policy token
+        assert_endpoint(&options, OpClass::Exists, DATA_PATH, OSS);
+        assert_endpoint(&single(&[EXISTS]), OpClass::Exists, DATA_PATH, CACHE);
+        assert_endpoint(&single(&[EXISTS]), OpClass::Exists, SNAPSHOT_PATH, OSS);
         assert_endpoint(&options, OpClass::Read, MANIFEST_PATH, CACHE);
         assert_endpoint(
             &options,
@@ -526,6 +540,9 @@ mod tests {
         let write_only = single(&["io-cache.policy=write"]);
         assert_endpoint(&write_only, OpClass::Write, DATA_PATH, CACHE);
         assert_endpoint(&write_only, OpClass::Meta, DATA_PATH, OSS);
+        let exists_only = single(&["io-cache.policy=exists"]);
+        assert_endpoint(&exists_only, OpClass::Exists, DATA_PATH, CACHE);
+        assert_endpoint(&exists_only, OpClass::Meta, DATA_PATH, OSS);
 
         let any_type = single(&["-io-cache.whitelist"]);
         assert_endpoint(&any_type, OpClass::Read, INDEX_PATH, CACHE);
@@ -575,6 +592,9 @@ mod tests {
         let options = multi(&[]);
         assert_endpoint(&options, OpClass::Read, MANIFEST_PATH, ACCEL);
         assert_endpoint(&options, OpClass::Meta, MANIFEST_PATH, ACCEL);
+        assert_endpoint(&options, OpClass::Exists, MANIFEST_PATH, OSS);
+        assert_endpoint(&multi(&[EXISTS]), OpClass::Exists, MANIFEST_PATH, ACCEL);
+        assert_endpoint(&multi(&[EXISTS]), OpClass::Exists, DATA_PATH, CLUSTER);
         assert_endpoint(&options, OpClass::Read, DATA_PATH, CLUSTER);
         assert_endpoint(&options, OpClass::Meta, DATA_PATH, CLUSTER);
         assert_endpoint(&options, OpClass::Read, INDEX_PATH, CLUSTER);
