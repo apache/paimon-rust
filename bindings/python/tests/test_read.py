@@ -317,8 +317,44 @@ def test_chunk_shuffle_takes_seed_and_chunk_size_before_optional_shard():
 
         with pytest.raises(ValueError, match="count must be positive"):
             builder.new_scan().with_shard(0, 0)
-        with pytest.raises(RuntimeError, match="requires chunk_shuffle"):
-            builder.new_scan().with_shard(0, 2).plan()
+
+
+@pytest.mark.parametrize("count", [1, 2, 5])
+def test_plain_worker_shards_read_each_row_once_before_limit(count):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder().with_projection(["id"])
+        snapshot_id = builder.new_scan().plan().snapshot_id()
+        seen = set()
+        for index in range(count):
+            scan = builder.new_scan()
+            assert scan.with_shard(index, count) is scan
+            plan = scan.plan()
+            assert plan.snapshot_id() == snapshot_id
+            rows = [
+                value
+                for split in plan.splits()
+                for value in pa.Table.from_batches(builder.new_read().read([split]))
+                .column("id").to_pylist()
+            ]
+            assert len(rows) == len(set(rows))
+            assert seen.isdisjoint(rows)
+            seen.update(rows)
+
+            limited = table.new_read_builder().with_projection(["id"]).with_limit(1)
+            limited_plan = limited.new_scan().with_shard(index, count).plan()
+            assert limited_plan.snapshot_id() == snapshot_id
+            limited_rows = [
+                value
+                for split in limited_plan.splits()
+                for value in pa.Table.from_batches(limited.new_read().read([split]))
+                .column("id").to_pylist()
+            ]
+            # with_limit is a split-planning hint; the reader can return a
+            # complete file. It must still retain this worker's owned rows.
+            assert bool(limited_rows) == bool(rows)
+            assert set(limited_rows).issubset(rows)
+        assert seen == {1, 2, 3}
 
 
 def test_chunk_shuffle_reads_split_local_ranges_across_files():
