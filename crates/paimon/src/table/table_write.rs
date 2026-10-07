@@ -52,6 +52,9 @@ use arrow_array::{ArrayRef, RecordBatch};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+#[path = "table_write_precomputed.rs"]
+mod precomputed;
+
 /// Enum to hold either an append-only writer, a key-value writer, or a postpone writer.
 enum FileWriter {
     Append(DataFileWriter),
@@ -101,9 +104,11 @@ impl FileWriter {
         if result.is_err() {
             self.abort().await;
         }
-        // A pending-bucket writer keeps its first-retract validation and
-        // arrival sequence across stream checkpoints, as Java does.
-        let retain = result.is_ok() && matches!(&self, FileWriter::Postpone(_));
+        // Java MergeTreeWriter keeps its sequence counter across checkpoints,
+        // including prepares whose messages have not been committed yet.
+        // Pending-bucket writers also retain first-retract validation.
+        let retain =
+            result.is_ok() && matches!(&self, FileWriter::KeyValue(_) | FileWriter::Postpone(_));
         (result, retain.then_some(self))
     }
 
@@ -725,10 +730,25 @@ impl TableWrite {
     }
 
     pub(super) fn normalize_write_batch(&self, batch: &RecordBatch) -> Result<Option<RecordBatch>> {
+        Ok(self
+            .normalize_write_batch_with_selection(batch)?
+            .map(|(batch, _)| batch))
+    }
+
+    /// Keep upstream metadata aligned when Java's RowKindFilter removes rows.
+    fn normalize_write_batch_with_selection(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<Option<(RecordBatch, Option<Vec<usize>>)>> {
         let batch = self.validate_write_batch_schema(batch)?;
         // Java filters row kinds before extracting Blob values. Ignored rows
         // need neither valid descriptor bytes nor physical files.
-        let batch = self.enrich_rowkind_batch(&batch)?;
+        let batch = self.generate_rowkind_batch(&batch)?;
+        let selection = self.rowkind_selection(&batch)?;
+        let batch = match &selection {
+            Some(rows) => take_rows(&batch, rows)?,
+            None => batch,
+        };
         if batch.num_rows() == 0 {
             return Ok(None);
         }
@@ -738,7 +758,7 @@ impl TableWrite {
                 self.table.schema().options(),
             )?;
         }
-        Ok(Some(batch))
+        Ok(Some((batch, selection)))
     }
 
     pub(super) async fn write_partition_bucket_batch(
@@ -1001,9 +1021,9 @@ impl TableWrite {
         })
     }
 
-    fn enrich_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn generate_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let Some(generator) = &self.row_kind_generator else {
-            return self.filter_rowkind_batch(batch);
+            return Ok(batch.clone());
         };
         if batch
             .schema()
@@ -1020,18 +1040,17 @@ impl TableWrite {
         let kinds = (0..batch.num_rows())
             .map(|row| generator.generate(batch, row).map(|kind| kind.to_value()))
             .collect::<Result<Vec<_>>>()?;
-        let batch = Self::add_per_row_value_kind_column(batch, kinds)?;
-        self.filter_rowkind_batch(&batch)
+        Self::add_per_row_value_kind_column(batch, kinds)
     }
 
     /// Both generated row kinds and explicit caller-provided kinds use the
     /// same Java RowKindFilter before bucket assignment and changelog writing.
-    fn filter_rowkind_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+    fn rowkind_selection(&self, batch: &RecordBatch) -> Result<Option<Vec<usize>>> {
         let Some(filter) = &self.row_kind_filter else {
-            return Ok(batch.clone());
+            return Ok(None);
         };
         let Some(column) = batch.column_by_name(VALUE_KIND_FIELD_NAME) else {
-            return Ok(batch.clone());
+            return Ok(None);
         };
         let kinds = column
             .as_any()
@@ -1047,7 +1066,7 @@ impl TableWrite {
                 keep_rows.push(row);
             }
         }
-        take_rows(batch, &keep_rows)
+        Ok((keep_rows.len() != batch.num_rows()).then_some(keep_rows))
     }
 
     fn add_per_row_value_kind_column(
@@ -1179,17 +1198,12 @@ impl TableWrite {
         }
     }
 
-    /// Close all writers and collect CommitMessages for use with TableCommit.
-    /// Writers are cleared after this call, allowing the TableWrite to be reused.
+    /// Flush all writers and collect CommitMessages for use with TableCommit.
+    /// Append writers are closed; primary-key writers retain their sequence
+    /// counters after handing off the prepared files, as Java does.
     ///
-    /// The per-bucket primary-key sequence cache is invalidated here too: it
-    /// memoizes `max_sequence_number + 1` scanned from the latest snapshot, which
-    /// this commit advances. Keeping it would make the next reuse cycle re-seed
-    /// from the pre-commit value and assign sequence numbers that overlap the
-    /// just-written files, so the highest-sequence-wins merge would silently drop
-    /// the newer rows -- Java's `MergeTreeWriter` advances its counter across
-    /// commits. (`sequence_snapshot` is pinned only by the postpone path, which
-    /// forbids reuse, so it is left untouched.)
+    /// Invalidate the snapshot sequence cache used to seed previously unseen
+    /// buckets. Already-open key-value writers keep their own advancing counter.
     pub async fn prepare_commit(&mut self) -> Result<Vec<CommitMessage>> {
         if let Some(writer) = self.format_writer.as_mut() {
             return writer.prepare_commit().await;

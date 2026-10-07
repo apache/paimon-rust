@@ -280,6 +280,17 @@ enum WriteTarget {
 }
 
 impl WriteTarget {
+    fn table_writer(&mut self) -> paimon::Result<&mut TableWrite> {
+        match self {
+            Self::Table(writer) => Ok(writer),
+            Self::PostponeFixed(_) => Err(paimon::Error::DataInvalid {
+                message: "Precomputed bucket writes require HASH_FIXED or HASH_DYNAMIC tables"
+                    .into(),
+                source: None,
+            }),
+        }
+    }
+
     fn with_write_type(&mut self, columns: Vec<String>) -> paimon::Result<()> {
         match self {
             Self::Table(writer) => {
@@ -602,6 +613,67 @@ impl UpdateContext {
 }
 
 impl WriteState {
+    fn with_dynamic_bucket_index(
+        &mut self,
+        py: Python<'_>,
+        ignore_existing: bool,
+        base_snapshot_id: Option<i64>,
+    ) -> PyResult<()> {
+        let writer = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?
+            .table_writer()
+            .map_err(to_py_err)?;
+        py.detach(|| {
+            runtime()
+                .block_on(writer.with_dynamic_bucket_index(ignore_existing, base_snapshot_id))
+                .map(|_| ())
+        })
+        .map_err(to_py_err)
+    }
+
+    fn write_arrow_batch_to_bucket(
+        &mut self,
+        py: Python<'_>,
+        batch: &Bound<'_, PyAny>,
+        bucket: i32,
+        key_hashes: Option<Vec<i64>>,
+        new_mappings: Option<Vec<bool>>,
+    ) -> PyResult<()> {
+        let batch = RecordBatch::from_pyarrow_bound(batch)?;
+        // Python's BinaryRow hash is unsigned. Accept either representation of
+        // the same Java 32-bit hash, and pass signed values into core.
+        let hashes = key_hashes
+            .map(|hashes| {
+                hashes
+                    .into_iter()
+                    .map(|hash| {
+                        if hash < i64::from(i32::MIN) || hash > i64::from(u32::MAX) {
+                            return Err(PyValueError::new_err("Key hash must be a 32-bit integer"));
+                        }
+                        Ok(hash as i32)
+                    })
+                    .collect::<PyResult<Vec<_>>>()
+            })
+            .transpose()?;
+        let writer = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?
+            .table_writer()
+            .map_err(to_py_err)?;
+        py.detach(|| {
+            runtime().block_on(writer.write_arrow_batch_to_bucket(
+                &batch,
+                bucket,
+                hashes.as_deref(),
+                new_mappings.as_deref(),
+            ))
+        })
+        .map_err(to_py_err)
+    }
+
     fn with_write_type(&mut self, columns: Vec<String>) -> PyResult<()> {
         self.inner
             .as_mut()
@@ -834,6 +906,31 @@ impl PyBatchTableUpdate {
 
 #[pymethods]
 impl PyBatchTableWrite {
+    #[pyo3(signature = (ignore_existing=false, base_snapshot_id=None))]
+    fn with_dynamic_bucket_index<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+        ignore_existing: bool,
+        base_snapshot_id: Option<i64>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.state
+            .with_dynamic_bucket_index(py, ignore_existing, base_snapshot_id)?;
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (batch, bucket, key_hashes=None, new_mappings=None))]
+    fn write_arrow_batch_to_bucket(
+        &mut self,
+        py: Python<'_>,
+        batch: &Bound<'_, PyAny>,
+        bucket: i32,
+        key_hashes: Option<Vec<i64>>,
+        new_mappings: Option<Vec<bool>>,
+    ) -> PyResult<()> {
+        self.state
+            .write_arrow_batch_to_bucket(py, batch, bucket, key_hashes, new_mappings)
+    }
+
     fn with_write_type(
         mut slf: PyRefMut<'_, Self>,
         columns: Vec<String>,
@@ -874,6 +971,31 @@ pub struct PyStreamTableWrite {
 
 #[pymethods]
 impl PyStreamTableWrite {
+    #[pyo3(signature = (ignore_existing=false, base_snapshot_id=None))]
+    fn with_dynamic_bucket_index<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        py: Python<'py>,
+        ignore_existing: bool,
+        base_snapshot_id: Option<i64>,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        slf.state
+            .with_dynamic_bucket_index(py, ignore_existing, base_snapshot_id)?;
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (batch, bucket, key_hashes=None, new_mappings=None))]
+    fn write_arrow_batch_to_bucket(
+        &mut self,
+        py: Python<'_>,
+        batch: &Bound<'_, PyAny>,
+        bucket: i32,
+        key_hashes: Option<Vec<i64>>,
+        new_mappings: Option<Vec<bool>>,
+    ) -> PyResult<()> {
+        self.state
+            .write_arrow_batch_to_bucket(py, batch, bucket, key_hashes, new_mappings)
+    }
+
     fn with_write_type(
         mut slf: PyRefMut<'_, Self>,
         columns: Vec<String>,
