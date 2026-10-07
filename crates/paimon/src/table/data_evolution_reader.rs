@@ -22,6 +22,7 @@ use super::data_file_reader::{
     append_null_row_id_column, attach_row_id, expand_selected_row_ids,
     file_index_selection_to_local_ranges, insert_column_at, DataFileReadTiming, DataFileReader,
 };
+use super::read_limit::take_limited_batch;
 use crate::arrow::format::blob::DEFAULT_BLOB_READ_PARALLELISM;
 use crate::arrow::format::FilePredicates;
 use crate::arrow::format::MosaicPrefetchOptions;
@@ -139,15 +140,6 @@ pub(crate) struct DataEvolutionReader {
     table_options: Arc<HashMap<String, String>>,
     mosaic_prefetch: MosaicPrefetchOptions,
     read_timing: Option<Arc<DataFileReadTiming>>,
-}
-
-fn take_limited_batch(batch: RecordBatch, remaining: &mut Option<usize>) -> RecordBatch {
-    let Some(left) = remaining else {
-        return batch;
-    };
-    let taken = batch.num_rows().min(*left);
-    *left -= taken;
-    batch.slice(0, taken)
 }
 
 impl DataEvolutionReader {

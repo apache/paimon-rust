@@ -119,6 +119,7 @@ mod postpone_retract;
 mod prepared_files;
 mod query_auth;
 mod read_builder;
+mod read_limit;
 pub mod referenced_files;
 pub(crate) mod rest_env;
 pub(crate) mod row_id_predicate;
