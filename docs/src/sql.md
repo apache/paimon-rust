@@ -1060,6 +1060,24 @@ Create a named tag from a snapshot:
 CALL sys.create_tag(table => 'paimon.my_db.my_table', tag => 'my_tag', snapshot_id => 1);
 ```
 
+`snapshot_id` is optional; omitting it uses the latest snapshot. The optional
+`time_retained` parameter accepts duration strings such as `'1d'`, `'12h'`, `'30min'`,
+or `'500ms'`. A duration string without a unit denotes milliseconds.
+
+```sql
+CALL sys.create_tag(
+    table => 'paimon.my_db.my_table',
+    tag => 'daily_backup',
+    snapshot_id => 1,
+    time_retained => '1d'
+);
+```
+
+When `time_retained` is specified, retention and tag creation time are persisted in
+the tag file. For example, `'1d'` appears as `PT24H` in the `time_retained` column
+of `$tags`. Omitting `time_retained` creates a tag without these metadata fields.
+This procedure does not automatically delete expired tags.
+
 ### create_tag_from_timestamp
 
 Create a named tag from a timestamp (finds the latest snapshot at or before the given time):

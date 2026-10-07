@@ -18,7 +18,7 @@
 //! CALL procedure support for Paimon tables.
 //!
 //! Supported procedures:
-//! - `CALL sys.create_tag(table => '...', tag => '...', snapshot_id => ...)`
+//! - `CALL sys.create_tag(table => '...', tag => '...', snapshot_id => ..., time_retained => '...')`
 //! - `CALL sys.delete_tag(table => '...', tag => '...')`
 //! - `CALL sys.rename_tag(table => '...', tag => '...', target_tag => '...')`
 //! - `CALL sys.rollback_to(table => '...', snapshot_id => ... | tag => '...')`
@@ -168,7 +168,7 @@ async fn earlier_or_equal_from_all(
 /// a misspelled `index_type` on `create_global_index` would build the default index.
 fn declared_parameters(proc_name: &str) -> Option<&'static [&'static str]> {
     Some(match proc_name {
-        "create_tag" => &["table", "tag", "snapshot_id"],
+        "create_tag" => &["table", "tag", "snapshot_id", "time_retained"],
         "delete_tag" => &["table", "tag"],
         "rename_tag" => &["table", "tag", "target_tag"],
         "rollback_to" => &["table", "snapshot_id", "tag"],
@@ -439,6 +439,7 @@ async fn proc_create_tag(
                 .map_err(|_| DataFusionError::Plan(format!("Invalid snapshot_id: '{s}'")))
         })
         .transpose()?;
+    let time_retained = args.get("time_retained").map(String::as_str);
 
     let (sm, tm) = managers(&table);
     if tm.tag_exists(tag_name).await.map_err(to_datafusion_error)? {
@@ -454,7 +455,7 @@ async fn proc_create_tag(
             .map_err(to_datafusion_error)?
             .ok_or_else(|| DataFusionError::Plan("No snapshots exist".to_string()))?
     };
-    tm.create(tag_name, &snapshot)
+    tm.create_with_retention(tag_name, &snapshot, time_retained)
         .await
         .map_err(to_datafusion_error)?;
     ok_result(ctx)
