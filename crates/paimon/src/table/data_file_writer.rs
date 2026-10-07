@@ -79,8 +79,10 @@ pub(crate) struct DataFileWriter {
     row_sidecar_enabled: bool,
     current_row_sidecar: Option<RowSidecarWriter>,
     resources: Option<ResourceContext>,
-    /// Paths owned by this write until prepare_commit hands them to the caller.
+    /// Created paths; cleanup respects the format's deletion policy until
+    /// prepare_commit hands the files to the caller.
     created_paths: Vec<String>,
+    delete_file_upon_abort: bool,
 }
 
 impl DataFileWriter {
@@ -146,6 +148,7 @@ impl DataFileWriter {
             current_index: None,
             resources: None,
             created_paths: Vec::new(),
+            delete_file_upon_abort: true,
         })
     }
 
@@ -157,6 +160,27 @@ impl DataFileWriter {
     pub(super) fn with_file_index(mut self, options: Option<Arc<FileIndexOptions>>) -> Self {
         self.index_options = options;
         self
+    }
+
+    /// Configure only the dedicated BLOB factory; ordinary format factories
+    /// and their write paths do not carry callback state.
+    pub(super) fn set_blob_consumer(
+        &mut self,
+        consumer: Arc<dyn crate::spec::BlobConsumer>,
+    ) -> Result<()> {
+        debug_assert!(self.current_writer.is_none());
+        self.format_writer_factory = Some(Arc::new(
+            crate::arrow::format::blob::BlobWriterFactory::new(
+                Some(self.file_io.clone()),
+                self.write_fields.first(),
+                Some(&self.format_options),
+            )?
+            .with_consumer(consumer),
+        ));
+        // Java BlobFormatWriter relinquishes deletion rights whenever a
+        // consumer can expose a descriptor, even if a later callback fails.
+        self.delete_file_upon_abort = false;
+        Ok(())
     }
 
     /// Java's dedicated-format writer does not create auxiliary ROW files,
@@ -503,12 +527,17 @@ impl DataFileWriter {
         self.current_file_path = None;
         while self.in_flight_closes.join_next().await.is_some() {}
         for path in self.created_paths.drain(..) {
-            let _ = self.file_io.delete_file(&path).await;
+            if self.delete_file_upon_abort {
+                let _ = self.file_io.delete_file(&path).await;
+            }
         }
         self.written_files.clear();
     }
 
     pub(super) async fn delete_files(&mut self, files: &[DataFileMeta]) {
+        if !self.delete_file_upon_abort {
+            return;
+        }
         for file in files {
             for path in file.collect_files(self.bucket_dir()) {
                 let _ = self.file_io.delete_file(&path).await;

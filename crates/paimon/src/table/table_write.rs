@@ -177,6 +177,7 @@ pub struct TableWrite {
     blob_inline_fields: HashSet<String>,
     /// Whether the table has non-descriptor blob fields requiring a dedicated-format writer.
     has_blob_fields: bool,
+    blob_consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
     /// Dedicated vector-store file format, when configured.
     vector_file_format: Option<String>,
     /// Whether the table has VECTOR fields requiring dedicated vector files.
@@ -247,6 +248,7 @@ impl TableWrite {
             blob_view_fields: HashSet::new(),
             blob_inline_fields: HashSet::new(),
             has_blob_fields: false,
+            blob_consumer: None,
             vector_file_format: None,
             has_dedicated_vector_fields: false,
             row_kind_generator: None,
@@ -474,6 +476,9 @@ impl TableWrite {
             .fields()
             .iter()
             .any(|f| f.data_type().is_blob_file_field() && !blob_inline_fields.contains(f.name()));
+        if has_blob_fields {
+            core_options.blob_copy_buffer_size()?;
+        }
         let has_dedicated_vector_fields = vector_file_format.is_some()
             && schema
                 .fields()
@@ -526,6 +531,7 @@ impl TableWrite {
             blob_view_fields,
             blob_inline_fields,
             has_blob_fields,
+            blob_consumer: None,
             vector_file_format,
             has_dedicated_vector_fields,
             row_kind_generator,
@@ -704,6 +710,30 @@ impl TableWrite {
         self.bucket_assigner = assigner;
         self.write_schema = write_schema;
         self.write_fields = fields;
+        Ok(self)
+    }
+
+    /// Receive dedicated append BLOB payload descriptors. Configure before
+    /// writing, as in PyPaimon. Java's primary-key and inline BLOB writers do
+    /// not invoke this consumer. Automatic abort preserves consumer Blob files;
+    /// callers can explicitly discard prepared files with TableCommit::abort.
+    pub fn with_blob_consumer(
+        &mut self,
+        consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
+    ) -> Result<&mut Self> {
+        self.ensure_active()?;
+        if self.written {
+            return Err(crate::Error::DataInvalid {
+                message: "with_blob_consumer must be called before any write operation".into(),
+                source: None,
+            });
+        }
+        if self.format_writer.is_some() {
+            return Err(crate::Error::Unsupported {
+                message: "with_blob_consumer requires a Paimon table".into(),
+            });
+        }
+        self.blob_consumer = consumer;
         Ok(self)
     }
 
@@ -1280,8 +1310,20 @@ impl TableWrite {
         self.close().await;
         // Only this failed invocation's outputs: no message has been returned
         // or submitted. Earlier successful prepare calls belong to the caller.
+        let mut cleanup = messages.to_vec();
+        if self.primary_key_indices.is_empty() && self.blob_consumer.is_some() {
+            // A successful partition may already have exposed its dedicated
+            // Blob files to the consumer. Preserve Java's deletion policy in
+            // this table-wide cleanup too. Explicit TableCommit.abort remains
+            // available when the caller knows the files are no longer needed.
+            for message in &mut cleanup {
+                message
+                    .new_files
+                    .retain(|file| !file.file_name.ends_with(".blob"));
+            }
+        }
         let commit = super::TableCommit::new(self.table.clone(), self.commit_user.clone());
-        if let Err(error) = commit.abort(messages).await {
+        if let Err(error) = commit.abort(&cleanup).await {
             log::warn!("Failed to discard unreturned prepared files: {error}");
         }
     }
@@ -1341,6 +1383,7 @@ impl TableWrite {
                     self.table.schema().options(),
                     &self.blob_inline_fields,
                 )?
+                .with_blob_consumer(self.blob_consumer.clone())?
                 .with_resources(self.resources.clone()),
             )))
         } else {
@@ -1516,6 +1559,95 @@ pub(in crate::table) mod tests {
 
     pub(in crate::table) fn test_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_partition_prepare_preserves_consumer_blob_files() {
+        use crate::io::FileRead;
+        use crate::spec::BlobDescriptor;
+        use arrow_array::{ArrayRef, LargeBinaryArray};
+        use std::sync::Mutex;
+
+        for has_consumer in [false, true] {
+            let io = test_file_io();
+            let schema = Schema::builder()
+                .column("pt", DataType::Int(IntType::new()))
+                .column("payload", DataType::Blob(BlobType::new()))
+                .partition_keys(["pt"])
+                .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
+                .build()
+                .unwrap();
+            let table = Table::new(
+                io.clone(),
+                Identifier::new("db", "partitioned_blob"),
+                "memory:/partitioned-blob".into(),
+                TableSchema::new(0, &schema),
+                None,
+            );
+            let mut writer = TableWrite::new(&table, "consumer".into()).unwrap();
+            let descriptors = Arc::new(Mutex::new(Vec::new()));
+            if has_consumer {
+                let received = descriptors.clone();
+                writer
+                    .with_blob_consumer(Some(Arc::new(
+                        move |_: &str, descriptor: Option<&BlobDescriptor>| {
+                            received.lock().unwrap().push(descriptor.unwrap().clone());
+                            Ok(false)
+                        },
+                    )))
+                    .unwrap();
+            }
+            let batch = RecordBatch::try_from_iter([
+                ("pt", Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef),
+                (
+                    "payload",
+                    Arc::new(LargeBinaryArray::from(vec![
+                        Some(b"payload".as_slice()),
+                        Some(b"payload".as_slice()),
+                    ])) as ArrayRef,
+                ),
+            ])
+            .unwrap();
+            writer.write_arrow_batch(&batch).await.unwrap();
+            assert_eq!(writer.partition_writers.len(), 2);
+            let FileWriter::AppendDedicated(partition) =
+                writer.partition_writers.values_mut().next().unwrap()
+            else {
+                panic!("expected a dedicated Blob writer");
+            };
+            partition.inject_blob_close_failure();
+            assert!(writer
+                .prepare_commit()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("injected close failure"));
+            assert!(writer.prepare_commit().await.is_err());
+            writer.close().await;
+            let files = io.list_status_recursive(table.location()).await.unwrap();
+            if has_consumer {
+                assert_eq!(files.len(), 2);
+                assert!(files.iter().all(|file| file.path.ends_with(".blob")));
+                let descriptors = descriptors.lock().unwrap().clone();
+                assert_eq!(descriptors.len(), 2);
+                for descriptor in descriptors {
+                    let reader = io
+                        .new_input(descriptor.uri())
+                        .unwrap()
+                        .reader()
+                        .await
+                        .unwrap();
+                    let start = descriptor.offset() as u64;
+                    assert_eq!(
+                        reader.read(start..start + 7).await.unwrap().as_ref(),
+                        b"payload"
+                    );
+                }
+            } else {
+                assert!(files.is_empty());
+            }
+        }
     }
 
     fn test_schema() -> TableSchema {

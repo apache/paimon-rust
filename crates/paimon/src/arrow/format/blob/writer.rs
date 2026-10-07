@@ -22,9 +22,9 @@ use super::{
     BLOB_ARRAY_MAGIC_NUMBER, BLOB_ARRAY_VERSION, BLOB_FORMAT_VERSION, BLOB_MAGIC_NUMBER_BYTES,
     BLOB_MAP_MAGIC_NUMBER, BLOB_MAP_VERSION,
 };
-use crate::arrow::format::{FormatFileWriter, FormatWriteResult};
-use crate::io::{FileIO, FileWrite, OutputFile};
-use crate::spec::{BlobDescriptor, DataField, DataType};
+use crate::arrow::format::{FormatFileWriter, FormatWriteResult, FormatWriterFactory};
+use crate::io::{FileIO, FileRead, FileWrite, OutputFile};
+use crate::spec::{BlobConsumer, BlobDescriptor, CoreOptions, DataField, DataType};
 use crate::{Error, Result};
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Int16Array, Int32Array,
@@ -34,14 +34,79 @@ use arrow_array::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use crc32fast::Hasher;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-const COPY_BUFFER_SIZE: u64 = 8 * 1024 * 1024;
+// Remote FileRead ranges open new requests. Keep read-ahead independent of
+// the Java-sized copy buffer so a 4 KiB buffer does not mean 4 KiB GETs.
+const SOURCE_READ_SIZE: u64 = 8 * 1024 * 1024;
+
+#[cfg(test)]
+#[path = "writer_consumer_tests.rs"]
+mod consumer_tests;
+
+pub(crate) struct BlobWriterFactory {
+    file_io: Option<FileIO>,
+    field: Option<DataField>,
+    consumer: Option<Arc<dyn BlobConsumer>>,
+    copy_buffer_size: usize,
+}
+
+impl BlobWriterFactory {
+    pub(crate) fn new(
+        file_io: Option<FileIO>,
+        field: Option<&DataField>,
+        options: Option<&HashMap<String, String>>,
+    ) -> Result<Self> {
+        let defaults = HashMap::new();
+        Ok(Self {
+            file_io,
+            field: field.cloned(),
+            consumer: None,
+            copy_buffer_size: CoreOptions::new(options.unwrap_or(&defaults))
+                .blob_copy_buffer_size()?,
+        })
+    }
+
+    pub(crate) fn with_consumer(mut self, consumer: Arc<dyn BlobConsumer>) -> Self {
+        self.consumer = Some(consumer);
+        self
+    }
+}
+
+#[async_trait]
+impl FormatWriterFactory for BlobWriterFactory {
+    async fn create_writer(
+        &self,
+        output: &OutputFile,
+        _compression: &str,
+    ) -> Result<Box<dyn FormatFileWriter>> {
+        let stream = if self.consumer.is_some() {
+            output.flushable_writer().await?
+        } else {
+            output.writer().await?
+        };
+        Ok(Box::new(
+            BlobFormatWriter::from_stream(
+                stream,
+                output,
+                self.file_io.clone(),
+                self.field.as_ref(),
+            )?
+            .with_copy_buffer_size(self.copy_buffer_size)
+            .with_consumer(self.consumer.clone()),
+        ))
+    }
+}
 
 pub(crate) struct BlobFormatWriter {
     writer: Box<dyn FileWrite>,
     file_io: Option<FileIO>,
     kind: BlobFieldKind,
+    path: String,
+    field_name: String,
+    consumer: Option<Arc<dyn BlobConsumer>>,
+    copy_buffer_size: usize,
     bytes_written: u64,
     lengths: Vec<i64>,
 }
@@ -59,6 +124,15 @@ impl BlobFormatWriter {
         file_io: Option<FileIO>,
         field: Option<&DataField>,
     ) -> Result<Self> {
+        Self::from_stream(output.writer().await?, output, file_io, field)
+    }
+
+    fn from_stream(
+        writer: Box<dyn FileWrite>,
+        output: &OutputFile,
+        file_io: Option<FileIO>,
+        field: Option<&DataField>,
+    ) -> Result<Self> {
         let kind = match field {
             Some(field) => validate_read_fields(std::slice::from_ref(field))?.unwrap(),
             None => BlobFieldKind::Scalar,
@@ -67,12 +141,41 @@ impl BlobFormatWriter {
             validate_key_type(key_type)?;
         }
         Ok(Self {
-            writer: output.writer().await?,
+            writer,
             file_io,
             kind,
+            path: output.location().to_string(),
+            field_name: field.map_or_else(String::new, |field| field.name().to_string()),
+            consumer: None,
+            copy_buffer_size: 4 * 1024,
             bytes_written: 0,
             lengths: Vec::new(),
         })
+    }
+
+    pub(crate) fn with_copy_buffer_size(mut self, size: usize) -> Self {
+        debug_assert!(size > 0);
+        self.copy_buffer_size = size;
+        self
+    }
+
+    fn with_consumer(mut self, consumer: Option<Arc<dyn BlobConsumer>>) -> Self {
+        self.consumer = consumer;
+        self
+    }
+
+    fn accept(&self, offset: u64, length: i64) -> Result<bool> {
+        match &self.consumer {
+            Some(consumer) => consumer.accept(
+                &self.field_name,
+                Some(&BlobDescriptor::new(
+                    self.path.clone(),
+                    i64::try_from(offset).map_err(|_| invalid("BLOB offset exceeds i64"))?,
+                    length,
+                )),
+            ),
+            None => Ok(false),
+        }
     }
 
     /// The callback range excludes the common entry magic and trailer.
@@ -129,14 +232,19 @@ impl BlobFormatWriter {
         let (start, mut hasher) = self.start_record().await?;
         let length = self.write_payload(value, &mut hasher).await?;
         self.finish_record(start, hasher).await?;
+        if self.accept(start + 4, length)? {
+            self.writer.flush().await?;
+        }
         Ok(length)
     }
 
     /// Resolve descriptors without materializing a complete referenced object.
     async fn write_payload(&mut self, value: &[u8], hasher: &mut Hasher) -> Result<i64> {
         if !BlobDescriptor::is_blob_descriptor(value) {
-            self.write_bytes(Bytes::copy_from_slice(value), hasher)
-                .await?;
+            for chunk in value.chunks(self.copy_buffer_size) {
+                self.write_bytes(Bytes::copy_from_slice(chunk), hasher)
+                    .await?;
+            }
             return i64::try_from(value.len()).map_err(|_| invalid("BLOB payload exceeds i64"));
         }
         let descriptor = BlobDescriptor::deserialize(value)?;
@@ -168,9 +276,22 @@ impl BlobFormatWriter {
             return Ok(0);
         }
         let reader = input.reader_for_range(offset..end).await?;
+        self.copy_payload(reader.as_ref(), offset..end, hasher, descriptor.uri())
+            .await?;
+        Ok(length_i64)
+    }
+
+    async fn copy_payload(
+        &mut self,
+        reader: &dyn FileRead,
+        range: std::ops::Range<u64>,
+        hasher: &mut Hasher,
+        uri: &str,
+    ) -> Result<()> {
+        let (offset, end) = (range.start, range.end);
         let mut position = offset;
         while position < end {
-            let chunk_end = position.saturating_add(COPY_BUFFER_SIZE).min(end);
+            let chunk_end = position.saturating_add(SOURCE_READ_SIZE).min(end);
             let chunk =
                 reader
                     .read(position..chunk_end)
@@ -178,33 +299,42 @@ impl BlobFormatWriter {
                     .map_err(|error| Error::UnexpectedError {
                         message: format!(
                         "Failed to read BlobDescriptor '{}' range {position}..{chunk_end}: {error}",
-                        crate::io::uri_reader::sanitize_blob_uri(descriptor.uri())
+                        crate::io::uri_reader::sanitize_blob_uri(uri)
                     ),
                         source: Some(Box::new(error)),
                     })?;
             if chunk.len() as u64 != chunk_end - position {
                 return Err(invalid(format!("Failed to read BlobDescriptor '{}': short read for range {position}..{chunk_end}, expected={} bytes, actual={} bytes",
-                    crate::io::uri_reader::sanitize_blob_uri(descriptor.uri()), chunk_end - position, chunk.len())));
+                    crate::io::uri_reader::sanitize_blob_uri(uri), chunk_end - position, chunk.len())));
             }
-            self.write_bytes(chunk, hasher).await?;
+            for start in (0..chunk.len()).step_by(self.copy_buffer_size) {
+                let end = start.saturating_add(self.copy_buffer_size).min(chunk.len());
+                self.write_bytes(chunk.slice(start..end), hasher).await?;
+            }
             position = chunk_end;
         }
-        Ok(length_i64)
+        Ok(())
     }
 
     async fn write_blob_values(
         &mut self,
         values: &LargeBinaryArray,
         hasher: &mut Hasher,
-    ) -> Result<Vec<i64>> {
+    ) -> Result<(Vec<i64>, bool)> {
         let mut lengths = Vec::with_capacity(values.len());
+        let mut flush = false;
         for value in values {
             lengths.push(match value {
                 None => -1,
-                Some(value) => self.write_payload(value, hasher).await?,
+                Some(value) => {
+                    let position = self.bytes_written;
+                    let length = self.write_payload(value, hasher).await?;
+                    flush |= self.accept(position, length)?;
+                    length
+                }
             });
         }
-        Ok(lengths)
+        Ok((lengths, flush))
     }
 
     async fn write_index(&mut self, values: &[i64], hasher: &mut Hasher) -> Result<i32> {
@@ -245,7 +375,7 @@ impl BlobFormatWriter {
         } else {
             None
         };
-        let value_lengths = self.write_blob_values(values, &mut hasher).await?;
+        let (value_lengths, flush) = self.write_blob_values(values, &mut hasher).await?;
         let key_index_length = if let Some(lengths) = key_lengths {
             Some(self.write_index(&lengths, &mut hasher).await?)
         } else {
@@ -261,7 +391,11 @@ impl BlobFormatWriter {
             &mut hasher,
         )
         .await?;
-        self.finish_record(start, hasher).await
+        self.finish_record(start, hasher).await?;
+        if flush {
+            self.writer.flush().await?;
+        }
+        Ok(())
     }
 }
 
@@ -276,6 +410,10 @@ impl FormatFileWriter for BlobFormatWriter {
         for row in 0..batch.num_rows() {
             if column.is_null(row) {
                 self.lengths.push(-1);
+                if let Some(consumer) = &self.consumer {
+                    // Java ignores the return value for NULL fields.
+                    consumer.accept(&self.field_name, None)?;
+                }
                 continue;
             }
             match &kind {
@@ -314,7 +452,7 @@ impl FormatFileWriter for BlobFormatWriter {
         0
     }
     async fn flush(&mut self) -> Result<()> {
-        Ok(())
+        self.writer.flush().await
     }
     async fn close(mut self: Box<Self>) -> Result<FormatWriteResult> {
         let index = encode_delta_varints_write(&self.lengths);

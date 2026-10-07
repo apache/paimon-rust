@@ -43,7 +43,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 mod writer;
-pub(crate) use writer::BlobFormatWriter;
+pub(crate) use writer::{BlobFormatWriter, BlobWriterFactory};
 
 pub(crate) struct BlobFormatReader {
     descriptor_mode: bool,

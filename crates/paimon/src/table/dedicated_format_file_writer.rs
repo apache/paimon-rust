@@ -58,13 +58,18 @@ pub(crate) struct AppendDedicatedFormatFileWriter {
     vector_writer: Option<VectorFieldWriter>,
     normal_column_indices: Vec<usize>,
     normal_schema: Arc<arrow_schema::Schema>,
-    // Completed normal + dedicated file groups, still owned until prepare_commit.
+    // Completed groups awaiting prepare_commit; each format owns its abort policy.
     written_files: Vec<DataFileMeta>,
     target_file_row_num: i64,
     current_group_row_count: i64,
 }
 
 impl AppendDedicatedFormatFileWriter {
+    #[cfg(test)]
+    pub(super) fn inject_blob_close_failure(&mut self) {
+        self.blob_writers[0].writer.inject_close_failure();
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         file_io: FileIO,
@@ -253,6 +258,18 @@ impl AppendDedicatedFormatFileWriter {
         self
     }
 
+    pub(crate) fn with_blob_consumer(
+        mut self,
+        consumer: Option<Arc<dyn crate::spec::BlobConsumer>>,
+    ) -> Result<Self> {
+        if let Some(consumer) = consumer {
+            for blob in &mut self.blob_writers {
+                blob.writer.set_blob_consumer(consumer.clone())?;
+            }
+        }
+        Ok(self)
+    }
+
     pub(crate) async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -332,15 +349,7 @@ impl AppendDedicatedFormatFileWriter {
     }
 
     pub(crate) async fn abort(&mut self) {
-        let cleanup = self
-            .normal_writer
-            .as_mut()
-            .or_else(|| self.blob_writers.first_mut().map(|blob| &mut blob.writer))
-            .or_else(|| self.vector_writer.as_mut().map(|vector| &mut vector.writer));
-        if let Some(writer) = cleanup {
-            writer.delete_files(&self.written_files).await;
-        }
-        self.written_files.clear();
+        self.delete_completed_files().await;
         self.current_group_row_count = 0;
         if let Some(normal) = &mut self.normal_writer {
             normal.abort().await;
@@ -350,6 +359,23 @@ impl AppendDedicatedFormatFileWriter {
         }
         if let Some(writer) = &mut self.vector_writer {
             writer.writer.abort().await;
+        }
+    }
+
+    /// Each physical writer owns its abort policy. A normal writer must not
+    /// delete Blob files whose descriptors may have escaped through a consumer.
+    async fn delete_completed_files(&mut self) {
+        for file in std::mem::take(&mut self.written_files) {
+            let blob = self.blob_writers.iter_mut().find(|blob| {
+                file.write_cols.as_deref() == Some(std::slice::from_ref(&blob.field_name))
+            });
+            let writer = blob
+                .map(|blob| &mut blob.writer)
+                .or(self.normal_writer.as_mut())
+                .or_else(|| self.vector_writer.as_mut().map(|vector| &mut vector.writer));
+            if let Some(writer) = writer {
+                writer.delete_files(std::slice::from_ref(&file)).await;
+            }
         }
     }
 
@@ -387,13 +413,13 @@ impl AppendDedicatedFormatFileWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::FileIOBuilder;
+    use crate::io::{FileIOBuilder, FileRead};
     use crate::spec::{BlobType, IntType};
     use arrow_array::{ArrayRef, Int32Array, LargeBinaryArray};
 
     #[tokio::test]
-    async fn failed_blob_close_cleans_every_physical_column() {
-        for (external, rolled, normal) in [
+    async fn failed_blob_close_respects_each_physical_writers_abort_policy() {
+        for (external, rolled, normal, has_consumer) in [
             (false, false, true),
             (true, false, true),
             (false, true, true),
@@ -402,7 +428,11 @@ mod tests {
             (true, false, false),
             (false, true, false),
             (true, true, false),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|(external, rolled, normal)| {
+            [false, true].map(|consumer| (external, rolled, normal, consumer))
+        }) {
             let io = FileIOBuilder::new("memory").build().unwrap();
             let batch = RecordBatch::try_from_iter([
                 ("id", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
@@ -472,6 +502,18 @@ mod tests {
                 &HashSet::new(),
             )
             .unwrap();
+            let descriptors = Arc::new(std::sync::Mutex::new(Vec::new()));
+            if has_consumer {
+                let received = descriptors.clone();
+                writer = writer
+                    .with_blob_consumer(Some(Arc::new(
+                        move |_: &str, descriptor: Option<&crate::spec::BlobDescriptor>| {
+                            received.lock().unwrap().push(descriptor.unwrap().clone());
+                            Ok(false)
+                        },
+                    )))
+                    .unwrap();
+            }
             writer.write(&batch).await.unwrap();
             writer.blob_writers[1].writer.inject_close_failure();
             let error = if rolled {
@@ -483,11 +525,33 @@ mod tests {
                 writer.prepare_commit().await.unwrap_err()
             };
             assert!(error.to_string().contains("injected close failure"));
-            assert!(io
-                .list_status_recursive("memory:/")
-                .await
-                .unwrap()
-                .is_empty());
+            let remaining = io.list_status_recursive("memory:/").await.unwrap();
+            if has_consumer {
+                assert!(!remaining.is_empty());
+                assert!(remaining
+                    .iter()
+                    .all(|status| status.path.ends_with(".blob")));
+                let descriptors = descriptors.lock().unwrap().clone();
+                for descriptor in descriptors {
+                    let reader = io
+                        .new_input(descriptor.uri())
+                        .unwrap()
+                        .reader()
+                        .await
+                        .unwrap();
+                    let start = descriptor.offset() as u64;
+                    assert_eq!(
+                        reader
+                            .read(start..start + descriptor.length() as u64)
+                            .await
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                }
+            } else {
+                assert!(remaining.is_empty());
+            }
         }
     }
 }

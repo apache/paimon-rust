@@ -1536,6 +1536,22 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or_else(|| self.target_file_size())
     }
 
+    /// Java's BlobFormatWriter copies through a positive, int-sized buffer.
+    pub fn blob_copy_buffer_size(&self) -> crate::Result<usize> {
+        let raw = self.options.get("blob.copy-buffer-size");
+        let bytes = raw
+            .map(|value| parse_memory_size(value))
+            .unwrap_or(Some(4 * 1024))
+            .filter(|size| (1..=i64::from(i32::MAX)).contains(size))
+            .ok_or_else(|| crate::Error::ConfigInvalid {
+                message: format!(
+                    "blob.copy-buffer-size must be between 1 and {} bytes, got {raw:?}",
+                    i32::MAX
+                ),
+            })?;
+        Ok(bytes as usize)
+    }
+
     /// Dedicated vector-store file format, if configured.
     ///
     /// Java leaves this unset by default. When present, vector columns are
