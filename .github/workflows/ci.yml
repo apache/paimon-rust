@@ -377,4 +377,5 @@ jobs:
         run: |
           cargo test --locked -p paimon --features storage-oss-cpp,storage-jindo --lib \
             io::storage_oss_cpp -- --include-ignored
-          cargo clippy --locked -p paimon --features storage-oss-cpp --lib --tests -- -D warnings
+          rustup toolchain install 1.98.0 --profile minimal --component clippy
+          cargo +1.98.0 clippy --locked -p paimon --features storage-oss-cpp --lib --tests -- -D warnings

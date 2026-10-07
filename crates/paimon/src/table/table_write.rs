@@ -133,6 +133,8 @@ pub struct TableWrite {
     table: Table,
     branch_schema_checked: bool,
     write_schema: Arc<arrow_schema::Schema>,
+    write_fields: Vec<DataField>,
+    written: bool,
     partition_writers: HashMap<PartitionBucketKey, FileWriter>,
     partition_computer: PartitionComputer,
     partition_keys: Vec<String>,
@@ -198,6 +200,8 @@ impl TableWrite {
             table: table.clone(),
             branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
             write_schema: build_target_arrow_schema(schema.fields())?,
+            write_fields: schema.fields().to_vec(),
+            written: false,
             partition_writers: HashMap::new(),
             partition_computer: PartitionComputer::new(
                 schema.partition_keys(),
@@ -482,6 +486,8 @@ impl TableWrite {
             table: table.clone(),
             branch_schema_checked: table.is_main_branch() || table.rest_env.is_some(),
             write_schema,
+            write_fields: fields.to_vec(),
+            written: false,
             partition_writers: HashMap::new(),
             partition_computer,
             partition_keys,
@@ -602,6 +608,97 @@ impl TableWrite {
         self
     }
 
+    /// Select the top-level columns written by an append table, as Java
+    /// `BaseAppendFileStoreWrite.withWriteType` does. Input follows this order;
+    /// omitted columns are recorded in file metadata rather than filled with NULL.
+    /// Configure this before writing any nonempty batch.
+    pub fn with_write_type(&mut self, write_columns: Vec<String>) -> Result<&mut Self> {
+        self.ensure_active()?;
+        if self.written {
+            return Err(crate::Error::DataInvalid {
+                message: "with_write_type must be called before any data is written".into(),
+                source: None,
+            });
+        }
+        if self.format_writer.is_some() || !self.table.schema().primary_keys().is_empty() {
+            return Err(crate::Error::Unsupported {
+                message: "with_write_type requires a Paimon append table".into(),
+            });
+        }
+        if write_columns.is_empty() {
+            return Err(crate::Error::DataInvalid {
+                message: "write columns must not be empty".into(),
+                source: None,
+            });
+        }
+        let schema = self.table.schema();
+        let mut seen = HashSet::new();
+        let fields = write_columns
+            .iter()
+            .map(|name| {
+                if !seen.insert(name) {
+                    return Err(crate::Error::DataInvalid {
+                        message: format!("Duplicate write column '{name}'"),
+                        source: None,
+                    });
+                }
+                schema
+                    .fields()
+                    .iter()
+                    .find(|field| field.name() == name)
+                    .cloned()
+                    .ok_or_else(|| crate::Error::DataInvalid {
+                        message: format!("Column '{name}' is not in table schema"),
+                        source: None,
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let indices = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| {
+                    fields
+                        .iter()
+                        .position(|field| field.name() == name)
+                        .ok_or_else(|| crate::Error::DataInvalid {
+                            message: format!("Write type must include routing column '{name}'"),
+                            source: None,
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        let partition_indices = indices(&self.partition_keys)?;
+        let options = CoreOptions::new(schema.options());
+        let total_buckets = options.bucket();
+        let bucket_indices = if total_buckets > 1 {
+            indices(&schema.bucket_keys())?
+        } else {
+            Vec::new()
+        };
+        let assigner = if total_buckets <= 1 || bucket_indices.is_empty() {
+            BucketAssignerEnum::Constant(ConstantBucketAssigner::new(
+                partition_indices,
+                if total_buckets == POSTPONE_BUCKET {
+                    POSTPONE_BUCKET
+                } else {
+                    0
+                },
+            ))
+        } else {
+            BucketAssignerEnum::Fixed(FixedBucketAssigner::new(
+                partition_indices,
+                bucket_indices,
+                options.bucket_function_type()?,
+                total_buckets,
+            ))
+        };
+        let write_schema = build_target_arrow_schema(&fields)?;
+        self.bucket_assigner = assigner;
+        self.write_schema = write_schema;
+        self.write_fields = fields;
+        Ok(self)
+    }
+
     /// Write an Arrow RecordBatch. Rows are routed to the correct partition and bucket.
     pub async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         if let Some(writer) = self.format_writer.as_mut() {
@@ -611,6 +708,7 @@ impl TableWrite {
         let Some(batch) = self.normalize_write_batch(batch)? else {
             return Ok(());
         };
+        self.written = true;
 
         let grouped = match self.divide_by_partition_bucket(&batch).await {
             Ok(grouped) => grouped,
@@ -788,7 +886,7 @@ impl TableWrite {
             }
         }
 
-        let fields = self.table.schema().fields().to_vec();
+        let fields = self.write_fields.clone();
         let output = self.bucket_assigner.assign_batch(batch, &fields).await?;
         if matches!(self.bucket_assigner, BucketAssignerEnum::CrossPartition(_)) {
             return self.divide_cross_partition_batch(batch, output);
@@ -1222,6 +1320,7 @@ impl TableWrite {
                     self.vector_target_file_size,
                     self.vector_file_format.as_deref(),
                     &self.write_schema,
+                    &self.write_fields,
                     fields,
                     self.table.schema().options(),
                     &self.blob_inline_fields,
@@ -1241,13 +1340,32 @@ impl TableWrite {
                     self.file_compression_zstd_level,
                     self.write_buffer_size,
                     self.file_format.clone(),
-                    self.table.schema().fields().to_vec(),
+                    self.write_fields.clone(),
                     self.table.schema().options().clone(),
                     Some(0),
                     None,
-                    None,
+                    (!super::data_evolution_fields::can_omit_normal_write_cols(
+                        self.table.schema().fields(),
+                        &self
+                            .write_fields
+                            .iter()
+                            .map(|field| field.name().to_string())
+                            .collect::<Vec<_>>(),
+                        &CoreOptions::new(self.table.schema().options()),
+                    ))
+                    .then(|| {
+                        self.write_fields
+                            .iter()
+                            .map(|field| field.name().to_string())
+                            .collect()
+                    }),
                 )?
-                .with_file_index(self.file_index_options.clone())
+                .with_file_index(
+                    self.file_index_options
+                        .as_ref()
+                        .and_then(|options| options.project_to_fields(&self.write_fields))
+                        .map(Arc::new),
+                )
                 .with_target_file_row_num(self.target_file_row_num)
                 .with_resources(self.resources.clone()),
             ))

@@ -64,6 +64,31 @@ def test_write_commit_read_roundtrip():
         assert result == {"id": [1, 2, 3], "name": ["a", "b", "c"]}
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_partial_write_type_roundtrip_and_lifecycle(tmp_path, streaming):
+    ctx = _make_empty_table(str(tmp_path))
+    table = _get_table(str(tmp_path))
+    builder = table.new_stream_write_builder() if streaming else table.new_batch_write_builder()
+    writer = builder.new_write()
+    assert writer.with_write_type(["id"]) is writer
+    writer.write_arrow(pa.record_batch([pa.array([], type=pa.int32())], names=["id"]))
+    assert writer.with_write_type(["id"]) is writer
+    for columns in [[], ["missing"], ["id", "id"]]:
+        with pytest.raises(ValueError):
+            writer.with_write_type(columns)
+    writer.write_arrow(pa.record_batch([pa.array([1, 2], type=pa.int32())], names=["id"]))
+    with pytest.raises(ValueError, match="before any data"):
+        writer.with_write_type(["id", "name"])
+    messages = writer.prepare_commit(True, 7) if streaming else writer.prepare_commit()
+    commit = builder.new_commit()
+    commit.commit(7, messages) if streaming else commit.commit(messages)
+    writer.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        writer.with_write_type(["id"])
+    assert pa.Table.from_batches(ctx.sql("SELECT id, name FROM paimon.wdb.t ORDER BY id")).to_pydict() == {
+        "id": [1, 2], "name": [None, None]}
+
+
 
 @pytest.mark.parametrize("primary_key", [False, True])
 def test_custom_data_file_prefix_matches_table_option(tmp_path, primary_key):

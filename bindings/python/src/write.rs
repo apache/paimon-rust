@@ -280,6 +280,18 @@ enum WriteTarget {
 }
 
 impl WriteTarget {
+    fn with_write_type(&mut self, columns: Vec<String>) -> paimon::Result<()> {
+        match self {
+            Self::Table(writer) => {
+                writer.with_write_type(columns)?;
+                Ok(())
+            }
+            Self::PostponeFixed(_) => Err(paimon::Error::Unsupported {
+                message: "with_write_type requires a Paimon append table".into(),
+            }),
+        }
+    }
+
     async fn write_arrow_batch(&mut self, batch: &RecordBatch) -> paimon::Result<()> {
         match self {
             Self::Table(writer) => writer.write_arrow_batch(batch).await,
@@ -590,6 +602,14 @@ impl UpdateContext {
 }
 
 impl WriteState {
+    fn with_write_type(&mut self, columns: Vec<String>) -> PyResult<()> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("TableWrite is closed"))?
+            .with_write_type(columns)
+            .map_err(to_py_err)
+    }
+
     fn write_arrow(&mut self, py: Python<'_>, batch: &Bound<'_, PyAny>) -> PyResult<()> {
         let batch = RecordBatch::from_pyarrow_bound(batch)?;
         let inner = self
@@ -814,6 +834,14 @@ impl PyBatchTableUpdate {
 
 #[pymethods]
 impl PyBatchTableWrite {
+    fn with_write_type(
+        mut slf: PyRefMut<'_, Self>,
+        columns: Vec<String>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.state.with_write_type(columns)?;
+        Ok(slf)
+    }
+
     fn close(&mut self, py: Python<'_>) {
         if let Some(mut writer) = self.state.inner.take() {
             py.detach(|| runtime().block_on(writer.close()));
@@ -846,6 +874,14 @@ pub struct PyStreamTableWrite {
 
 #[pymethods]
 impl PyStreamTableWrite {
+    fn with_write_type(
+        mut slf: PyRefMut<'_, Self>,
+        columns: Vec<String>,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        slf.state.with_write_type(columns)?;
+        Ok(slf)
+    }
+
     fn close(&mut self, py: Python<'_>) {
         if let Some(mut writer) = self.state.inner.take() {
             py.detach(|| runtime().block_on(writer.close()));

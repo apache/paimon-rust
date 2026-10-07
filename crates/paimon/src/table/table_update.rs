@@ -43,8 +43,8 @@ fn invalid(message: impl Into<String>) -> crate::Error {
 /// [`TableCommit`](super::TableCommit).
 ///
 /// Row-ID updates infer columns from the input unless configured with
-/// [`with_update_type`](Self::with_update_type). Key-based upserts currently
-/// require complete Arrow rows and match keys within each partition.
+/// [`with_update_type`](Self::with_update_type). Key-based upserts accept a
+/// column subset including the keys and match keys within each partition.
 #[derive(Clone)]
 pub struct TableUpdate {
     table: Table,
@@ -190,10 +190,11 @@ impl TableUpdate {
             .await
     }
 
-    /// Upsert complete Arrow rows by composite key through the core upsert
+    /// Upsert Arrow rows by composite key through the core upsert
     /// writer. Keys match within each partition, including when partition
     /// columns are omitted from `upsert_keys`. Existing keys update every
-    /// matching row ID; new keys append.
+    /// matching row ID; new keys append all input columns. Omitted columns on
+    /// matched rows retain their values; on new rows they are absent from the file.
     pub async fn upsert_by_arrow_with_key(
         &self,
         batches: Vec<RecordBatch>,
