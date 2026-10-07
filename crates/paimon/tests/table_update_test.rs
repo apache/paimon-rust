@@ -755,6 +755,284 @@ async fn grouped_updates_on_an_empty_table_preserve_empty_input_semantics() {
 }
 
 #[tokio::test]
+async fn partial_upsert_updates_matches_and_appends_only_input_columns() {
+    use arrow_array::Array;
+    let table = evolution_table().await;
+    write_batch(
+        &table,
+        &batch(&[
+            ("id", vec![1, 1, 2]),
+            ("value", vec![10, 11, 20]),
+            ("score", vec![100, 101, 200]),
+        ]),
+    )
+    .await;
+    let builder = table.new_write_builder();
+    let mut update = builder.new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![batch(&[("value", vec![12, 30, 13]), ("id", vec![1, 3, 1])])],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    for file in messages.iter().flat_map(|message| &message.new_files) {
+        assert!(file
+            .write_cols
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|column| column != "score"));
+    }
+    builder.new_commit().commit(messages).await.unwrap();
+    let reader = table.new_read_builder();
+    let plan = reader.new_scan().plan().await.unwrap();
+    let batches: Vec<RecordBatch> = reader
+        .new_read()
+        .unwrap()
+        .to_arrow(plan.splits())
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|array| array.as_any().downcast_ref::<Int32Array>().unwrap())
+            .collect::<Vec<_>>();
+        for row in 0..batch.num_rows() {
+            rows.push(
+                columns
+                    .iter()
+                    .map(|column| column.is_valid(row).then(|| column.value(row)))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some(1), Some(13), Some(100)],
+            vec![Some(1), Some(13), Some(101)],
+            vec![Some(2), Some(20), Some(200)],
+            vec![Some(3), Some(30), None],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn partial_upsert_requires_update_columns_only_for_matches() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["score".into()]).unwrap();
+    let before = parquet_files(&table).await;
+    let error = update
+        .upsert_by_arrow_with_key(
+            vec![batch(&[("id", vec![1]), ("value", vec![99])])],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("score"));
+    assert_eq!(parquet_files(&table).await, before);
+    // The update selection does not restrict the columns of unmatched rows.
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![batch(&[("id", vec![4]), ("value", vec![40])])],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        messages[0].new_files[0].write_cols,
+        Some(vec!["id".into(), "value".into()])
+    );
+    commit(&table, messages).await;
+}
+
+#[tokio::test]
+async fn partial_upsert_rejects_ambiguous_unknown_and_inconsistent_input() {
+    let table = evolution_table().await;
+    seed(&table).await;
+    let before = parquet_files(&table).await;
+    let mut update = table.new_write_builder().new_update().unwrap();
+    update.with_update_type(vec!["value".into()]).unwrap();
+    for batches in [
+        vec![batch(&[
+            ("id", vec![1]),
+            ("id", vec![2]),
+            ("value", vec![99]),
+        ])],
+        vec![batch(&[("id", vec![1]), ("missing", vec![99])])],
+        vec![batch(&[("value", vec![99])])],
+        vec![
+            batch(&[("id", vec![1]), ("value", vec![99])]),
+            batch(&[("id", vec![1]), ("score", vec![99])]),
+        ],
+    ] {
+        assert!(update
+            .upsert_by_arrow_with_key(batches, vec!["id".into()])
+            .await
+            .is_err());
+        assert_eq!(parquet_files(&table).await, before);
+    }
+    let messages = update
+        .upsert_by_arrow_with_key(
+            vec![
+                batch(&[("value", vec![41]), ("id", vec![1])]),
+                batch(&[("id", vec![1]), ("value", vec![42])]),
+            ],
+            vec!["id".into()],
+        )
+        .await
+        .unwrap();
+    commit(&table, messages).await;
+    assert_eq!(
+        read_rows(&table).await,
+        vec![vec![1, 42, 100], vec![2, 20, 200], vec![3, 30, 300]]
+    );
+}
+
+#[tokio::test]
+async fn floating_upsert_keys_preserve_fractions_nulls_and_duplicate_targets() {
+    use arrow_array::{Array, Float32Array, Float64Array};
+    use paimon::spec::{DoubleType, FloatType};
+    for wide in [false, true] {
+        let schema = Schema::builder()
+            .column(
+                "key",
+                if wide {
+                    DataType::Double(DoubleType::new())
+                } else {
+                    DataType::Float(FloatType::new())
+                },
+            )
+            .column("value", DataType::Int(IntType::new()))
+            .column("keep", DataType::Int(IntType::new()))
+            .option("row-tracking.enabled", "true")
+            .option("data-evolution.enabled", "true")
+            .build()
+            .unwrap();
+        let (io, table) = memory_table("memory:/floating_upsert", TableSchema::new(0, &schema));
+        setup_dirs(&io, table.location()).await;
+        persist_table_schema(&io, table.location(), table.schema()).await;
+        let keys = |values: Vec<Option<f64>>| -> ArrayRef {
+            if wide {
+                Arc::new(Float64Array::from(values))
+            } else {
+                Arc::new(Float32Array::from(
+                    values
+                        .into_iter()
+                        .map(|value| value.map(|v| v as f32))
+                        .collect::<Vec<_>>(),
+                ))
+            }
+        };
+        let original = RecordBatch::try_from_iter([
+            ("key", keys(vec![Some(-1.25), Some(-1.25), None, Some(1.5)])),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![10, 11, 20, 30])) as ArrayRef,
+            ),
+            (
+                "keep",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        write_batch(&table, &original).await;
+        let input = RecordBatch::try_from_iter([
+            (
+                "key",
+                keys(vec![None, Some(-1.25), Some(2.75), Some(-1.25)]),
+            ),
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![21, 12, 40, 13])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut update = table.new_write_builder().new_update().unwrap();
+        update.with_update_type(vec!["value".into()]).unwrap();
+        commit(
+            &table,
+            update
+                .upsert_by_arrow_with_key(vec![input], vec!["key".into()])
+                .await
+                .unwrap(),
+        )
+        .await;
+        let reader = table.new_read_builder();
+        let plan = reader.new_scan().plan().await.unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .new_read()
+            .unwrap()
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        for batch in batches {
+            let value = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let keep = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                let key = if batch.column(0).is_null(row) {
+                    None
+                } else if wide {
+                    Some(
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .unwrap()
+                            .value(row),
+                    )
+                } else {
+                    Some(f64::from(
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .unwrap()
+                            .value(row),
+                    ))
+                };
+                actual.push((
+                    key,
+                    value.value(row),
+                    keep.is_valid(row).then(|| keep.value(row)),
+                ));
+            }
+        }
+        actual.sort_by_key(|row| row.1);
+        assert_eq!(
+            actual,
+            vec![
+                (Some(-1.25), 13, Some(1)),
+                (Some(-1.25), 13, Some(2)),
+                (None, 21, Some(3)),
+                (Some(1.5), 30, Some(4)),
+                (Some(2.75), 40, None),
+            ]
+        );
+    }
+}
+
+#[tokio::test]
 async fn configured_upsert_and_delete_are_core_operations() {
     let table = evolution_table().await;
     write_batch(

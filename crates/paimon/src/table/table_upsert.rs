@@ -26,6 +26,7 @@ use arrow_schema::{DataType, Field, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use futures::TryStreamExt;
 
+use super::update_input::unique_column_index;
 use super::upsert_key_matcher::UpsertKeyMatcher;
 use super::write_batch_normalize::normalize_write_array;
 use crate::spec::{
@@ -74,7 +75,7 @@ fn partition_key(row: &BinaryRow, fields: &[DataField]) -> crate::Result<Vec<u8>
     Ok(builder.build().to_serialized_bytes())
 }
 
-/// Upsert full Arrow rows into a data-evolution table without primary keys.
+/// Upsert Arrow rows into a data-evolution table without primary keys.
 /// Internal executor for `TableUpdate::upsert_by_arrow_with_key`. Existing
 /// keys are updated by row ID; new keys are appended.
 #[must_use = "upsert must be used to call prepare_commit()"]
@@ -137,27 +138,48 @@ impl TableUpsert {
         })
     }
 
-    /// Add full rows. Column order may differ from the table schema; names and
-    /// Arrow layouts follow the same normalization as ordinary writes. Multiple
-    /// batches form one logical upsert input.
+    /// Add rows containing the keys and columns to write. Column order may
+    /// differ from the table schema; names and Arrow layouts follow the same
+    /// normalization as ordinary writes. Batches form one logical upsert input.
     pub(super) fn add_batch(&mut self, batch: RecordBatch) -> crate::Result<()> {
         let target = crate::arrow::build_target_arrow_schema(self.table.schema().fields())?;
-        if batch.num_columns() != target.fields().len() {
-            return Err(invalid("native upsert requires all table columns"));
+        let input_schema = batch.schema();
+        for field in input_schema.fields() {
+            unique_column_index(&input_schema, field.name())?;
+            target.field_with_name(field.name()).map_err(|_| {
+                invalid(format!(
+                    "upsert column '{}' is not in table schema",
+                    field.name()
+                ))
+            })?;
+        }
+        for key in &self.keys {
+            unique_column_index(&input_schema, key)?;
         }
         let mut columns = Vec::with_capacity(target.fields().len());
+        let mut fields = Vec::new();
         for field in target.fields() {
-            let column = batch
-                .column_by_name(field.name())
-                .ok_or_else(|| invalid(format!("missing upsert column '{}'", field.name())))?;
+            let Some(column) = batch.column_by_name(field.name()) else {
+                continue;
+            };
             columns.push(
                 normalize_write_array(column, field.data_type()).map_err(|error| {
                     invalid(format!("Invalid upsert column '{}': {error}", field.name()))
                 })?,
             );
+            fields.push(field.clone());
         }
-        let ordered = RecordBatch::try_new(target, columns)
+        let ordered = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|error| invalid(format!("cannot order upsert columns: {error}")))?;
+        if self
+            .source
+            .first()
+            .is_some_and(|first| first.schema() != ordered.schema())
+        {
+            return Err(invalid(
+                "Arrow batches in one upsert input must have the same columns",
+            ));
+        }
         self.source.push(ordered);
         Ok(())
     }
@@ -183,7 +205,20 @@ impl TableUpsert {
                     .map_err(|error| invalid(error.to_string()))
             })
             .collect::<crate::Result<Vec<_>>>()?;
-        let partitions: HashSet<_> = batch_to_serialized_bytes(source, &indices, schema.fields())?
+        let input_fields = source
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| {
+                schema
+                    .fields()
+                    .iter()
+                    .find(|table_field| table_field.name() == field.name())
+                    .unwrap()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let partitions: HashSet<_> = batch_to_serialized_bytes(source, &indices, &input_fields)?
             .into_iter()
             .collect();
         let fields = schema.partition_fields();
@@ -251,6 +286,14 @@ impl TableUpsert {
                     .new_write_builder()
                     .with_commit_user(self.commit_user.clone())?
                     .new_write()?;
+                append.with_write_type(
+                    new_rows
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().to_string())
+                        .collect(),
+                )?;
                 if let Err(error) = append.write_arrow_batch(&new_rows).await {
                     append.close().await;
                     return Err(error);
