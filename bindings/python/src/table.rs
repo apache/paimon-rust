@@ -27,7 +27,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::context::complete_jindo_options;
+use crate::context::complete_storage_options;
 use crate::error::to_py_err;
 use crate::partition::PyPartitionStat;
 use crate::read::PyReadBuilder;
@@ -67,7 +67,7 @@ impl PyTable {
     ) -> PyResult<Self> {
         let schema: TableSchema = serde_json::from_str(schema_json)
             .map_err(|err| PyValueError::new_err(format!("Invalid table schema JSON: {err}")))?;
-        let properties = complete_jindo_options(
+        let properties = complete_storage_options(
             options
                 .map(crate::read::extract_options)
                 .transpose()?
@@ -103,7 +103,7 @@ impl PyTable {
                 PyValueError::new_err(format!("Invalid REST table response JSON: {err}"))
             })?;
         let identifier = Identifier::new(database, table);
-        let rest_options = complete_jindo_options(rest_options);
+        let rest_options = complete_storage_options(rest_options);
         let table = py
             .detach(|| {
                 runtime().block_on(paimon::table::Table::from_rest_response(
