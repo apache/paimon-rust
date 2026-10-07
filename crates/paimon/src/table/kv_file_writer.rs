@@ -44,8 +44,8 @@ use crate::table::managed_blob_reference::ManagedBlobReferences;
 use crate::table::managed_blob_writer::ManagedBlobWriteState;
 use crate::table::prepared_files::PreparedFiles;
 use crate::table::sort_merge::{
-    AggregateMergeFunction, BufferedBatch, FirstRowMergeFunction, MergeFunction, MergeResult,
-    MergeRow, PartialUpdateMergeFunction,
+    canonicalize_sequence_nans, AggregateMergeFunction, BufferedBatch, FirstRowMergeFunction,
+    MergeFunction, MergeResult, MergeRow, PartialUpdateMergeFunction,
 };
 use crate::Result;
 use arrow_array::{Array, BooleanArray, Int64Array, Int8Array, RecordBatch, UInt32Array};
@@ -323,7 +323,7 @@ impl KeyValueFileWriter {
             !CoreOptions::new(&self.config.table_options).sequence_field_sort_order_is_ascending();
         for &idx in &self.config.sequence_field_indices {
             sort_columns.push(SortColumn {
-                values: combined.column(idx).clone(),
+                values: canonicalize_sequence_nans(combined.column(idx)),
                 options: Some(SortOptions {
                     descending: user_sequence_descending,
                     nulls_first: true,

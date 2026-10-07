@@ -30,7 +30,9 @@ use crate::spec::{AggregationConfig, CoreOptions, DataField, PartialUpdateConfig
 use crate::table::aggregator::{new_aggregator, FieldAggregator};
 use crate::table::ArrowRecordBatchStream;
 use crate::Error;
-use arrow_array::{new_null_array, ArrayRef, Int64Array, Int8Array, RecordBatch};
+use arrow_array::{
+    new_null_array, ArrayRef, Float32Array, Float64Array, Int64Array, Int8Array, RecordBatch,
+};
 use arrow_ord::ord::make_comparator;
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
 use arrow_schema::{SchemaRef, SortOptions};
@@ -40,7 +42,7 @@ use futures::StreamExt;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // MergeFunction
@@ -166,6 +168,38 @@ pub(super) fn compare_sequence_order(lhs: &MergeRow, rhs: &MergeRow) -> Ordering
         // Java SortMergeReader compares isAdd() after equal sequence numbers:
         // retracts come first, adds last.
         .then_with(|| matches!(lhs.value_kind, 0 | 2).cmp(&matches!(rhs.value_kind, 0 | 2)))
+}
+
+/// Canonicalize NaNs in floating sequence columns before Arrow orders them.
+///
+/// Arrow distinguishes NaN bit patterns. Java `Float.compare` and
+/// `Double.compare`, which define Paimon's sequence-field order, treat every
+/// NaN as equal and greater than every non-NaN value. Canonical positive NaNs
+/// preserve that order while keeping signed zero unchanged. The returned array
+/// is only an ordering key; stored values retain their original bits.
+pub(super) fn canonicalize_sequence_nans(array: &ArrayRef) -> ArrayRef {
+    if let Some(values) = array.as_any().downcast_ref::<Float32Array>() {
+        if values
+            .iter()
+            .flatten()
+            .any(|value| value.is_nan() && value.to_bits() != f32::NAN.to_bits())
+        {
+            return Arc::new(Float32Array::from_iter(values.iter().map(|value| {
+                value.map(|value| if value.is_nan() { f32::NAN } else { value })
+            })));
+        }
+    } else if let Some(values) = array.as_any().downcast_ref::<Float64Array>() {
+        if values
+            .iter()
+            .flatten()
+            .any(|value| value.is_nan() && value.to_bits() != f64::NAN.to_bits())
+        {
+            return Arc::new(Float64Array::from_iter(values.iter().map(|value| {
+                value.map(|value| if value.is_nan() { f64::NAN } else { value })
+            })));
+        }
+    }
+    array.clone()
 }
 
 impl MergeFunction for DeduplicateMergeFunction {
@@ -1345,7 +1379,7 @@ fn convert_batch_user_sequences(
     };
     let columns = indices
         .iter()
-        .map(|&idx| batch.column(idx).clone())
+        .map(|&idx| canonicalize_sequence_nans(batch.column(idx)))
         .collect::<Vec<_>>();
     converter
         .convert_columns(&columns)

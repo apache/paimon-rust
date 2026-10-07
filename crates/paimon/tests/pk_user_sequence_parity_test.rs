@@ -340,6 +340,67 @@ async fn typed_user_sequences_match_java_in_flush_and_across_files() {
     }
 }
 
+#[tokio::test]
+async fn floating_nan_sequence_ties_keep_the_last_row() {
+    let cases = [
+        (
+            "float",
+            DataType::Float(FloatType::new()),
+            Arc::new(Float32Array::from(vec![f32::NAN])) as ArrayRef,
+            Arc::new(Float32Array::from(vec![f32::from_bits(0xffc0_0001)])) as ArrayRef,
+        ),
+        (
+            "double",
+            DataType::Double(DoubleType::new()),
+            Arc::new(Float64Array::from(vec![f64::NAN])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![f64::from_bits(
+                0xfff8_0000_0000_0001,
+            )])) as ArrayRef,
+        ),
+    ];
+
+    for (name, field_type, positive_nan, negative_nan) in cases {
+        for (order, (first, last)) in [
+            (positive_nan.clone(), negative_nan.clone()),
+            (negative_nan.clone(), positive_nan.clone()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for engine in ["deduplicate", "partial-update", "aggregation"] {
+                for descending in [false, true] {
+                    for separate_commits in [false, true] {
+                        let path = format!(
+                            "memory:/pk_user_sequence/nan_{name}_{order}_{engine}_{descending}_{separate_commits}"
+                        );
+                        let table =
+                            typed_sequence_table(&path, engine, field_type.clone(), descending)
+                                .await;
+                        let first = typed_sequence_batch(first.clone(), 10);
+                        let last = typed_sequence_batch(last.clone(), 20);
+                        if separate_commits {
+                            write_batch(&table, &first).await;
+                            write_batch(&table, &last).await;
+                        } else {
+                            let batch = arrow_select::concat::concat_batches(
+                                &first.schema(),
+                                &[first, last],
+                            )
+                            .unwrap();
+                            write_batch(&table, &batch).await;
+                        }
+                        assert_eq!(
+                            scan_typed_sequence_value(&table).await,
+                            20,
+                            "type={name}, engine={engine}, descending={descending}, separate_commits={separate_commits}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn composite_sequence_batch(rows: &[(Option<&str>, Option<i32>, i32)]) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
