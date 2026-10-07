@@ -69,7 +69,8 @@ class TableScan:
         semantics."""
         ...
     def with_shard(self, index: int, count: int) -> "TableScan":
-        """Select one balanced worker shard (``index`` of ``count``) for a distributed scan."""
+        """Select a Java file-name or bucket shard; chunk shuffle uses balanced
+        ranges of shuffled chunks. Row-position sharding is a separate API."""
         ...
     def plan(self) -> Plan: ...
 

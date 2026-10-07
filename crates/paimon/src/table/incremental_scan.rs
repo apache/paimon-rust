@@ -266,7 +266,7 @@ impl<'a> IncrementalScan<'a> {
         Ok(self)
     }
 
-    /// Select one balanced worker shard for a distributed scan.
+    /// Select one worker shard using the same rules as [`TableScan::with_shard`].
     pub fn with_shard(mut self, index: usize, count: usize) -> crate::Result<Self> {
         self.scan = self.scan.with_shard(index, count)?;
         Ok(self)
