@@ -210,13 +210,15 @@ impl ManagedBlobReadPlan {
                 let batch = crate::arrow::residual::filter_record_batch_by_predicates(
                     batch?, &ordinary_predicates, &self.scan_fields,
                 )?;
-                // With LIMIT, inspect one candidate at a time. A rejected row
-                // consumes no quota, and later payloads must remain unopened
-                // once enough rows match. Output-only BLOBs resolve afterward.
-                let width = if limit.is_some() { 1 } else { batch.num_rows().max(1) };
-                for offset in (0..batch.num_rows()).step_by(width) {
+                // Inspect at most the remaining quota of candidate rows. Even
+                // if every candidate matches, none is beyond LIMIT. Rejected
+                // rows consume no quota; shrink the next batch accordingly.
+                let mut offset = 0;
+                while offset < batch.num_rows() {
                     if remaining == Some(0) { break 'batches; }
-                    let candidate = batch.slice(offset, width.min(batch.num_rows() - offset));
+                    let width = remaining.unwrap_or(batch.num_rows()).min(batch.num_rows() - offset);
+                    let candidate = batch.slice(offset, width);
+                    offset += width;
                     let mut filter = BlobPredicateBatch::new(
                         candidate, &self.predicates, &self.scan_fields,
                         &resolved, &file_io, &limiter,
@@ -658,7 +660,7 @@ mod tests {
         let options = std::collections::HashMap::new();
         let options = CoreOptions::new(&options);
         for (predicate, expected) in cases {
-            for limit in [None, Some(1)] {
+            for limit in [None, Some(1), Some(2)] {
                 let plan = ManagedBlobReadPlan::new(
                     &fields[..1],
                     std::slice::from_ref(&predicate),
