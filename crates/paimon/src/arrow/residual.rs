@@ -369,7 +369,7 @@ pub(crate) fn evaluate_exact_leaf_predicate(
     if matches!(array.data_type(), arrow_schema::DataType::Decimal128(_, _))
         && !matches!(op, PredicateOperator::IsNull | PredicateOperator::IsNotNull)
     {
-        return evaluate_decimal_leaf(array, op, literals);
+        return evaluate_decimal_leaf(array, op, literals).map(sanitize_filter_mask);
     }
     match op {
         PredicateOperator::IsNull => Ok(boolean_mask_from_predicate(array.len(), |row_index| {
@@ -2537,5 +2537,63 @@ mod tests {
         let out =
             filter_record_batch_by_predicates(batch, &fp, std::slice::from_ref(&col)).unwrap();
         assert_eq!(out.num_rows(), 2, "d > 1.05 == d >= 1.1 -> {{1.1, 1.2}}");
+    }
+
+    #[test]
+    fn test_nullable_decimal_composes() {
+        // A NULL decimal fails its leaf, so AND and OR combine masks without NULLs.
+        use crate::spec::DecimalType;
+        let decimal = || DataType::Decimal(DecimalType::with_nullable(true, 10, 2).unwrap());
+        let col = DataField::new(0, "d".to_string(), decimal());
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "d",
+            ArrowDataType::Decimal128(10, 2),
+            true,
+        )]));
+        // 1.00, NULL, 2.00 (unscaled at scale 2)
+        let arr = arrow_array::Decimal128Array::from(vec![Some(100), None, Some(200)])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+        let cmp = |op, unscaled| {
+            let literal = Datum::Decimal {
+                unscaled,
+                precision: 10,
+                scale: 2,
+            };
+            leaf(0, decimal(), op, vec![literal])
+        };
+        for (pred, expected) in [
+            // d > 0.50 AND d < 1.50 -> [1.00]
+            (
+                Predicate::And(vec![
+                    cmp(PredicateOperator::Gt, 50),
+                    cmp(PredicateOperator::Lt, 150),
+                ]),
+                vec![100i128],
+            ),
+            // d < 1.50 OR d > 1.50 -> [1.00, 2.00]
+            (
+                Predicate::Or(vec![
+                    cmp(PredicateOperator::Lt, 150),
+                    cmp(PredicateOperator::Gt, 150),
+                ]),
+                vec![100, 200],
+            ),
+        ] {
+            let fp = file_predicates(vec![pred], vec![col.clone()]);
+            let out =
+                filter_record_batch_by_predicates(batch.clone(), &fp, std::slice::from_ref(&col))
+                    .unwrap();
+            let values: Vec<i128> = out
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Decimal128Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .collect();
+            assert_eq!(values, expected);
+        }
     }
 }
