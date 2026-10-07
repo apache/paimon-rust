@@ -583,6 +583,53 @@ impl UpdateContext {
         })
     }
 
+    fn merge_into(
+        &self,
+        py: Python<'_>,
+        source: Option<&Bound<'_, PyAny>>,
+        on: Vec<(String, String)>,
+        when_matched: &Bound<'_, PyAny>,
+        when_not_matched: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        let source = match source {
+            Some(source) => paimon::table::MergeSource::Batches(arrow_table_batches(source)?),
+            None => paimon::table::MergeSource::SelfTable,
+        };
+        let source_schema = match &source {
+            paimon::table::MergeSource::Batches(batches) => batches[0].schema(),
+            paimon::table::MergeSource::SelfTable => {
+                let schema = paimon::arrow::build_target_arrow_schema(self.table.schema().fields())
+                    .map_err(to_py_err)?;
+                let mut fields = schema.fields().to_vec();
+                fields.push(Arc::new(arrow::datatypes::Field::new(
+                    "_ROW_ID",
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                )));
+                Arc::new(ArrowSchema::new(fields))
+            }
+        };
+        let errors = Arc::new(Mutex::new(None));
+        let (matched, not_matched) = crate::merge_into::from_python(
+            py,
+            &self.table,
+            source_schema,
+            when_matched,
+            when_not_matched,
+            errors.clone(),
+        )?;
+        let result = py
+            .detach(|| runtime().block_on(self.inner.merge_into(source, on, matched, not_matched)));
+        if let Some(error) = errors.lock().unwrap().take() {
+            return Err(error);
+        }
+        Ok(wrap_messages(
+            result.map_err(to_py_err)?,
+            &self.table_location,
+            &self.commit_user,
+        ))
+    }
+
     fn update_by_predicate(
         &self,
         py: Python<'_>,
@@ -862,6 +909,22 @@ pub struct PyStreamTableUpdate {
 
 #[pymethods]
 impl PyStreamTableUpdate {
+    #[pyo3(signature = (source, *, on, when_matched, when_not_matched, commit_identifier))]
+    fn merge_into(
+        &self,
+        py: Python<'_>,
+        source: Option<&Bound<'_, PyAny>>,
+        on: Vec<(String, String)>,
+        when_matched: &Bound<'_, PyAny>,
+        when_not_matched: &Bound<'_, PyAny>,
+        commit_identifier: i64,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        // The stream committer applies the identifier to the returned messages.
+        let _ = commit_identifier;
+        self.context
+            .merge_into(py, source, on, when_matched, when_not_matched)
+    }
+
     #[pyo3(signature = (predicate, assignments, commit_identifier, read_columns=None))]
     fn update_by_predicate(
         &self,
@@ -933,6 +996,19 @@ impl PyStreamTableUpdate {
 
 #[pymethods]
 impl PyBatchTableUpdate {
+    #[pyo3(signature = (source, *, on, when_matched, when_not_matched))]
+    fn merge_into(
+        &self,
+        py: Python<'_>,
+        source: Option<&Bound<'_, PyAny>>,
+        on: Vec<(String, String)>,
+        when_matched: &Bound<'_, PyAny>,
+        when_not_matched: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<PyCommitMessage>> {
+        self.context
+            .merge_into(py, source, on, when_matched, when_not_matched)
+    }
+
     #[pyo3(signature = (predicate, assignments, read_columns=None))]
     fn update_by_predicate(
         &self,

@@ -262,6 +262,17 @@ class BatchTableWrite:
         ...
 
 class BatchTableUpdate:
+    def merge_into(
+        self, source: Optional[pyarrow.Table], *, on: Sequence[Tuple[str, str]],
+        when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]]
+    ) -> List[CommitMessage]:
+        """Prepare MERGE against one snapshot. None selects self-merge on _ROW_ID.
+
+        Clauses carry assignments as (column, source/target/literal, value)
+        tuples, a delete flag, and optional SQL condition metadata.
+        Commit returned messages through the matching builder's committer.
+        """
+        ...
     def update_by_predicate(
         self, predicate: Optional[Dict[str, Any]], assignments: Dict[str, Any],
         read_columns: Optional[Sequence[str]] = None
@@ -289,6 +300,18 @@ class TableUpdateByRowId:
     def _abort(self) -> None: ...
 
 class StreamTableUpdate:
+    def merge_into(
+        self, source: Optional[pyarrow.Table], *, on: Sequence[Tuple[str, str]],
+        when_matched: Sequence[Dict[str, Any]], when_not_matched: Sequence[Dict[str, Any]],
+        commit_identifier: int
+    ) -> List[CommitMessage]:
+        """Prepare MERGE against one snapshot. None selects self-merge on _ROW_ID.
+
+        Clauses carry assignments as (column, source/target/literal, value)
+        tuples, a delete flag, and optional SQL condition metadata.
+        Commit returned messages through the matching builder's committer.
+        """
+        ...
     def update_by_predicate(
         self, predicate: Optional[Dict[str, Any]], assignments: Dict[str, Any],
         commit_identifier: int, read_columns: Optional[Sequence[str]] = None
