@@ -18,7 +18,8 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
-use arrow_array::{Array, BinaryArray, FixedSizeListArray, StructArray};
+use arrow_array::types::Int32Type;
+use arrow_array::{Array, BinaryArray, DictionaryArray, FixedSizeListArray, StructArray};
 use arrow_schema::{DataType, Field};
 
 use crate::variant::VariantFloat32Projection;
@@ -69,14 +70,14 @@ pub(crate) fn extract_numeric_fields(
             })?;
 
     let value_column = variant_binary_child(column, 0, "value")?;
-    let metadata_column = variant_binary_child(column, 1, "metadata")?;
+    let metadata_column = VariantMetadataColumn::new(column)?;
     let mut builder = FixedSizeListBuilder::with_capacity(
         Float32Builder::with_capacity(value_capacity),
         width,
         column.len(),
     )
     .with_field(Arc::new(Field::new("item", DataType::Float32, true)));
-    let mut projection_metadata = None;
+    let mut projection_metadata: Option<MetadataIdentity<'_>> = None;
     let mut projection = None;
     let mut offsets = Vec::new();
     let mut extracted = vec![None; fields.len()];
@@ -92,10 +93,10 @@ pub(crate) fn extract_numeric_fields(
             ));
         }
 
-        let metadata = metadata_column.value(row);
-        if projection_metadata != Some(metadata) {
+        let (metadata, identity) = metadata_column.value(row);
+        if !projection_metadata.is_some_and(|previous| previous.same_as(&identity)) {
             projection = Some(VariantFloat32Projection::new(metadata, fields)?);
-            projection_metadata = Some(metadata);
+            projection_metadata = Some(identity);
         }
         match mode {
             NumericFieldMode::Cast { fail_on_error } => {
@@ -121,6 +122,90 @@ pub(crate) fn extract_numeric_fields(
     }
 
     Ok(builder.finish())
+}
+
+/// Variant metadata read either as plain binary or, without per-row copies, dictionary-encoded.
+enum VariantMetadataColumn<'a> {
+    Plain(&'a BinaryArray),
+    Dictionary {
+        keys: &'a DictionaryArray<Int32Type>,
+        values: &'a BinaryArray,
+    },
+}
+
+/// Identifies the metadata a projection was built for; dictionary keys avoid comparing bytes.
+#[derive(Clone, Copy)]
+enum MetadataIdentity<'a> {
+    Bytes(&'a [u8]),
+    Key(i32),
+}
+
+impl MetadataIdentity<'_> {
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Key(a), Self::Key(b)) => a == b,
+            (Self::Bytes(a), Self::Bytes(b)) => {
+                (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
+            }
+            _ => false,
+        }
+    }
+}
+
+impl<'a> VariantMetadataColumn<'a> {
+    fn new(column: &'a StructArray) -> Result<Self> {
+        let Some(field) = column.fields().get(1) else {
+            return data_invalid("Expected Variant struct fields value and metadata");
+        };
+        if column.num_columns() != 2 || field.name() != "metadata" {
+            return data_invalid("Expected Variant struct fields value and metadata");
+        }
+        match field.data_type() {
+            DataType::Binary => Ok(Self::Plain(variant_binary_child(column, 1, "metadata")?)),
+            DataType::Dictionary(key, value)
+                if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Binary =>
+            {
+                let keys = column
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: "Variant metadata dictionary must use Int32 keys".to_string(),
+                        source: None,
+                    })?;
+                let values = keys
+                    .values()
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| Error::DataInvalid {
+                        message: "Variant metadata dictionary values must be Binary".to_string(),
+                        source: None,
+                    })?;
+                Ok(Self::Dictionary { keys, values })
+            }
+            _ => data_invalid("Expected Variant struct fields value and metadata"),
+        }
+    }
+
+    fn is_null(&self, row: usize) -> bool {
+        match self {
+            Self::Plain(array) => array.is_null(row),
+            Self::Dictionary { keys, .. } => keys.is_null(row),
+        }
+    }
+
+    fn value(&self, row: usize) -> (&'a [u8], MetadataIdentity<'a>) {
+        match self {
+            Self::Plain(array) => {
+                let bytes = array.value(row);
+                (bytes, MetadataIdentity::Bytes(bytes))
+            }
+            Self::Dictionary { keys, values } => {
+                let key = keys.keys().value(row);
+                (values.value(key as usize), MetadataIdentity::Key(key))
+            }
+        }
+    }
 }
 
 fn variant_binary_child<'a>(
@@ -196,6 +281,34 @@ mod tests {
             vec![Arc::new(values.finish()), Arc::new(metadata.finish())],
             Some(NullBuffer::new(BooleanBuffer::from(validity))),
         )
+    }
+
+    #[test]
+    fn dictionary_metadata_matches_plain_metadata() {
+        let plain = variant_column(&[
+            Some(r#"{"x":1,"y":2.5}"#),
+            None,
+            Some(r#"{"y":-1,"x":4}"#),
+            Some(r#"{"z":true}"#),
+        ]);
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Binary));
+        let metadata = arrow_cast::cast(plain.column(1), &dictionary_type).unwrap();
+        let mut fields = plain
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields[1] = fields[1].clone().with_data_type(dictionary_type);
+        let dictionary = StructArray::new(
+            fields.into(),
+            vec![plain.column(0).clone(), metadata],
+            plain.nulls().cloned(),
+        );
+        let names = vec!["x".to_string(), "y".to_string()];
+        let expected = variant_get_numeric_fields(&plain, &names).unwrap();
+        let actual = variant_get_numeric_fields(&dictionary, &names).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
